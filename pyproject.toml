@@ -1,0 +1,7 @@
+[project]
+name = "kestrel"
+version = "0.1.0"
+description = "inference engine for moondream"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["torch==2.8.0"]

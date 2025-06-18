@@ -1,0 +1,5 @@
+sync.sh
+.venv
+__pycache__/
+*.pyc
+.env
