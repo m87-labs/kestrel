@@ -1,3 +1,5 @@
 """Kestrel inference package."""
 
-__all__ = []
+from .engine import InferenceEngine, EngineResult, EngineMetrics
+
+__all__ = ["InferenceEngine", "EngineResult", "EngineMetrics"]

@@ -7,11 +7,20 @@ from __future__ import annotations
 
 from typing import Optional
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention_raw
+
+try:
+    _graph_safe_flex_attention = torch.compile(_flex_attention_raw, fullgraph=True)  # type: ignore[arg-type]
+    FLEX_ATTENTION_GRAPH_SAFE = True
+except Exception:
+    _graph_safe_flex_attention = _flex_attention_raw
+    FLEX_ATTENTION_GRAPH_SAFE = False
 
 from .config import TextConfig
 from .layers import (
@@ -88,7 +97,7 @@ def attn(
 
     if flex_block_mask_slice is not None:
         torch._assert(n_heads == n_kv_heads, "Grouped query attention not supported")
-        out = flex_attention(q, k, v, block_mask=flex_block_mask_slice)
+        out = _graph_safe_flex_attention(q, k, v, block_mask=flex_block_mask_slice)
     else:
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, enable_gqa=n_heads != n_kv_heads
@@ -239,4 +248,5 @@ __all__ = [
     "lm_head",
     "attn",
     "build_text_model",
+    "FLEX_ATTENTION_GRAPH_SAFE",
 ]

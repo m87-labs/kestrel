@@ -27,7 +27,12 @@ def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
 class PagedKVCache(torch.nn.Module):
     def __init__(self, page_table, n_heads, head_dim, dtype):
         super().__init__()
-        cache_shape = (1, n_heads, page_table.n_pages * page_table.page_size, head_dim)
+        cache_shape = (
+            1,
+            n_heads,
+            page_table.n_pages * page_table.page_size,
+            head_dim,
+        )
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 

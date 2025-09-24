@@ -31,6 +31,9 @@ class RuntimeConfig:
     max_batch_size: int = 4
     page_size: int = 128
     max_seq_length: Optional[int] = None
+    enable_compile: bool = True
+    compile_mode: Optional[str] = None
+    enable_cuda_graphs: bool = True
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

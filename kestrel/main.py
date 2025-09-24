@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 
 import torch
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
-from kestrel.scheduler import GenerationScheduler
+from kestrel.engine import InferenceEngine
 
 
 def _parse_dtype(value: str) -> torch.dtype:
@@ -51,10 +51,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=4096,
         help="Maximum total sequence length (prompt + generation)",
     )
+    schedule.add_argument(
+        "--disable-compile",
+        action="store_true",
+        help="Disable torch.compile for eligible runtime paths",
+    )
+    schedule.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        help="Disable CUDA graph capture for batched decode",
+    )
+    schedule.add_argument(
+        "--batch-timeout-ms",
+        type=float,
+        default=20.0,
+        help="Micro-batching timeout (in milliseconds) before dispatching queued requests",
+    )
     return parser
 
 
-def _handle_schedule(args: argparse.Namespace) -> None:
+async def _handle_schedule(args: argparse.Namespace) -> None:
     model_paths = ModelPaths(
         weights=args.weights,
         config_json=args.config,
@@ -67,16 +83,29 @@ def _handle_schedule(args: argparse.Namespace) -> None:
         max_batch_size=args.max_batch_size,
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
+        enable_compile=not args.disable_compile,
+        enable_cuda_graphs=not args.disable_cuda_graphs,
     )
 
-    runtime = MoondreamTextRuntime(runtime_cfg)
-    scheduler = GenerationScheduler(runtime)
-    for prompt in args.prompts:
-        scheduler.submit(prompt, max_new_tokens=args.max_new_tokens)
+    engine = await InferenceEngine.create(
+        runtime_cfg,
+        batch_timeout_s=args.batch_timeout_ms / 1000.0,
+    )
+    try:
+        submissions = [
+            engine.submit(prompt, max_new_tokens=args.max_new_tokens)
+            for prompt in args.prompts
+        ]
+        results = await asyncio.gather(*submissions)
+    finally:
+        await engine.shutdown()
 
-    results = scheduler.run()
     for result in results:
-        print(f"[{result.request_id}] {result.finish_reason}: {result.text}")
+        metrics = result.metrics
+        print(
+            f"[{result.request_id}] {result.finish_reason}: {result.text} "
+            f"(latency={metrics.latency_s:.3f}s, decode_tokens={metrics.decode_tokens})"
+        )
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -84,7 +113,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "schedule":
-        _handle_schedule(args)
+        asyncio.run(_handle_schedule(args))
     else:
         parser.print_help()
 

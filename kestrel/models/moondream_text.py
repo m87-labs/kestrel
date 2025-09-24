@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+import warnings
+
 import torch
 from torch import Tensor
 
@@ -22,7 +24,12 @@ from kestrel.moondream import (
     MoondreamTextModel,
     load_text_weights,
 )
-from kestrel.moondream.text import lm_head, text_decoder, text_encoder
+from kestrel.moondream.text import (
+    FLEX_ATTENTION_GRAPH_SAFE,
+    lm_head,
+    text_decoder,
+    text_encoder,
+)
 from torch.nn.attention.flex_attention import BlockMask
 
 
@@ -58,6 +65,14 @@ class SequenceState:
 
     def remaining_new_tokens(self) -> int:
         return max(self.max_length - self.length, 0)
+
+
+@dataclass
+class _GraphWorkspace:
+    token_buffer: Tensor
+    batch_idx_buffer: Tensor
+    position_buffer: Tensor
+    output_buffer: Tensor
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -206,6 +221,38 @@ class MoondreamTextRuntime:
         )
 
         self.active_sequences: Dict[int, SequenceState] = {}
+        self._use_cuda_graphs = (
+            cfg.enable_cuda_graphs
+            and torch.cuda.is_available()
+            and self.device.type == "cuda"
+        )
+        if self._use_cuda_graphs and not FLEX_ATTENTION_GRAPH_SAFE:
+            warnings.warn(
+                "Disabling CUDA graphs because flex-attention could not be compiled with torch.compile",
+                RuntimeWarning,
+            )
+            self._use_cuda_graphs = False
+
+        self._graph_workspace: _GraphWorkspace | None = None
+        self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._graph_batch_sizes: list[int] = []
+        self._graph_pool: object | None = None
+
+        self._prefill_fn = self._prefill_impl
+        if cfg.enable_compile:
+            compile_kwargs: dict[str, object] = {"dynamic": True}
+            if cfg.compile_mode:
+                compile_kwargs["mode"] = cfg.compile_mode
+            try:
+                self._prefill_fn = torch.compile(self._prefill_impl, **compile_kwargs)
+            except Exception as exc:  # pragma: no cover - torch.compile optional path
+                warnings.warn(
+                    f"torch.compile failed for prefill path, continuing without compilation: {exc}"
+                )
+                self._prefill_fn = self._prefill_impl
+
+        if self._use_cuda_graphs:
+            self._ensure_cuda_graphs_ready()
 
     # ------------------------------------------------------------------
     # Capacity helpers
@@ -299,6 +346,9 @@ class MoondreamTextRuntime:
 
     @torch.inference_mode()
     def _prefill(self, input_ids: Tensor) -> Tensor:
+        return self._prefill_fn(input_ids)
+
+    def _prefill_impl(self, input_ids: Tensor) -> Tensor:
         seq_len = input_ids.shape[1]
         pos_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0)
         embeds = text_encoder(input_ids, self.model.text)
@@ -413,6 +463,20 @@ class MoondreamTextRuntime:
             dtype=torch.int32,
         )
 
+        tokens = token_ids.to(device=self.device, dtype=torch.long)
+        batch_size = batch_idx.shape[0]
+        if self._use_cuda_graphs and batch_size > 0:
+            self._ensure_cuda_graphs_ready()
+            graph_batch_size = self._select_graph_batch_size(batch_size)
+            if graph_batch_size is not None:
+                return self._decode_with_graph(
+                    batch_idx, tokens, input_pos, graph_batch_size
+                )
+        return self._decode_step(batch_idx, tokens, input_pos)
+
+    def _decode_step(
+        self, batch_idx: Tensor, tokens: Tensor, input_pos: Tensor
+    ) -> Tensor:
         self.input_positions.zero_()
         self.input_positions[batch_idx] = input_pos
         offsets = self.input_positions[batch_idx]
@@ -421,7 +485,6 @@ class MoondreamTextRuntime:
         for cache in self.layer_caches:
             cache.set_active_batch(batch_idx)
 
-        tokens = token_ids.to(device=self.device, dtype=torch.long)
         embeds = text_encoder(tokens.view(-1, 1), self.model.text)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
         hidden = text_decoder(
@@ -434,6 +497,143 @@ class MoondreamTextRuntime:
         )
         logits = lm_head(hidden, self.model.text)
         return logits
+
+    def _decode_with_graph(
+        self,
+        batch_idx: Tensor,
+        tokens: Tensor,
+        input_pos: Tensor,
+        graph_batch_size: int,
+    ) -> Tensor:
+        workspace = self._graph_workspace
+        if workspace is None:
+            raise RuntimeError("CUDA graph workspace is not initialized")
+        if graph_batch_size not in self._cuda_graphs:
+            raise RuntimeError(
+                f"No CUDA graph captured for batch size {graph_batch_size}"
+            )
+
+        batch_size = batch_idx.shape[0]
+        self._clear_graph_inputs(graph_batch_size)
+        workspace.token_buffer[:batch_size, 0].copy_(tokens)
+        workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
+        workspace.position_buffer[:batch_size].copy_(input_pos)
+
+        graph = self._cuda_graphs[graph_batch_size]
+        graph.replay()
+        return workspace.output_buffer[:batch_size].clone()
+
+    def _ensure_cuda_graphs_ready(self) -> None:
+        if not self._use_cuda_graphs or self._cuda_graphs:
+            return
+        self._initialize_graph_workspace()
+        self._capture_decode_graphs()
+
+    def _initialize_graph_workspace(self) -> None:
+        if self._graph_workspace is not None:
+            return
+        max_effective_batch = max(1, self.max_batch_size - 1)
+        vocab = self.model.text.lm_head.weight.shape[0]
+        token_buffer = torch.zeros(
+            (max_effective_batch, 1), device=self.device, dtype=torch.long
+        )
+        batch_idx_buffer = torch.zeros(
+            (max_effective_batch,), device=self.device, dtype=torch.long
+        )
+        position_buffer = torch.zeros(
+            (max_effective_batch,), device=self.device, dtype=torch.int32
+        )
+        output_buffer = torch.zeros(
+            (max_effective_batch, vocab),
+            device=self.device,
+            dtype=self.model.text.lm_head.weight.dtype,
+        )
+        self._graph_workspace = _GraphWorkspace(
+            token_buffer=token_buffer,
+            batch_idx_buffer=batch_idx_buffer,
+            position_buffer=position_buffer,
+            output_buffer=output_buffer,
+        )
+        self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
+
+    def _make_graph_batch_sizes(self, max_batch: int) -> list[int]:
+        seeds = [size for size in (1, 2, 4, 8) if size <= max_batch]
+        ramps = list(range(16, max_batch + 1, 16))
+        sizes = sorted({*seeds, *ramps, max_batch})
+        return sizes
+
+    def _capture_decode_graphs(self) -> None:
+        workspace = self._graph_workspace
+        if workspace is None:
+            raise RuntimeError("CUDA graph workspace must be initialized before capture")
+        max_batch = workspace.token_buffer.shape[0]
+        if max_batch == 0:
+            return
+
+        device = self.device
+        batch_indices = torch.arange(1, max_batch + 1, device=device, dtype=torch.long)
+        workspace.batch_idx_buffer.copy_(batch_indices)
+        workspace.token_buffer.zero_()
+        workspace.position_buffer.zero_()
+
+        allocated_batches: list[int] = []
+        try:
+            for idx in batch_indices.tolist():
+                allocated = self.page_table.allocate()
+                if allocated != idx:
+                    raise RuntimeError(
+                        f"Expected batch index {idx} during CUDA graph capture, got {allocated}"
+                    )
+                batch_tensor = torch.tensor([idx], device=device, dtype=torch.int64)
+                self.page_table.reserve(
+                    batch_idx_int=idx,
+                    batch_idx=batch_tensor,
+                    seq_len=1,
+                )
+                allocated_batches.append(idx)
+
+            torch.cuda.synchronize(device=device)
+            for bs in reversed(self._graph_batch_sizes):
+                graph = torch.cuda.CUDAGraph()
+                with torch.inference_mode():
+                    warmup = self._decode_step(
+                        workspace.batch_idx_buffer[:bs],
+                        workspace.token_buffer[:bs, 0],
+                        workspace.position_buffer[:bs],
+                    )
+                    workspace.output_buffer[:bs].copy_(warmup)
+                    torch.cuda.synchronize(device=device)
+
+                    with torch.cuda.graph(graph, self._graph_pool):
+                        out = self._decode_step(
+                            workspace.batch_idx_buffer[:bs],
+                            workspace.token_buffer[:bs, 0],
+                            workspace.position_buffer[:bs],
+                        )
+                        workspace.output_buffer[:bs].copy_(out)
+
+                if self._graph_pool is None:
+                    self._graph_pool = graph.pool()
+                self._cuda_graphs[bs] = graph
+                torch.cuda.synchronize(device=device)
+        finally:
+            for idx in reversed(allocated_batches):
+                self.page_table.erase(idx)
+            self._clear_graph_inputs(max_batch)
+
+    def _select_graph_batch_size(self, batch_size: int) -> int | None:
+        for size in self._graph_batch_sizes:
+            if size >= batch_size:
+                return size
+        return None
+
+    def _clear_graph_inputs(self, limit: int) -> None:
+        workspace = self._graph_workspace
+        if workspace is None or limit <= 0:
+            return
+        workspace.token_buffer[:limit].zero_()
+        workspace.batch_idx_buffer[:limit].zero_()
+        workspace.position_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamTextRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]
