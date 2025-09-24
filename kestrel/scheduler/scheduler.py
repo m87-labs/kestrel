@@ -10,19 +10,34 @@ from torch import Tensor
 from kestrel.models import MoondreamTextRuntime
 
 from .queues import RequestQueue, RunningQueue
-from .types import GenerationRequest, ScheduledSequence, SchedulerResult
+from .types import (
+    GenerationRequest,
+    ScheduledSequence,
+    SchedulerResult,
+    StreamCallback,
+    StreamUpdate,
+)
 
 
 class GenerationScheduler:
     """Batched prefill+decode driver that mirrors flex-nano-vllm semantics."""
 
-    def __init__(self, runtime: MoondreamTextRuntime, *, greedy: bool = True) -> None:
+    def __init__(
+        self,
+        runtime: MoondreamTextRuntime,
+        *,
+        default_temperature: float = 0.0,
+        default_top_p: float = 1.0,
+    ) -> None:
         self.runtime = runtime
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
         self.running: RunningQueue[ScheduledSequence] = RunningQueue()
         self.completed: list[ScheduledSequence] = []
-        self.greedy = greedy
         self._next_request_id = 0
+        self._default_temperature = max(float(default_temperature), 0.0)
+        self._default_top_p = float(default_top_p)
+        if not (0.0 < self._default_top_p <= 1.0):
+            raise ValueError("default_top_p must be in the range (0, 1]")
 
     # ------------------------------------------------------------------
     # Submission
@@ -34,6 +49,9 @@ class GenerationScheduler:
         max_new_tokens: int,
         prompt_tokens: Optional[Tensor] = None,
         request_id: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        stream_callback: Optional[StreamCallback] = None,
     ) -> int:
         """Queue a new prompt for generation."""
 
@@ -44,6 +62,9 @@ class GenerationScheduler:
             prompt=prompt,
             prompt_tokens=prompt_tokens.detach().clone().to("cpu"),
             max_new_tokens=max_new_tokens,
+            temperature=self._resolve_temperature(temperature),
+            top_p=self._resolve_top_p(top_p),
+            stream_callback=stream_callback,
         )
         self.waiting.push(request)
         return request.request_id
@@ -53,10 +74,21 @@ class GenerationScheduler:
         prompts: Iterable[str],
         *,
         max_new_tokens: int,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        stream_callback: Optional[StreamCallback] = None,
     ) -> List[int]:
         ids: List[int] = []
         for prompt in prompts:
-            ids.append(self.submit(prompt, max_new_tokens=max_new_tokens))
+            ids.append(
+                self.submit(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stream_callback=stream_callback,
+                )
+            )
         return ids
 
     # ------------------------------------------------------------------
@@ -117,8 +149,9 @@ class GenerationScheduler:
                 continue
 
             first_logits = logits.squeeze(0)
-            next_token = self._select_next_token(first_logits)
+            next_token = self._select_next_token(first_logits, seq.request)
             seq.stage_token(next_token, first_logits)
+            self._emit_stream(seq)
 
             if self._mark_finished_if_needed(seq):
                 progress = True
@@ -155,19 +188,33 @@ class GenerationScheduler:
 
         for seq, row in zip(active, logits):
             seq.state.advance()
-            next_token = self._select_next_token(row)
+            next_token = self._select_next_token(row, seq.request)
             seq.stage_token(next_token, row)
+            self._emit_stream(seq)
             if not self._mark_finished_if_needed(seq):
                 idle.append(seq)
 
         self.running.extend(idle)
         return True
 
-    def _select_next_token(self, logits: Tensor) -> int:
-        if not self.greedy:
-            probs = torch.softmax(logits, dim=-1)
-            return int(torch.multinomial(probs, num_samples=1).item())
-        return int(torch.argmax(logits, dim=-1).item())
+    def _select_next_token(self, logits: Tensor, request: GenerationRequest) -> int:
+        temperature = max(request.temperature, 0.0)
+        if temperature <= 0.0:
+            return int(torch.argmax(logits, dim=-1).item())
+
+        scaled_logits = logits / max(temperature, 1e-6)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            return int(torch.argmax(logits, dim=-1).item())
+
+        top_p = request.top_p
+        if top_p < 1.0:
+            token_id = self._sample_top_p(probs, top_p)
+            if token_id is not None:
+                return token_id
+
+        sampled = torch.multinomial(probs, num_samples=1)
+        return int(sampled.item())
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token
@@ -197,6 +244,53 @@ class GenerationScheduler:
         if seq.state.batch_idx in self.runtime.active_sequences:
             self.runtime.release_sequence(seq.state)
         self.completed.append(seq)
+
+    def _emit_stream(self, seq: ScheduledSequence) -> None:
+        callback = seq.request.stream_callback
+        if callback is None:
+            return
+        if seq.stream_offset >= len(seq.generated_tokens):
+            return
+
+        token_index = len(seq.generated_tokens) - 1
+        token_id = seq.generated_tokens[token_index]
+        new_tokens = seq.generated_tokens[seq.stream_offset :]
+        text = self.runtime.tokenizer.decode(new_tokens) if new_tokens else ""
+        update = StreamUpdate(
+            request_id=seq.request.request_id,
+            token=token_id,
+            text=text,
+            token_index=token_index,
+        )
+        callback(update)
+        seq.stream_offset = len(seq.generated_tokens)
+
+    def _sample_top_p(self, probs: Tensor, top_p: float) -> Optional[int]:
+        if probs.ndim != 1:
+            probs = probs.view(-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumulative > top_p
+        if mask.numel() > 0:
+            mask[0] = False
+        filtered = sorted_probs.masked_fill(mask, 0.0)
+        total = filtered.sum()
+        if total <= 0:
+            return int(sorted_indices[0].item())
+        filtered = filtered / total
+        sampled = torch.multinomial(filtered, num_samples=1)
+        return int(sorted_indices[sampled.item()].item())
+
+    def _resolve_temperature(self, temperature: Optional[float]) -> float:
+        if temperature is None:
+            return self._default_temperature
+        return max(float(temperature), 0.0)
+
+    def _resolve_top_p(self, top_p: Optional[float]) -> float:
+        value = self._default_top_p if top_p is None else float(top_p)
+        if value <= 0.0 or value > 1.0:
+            raise ValueError("top_p must be in the range (0, 1]")
+        return value
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
         text = self.runtime.tokenizer.decode(seq.generated_tokens) if seq.generated_tokens else ""

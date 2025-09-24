@@ -67,10 +67,32 @@ def _build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Micro-batching timeout (in milliseconds) before dispatching queued requests",
     )
+    schedule.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Softmax temperature; 0 selects greedy decoding",
+    )
+    schedule.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling mass (0 < p <= 1)",
+    )
+    schedule.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream tokens as they are generated",
+    )
     return parser
 
 
 async def _handle_schedule(args: argparse.Namespace) -> None:
+    if args.temperature < 0.0:
+        raise SystemExit("temperature must be non-negative")
+    if args.top_p <= 0.0 or args.top_p > 1.0:
+        raise SystemExit("top-p must be in the range (0, 1]")
+
     model_paths = ModelPaths(
         weights=args.weights,
         config_json=args.config,
@@ -92,11 +114,34 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         batch_timeout_s=args.batch_timeout_ms / 1000.0,
     )
     try:
-        submissions = [
-            engine.submit(prompt, max_new_tokens=args.max_new_tokens)
-            for prompt in args.prompts
-        ]
-        results = await asyncio.gather(*submissions)
+        if args.stream:
+            streams = []
+            for prompt in args.prompts:
+                stream = await engine.submit_streaming(
+                    prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                streams.append(stream)
+
+            async def consume(stream):
+                async for update in stream:
+                    print(f"[{stream.request_id}] +{update.text}", flush=True)
+                return await stream.result()
+
+            results = await asyncio.gather(*(consume(stream) for stream in streams))
+        else:
+            submissions = [
+                engine.submit(
+                    prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                for prompt in args.prompts
+            ]
+            results = await asyncio.gather(*submissions)
     finally:
         await engine.shutdown()
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 from torch import Tensor
@@ -19,6 +19,9 @@ class GenerationRequest:
     prompt: str
     prompt_tokens: Tensor
     max_new_tokens: int
+    temperature: float = 0.0
+    top_p: float = 1.0
+    stream_callback: Optional["StreamCallback"] = None
 
     prompt_length: int = field(init=False)
 
@@ -32,6 +35,10 @@ class GenerationRequest:
             )
         self.prompt_tokens = tokens.to(dtype=torch.long, device="cpu")
         self.prompt_length = int(self.prompt_tokens.shape[0])
+        if self.temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not (0.0 < self.top_p <= 1.0):
+            raise ValueError("top_p must be in the range (0, 1]")
 
     @property
     def target_length(self) -> int:
@@ -49,6 +56,7 @@ class ScheduledSequence:
     last_logits: Optional[Tensor] = None
     finished: bool = False
     finish_reason: Optional[str] = None
+    stream_offset: int = 0
 
     def stage_token(self, token_id: int, logits: Tensor) -> None:
         token = int(token_id)
@@ -77,3 +85,16 @@ class SchedulerResult:
     tokens: List[int]
     text: str
     finish_reason: str
+
+
+@dataclass
+class StreamUpdate:
+    """Incremental token update emitted while a request is decoding."""
+
+    request_id: int
+    token: int
+    text: str
+    token_index: int
+
+
+StreamCallback = Callable[[StreamUpdate], None]

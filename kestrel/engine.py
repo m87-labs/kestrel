@@ -6,13 +6,13 @@ import asyncio
 import itertools
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import AsyncIterator, Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 
 from kestrel.config import RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
-from kestrel.scheduler import GenerationScheduler, SchedulerResult
+from kestrel.scheduler import GenerationScheduler, SchedulerResult, StreamUpdate
 
 
 @dataclass(slots=True)
@@ -41,14 +41,74 @@ class EngineResult:
 
 
 @dataclass(slots=True)
+class _StreamCompletion:
+    result: Optional[EngineResult] = None
+    error: Optional[BaseException] = None
+
+
+_StreamQueueItem = Union[StreamUpdate, _StreamCompletion]
+_StreamQueue = asyncio.Queue[_StreamQueueItem]
+
+
+class EngineStream(AsyncIterator[StreamUpdate]):
+    """Asynchronous iterator that yields incremental generation updates."""
+
+    __slots__ = (
+        "request_id",
+        "_queue",
+        "_result_future",
+        "_final_result",
+        "_error",
+    )
+
+    def __init__(
+        self,
+        request_id: int,
+        queue: _StreamQueue,
+        result_future: asyncio.Future[EngineResult],
+    ) -> None:
+        self.request_id = request_id
+        self._queue = queue
+        self._result_future = result_future
+        self._final_result: Optional[EngineResult] = None
+        self._error: Optional[BaseException] = None
+
+    def __aiter__(self) -> "EngineStream":
+        return self
+
+    async def __anext__(self) -> StreamUpdate:
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, _StreamCompletion):
+                if item.error is not None:
+                    self._error = item.error
+                    raise item.error
+                if item.result is not None:
+                    self._final_result = item.result
+                raise StopAsyncIteration
+            return item
+
+    async def result(self) -> EngineResult:
+        if self._final_result is not None:
+            return self._final_result
+        if self._error is not None:
+            raise self._error
+        result = await self._result_future
+        self._final_result = result
+        return result
+
+@dataclass(slots=True)
 class _PendingRequest:
     request_id: int
     prompt: str
     prompt_tokens: torch.Tensor
     prompt_length: int
     max_new_tokens: int
+    temperature: float
+    top_p: float
     submitted_at: float
     future: asyncio.Future[EngineResult]
+    stream_queue: Optional["_StreamQueue"]
 
 
 class InferenceEngine:
@@ -68,6 +128,7 @@ class InferenceEngine:
         self._worker_task: asyncio.Task[None] | None = None
         self._request_ids = itertools.count()
         self._shutdown = False
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def runtime(self) -> MoondreamTextRuntime:
@@ -94,6 +155,7 @@ class InferenceEngine:
         if self._runtime is not None:
             return
         loop = asyncio.get_running_loop()
+        self._loop = loop
         self._runtime = await loop.run_in_executor(None, MoondreamTextRuntime, self._runtime_cfg)
         await loop.run_in_executor(None, self._warmup)
         self._worker_task = asyncio.create_task(self._worker_loop())
@@ -125,13 +187,55 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> EngineResult:
+        future, _ = await self._submit_request(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            prompt_tokens=prompt_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream_queue=None,
+        )
+        return await future
+
+    async def submit_streaming(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        prompt_tokens: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> EngineStream:
+        queue: _StreamQueue = asyncio.Queue()
+        future, request_id = await self._submit_request(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            prompt_tokens=prompt_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream_queue=queue,
+        )
+        return EngineStream(request_id=request_id, queue=queue, result_future=future)
+
+    async def _submit_request(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        prompt_tokens: Optional[torch.Tensor],
+        temperature: Optional[float],
+        top_p: Optional[float],
+        stream_queue: Optional[_StreamQueue],
+    ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
         await self._ensure_started()
 
-        req_id = next(self._request_ids)
         loop = asyncio.get_running_loop()
+        req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
 
         if prompt_tokens is None:
@@ -139,18 +243,21 @@ class InferenceEngine:
         else:
             tokens = prompt_tokens
 
-        tokens_cpu = tokens.to("cpu")
+        tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt,
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
             max_new_tokens=max_new_tokens,
+            temperature=self._normalize_temperature(temperature),
+            top_p=self._normalize_top_p(top_p),
             submitted_at=time.perf_counter(),
             future=future,
+            stream_queue=stream_queue,
         )
         await self._queue.put(payload)
-        return await future
+        return future, req_id
 
     async def _ensure_started(self) -> None:
         if self._runtime is None:
@@ -190,6 +297,7 @@ class InferenceEngine:
                     future = req.future
                     if future and not future.done():
                         future.set_exception(exc)
+                    self._complete_stream(req, error=exc)
 
                 self._shutdown = True
 
@@ -224,9 +332,11 @@ class InferenceEngine:
                 try:
                     result = results[req.request_id]
                 except KeyError:
-                    future.set_exception(
-                        RuntimeError(f"Request {req.request_id} missing from scheduler results")
+                    error = RuntimeError(
+                        f"Request {req.request_id} missing from scheduler results"
                     )
+                    future.set_exception(error)
+                    self._complete_stream(req, error=error)
                     continue
                 metrics = EngineMetrics(
                     prompt_tokens=req.prompt_length,
@@ -243,6 +353,7 @@ class InferenceEngine:
                 )
                 if not future.done():
                     future.set_result(engine_result)
+                self._complete_stream(req, result=engine_result)
 
             if self._shutdown:
                 break
@@ -251,21 +362,73 @@ class InferenceEngine:
         while not self._queue.empty():
             pending = self._queue.get_nowait()
             if pending and pending.future and not pending.future.done():
-                pending.future.set_exception(RuntimeError("Engine shut down"))
+                error = RuntimeError("Engine shut down")
+                pending.future.set_exception(error)
+                self._complete_stream(pending, error=error)
+
+    def _normalize_temperature(self, value: Optional[float]) -> float:
+        if value is None:
+            return 0.0
+        if value < 0.0:
+            raise ValueError("temperature must be non-negative")
+        return float(value)
+
+    def _normalize_top_p(self, value: Optional[float]) -> float:
+        if value is None:
+            return 1.0
+        top_p = float(value)
+        if top_p <= 0.0 or top_p > 1.0:
+            raise ValueError("top_p must be in the range (0, 1]")
+        return top_p
+
+    def _build_stream_callback(
+        self, req: _PendingRequest
+    ) -> Optional[Callable[[StreamUpdate], None]]:
+        queue = req.stream_queue
+        loop = self._loop
+        if queue is None or loop is None:
+            return None
+
+        target_queue = queue
+        target_loop = loop
+
+        def _callback(update: StreamUpdate) -> None:
+            target_loop.call_soon_threadsafe(target_queue.put_nowait, update)
+
+        return _callback
+
+    def _complete_stream(
+        self,
+        req: _PendingRequest,
+        *,
+        result: Optional[EngineResult] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        queue = req.stream_queue
+        if queue is None:
+            return
+        req.stream_queue = None
+        completion = _StreamCompletion(result=result, error=error)
+        queue.put_nowait(completion)
 
     def _run_batch(self, batch: Iterable[_PendingRequest]) -> dict[int, SchedulerResult]:
-        scheduler = GenerationScheduler(self.runtime)
-        id_to_request: dict[int, _PendingRequest] = {}
+        scheduler = GenerationScheduler(
+            self.runtime,
+            default_temperature=0.0,
+            default_top_p=1.0,
+        )
         for req in batch:
-            id_to_request[req.request_id] = req
             scheduler.submit(
                 req.prompt,
                 max_new_tokens=req.max_new_tokens,
                 prompt_tokens=req.prompt_tokens.clone(),
                 request_id=req.request_id,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                stream_callback=self._build_stream_callback(req),
             )
         results = scheduler.run()
         return {result.request_id: result for result in results}
 
 
-__all__ = ["InferenceEngine", "EngineResult", "EngineMetrics"]
+__all__ = ["InferenceEngine", "EngineResult", "EngineMetrics", "EngineStream"]
