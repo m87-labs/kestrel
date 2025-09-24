@@ -3,3 +3,4 @@ sync.sh
 __pycache__/
 *.pyc
 .env
+AGENTS.md
