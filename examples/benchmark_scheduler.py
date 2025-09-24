@@ -239,8 +239,6 @@ async def _async_main(args: argparse.Namespace) -> None:
                 "decode_toks_per_s": decode_throughput,
                 "prefill_toks_per_s": prefill_throughput,
                 "avg_latency_s": avg_latency,
-                "avg_prefill_tokens": prompt_tokens / len(prompt_payloads) if prompt_payloads else 0.0,
-                "avg_decode_tokens": decode_tokens / len(prompt_payloads) if prompt_payloads else 0.0,
             }
             runs.append(run_metrics)
 

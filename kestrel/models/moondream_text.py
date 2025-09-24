@@ -99,13 +99,12 @@ class _LayerPagedCache(torch.nn.Module):
         self.set_active_batch(torch.tensor([batch_idx], device=device, dtype=torch.int64))
 
     def set_active_batch(self, batch_indices: Tensor) -> None:
-        if batch_indices.ndim == 0:
-            batch_indices = batch_indices.view(1)
-        if batch_indices.ndim != 1:
+        idx = torch.atleast_1d(batch_indices)
+        if idx.ndim != 1:
             raise ValueError(
                 f"batch_indices must be 1D, received shape {batch_indices.shape}"
             )
-        self._batch_idx_tensor = batch_indices.to(
+        self._batch_idx_tensor = idx.to(
             device=self.cache.k_cache.device, dtype=torch.int64
         )
 
@@ -113,39 +112,33 @@ class _LayerPagedCache(torch.nn.Module):
         if self._batch_idx_tensor is None:
             raise RuntimeError("Paged cache must be bound before update calls")
 
-        if pos_ids.ndim == 1:
-            input_pos = pos_ids.unsqueeze(0)
-        elif pos_ids.ndim == 2:
-            input_pos = pos_ids
-        else:
-            raise ValueError(f"Unsupported position shape: {pos_ids.shape}")
+        if k_val.shape[2] != v_val.shape[2]:
+            raise ValueError("k_val and v_val must share the sequence dimension")
 
-        input_pos = input_pos.to(dtype=torch.int32, device=k_val.device)
-        if k_val.shape[2] != input_pos.shape[1]:
+        input_pos = torch.atleast_2d(pos_ids).to(
+            dtype=torch.int32, device=k_val.device
+        )
+        if input_pos.shape[0] != 1 and input_pos.shape[0] != k_val.shape[0]:
+            raise ValueError(
+                f"Unsupported position shape {pos_ids.shape} for batch size {k_val.shape[0]}"
+            )
+
+        seq_len = input_pos.shape[1]
+        if k_val.shape[2] != seq_len:
             raise ValueError(
                 f"KV sequence length {k_val.shape[2]} does not match position tensor {input_pos.shape}"
             )
+
         batch_idx = self._batch_idx_tensor
-        batch_count, seq_len = input_pos.shape
+        if batch_idx is None:
+            raise RuntimeError("Paged cache must be bound before update calls")
 
         if seq_len == 1:
-            if batch_idx.numel() == 1:
-                batch_idx_arg = batch_idx.expand(batch_count)
-            elif batch_idx.numel() == batch_count:
-                batch_idx_arg = batch_idx
-            else:
-                raise ValueError(
-                    f"Batch index count {batch_idx.numel()} does not match decode batch {batch_count}"
-                )
+            batch_idx_arg = batch_idx.expand(k_val.shape[0])
         else:
-            if batch_count != 1:
-                raise ValueError(
-                    f"Prefill expects single sequence, got input_pos shape {input_pos.shape}"
-                )
             if batch_idx.numel() == 0:
                 raise ValueError("No batch index bound for prefill update")
-            batch_idx_scalar = batch_idx.view(1)[0]
-            batch_idx_arg = batch_idx_scalar.view(1, 1).expand(1, seq_len)
+            batch_idx_arg = batch_idx.view(1).expand_as(input_pos)
 
         return self.cache.update(
             input_pos=input_pos,
@@ -466,9 +459,8 @@ class MoondreamTextRuntime:
         tokens = token_ids.to(device=self.device, dtype=torch.long)
         batch_size = batch_idx.shape[0]
         if self._use_cuda_graphs and batch_size > 0:
-            self._ensure_cuda_graphs_ready()
             graph_batch_size = self._select_graph_batch_size(batch_size)
-            if graph_batch_size is not None:
+            if graph_batch_size is not None and self._cuda_graphs:
                 return self._decode_with_graph(
                     batch_idx, tokens, input_pos, graph_batch_size
                 )
@@ -602,6 +594,7 @@ class MoondreamTextRuntime:
                         workspace.position_buffer[:bs],
                     )
                     workspace.output_buffer[:bs].copy_(warmup)
+
                     torch.cuda.synchronize(device=device)
 
                     with torch.cuda.graph(graph, self._graph_pool):
@@ -619,7 +612,7 @@ class MoondreamTextRuntime:
         finally:
             for idx in reversed(allocated_batches):
                 self.page_table.erase(idx)
-            self._clear_graph_inputs(max_batch)
+            self._clear_graph_inputs(0)
 
     def _select_graph_batch_size(self, batch_size: int) -> int | None:
         for size in self._graph_batch_sizes:
@@ -629,8 +622,10 @@ class MoondreamTextRuntime:
 
     def _clear_graph_inputs(self, limit: int) -> None:
         workspace = self._graph_workspace
-        if workspace is None or limit <= 0:
+        if workspace is None:
             return
+        if limit <= 0:
+            limit = workspace.token_buffer.shape[0]
         workspace.token_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()

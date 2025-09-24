@@ -44,8 +44,14 @@ class TokenizerConfig:
     end_ground_id: int = 9
     templates: Dict[str, Optional[Dict[str, List[int]]]] = field(
         default_factory=lambda: {
-            "caption": None,
-            "query": {"prefix": [1, 24361, 2], "suffix": [3]},
+            "caption": {
+                "short": [1, 32708, 2, 12492, 3],
+                "normal": [1, 32708, 2, 6382, 3],
+                "long": [1, 32708, 2, 4059, 3],
+            },
+            "query": {"prefix": [1, 15381, 2], "suffix": [3]},
+            "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
+            "point": {"prefix": [1, 2581, 2], "suffix": [3]},
         }
     )
 
@@ -103,8 +109,14 @@ DEFAULT_MOONDREAM3_CONFIG = {
         "start_ground_points_id": 7,
         "end_ground_id": 9,
         "templates": {
-            "caption": None,
-            "query": {"prefix": [1, 24361, 2], "suffix": [3]},
+            "caption": {
+                "short": [1, 32708, 2, 12492, 3],
+                "normal": [1, 32708, 2, 6382, 3],
+                "long": [1, 32708, 2, 4059, 3],
+            },
+            "query": {"prefix": [1, 15381, 2], "suffix": [3]},
+            "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
+            "point": {"prefix": [1, 2581, 2], "suffix": [3]},
         },
     },
 }

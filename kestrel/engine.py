@@ -183,7 +183,41 @@ class InferenceEngine:
             if not batch:
                 continue
 
-            results = await loop.run_in_executor(None, self._run_batch, batch)
+            try:
+                results = await loop.run_in_executor(None, self._run_batch, batch)
+            except Exception as exc:
+                for req in batch:
+                    future = req.future
+                    if future and not future.done():
+                        future.set_exception(exc)
+
+                self._shutdown = True
+
+                # Best-effort cleanup of any sequences that may have been admitted.
+                try:
+                    runtime_sequences = list(self.runtime.active_sequences.values())
+                except Exception:  # pragma: no cover - defensive cleanup
+                    runtime_sequences = []
+                for state in runtime_sequences:
+                    try:
+                        self.runtime.release_sequence(state)
+                    except Exception:
+                        pass
+
+                # Propagate the same failure to anything still queued.
+                try:
+                    while True:
+                        pending = self._queue.get_nowait()
+                        if pending is None:
+                            continue
+                        future = pending.future
+                        if future and not future.done():
+                            future.set_exception(exc)
+                except asyncio.QueueEmpty:
+                    pass
+
+                break
+
             completed_at = time.perf_counter()
             for req in batch:
                 future = req.future
