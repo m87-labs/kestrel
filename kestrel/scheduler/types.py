@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 import torch
 from torch import Tensor
+from PIL import Image
 
 from kestrel.models import SequenceState
 
@@ -22,6 +24,8 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
+    image: Optional[Image.Image] = None
+    image_length: int = 0
 
     prompt_length: int = field(init=False)
 
@@ -42,7 +46,7 @@ class GenerationRequest:
 
     @property
     def target_length(self) -> int:
-        return self.prompt_length + self.max_new_tokens
+        return self.prompt_length + self.image_length + self.max_new_tokens
 
 
 @dataclass
@@ -57,16 +61,25 @@ class ScheduledSequence:
     finished: bool = False
     finish_reason: Optional[str] = None
     stream_offset: int = 0
+    started_at: float = field(default=0.0)
+    first_token_time: Optional[float] = None
+    completed_at: Optional[float] = None
 
     def stage_token(self, token_id: int, logits: Tensor) -> None:
         token = int(token_id)
         self.generated_tokens.append(token)
         self.pending_token = token
         self.last_logits = logits.detach().to("cpu")
+        if self.first_token_time is None:
+            self.first_token_time = time.perf_counter()
 
     @property
     def total_length(self) -> int:
-        return self.request.prompt_length + len(self.generated_tokens)
+        return (
+            self.request.prompt_length
+            + self.request.image_length
+            + len(self.generated_tokens)
+        )
 
     @property
     def last_token(self) -> Optional[int]:
@@ -85,6 +98,7 @@ class SchedulerResult:
     tokens: List[int]
     text: str
     finish_reason: str
+    metrics: "RequestMetrics"
 
 
 @dataclass
@@ -98,3 +112,12 @@ class StreamUpdate:
 
 
 StreamCallback = Callable[[StreamUpdate], None]
+
+
+@dataclass
+class RequestMetrics:
+    prompt_tokens: int
+    decode_tokens: int
+    processing_latency_s: float
+    ttft_s: float
+    decode_latency_s: float

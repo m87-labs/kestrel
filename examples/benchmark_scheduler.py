@@ -10,10 +10,12 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass
+from itertools import cycle
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -31,6 +33,7 @@ class PromptPayload:
     text: str
     tokens: torch.Tensor  # stored on CPU for reuse
     length: int  # number of tokens including BOS/prefix/suffix
+    image: Optional[Image.Image] = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,6 +68,19 @@ def _parse_args() -> argparse.Namespace:
         "--prompt-template",
         default="Explain the implications of recent advances in artificial intelligence.",
         help="Base sentence repeated to synthesize prompts",
+    )
+    parser.add_argument(
+        "--image",
+        dest="images",
+        action="append",
+        type=Path,
+        default=[],
+        help="Path to an image file to attach to prompts (repeatable).",
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        help="Directory containing images (jpg/png/webp) to attach; files are cycled if fewer than prompts.",
     )
     parser.add_argument(
         "--disable-compile",
@@ -102,6 +118,7 @@ def _synthetic_prompts(
     template: str,
     seed: int,
     max_new_tokens: int,
+    images: Optional[Sequence[Image.Image]] = None,
 ) -> List[PromptPayload]:
     tokenizer = runtime.tokenizer
     cfg = runtime.config.tokenizer
@@ -122,6 +139,7 @@ def _synthetic_prompts(
     ]
 
     payloads: List[PromptPayload] = []
+    image_iter = cycle(images) if images else None
     for idx in range(count):
         target = rng.randint(min_tokens, max_tokens)
         target = min(target, max_allowed_content)
@@ -135,8 +153,14 @@ def _synthetic_prompts(
             base = tokenizer.decode(token_ids)
 
         prompt_tokens = runtime.build_prompt_tokens(base).to("cpu")
+        image = next(image_iter) if image_iter is not None else None
         payloads.append(
-            PromptPayload(text=base, tokens=prompt_tokens, length=prompt_tokens.shape[1])
+            PromptPayload(
+                text=base,
+                tokens=prompt_tokens,
+                length=prompt_tokens.shape[1],
+                image=image,
+            )
         )
 
     return payloads
@@ -152,13 +176,14 @@ async def _run_round(
     engine: InferenceEngine,
     prompts: List[PromptPayload],
     max_new_tokens: int,
-) -> tuple[float, List[int], List[int], float]:
+) -> tuple[float, List[int], List[int], List[float], List[float], List[float]]:
     start = time.perf_counter()
     tasks = [
         engine.submit(
             payload.text,
             max_new_tokens=max_new_tokens,
             prompt_tokens=payload.tokens.clone(),
+            image=payload.image,
         )
         for payload in prompts
     ]
@@ -168,12 +193,10 @@ async def _run_round(
     elapsed = time.perf_counter() - start
     decode_lengths = [res.metrics.decode_tokens for res in results]
     prompt_lengths = [res.metrics.prompt_tokens for res in results]
-    mean_latency = (
-        sum(res.metrics.latency_s for res in results) / len(results)
-        if results
-        else 0.0
-    )
-    return elapsed, decode_lengths, prompt_lengths, mean_latency
+    processing_latencies = [res.metrics.processing_latency_s for res in results]
+    ttfts = [res.metrics.ttft_s for res in results]
+    decode_latencies = [res.metrics.decode_latency_s for res in results]
+    return elapsed, decode_lengths, prompt_lengths, processing_latencies, ttfts, decode_latencies
 
 
 async def _async_main(args: argparse.Namespace) -> None:
@@ -198,6 +221,24 @@ async def _async_main(args: argparse.Namespace) -> None:
     engine = await InferenceEngine.create(runtime_cfg)
     runtime = engine.runtime
 
+    images: List[Image.Image] = []
+    image_paths: List[Path] = []
+    if args.image_dir:
+        if not args.image_dir.exists():
+            raise FileNotFoundError(f"Image directory {args.image_dir} does not exist")
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            image_paths.extend(sorted(args.image_dir.glob(ext)))
+    if args.images:
+        image_paths.extend(args.images)
+    if image_paths:
+        for path in image_paths:
+            try:
+                images.append(Image.open(path).convert("RGB"))
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load image at {path}: {exc}") from exc
+        if not images:
+            raise RuntimeError("No valid images loaded for benchmarking")
+
     prompt_payloads = _synthetic_prompts(
         runtime,
         count=args.num_prompts,
@@ -206,6 +247,7 @@ async def _async_main(args: argparse.Namespace) -> None:
         template=args.prompt_template,
         seed=args.seed,
         max_new_tokens=args.max_new_tokens,
+        images=images,
     )
 
     prompt_token_total = sum(p.length for p in prompt_payloads)
@@ -213,14 +255,21 @@ async def _async_main(args: argparse.Namespace) -> None:
     print(
         f"Average prompt length: {prompt_token_total / len(prompt_payloads):.1f} tokens (including template)"
     )
+    if images:
+        print(f"Attached {len(images)} unique image(s); cycling if fewer than prompts")
 
     runs: List[dict] = []
     try:
         for round_idx in range(args.rounds):
             ordering = _random_order(prompt_payloads, args.seed + round_idx)
-            elapsed, decode_lengths, prompt_lengths, avg_latency = await _run_round(
-                engine, ordering, args.max_new_tokens
-            )
+            (
+                elapsed,
+                decode_lengths,
+                prompt_lengths,
+                processing_latencies,
+                ttfts,
+                decode_latencies,
+            ) = await _run_round(engine, ordering, args.max_new_tokens)
 
             decode_tokens = sum(decode_lengths)
             prompt_tokens = sum(prompt_lengths)
@@ -238,7 +287,19 @@ async def _async_main(args: argparse.Namespace) -> None:
                 "throughput_toks_per_s": tokens_per_sec,
                 "decode_toks_per_s": decode_throughput,
                 "prefill_toks_per_s": prefill_throughput,
-                "avg_latency_s": avg_latency,
+                "avg_processing_latency_s": (
+                    sum(processing_latencies) / len(processing_latencies)
+                    if processing_latencies
+                    else 0.0
+                ),
+                "avg_ttft_s": (
+                    sum(ttfts) / len(ttfts) if ttfts else 0.0
+                ),
+                "avg_decode_latency_s": (
+                    sum(decode_latencies) / len(decode_latencies)
+                    if decode_latencies
+                    else 0.0
+                ),
             }
             runs.append(run_metrics)
 
@@ -251,7 +312,9 @@ async def _async_main(args: argparse.Namespace) -> None:
         await engine.shutdown()
 
     throughput_values = [run["throughput_toks_per_s"] for run in runs]
-    latency_values = [run["avg_latency_s"] for run in runs]
+    processing_latency_values = [run["avg_processing_latency_s"] for run in runs]
+    ttft_values = [run["avg_ttft_s"] for run in runs]
+    decode_latency_values = [run["avg_decode_latency_s"] for run in runs]
     total_prefill_tokens = sum(run["prompt_tokens"] for run in runs)
     total_decode_tokens = sum(run["decode_tokens"] for run in runs)
     total_wall = sum(run["wall_seconds"] for run in runs)
@@ -272,7 +335,13 @@ async def _async_main(args: argparse.Namespace) -> None:
     aggregate = {
         "mean_throughput_tok_per_s": statistics.mean(throughput_values) if throughput_values else 0.0,
         "stdev_throughput_tok_per_s": statistics.pstdev(throughput_values) if len(throughput_values) > 1 else 0.0,
-        "mean_latency_s": statistics.mean(latency_values) if latency_values else 0.0,
+        "mean_processing_latency_s": statistics.mean(processing_latency_values)
+        if processing_latency_values
+        else 0.0,
+        "mean_ttft_s": statistics.mean(ttft_values) if ttft_values else 0.0,
+        "mean_decode_latency_s": statistics.mean(decode_latency_values)
+        if decode_latency_values
+        else 0.0,
         "prefill_tok_per_s": prefill_tok_per_s,
         "decode_tok_per_s": decode_tok_per_s,
         "avg_prefill_tokens": avg_prefill_tokens,
@@ -285,7 +354,10 @@ async def _async_main(args: argparse.Namespace) -> None:
         f"Throughput mean: {aggregate['mean_throughput_tok_per_s']:.1f} tok/s"
         f" (stdev {aggregate['stdev_throughput_tok_per_s']:.1f})"
     )
-    print(f"Avg per-request latency: {aggregate['mean_latency_s']*1000:.1f} ms")
+    print(
+        f"Avg processing latency: {aggregate['mean_processing_latency_s']*1000:.1f} ms "
+        f"(TTFT {aggregate['mean_ttft_s']*1000:.1f} ms, decode {aggregate['mean_decode_latency_s']*1000:.1f} ms)"
+    )
     print(
         f"Average prefill tokens: {aggregate['avg_prefill_tokens']:.1f} | "
         f"Average decode tokens: {aggregate['avg_decode_tokens']:.1f}"

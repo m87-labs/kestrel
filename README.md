@@ -2,63 +2,66 @@
 
 ## Implemented Functionality
 
-- **Self-contained Moondream text stack** — `kestrel/moondream/` hosts configs, rotary helpers, attention/MLP layers, τ scaling, and weight-loading code. Defaults now mirror the latest upstream tokenizer templates, so prompts match the reference Moondream release when no external JSON is provided.
+- **Multimodal Moondream runtime** — `kestrel/moondream/` assembles both the text decoder and vision encoder, mirrors upstream tokenizer templates, and loads weights directly from the production checkpoints (torch or safetensors). Rotary tables stay in fp32 for parity.
 
-- **Paged KV cache integration** — `kestrel/models/moondream_text.py` wires the shared `PagedKVCache` (`kestrel/kv_cache.py`) into every transformer block, manages sequence state, and exposes `start_sequence` / `decode` / `decode_batch` / `release` helpers for greedy generation.
+- **Paged KV cache integration** — `kestrel/models/moondream_text.py` wires the shared `PagedKVCache` into every transformer block, handles sequence accounting, and exposes `start_sequence` / `decode_batch` / `release` for greedy or sampling-based flows.
 
-- **Runtime configuration & guards** — `kestrel/config.py` provides `ModelPaths` and `RuntimeConfig` to control device, dtype, page size, and batch limits. We now enforce `max_batch_size >= 2` (slot 0 stays reserved in the page table).
+- **Vision prefix support** — Image crops are generated and stitched entirely on device, the vision stack runs under `torch.inference_mode`, and image embeddings are inserted with bidirectional attention while subsequent text stays causal. `MoondreamTextRuntime.greedy_generate(..., image=...)` now matches the reference model on parity checks.
 
-- **Parity with reference Moondream (text-only)** — Rotary tables are regenerated in float32, τ gating mirrors the upstream implementation, and parity scripts confirm identical logits with the Hugging Face runner on CUDA bf16 (`examples/compare_text.py`).
+- **Runtime configuration & guards** — `kestrel/config.py` exposes `RuntimeConfig` knobs for device, dtype, page size, sequence limits, and compiler flags. Invalid combinations (e.g., `max_batch_size < 2` or seq length not divisible by page size) are rejected early.
 
-- **Scheduler + asynchronous engine** — `kestrel/scheduler/` implements request structs, waiting/running queues, page-table reservation, and a flex-nano–style prefill/decode loop; `kestrel/engine.py` layers on an asyncio coordinator that micro-batches submissions, exposes per-request metrics, and powers the CLI.
+- **Scheduler + async engine** — `kestrel/scheduler/` implements a flex-nano–style prefill/decode loop with request queues, while `kestrel/engine.py` batches submissions on an asyncio worker. Execution metrics now include true processing latency, time-to-first-token (TTFT), decode latency, and per-request token counts.
 
-- **torch.compile & CUDA graphs** — Prefill runs under `torch.compile` by default (opt out via `enable_compile=False` or the CLI `--disable-compile`). Decode batches lazily capture CUDA graphs per batch size for faster replay; disable with `enable_cuda_graphs=False` or `--disable-cuda-graphs`.
+- **torch.compile & CUDA graphs** — Prefill uses `torch.compile(dynamic=True)` by default (with fallbacks). Decode captures CUDA graphs per batch size; both can be disabled via config or CLI flags.
 
-- **Benchmarking tooling** — `examples/benchmark_scheduler.py` fires synthetic prompt traffic through the scheduler, reports throughput/latency, and produces reproducible numbers (see belka runs at batch sizes 2 / 4 / 8).
+- **Benchmarking & diagnostics**
+  - `examples/benchmark_scheduler.py`: fires batched workloads (text or image+text) and reports throughput plus latency breakdowns. Accepts `--image`/`--image-dir` to benchmark multimodal traffic.
+  - `examples/compare_vision.py`: runs reference vs Kestrel inference for the same image/prompt. Use `--mode reference|kestrel` to avoid loading both models concurrently.
+  - `examples/inspect_kv.py`, `examples/probe_tau.py`: quickly spot regression in cache contents or τ gating.
 
-- **Diagnostics & regression tooling**  
-  - `examples/compare_text.py`: end-to-end logit comparison (prefill + decode) against the reference model.  
-  - `examples/inspect_kv.py`: captures per-layer K/V, τ, rotary tensors, and prints stats to pinpoint drift.  
-  - `examples/probe_tau.py`: focused probe for layer-0 τ/rotary behaviour.
-
-- **Usage pattern** — After syncing to a GPU box (e.g., `./sync.sh belka`) and running `uv sync`, parity and benchmarking remain reproducible:  
+- **Usage pattern** — After syncing to a GPU box (e.g., `./sync.sh belka`) and running `uv sync` (or activating the existing venv on belka), parity and benchmarking remain reproducible:
   ```bash
-  # Text parity / greedy check
-  uv run python examples/compare_text.py \
+  # Vision + text parity check (reference run)
+  uv run python examples/compare_vision.py \
+      --mode reference \
       --weights ~/code/moondream/model.pt \
-      --prompt "What is the capital of France?" \
-      --device cuda --dtype bfloat16 --max-new-tokens 6
+      --image external/moondream/assets/demo-1.jpg \
+      --prompt "Describe the image." \
+      --device cuda --dtype bfloat16 --max-new-tokens 64
   ```
-  A zero diff confirms logits match the reference.
 
 ### Sampling & Benchmarking How-To
 
-- **Sampling smoke test**  
+- **Sampling smoke test**
+
   ```bash
   uv run python -m kestrel.main schedule \
       "Tell me about the oceans." \
       "How do rockets work?" \
       --weights ~/code/moondream/model.pt \
       --max-batch-size 8 \
-      --max-new-tokens 128 \
-      --device cuda --dtype bfloat16
+      --max-new-tokens 256 \
+      --device cuda --dtype bfloat16 --stream
   ```
+
   This exercises the asynchronous engine end-to-end; expect full responses (no immediate EOS) on the first decode step.
 
-- **Scheduler benchmark**  
+- **Scheduler benchmark**
   ```bash
   uv run python examples/benchmark_scheduler.py \
       --weights ~/code/moondream/model.pt \
       --device cuda --dtype bfloat16 \
       --num-prompts 32 --max-new-tokens 512 \
-      --max-batch-size 8 --max-seq-length 4096
+      --max-batch-size 8 --max-seq-length 4096 \
+      --image external/moondream/assets/demo-1.jpg
   ```
-  The script prints prefill/decode throughput and latency per round; use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on belka to match our recorded runs.
+  Add `--image` (repeatable) or `--image-dir` to exercise vision-conditioned prompts; images cycle if fewer than prompts. The script prints prefill/decode throughput and latency per round; use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on belka to match our recorded runs.
 
 ## Pending Work
 
-- **Sampling modes & streaming** — Extend the scheduler/engine beyond greedy decoding: top-k/top-p sampling, temperature control, and streaming token delivery (plus answer-token masking consistent with the reference `MoondreamModel`).
-- **Vision & multimodal integration** — Re-enable the Moondream vision encoder, spatial prompts, point detection, and LoRA variant handling to reach image-text parity.
+- [done] **Sampling modes & streaming** — Extend the scheduler/engine beyond greedy decoding: top-k/top-p sampling, temperature control, and streaming token delivery (plus answer-token masking consistent with the reference `MoondreamModel`).
+- [done] **Vision prefix parity** — Bring the vision encoder, projection, and per-request image handling to parity with the reference implementation. (Spatial grounding & LoRA variants remain TODO.)
+- **Spatial reasoning & LoRA variants** — Reintroduce spatial prompts, point detection, and LoRA adapter support to reach full multimodal parity.
 - **Serving surfaces** — Layer HTTP/gRPC entrypoints with request metadata, backpressure, logging, and observability around the async engine.
 - **Automated testing & CI** — Stand up pytest coverage (page eviction, scheduler edge cases, τ/rotary parity), static type-checking (pyright), linting, and integrate benchmark smoke tests into CI/perf tracking.
 

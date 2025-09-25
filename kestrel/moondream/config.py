@@ -6,6 +6,7 @@ This module is adapted from the open-source Moondream project
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -121,10 +122,67 @@ DEFAULT_MOONDREAM3_CONFIG = {
     },
 }
 
+@dataclass(frozen=True)
+class VisionConfig:
+    enc_dim: int = 1152
+    enc_patch_size: int = 14
+    enc_n_layers: int = 27
+    enc_ff_dim: int = 4304
+    enc_n_heads: int = 16
+    proj_out_dim: int = 2048
+    crop_size: int = 378
+    in_channels: int = 3
+    max_crops: int = 12
+    overlap_margin: int = 4
+    proj_inner_dim: int = 8192
+
+
+@dataclass(frozen=True)
+class MoondreamConfig:
+    text: TextConfig = TextConfig()
+    vision: VisionConfig = VisionConfig()
+    tokenizer: TokenizerConfig = TokenizerConfig()
+
+    @classmethod
+    def from_dict(cls, config_dict: Dict) -> "MoondreamConfig":
+        text_dict = dict(config_dict.get("text", {}))
+        moe_cfg = text_dict.get("moe")
+        if moe_cfg is not None and not isinstance(moe_cfg, TextMoeConfig):
+            text_dict["moe"] = TextMoeConfig(**moe_cfg)
+        text_cfg = TextConfig(**text_dict)
+
+        tokenizer_dict = dict(config_dict.get("tokenizer", {}))
+        tokenizer_cfg = TokenizerConfig(**tokenizer_dict)
+
+        vision_dict = dict(config_dict.get("vision", {}))
+        vision_cfg = VisionConfig(**vision_dict)
+        return cls(text=text_cfg, vision=vision_cfg, tokenizer=tokenizer_cfg)
+
+    def to_dict(self) -> Dict:
+        text_dict = self.text.__dict__.copy()
+        moe_cfg = text_dict.get("moe")
+        if isinstance(moe_cfg, TextMoeConfig):
+            text_dict["moe"] = moe_cfg.__dict__.copy()
+        return {
+            "text": text_dict,
+            "vision": self.vision.__dict__.copy(),
+            "tokenizer": self.tokenizer.__dict__.copy(),
+        }
+
+
+DEFAULT_MOONDREAM_CONFIG = {
+    "text": deepcopy(DEFAULT_MOONDREAM3_CONFIG["text"]),
+    "vision": VisionConfig().__dict__.copy(),
+    "tokenizer": deepcopy(DEFAULT_MOONDREAM3_CONFIG["tokenizer"]),
+}
+
 __all__ = [
     "TextMoeConfig",
     "TextConfig",
     "TokenizerConfig",
+    "VisionConfig",
     "MoondreamTextConfig",
+    "MoondreamConfig",
     "DEFAULT_MOONDREAM3_CONFIG",
+    "DEFAULT_MOONDREAM_CONFIG",
 ]

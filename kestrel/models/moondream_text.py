@@ -1,4 +1,4 @@
-"""Text-only Moondream runtime built on Kestrel's paged KV cache."""
+"""Moondream runtime with paged KV cache and optional image prefixes."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Optional, Sequence
 
 import warnings
 
 import torch
 from torch import Tensor
+from PIL import Image
 
 from tokenizers import Tokenizer
 
@@ -19,10 +20,10 @@ from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import PageTable, PagedKVCache
 
 from kestrel.moondream import (
-    DEFAULT_MOONDREAM3_CONFIG,
-    MoondreamTextConfig,
-    MoondreamTextModel,
-    load_text_weights,
+    DEFAULT_MOONDREAM_CONFIG,
+    MoondreamConfig,
+    MoondreamModel,
+    load_moondream_weights,
 )
 from kestrel.moondream.text import (
     FLEX_ATTENTION_GRAPH_SAFE,
@@ -30,6 +31,8 @@ from kestrel.moondream.text import (
     text_decoder,
     text_encoder,
 )
+from kestrel.moondream.vision import encode_image
+from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
 from torch.nn.attention.flex_attention import BlockMask
 
 
@@ -44,6 +47,7 @@ class SequenceState:
     length: int
     max_length: int
     prompt_length: int | None = None
+    image_length: int = 0
 
     def __post_init__(self) -> None:
         if self.prompt_length is None:
@@ -160,8 +164,8 @@ class MoondreamTextRuntime:
             with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
                 raw_config = json.load(fp)
         else:
-            raw_config = deepcopy(DEFAULT_MOONDREAM3_CONFIG)
-        self.config = MoondreamTextConfig.from_dict(raw_config)
+            raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
+        self.config = MoondreamConfig.from_dict(raw_config)
 
         self.max_seq_length = cfg.max_seq_length or self.config.text.max_context
         if self.max_seq_length % cfg.page_size != 0:
@@ -182,13 +186,18 @@ class MoondreamTextRuntime:
             device=str(self.device),
         )
 
-        self.model = MoondreamTextModel(
+        self.model = MoondreamModel(
             self.config,
             dtype=self.dtype,
             device=self.device,
             setup_caches=False,
         ).eval()
-        load_text_weights(str(cfg.model_paths.weights), self.model)
+        self.image_prefix_length = (
+            self.model.vision.pos_emb.shape[1]
+            if hasattr(self.model, "vision")
+            else 0
+        )
+        load_moondream_weights(str(cfg.model_paths.weights), self.model)
 
         tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
@@ -213,7 +222,7 @@ class MoondreamTextRuntime:
             self.max_batch_size, dtype=torch.int32, device=self.device
         )
 
-        self.active_sequences: Dict[int, SequenceState] = {}
+        self.active_sequences: dict[int, SequenceState] = {}
         self._use_cuda_graphs = (
             cfg.enable_cuda_graphs
             and torch.cuda.is_available()
@@ -272,14 +281,49 @@ class MoondreamTextRuntime:
     # ------------------------------------------------------------------
     # Sequence lifecycle
 
+    def encode_image(self, image: Image.Image) -> Tensor:
+        return encode_image(
+            image,
+            self.model.vision,
+            self.config.vision,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
     def start_sequence(
-        self, question: Optional[str] = None, *, prompt_tokens: Optional[Tensor] = None, max_new_tokens: Optional[int] = None
+        self,
+        question: Optional[str] = None,
+        *,
+        prompt_tokens: Optional[Tensor] = None,
+        image: Optional[Image.Image] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
+        reset_peak_gpu_memory(self.device)
+        log_gpu_memory("start_sequence:begin", self.device)
         if prompt_tokens is None:
             if question is None:
-                raise ValueError('Either question or prompt_tokens must be provided.')
+                raise ValueError("Either question or prompt_tokens must be provided.")
             prompt_tokens = self.build_prompt_tokens(question)
-        prompt_len = prompt_tokens.shape[1]
+
+        prompt_tokens = prompt_tokens.to(device=self.device, dtype=torch.long)
+        if prompt_tokens.ndim != 2:
+            raise ValueError(
+                f"prompt_tokens must have shape (1, N); received {prompt_tokens.shape}"
+            )
+
+        embeddings: list[Tensor] = []
+        image_length = 0
+        if image is not None:
+            image_proj = self.encode_image(image).unsqueeze(0)
+            embeddings.append(image_proj)
+            image_length = image_proj.shape[1]
+            log_gpu_memory("start_sequence:after_image_encode", self.device)
+
+        token_embeds = text_encoder(prompt_tokens, self.model.text)
+        embeddings.append(token_embeds)
+        inputs_embeds = torch.cat(embeddings, dim=1)
+
+        prompt_len = inputs_embeds.shape[1]
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
         target_length = prompt_len + max_new
         if target_length > self.max_seq_length:
@@ -297,12 +341,23 @@ class MoondreamTextRuntime:
         for cache in self.layer_caches:
             cache.bind(batch_idx=batch_idx, device=self.device)
 
-        logits = self._prefill(prompt_tokens)
+        attention_mask = torch.tril(
+            torch.ones(1, 1, prompt_len, prompt_len, dtype=torch.bool, device=self.device)
+        )
+        if image_length:
+            attention_mask[:, :, :image_length, :image_length] = True
+        position_ids = torch.arange(
+            prompt_len, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        log_gpu_memory("start_sequence:after_prefill", self.device)
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
             max_length=target_length,
             prompt_length=prompt_len,
+            image_length=image_length,
         )
         self.active_sequences[batch_idx] = state
         return state, logits
@@ -315,9 +370,17 @@ class MoondreamTextRuntime:
     # Core forward paths
 
     def greedy_generate(
-        self, question: str, *, max_new_tokens: int = DEFAULT_MAX_TOKENS
+        self,
+        question: str,
+        *,
+        image: Optional[Image.Image] = None,
+        max_new_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> tuple[str, list[int]]:
-        state, logits = self.start_sequence(question, max_new_tokens=max_new_tokens)
+        state, logits = self.start_sequence(
+            question,
+            image=image,
+            max_new_tokens=max_new_tokens,
+        )
         generated: list[int] = []
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
@@ -338,21 +401,20 @@ class MoondreamTextRuntime:
         return text, generated
 
     @torch.inference_mode()
-    def _prefill(self, input_ids: Tensor) -> Tensor:
-        return self._prefill_fn(input_ids)
+    def _prefill(self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor) -> Tensor:
+        return self._prefill_fn(inputs_embeds, attn_mask, position_ids)
 
-    def _prefill_impl(self, input_ids: Tensor) -> Tensor:
-        seq_len = input_ids.shape[1]
-        pos_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0)
-        embeds = text_encoder(input_ids, self.model.text)
-        attn_mask = torch.tril(
-            torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool, device=self.device)
-        )
+    def _prefill_impl(
+        self,
+        inputs_embeds: Tensor,
+        attn_mask: Tensor,
+        position_ids: Tensor,
+    ) -> Tensor:
         hidden = text_decoder(
-            embeds,
+            inputs_embeds,
             self.model.text,
             attn_mask,
-            pos_ids,
+            position_ids,
             self.config.text,
         )
         logits = lm_head(hidden, self.model.text)

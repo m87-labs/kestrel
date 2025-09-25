@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
+from PIL import Image
 
 from kestrel.config import RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
@@ -21,11 +22,19 @@ class EngineMetrics:
 
     prompt_tokens: int
     decode_tokens: int
-    latency_s: float
+    processing_latency_s: float
+    ttft_s: float
+    decode_latency_s: float
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.decode_tokens
+
+    @property
+    def decode_tokens_per_s(self) -> float:
+        if self.decode_latency_s <= 0 or self.decode_tokens <= 0:
+            return 0.0
+        return self.decode_tokens / self.decode_latency_s
 
 
 @dataclass(slots=True)
@@ -103,6 +112,8 @@ class _PendingRequest:
     prompt: str
     prompt_tokens: torch.Tensor
     prompt_length: int
+    image: Optional[Image.Image]
+    image_length: int
     max_new_tokens: int
     temperature: float
     top_p: float
@@ -187,6 +198,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
+        image: Optional[Image.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineResult:
@@ -194,6 +206,7 @@ class InferenceEngine:
             prompt,
             max_new_tokens=max_new_tokens,
             prompt_tokens=prompt_tokens,
+            image=image,
             temperature=temperature,
             top_p=top_p,
             stream_queue=None,
@@ -206,6 +219,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
+        image: Optional[Image.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineStream:
@@ -214,6 +228,7 @@ class InferenceEngine:
             prompt,
             max_new_tokens=max_new_tokens,
             prompt_tokens=prompt_tokens,
+            image=image,
             temperature=temperature,
             top_p=top_p,
             stream_queue=queue,
@@ -226,6 +241,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor],
+        image: Optional[Image.Image],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
@@ -238,17 +254,25 @@ class InferenceEngine:
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
 
+        if image is not None and self.runtime.image_prefix_length == 0:
+            raise ValueError("Runtime does not support image inputs")
+
         if prompt_tokens is None:
             tokens = self.runtime.build_prompt_tokens(prompt)
         else:
             tokens = prompt_tokens
 
         tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
+        image_length = (
+            self.runtime.image_prefix_length if image is not None else 0
+        )
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt,
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
+            image=image,
+            image_length=image_length,
             max_new_tokens=max_new_tokens,
             temperature=self._normalize_temperature(temperature),
             top_p=self._normalize_top_p(top_p),
@@ -326,7 +350,6 @@ class InferenceEngine:
 
                 break
 
-            completed_at = time.perf_counter()
             for req in batch:
                 future = req.future
                 try:
@@ -338,10 +361,13 @@ class InferenceEngine:
                     future.set_exception(error)
                     self._complete_stream(req, error=error)
                     continue
+                sched_metrics = result.metrics
                 metrics = EngineMetrics(
-                    prompt_tokens=req.prompt_length,
-                    decode_tokens=len(result.tokens),
-                    latency_s=max(0.0, completed_at - req.submitted_at),
+                    prompt_tokens=sched_metrics.prompt_tokens,
+                    decode_tokens=sched_metrics.decode_tokens,
+                    processing_latency_s=sched_metrics.processing_latency_s,
+                    ttft_s=sched_metrics.ttft_s,
+                    decode_latency_s=sched_metrics.decode_latency_s,
                 )
                 engine_result = EngineResult(
                     request_id=req.request_id,
@@ -422,6 +448,7 @@ class InferenceEngine:
                 req.prompt,
                 max_new_tokens=req.max_new_tokens,
                 prompt_tokens=req.prompt_tokens.clone(),
+                image=req.image,
                 request_id=req.request_id,
                 temperature=req.temperature,
                 top_p=req.top_p,

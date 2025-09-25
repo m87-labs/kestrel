@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional
 
+import time
+
 import torch
 from torch import Tensor
+from PIL import Image
 
 from kestrel.models import MoondreamTextRuntime
 
 from .queues import RequestQueue, RunningQueue
 from .types import (
     GenerationRequest,
+    RequestMetrics,
     ScheduledSequence,
     SchedulerResult,
     StreamCallback,
@@ -49,6 +53,7 @@ class GenerationScheduler:
         max_new_tokens: int,
         prompt_tokens: Optional[Tensor] = None,
         request_id: Optional[int] = None,
+        image: Optional[Image.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
@@ -57,6 +62,11 @@ class GenerationScheduler:
 
         if prompt_tokens is None:
             prompt_tokens = self.runtime.build_prompt_tokens(prompt)
+        if image is not None and not hasattr(self.runtime.model, "vision"):
+            raise ValueError("Runtime does not support image inputs")
+        image_length = (
+            self.runtime.image_prefix_length if image is not None else 0
+        )
         request = GenerationRequest(
             request_id=request_id if request_id is not None else self._issue_request_id(),
             prompt=prompt,
@@ -65,6 +75,8 @@ class GenerationScheduler:
             temperature=self._resolve_temperature(temperature),
             top_p=self._resolve_top_p(top_p),
             stream_callback=stream_callback,
+            image=image,
+            image_length=image_length,
         )
         self.waiting.push(request)
         return request.request_id
@@ -74,21 +86,32 @@ class GenerationScheduler:
         prompts: Iterable[str],
         *,
         max_new_tokens: int,
+        images: Optional[Iterable[Optional[Image.Image]]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
     ) -> List[int]:
         ids: List[int] = []
+        image_iter = iter(images) if images is not None else None
         for prompt in prompts:
+            image = next(image_iter) if image_iter is not None else None
             ids.append(
                 self.submit(
                     prompt,
                     max_new_tokens=max_new_tokens,
+                    image=image,
                     temperature=temperature,
                     top_p=top_p,
                     stream_callback=stream_callback,
                 )
             )
+        if image_iter is not None:
+            try:
+                next(image_iter)
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("Number of images does not match number of prompts")
         return ids
 
     # ------------------------------------------------------------------
@@ -138,12 +161,17 @@ class GenerationScheduler:
             tokens = request.prompt_tokens.view(1, -1).to(
                 device=self.runtime.device, dtype=torch.long
             )
+            prefill_start = time.perf_counter()
             state, logits = self.runtime.start_sequence(
-                prompt_tokens=tokens, max_new_tokens=request.max_new_tokens
+                prompt_tokens=tokens,
+                image=request.image,
+                max_new_tokens=request.max_new_tokens,
             )
             seq = ScheduledSequence(request=request, state=state)
+            seq.started_at = prefill_start
 
             if request.max_new_tokens <= 0:
+                seq.first_token_time = prefill_start
                 self._finalize_sequence(seq, "max_new_tokens")
                 progress = True
                 continue
@@ -241,6 +269,9 @@ class GenerationScheduler:
             return
         seq.finished = True
         seq.finish_reason = reason
+        seq.completed_at = time.perf_counter()
+        if seq.first_token_time is None:
+            seq.first_token_time = seq.completed_at
         if seq.state.batch_idx in self.runtime.active_sequences:
             self.runtime.release_sequence(seq.state)
         self.completed.append(seq)
@@ -294,10 +325,26 @@ class GenerationScheduler:
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
         text = self.runtime.tokenizer.decode(seq.generated_tokens) if seq.generated_tokens else ""
+        prompt_tokens = seq.state.prompt_length
+        decode_tokens = len(seq.generated_tokens)
+        started_at = seq.started_at
+        completed_at = seq.completed_at or time.perf_counter()
+        first_token_time = seq.first_token_time or completed_at
+        processing_latency = max(completed_at - started_at, 0.0)
+        ttft = max(first_token_time - started_at, 0.0)
+        decode_latency = max(completed_at - first_token_time, 0.0)
+        metrics = RequestMetrics(
+            prompt_tokens=prompt_tokens,
+            decode_tokens=decode_tokens,
+            processing_latency_s=processing_latency,
+            ttft_s=ttft,
+            decode_latency_s=decode_latency,
+        )
         return SchedulerResult(
             request_id=seq.request.request_id,
             prompt=seq.request.prompt,
             tokens=list(seq.generated_tokens),
             text=text,
             finish_reason=seq.finish_reason or "unknown",
+            metrics=metrics,
         )
