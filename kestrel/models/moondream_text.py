@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import warnings
 
@@ -34,6 +34,9 @@ from kestrel.moondream.text import (
 from kestrel.moondream.vision import encode_image
 from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
 from torch.nn.attention.flex_attention import BlockMask
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -155,17 +158,45 @@ class _LayerPagedCache(torch.nn.Module):
 class MoondreamTextRuntime:
     """High-level runtime for paged text-only Moondream inference."""
 
-    def __init__(self, cfg: RuntimeConfig) -> None:
+    def __init__(
+        self,
+        cfg: RuntimeConfig,
+        *,
+        existing_model: Optional[MoondreamModel] = None,
+        tokenizer: Optional[Tokenizer] = None,
+    ) -> None:
         self._cfg = cfg
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
 
-        if cfg.model_paths.config_json:
-            with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
-                raw_config = json.load(fp)
+        if existing_model is not None:
+            self.model = existing_model.to(device=self.device, dtype=self.dtype).eval()
+            self.config = self.model.config
         else:
-            raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
-        self.config = MoondreamConfig.from_dict(raw_config)
+            if cfg.model_paths.config_json:
+                with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
+                    raw_config = json.load(fp)
+            else:
+                raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
+            self.config = MoondreamConfig.from_dict(raw_config)
+
+            self.model = MoondreamModel(
+                self.config,
+                dtype=self.dtype,
+                device=self.device,
+                setup_caches=False,
+            ).eval()
+            if cfg.model_paths.weights is None:
+                raise ValueError(
+                    "RuntimeConfig.model_paths.weights must be provided when no existing model is supplied"
+                )
+            load_moondream_weights(str(cfg.model_paths.weights), self.model)
+
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
+            self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
 
         self.max_seq_length = cfg.max_seq_length or self.config.text.max_context
         if self.max_seq_length % cfg.page_size != 0:
@@ -186,21 +217,11 @@ class MoondreamTextRuntime:
             device=str(self.device),
         )
 
-        self.model = MoondreamModel(
-            self.config,
-            dtype=self.dtype,
-            device=self.device,
-            setup_caches=False,
-        ).eval()
         self.image_prefix_length = (
             self.model.vision.pos_emb.shape[1]
             if hasattr(self.model, "vision")
             else 0
         )
-        load_moondream_weights(str(cfg.model_paths.weights), self.model)
-
-        tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
-        self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
 
         head_dim = self.config.text.dim // self.config.text.n_heads
         self.layer_caches: list[_LayerPagedCache] = []
@@ -258,6 +279,23 @@ class MoondreamTextRuntime:
 
     # ------------------------------------------------------------------
     # Capacity helpers
+
+    @classmethod
+    def from_huggingface(
+        cls,
+        cfg: RuntimeConfig,
+        hf_model: "PreTrainedModel",
+        *,
+        tokenizer: Optional[Tokenizer] = None,
+    ) -> "MoondreamTextRuntime":
+        """Create a runtime that reuses tensors from a Hugging Face model."""
+
+        base_model = getattr(hf_model, "model", hf_model)
+        if not isinstance(base_model, MoondreamModel):
+            raise TypeError(
+                "hf_model must expose a MoondreamModel via its 'model' attribute"
+            )
+        return cls(cfg, existing_model=base_model, tokenizer=tokenizer)
 
     def can_reserve(self, total_length: int) -> bool:
         """Return True if a request of ``total_length`` tokens can be admitted."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from functools import partial
 from pathlib import Path
 from typing import List, Optional
 
@@ -31,36 +32,40 @@ def _parse_dtype(value: str) -> torch.dtype:
     return mapping[key]
 
 
+def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
+    parser.add_argument("--config", type=Path, help="Optional model config JSON")
+    parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
+    parser.add_argument("--device", default="cuda", help="Torch device to run on")
+    parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
+    parser.add_argument("--max-batch-size", type=int, default=4, help="Max sequences per decode step")
+    parser.add_argument("--page-size", type=int, default=128, help="KV cache page size")
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=4096,
+        help="Maximum total sequence length (prompt + generation)",
+    )
+    parser.add_argument(
+        "--disable-compile",
+        action="store_true",
+        help="Disable torch.compile for eligible runtime paths",
+    )
+    parser.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        help="Disable CUDA graph capture for batched decode",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Moondream scheduler demo")
     subparsers = parser.add_subparsers(dest="command")
 
     schedule = subparsers.add_parser("schedule", help="Run batched text generation")
     schedule.add_argument("prompts", nargs="+", help="Prompts to generate responses for")
-    schedule.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
-    schedule.add_argument("--config", type=Path, help="Optional model config JSON")
-    schedule.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
-    schedule.add_argument("--device", default="cuda", help="Torch device to run on")
-    schedule.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
+    _add_runtime_args(schedule)
     schedule.add_argument("--max-new-tokens", type=int, default=64, help="Tokens to sample per request")
-    schedule.add_argument("--max-batch-size", type=int, default=4, help="Max sequences per decode step")
-    schedule.add_argument("--page-size", type=int, default=128, help="KV cache page size")
-    schedule.add_argument(
-        "--max-seq-length",
-        type=int,
-        default=4096,
-        help="Maximum total sequence length (prompt + generation)",
-    )
-    schedule.add_argument(
-        "--disable-compile",
-        action="store_true",
-        help="Disable torch.compile for eligible runtime paths",
-    )
-    schedule.add_argument(
-        "--disable-cuda-graphs",
-        action="store_true",
-        help="Disable CUDA graph capture for batched decode",
-    )
     schedule.add_argument(
         "--batch-timeout-ms",
         type=float,
@@ -84,21 +89,52 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stream tokens as they are generated",
     )
+
+    serve = subparsers.add_parser("serve", help="Run the HTTP inference server")
+    _add_runtime_args(serve)
+    serve.add_argument(
+        "--batch-timeout-ms",
+        type=float,
+        default=20.0,
+        help="Micro-batching timeout (in milliseconds) before dispatching queued requests",
+    )
+    serve.add_argument(
+        "--default-max-new-tokens",
+        type=int,
+        default=64,
+        help="Default max tokens to generate when a request does not specify it",
+    )
+    serve.add_argument(
+        "--default-temperature",
+        type=float,
+        default=0.0,
+        help="Default sampling temperature when a request omits it",
+    )
+    serve.add_argument(
+        "--default-top-p",
+        type=float,
+        default=1.0,
+        help="Default nucleus sampling mass when a request omits it",
+    )
+    serve.add_argument("--host", default="0.0.0.0", help="Host address to bind the HTTP server")
+    serve.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server")
+    serve.add_argument(
+        "--log-level",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        default="info",
+        help="Log level for the HTTP server",
+    )
+
     return parser
 
 
-async def _handle_schedule(args: argparse.Namespace) -> None:
-    if args.temperature < 0.0:
-        raise SystemExit("temperature must be non-negative")
-    if args.top_p <= 0.0 or args.top_p > 1.0:
-        raise SystemExit("top-p must be in the range (0, 1]")
-
+def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     model_paths = ModelPaths(
         weights=args.weights,
         config_json=args.config,
         tokenizer=args.tokenizer,
     )
-    runtime_cfg = RuntimeConfig(
+    return RuntimeConfig(
         model_paths=model_paths,
         device=args.device,
         dtype=args.dtype,
@@ -108,6 +144,15 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         enable_compile=not args.disable_compile,
         enable_cuda_graphs=not args.disable_cuda_graphs,
     )
+
+
+async def _handle_schedule(args: argparse.Namespace) -> None:
+    if args.temperature < 0.0:
+        raise SystemExit("temperature must be non-negative")
+    if args.top_p <= 0.0 or args.top_p > 1.0:
+        raise SystemExit("top-p must be in the range (0, 1]")
+
+    runtime_cfg = _create_runtime_config(args)
 
     engine = await InferenceEngine.create(
         runtime_cfg,
@@ -149,8 +194,52 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         metrics = result.metrics
         print(
             f"[{result.request_id}] {result.finish_reason}: {result.text} "
-            f"(latency={metrics.latency_s:.3f}s, decode_tokens={metrics.decode_tokens})"
+            f"(processing={metrics.processing_latency_s:.3f}s, ttft={metrics.ttft_s:.3f}s, "
+            f"decode={metrics.decode_latency_s:.3f}s, decode_tokens={metrics.decode_tokens})"
         )
+
+
+def _handle_serve(args: argparse.Namespace) -> None:
+    if args.default_temperature < 0.0:
+        raise SystemExit("default-temperature must be non-negative")
+    if args.default_top_p <= 0.0 or args.default_top_p > 1.0:
+        raise SystemExit("default-top-p must be in the range (0, 1]")
+    if args.default_max_new_tokens <= 0:
+        raise SystemExit("default-max-new-tokens must be positive")
+    if args.port <= 0 or args.port > 65535:
+        raise SystemExit("port must be between 1 and 65535")
+
+    runtime_cfg = _create_runtime_config(args)
+    batch_timeout = args.batch_timeout_ms / 1000.0
+
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise SystemExit(
+            "uvicorn is required for server mode. Install it with 'pip install uvicorn'."
+        ) from exc
+
+    try:
+        from kestrel.server import create_app
+    except ImportError as exc:  # pragma: no cover - defensive guard
+        raise SystemExit(f"Unable to import server module: {exc}") from exc
+
+    app_factory = partial(
+        create_app,
+        runtime_cfg=runtime_cfg,
+        batch_timeout_s=batch_timeout,
+        default_max_new_tokens=args.default_max_new_tokens,
+        default_temperature=args.default_temperature,
+        default_top_p=args.default_top_p,
+    )
+
+    uvicorn.run(
+        app_factory,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        factory=True,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -159,6 +248,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.command == "schedule":
         asyncio.run(_handle_schedule(args))
+    elif args.command == "serve":
+        _handle_serve(args)
     else:
         parser.print_help()
 
