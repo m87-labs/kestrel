@@ -11,9 +11,10 @@ import math
 import sys
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -30,6 +31,7 @@ from kestrel.moondream.layers import (
     mlp as dense_mlp,
     moe_mlp,
 )
+from kestrel.ops import apply_rotary_triton
 
 
 @dataclasses.dataclass
@@ -62,7 +64,9 @@ class PhaseTimer:
                 end_event.record()
                 torch.cuda.synchronize()
                 gpu_ms = start_event.elapsed_time(end_event)
-            self._records.setdefault(name, []).append(PhaseSample(cpu_ms=cpu_ms, gpu_ms=gpu_ms))
+            self._records.setdefault(name, []).append(
+                PhaseSample(cpu_ms=cpu_ms, gpu_ms=gpu_ms)
+            )
 
     def merge(self, other: "PhaseTimer") -> None:
         for name, samples in other._records.items():
@@ -83,6 +87,17 @@ def _phase(name: str):
     return timer.record(name)
 
 
+def _prepare_cos_sin(
+    freqs_cis: torch.Tensor, position_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = freqs_cis[..., 0][position_ids, :]
+    sin = freqs_cis[..., 1][position_ids, :]
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    return cos.contiguous(), sin.contiguous()
+
+
 # Monkey patches ----------------------------------------------------------------
 
 _original_attn = text_mod.attn
@@ -90,9 +105,108 @@ _original_moe_mlp = moe_mlp
 _original_mlp = dense_mlp
 
 
-def _attn_instrumented(*args, **kwargs):
+def _attn_instrumented(
+    x: torch.Tensor,
+    module: torch.nn.Module,
+    freqs_cis: torch.Tensor,
+    kv_cache: Optional[torch.nn.Module],
+    attn_mask: Optional[torch.Tensor],
+    n_heads: int,
+    n_kv_heads: int,
+    position_ids: torch.Tensor,
+    lora: Optional[dict] = None,
+    flashinfer_state: Optional[tuple] = None,
+):
     with _phase("decode.attn.total"):
-        return _original_attn(*args, **kwargs)
+        bsz, q_len, d_model = x.shape
+        head_dim = d_model // n_heads
+
+        with _phase("decode.attn.qkv"):
+            qkv_out = module.qkv(x)
+            if lora is not None:
+                qkv_out += F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
+
+        q_dim = n_heads * head_dim
+        kv_dim = n_kv_heads * head_dim
+        q, k, v = qkv_out.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        q = q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
+        k = k.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+        v = v.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+
+        if hasattr(module, "tau") and module.tau is not None:
+            with _phase("decode.attn.tau"):
+                tok_feat = F.gelu(qkv_out)
+                tok_q = torch.tanh(
+                    torch.matmul(tok_feat, module.tau["wq"].t())
+                ).permute(0, 2, 1)
+                tok_v = torch.tanh(
+                    torch.matmul(tok_feat, module.tau["wv"].t())
+                ).permute(0, 2, 1)
+
+                pos = position_ids.to(q.dtype) + 1
+                pos_log = pos.log().unsqueeze(1)
+                alpha = module.tau["alpha"].view(1, -1, 1)
+                tau_pos = 1 + (torch.sigmoid(alpha * pos_log) - 0.5)
+
+                q.mul_((tok_q + tau_pos).unsqueeze(-1))
+                v.mul_((tok_v + tau_pos).unsqueeze(-1))
+
+        with _phase("decode.attn.rotary"):
+            cos, sin = _prepare_cos_sin(freqs_cis, position_ids)
+            q, k = apply_rotary_triton(
+                q,
+                k,
+                cos.to(q.device, non_blocking=True),
+                sin.to(q.device, non_blocking=True),
+            )
+
+        if kv_cache is not None:
+            with _phase("decode.attn.cache_update"):
+                kv_result = kv_cache.update(position_ids, k, v)
+        else:
+            kv_result = (k, v)
+
+        if flashinfer_state is not None:
+            flash_ctx, metadata, use_graph = flashinfer_state
+            if kv_cache is None:
+                raise RuntimeError("FlashInfer decode requires a KV cache")
+            torch._assert(q.shape[2] == 1, "FlashInfer decode expects q_len == 1")
+            q_heads = q.view(bsz, n_heads, head_dim)
+            k_cache = kv_cache.cache.k_cache  # type: ignore[attr-defined]
+            v_cache = kv_cache.cache.v_cache  # type: ignore[attr-defined]
+            k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
+            v_scale = getattr(kv_cache.cache, "v_scale", None)  # type: ignore[attr-defined]
+            with _phase("decode.attn.flashinfer"):
+                attn_heads = flash_ctx.run(
+                    q_heads,
+                    (k_cache, v_cache),
+                    use_graph=use_graph,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+            out = attn_heads.unsqueeze(2)
+        else:
+            k_attn, v_attn = kv_result
+            with _phase("decode.attn.flashinfer"):
+                out = F.scaled_dot_product_attention(
+                    q,
+                    k_attn,
+                    v_attn,
+                    attn_mask=attn_mask,
+                    enable_gqa=n_heads != n_kv_heads,
+                )
+
+        out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
+
+        with _phase("decode.attn.proj"):
+            out0 = module.proj(out)
+            if lora is not None:
+                out1 = F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
+                out = out0 + out1
+            else:
+                out = out0
+        return out
 
 
 def _moe_mlp_instrumented(x, mlp_module, experts_per_token, *, mode="decode"):
@@ -128,7 +242,14 @@ def summarise(records: Dict[str, List[PhaseSample]], steps: int) -> List[Summary
         total_gpu = sum(gpu_vals)
         total_cpu = sum(cpu_vals)
         per_step = total_gpu / steps if steps else float("nan")
-        rows.append(SummaryRow(name=name, total_gpu_ms=total_gpu, total_cpu_ms=total_cpu, per_step_gpu_ms=per_step))
+        rows.append(
+            SummaryRow(
+                name=name,
+                total_gpu_ms=total_gpu,
+                total_cpu_ms=total_cpu,
+                per_step_gpu_ms=per_step,
+            )
+        )
     rows.sort(key=lambda r: r.total_gpu_ms, reverse=True)
     return rows
 
@@ -150,7 +271,9 @@ def build_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
 
 def make_prompt_tokens(runtime: MoondreamTextRuntime, length: int) -> torch.Tensor:
     vocab = runtime.model.text.wte.shape[0]
-    tokens = torch.randint(0, vocab, (1, length), device=runtime.device, dtype=torch.long)
+    tokens = torch.randint(
+        0, vocab, (1, length), device=runtime.device, dtype=torch.long
+    )
     return tokens
 
 
@@ -196,7 +319,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=4096)
-    parser.add_argument("--kv-calibration", type=Path, help="Optional FP8 calibration JSON")
+    parser.add_argument(
+        "--kv-calibration", type=Path, help="Optional FP8 calibration JSON"
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
 

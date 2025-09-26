@@ -22,7 +22,8 @@ from .layers import (
     LinearWeights,
     MLPWeights,
 )
-from .rope import apply_rotary_emb, precompute_freqs_cis
+from .rope import precompute_freqs_cis
+from ..ops import apply_rotary_triton
 from .flashinfer import FlashInferBatchMetadata, FlashInferDecodeContext
 
 
@@ -68,21 +69,32 @@ def attn(
 
     if hasattr(module, "tau") and module.tau is not None:
         tok_feat = F.gelu(qkv_out)
-        tok_q = torch.tanh(torch.matmul(tok_feat, module.tau["wq"].t())).permute(0, 2, 1)
-        tok_v = torch.tanh(torch.matmul(tok_feat, module.tau["wv"].t())).permute(0, 2, 1)
+        tok_q = torch.tanh(torch.matmul(tok_feat, module.tau["wq"].t())).permute(
+            0, 2, 1
+        )
+        tok_v = torch.tanh(torch.matmul(tok_feat, module.tau["wv"].t())).permute(
+            0, 2, 1
+        )
 
         pos = position_matrix.to(q.dtype) + 1
         pos_log = pos.log().unsqueeze(1)  # (B,1,S)
         alpha = module.tau["alpha"].view(1, -1, 1)
         tau_pos = 1 + (torch.sigmoid(alpha * pos_log) - 0.5)  # (B,H,S)
 
-        tau_q = (tok_q + tau_pos).unsqueeze(-1)
-        tau_v = (tok_v + tau_pos).unsqueeze(-1)
-        q = q * tau_q
-        v = v * tau_v
+        q.mul_((tok_q + tau_pos).unsqueeze(-1))
+        v.mul_((tok_v + tau_pos).unsqueeze(-1))
 
-    q = apply_rotary_emb(q.to(torch.float32), freqs_cis, position_ids, n_heads).to(q.dtype)
-    k = apply_rotary_emb(k.to(torch.float32), freqs_cis, position_ids, n_kv_heads).to(k.dtype)
+    cos = freqs_cis[..., 0][position_ids]
+    sin = freqs_cis[..., 1][position_ids]
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    q, k = apply_rotary_triton(
+        q,
+        k,
+        cos.contiguous(),
+        sin.contiguous(),
+    )
 
     if kv_cache is not None:
         kv_result = kv_cache.update(position_ids, k, v)
@@ -154,7 +166,11 @@ def text_decoder(
         x_norm = layer_norm(x, ln_weights)
 
         flash_state = None
-        if use_flashinfer and flashinfer_ctx is not None and flashinfer_metadata is not None:
+        if (
+            use_flashinfer
+            and flashinfer_ctx is not None
+            and flashinfer_metadata is not None
+        ):
             flash_state = (flashinfer_ctx, flashinfer_metadata, use_graph)
 
         attn_out = attn(
@@ -193,7 +209,9 @@ def text_decoder(
     return x
 
 
-def lm_head(hidden: torch.Tensor, module: nn.Module, indices: Optional[torch.Tensor] = None):
+def lm_head(
+    hidden: torch.Tensor, module: nn.Module, indices: Optional[torch.Tensor] = None
+):
     hidden_last = hidden[:, -1, :]
     post_ln = LayerNormWeights(weight=module.post_ln.weight, bias=module.post_ln.bias)
     hidden_norm = layer_norm(hidden_last, post_ln)
@@ -221,14 +239,20 @@ def build_text_model(config: TextConfig, dtype: torch.dtype) -> nn.Module:
                             "attn": nn.ModuleDict(
                                 {
                                     "qkv": nn.Linear(config.dim, qkv_dim, dtype=dtype),
-                                    "proj": nn.Linear(config.dim, config.dim, dtype=dtype),
+                                    "proj": nn.Linear(
+                                        config.dim, config.dim, dtype=dtype
+                                    ),
                                     "tau": nn.ParameterDict(
                                         {
                                             "wq": nn.Parameter(
-                                                torch.empty(config.n_heads, qkv_dim, dtype=dtype)
+                                                torch.empty(
+                                                    config.n_heads, qkv_dim, dtype=dtype
+                                                )
                                             ),
                                             "wv": nn.Parameter(
-                                                torch.empty(config.n_heads, qkv_dim, dtype=dtype)
+                                                torch.empty(
+                                                    config.n_heads, qkv_dim, dtype=dtype
+                                                )
                                             ),
                                             "alpha": nn.Parameter(
                                                 torch.empty(config.n_heads, dtype=dtype)
