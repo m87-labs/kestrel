@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import binascii
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import pyvips
+
+ImageArray = np.ndarray
 
 
 def load_vips_from_base64(data: str) -> pyvips.Image:
@@ -58,14 +60,45 @@ def ensure_srgb(image: pyvips.Image) -> pyvips.Image:
     return image
 
 
-def vips_to_uint8_numpy(image: pyvips.Image) -> np.ndarray:
+def vips_to_uint8_numpy(image: pyvips.Image) -> ImageArray:
     """Convert a pyvips image into a HxWxC uint8 NumPy array."""
 
     memory = image.write_to_memory()
     array = np.frombuffer(memory, dtype=np.uint8)
     height, width, bands = image.height, image.width, image.bands
     array = array.reshape(height, width, bands)
-    return array.copy()
+    # The buffer returned by pyvips is read-only; take a contiguous copy so we can
+    # hand it to consumers that expect writable memory (e.g., torch.from_numpy).
+    return np.ascontiguousarray(array)
+
+
+def as_uint8_image_array(image: Union[pyvips.Image, ImageArray]) -> ImageArray:
+    """Normalize image inputs to a contiguous uint8 HxWxC array."""
+
+    if isinstance(image, pyvips.Image):
+        return vips_to_uint8_numpy(image)
+
+    if isinstance(image, np.ndarray):
+        if image.ndim != 3:
+            raise ValueError(
+                f"Vision image must have shape (H, W, C); received ndim={image.ndim}"
+            )
+        if image.shape[2] not in (3, 4):
+            raise ValueError(
+                f"Vision image must have 3 or 4 channels; received {image.shape[2]}"
+            )
+        array = image[..., :3]
+        if array.dtype != np.uint8:
+            raise TypeError(
+                f"Vision image array must have dtype=uint8; received {array.dtype}"
+            )
+        if not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array)
+        return array
+
+    raise TypeError(
+        "image must be a pyvips.Image or an HxWxC uint8 numpy array"
+    )
 
 
 def _b64decode(payload: str) -> bytes:
@@ -79,4 +112,6 @@ __all__ = [
     "ensure_srgb",
     "load_vips_from_base64",
     "vips_to_uint8_numpy",
+    "as_uint8_image_array",
+    "ImageArray",
 ]

@@ -56,6 +56,11 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Disable CUDA graph capture for batched decode",
     )
+    parser.add_argument(
+        "--kv-calibration",
+        type=Path,
+        help="Path to an FP8 KV calibration JSON (enables FP8 KV cache)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -143,6 +148,7 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         max_seq_length=args.max_seq_length,
         enable_compile=not args.disable_compile,
         enable_cuda_graphs=not args.disable_cuda_graphs,
+        kv_calibration=getattr(args, "kv_calibration", None),
     )
 
 

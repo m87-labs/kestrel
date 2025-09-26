@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import warnings
 
@@ -36,6 +36,7 @@ from kestrel.moondream.flashinfer import (
     FlashInferDecodeContext,
 )
 from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
+from kestrel.utils.image import ImageArray
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -91,6 +92,10 @@ class _LayerPagedCache(torch.nn.Module):
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layout: str = "NHD",
     ) -> None:
         super().__init__()
         self.cache = PagedKVCache(
@@ -98,6 +103,9 @@ class _LayerPagedCache(torch.nn.Module):
             n_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            layout=layout,
         ).to(device)
         self._batch_idx_tensor: Optional[Tensor] = None
 
@@ -169,6 +177,13 @@ class MoondreamTextRuntime:
             raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
         self.config = MoondreamConfig.from_dict(raw_config)
 
+        self._kv_layer_k_scales: list[float] | None = None
+        self._kv_layer_v_scales: list[float] | None = None
+        if cfg.kv_calibration is not None:
+            self._kv_layer_k_scales, self._kv_layer_v_scales = self._load_kv_calibration(
+                cfg.kv_calibration
+            )
+
         self.max_seq_length = cfg.max_seq_length or self.config.text.max_context
         if self.max_seq_length % cfg.page_size != 0:
             raise ValueError("max_seq_length must be divisible by page_size")
@@ -187,6 +202,14 @@ class MoondreamTextRuntime:
             max_batch_size=self.max_batch_size,
             device=str(self.device),
         )
+
+        kv_cache_dtype = (
+            torch.float8_e4m3fn
+            if self._kv_layer_k_scales is not None and self._kv_layer_v_scales is not None
+            else self.dtype
+        )
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_layout = "HND" if kv_cache_dtype == torch.float8_e4m3fn else "NHD"
 
         self.model = MoondreamModel(
             self.config,
@@ -208,12 +231,24 @@ class MoondreamTextRuntime:
         self.head_dim = head_dim
         self.layer_caches: list[_LayerPagedCache] = []
         for block in self.model.text.blocks:
+            layer_idx = len(self.layer_caches)
+            k_scale = None
+            v_scale = None
+            if (
+                self._kv_layer_k_scales is not None
+                and self._kv_layer_v_scales is not None
+            ):
+                k_scale = self._kv_layer_k_scales[layer_idx]
+                v_scale = self._kv_layer_v_scales[layer_idx]
             cache = _LayerPagedCache(
                 page_table=self.page_table,
                 n_kv_heads=self.config.text.n_kv_heads,
                 head_dim=head_dim,
-                dtype=self.dtype,
+                dtype=kv_cache_dtype,
                 device=self.device,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                layout=self.kv_layout,
             )
             block.kv_cache = cache
             self.layer_caches.append(cache)
@@ -227,7 +262,9 @@ class MoondreamTextRuntime:
 
         self._flashinfer_ctx = FlashInferDecodeContext(
             device=self.device,
-            dtype=self.dtype,
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_cache_dtype,
+            kv_layout=self.kv_layout,
             page_size=self.page_size,
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_length,
@@ -280,7 +317,7 @@ class MoondreamTextRuntime:
     # ------------------------------------------------------------------
     # Sequence lifecycle
 
-    def encode_image(self, image: pyvips.Image) -> Tensor:
+    def encode_image(self, image: Union[pyvips.Image, ImageArray]) -> Tensor:
         return encode_image(
             image,
             self.model.vision,
@@ -294,7 +331,7 @@ class MoondreamTextRuntime:
         question: Optional[str] = None,
         *,
         prompt_tokens: Optional[Tensor] = None,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[Union[pyvips.Image, ImageArray]] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
         reset_peak_gpu_memory(self.device)
@@ -372,7 +409,7 @@ class MoondreamTextRuntime:
         self,
         question: str,
         *,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[Union[pyvips.Image, ImageArray]] = None,
         max_new_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> tuple[str, list[int]]:
         state, logits = self.start_sequence(
@@ -402,6 +439,41 @@ class MoondreamTextRuntime:
     @torch.inference_mode()
     def _prefill(self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor) -> Tensor:
         return self._prefill_fn(inputs_embeds, attn_mask, position_ids)
+
+    def _load_kv_calibration(self, path: Path) -> tuple[list[float], list[float]]:
+        with Path(path).open("r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+
+        try:
+            k_section = payload["k"]
+            v_section = payload["v"]
+        except KeyError as exc:  # pragma: no cover - defensive
+            raise ValueError("Invalid calibration file: missing 'k' or 'v' section") from exc
+
+        def _scales(section: dict[str, object]) -> list[float]:
+            if "per_layer_scale" in section:
+                values = section["per_layer_scale"]
+            else:
+                amax = section.get("per_layer_amax")
+                if amax is None:
+                    raise ValueError("Calibration file missing per-layer scale data")
+                metadata = payload.get("metadata", {})
+                fp8_max = metadata.get("fp8_max", 448.0)
+                guard = metadata.get("guard_factor", 1.0)
+                denom = fp8_max * guard if guard else fp8_max
+                values = [float(val) / denom for val in amax]
+            return [float(val) for val in values]
+
+        k_scales = _scales(k_section)
+        v_scales = _scales(v_section)
+
+        n_layers = self.config.text.n_layers
+        if len(k_scales) != n_layers or len(v_scales) != n_layers:
+            raise ValueError(
+                f"Calibration scales do not match model layers (expected {n_layers})"
+            )
+
+        return k_scales, v_scales
 
     def _prefill_impl(
         self,

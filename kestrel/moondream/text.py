@@ -97,10 +97,14 @@ def attn(
         q_heads = q.view(bsz, n_heads, head_dim)
         k_cache = kv_cache.cache.k_cache  # type: ignore[attr-defined]
         v_cache = kv_cache.cache.v_cache  # type: ignore[attr-defined]
+        k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
+        v_scale = getattr(kv_cache.cache, "v_scale", None)  # type: ignore[attr-defined]
         attn_heads = flash_ctx.run(
             q_heads,
             (k_cache, v_cache),
             use_graph=use_graph,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
         out = attn_heads.unsqueeze(2)
     else:

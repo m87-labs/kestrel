@@ -224,8 +224,6 @@ def scatter2scatter_compileable(
         N=O.size(1),
         E=W.size(0),
         BLOCK_M=BLOCK_M,
-        BLOCK_N=128,
-        BLOCK_K=32,
         ACC_TYPE=tl.float32,
         OUT_M=O.size(0),
         allow_tf32=ALLOW_TF32,

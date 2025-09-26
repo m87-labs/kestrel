@@ -8,12 +8,14 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import pyvips
 
 from kestrel.config import RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
 from kestrel.scheduler import GenerationScheduler, SchedulerResult, StreamUpdate
+from kestrel.utils.image import ImageArray, as_uint8_image_array
 
 
 @dataclass(slots=True)
@@ -112,7 +114,7 @@ class _PendingRequest:
     prompt: str
     prompt_tokens: torch.Tensor
     prompt_length: int
-    image: Optional[pyvips.Image]
+    image: Optional[ImageArray]
     image_length: int
     max_new_tokens: int
     temperature: float
@@ -198,7 +200,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[Union[pyvips.Image, ImageArray]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineResult:
@@ -219,7 +221,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[Union[pyvips.Image, ImageArray]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineStream:
@@ -241,7 +243,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor],
-        image: Optional[pyvips.Image],
+        image: Optional[Union[pyvips.Image, ImageArray]],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
@@ -254,8 +256,20 @@ class InferenceEngine:
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
 
-        if image is not None and self.runtime.image_prefix_length == 0:
-            raise ValueError("Runtime does not support image inputs")
+        image_array: Optional[ImageArray] = None
+        if image is not None:
+            if self.runtime.image_prefix_length == 0:
+                raise ValueError("Runtime does not support image inputs")
+            if isinstance(image, pyvips.Image):
+                image_array = await loop.run_in_executor(
+                    None, as_uint8_image_array, image
+                )
+            elif isinstance(image, np.ndarray):
+                image_array = as_uint8_image_array(image)
+            else:
+                raise TypeError(
+                    "image must be a pyvips.Image or an HxWxC uint8 numpy array"
+                )
 
         if prompt_tokens is None:
             tokens = self.runtime.build_prompt_tokens(prompt)
@@ -263,15 +277,13 @@ class InferenceEngine:
             tokens = prompt_tokens
 
         tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
-        image_length = (
-            self.runtime.image_prefix_length if image is not None else 0
-        )
+        image_length = self.runtime.image_prefix_length if image_array is not None else 0
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt,
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
-            image=image,
+            image=image_array,
             image_length=image_length,
             max_new_tokens=max_new_tokens,
             temperature=self._normalize_temperature(temperature),

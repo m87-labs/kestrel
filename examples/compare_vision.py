@@ -9,9 +9,13 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import pyvips
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 REFERENCE_ROOT = REPO_ROOT / "external" / "moondream"
 if str(REFERENCE_ROOT) not in sys.path:
     sys.path.append(str(REFERENCE_ROOT))
@@ -22,6 +26,7 @@ from moondream.torch.weights import load_weights_into_model as load_reference_we
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
+from kestrel.utils.image import ensure_srgb
 
 
 @dataclass
@@ -90,7 +95,7 @@ def run_reference(
 
 def run_kestrel(
     weights: Path,
-    image: Image.Image,
+    image: pyvips.Image,
     prompt: str,
     device: torch.device,
     dtype: torch.dtype,
@@ -99,6 +104,7 @@ def run_kestrel(
     enable_compile: bool,
     enable_cuda_graphs: bool,
     max_seq_length: int,
+    kv_calibration: Path | None,
 ) -> GenerationResult:
     paths = ModelPaths(weights=weights)
     runtime_cfg = RuntimeConfig(
@@ -109,6 +115,7 @@ def run_kestrel(
         enable_cuda_graphs=enable_cuda_graphs,
         max_batch_size=2,
         max_seq_length=max_seq_length,
+        kv_calibration=kv_calibration,
     )
 
     runtime = MoondreamTextRuntime(runtime_cfg)
@@ -148,14 +155,19 @@ def main() -> None:
         required=True,
         help="Which implementation to run. Invoke twice (once per mode) to compare outputs without loading both models concurrently.",
     )
+    parser.add_argument(
+        "--kv-calibration",
+        type=Path,
+        default=None,
+        help="Optional FP8 KV calibration JSON for Kestrel mode",
+    )
     args = parser.parse_args()
 
     device = _resolve_device(args.device)
     dtype = _resolve_dtype(args.dtype)
 
-    image = Image.open(args.image).convert("RGB")
-
     if args.mode == "reference":
+        image = Image.open(args.image).convert("RGB")
         result = run_reference(
             weights=args.weights,
             image=image,
@@ -169,9 +181,12 @@ def main() -> None:
         print("Reference answer:")
         print(result.answer)
     else:
+        vips_image = ensure_srgb(
+            pyvips.Image.new_from_file(str(args.image), access="sequential")
+        )
         result = run_kestrel(
             weights=args.weights,
-            image=image,
+            image=vips_image,
             prompt=args.prompt,
             device=device,
             dtype=dtype,
@@ -179,6 +194,7 @@ def main() -> None:
             enable_compile=args.enable_compile,
             enable_cuda_graphs=args.enable_cuda_graphs,
             max_seq_length=args.kestrel_max_seq_length,
+            kv_calibration=args.kv_calibration,
         )
         print("Kestrel answer:")
         print(result.answer)

@@ -8,11 +8,16 @@ import contextlib
 import dataclasses
 import json
 import math
+import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Dict, List, Optional
 
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
@@ -138,6 +143,7 @@ def build_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
         max_seq_length=args.max_seq_length,
         enable_compile=False,
         enable_cuda_graphs=False,
+        kv_calibration=args.kv_calibration,
     )
     return MoondreamTextRuntime(cfg)
 
@@ -190,6 +196,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=4096)
+    parser.add_argument("--kv-calibration", type=Path, help="Optional FP8 calibration JSON")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
 

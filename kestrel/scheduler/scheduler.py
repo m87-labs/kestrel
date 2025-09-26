@@ -8,7 +8,6 @@ import time
 
 import torch
 from torch import Tensor
-import pyvips
 
 from kestrel.models import MoondreamTextRuntime
 
@@ -22,6 +21,7 @@ from .types import (
     StreamUpdate,
 )
 from .sampling import sample_tokens
+from kestrel.utils.image import ImageArray
 
 
 class GenerationScheduler:
@@ -54,7 +54,7 @@ class GenerationScheduler:
         max_new_tokens: int,
         prompt_tokens: Optional[Tensor] = None,
         request_id: Optional[int] = None,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[ImageArray] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
@@ -87,7 +87,7 @@ class GenerationScheduler:
         prompts: Iterable[str],
         *,
         max_new_tokens: int,
-        images: Optional[Iterable[Optional[pyvips.Image]]] = None,
+        images: Optional[Iterable[Optional[ImageArray]]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,

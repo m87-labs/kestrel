@@ -34,6 +34,7 @@ class RuntimeConfig:
     enable_compile: bool = True
     compile_mode: Optional[str] = None
     enable_cuda_graphs: bool = True
+    kv_calibration: Optional[Path] = None
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

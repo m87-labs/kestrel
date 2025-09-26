@@ -9,8 +9,11 @@ dependencies = [
     "tokenizers>=0.15",
     "safetensors>=0.4",
     "transformers>=4.44",
+    "pyvips>=2.3",
+    "pyvips-binary>=2.48",
     "pillow>=10",
     "starlette>=0.37",
     "httpx>=0.27",
     "uvicorn>=0.30",
+    "flashinfer-python>=0.3.0",
 ]

@@ -45,7 +45,9 @@ class FlashInferDecodeContext:
         self,
         *,
         device: torch.device,
-        dtype: torch.dtype,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        kv_layout: str,
         page_size: int,
         max_batch_size: int,
         max_seq_len: int,
@@ -53,7 +55,9 @@ class FlashInferDecodeContext:
         workspace_bytes: int = 128 * 1024 * 1024,
     ) -> None:
         self.device = device
-        self.dtype = dtype
+        self.q_dtype = q_dtype
+        self.kv_dtype = kv_dtype
+        self.kv_layout = kv_layout
         self.page_size = page_size
         self.use_cuda_graphs = use_cuda_graphs
 
@@ -61,7 +65,7 @@ class FlashInferDecodeContext:
             workspace_bytes, dtype=torch.uint8, device=device
         )
         self._decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-            self._workspace, "NHD"
+            self._workspace, kv_layout
         )
 
         self._max_batch_size = max_batch_size
@@ -111,8 +115,8 @@ class FlashInferDecodeContext:
                 head_dim,
                 self.page_size,
                 pos_encoding_mode="NONE",
-                q_data_type=self.dtype,
-                kv_data_type=self.dtype,
+                q_data_type=self.q_dtype,
+                kv_data_type=self.kv_dtype,
             )
         else:
             self._active_graph_state = None
@@ -125,8 +129,8 @@ class FlashInferDecodeContext:
                 head_dim,
                 self.page_size,
                 pos_encoding_mode="NONE",
-                q_data_type=self.dtype,
-                kv_data_type=self.dtype,
+                q_data_type=self.q_dtype,
+                kv_data_type=self.kv_dtype,
             )
 
     # ------------------------------------------------------------------
@@ -138,16 +142,26 @@ class FlashInferDecodeContext:
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
         *,
         use_graph: bool,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if q.ndim != 3:
             raise ValueError("FlashInfer expects q with shape [B, H, D]")
 
+        run_kwargs: dict[str, float] = {}
+        if k_scale is not None:
+            run_kwargs["k_scale"] = float(k_scale)
+        if v_scale is not None:
+            run_kwargs["v_scale"] = float(v_scale)
+
         if use_graph:
             if self._active_graph_state is None:
                 raise RuntimeError("Graph state not initialized; call plan first")
-            return self._active_graph_state.wrapper.run(q, kv_cache, out=out)
-        return self._decode_wrapper.run(q, kv_cache, out=out)
+            return self._active_graph_state.wrapper.run(
+                q, kv_cache, out=out, **run_kwargs
+            )
+        return self._decode_wrapper.run(q, kv_cache, out=out, **run_kwargs)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -179,7 +193,7 @@ class FlashInferDecodeContext:
             kv_indptr,
             kv_indices,
             kv_last,
-            kv_layout="NHD",
+            kv_layout=self.kv_layout,
         )
         state = _GraphState(
             wrapper=wrapper,

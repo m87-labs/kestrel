@@ -42,6 +42,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--page-size", type=int, default=128)
     parser.add_argument("--max-seq-length", type=int, default=None)
+    parser.add_argument(
+        "--kv-calibration",
+        type=Path,
+        default=None,
+        help="Path to FP8 calibration JSON to enable FP8 KV cache",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +170,7 @@ def main() -> None:
         max_batch_size=2,
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
+        kv_calibration=args.kv_calibration,
     )
     runtime = MoondreamTextRuntime(runtime_cfg)
 
@@ -181,6 +188,7 @@ def main() -> None:
         "median": diff_prefill.median().item(),
     })
 
+    decode_stats: list[tuple[float, float, float]] = []
     try:
         for step, token_id in enumerate(generated_ids[: args.max_new_tokens]):
             token_tensor = torch.tensor([token_id], device=runtime.device, dtype=torch.long)
@@ -188,9 +196,11 @@ def main() -> None:
                 kestrel_logits = runtime.decode(state, token_tensor).to("cpu")
             ref_logits = ref_decode[step]
             diff = (kestrel_logits - ref_logits).abs()
+            stats = (diff.max().item(), diff.mean().item(), diff.median().item())
+            decode_stats.append(stats)
             print(
                 f"Step {step} logits diff:",
-                {"max": diff.max().item(), "mean": diff.mean().item(), "median": diff.median().item()},
+                {"max": stats[0], "mean": stats[1], "median": stats[2]},
             )
     finally:
         runtime.release_sequence(state)
@@ -198,6 +208,20 @@ def main() -> None:
     text = tokenizer.decode(generated_ids) if generated_ids else ""
     print("Generated tokens:", generated_ids)
     print("Generated text:", text)
+
+    if decode_stats:
+        max_abs = max(s[0] for s in decode_stats)
+        mean_of_means = sum(s[1] for s in decode_stats) / len(decode_stats)
+        mean_of_medians = sum(s[2] for s in decode_stats) / len(decode_stats)
+        print(
+            "Decode summary:",
+            {
+                "steps": len(decode_stats),
+                "max_abs": max_abs,
+                "mean_abs": mean_of_means,
+                "median_abs": mean_of_medians,
+            },
+        )
 
 
 if __name__ == "__main__":

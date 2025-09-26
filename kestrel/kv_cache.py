@@ -25,18 +25,75 @@ def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
 
 
 class PagedKVCache(torch.nn.Module):
-    def __init__(self, page_table, n_heads, head_dim, dtype):
+    def __init__(
+        self,
+        page_table,
+        n_heads,
+        head_dim,
+        dtype,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layout: str = "NHD",
+    ):
         super().__init__()
-        cache_shape = (
-            page_table.n_pages,
-            page_table.page_size,
-            n_heads,
-            head_dim,
-        )
+        if layout not in {"NHD", "HND"}:
+            raise ValueError(f"Unsupported KV layout '{layout}'")
+        self.layout = layout
+
+        if layout == "NHD":
+            cache_shape = (
+                page_table.n_pages,
+                page_table.page_size,
+                n_heads,
+                head_dim,
+            )
+        else:  # HND
+            cache_shape = (
+                page_table.n_pages,
+                n_heads,
+                page_table.page_size,
+                head_dim,
+            )
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
         self.page_table = page_table
+        self.quantized = dtype == torch.float8_e4m3fn
+        if self.quantized:
+            if k_scale is None or v_scale is None:
+                raise ValueError("FP8 KV cache requires per-layer k/v scales")
+            self.k_scale = float(k_scale)
+            self.v_scale = float(v_scale)
+            self._k_inv_scale = 1.0 / self.k_scale
+            self._v_inv_scale = 1.0 / self.v_scale
+            self.register_buffer(
+                "k_inv_scale_tensor",
+                torch.tensor(self._k_inv_scale, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "v_inv_scale_tensor",
+                torch.tensor(self._v_inv_scale, dtype=torch.float32),
+            )
+        else:
+            self.k_scale = None
+            self.v_scale = None
+            self._k_inv_scale = None
+            self._v_inv_scale = None
+            self.register_buffer("k_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32))
+            self.register_buffer("v_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32))
+
+    def _prepare_key_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.quantized:
+            return tensor
+        scale = self.k_inv_scale_tensor.to(dtype=tensor.dtype)
+        return (tensor * scale).to(self.k_cache.dtype)
+
+    def _prepare_value_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.quantized:
+            return tensor
+        scale = self.v_inv_scale_tensor.to(dtype=tensor.dtype)
+        return (tensor * scale).to(self.v_cache.dtype)
 
     def update(self, input_pos, k_val, v_val, batch_idx=None):
         assert (
@@ -44,16 +101,58 @@ class PagedKVCache(torch.nn.Module):
         ), "batch_idx is required for paged kv cache, are you using non-paged attention?"
 
         if batch_idx.ndim == 1:
-            # batch_idx should be [B] (decode)
-            return self.page_table.assign(
-                batch_idx, input_pos, k_val, v_val, self.k_cache, self.v_cache
-            )
+            batch_indices = batch_idx.view(-1, 1).expand_as(input_pos)
         else:
             assert batch_idx.ndim == 2, "batch_idx must be 1D or 2D"
-            # batch_idx should be [1, L] (batch prefill)
-            return self.page_table.assign_prefill_no_paging(
-                batch_idx, input_pos, k_val, v_val, self.k_cache, self.v_cache
+            batch_indices = batch_idx
+
+        k_store = self._prepare_key_tensor(k_val)
+        v_store = self._prepare_value_tensor(v_val)
+
+        page_size = self.page_table.page_size
+        logical_block_idx = input_pos // page_size
+        logical_block_offset = input_pos % page_size
+
+        batch_flat = batch_indices.to(torch.long).reshape(-1)
+        block_flat = logical_block_idx.to(torch.long).reshape(-1)
+        offset_flat = logical_block_offset.to(torch.long).reshape(-1)
+
+        physical_block_idx = self.page_table.page_table[batch_flat, block_flat]
+        page_idx = physical_block_idx.to(torch.long)
+        slot_idx = offset_flat
+
+        if self.layout == "NHD":
+            kv_shape = (
+                k_store.shape[0] * k_store.shape[2],
+                k_store.shape[1],
+                k_store.shape[3],
             )
+            vv_shape = (
+                v_store.shape[0] * v_store.shape[2],
+                v_store.shape[1],
+                v_store.shape[3],
+            )
+            k_view = k_store.permute(0, 2, 1, 3).contiguous().view(kv_shape)
+            v_view = v_store.permute(0, 2, 1, 3).contiguous().view(vv_shape)
+
+            self.k_cache[page_idx, slot_idx] = k_view
+            self.v_cache[page_idx, slot_idx] = v_view
+        else:  # HND
+            k_view = (
+                k_store.permute(0, 2, 1, 3)
+                .contiguous()
+                .view(-1, k_store.shape[1], k_store.shape[3])
+            )
+            v_view = (
+                v_store.permute(0, 2, 1, 3)
+                .contiguous()
+                .view(-1, v_store.shape[1], v_store.shape[3])
+            )
+
+            self.k_cache[page_idx, :, slot_idx, :] = k_view
+            self.v_cache[page_idx, :, slot_idx, :] = v_view
+
+        return k_val, v_val
 
 
 class PageTable:
@@ -261,15 +360,19 @@ class PageTable:
         page_idx = physical_block_idx.reshape(-1).to(torch.long)
         slot_idx = logical_block_offset.reshape(-1).to(torch.long)
 
-        kv_shape = (B * S, H, K_D)
-        vv_shape = (B * S, H, V_D)
-        k_view = k_val.permute(0, 2, 1, 3).contiguous().view(kv_shape)
-        v_view = v_val.permute(0, 2, 1, 3).contiguous().view(vv_shape)
+        k_store = self._prepare_key_tensor(k_val)
+        v_store = self._prepare_value_tensor(v_val)
 
-        k_cache[page_idx, slot_idx] = k_view
-        v_cache[page_idx, slot_idx] = v_view
+        self.page_table.assign(
+            batch_idx,
+            input_pos,
+            k_store,
+            v_store,
+            k_cache,
+            v_cache,
+        )
 
-        return k_cache, v_cache
+        return k_val, v_val
 
     def convert_logical_block_mask(
         self,
@@ -396,38 +499,6 @@ class PageTable:
 
         return new_mask_mod
 
-    # NOTE: not used in the current codebase
-    def get_score_mod(
-        self, score_mod: Optional[_score_mod_signature], batch_idx: torch.Tensor
-    ) -> _score_mod_signature:
-        """
-        Converts a score_mod based on mapping from the physical block index to the logical
-        block index.
-
-        Args:
-            score_mod (_score_mod_signature): score_mod based on the logical block index.
-        """
-        if score_mod is None:
-            score_mod = _identity
-
-        def new_score_mod(
-            score: torch.Tensor,
-            b: torch.Tensor,
-            h: torch.Tensor,
-            q_idx: torch.Tensor,
-            physical_kv_idx: torch.Tensor,
-        ):
-            is_valid, safe_logical_kv_idx = self.get_logical_kv_idx(
-                b, physical_kv_idx, batch_idx
-            )
-            return torch.where(
-                is_valid,
-                score_mod(score, b, h, q_idx, safe_logical_kv_idx),
-                float("-inf"),
-            )
-
-        return new_score_mod
-
     def create_causal_blockmask(self, B, L):
         """A minimal, unoptimized causal block mask creation function"""
 
@@ -550,14 +621,11 @@ class PageTable:
 
         input_pos_block_idx = input_pos // self.page_size
         input_pos_offset_in_block = input_pos % self.page_size
-        physical_block_idx = self.page_table[batch_idx, input_pos_block_idx]
-        page_idx = physical_block_idx.view(-1).to(torch.long)
-        slot_idx = input_pos_offset_in_block.view(-1).to(torch.long)
-
-        k_view = k_val.permute(0, 2, 1, 3).contiguous().view(-1, k_val.shape[1], k_val.shape[3])
-        v_view = v_val.permute(0, 2, 1, 3).contiguous().view(-1, v_val.shape[1], v_val.shape[3])
-
-        k_cache[page_idx, slot_idx] = k_view
-        v_cache[page_idx, slot_idx] = v_view
+        physical_kv_idx = (
+            self.page_table[batch_idx, input_pos_block_idx] * self.page_size
+            + input_pos_offset_in_block
+        )
+        k_cache[:, :, physical_kv_idx.view(-1), :] = k_val
+        v_cache[:, :, physical_kv_idx.view(-1), :] = v_val
 
         return k_val, v_val
