@@ -8,7 +8,7 @@ from typing import Callable, List, Optional
 
 import torch
 from torch import Tensor
-from PIL import Image
+import pyvips
 
 from kestrel.models import SequenceState
 
@@ -24,7 +24,7 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
-    image: Optional[Image.Image] = None
+    image: Optional[pyvips.Image] = None
     image_length: int = 0
 
     prompt_length: int = field(init=False)

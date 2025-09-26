@@ -104,5 +104,3 @@ def main() -> None:
         block_ext = model_ext.text.blocks[0]
         ln_ext = external_layer_norm(embeds_ext.to(block_ext.ln.weight.dtype), block_ext.ln).to(torch.float32)
         qkv_ext = block_ext.attn.qkv(ln_ext.to(dtype)).to(torch.float32)
-.
-.

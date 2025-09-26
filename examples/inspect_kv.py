@@ -208,19 +208,13 @@ def _make_internal_attn_wrapper(store: AttnCaptureStore):
         if kv_cache is not None:
             k_for_attn, v = kv_cache.update(position_ids, k_for_attn, v)
 
-        if flex_block_mask_slice is not None:
-            torch._assert(n_heads == n_kv_heads, "Grouped query attention not supported")
-            attn_out = internal_text.flex_attention(
-                q_for_attn, k_for_attn, v, block_mask=flex_block_mask_slice
-            )
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q_for_attn,
-                k_for_attn,
-                v,
-                attn_mask=attn_mask,
-                enable_gqa=n_heads != n_kv_heads,
-            )
+        attn_out = F.scaled_dot_product_attention(
+            q_for_attn,
+            k_for_attn,
+            v,
+            attn_mask=attn_mask,
+            enable_gqa=n_heads != n_kv_heads,
+        )
 
         out = attn_out.transpose(1, 2).reshape(bsz, q_len, d_model)
         out_proj = module.proj(out)
@@ -438,10 +432,12 @@ def _gather_internal_kv(runtime: MoondreamTextRuntime, batch_idx: int, length: i
     k_list: list[torch.Tensor] = []
     v_list: list[torch.Tensor] = []
     for block in runtime.model.text.blocks:
-        k_cache = block.kv_cache.cache.k_cache[0, :, physical_index, :].detach().cpu()
-        v_cache = block.kv_cache.cache.v_cache[0, :, physical_index, :].detach().cpu()
-        k_list.append(k_cache)
-        v_list.append(v_cache)
+        k_cache = block.kv_cache.cache.k_cache
+        v_cache = block.kv_cache.cache.v_cache
+        gathered_k = k_cache[physical_page, offset].detach().cpu()
+        gathered_v = v_cache[physical_page, offset].detach().cpu()
+        k_list.append(gathered_k.permute(1, 0, 2).contiguous())
+        v_list.append(gathered_v.permute(1, 0, 2).contiguous())
     return k_list, v_list
 
 

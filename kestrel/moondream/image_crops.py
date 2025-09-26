@@ -7,7 +7,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -68,12 +68,9 @@ def overlap_crop_image(
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
-    pil_img = Image.fromarray(image)
-    resized = pil_img.resize((int(target_size[1]), int(target_size[0])), Image.Resampling.LANCZOS)
-    image = np.asarray(resized)
+    image = _resize_image(image, (int(target_size[0]), int(target_size[1])))
 
-    global_pil = pil_img.resize((int(base_size[1]), int(base_size[0])), Image.Resampling.LANCZOS)
-    crops[0] = np.asarray(global_pil)
+    crops[0] = _resize_image(image, (int(base_size[0]), int(base_size[1])))
 
     for i in range(tiling[0]):
         for j in range(tiling[1]):
@@ -85,6 +82,32 @@ def overlap_crop_image(
             crops[1 + i * tiling[1] + j, : crop_region.shape[0], : crop_region.shape[1]] = crop_region
 
     return crops, tiling
+
+
+def _resize_image(image: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """Resize a uint8 image to ``size`` (height, width) using bilinear filtering."""
+
+    if image.ndim != 3:
+        raise ValueError(f"Expected image with shape (H, W, C); received {image.shape}")
+
+    target_h, target_w = size
+    if image.shape[0] == target_h and image.shape[1] == target_w:
+        return image.copy()
+
+    tensor = (
+        torch.from_numpy(image)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(dtype=torch.float32)
+    )
+    resized = F.interpolate(
+        tensor,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    resized = resized.squeeze(0).permute(1, 2, 0).clamp(0, 255).to(dtype=torch.uint8)
+    return resized.cpu().numpy()
 
 
 def reconstruct_from_crops(

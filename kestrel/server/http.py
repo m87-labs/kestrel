@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
+import asyncio
 import json
 import logging
-import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Any, Dict, Optional
 
-from PIL import Image, UnidentifiedImageError
+import pyvips
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -20,13 +18,9 @@ from starlette.routing import Route
 
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
+from kestrel.utils.image import load_vips_from_base64
 
 logger = logging.getLogger(__name__)
-
-_DATA_URL_RE = re.compile(
-    r"^data:image/(?P<subtype>[a-zA-Z0-9.+\-]+);base64,(?P<data>.+)$",
-    re.IGNORECASE,
-)
 
 
 @dataclass(slots=True)
@@ -41,11 +35,12 @@ class _ServerConfig:
 class _ServerState:
     """Container that owns the inference engine shared by all requests."""
 
-    __slots__ = ("config", "engine")
+    __slots__ = ("config", "engine", "_decode_executor")
 
     def __init__(self, config: _ServerConfig) -> None:
         self.config = config
         self.engine: Optional[InferenceEngine] = None
+        self._decode_executor: Optional[ThreadPoolExecutor] = None
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -57,6 +52,13 @@ class _ServerState:
         self.engine = await InferenceEngine.create(
             self.config.runtime_cfg, batch_timeout_s=self.config.batch_timeout_s
         )
+        runtime = self.engine.runtime
+        max_workers = max(1, getattr(runtime, "max_batch_size", 4))
+        if self._decode_executor is not None:
+            self._decode_executor.shutdown(wait=True)
+        self._decode_executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="kestrel-image"
+        )
         logger.info("Inference engine ready")
 
     async def shutdown(self) -> None:
@@ -65,6 +67,10 @@ class _ServerState:
         logger.info("Shutting down inference engine")
         await self.engine.shutdown()
         self.engine = None
+        executor = self._decode_executor
+        self._decode_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     # ------------------------------------------------------------------
     # Request handlers
@@ -108,14 +114,14 @@ class _ServerState:
             )
 
         image_url = payload.get("image_url")
-        image: Optional[Image.Image] = None
+        image: Optional[pyvips.Image] = None
         if image_url is not None:
             if not isinstance(image_url, str):
                 return JSONResponse(
                     {"error": "Field 'image_url' must be a string"}, status_code=400
                 )
             try:
-                image = _decode_image(image_url)
+                image = await self._decode_image(image_url)
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -145,8 +151,6 @@ class _ServerState:
                 maximum=1.0,
             )
         except ValueError as exc:
-            if image is not None:
-                image.close()
             return JSONResponse({"error": str(exc)}, status_code=400)
 
         engine = self.engine
@@ -166,10 +170,6 @@ class _ServerState:
             return JSONResponse(
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
-        finally:
-            if image is not None:
-                image.close()
-
         metrics = result.metrics
         total_latency = time.perf_counter() - start_time
         response_payload = {
@@ -188,43 +188,12 @@ class _ServerState:
         }
         return JSONResponse(response_payload)
 
+    async def _decode_image(self, data: str) -> pyvips.Image:
+        """Run base64 decode and colour conversion off the event loop."""
 
-def _decode_image(image_value: str) -> Image.Image:
-    if image_value.startswith("http"):
-        raise ValueError(
-            "image_url must be a base64 data URL (data:image/...) or raw base64 payload"
-        )
-
-    if image_value.startswith("data:image"):
-        match = _DATA_URL_RE.match(image_value)
-        if not match:
-            raise ValueError(
-                "Invalid data URL. Expected format data:image/<type>;base64,<payload>"
-            )
-        data_part = match.group("data")
-    else:
-        data_part = image_value
-
-    normalized = re.sub(r"\s+", "", data_part)
-    try:
-        image_bytes = base64.b64decode(normalized, validate=True)
-    except binascii.Error as exc:
-        raise ValueError("image_url must contain valid base64 data") from exc
-
-    if not image_bytes:
-        raise ValueError("image_url base64 payload is empty")
-
-    buffer = BytesIO(image_bytes)
-    try:
-        with Image.open(buffer) as img:
-            converted = img.convert("RGB")
-            converted.load()
-    except (UnidentifiedImageError, ValueError, OSError) as exc:
-        raise ValueError("image_url payload is not a supported image format") from exc
-
-    return converted
-
-
+        loop = asyncio.get_running_loop()
+        executor = self._decode_executor
+        return await loop.run_in_executor(executor, load_vips_from_base64, data)
 def _coerce_int(
     value: Any,
     *,

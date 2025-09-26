@@ -10,9 +10,9 @@ from typing import Optional, Sequence
 
 import warnings
 
+import pyvips
 import torch
 from torch import Tensor
-from PIL import Image
 
 from tokenizers import Tokenizer
 
@@ -31,8 +31,11 @@ from kestrel.moondream.text import (
     text_encoder,
 )
 from kestrel.moondream.vision import encode_image
+from kestrel.moondream.flashinfer import (
+    FlashInferBatchMetadata,
+    FlashInferDecodeContext,
+)
 from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
-from torch.nn.attention.flex_attention import BlockMask
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -202,6 +205,7 @@ class MoondreamTextRuntime:
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
 
         head_dim = self.config.text.dim // self.config.text.n_heads
+        self.head_dim = head_dim
         self.layer_caches: list[_LayerPagedCache] = []
         for block in self.model.text.blocks:
             cache = _LayerPagedCache(
@@ -214,18 +218,20 @@ class MoondreamTextRuntime:
             block.kv_cache = cache
             self.layer_caches.append(cache)
 
-        self.block_mask = self.page_table.create_causal_blockmask(
-            B=self.max_batch_size, L=self.max_seq_length
-        )
-        self.input_positions = torch.zeros(
-            self.max_batch_size, dtype=torch.int32, device=self.device
-        )
-
         self.active_sequences: dict[int, SequenceState] = {}
         self._use_cuda_graphs = (
             cfg.enable_cuda_graphs
             and torch.cuda.is_available()
             and self.device.type == "cuda"
+        )
+
+        self._flashinfer_ctx = FlashInferDecodeContext(
+            device=self.device,
+            dtype=self.dtype,
+            page_size=self.page_size,
+            max_batch_size=self.max_batch_size,
+            max_seq_len=self.max_seq_length,
+            use_cuda_graphs=self._use_cuda_graphs,
         )
 
         self._graph_workspace: _GraphWorkspace | None = None
@@ -274,7 +280,7 @@ class MoondreamTextRuntime:
     # ------------------------------------------------------------------
     # Sequence lifecycle
 
-    def encode_image(self, image: Image.Image) -> Tensor:
+    def encode_image(self, image: pyvips.Image) -> Tensor:
         return encode_image(
             image,
             self.model.vision,
@@ -288,7 +294,7 @@ class MoondreamTextRuntime:
         question: Optional[str] = None,
         *,
         prompt_tokens: Optional[Tensor] = None,
-        image: Optional[Image.Image] = None,
+        image: Optional[pyvips.Image] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
         reset_peak_gpu_memory(self.device)
@@ -366,7 +372,7 @@ class MoondreamTextRuntime:
         self,
         question: str,
         *,
-        image: Optional[Image.Image] = None,
+        image: Optional[pyvips.Image] = None,
         max_new_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> tuple[str, list[int]]:
         state, logits = self.start_sequence(
@@ -421,71 +427,6 @@ class MoondreamTextRuntime:
         state.advance()
         return logits.unsqueeze(0)
 
-    def _build_decode_block_mask(
-        self, state: SequenceState, pos_tensor: Tensor
-    ) -> Tensor:
-        batch_idx_tensor = torch.tensor(
-            [state.batch_idx], device=self.device, dtype=torch.int64
-        )
-        pos_tensor = pos_tensor.to(device=self.device, dtype=torch.int32)
-        self.input_positions.zero_()
-        self.input_positions[state.batch_idx] = pos_tensor.item()
-        offsets = self.input_positions[batch_idx_tensor]
-        return self._make_decode_block_mask(batch_idx_tensor, offsets)
-
-    def _make_decode_block_mask(
-        self, batch_idx: Tensor, offsets: Tensor
-    ) -> BlockMask:
-        """Construct a decode-time block mask for the provided batch indices."""
-
-        if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be a 1D tensor")
-        if offsets.ndim != 1:
-            raise ValueError("offsets must be a 1D tensor")
-        if batch_idx.shape[0] != offsets.shape[0]:
-            raise ValueError("batch_idx and offsets must have the same shape")
-
-        block_mask = self.block_mask
-        input_block_idx = offsets // block_mask.BLOCK_SIZE[0]
-
-        def causal_offset(off: Tensor):
-            def offset_fn(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor):
-                return q_idx + off[b] >= kv_idx
-
-            return offset_fn
-
-        kv_num_blocks = (
-            block_mask.kv_num_blocks[batch_idx, :, input_block_idx]
-            .view(offsets.shape[0], 1, 1)
-        )
-        kv_indices = (
-            block_mask.kv_indices[batch_idx, :, input_block_idx]
-            .view(offsets.shape[0], 1, 1, -1)
-        )
-        full_kv_num_blocks = None
-        full_kv_indices = None
-        if block_mask.full_kv_num_blocks is not None:
-            full_kv_num_blocks = (
-                block_mask.full_kv_num_blocks[batch_idx, :, input_block_idx]
-                .view(offsets.shape[0], 1, 1)
-            )
-            full_kv_indices = (
-                block_mask.full_kv_indices[batch_idx, :, input_block_idx]
-                .view(offsets.shape[0], 1, 1, -1)
-            )
-
-        seq_lengths = (1, block_mask.seq_lengths[1])
-        logical_mask = BlockMask.from_kv_blocks(
-            kv_num_blocks,
-            kv_indices,
-            full_kv_num_blocks,
-            full_kv_indices,
-            BLOCK_SIZE=block_mask.BLOCK_SIZE,
-            mask_mod=causal_offset(offsets),
-            seq_lengths=seq_lengths,
-        )
-        return self.page_table.convert_logical_block_mask(logical_mask, batch_idx)
-
     @torch.inference_mode()
     def decode_batch(
         self,
@@ -522,26 +463,78 @@ class MoondreamTextRuntime:
                 )
         return self._decode_step(batch_idx, tokens, input_pos)
 
-    def _decode_step(
-        self, batch_idx: Tensor, tokens: Tensor, input_pos: Tensor
-    ) -> Tensor:
-        self.input_positions.zero_()
-        self.input_positions[batch_idx] = input_pos
-        offsets = self.input_positions[batch_idx]
-        block_mask = self._make_decode_block_mask(batch_idx, offsets)
+    def _build_flashinfer_metadata(
+        self,
+        batch_idx: Tensor,
+        input_pos: Tensor,
+        *,
+        full_batch_size: Optional[int] = None,
+    ) -> FlashInferBatchMetadata:
+        if batch_idx.ndim != 1:
+            raise ValueError("batch_idx must be 1D")
 
+        seq_lens = input_pos.to(dtype=torch.int32) + 1
+        expanded_batch = batch_idx
+        expanded_seq = seq_lens
+
+        if full_batch_size is not None and full_batch_size > batch_idx.shape[0]:
+            pad = full_batch_size - batch_idx.shape[0]
+            pad_batch = torch.zeros(pad, dtype=torch.long, device=self.device)
+            pad_seq = torch.ones(pad, dtype=torch.int32, device=self.device)
+            expanded_batch = torch.cat([batch_idx, pad_batch], dim=0)
+            expanded_seq = torch.cat([seq_lens, pad_seq], dim=0)
+
+        kv_indptr, kv_indices, kv_last_page_len = (
+            self.page_table.build_flashinfer_kv_metadata(expanded_batch, expanded_seq)
+        )
+        return FlashInferBatchMetadata(
+            batch_size=expanded_batch.shape[0],
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            kv_last_page_len=kv_last_page_len,
+        )
+
+    def _decode_step(
+        self,
+        batch_idx: Tensor,
+        tokens: Tensor,
+        input_pos: Tensor,
+        *,
+        use_graph: bool = False,
+        full_batch_size: Optional[int] = None,
+        flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
+        skip_plan: bool = False,
+    ) -> Tensor:
         for cache in self.layer_caches:
             cache.set_active_batch(batch_idx)
 
         embeds = text_encoder(tokens.view(-1, 1), self.model.text)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
+
+        metadata = flashinfer_metadata
+        if metadata is None:
+            metadata = self._build_flashinfer_metadata(
+                batch_idx, input_pos, full_batch_size=full_batch_size
+            )
+
+        if not skip_plan:
+            self._flashinfer_ctx.plan(
+                metadata,
+                num_q_heads=self.config.text.n_heads,
+                num_kv_heads=self.config.text.n_kv_heads,
+                head_dim=self.head_dim,
+                use_graph=use_graph,
+            )
         hidden = text_decoder(
             embeds,
             self.model.text,
             attn_mask=None,
             position_ids=position_ids,
             config=self.config.text,
-            flex_block_mask_slice=block_mask,
+            flashinfer_ctx=self._flashinfer_ctx,
+            flashinfer_metadata=metadata,
+            use_flashinfer=True,
+            use_graph=use_graph,
             mode="decode",
         )
         logits = lm_head(hidden, self.model.text)
@@ -567,6 +560,19 @@ class MoondreamTextRuntime:
         workspace.token_buffer[:batch_size, 0].copy_(tokens)
         workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
         workspace.position_buffer[:batch_size].copy_(input_pos)
+
+        metadata = self._build_flashinfer_metadata(
+            workspace.batch_idx_buffer[:graph_batch_size],
+            workspace.position_buffer[:graph_batch_size],
+            full_batch_size=graph_batch_size,
+        )
+        self._flashinfer_ctx.plan(
+            metadata,
+            num_q_heads=self.config.text.n_heads,
+            num_kv_heads=self.config.text.n_kv_heads,
+            head_dim=self.head_dim,
+            use_graph=True,
+        )
 
         graph = self._cuda_graphs[graph_batch_size]
         graph.replay()
@@ -645,10 +651,19 @@ class MoondreamTextRuntime:
             for bs in reversed(self._graph_batch_sizes):
                 graph = torch.cuda.CUDAGraph()
                 with torch.inference_mode():
+                    metadata = self._build_flashinfer_metadata(
+                        workspace.batch_idx_buffer[:bs],
+                        workspace.position_buffer[:bs],
+                        full_batch_size=bs,
+                    )
                     warmup = self._decode_step(
                         workspace.batch_idx_buffer[:bs],
                         workspace.token_buffer[:bs, 0],
                         workspace.position_buffer[:bs],
+                        use_graph=True,
+                        full_batch_size=bs,
+                        flashinfer_metadata=metadata,
+                        skip_plan=False,
                     )
                     workspace.output_buffer[:bs].copy_(warmup)
 
@@ -659,6 +674,10 @@ class MoondreamTextRuntime:
                             workspace.batch_idx_buffer[:bs],
                             workspace.token_buffer[:bs, 0],
                             workspace.position_buffer[:bs],
+                            use_graph=True,
+                            full_batch_size=bs,
+                            flashinfer_metadata=metadata,
+                            skip_plan=True,
                         )
                         workspace.output_buffer[:bs].copy_(out)
 

@@ -7,22 +7,9 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torch.nn.attention.flex_attention import flex_attention as _flex_attention_raw
-
-try:
-    _graph_safe_flex_attention = torch.compile(  # type: ignore[arg-type]
-        _flex_attention_raw, fullgraph=True
-    )
-except Exception as exc:  # pragma: no cover - depends on runtime support
-    raise RuntimeError(
-        "FlexAttention must be torch.compile-able for CUDA graph capture"
-    ) from exc
 
 from .config import TextConfig
 from .layers import (
@@ -36,6 +23,7 @@ from .layers import (
     MLPWeights,
 )
 from .rope import apply_rotary_emb, precompute_freqs_cis
+from .flashinfer import FlashInferBatchMetadata, FlashInferDecodeContext
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -52,7 +40,9 @@ def attn(
     n_kv_heads: int,
     position_ids: torch.Tensor,
     lora: Optional[dict] = None,
-    flex_block_mask_slice=None,
+    flashinfer_state: Optional[
+        tuple[FlashInferDecodeContext, FlashInferBatchMetadata, bool]
+    ] = None,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -95,14 +85,32 @@ def attn(
     k = apply_rotary_emb(k.to(torch.float32), freqs_cis, position_ids, n_kv_heads).to(k.dtype)
 
     if kv_cache is not None:
-        k, v = kv_cache.update(position_ids, k, v)
-
-    if flex_block_mask_slice is not None:
-        torch._assert(n_heads == n_kv_heads, "Grouped query attention not supported")
-        out = _graph_safe_flex_attention(q, k, v, block_mask=flex_block_mask_slice)
+        kv_result = kv_cache.update(position_ids, k, v)
     else:
+        kv_result = (k, v)
+
+    if flashinfer_state is not None:
+        flash_ctx, metadata, use_graph = flashinfer_state
+        if kv_cache is None:
+            raise RuntimeError("FlashInfer decode requires a KV cache")
+        torch._assert(q.shape[2] == 1, "FlashInfer decode expects q_len == 1")
+        q_heads = q.view(bsz, n_heads, head_dim)
+        k_cache = kv_cache.cache.k_cache  # type: ignore[attr-defined]
+        v_cache = kv_cache.cache.v_cache  # type: ignore[attr-defined]
+        attn_heads = flash_ctx.run(
+            q_heads,
+            (k_cache, v_cache),
+            use_graph=use_graph,
+        )
+        out = attn_heads.unsqueeze(2)
+    else:
+        k_attn, v_attn = kv_result
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, enable_gqa=n_heads != n_kv_heads
+            q,
+            k_attn,
+            v_attn,
+            attn_mask=attn_mask,
+            enable_gqa=n_heads != n_kv_heads,
         )
 
     out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
@@ -123,7 +131,10 @@ def text_decoder(
     config: TextConfig,
     lora: Optional[dict] = None,
     *,
-    flex_block_mask_slice=None,
+    flashinfer_ctx: Optional[FlashInferDecodeContext] = None,
+    flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
+    use_flashinfer: bool = False,
+    use_graph: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
@@ -138,6 +149,10 @@ def text_decoder(
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
 
+        flash_state = None
+        if use_flashinfer and flashinfer_ctx is not None and flashinfer_metadata is not None:
+            flash_state = (flashinfer_ctx, flashinfer_metadata, use_graph)
+
         attn_out = attn(
             x_norm,
             block.attn,
@@ -148,7 +163,7 @@ def text_decoder(
             config.n_kv_heads,
             position_ids,
             lora=attn_lora,
-            flex_block_mask_slice=flex_block_mask_slice,
+            flashinfer_state=flash_state,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:

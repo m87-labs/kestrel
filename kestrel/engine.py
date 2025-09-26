@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
-from PIL import Image
+import pyvips
 
 from kestrel.config import RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
@@ -112,7 +112,7 @@ class _PendingRequest:
     prompt: str
     prompt_tokens: torch.Tensor
     prompt_length: int
-    image: Optional[Image.Image]
+    image: Optional[pyvips.Image]
     image_length: int
     max_new_tokens: int
     temperature: float
@@ -198,7 +198,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
-        image: Optional[Image.Image] = None,
+        image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineResult:
@@ -219,7 +219,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor] = None,
-        image: Optional[Image.Image] = None,
+        image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineStream:
@@ -241,7 +241,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         prompt_tokens: Optional[torch.Tensor],
-        image: Optional[Image.Image],
+        image: Optional[pyvips.Image],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],

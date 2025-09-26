@@ -24,10 +24,16 @@ class MLP(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.experts = ParallelExperts(
-            num_experts, input_size, hidden_size * 2, dtype=dtype
+            num_experts,
+            input_size,
+            hidden_size * 2,
+            dtype=dtype,
         )
         self.output_experts = ParallelExperts(
-            num_experts, hidden_size, input_size, dtype=dtype
+            num_experts,
+            hidden_size,
+            input_size,
+            dtype=dtype,
         )
         self.top_k = min(top_k, self.num_experts)
         self.activation = activation or nn.GELU()
@@ -44,7 +50,7 @@ class MLP(nn.Module):
             sorted_expert_idxs, sorted_scattered_idxs = kernels.ops.flatten_and_sort(
                 expert_idxs
             )
-            padded_block_idxs, expert_offsets = kernels.ops.padded_block_indices(
+            padded_block_idxs, _ = kernels.ops.padded_block_indices(
                 sorted_expert_idxs, self.num_experts
             )
 
@@ -54,7 +60,6 @@ class MLP(nn.Module):
             sorted_expert_idxs,
             sorted_scattered_idxs,
             padded_block_idxs,
-            expert_offsets,
             grouped_out=True,
         ).chunk(2, dim=-1)
         h = self.activation(h) * (g + 1)
@@ -64,7 +69,6 @@ class MLP(nn.Module):
             sorted_expert_idxs,
             sorted_scattered_idxs,
             padded_block_idxs,
-            expert_offsets,
             grouped_in=True,
             gates=expert_p,
         )

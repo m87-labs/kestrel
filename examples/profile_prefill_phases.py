@@ -157,7 +157,6 @@ def _attn_instrumented(
     n_kv_heads: int,
     position_ids: torch.Tensor,
     lora: Optional[dict] = None,
-    flex_block_mask_slice=None,
 ) -> torch.Tensor:
     timer = _CURRENT_TIMER
     if timer is None:
@@ -171,7 +170,6 @@ def _attn_instrumented(
             n_kv_heads,
             position_ids,
             lora=lora,
-            flex_block_mask_slice=flex_block_mask_slice,
         )
 
     bsz, q_len, d_model = x.shape
@@ -224,15 +222,10 @@ def _attn_instrumented(
         with timer.record("prefill.attn.kv_cache_update"):
             k, v = kv_cache.update(position_ids, k, v)
 
-    if flex_block_mask_slice is not None:
-        torch._assert(n_heads == n_kv_heads, "Grouped query attention not supported")
-        with timer.record("prefill.attn.flex_attention"):
-            out = text_mod._graph_safe_flex_attention(q, k, v, block_mask=flex_block_mask_slice)
-    else:
-        with timer.record("prefill.attn.sdpa"):
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=n_heads != n_kv_heads
-            )
+    with timer.record("prefill.attn.sdpa"):
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, enable_gqa=n_heads != n_kv_heads
+        )
 
     with timer.record("prefill.attn.out_proj"):
         out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
@@ -315,7 +308,10 @@ def _text_decoder_instrumented(
     config,
     lora: Optional[dict] = None,
     *,
-    flex_block_mask_slice=None,
+    flashinfer_ctx=None,
+    flashinfer_metadata=None,
+    use_flashinfer: bool = False,
+    use_graph: bool = False,
     mode: str = "decode",
 ) -> torch.Tensor:
     timer = _CURRENT_TIMER
@@ -327,7 +323,10 @@ def _text_decoder_instrumented(
             position_ids,
             config,
             lora=lora,
-            flex_block_mask_slice=flex_block_mask_slice,
+            flashinfer_ctx=flashinfer_ctx,
+            flashinfer_metadata=flashinfer_metadata,
+            use_flashinfer=use_flashinfer,
+            use_graph=use_graph,
             mode=mode,
         )
 
@@ -355,7 +354,6 @@ def _text_decoder_instrumented(
                 config.n_kv_heads,
                 position_ids,
                 lora=attn_lora,
-                flex_block_mask_slice=flex_block_mask_slice,
             )
 
         if config.moe is not None and i >= config.moe.start_layer:

@@ -28,9 +28,9 @@ class PagedKVCache(torch.nn.Module):
     def __init__(self, page_table, n_heads, head_dim, dtype):
         super().__init__()
         cache_shape = (
-            1,
+            page_table.n_pages,
+            page_table.page_size,
             n_heads,
-            page_table.n_pages * page_table.page_size,
             head_dim,
         )
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
@@ -217,15 +217,14 @@ class PageTable:
             batch_idx (Tensor): batch index; shape :math:`(B)`.
             input_pos (Tensor): input positions to be assigned for the given batch; shape :math:`(B, S)`.
             val (Tensor): value to be assigned; shape :math:`(B, H, S, D)`
-            cache (Tensor): the cache to store the values; shape:`(1, H, MAX_S, D)`
+            cache (Tensor): the cache to store the values; shape:`(MAX_PAGES, PAGE_SIZE, H, D)`
         """
         if k_val.requires_grad:
             raise RuntimeError("val must not require gradient")
 
         B, H, S, K_D = k_val.shape
-        _, H_cache, MAX_S, D_cache = k_cache.shape
+        _, _, H_cache, D_cache = k_cache.shape
         assert H_cache == H, "number of heads must match"
-        assert MAX_S >= S, "cache must have enough space"
         assert D_cache == K_D, "hidden dim must match"
         assert input_pos.shape == (B, S), "input_pos must have the same shape as val"
         assert batch_idx.shape == (B,), "batch_idx must have one dimension only"
@@ -235,17 +234,13 @@ class PageTable:
             raise RuntimeError(
                 f"Expect val and batch_idx have the same batch size but got B={B} and B={batch_idx.shape[0]}."
             )
-        if H != k_cache.shape[1]:
-            raise RuntimeError(
-                f"Expect val and cache has the same number of heads but got H={H} and H={k_cache.shape[1]}."
-            )
         if S != input_pos.shape[1]:
             raise RuntimeError(
                 f"Expect val and input_pos has the same length but got S={S} and S={input_pos.shape[0]}."
             )
-        if K_D != k_cache.shape[3]:
+        if K_D != D_cache:
             raise RuntimeError(
-                f"Expect k_val and k_cache has the same hidden dim but got D={K_D} and D={k_cache.shape[3]}."
+                f"Expect k_val and k_cache has the same hidden dim but got D={K_D} and D={D_cache}."
             )
         if V_D != v_cache.shape[3]:
             raise RuntimeError(
@@ -263,15 +258,16 @@ class PageTable:
             torch.int32
         )  # [B, S]
 
-        addr = (physical_block_idx * self.page_size + logical_block_offset).view(
-            -1
-        )  # [B*S]
+        page_idx = physical_block_idx.reshape(-1).to(torch.long)
+        slot_idx = logical_block_offset.reshape(-1).to(torch.long)
 
-        k_val = k_val.permute(1, 0, 2, 3).contiguous().view(1, H, B * S, K_D)
-        v_val = v_val.permute(1, 0, 2, 3).contiguous().view(1, H, B * S, V_D)
+        kv_shape = (B * S, H, K_D)
+        vv_shape = (B * S, H, V_D)
+        k_view = k_val.permute(0, 2, 1, 3).contiguous().view(kv_shape)
+        v_view = v_val.permute(0, 2, 1, 3).contiguous().view(vv_shape)
 
-        k_cache[:, :, addr, :] = k_val
-        v_cache[:, :, addr, :] = v_val
+        k_cache[page_idx, slot_idx] = k_view
+        v_cache[page_idx, slot_idx] = v_view
 
         return k_cache, v_cache
 
@@ -448,6 +444,61 @@ class PageTable:
             device=self.device,
         )
 
+    def build_flashinfer_kv_metadata(
+        self,
+        batch_idx: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Construct per-request metadata tensors for FlashInfer paged decoding."""
+
+        if batch_idx.ndim != 1:
+            raise ValueError("batch_idx must be 1D for FlashInfer metadata")
+        if seq_lens.ndim != 1:
+            raise ValueError("seq_lens must be 1D for FlashInfer metadata")
+        if batch_idx.shape[0] != seq_lens.shape[0]:
+            raise ValueError(
+                "batch_idx and seq_lens must have matching leading dimensions"
+            )
+
+        device = self.page_table.device
+        batch_size = batch_idx.shape[0]
+        if batch_size == 0:
+            empty = torch.zeros(0, dtype=torch.int32, device=device)
+            return (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                empty,
+                empty,
+            )
+
+        seq_lens = seq_lens.to(device=device, dtype=torch.int32)
+        num_pages = torch.div(
+            seq_lens + (self.page_size - 1),
+            self.page_size,
+            rounding_mode="floor",
+        )
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        if num_pages.numel() > 0:
+            kv_indptr[1:] = torch.cumsum(num_pages, dim=0)
+
+        total_pages = int(kv_indptr[-1].item())
+        if total_pages == 0:
+            kv_indices = torch.zeros(0, dtype=torch.int32, device=device)
+        else:
+            max_pages = int(num_pages.max().item())
+            page_rows = self.page_table[batch_idx.to(torch.long), :max_pages]
+            page_rows = page_rows.to(torch.int32)
+            arange_pages = torch.arange(max_pages, device=device, dtype=torch.int32)
+            mask = arange_pages.unsqueeze(0) < num_pages.unsqueeze(1)
+            kv_indices = torch.masked_select(page_rows, mask)
+
+        kv_last_page_len = torch.where(
+            num_pages > 0,
+            ((seq_lens - 1) % self.page_size) + 1,
+            torch.zeros_like(seq_lens),
+        )
+
+        return kv_indptr, kv_indices.to(torch.int32), kv_last_page_len
+
     def create_prefill_blockmask_no_paging(
         self, batch_idx: Tensor, BLOCK_SIZE: int = 128
     ):
@@ -485,8 +536,8 @@ class PageTable:
         input_pos: [1, L]
         k_val: [1, H, L, D]
         v_val: [1, H, L, D]
-        k_cache: [1, H, MAX_S, D]
-        v_cache: [1, H, MAX_S, D]
+        k_cache: [MAX_PAGES, PAGE_SIZE, H, D]
+        v_cache: [MAX_PAGES, PAGE_SIZE, H, D]
         """
 
         assert batch_idx.ndim == 2, "batch_idx must be a 2D tensor"
@@ -499,11 +550,14 @@ class PageTable:
 
         input_pos_block_idx = input_pos // self.page_size
         input_pos_offset_in_block = input_pos % self.page_size
-        physical_kv_idx = (
-            self.page_table[batch_idx, input_pos_block_idx] * self.page_size
-            + input_pos_offset_in_block
-        )
-        k_cache[:, :, physical_kv_idx.view(-1), :] = k_val
-        v_cache[:, :, physical_kv_idx.view(-1), :] = v_val
+        physical_block_idx = self.page_table[batch_idx, input_pos_block_idx]
+        page_idx = physical_block_idx.view(-1).to(torch.long)
+        slot_idx = input_pos_offset_in_block.view(-1).to(torch.long)
+
+        k_view = k_val.permute(0, 2, 1, 3).contiguous().view(-1, k_val.shape[1], k_val.shape[3])
+        v_view = v_val.permute(0, 2, 1, 3).contiguous().view(-1, v_val.shape[1], v_val.shape[3])
+
+        k_cache[page_idx, slot_idx] = k_view
+        v_cache[page_idx, slot_idx] = v_view
 
         return k_val, v_val

@@ -8,15 +8,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+import pyvips
 
 from .config import VisionConfig
 from .image_crops import reconstruct_from_crops, select_tiling
 from kestrel.utils import log_gpu_memory
+from kestrel.utils.image import vips_to_uint8_numpy
 
 
 def prepare_crops(
-    image: Image.Image,
+    image: pyvips.Image,
     config: VisionConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -24,7 +25,10 @@ def prepare_crops(
     if device.type != "cuda":
         raise RuntimeError("Vision preprocessing expects a CUDA device")
 
-    np_image = np.array(image.convert("RGB"))
+    if not isinstance(image, pyvips.Image):
+        raise TypeError("Vision preprocessing expects a pyvips.Image instance")
+
+    np_image = vips_to_uint8_numpy(image)
     margin = config.overlap_margin * config.enc_patch_size
     window = max(config.crop_size - 2 * margin, 1)
 
@@ -210,7 +214,7 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
 
 
 def encode_image(
-    image: Image.Image,
+    image: pyvips.Image,
     module: nn.Module,
     config: VisionConfig,
     *,
