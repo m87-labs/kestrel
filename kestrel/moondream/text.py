@@ -137,6 +137,7 @@ def text_decoder(
 
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
+
         attn_out = attn(
             x_norm,
             block.attn,

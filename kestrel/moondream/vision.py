@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .config import VisionConfig
-from .image_crops import overlap_crop_image, reconstruct_from_crops
+from .image_crops import reconstruct_from_crops, select_tiling
 from kestrel.utils import log_gpu_memory
 
 
@@ -21,18 +21,91 @@ def prepare_crops(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    if device.type != "cuda":
+        raise RuntimeError("Vision preprocessing expects a CUDA device")
+
     np_image = np.array(image.convert("RGB"))
-    crops, tiling = overlap_crop_image(
-        np_image,
-        overlap_margin=config.overlap_margin,
-        max_crops=config.max_crops,
-        base_size=(config.crop_size, config.crop_size),
-        patch_size=config.enc_patch_size,
+    margin = config.overlap_margin * config.enc_patch_size
+    window = max(config.crop_size - 2 * margin, 1)
+
+    height, width = np_image.shape[:2]
+    h_tiles, w_tiles = select_tiling(
+        max(1, height - 2 * margin),
+        max(1, width - 2 * margin),
+        window,
+        config.max_crops,
     )
-    crops = np.transpose(crops, (0, 3, 1, 2))
-    crop_tensor = torch.from_numpy(crops).to(device=device, dtype=dtype)
-    crop_tensor = crop_tensor.div_(255.0).sub_(0.5).div_(0.5)
-    return crop_tensor, tiling
+
+    cpu_tensor = torch.from_numpy(np_image).to(torch.uint8).pin_memory()
+    img = cpu_tensor.permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True) / 255.0
+
+    crops = _bilinear_overlap_crops(
+        img,
+        crop_size=config.crop_size,
+        window=window,
+        margin=margin,
+        tiling=(h_tiles, w_tiles),
+    )
+    crops = crops.sub_(0.5).div_(0.5)
+    crops = crops.to(dtype=dtype)
+    return crops, (h_tiles, w_tiles)
+
+
+def _bilinear_overlap_crops(
+    img: torch.Tensor,
+    *,
+    crop_size: int,
+    window: int,
+    margin: int,
+    tiling: Tuple[int, int],
+) -> torch.Tensor:
+    """Generate overlapping crops using bilinear GPU resizing."""
+
+    if img.ndim != 4:
+        raise ValueError(f"Expected image tensor of shape (1, C, H, W); received {img.shape}")
+
+    device = img.device
+    _, channels, height, width = img.shape
+
+    h_tiles, w_tiles = tiling
+    num_crops = h_tiles * w_tiles + 1
+    crops = torch.zeros(
+        (num_crops, channels, crop_size, crop_size),
+        device=device,
+        dtype=img.dtype,
+    )
+
+    global_crop = torch.nn.functional.interpolate(
+        img, size=(crop_size, crop_size), mode="bilinear", align_corners=False
+    )
+    crops[0] = global_crop[0]
+
+    target_h = h_tiles * window + 2 * margin
+    target_w = w_tiles * window + 2 * margin
+    target_h = max(target_h, crop_size)
+    target_w = max(target_w, crop_size)
+
+    resized = torch.nn.functional.interpolate(
+        img,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    idx = 1
+    for tile_y in range(h_tiles):
+        for tile_x in range(w_tiles):
+            y0 = tile_y * window
+            x0 = tile_x * window
+            y1 = min(y0 + crop_size, target_h)
+            x1 = min(x0 + crop_size, target_w)
+
+            crop = crops[idx]
+            crop_slice = resized[0, :, y0:y1, x0:x1]
+            crop[:, : y1 - y0, : x1 - x0].copy_(crop_slice)
+            idx += 1
+
+    return crops
 
 
 def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
