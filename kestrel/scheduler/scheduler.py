@@ -21,6 +21,7 @@ from .types import (
     StreamCallback,
     StreamUpdate,
 )
+from .sampling import sample_tokens
 
 
 class GenerationScheduler:
@@ -177,8 +178,11 @@ class GenerationScheduler:
                 continue
 
             first_logits = logits.squeeze(0)
-            next_token = self._select_next_token(first_logits, seq.request)
-            seq.stage_token(next_token, first_logits)
+            sampled = self._sample_batch(
+                first_logits.unsqueeze(0), [seq.request]
+            )
+            token_value = int(sampled[0])
+            seq.stage_token(token_value, first_logits)
             self._emit_stream(seq)
 
             if self._mark_finished_if_needed(seq):
@@ -209,15 +213,18 @@ class GenerationScheduler:
             return False
 
         token_ids = torch.tensor(
-            [seq.pending_token for seq in active],
-            dtype=torch.long,
+            [seq.pending_token for seq in active], dtype=torch.long
         )
         logits = self.runtime.decode_batch([seq.state for seq in active], token_ids)
 
-        for seq, row in zip(active, logits):
+        sampled_tokens = self._sample_batch(
+            logits, [seq.request for seq in active]
+        )
+        sampled_cpu = sampled_tokens.cpu().tolist()
+
+        for seq, row, token_value in zip(active, logits, sampled_cpu):
             seq.state.advance()
-            next_token = self._select_next_token(row, seq.request)
-            seq.stage_token(next_token, row)
+            seq.stage_token(int(token_value), row)
             self._emit_stream(seq)
             if not self._mark_finished_if_needed(seq):
                 idle.append(seq)
@@ -225,24 +232,26 @@ class GenerationScheduler:
         self.running.extend(idle)
         return True
 
-    def _select_next_token(self, logits: Tensor, request: GenerationRequest) -> int:
-        temperature = max(request.temperature, 0.0)
-        if temperature <= 0.0:
-            return int(torch.argmax(logits, dim=-1).item())
+    def _sample_batch(
+        self, logits: Tensor, requests: List[GenerationRequest]
+    ) -> Tensor:
+        batch = len(requests)
+        if batch == 0:
+            return torch.empty(0, dtype=torch.long, device=logits.device)
 
-        scaled_logits = logits / max(temperature, 1e-6)
-        probs = torch.softmax(scaled_logits, dim=-1)
-        if torch.isnan(probs).any() or torch.isinf(probs).any():
-            return int(torch.argmax(logits, dim=-1).item())
+        if all(req.temperature <= 0.0 for req in requests) and all(
+            req.top_p >= 1.0 for req in requests
+        ):
+            return torch.argmax(logits, dim=-1)
 
-        top_p = request.top_p
-        if top_p < 1.0:
-            token_id = self._sample_top_p(probs, top_p)
-            if token_id is not None:
-                return token_id
-
-        sampled = torch.multinomial(probs, num_samples=1)
-        return int(sampled.item())
+        temps = torch.empty(batch, dtype=torch.float32)
+        top_ps = torch.empty(batch, dtype=torch.float32)
+        for i, req in enumerate(requests):
+            temps[i] = req.temperature
+            top_ps[i] = req.top_p
+        temps = temps.to(device=logits.device)
+        top_ps = top_ps.to(device=logits.device)
+        return sample_tokens(logits, temps, top_ps)
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token
@@ -295,22 +304,6 @@ class GenerationScheduler:
         )
         callback(update)
         seq.stream_offset = len(seq.generated_tokens)
-
-    def _sample_top_p(self, probs: Tensor, top_p: float) -> Optional[int]:
-        if probs.ndim != 1:
-            probs = probs.view(-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        mask = cumulative > top_p
-        if mask.numel() > 0:
-            mask[0] = False
-        filtered = sorted_probs.masked_fill(mask, 0.0)
-        total = filtered.sum()
-        if total <= 0:
-            return int(sorted_indices[0].item())
-        filtered = filtered / total
-        sampled = torch.multinomial(filtered, num_samples=1)
-        return int(sorted_indices[sampled.item()].item())
 
     def _resolve_temperature(self, temperature: Optional[float]) -> float:
         if temperature is None:

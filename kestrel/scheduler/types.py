@@ -69,7 +69,9 @@ class ScheduledSequence:
         token = int(token_id)
         self.generated_tokens.append(token)
         self.pending_token = token
-        self.last_logits = logits.detach().to("cpu")
+        # The logits argument is retained for API compatibility, but we deliberately
+        # avoid copying them to host memory here. Nothing consumes the cached logits
+        # and the transfer was forcing a device sync on every decode step.
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
 

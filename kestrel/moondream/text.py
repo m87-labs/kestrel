@@ -5,7 +5,7 @@ Adapted from the Moondream project (Apache-2.0).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 import warnings
 
@@ -16,11 +16,13 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention as _flex_attention_raw
 
 try:
-    _graph_safe_flex_attention = torch.compile(_flex_attention_raw, fullgraph=True)  # type: ignore[arg-type]
-    FLEX_ATTENTION_GRAPH_SAFE = True
-except Exception:
-    _graph_safe_flex_attention = _flex_attention_raw
-    FLEX_ATTENTION_GRAPH_SAFE = False
+    _graph_safe_flex_attention = torch.compile(  # type: ignore[arg-type]
+        _flex_attention_raw, fullgraph=True
+    )
+except Exception as exc:  # pragma: no cover - depends on runtime support
+    raise RuntimeError(
+        "FlexAttention must be torch.compile-able for CUDA graph capture"
+    ) from exc
 
 from .config import TextConfig
 from .layers import (
@@ -120,7 +122,9 @@ def text_decoder(
     position_ids: torch.Tensor,
     config: TextConfig,
     lora: Optional[dict] = None,
+    *,
     flex_block_mask_slice=None,
+    mode: Literal["prefill", "decode"] = "decode",
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         if lora is not None:
@@ -147,7 +151,12 @@ def text_decoder(
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
-            mlp_out = moe_mlp(x_norm, block.mlp, config.moe.experts_per_token)
+            mlp_out = moe_mlp(
+                x_norm,
+                block.mlp,
+                config.moe.experts_per_token,
+                mode=mode,
+            )
         else:
             mlp_weights = MLPWeights(
                 fc1=LinearWeights(
@@ -214,6 +223,7 @@ def build_text_model(config: TextConfig, dtype: torch.dtype) -> nn.Module:
                                     config.moe.expert_inner_dim,
                                     config.moe.num_experts,
                                     dtype,
+                                    top_k=config.moe.experts_per_token,
                                 )
                                 if config.moe is not None
                                 and i >= config.moe.start_layer
@@ -248,5 +258,4 @@ __all__ = [
     "lm_head",
     "attn",
     "build_text_model",
-    "FLEX_ATTENTION_GRAPH_SAFE",
 ]
