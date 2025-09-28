@@ -27,27 +27,65 @@ def padded_block_indices(
     sorted_expert_idxs: torch.Tensor,
     k: int,
     N_BLOCK_SIZE: int = BLOCK_M,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    out: torch.Tensor | None = None,
+    block_idx_template: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     expert_counts = compileable_bincount(sorted_expert_idxs, minlength=k)
     padded_block_counts = ((expert_counts - 1) // N_BLOCK_SIZE) + 1
     padded_expert_block_end = padded_block_counts.cumsum(-1)
     expert_boundaries_end = expert_counts.cumsum(-1)
     expert_boundaries_start = expert_boundaries_end - expert_counts
     padded_expert_block_start = padded_expert_block_end - padded_block_counts
-    block_idxs = torch.arange(
-        padded_expert_block_end[-1],
-        dtype=sorted_expert_idxs.dtype,
-        device=sorted_expert_idxs.device,
-    )
+
+    total_blocks = padded_expert_block_end[-1]
+
+    if out is None:
+        block_idxs = torch.arange(
+            total_blocks,
+            dtype=sorted_expert_idxs.dtype,
+            device=sorted_expert_idxs.device,
+        )
+    else:
+        if out.dim() != 1 or out.dtype != torch.long:
+            raise ValueError("Output buffer for padded_block_indices must be 1D long tensor")
+        if block_idx_template is not None and block_idx_template.size(0) != out.size(0):
+            raise ValueError("block_idx_template must match out buffer shape")
+        torch._assert(
+            torch.tensor(out.size(0), device=total_blocks.device, dtype=total_blocks.dtype)
+            >= total_blocks,
+            "Output buffer has fewer slots than required blocks",
+        )
+        block_idxs = (
+            block_idx_template
+            if block_idx_template is not None
+            else torch.arange(
+                out.size(0),
+                dtype=sorted_expert_idxs.dtype,
+                device=sorted_expert_idxs.device,
+            )
+        )
+
     block_mask = (block_idxs[:, None] < padded_expert_block_start) | (
         block_idxs[:, None] >= padded_expert_block_end
     )
+
+    inactive_mask = block_idxs >= total_blocks
+    block_mask = block_mask | inactive_mask[:, None]
+
     expanded_block_idxs = (
         N_BLOCK_SIZE * (block_idxs[:, None] - padded_expert_block_start)
         + expert_boundaries_start
     )
-    expanded_block_idxs = expanded_block_idxs.masked_fill(block_mask, 0).sum(-1)
-    return expanded_block_idxs, expert_boundaries_end
+    sentinel = sorted_expert_idxs.size(0)
+    expanded_block_idxs = expanded_block_idxs.masked_fill(block_mask, sentinel)
+    expanded_block_idxs = expanded_block_idxs.min(dim=-1).values
+
+    if out is not None:
+        out.copy_(expanded_block_idxs)
+        return out, expert_boundaries_end, total_blocks
+
+    return expanded_block_idxs, expert_boundaries_end, total_blocks
 
 
 def _scatter2scatter_configs():
@@ -101,10 +139,13 @@ def _scatter2scatter(
     N_block_id = pid % N_BLOCK_COUNT
     M_range = tl.arange(0, BLOCK_M)
     block_start_idx = tl.load(block_start_idx_ptr + M_block_id)
+    if block_start_idx >= (FAN_OUT * M):
+        return
     M_block = tl.max_contiguous(block_start_idx + M_range, BLOCK_M)
     E_idxs = tl.load(expert_idxs_ptr + M_block, mask=M_block < (FAN_OUT * M), other=E)
     E_idx = tl.min(E_idxs)
-    E_mask = E_idxs == E_idx
+    valid_mask = E_idxs < E
+    E_mask = (E_idxs == E_idx) & valid_mask
     M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
     if x_grouped:
         M_in_idx = M_block

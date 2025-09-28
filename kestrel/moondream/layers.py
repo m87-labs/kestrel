@@ -111,6 +111,9 @@ def moe_mlp(
 
     num_tokens, top_k = topk_idxs.shape
 
+    if mode == "decode":
+        scatter_mlp.ensure_workspaces(num_tokens, x_flat.device, x_flat.dtype)
+
     if mode == "prefill":
         mlp_out = scatter_mlp(x_flat, topk_weights, topk_idxs).view(B, T, C)
         return mlp_out

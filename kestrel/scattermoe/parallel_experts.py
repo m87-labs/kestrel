@@ -17,6 +17,7 @@ def parallel_linear(
     gates: torch.Tensor | None = None,
     grouped_in: bool = False,
     grouped_out: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Scatter-gather linear layer used by the MoE MLP forward path."""
 
@@ -29,6 +30,7 @@ def parallel_linear(
         padded_block_idxs,
         x_grouped=grouped_in,
         y_grouped=grouped_out,
+        out=out,
     )
 
     if gates is not None:
@@ -73,6 +75,7 @@ class ParallelExperts(nn.Module):
         gates: torch.Tensor | None = None,
         grouped_in: bool = False,
         grouped_out: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         expert_weights = self.weight.permute(0, 2, 1)
         return parallel_linear(
@@ -85,6 +88,7 @@ class ParallelExperts(nn.Module):
             gates=gates,
             grouped_in=grouped_in,
             grouped_out=grouped_out,
+            out=out,
         )
 
 
