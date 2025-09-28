@@ -226,6 +226,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         raise SystemExit("latency-threshold-ms must be positive")
     if args.ttft_threshold_ms <= 0:
         raise SystemExit("ttft-threshold-ms must be positive")
+    if args.concurrency_scale <= 0:
+        raise SystemExit("concurrency-scale must be positive")
     if args.settings_top_p <= 0 or args.settings_top_p > 1:
         raise SystemExit("settings-top-p must be in (0, 1]")
     if args.settings_temperature < 0:
@@ -337,23 +339,35 @@ def aggregate_token_stats(
     }
 
 
-def build_stage_configs(args: argparse.Namespace) -> List[StageConfig]:
+def build_stage_targets(args: argparse.Namespace) -> List[float]:
     if args.start_rps <= 0:
         raise SystemExit("start-rps must be positive")
     if args.rps_step <= 0:
         raise SystemExit("rps-step must be positive")
     if args.max_rps < args.start_rps:
         raise SystemExit("max-rps must be >= start-rps")
-    configs: List[StageConfig] = []
+    targets: List[float] = []
     target = args.start_rps
     while target <= args.max_rps + 1e-6:
-        concurrency = max(1, min(
-            args.max_concurrency,
-            math.ceil(target * max(args.concurrency_scale, 1e-3)),
-        ))
-        configs.append(StageConfig(target_rps=target, duration_s=args.stage_duration, concurrency_limit=concurrency))
+        targets.append(target)
         target += args.rps_step
-    return configs
+    return targets
+
+
+def estimate_concurrency_limit(
+    *,
+    target_rps: float,
+    latency_hint_s: float,
+    max_concurrency: int,
+    concurrency_scale: float,
+) -> int:
+    if target_rps <= 0:
+        return 1
+    effective_hint = max(latency_hint_s, 1.0 / target_rps)
+    desired = target_rps * effective_hint * concurrency_scale
+    if not math.isfinite(desired) or desired <= 0:
+        return 1
+    return max(1, min(max_concurrency, math.ceil(desired)))
 
 
 async def send_request(
@@ -552,6 +566,7 @@ def print_stage_line(summary: Dict[str, Any]) -> None:
     tokens = summary["tokens"]
     print(
         f"RPS target={summary['target_rps']:.1f} obs={summary['throughput_rps']:.2f} | "
+        f"window={summary['planned_duration_s']:.0f}s wall={summary['actual_duration_s']:.1f}s | "
         f"concurrency={summary['concurrency_limit']} | "
         f"succ={summary['requests_success']}/{summary['requests_total']} | "
         f"err={summary['error_rate']*100:.1f}% | "
@@ -577,11 +592,12 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
     if not payload_templates:
         raise SystemExit("No payloads prepared")
 
-    configs = build_stage_configs(args)
+    stage_targets = build_stage_targets(args)
     latency_threshold_s = args.latency_threshold_ms / 1000.0
     ttft_threshold_s = args.ttft_threshold_ms / 1000.0
 
     results: List[Dict[str, Any]] = []
+    latency_hint_s = max(latency_threshold_s, 1.0 / max(args.start_rps, 1e-6))
 
     async with httpx.AsyncClient() as client:
         if args.warmup_requests > 0:
@@ -593,7 +609,18 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                 args.warmup_requests,
             )
 
-        for config in configs:
+        for target_rps in stage_targets:
+            concurrency_limit = estimate_concurrency_limit(
+                target_rps=target_rps,
+                latency_hint_s=latency_hint_s,
+                max_concurrency=args.max_concurrency,
+                concurrency_scale=args.concurrency_scale,
+            )
+            config = StageConfig(
+                target_rps=target_rps,
+                duration_s=args.stage_duration,
+                concurrency_limit=concurrency_limit,
+            )
             stage_records = await run_stage(
                 config,
                 client,
@@ -613,6 +640,9 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             if args.verbose:
                 print(json.dumps(summary, indent=2))
             results.append(summary)
+            latency_p95 = summary.get("latency", {}).get("p95")
+            if isinstance(latency_p95, (int, float)) and latency_p95 > 0:
+                latency_hint_s = max(latency_hint_s, latency_p95)
             if summary["overloaded"]:
                 break
 

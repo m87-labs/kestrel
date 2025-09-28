@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 import torch.nn.functional as F
 from PIL import Image
+import numpy as np
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.models import MoondreamTextRuntime
@@ -37,6 +38,7 @@ from kestrel.moondream.text import (
     text_decoder as original_text_decoder,
     text_encoder as original_text_encoder,
 )
+from kestrel.ops import apply_rotary_triton
 
 
 @dataclasses.dataclass
@@ -157,6 +159,7 @@ def _attn_instrumented(
     n_kv_heads: int,
     position_ids: torch.Tensor,
     lora: Optional[dict] = None,
+    flashinfer_state: Optional[tuple] = None,
 ) -> torch.Tensor:
     timer = _CURRENT_TIMER
     if timer is None:
@@ -170,6 +173,7 @@ def _attn_instrumented(
             n_kv_heads,
             position_ids,
             lora=lora,
+            flashinfer_state=flashinfer_state,
         )
 
     bsz, q_len, d_model = x.shape
@@ -213,15 +217,20 @@ def _attn_instrumented(
             q = q * tau_q
             v = v * tau_v
 
-    with timer.record("prefill.attn.rotary_q"):
-        q = text_mod.apply_rotary_emb(q.to(torch.float32), freqs_cis, position_ids, n_heads).to(q.dtype)
-    with timer.record("prefill.attn.rotary_k"):
-        k = text_mod.apply_rotary_emb(k.to(torch.float32), freqs_cis, position_ids, n_kv_heads).to(k.dtype)
+    cos = freqs_cis[..., 0][position_ids]
+    sin = freqs_cis[..., 1][position_ids]
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+
+    with timer.record("prefill.attn.rotary"):
+        q, k = apply_rotary_triton(q, k, cos, sin)
 
     if kv_cache is not None:
         with timer.record("prefill.attn.kv_cache_update"):
             k, v = kv_cache.update(position_ids, k, v)
-
     with timer.record("prefill.attn.sdpa"):
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, enable_gqa=n_heads != n_kv_heads
@@ -403,8 +412,9 @@ MoondreamTextRuntime._prefill = _prefill_wrapper  # type: ignore[assignment]
 # ---------------------------------------------------------------------------
 # Profiling driver
 
-def _load_image(image_path: Path) -> Image.Image:
-    return Image.open(image_path).convert("RGB")
+def _load_image(image_path: Path) -> np.ndarray:
+    pil_image = Image.open(image_path).convert("RGB")
+    return np.array(pil_image, dtype=np.uint8, copy=True)
 
 
 def _build_runtime(

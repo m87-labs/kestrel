@@ -96,13 +96,23 @@ def attn(
         sin.contiguous(),
     )
 
+    flash_ctx = None
+    metadata = None
+    use_graph = False
+    if flashinfer_state is not None:
+        if len(flashinfer_state) == 3:
+            flash_ctx, metadata, use_graph = flashinfer_state  # type: ignore[misc]
+        else:
+            raise ValueError(
+                f"Unexpected flashinfer_state tuple length {len(flashinfer_state)}"
+            )
+
     if kv_cache is not None:
         kv_result = kv_cache.update(position_ids, k, v)
     else:
         kv_result = (k, v)
 
-    if flashinfer_state is not None:
-        flash_ctx, metadata, use_graph = flashinfer_state
+    if flash_ctx is not None:
         if kv_cache is None:
             raise RuntimeError("FlashInfer decode requires a KV cache")
         torch._assert(q.shape[2] == 1, "FlashInfer decode expects q_len == 1")
@@ -224,7 +234,9 @@ def lm_head(
     return logits
 
 
-def build_text_model(config: TextConfig, dtype: torch.dtype) -> nn.Module:
+def build_text_model(
+    config: TextConfig, dtype: torch.dtype, *, device: torch.device | str | None = None
+) -> nn.Module:
     qkv_dim = int(config.dim * (1 + 2 * config.n_kv_heads / config.n_heads))
     if config.group_size is not None:
         raise NotImplementedError("Quantized linear layers are not supported yet")
@@ -286,7 +298,9 @@ def build_text_model(config: TextConfig, dtype: torch.dtype) -> nn.Module:
     text.wte = nn.Parameter(torch.empty(config.vocab_size, config.dim, dtype=dtype))
     text.register_buffer(
         "freqs_cis",
-        precompute_freqs_cis(config.dim // (2 * config.n_heads), config.max_context),
+        precompute_freqs_cis(
+            config.dim // (2 * config.n_heads), config.max_context, device=device
+        ),
         persistent=False,
     )
 

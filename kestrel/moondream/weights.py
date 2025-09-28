@@ -135,7 +135,8 @@ def _refresh_rotary_tables(model: nn.Module) -> None:
         text_cfg.dim // (2 * text_cfg.n_heads),
         text_cfg.max_context,
         dtype=torch.float32,
-    ).to(model.text.freqs_cis.device)
+        device=model.text.freqs_cis.device,
+    )
 
 
 def load_text_weights(path: str, model: nn.Module) -> None:

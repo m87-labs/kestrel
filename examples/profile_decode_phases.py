@@ -161,14 +161,24 @@ def _attn_instrumented(
                 sin.to(q.device, non_blocking=True),
             )
 
+        flash_ctx = None
+        metadata = None
+        use_graph = False
+        if flashinfer_state is not None:
+            if len(flashinfer_state) == 3:
+                flash_ctx, metadata, use_graph = flashinfer_state  # type: ignore[misc]
+            else:  # pragma: no cover - defensive programming
+                raise ValueError(
+                    f"Unexpected flashinfer_state tuple length {len(flashinfer_state)}"
+                )
+
         if kv_cache is not None:
             with _phase("decode.attn.cache_update"):
                 kv_result = kv_cache.update(position_ids, k, v)
         else:
             kv_result = (k, v)
 
-        if flashinfer_state is not None:
-            flash_ctx, metadata, use_graph = flashinfer_state
+        if flash_ctx is not None:
             if kv_cache is None:
                 raise RuntimeError("FlashInfer decode requires a KV cache")
             torch._assert(q.shape[2] == 1, "FlashInfer decode expects q_len == 1")

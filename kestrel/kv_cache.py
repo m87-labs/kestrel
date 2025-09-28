@@ -9,9 +9,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
-    _identity,
     _mask_mod_signature,
-    _score_mod_signature,
     BlockMask,
     noop_mask,
     create_block_mask,
@@ -34,27 +32,14 @@ class PagedKVCache(torch.nn.Module):
         *,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        layout: str = "NHD",
     ):
         super().__init__()
-        if layout not in {"NHD", "HND"}:
-            raise ValueError(f"Unsupported KV layout '{layout}'")
-        self.layout = layout
-
-        if layout == "NHD":
-            cache_shape = (
-                page_table.n_pages,
-                page_table.page_size,
-                n_heads,
-                head_dim,
-            )
-        else:  # HND
-            cache_shape = (
-                page_table.n_pages,
-                n_heads,
-                page_table.page_size,
-                head_dim,
-            )
+        cache_shape = (
+            page_table.n_pages,
+            n_heads,
+            page_table.page_size,
+            head_dim,
+        )
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
@@ -80,8 +65,12 @@ class PagedKVCache(torch.nn.Module):
             self.v_scale = None
             self._k_inv_scale = None
             self._v_inv_scale = None
-            self.register_buffer("k_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32))
-            self.register_buffer("v_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32))
+            self.register_buffer(
+                "k_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "v_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32)
+            )
 
     def _prepare_key_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self.quantized:
@@ -121,36 +110,19 @@ class PagedKVCache(torch.nn.Module):
         page_idx = physical_block_idx.to(torch.long)
         slot_idx = offset_flat
 
-        if self.layout == "NHD":
-            kv_shape = (
-                k_store.shape[0] * k_store.shape[2],
-                k_store.shape[1],
-                k_store.shape[3],
-            )
-            vv_shape = (
-                v_store.shape[0] * v_store.shape[2],
-                v_store.shape[1],
-                v_store.shape[3],
-            )
-            k_view = k_store.permute(0, 2, 1, 3).contiguous().view(kv_shape)
-            v_view = v_store.permute(0, 2, 1, 3).contiguous().view(vv_shape)
+        k_view = (
+            k_store.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(-1, k_store.shape[1], k_store.shape[3])
+        )
+        v_view = (
+            v_store.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(-1, v_store.shape[1], v_store.shape[3])
+        )
 
-            self.k_cache[page_idx, slot_idx] = k_view
-            self.v_cache[page_idx, slot_idx] = v_view
-        else:  # HND
-            k_view = (
-                k_store.permute(0, 2, 1, 3)
-                .contiguous()
-                .view(-1, k_store.shape[1], k_store.shape[3])
-            )
-            v_view = (
-                v_store.permute(0, 2, 1, 3)
-                .contiguous()
-                .view(-1, v_store.shape[1], v_store.shape[3])
-            )
-
-            self.k_cache[page_idx, :, slot_idx, :] = k_view
-            self.v_cache[page_idx, :, slot_idx, :] = v_view
+        self.k_cache[page_idx, :, slot_idx, :] = k_view
+        self.v_cache[page_idx, :, slot_idx, :] = v_view
 
         return k_val, v_val
 
@@ -316,13 +288,13 @@ class PageTable:
             batch_idx (Tensor): batch index; shape :math:`(B)`.
             input_pos (Tensor): input positions to be assigned for the given batch; shape :math:`(B, S)`.
             val (Tensor): value to be assigned; shape :math:`(B, H, S, D)`
-            cache (Tensor): the cache to store the values; shape:`(MAX_PAGES, PAGE_SIZE, H, D)`
+        cache (Tensor): the cache to store the values; shape:`(MAX_PAGES, H, PAGE_SIZE, D)`
         """
         if k_val.requires_grad:
             raise RuntimeError("val must not require gradient")
 
         B, H, S, K_D = k_val.shape
-        _, _, H_cache, D_cache = k_cache.shape
+        _, H_cache, _, D_cache = k_cache.shape
         assert H_cache == H, "number of heads must match"
         assert D_cache == K_D, "hidden dim must match"
         assert input_pos.shape == (B, S), "input_pos must have the same shape as val"
@@ -607,8 +579,8 @@ class PageTable:
         input_pos: [1, L]
         k_val: [1, H, L, D]
         v_val: [1, H, L, D]
-        k_cache: [MAX_PAGES, PAGE_SIZE, H, D]
-        v_cache: [MAX_PAGES, PAGE_SIZE, H, D]
+        k_cache: [MAX_PAGES, H, PAGE_SIZE, D]
+        v_cache: [MAX_PAGES, H, PAGE_SIZE, D]
         """
 
         assert batch_idx.ndim == 2, "batch_idx must be a 2D tensor"
@@ -621,11 +593,22 @@ class PageTable:
 
         input_pos_block_idx = input_pos // self.page_size
         input_pos_offset_in_block = input_pos % self.page_size
-        physical_kv_idx = (
-            self.page_table[batch_idx, input_pos_block_idx] * self.page_size
-            + input_pos_offset_in_block
+        physical_page = self.page_table[batch_idx, input_pos_block_idx].to(torch.long)
+        page_idx = physical_page.view(-1)
+        slot_idx = input_pos_offset_in_block.view(-1).to(torch.long)
+
+        k_store = (
+            k_val.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(-1, k_val.shape[1], k_val.shape[3])
         )
-        k_cache[:, :, physical_kv_idx.view(-1), :] = k_val
-        v_cache[:, :, physical_kv_idx.view(-1), :] = v_val
+        v_store = (
+            v_val.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(-1, v_val.shape[1], v_val.shape[3])
+        )
+
+        k_cache[page_idx, :, slot_idx, :] = k_store
+        v_cache[page_idx, :, slot_idx, :] = v_store
 
         return k_val, v_val

@@ -13,9 +13,15 @@ def precompute_freqs_cis(
     end: int,
     theta: float = 1_500_000.0,
     dtype: torch.dtype = torch.float32,
+    *,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype)[: (dim // 2)] / dim))
-    t = torch.arange(end, dtype=dtype).unsqueeze(1)
+    if device is not None:
+        device = torch.device(device)
+
+    freq_indices = torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)]
+    freqs = 1.0 / (theta ** (freq_indices / dim))
+    t = torch.arange(end, dtype=dtype, device=device).unsqueeze(1)
     freqs = t * freqs.unsqueeze(0)
     freqs = torch.exp(1j * freqs)
     return torch.stack([freqs.real, freqs.imag], dim=-1)

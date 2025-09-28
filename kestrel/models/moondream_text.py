@@ -35,6 +35,7 @@ from kestrel.moondream.flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
 )
+
 from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
 from kestrel.utils.image import ImageArray
 
@@ -95,7 +96,6 @@ class _LayerPagedCache(torch.nn.Module):
         *,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        layout: str = "NHD",
     ) -> None:
         super().__init__()
         self.cache = PagedKVCache(
@@ -105,7 +105,6 @@ class _LayerPagedCache(torch.nn.Module):
             dtype=dtype,
             k_scale=k_scale,
             v_scale=v_scale,
-            layout=layout,
         ).to(device)
         self._batch_idx_tensor: Optional[Tensor] = None
 
@@ -209,7 +208,7 @@ class MoondreamTextRuntime:
             else self.dtype
         )
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_layout = "HND" if kv_cache_dtype == torch.float8_e4m3fn else "NHD"
+        self.kv_layout = "HND"
 
         self.model = MoondreamModel(
             self.config,
@@ -248,7 +247,6 @@ class MoondreamTextRuntime:
                 device=self.device,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                layout=self.kv_layout,
             )
             block.kv_cache = cache
             self.layer_caches.append(cache)

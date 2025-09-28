@@ -61,9 +61,7 @@ class FlashInferDecodeContext:
         self.page_size = page_size
         self.use_cuda_graphs = use_cuda_graphs
 
-        self._workspace = torch.empty(
-            workspace_bytes, dtype=torch.uint8, device=device
-        )
+        self._workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
         self._decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             self._workspace, kv_layout
         )
