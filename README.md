@@ -17,6 +17,7 @@
 - **Benchmarking & diagnostics**
   - `examples/benchmark_scheduler.py`: fires batched workloads (text or image+text) and reports throughput plus latency breakdowns. Accepts `--image`/`--image-dir` to benchmark multimodal traffic.
   - `examples/benchmark_http_server.py`: ramps HTTP load against `/v1/query`, increasing RPS until overload while tracking observed throughput, latency, TTFT, and error rates.
+  - `examples/benchmark_decode_scaling.py`: measures decoder throughput directly against the runtime (no HTTP), prefilling once and timing decode iterations as batch size scales.
   - `examples/compare_vision.py`: runs reference vs Kestrel inference for the same image/prompt. Use `--mode reference|kestrel` to avoid loading both models concurrently.
   - `examples/inspect_kv.py`, `examples/probe_tau.py`: quickly spot regression in cache contents or τ gating.
 
@@ -95,10 +96,10 @@
   uv run python examples/benchmark_http_server.py \
       --url http://127.0.0.1:8080/v1/query \
       --image external/moondream/assets/demo-1.jpg \
-      --stage-duration 30 --start-rps 1 --rps-step 2 --max-rps 64
+      --stage-duration 30 --start-concurrency 1 --concurrency-step 2 --max-concurrency 64
   ```
 
-  The script warms the endpoint, then increases target RPS until overload (triggered by error rate, latency, or TTFT thresholds). Each stage prints observed throughput, success/error counts, and p95 latency/TTFT; use `--output` to capture full JSON metrics for dashboards.
+  The script warms the endpoint, then increases concurrency until overload (triggered by error rate, latency, or TTFT thresholds). Each stage prints concurrency, observed throughput, success/error counts, and p95 latency/TTFT; use `--output` to capture full JSON metrics for dashboards.
 
 - **Reproducible benchmark workflow**
 
@@ -107,12 +108,12 @@
      ```bash
      tmux new-session -d -s kestrel_http \
          'cd ~/code/kestrel && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-          uv run python -m kestrel.main serve \
-              --weights ~/code/moondream/model.pt \
-              --device cuda --dtype bfloat16 \
-              --max-batch-size ${BATCH} \
-              --default-max-new-tokens 256 \
-              --host 0.0.0.0 --port 8080'
+        uv run python -m kestrel.main serve \
+            --weights ~/code/moondream/model.pt \
+            --device cuda --dtype bfloat16 \
+            --max-batch-size ${BATCH} \
+            --default-max-new-tokens 256 \
+            --host 0.0.0.0 --port 8080'
      ```
      Wait for `Application startup complete` via `tmux capture-pane -pt kestrel_http` before driving load.
   3. **Run the HTTP ramp** – hit `/v1/query` with the load generator, storing results per configuration:
@@ -121,7 +122,7 @@
          --url http://127.0.0.1:8080/v1/query \
          --image external/moondream/assets/demo-1.jpg \
          --stage-duration 30 \
-         --start-rps 1 --rps-step 2 --max-rps 32 \
+         --start-concurrency 1 --concurrency-step 2 --max-concurrency 32 \
          --latency-threshold-ms 4000 --ttft-threshold-ms 2500 --error-threshold 0.10 \
          --output /tmp/http_benchmark_bs${BATCH}.json
      ```

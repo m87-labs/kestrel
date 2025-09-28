@@ -43,7 +43,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=4096,
+        default=131072,
         help="Maximum total sequence length (prompt + generation)",
     )
     parser.add_argument(
