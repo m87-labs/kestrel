@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Tuple, TypedDict
 
 import numpy as np
 import torch
+
+try:
+    import pyvips  # type: ignore[attr-defined]
+
+    HAS_VIPS = True
+except Exception:  # pragma: no cover - optional dependency
+    from PIL import Image
+
+    HAS_VIPS = False
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -33,6 +42,86 @@ def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tu
             h_tiles = math.floor(max_crops / w_tiles)
 
     return (max(1, h_tiles), max(1, w_tiles))
+
+
+class OverlapCropOutput(TypedDict):
+    crops: np.ndarray
+    tiling: Tuple[int, int]
+
+
+def overlap_crop_image(
+    image: np.ndarray,
+    *,
+    overlap_margin: int,
+    max_crops: int,
+    base_size: Tuple[int, int] = (378, 378),
+    patch_size: int = 14,
+) -> OverlapCropOutput:
+    """Create a global crop plus overlapping local crops with consistent margins."""
+
+    original_h, original_w = image.shape[:2]
+
+    margin_pixels = patch_size * overlap_margin
+    total_margin_pixels = margin_pixels * 2
+
+    crop_patches = base_size[0] // patch_size
+    crop_window_patches = crop_patches - (2 * overlap_margin)
+    crop_window_size = crop_window_patches * patch_size
+
+    tiling = select_tiling(
+        max(1, original_h - total_margin_pixels),
+        max(1, original_w - total_margin_pixels),
+        crop_window_size,
+        max_crops,
+    )
+
+    num_crops = tiling[0] * tiling[1] + 1
+    crops = np.zeros((num_crops, base_size[0], base_size[1], image.shape[2]), dtype=np.uint8)
+
+    target_size = (
+        tiling[0] * crop_window_size + total_margin_pixels,
+        tiling[1] * crop_window_size + total_margin_pixels,
+    )
+
+    if HAS_VIPS:
+        vips_image = pyvips.Image.new_from_array(image)
+        scale_x = target_size[1] / original_w
+        scale_y = target_size[0] / original_h
+        resized = vips_image.resize(scale_x, vscale=scale_y)
+        image = resized.numpy()
+
+        scale_x = base_size[1] / original_w
+        scale_y = base_size[0] / original_h
+        global_vips = vips_image.resize(scale_x, vscale=scale_y)
+        crops[0] = global_vips.numpy()
+    else:
+        pil_img = Image.fromarray(image)
+        resized = pil_img.resize(
+            (int(target_size[1]), int(target_size[0])),
+            resample=Image.Resampling.LANCZOS,
+        )
+        image = np.asarray(resized)
+
+        global_pil = pil_img.resize(
+            (int(base_size[1]), int(base_size[0])),
+            resample=Image.Resampling.LANCZOS,
+        )
+        crops[0] = np.asarray(global_pil)
+
+    for tile_y in range(tiling[0]):
+        for tile_x in range(tiling[1]):
+            y0 = tile_y * crop_window_size
+            x0 = tile_x * crop_window_size
+
+            y1 = min(y0 + base_size[0], image.shape[0])
+            x1 = min(x0 + base_size[1], image.shape[1])
+
+            idx = 1 + tile_y * tiling[1] + tile_x
+            crop_region = image[y0:y1, x0:x1]
+            crops[idx, : crop_region.shape[0], : crop_region.shape[1]] = crop_region
+
+    return {"crops": crops, "tiling": tiling}
+
 
 def reconstruct_from_crops(
     crops: torch.Tensor | np.ndarray,
@@ -79,7 +168,7 @@ def reconstruct_from_crops(
             dest_x0 = tile_x * window_w + (0 if tile_x == 0 else margin_pixels)
             dest_x1 = dest_x0 + (x_end - x_start)
 
-            reconstructed[dest_y0:dest_y1, dest_x0:dest_x1] = crop[ y_start:y_end, x_start:x_end ]
+            reconstructed[dest_y0:dest_y1, dest_x0:dest_x1] = crop[y_start:y_end, x_start:x_end]
 
     if is_numpy:
         return reconstructed.cpu().numpy()
@@ -88,5 +177,6 @@ def reconstruct_from_crops(
 
 __all__ = [
     "select_tiling",
+    "overlap_crop_image",
     "reconstruct_from_crops",
 ]
