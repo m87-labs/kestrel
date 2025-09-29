@@ -134,7 +134,7 @@ def _rope_interleaved_strided(
         )
 
 
-def apply_rotary_triton(
+def apply_rotary_emb(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -204,4 +204,23 @@ def apply_rotary_triton(
     return q_out, k_out
 
 
-__all__ = ["apply_rotary_triton"]
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 1_500_000.0,
+    dtype: torch.dtype = torch.float32,
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    if device is not None:
+        device = torch.device(device)
+
+    freq_indices = torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)]
+    freqs = 1.0 / (theta ** (freq_indices / dim))
+    t = torch.arange(end, dtype=dtype, device=device).unsqueeze(1)
+    freqs = t * freqs.unsqueeze(0)
+    freqs = torch.exp(1j * freqs)
+    return torch.stack([freqs.real, freqs.imag], dim=-1)
+
+
+__all__ = ["apply_rotary_emb", "precompute_freqs_cis"]

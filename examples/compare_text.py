@@ -103,7 +103,6 @@ def _run_reference(
             temperature=0.0,
             top_p=1.0,
             attn_mask=attn_mask,
-            lora=None,
         )
         ref_prefill = logits_prefill.to("cpu")
 
@@ -122,7 +121,7 @@ def _run_reference(
 
             token_emb = text_encoder(next_token, model.text)
             mask[:, :, pos] = 1
-            logits_step, hidden = model._decode_one_tok(token_emb, mask, pos_ids, lora=None)
+            logits_step, hidden = model._decode_one_tok(token_emb, mask, pos_ids)
             decode_logits.append(logits_step.to("cpu"))
 
             pos += 1

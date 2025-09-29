@@ -11,7 +11,6 @@ import pyvips
 
 from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
-from kestrel.utils import log_gpu_memory
 from kestrel.utils.image import ensure_srgb
 
 
@@ -160,9 +159,7 @@ def encode_image(
                 raise ValueError("image must be provided when overlap is not supplied")
             crops, tiling = prepare_crops(image, config, device, dtype)
         torch._dynamo.mark_dynamic(crops, 0)
-        log_gpu_memory("vision:after_prepare_crops", device)
         outputs = vision_encoder(crops, module, config)
-        log_gpu_memory("vision:after_encoder", device)
         global_features = outputs[0]
         local = outputs[1:].reshape(
             -1,
@@ -178,7 +175,6 @@ def encode_image(
         )
         reconstructed = reconstructed.to(device=device, dtype=outputs.dtype)
         projected = vision_projection(global_features, reconstructed, module, config)
-        log_gpu_memory("vision:after_projection", device)
     return projected
 
 

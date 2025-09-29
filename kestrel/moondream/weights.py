@@ -12,7 +12,7 @@ import safetensors
 import torch
 import torch.nn as nn
 
-from .rope import precompute_freqs_cis
+from ..ops import precompute_freqs_cis
 
 @contextmanager
 def safetensors_open(path: str):

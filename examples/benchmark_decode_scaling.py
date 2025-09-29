@@ -180,9 +180,6 @@ def _run_trial(
     decode_steps: int,
     warmup_steps: int,
 ) -> dict[str, float]:
-    if runtime.device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(runtime.device)
-
     sequences: List[tuple[PromptSpec, SequenceState]] = []
     initial_tokens: List[torch.Tensor] = []
     prefill_start = time.perf_counter()
@@ -235,10 +232,6 @@ def _run_trial(
         "decode_tokens": total_decode_tokens,
         "decode_toks_per_s": tokens_per_s,
     }
-
-    if runtime.device.type == "cuda" and torch.cuda.is_available():
-        metrics["peak_memory_bytes"] = torch.cuda.max_memory_allocated(runtime.device)
-        torch.cuda.reset_peak_memory_stats(runtime.device)
 
     return metrics
 

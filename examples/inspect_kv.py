@@ -148,7 +148,6 @@ def _make_internal_attn_wrapper(store: AttnCaptureStore):
         n_heads: int,
         n_kv_heads: int,
         position_ids: torch.Tensor,
-        lora: Optional[dict] = None,
         flex_block_mask_slice=None,
     ) -> torch.Tensor:
         bsz, q_len, d_model = x.shape
@@ -158,8 +157,6 @@ def _make_internal_attn_wrapper(store: AttnCaptureStore):
             position_ids = position_ids.view(-1)
 
         qkv_out = module.qkv(x)
-        if lora is not None:
-            qkv_out += F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
 
         q_dim = n_heads * head_dim
         kv_dim = n_kv_heads * head_dim
@@ -217,12 +214,7 @@ def _make_internal_attn_wrapper(store: AttnCaptureStore):
         )
 
         out = attn_out.transpose(1, 2).reshape(bsz, q_len, d_model)
-        out_proj = module.proj(out)
-        if lora is not None:
-            lora_out = F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
-            out = out_proj + lora_out
-        else:
-            out = out_proj
+        out = module.proj(out)
 
         mode = _CAPTURE_MODE
         if mode is not None:
@@ -245,15 +237,12 @@ def _make_external_attn_wrapper(store: AttnCaptureStore):
         n_heads: int,
         n_kv_heads: int,
         position_ids: torch.Tensor,
-        lora: Optional[dict] = None,
         flex_block_mask_slice=None,
     ) -> torch.Tensor:
         bsz, q_len, d_model = x.shape
         head_dim = d_model // n_heads
 
         qkv_out = module.qkv(x)
-        if lora is not None:
-            qkv_out += F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
 
         q_dim = n_heads * head_dim
         kv_dim = n_kv_heads * head_dim
@@ -316,12 +305,7 @@ def _make_external_attn_wrapper(store: AttnCaptureStore):
             )
 
         out = attn_out.transpose(1, 2).reshape(bsz, q_len, d_model)
-        out_proj = module.proj(out)
-        if lora is not None:
-            lora_out = F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
-            out = out_proj + lora_out
-        else:
-            out = out_proj
+        out = module.proj(out)
 
         mode = _CAPTURE_MODE
         if mode is not None:
@@ -482,7 +466,6 @@ def _run_reference(
                 temperature=0.0,
                 top_p=1.0,
                 attn_mask=attn_mask,
-                lora=None,
             )
         pref_kv = _gather_external_kv(model, pos)
 
@@ -501,7 +484,7 @@ def _run_reference(
             decode_idx = capture_store.begin_decode_step()
             with _capture_mode("decode", decode_idx):
                 logits_step, hidden = model._decode_one_tok(
-                    token_emb, attn_mask, pos_ids, lora=None
+                    token_emb, attn_mask, pos_ids
                 )
             next_token = torch.argmax(logits_step, dim=-1, keepdim=True)
             pos += 1

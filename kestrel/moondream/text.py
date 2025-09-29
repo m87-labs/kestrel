@@ -22,8 +22,7 @@ from .layers import (
     LinearWeights,
     MLPWeights,
 )
-from .rope import precompute_freqs_cis
-from ..ops import apply_rotary_triton
+from ..ops import apply_rotary_emb, precompute_freqs_cis
 from .flashinfer import FlashInferBatchMetadata, FlashInferDecodeContext
 
 
@@ -40,7 +39,6 @@ def attn(
     n_heads: int,
     n_kv_heads: int,
     position_ids: torch.Tensor,
-    lora: Optional[dict] = None,
     flashinfer_state: Optional[
         tuple[FlashInferDecodeContext, FlashInferBatchMetadata, bool]
     ] = None,
@@ -56,8 +54,6 @@ def attn(
         raise ValueError(f"Unsupported position_ids shape: {position_ids.shape}")
 
     qkv_out = module.qkv(x)
-    if lora is not None:
-        qkv_out += F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
 
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
@@ -89,7 +85,7 @@ def attn(
     if cos.ndim == 2:
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-    q, k = apply_rotary_triton(
+    q, k = apply_rotary_emb(
         q,
         k,
         cos.contiguous(),
@@ -140,13 +136,7 @@ def attn(
         )
 
     out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
-    out0 = module.proj(out)
-    if lora is not None:
-        out1 = F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
-        out = out0 + out1
-    else:
-        out = out0
-    return out
+    return module.proj(out)
 
 
 def text_decoder(
@@ -155,7 +145,6 @@ def text_decoder(
     attn_mask: Optional[torch.Tensor],
     position_ids: torch.Tensor,
     config: TextConfig,
-    lora: Optional[dict] = None,
     *,
     flashinfer_ctx: Optional[FlashInferDecodeContext] = None,
     flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
@@ -164,14 +153,6 @@ def text_decoder(
     mode: Literal["prefill", "decode"] = "decode",
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
-        if lora is not None:
-            layer_lora = lora["text"]["blocks"][str(i)]
-            mlp_lora = layer_lora["mlp"]
-            attn_lora = layer_lora["attn"]
-        else:
-            mlp_lora = None
-            attn_lora = None
-
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
 
@@ -192,7 +173,6 @@ def text_decoder(
             config.n_heads,
             config.n_kv_heads,
             position_ids,
-            lora=attn_lora,
             flashinfer_state=flash_state,
         )
 
@@ -212,7 +192,7 @@ def text_decoder(
                     weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
                 ),
             )
-            mlp_out = mlp(x_norm, mlp_weights, lora=mlp_lora)
+            mlp_out = mlp(x_norm, mlp_weights)
 
         x = x + attn_out + mlp_out
 

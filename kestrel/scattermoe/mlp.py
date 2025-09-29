@@ -102,6 +102,12 @@ class MLP(nn.Module):
                 and self._workspace_tokens >= x.size(0)
             )
 
+            capturing = (
+                x.is_cuda
+                and torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            )
+
             if use_workspace:
                 assert self._workspace_up is not None
                 length = sorted_expert_idxs.size(0)
@@ -109,12 +115,15 @@ class MLP(nn.Module):
                 sorted_scattered_buffer = self._workspace_up.sorted_scattered_idxs[:length]
                 sorted_expert_buffer.copy_(sorted_expert_idxs)
                 sorted_scattered_buffer.copy_(sorted_scattered_idxs)
-                padded_block_idxs, _, _ = kernels.ops.padded_block_indices(
-                    sorted_expert_buffer,
-                    self.num_experts,
-                    out=self._workspace_up.padded_block_idxs,
-                    block_idx_template=self._workspace_up.block_idx_template,
-                )
+                if not capturing:
+                    padded_block_idxs, _, _ = kernels.ops.padded_block_indices(
+                        sorted_expert_buffer,
+                        self.num_experts,
+                        out=self._workspace_up.padded_block_idxs,
+                        block_idx_template=self._workspace_up.block_idx_template,
+                    )
+                else:
+                    padded_block_idxs = self._workspace_up.padded_block_idxs
                 sorted_expert_for_kernel = sorted_expert_buffer
                 sorted_scattered_for_kernel = sorted_scattered_buffer
             else:

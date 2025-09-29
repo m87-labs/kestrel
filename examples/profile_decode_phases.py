@@ -31,7 +31,7 @@ from kestrel.moondream.layers import (
     mlp as dense_mlp,
     moe_mlp,
 )
-from kestrel.ops import apply_rotary_triton
+from kestrel.ops import apply_rotary_emb
 
 
 @dataclasses.dataclass
@@ -114,7 +114,6 @@ def _attn_instrumented(
     n_heads: int,
     n_kv_heads: int,
     position_ids: torch.Tensor,
-    lora: Optional[dict] = None,
     flashinfer_state: Optional[tuple] = None,
 ):
     with _phase("decode.attn.total"):
@@ -123,8 +122,6 @@ def _attn_instrumented(
 
         with _phase("decode.attn.qkv"):
             qkv_out = module.qkv(x)
-            if lora is not None:
-                qkv_out += F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
 
         q_dim = n_heads * head_dim
         kv_dim = n_kv_heads * head_dim
@@ -154,7 +151,7 @@ def _attn_instrumented(
 
         with _phase("decode.attn.rotary"):
             cos, sin = _prepare_cos_sin(freqs_cis, position_ids)
-            q, k = apply_rotary_triton(
+            q, k = apply_rotary_emb(
                 q,
                 k,
                 cos.to(q.device, non_blocking=True),
@@ -210,12 +207,7 @@ def _attn_instrumented(
         out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
 
         with _phase("decode.attn.proj"):
-            out0 = module.proj(out)
-            if lora is not None:
-                out1 = F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
-                out = out0 + out1
-            else:
-                out = out0
+            out = module.proj(out)
         return out
 
 
@@ -226,9 +218,9 @@ def _moe_mlp_instrumented(x, mlp_module, experts_per_token, *, mode="decode"):
     return _original_moe_mlp(x, mlp_module, experts_per_token, mode=mode)
 
 
-def _mlp_instrumented(x, w, lora=None):
+def _mlp_instrumented(x, w):
     with _phase("decode.dense_mlp.total"):
-        return _original_mlp(x, w, lora=lora)
+        return _original_mlp(x, w)
 
 
 text_mod.attn = _attn_instrumented  # type: ignore[assignment]

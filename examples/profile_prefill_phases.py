@@ -39,7 +39,7 @@ from kestrel.moondream.text import (
     text_decoder as original_text_decoder,
     text_encoder as original_text_encoder,
 )
-from kestrel.ops import apply_rotary_triton
+from kestrel.ops import apply_rotary_emb
 
 
 @dataclasses.dataclass
@@ -159,7 +159,6 @@ def _attn_instrumented(
     n_heads: int,
     n_kv_heads: int,
     position_ids: torch.Tensor,
-    lora: Optional[dict] = None,
     flashinfer_state: Optional[tuple] = None,
 ) -> torch.Tensor:
     timer = _CURRENT_TIMER
@@ -173,7 +172,6 @@ def _attn_instrumented(
             n_heads,
             n_kv_heads,
             position_ids,
-            lora=lora,
             flashinfer_state=flashinfer_state,
         )
 
@@ -189,9 +187,6 @@ def _attn_instrumented(
 
     with timer.record("prefill.attn.qkv"):
         qkv_out = module.qkv(x)
-    if lora is not None:
-        with timer.record("prefill.attn.lora_qkv"):
-            qkv_out = qkv_out + F.linear(F.linear(x, lora["qkv"]["A"]), lora["qkv"]["B"])
 
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
@@ -227,7 +222,7 @@ def _attn_instrumented(
     sin = sin.contiguous()
 
     with timer.record("prefill.attn.rotary"):
-        q, k = apply_rotary_triton(q, k, cos, sin)
+        q, k = apply_rotary_emb(q, k, cos, sin)
 
     if kv_cache is not None:
         with timer.record("prefill.attn.kv_cache_update"):
@@ -241,38 +236,22 @@ def _attn_instrumented(
         out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
         out = module.proj(out)
 
-    if lora is not None:
-        with timer.record("prefill.attn.lora_proj"):
-            out = out + F.linear(F.linear(x, lora["proj"]["A"]), lora["proj"]["B"])
-
     return out
 
 
-def _dense_mlp_instrumented(x: torch.Tensor, w: MLPWeights, lora: Optional[dict] = None) -> torch.Tensor:
+def _dense_mlp_instrumented(x: torch.Tensor, w: MLPWeights) -> torch.Tensor:
     timer = _CURRENT_TIMER
     if timer is None:
-        return original_dense_mlp(x, w, lora=lora)
+        return original_dense_mlp(x, w)
 
     with timer.record("prefill.mlp.fc1"):
-        x0 = linear(x, w.fc1)
-    if lora is not None:
-        with timer.record("prefill.mlp.lora_fc1"):
-            x1 = F.linear(F.linear(x, lora["fc1"]["A"]), lora["fc1"]["B"])
-            x = x0 + x1
-    else:
-        x = x0
+        x = linear(x, w.fc1)
 
     with timer.record("prefill.mlp.activation"):
         x = gelu_approx(x)
 
     with timer.record("prefill.mlp.fc2"):
-        x0 = linear(x, w.fc2)
-    if lora is not None:
-        with timer.record("prefill.mlp.lora_fc2"):
-            x1 = F.linear(F.linear(x, lora["fc2"]["A"]), lora["fc2"]["B"])
-            x = x0 + x1
-    else:
-        x = x0
+        x = linear(x, w.fc2)
 
     return x
 
@@ -316,7 +295,6 @@ def _text_decoder_instrumented(
     attn_mask: Optional[torch.Tensor],
     position_ids: torch.Tensor,
     config,
-    lora: Optional[dict] = None,
     *,
     flashinfer_ctx=None,
     flashinfer_metadata=None,
@@ -332,7 +310,6 @@ def _text_decoder_instrumented(
             attn_mask,
             position_ids,
             config,
-            lora=lora,
             flashinfer_ctx=flashinfer_ctx,
             flashinfer_metadata=flashinfer_metadata,
             use_flashinfer=use_flashinfer,
@@ -341,13 +318,6 @@ def _text_decoder_instrumented(
         )
 
     for i, block in enumerate(module.blocks):
-        if lora is not None:
-            layer_lora = lora["text"]["blocks"][str(i)]
-            mlp_lora = layer_lora["mlp"]
-            attn_lora = layer_lora["attn"]
-        else:
-            mlp_lora = None
-            attn_lora = None
 
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         with timer.record(f"prefill.layer{i:02d}.layer_norm"):
@@ -363,7 +333,6 @@ def _text_decoder_instrumented(
                 config.n_heads,
                 config.n_kv_heads,
                 position_ids,
-                lora=attn_lora,
             )
 
         if config.moe is not None and i >= config.moe.start_layer:
@@ -384,7 +353,7 @@ def _text_decoder_instrumented(
                 ),
             )
             with timer.record(f"prefill.layer{i:02d}.mlp"):
-                mlp_out = _dense_mlp_instrumented(x_norm, mlp_weights, lora=mlp_lora)
+                mlp_out = _dense_mlp_instrumented(x_norm, mlp_weights)
 
         with timer.record(f"prefill.layer{i:02d}.residual"):
             x = x + attn_out + mlp_out
@@ -554,9 +523,6 @@ def _group_by_category(summary: Iterable[SummaryRow]) -> dict[str, SummaryRow]:
 
 
 def run_profile(args) -> None:
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
     runtime = _build_runtime(
         weights=args.weights,
         device=args.device,

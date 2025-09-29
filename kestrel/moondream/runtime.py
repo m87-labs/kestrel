@@ -34,7 +34,6 @@ from .flashinfer import (
     FlashInferDecodeContext,
 )
 
-from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -361,8 +360,6 @@ class MoondreamRuntime:
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
-        reset_peak_gpu_memory(self.device)
-        log_gpu_memory("start_sequence:begin", self.device)
         prompt_tokens = prompt_tokens.to(device=self.device, dtype=torch.long)
         if prompt_tokens.ndim != 2:
             raise ValueError(
@@ -392,7 +389,6 @@ class MoondreamRuntime:
             if remainder is not None:
                 embeddings.append(remainder)
             image_length = image_proj.shape[1]
-            log_gpu_memory("start_sequence:after_image_encode", self.device)
         elif remainder is not None:
             embeddings.append(remainder)
 
@@ -428,7 +424,6 @@ class MoondreamRuntime:
         ).unsqueeze(0)
 
         logits = self._prefill(inputs_embeds, attention_mask, position_ids)
-        log_gpu_memory("start_sequence:after_prefill", self.device)
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
