@@ -7,12 +7,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-try:  # pragma: no cover - optional dependency validated at runtime
-    import flashinfer  # type: ignore
-except ModuleNotFoundError as exc:  # pragma: no cover - handled upstream
-    raise RuntimeError(
-        "FlashInfer is required for decoding. Please install the flashinfer package."
-    ) from exc
+import flashinfer  # type: ignore
 
 
 @dataclass

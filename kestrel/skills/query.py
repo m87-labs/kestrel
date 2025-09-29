@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
+import torch
 from torch import Tensor
 
-from .base import SkillSpec
+from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
     from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.scheduler.types import GenerationRequest
 
 
 class QuerySkill(SkillSpec):
@@ -27,5 +29,42 @@ class QuerySkill(SkillSpec):
         image_crops: Optional[object] = None,
         options: Optional[Mapping[str, object]] = None,
     ) -> Tensor:
-        # Query uses the existing runtime helper to assemble the prompt.
-        return runtime.build_prompt_tokens(prompt)
+        template = runtime.config.tokenizer.templates["query"]
+        prefix: Sequence[int] = template["prefix"]
+        suffix: Sequence[int] = template["suffix"]
+        encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
+        ids = [*prefix, *encoded, *suffix]
+        if not ids:
+            return torch.empty((1, 0), dtype=torch.long)
+        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+
+    def create_state(
+        self,
+        runtime: "MoondreamRuntime",
+        request: "GenerationRequest",
+    ) -> "QuerySkillState":
+        return QuerySkillState(self, request)
+
+
+class QuerySkillState(SkillState):
+    """Skill state that buffers tokens and exposes plain text outputs."""
+
+    def __init__(self, spec: SkillSpec, request: "GenerationRequest") -> None:
+        super().__init__(spec, request)
+
+    def consume_step(
+        self,
+        runtime: "MoondreamRuntime",
+        step: DecodeStep,
+    ) -> None:
+        self.append_token(step.token)
+        return None
+
+    def finalize(
+        self,
+        runtime: "MoondreamRuntime",
+        *,
+        reason: str,
+    ) -> SkillFinalizeResult:
+        text = runtime.tokenizer.decode(list(self.tokens)) if self.tokens else ""
+        return SkillFinalizeResult(text=text, tokens=list(self.tokens))

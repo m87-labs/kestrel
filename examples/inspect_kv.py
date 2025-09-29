@@ -531,7 +531,7 @@ def _run_internal(
     with torch.no_grad():
         _annotate_layers(runtime.model.text.blocks)
         with _capture_mode("prefill", 0):
-            state, _ = runtime.start_sequence(
+            state, _, _ = runtime.start_sequence(
                 prompt_tokens=prompt, max_new_tokens=max_new_tokens
             )
 

@@ -19,20 +19,17 @@ from tokenizers import Tokenizer
 from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import PageTable, PagedKVCache
 
-from kestrel.moondream import (
-    DEFAULT_MOONDREAM_CONFIG,
-    MoondreamConfig,
-    MoondreamModel,
-    load_moondream_weights,
-)
-from kestrel.moondream.text import (
+from .config import DEFAULT_MOONDREAM_CONFIG, MoondreamConfig
+from .model import MoondreamModel
+from .weights import load_moondream_weights
+from .text import (
     lm_head,
     text_decoder,
     text_encoder,
 )
-from kestrel.moondream.vision import encode_image
-from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.moondream.flashinfer import (
+from .vision import encode_image
+from .image_crops import OverlapCropOutput
+from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
 )
@@ -341,20 +338,6 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # Prompt helpers
 
-    def build_prompt_tokens(self, question: str) -> Tensor:
-        prefix = self.config.tokenizer.templates["query"]["prefix"]
-        suffix = self.config.tokenizer.templates["query"]["suffix"]
-        ids = (
-            [self.config.tokenizer.bos_id]
-            + prefix
-            + self.tokenizer.encode(question).ids
-            + suffix
-        )
-        return torch.tensor(ids, dtype=torch.long, device=self.device).unsqueeze(0)
-
-    # ------------------------------------------------------------------
-    # Sequence lifecycle
-
     def encode_image(
         self,
         image: Optional[pyvips.Image],
@@ -372,20 +355,14 @@ class MoondreamRuntime:
 
     def start_sequence(
         self,
-        question: Optional[str] = None,
+        prompt_tokens: Tensor,
         *,
-        prompt_tokens: Optional[Tensor] = None,
         image: Optional[pyvips.Image] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
         reset_peak_gpu_memory(self.device)
         log_gpu_memory("start_sequence:begin", self.device)
-        if prompt_tokens is None:
-            if question is None:
-                raise ValueError("Either question or prompt_tokens must be provided.")
-            prompt_tokens = self.build_prompt_tokens(question)
-
         prompt_tokens = prompt_tokens.to(device=self.device, dtype=torch.long)
         if prompt_tokens.ndim != 2:
             raise ValueError(
@@ -394,18 +371,34 @@ class MoondreamRuntime:
 
         embeddings: list[Tensor] = []
         image_length = 0
+        # Always prepend the BOS embedding regardless of image presence so callers
+        # only provide skill-specific tokens.
+        bos_token = torch.tensor(
+            [[self.config.tokenizer.bos_id]], device=self.device, dtype=torch.long
+        )
+        bos_embed = text_encoder(bos_token, self.model.text)
+        embeddings.append(bos_embed)
+
+        remainder: Optional[Tensor] = None
+        if prompt_tokens.shape[1] > 0:
+            remainder = text_encoder(prompt_tokens, self.model.text)
+
         if image is not None or image_crops is not None:
             image_proj = self.encode_image(
                 image,
                 overlap=image_crops,
             ).unsqueeze(0)
             embeddings.append(image_proj)
+            if remainder is not None:
+                embeddings.append(remainder)
             image_length = image_proj.shape[1]
             log_gpu_memory("start_sequence:after_image_encode", self.device)
+        elif remainder is not None:
+            embeddings.append(remainder)
 
-        token_embeds = text_encoder(prompt_tokens, self.model.text)
-        embeddings.append(token_embeds)
-        inputs_embeds = torch.cat(embeddings, dim=1)
+        # Filter out any None placeholders before concatenation (e.g., when prompt
+        # tokens are empty).
+        inputs_embeds = torch.cat([emb for emb in embeddings if emb is not None], dim=1)
 
         prompt_len = inputs_embeds.shape[1]
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
@@ -452,39 +445,6 @@ class MoondreamRuntime:
 
     # ------------------------------------------------------------------
     # Core forward paths
-
-    def greedy_generate(
-        self,
-        question: str,
-        *,
-        image: Optional[pyvips.Image] = None,
-        image_crops: Optional[OverlapCropOutput] = None,
-        max_new_tokens: int = DEFAULT_MAX_TOKENS,
-    ) -> tuple[str, list[int]]:
-        state, logits = self.start_sequence(
-            question,
-            image=image,
-            image_crops=image_crops,
-            max_new_tokens=max_new_tokens,
-        )
-        generated: list[int] = []
-        next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-        try:
-            while True:
-                token_id = next_token.view(-1)[0].item()
-                if token_id == self.config.tokenizer.eos_id:
-                    break
-                generated.append(token_id)
-                if len(generated) >= max_new_tokens:
-                    break
-                logits = self.decode(state, next_token.view(1, 1))
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-        finally:
-            self.release_sequence(state)
-
-        text = self.tokenizer.decode(generated) if generated else ""
-        return text, generated
 
     @torch.inference_mode()
     def _prefill(self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor) -> Tensor:

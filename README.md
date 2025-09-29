@@ -2,7 +2,7 @@
 
 ## Design Overview
 
-- **Skill‑first architecture** – Every request is routed through a `SkillSpec`. Skills build prompts, describe decoding phases, and format results. The default `QuerySkill` emits plain text; structured skills (detect/point) plug in the same interfaces without touching scheduler internals.
+- **Skill‑first architecture** – Every request is routed through a `SkillSpec`. Skills build prompts, describe decoding phases, and format results. The default `QuerySkill` emits plain text; structured skills (e.g., `PointSkill`) reuse the same interfaces without touching scheduler internals.
 - **Runtime core** – `MoondreamRuntime` owns memory planning, paged KV caches, FlashInfer decode, and image encoding. It exposes generic helpers (`prefill_prompt`, `run_structured_phase`, `append_tokens`) that skills consume.
 - **Generation scheduler** – `kestrel/scheduler/GenerationScheduler` batches prefill/decode steps across requests, tracks per-request phase state, and streams tokens. It is skill-agnostic: all decoding/formatting decisions come from the attached skill object.
 - **Async engine** – `kestrel/engine.InferenceEngine` mediates between clients and the scheduler. It resolves skills, builds `SkillRequest`s, gathers metrics, and exposes high-level entrypoints such as `engine.query(...)`.
@@ -65,6 +65,18 @@ print(result.text)
 ```
 
 Response fields include the generated `answer`, `finish_reason`, and timing metrics (`processing_latency_s`, `ttft_s`, `decode_latency_s`, token counts/throughput). Streaming responses emit Server-Sent Events with the same structure.
+
+`POST /v1/point`
+
+```json
+{
+  "object": "burger",
+  "image_url": "data:image/png;base64,<...>",
+  "max_points": 16
+}
+```
+
+Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request metadata, and the same timing metrics as `/v1/query`.
 
 ## Usage Examples
 
@@ -148,3 +160,16 @@ uv run python examples/compare_vision.py \
   ```
 
   Increase concurrency until overload while tracking observed throughput, latency, TTFT, and error rates. Use `--output` to capture JSON metrics; the helper script in `examples/benchmark_http_server.py` can render an HTML summary from those artifacts.
+
+- **Point detection example**
+
+  ```bash
+  curl -s http://127.0.0.1:8080/v1/point \
+      -H 'content-type: application/json' \
+      -d '{
+            "object": "burger",
+            "image_url": "data:image/jpeg;base64,'"$(base64 -w0 external/moondream/assets/demo-1.jpg)"'"
+          }'
+  ```
+
+  Returns normalised coordinates under the `points` key.

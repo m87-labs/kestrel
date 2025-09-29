@@ -21,7 +21,6 @@ from .types import (
     ScheduledSequence,
     SchedulerResult,
     StreamCallback,
-    StreamUpdate,
 )
 from .sampling import sample_tokens
 
@@ -200,7 +199,13 @@ class GenerationScheduler:
                 image_crops=request.image_crops,
                 max_new_tokens=request.max_new_tokens,
             )
-            seq = ScheduledSequence(request=request, state=state)
+            skill_state = request.skill.create_state(self.runtime, request)
+            seq = ScheduledSequence(
+                request=request,
+                state=state,
+                skill_state=skill_state,
+            )
+            seq.skill_state.on_prefill(self.runtime)
             seq.started_at = prefill_start
 
             if request.max_new_tokens <= 0:
@@ -210,12 +215,9 @@ class GenerationScheduler:
                 continue
 
             first_logits = logits.squeeze(0)
-            sampled = self._sample_batch(
-                first_logits.unsqueeze(0), [seq.request]
-            )
+            sampled = self._sample_batch(first_logits.unsqueeze(0), [seq.request])
             token_value = int(sampled[0])
-            seq.stage_token(token_value, first_logits)
-            self._emit_stream(seq)
+            seq.stage_token(self.runtime, token_value)
 
             if self._mark_finished_if_needed(seq):
                 progress = True
@@ -256,8 +258,7 @@ class GenerationScheduler:
 
         for seq, row, token_value in zip(active, logits, sampled_cpu):
             seq.state.advance()
-            seq.stage_token(int(token_value), row)
-            self._emit_stream(seq)
+            seq.stage_token(self.runtime, int(token_value))
             if not self._mark_finished_if_needed(seq):
                 idle.append(seq)
 
@@ -289,7 +290,7 @@ class GenerationScheduler:
         last_token = seq.last_token
         eos_id = self.runtime.config.tokenizer.eos_id
         eos_hit = last_token == eos_id
-        max_new_hit = len(seq.generated_tokens) >= seq.request.max_new_tokens
+        max_new_hit = seq.skill_state.token_count >= seq.request.max_new_tokens
         max_len_hit = seq.total_length >= seq.state.max_length
 
         if not (eos_hit or max_new_hit or max_len_hit):
@@ -317,26 +318,6 @@ class GenerationScheduler:
             self.runtime.release_sequence(seq.state)
         self.completed.append(seq)
 
-    def _emit_stream(self, seq: ScheduledSequence) -> None:
-        callback = seq.request.stream_callback
-        if callback is None:
-            return
-        if seq.stream_offset >= len(seq.generated_tokens):
-            return
-
-        token_index = len(seq.generated_tokens) - 1
-        token_id = seq.generated_tokens[token_index]
-        new_tokens = seq.generated_tokens[seq.stream_offset :]
-        text = seq.request.skill.stream_text(self.runtime, new_tokens)
-        update = StreamUpdate(
-            request_id=seq.request.request_id,
-            token=token_id,
-            text=text,
-            token_index=token_index,
-        )
-        callback(update)
-        seq.stream_offset = len(seq.generated_tokens)
-
     def _resolve_temperature(self, temperature: Optional[float]) -> float:
         if temperature is None:
             return self._default_temperature
@@ -349,9 +330,12 @@ class GenerationScheduler:
         return value
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
-        text = seq.request.skill.decode_tokens(self.runtime, seq.generated_tokens)
+        finalize = seq.skill_state.finalize(
+            self.runtime, reason=seq.finish_reason or "unknown"
+        )
+        text = finalize.text
         prompt_tokens = seq.state.prompt_length
-        decode_tokens = len(seq.generated_tokens)
+        decode_tokens = len(finalize.tokens)
         started_at = seq.started_at
         completed_at = seq.completed_at or time.perf_counter()
         first_token_time = seq.first_token_time or completed_at
@@ -368,7 +352,7 @@ class GenerationScheduler:
         return SchedulerResult(
             request_id=seq.request.request_id,
             prompt=seq.request.prompt,
-            tokens=list(seq.generated_tokens),
+            tokens=finalize.tokens,
             text=text,
             finish_reason=seq.finish_reason or "unknown",
             metrics=metrics,

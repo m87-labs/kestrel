@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
+from kestrel.skills import QuerySkill
 
 
 @dataclass
@@ -140,9 +141,10 @@ def _prepare_payloads(
     prompts: Sequence[str],
     image: Optional["pyvips.Image"],
 ) -> List[PromptSpec]:
+    skill = QuerySkill()
     payloads: List[PromptSpec] = []
     for text in prompts:
-        tokens = runtime.build_prompt_tokens(text).to("cpu")
+        tokens = skill.build_prompt_tokens(runtime, text).to("cpu")
         payloads.append(PromptSpec(text=text, tokens=tokens, image=image))
     return payloads
 
@@ -187,7 +189,7 @@ def _run_trial(
     logits: Optional[torch.Tensor] = None
     for idx in range(batch_size):
         payload = payloads[idx]
-        state, logits = runtime.start_sequence(
+        state, logits, _ = runtime.start_sequence(
             prompt_tokens=payload.tokens.clone(),
             image=payload.image,
             max_new_tokens=decode_steps + warmup_steps,

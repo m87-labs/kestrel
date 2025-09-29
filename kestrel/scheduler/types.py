@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.moondream.runtime import SequenceState
+from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
 from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.skills import SkillSpec
+from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
 @dataclass
@@ -42,7 +42,10 @@ class GenerationRequest:
                 f"prompt_tokens must be 1D or shaped (1, L); got {self.prompt_tokens.shape}"
             )
         self.prompt_tokens = tokens.to(dtype=torch.long, device="cpu")
-        self.prompt_length = int(self.prompt_tokens.shape[0])
+        # Runtime unconditionally prepends a BOS token, so account for it in the
+        # prompt length even though individual skills omit it from their token
+        # buffers.
+        self.prompt_length = int(self.prompt_tokens.shape[0]) + 1
         if self.temperature < 0.0:
             raise ValueError("temperature must be non-negative")
         if not (0.0 < self.top_p <= 1.0):
@@ -59,37 +62,38 @@ class ScheduledSequence:
 
     request: GenerationRequest
     state: SequenceState
-    generated_tokens: List[int] = field(default_factory=list)
+    skill_state: SkillState
     pending_token: Optional[int] = None
-    last_logits: Optional[Tensor] = None
     finished: bool = False
     finish_reason: Optional[str] = None
-    stream_offset: int = 0
     started_at: float = field(default=0.0)
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
 
-    def stage_token(self, token_id: int, logits: Tensor) -> None:
+    def stage_token(
+        self,
+        runtime: MoondreamRuntime,
+        token_id: int,
+    ) -> None:
         token = int(token_id)
-        self.generated_tokens.append(token)
         self.pending_token = token
-        # The logits argument is retained for API compatibility, but we deliberately
-        # avoid copying them to host memory here. Nothing consumes the cached logits
-        # and the transfer was forcing a device sync on every decode step.
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
+        step = DecodeStep(token=token, position=self.skill_state.token_count)
+        self.skill_state.consume_step(runtime, step)
 
     @property
     def total_length(self) -> int:
         return (
             self.request.prompt_length
             + self.request.image_length
-            + len(self.generated_tokens)
+            + self.skill_state.token_count
         )
 
     @property
     def last_token(self) -> Optional[int]:
-        return self.generated_tokens[-1] if self.generated_tokens else None
+        tokens: Sequence[int] = self.skill_state.tokens
+        return tokens[-1] if tokens else None
 
     def needs_decode(self) -> bool:
         return not self.finished and self.pending_token is not None

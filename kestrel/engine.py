@@ -189,7 +189,8 @@ class InferenceEngine:
         assert self._runtime is not None
         runtime = self._runtime
         prompt = "Warmup prompt."
-        tokens = runtime.build_prompt_tokens(prompt)
+        skill = self._skills.default
+        tokens = skill.build_prompt_tokens(runtime, prompt)
         state, logits = runtime.start_sequence(prompt_tokens=tokens, max_new_tokens=1)
         try:
             next_token = torch.argmax(logits, dim=-1)

@@ -290,7 +290,7 @@ def profile_decode(args: argparse.Namespace) -> Dict[str, List[PhaseSample]]:
     runtime = build_runtime(args)
     prompt_tokens = make_prompt_tokens(runtime, args.prompt_length)
 
-    state, _ = runtime.start_sequence(prompt_tokens=prompt_tokens)
+    state, _, _ = runtime.start_sequence(prompt_tokens=prompt_tokens)
 
     dummy_token = torch.zeros((1, 1), dtype=torch.long, device=runtime.device)
 

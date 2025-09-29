@@ -119,6 +119,10 @@ def moe_mlp(
         return mlp_out
 
     if T == 1:
+        # For CUDA graph capture we bypass ScatterMoE kernels on the single-token path.
+        # The module's flatten/sort helpers currently rely on torch.compile, which
+        # triggers capture-time CUDA errors. The hand-written fallback avoids those
+        # ops while still using the expert weights backed by ScatterMoE.
         w1_weight = scatter_mlp.experts.weight
         w2_weight = scatter_mlp.output_experts.weight
 

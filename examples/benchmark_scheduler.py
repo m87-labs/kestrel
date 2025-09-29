@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.moondream.runtime import MoondreamRuntime
+from kestrel.skills import QuerySkill
 
 
 @dataclass
@@ -140,6 +141,7 @@ def _synthetic_prompts(
 
     payloads: List[PromptPayload] = []
     image_iter = cycle(images) if images else None
+    skill = QuerySkill()
     for idx in range(count):
         target = rng.randint(min_tokens, max_tokens)
         target = min(target, max_allowed_content)
@@ -152,7 +154,7 @@ def _synthetic_prompts(
             token_ids = token_ids[:max_allowed_content]
             base = tokenizer.decode(token_ids)
 
-        prompt_tokens = runtime.build_prompt_tokens(base).to("cpu")
+        prompt_tokens = skill.build_prompt_tokens(runtime, base).to("cpu")
         image = next(image_iter) if image_iter is not None else None
         payloads.append(
             PromptPayload(

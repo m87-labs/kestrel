@@ -169,7 +169,7 @@ def main() -> None:
 
     prompt_tensor = torch.tensor(prompt_ids, device=runtime.device, dtype=torch.long).unsqueeze(0)
     with torch.no_grad():
-        state, kestrel_prefill = runtime.start_sequence(
+        state, kestrel_prefill, _ = runtime.start_sequence(
             prompt_tokens=prompt_tensor,
             max_new_tokens=args.max_new_tokens,
         )

@@ -27,6 +27,9 @@ from moondream.torch.weights import load_weights_into_model as load_reference_we
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.utils.image import ensure_srgb
+from kestrel.skills import QuerySkill
+from kestrel.engine import InferenceEngine
+from kestrel.skills import SkillRegistry
 
 
 @dataclass
@@ -93,7 +96,7 @@ def run_reference(
     return GenerationResult(answer=answer)
 
 
-def run_kestrel(
+async def run_kestrel(
     weights: Path,
     image: pyvips.Image,
     prompt: str,
@@ -116,14 +119,23 @@ def run_kestrel(
         max_seq_length=max_seq_length,
     )
 
-    runtime = MoondreamRuntime(runtime_cfg)
-    answer, _ = runtime.greedy_generate(
-        prompt,
-        image=image,
-        max_new_tokens=max_new_tokens,
-    )
-
-    del runtime
+    skill = QuerySkill()
+    registry = SkillRegistry([skill])
+    engine = await InferenceEngine.create(runtime_cfg, skills=registry)
+    try:
+        prompt_tokens = skill.build_prompt_tokens(engine.runtime, prompt)
+        result = await engine.submit(
+            prompt,
+            prompt_tokens=prompt_tokens,
+            image=image,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            skill=skill,
+        )
+        answer = result.text
+    finally:
+        await engine.shutdown()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return GenerationResult(answer=answer)
@@ -176,16 +188,18 @@ def main() -> None:
         vips_image = ensure_srgb(
             pyvips.Image.new_from_file(str(args.image), access="sequential")
         )
-        result = run_kestrel(
-            weights=args.weights,
-            image=vips_image,
-            prompt=args.prompt,
-            device=device,
-            dtype=dtype,
-            max_new_tokens=args.max_new_tokens,
-            enable_compile=args.enable_compile,
-            enable_cuda_graphs=args.enable_cuda_graphs,
-            max_seq_length=args.kestrel_max_seq_length,
+        result = asyncio.run(
+            run_kestrel(
+                weights=args.weights,
+                image=vips_image,
+                prompt=args.prompt,
+                device=device,
+                dtype=dtype,
+                max_new_tokens=args.max_new_tokens,
+                enable_compile=args.enable_compile,
+                enable_cuda_graphs=args.enable_cuda_graphs,
+                max_seq_length=args.kestrel_max_seq_length,
+            )
         )
         print("Kestrel answer:")
         print(result.answer)

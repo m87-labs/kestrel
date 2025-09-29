@@ -22,6 +22,7 @@ from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream import text as text_mod
 from kestrel.moondream import vision as vision_mod
+from kestrel.skills import QuerySkill
 from kestrel.moondream.layers import (
     LayerNormWeights,
     LinearWeights,
@@ -451,10 +452,11 @@ def _build_runtime(
     )
     return MoondreamRuntime(rt_cfg)
 
+_QUERY_SKILL = QuerySkill()
+
 
 def _tokenize_prompt(runtime: MoondreamRuntime, prompt: str) -> torch.Tensor:
-    prompt_tokens = runtime.build_prompt_tokens(prompt)
-    return prompt_tokens
+    return _QUERY_SKILL.build_prompt_tokens(runtime, prompt)
 
 
 @dataclasses.dataclass
@@ -572,7 +574,7 @@ def run_profile(args) -> None:
     prompt_tokens = _tokenize_prompt(runtime, args.prompt)
 
     # Warm-up (no instrumentation)
-    state, _ = runtime.start_sequence(prompt_tokens=prompt_tokens, image=image)
+    state, _, _ = runtime.start_sequence(prompt_tokens=prompt_tokens, image=image)
     runtime.release_sequence(state)
 
     all_records: dict[str, list[PhaseSample]] = defaultdict(list)
@@ -583,7 +585,7 @@ def run_profile(args) -> None:
         _CURRENT_TIMER = timer
         try:
             with timer.record("prefill.start_sequence.total"):
-                state, _ = runtime.start_sequence(prompt_tokens=prompt_tokens, image=image)
+                state, _, _ = runtime.start_sequence(prompt_tokens=prompt_tokens, image=image)
         finally:
             _CURRENT_TIMER = None
         runtime.release_sequence(state)

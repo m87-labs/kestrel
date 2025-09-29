@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from torch import Tensor
 
 if False:  # pragma: no cover - type-checking imports
     from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.scheduler.types import GenerationRequest
 
 
 @dataclass(frozen=True)
@@ -16,9 +17,6 @@ class SkillSpec:
     """Declarative description of a skill's prompt and decoding behaviour."""
 
     name: str
-
-    # ------------------------------------------------------------------
-    # Prompt construction
 
     def build_prompt_tokens(
         self,
@@ -31,24 +29,74 @@ class SkillSpec:
     ) -> Tensor:
         raise NotImplementedError
 
+    def create_state(
+        self,
+        runtime: "MoondreamRuntime",
+        request: "GenerationRequest",
+    ) -> "SkillState":
+        raise NotImplementedError
+
+
+@dataclass(slots=True)
+class DecodeStep:
+    """Raw token emission from the runtime decode loop."""
+
+    token: int
+    position: int
+    phase: str = "answer"
+    hidden: Optional[Tensor] = None
+
+
+@dataclass(slots=True)
+class SkillFinalizeResult:
+    """Final materialisation of a skill-driven request."""
+
+    text: str
+    tokens: List[int]
+    extras: Dict[str, object] = field(default_factory=dict)
+
+
+class SkillState:
+    """Per-request controller that interprets decode steps for a skill."""
+
+    def __init__(self, spec: SkillSpec, request: "GenerationRequest") -> None:
+        self.spec = spec
+        self.request = request
+        self._tokens: List[int] = []
+
     # ------------------------------------------------------------------
-    # Text formatting
 
-    def decode_tokens(
+    def on_prefill(self, runtime: "MoondreamRuntime") -> None:
+        """Hook invoked once prefill completes."""
+        return None
+
+    def consume_step(
         self,
         runtime: "MoondreamRuntime",
-        tokens: Sequence[int],
-    ) -> str:
-        if not tokens:
-            return ""
-        return runtime.tokenizer.decode(list(tokens))
+        step: DecodeStep,
+    ) -> None:
+        raise NotImplementedError
 
-    def stream_text(
+    def finalize(
         self,
         runtime: "MoondreamRuntime",
-        tokens: Sequence[int],
-    ) -> str:
-        return self.decode_tokens(runtime, tokens)
+        *,
+        reason: str,
+    ) -> SkillFinalizeResult:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+
+    def append_token(self, token: int) -> None:
+        self._tokens.append(token)
+
+    @property
+    def tokens(self) -> Sequence[int]:
+        return self._tokens
+
+    @property
+    def token_count(self) -> int:
+        return len(self._tokens)
 
 
 class SkillRegistry:
