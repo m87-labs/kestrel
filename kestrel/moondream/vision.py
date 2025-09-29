@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -10,13 +10,13 @@ import torch.nn.functional as F
 import pyvips
 
 from .config import VisionConfig
-from .image_crops import overlap_crop_image, reconstruct_from_crops
+from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils import log_gpu_memory
-from kestrel.utils.image import ImageArray, as_uint8_image_array
+from kestrel.utils.image import ensure_srgb
 
 
 def prepare_crops(
-    image: Union[pyvips.Image, ImageArray],
+    image: pyvips.Image,
     config: VisionConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -24,15 +24,15 @@ def prepare_crops(
     if device.type != "cuda":
         raise RuntimeError("Vision preprocessing expects a CUDA device")
 
-    np_image = as_uint8_image_array(image)
-    overlap = overlap_crop_image(
-        np_image,
-        overlap_margin=config.overlap_margin,
-        max_crops=config.max_crops,
-        base_size=(config.crop_size, config.crop_size),
-        patch_size=config.enc_patch_size,
-    )
+    overlap = compute_overlap_crops(image, config)
+    return prepare_crops_from_overlap(overlap, device, dtype)
 
+
+def prepare_crops_from_overlap(
+    overlap: OverlapCropOutput,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
     crops_cpu = torch.from_numpy(overlap["crops"])
     crops_cpu = crops_cpu.permute(0, 3, 1, 2).contiguous().pin_memory()
     crops = crops_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -144,15 +144,21 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
 
 
 def encode_image(
-    image: Union[pyvips.Image, ImageArray],
+    image: Optional[pyvips.Image],
     module: nn.Module,
     config: VisionConfig,
     *,
     device: torch.device,
     dtype: torch.dtype,
+    overlap: Optional[OverlapCropOutput] = None,
 ) -> torch.Tensor:
     with torch.inference_mode():
-        crops, tiling = prepare_crops(image, config, device, dtype)
+        if overlap is not None:
+            crops, tiling = prepare_crops_from_overlap(overlap, device, dtype)
+        else:
+            if image is None:
+                raise ValueError("image must be provided when overlap is not supplied")
+            crops, tiling = prepare_crops(image, config, device, dtype)
         torch._dynamo.mark_dynamic(crops, 0)
         log_gpu_memory("vision:after_prepare_crops", device)
         outputs = vision_encoder(crops, module, config)
@@ -176,11 +182,26 @@ def encode_image(
     return projected
 
 
+def compute_overlap_crops(
+    image: pyvips.Image, config: VisionConfig
+) -> OverlapCropOutput:
+    normalized = ensure_srgb(image)
+    return overlap_crop_image(
+        normalized,
+        overlap_margin=config.overlap_margin,
+        max_crops=config.max_crops,
+        base_size=(config.crop_size, config.crop_size),
+        patch_size=config.enc_patch_size,
+    )
+
+
 __all__ = [
     "prepare_crops",
+    "prepare_crops_from_overlap",
     "create_patches",
     "vision_encoder",
     "vision_projection",
     "build_vision_model",
     "encode_image",
+    "compute_overlap_crops",
 ]

@@ -8,14 +8,9 @@ from typing import Tuple, TypedDict
 import numpy as np
 import torch
 
-try:
-    import pyvips  # type: ignore[attr-defined]
+import pyvips
 
-    HAS_VIPS = True
-except Exception:  # pragma: no cover - optional dependency
-    from PIL import Image
-
-    HAS_VIPS = False
+from kestrel.utils.image import vips_to_uint8_numpy
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -50,7 +45,7 @@ class OverlapCropOutput(TypedDict):
 
 
 def overlap_crop_image(
-    image: np.ndarray,
+    image: pyvips.Image,
     *,
     overlap_margin: int,
     max_crops: int,
@@ -59,7 +54,7 @@ def overlap_crop_image(
 ) -> OverlapCropOutput:
     """Create a global crop plus overlapping local crops with consistent margins."""
 
-    original_h, original_w = image.shape[:2]
+    original_h, original_w = image.height, image.width
 
     margin_pixels = patch_size * overlap_margin
     total_margin_pixels = margin_pixels * 2
@@ -76,49 +71,38 @@ def overlap_crop_image(
     )
 
     num_crops = tiling[0] * tiling[1] + 1
-    crops = np.zeros((num_crops, base_size[0], base_size[1], image.shape[2]), dtype=np.uint8)
+    crops = np.zeros((num_crops, base_size[0], base_size[1], image.bands), dtype=np.uint8)
 
     target_size = (
         tiling[0] * crop_window_size + total_margin_pixels,
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
-    if HAS_VIPS:
-        vips_image = pyvips.Image.new_from_array(image)
-        scale_x = target_size[1] / original_w
-        scale_y = target_size[0] / original_h
-        resized = vips_image.resize(scale_x, vscale=scale_y)
-        image = resized.numpy()
+    scale_x = target_size[1] / original_w
+    scale_y = target_size[0] / original_h
+    resized = image.resize(scale_x, vscale=scale_y)
+    resized_numpy = vips_to_uint8_numpy(resized)
 
-        scale_x = base_size[1] / original_w
-        scale_y = base_size[0] / original_h
-        global_vips = vips_image.resize(scale_x, vscale=scale_y)
-        crops[0] = global_vips.numpy()
-    else:
-        pil_img = Image.fromarray(image)
-        resized = pil_img.resize(
-            (int(target_size[1]), int(target_size[0])),
-            resample=Image.Resampling.LANCZOS,
-        )
-        image = np.asarray(resized)
-
-        global_pil = pil_img.resize(
-            (int(base_size[1]), int(base_size[0])),
-            resample=Image.Resampling.LANCZOS,
-        )
-        crops[0] = np.asarray(global_pil)
+    scale_x_global = base_size[1] / original_w
+    scale_y_global = base_size[0] / original_h
+    global_vips = image.resize(scale_x_global, vscale=scale_y_global)
+    crops[0] = vips_to_uint8_numpy(global_vips)
 
     for tile_y in range(tiling[0]):
         for tile_x in range(tiling[1]):
             y0 = tile_y * crop_window_size
             x0 = tile_x * crop_window_size
 
-            y1 = min(y0 + base_size[0], image.shape[0])
-            x1 = min(x0 + base_size[1], image.shape[1])
+            y1 = min(y0 + base_size[0], resized.height)
+            x1 = min(x0 + base_size[1], resized.width)
 
             idx = 1 + tile_y * tiling[1] + tile_x
-            crop_region = image[y0:y1, x0:x1]
-            crops[idx, : crop_region.shape[0], : crop_region.shape[1]] = crop_region
+            width = max(0, x1 - x0)
+            height = max(0, y1 - y0)
+            if width == 0 or height == 0:
+                continue
+            crop_region = resized_numpy[y0:y1, x0:x1]
+            crops[idx, :height, :width] = crop_region
 
     return {"crops": crops, "tiling": tiling}
 

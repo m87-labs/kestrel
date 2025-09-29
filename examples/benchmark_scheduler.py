@@ -14,8 +14,8 @@ from itertools import cycle
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+import pyvips
 import torch
-from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,7 +33,7 @@ class PromptPayload:
     text: str
     tokens: torch.Tensor  # stored on CPU for reuse
     length: int  # number of tokens including BOS/prefix/suffix
-    image: Optional[Image.Image] = None
+    image: Optional[pyvips.Image] = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -118,7 +118,7 @@ def _synthetic_prompts(
     template: str,
     seed: int,
     max_new_tokens: int,
-    images: Optional[Sequence[Image.Image]] = None,
+    images: Optional[Sequence[pyvips.Image]] = None,
 ) -> List[PromptPayload]:
     tokenizer = runtime.tokenizer
     cfg = runtime.config.tokenizer
@@ -221,7 +221,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     engine = await InferenceEngine.create(runtime_cfg)
     runtime = engine.runtime
 
-    images: List[Image.Image] = []
+    images: List[pyvips.Image] = []
     image_paths: List[Path] = []
     if args.image_dir:
         if not args.image_dir.exists():
@@ -233,7 +233,8 @@ async def _async_main(args: argparse.Namespace) -> None:
     if image_paths:
         for path in image_paths:
             try:
-                images.append(Image.open(path).convert("RGB"))
+                vips_image = pyvips.Image.new_from_file(str(path), access="sequential")
+                images.append(vips_image)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load image at {path}: {exc}") from exc
         if not images:

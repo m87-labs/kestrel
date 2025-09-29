@@ -69,7 +69,8 @@
   uv run python -m kestrel.main serve \
       --weights ~/code/moondream/model.pt \
       --device cuda --dtype bfloat16 \
-      --default-max-new-tokens 128 \
+      --max-batch-size 64 \
+      --default-max-new-tokens 512 \
       --host 0.0.0.0 --port 8080
   ```
 
@@ -96,13 +97,12 @@
   uv run python examples/benchmark_http_server.py \
       --url http://127.0.0.1:8080/v1/query \
       --image external/moondream/assets/demo-1.jpg \
-      --stage-duration 30 --start-concurrency 1 --concurrency-step 2 --max-concurrency 64
+      --stage-duration 30 --start-concurrency 1 --concurrency-step 4 --max-concurrency 64
   ```
 
   The script warms the endpoint, then increases concurrency until overload (triggered by error rate, latency, or TTFT thresholds). Each stage prints concurrency, observed throughput, success/error counts, and p95 latency/TTFT; use `--output` to capture full JSON metrics for dashboards.
 
 - **Reproducible benchmark workflow**
-
   1. **Sync & dependencies** – `./sync.sh <host>` to push the repo, then on the GPU box run `uv sync` inside `~/code/kestrel` so Starlette/Uvicorn/httpx land.
   2. **Launch server** – for each batch size (or other config) start the ASGI server in tmux:
      ```bash

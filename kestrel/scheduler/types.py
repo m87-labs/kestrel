@@ -6,11 +6,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+import pyvips
 import torch
 from torch import Tensor
 
 from kestrel.models import SequenceState
-from kestrel.utils.image import ImageArray
+from kestrel.moondream.image_crops import OverlapCropOutput
 
 
 @dataclass
@@ -24,7 +25,8 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
-    image: Optional[ImageArray] = None
+    image: Optional[pyvips.Image] = None
+    image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0
 
     prompt_length: int = field(init=False)

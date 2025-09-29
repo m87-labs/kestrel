@@ -164,8 +164,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--latency-threshold-ms",
         type=float,
-        default=2000.0,
-        help="P95 latency threshold (ms) for overload detection",
+        default=8.0,
+        help="P95 latency threshold (seconds if <=50, otherwise treated as milliseconds)",
     )
     parser.add_argument(
         "--ttft-threshold-ms",
@@ -220,6 +220,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         raise SystemExit("error-threshold must be between 0 and 1")
     if args.latency_threshold_ms <= 0:
         raise SystemExit("latency-threshold-ms must be positive")
+    # Allow users to provide thresholds in seconds for small values while preserving
+    # compatibility with existing millisecond inputs.
+    if args.latency_threshold_ms <= 50:
+        args.latency_threshold_ms *= 1000.0
     if args.ttft_threshold_ms <= 0:
         raise SystemExit("ttft-threshold-ms must be positive")
     if args.settings_top_p <= 0 or args.settings_top_p > 1:

@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence
 
 import warnings
 
@@ -31,13 +31,13 @@ from kestrel.moondream.text import (
     text_encoder,
 )
 from kestrel.moondream.vision import encode_image
+from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
 )
 
 from kestrel.utils import log_gpu_memory, reset_peak_gpu_memory
-from kestrel.utils.image import ImageArray
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -315,13 +315,19 @@ class MoondreamTextRuntime:
     # ------------------------------------------------------------------
     # Sequence lifecycle
 
-    def encode_image(self, image: Union[pyvips.Image, ImageArray]) -> Tensor:
+    def encode_image(
+        self,
+        image: Optional[pyvips.Image],
+        *,
+        overlap: Optional[OverlapCropOutput] = None,
+    ) -> Tensor:
         return encode_image(
             image,
             self.model.vision,
             self.config.vision,
             device=self.device,
             dtype=self.dtype,
+            overlap=overlap,
         )
 
     def start_sequence(
@@ -329,7 +335,8 @@ class MoondreamTextRuntime:
         question: Optional[str] = None,
         *,
         prompt_tokens: Optional[Tensor] = None,
-        image: Optional[Union[pyvips.Image, ImageArray]] = None,
+        image: Optional[pyvips.Image] = None,
+        image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
         reset_peak_gpu_memory(self.device)
@@ -347,8 +354,11 @@ class MoondreamTextRuntime:
 
         embeddings: list[Tensor] = []
         image_length = 0
-        if image is not None:
-            image_proj = self.encode_image(image).unsqueeze(0)
+        if image is not None or image_crops is not None:
+            image_proj = self.encode_image(
+                image,
+                overlap=image_crops,
+            ).unsqueeze(0)
             embeddings.append(image_proj)
             image_length = image_proj.shape[1]
             log_gpu_memory("start_sequence:after_image_encode", self.device)
@@ -407,12 +417,14 @@ class MoondreamTextRuntime:
         self,
         question: str,
         *,
-        image: Optional[Union[pyvips.Image, ImageArray]] = None,
+        image: Optional[pyvips.Image] = None,
+        image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> tuple[str, list[int]]:
         state, logits = self.start_sequence(
             question,
             image=image,
+            image_crops=image_crops,
             max_new_tokens=max_new_tokens,
         )
         generated: list[int] = []
