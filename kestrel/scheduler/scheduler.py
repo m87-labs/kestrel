@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Mapping, Optional
 
 import time
 
@@ -12,7 +12,7 @@ from torch import Tensor
 
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec
+from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec, SkillState
 
 from .queues import RequestQueue, RunningQueue
 from .types import (
@@ -63,6 +63,7 @@ class GenerationScheduler:
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
         skill: Optional[str | SkillSpec] = None,
+        skill_state: Optional[SkillState] = None,
     ) -> int:
         """Queue a new prompt for generation."""
 
@@ -74,7 +75,6 @@ class GenerationScheduler:
                 prompt,
                 image=image,
                 image_crops=image_crops,
-                options=None,
             )
         if image is not None and not hasattr(self.runtime.model, "vision"):
             raise ValueError("Runtime does not support image inputs")
@@ -96,8 +96,23 @@ class GenerationScheduler:
             image_length=image_length,
             skill=skill_spec,
         )
+        if skill_state is None:
+            skill_state = skill_spec.create_state(self.runtime, request)
+        request.skill_state = skill_state
         self.waiting.push(request)
         return request.request_id
+
+    def enqueue_request(
+        self,
+        request: GenerationRequest,
+        skill_state: SkillState,
+    ) -> None:
+        """Insert a fully constructed request/skill state into the waiting queue."""
+
+        if request.skill_state is not None and request.skill_state is not skill_state:
+            raise ValueError("GenerationRequest already has an associated SkillState")
+        request.skill_state = skill_state
+        self.waiting.push(request)
 
     def submit_many(
         self,
@@ -110,13 +125,16 @@ class GenerationScheduler:
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
         skill: Optional[str | SkillSpec] = None,
+        skill_states: Optional[Iterable[Optional[SkillState]]] = None,
     ) -> List[int]:
         ids: List[int] = []
         image_iter = iter(images) if images is not None else None
         crops_iter = iter(image_crops) if image_crops is not None else None
+        state_iter = iter(skill_states) if skill_states is not None else None
         for prompt in prompts:
             image = next(image_iter) if image_iter is not None else None
             crops = next(crops_iter) if crops_iter is not None else None
+            state = next(state_iter) if state_iter is not None else None
             ids.append(
                 self.submit(
                     prompt,
@@ -127,6 +145,7 @@ class GenerationScheduler:
                     top_p=top_p,
                     stream_callback=stream_callback,
                     skill=skill,
+                    skill_state=state,
                 )
             )
         if image_iter is not None:
@@ -143,6 +162,13 @@ class GenerationScheduler:
                 pass
             else:
                 raise ValueError("Number of image_crops entries does not match number of prompts")
+        if state_iter is not None:
+            try:
+                next(state_iter)
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("Number of skill_states entries does not match number of prompts")
         return ids
 
     # ------------------------------------------------------------------
@@ -199,7 +225,10 @@ class GenerationScheduler:
                 image_crops=request.image_crops,
                 max_new_tokens=request.max_new_tokens,
             )
-            skill_state = request.skill.create_state(self.runtime, request)
+            skill_state = request.skill_state
+            if skill_state is None:
+                skill_state = request.skill.create_state(self.runtime, request)
+            request.skill_state = skill_state
             seq = ScheduledSequence(
                 request=request,
                 state=state,
@@ -356,4 +385,5 @@ class GenerationScheduler:
             text=text,
             finish_reason=seq.finish_reason or "unknown",
             metrics=metrics,
+            extras=finalize.extras,
         )

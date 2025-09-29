@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from torch import Tensor
 
@@ -25,7 +25,6 @@ class SkillSpec:
         *,
         image: Optional[object] = None,
         image_crops: Optional[object] = None,
-        options: Optional[Mapping[str, object]] = None,
     ) -> Tensor:
         raise NotImplementedError
 
@@ -33,6 +32,8 @@ class SkillSpec:
         self,
         runtime: "MoondreamRuntime",
         request: "GenerationRequest",
+        *,
+        context: Optional[object] = None,
     ) -> "SkillState":
         raise NotImplementedError
 
@@ -97,7 +98,6 @@ class SkillState:
     @property
     def token_count(self) -> int:
         return len(self._tokens)
-
 
 class SkillRegistry:
     """Lookup table for skills with a default entry."""

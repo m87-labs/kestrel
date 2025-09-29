@@ -5,7 +5,7 @@
 - **Skill‑first architecture** – Every request is routed through a `SkillSpec`. Skills build prompts, describe decoding phases, and format results. The default `QuerySkill` emits plain text; structured skills (e.g., `PointSkill`) reuse the same interfaces without touching scheduler internals.
 - **Runtime core** – `MoondreamRuntime` owns memory planning, paged KV caches, FlashInfer decode, and image encoding. It exposes generic helpers (`prefill_prompt`, `run_structured_phase`, `append_tokens`) that skills consume.
 - **Generation scheduler** – `kestrel/scheduler/GenerationScheduler` batches prefill/decode steps across requests, tracks per-request phase state, and streams tokens. It is skill-agnostic: all decoding/formatting decisions come from the attached skill object.
-- **Async engine** – `kestrel/engine.InferenceEngine` mediates between clients and the scheduler. It resolves skills, builds `SkillRequest`s, gathers metrics, and exposes high-level entrypoints such as `engine.query(...)`.
+- **Async engine** – `kestrel/engine.InferenceEngine` mediates between clients and the scheduler. It resolves skills, builds skill-specific request objects, gathers metrics, and exposes high-level entrypoints such as `engine.query(...)`.
 - **Serving surfaces** – `kestrel.main serve` launches a Starlette app (`kestrel/server/http.py`) that shares the async engine, providing HTTP endpoints with consistent metrics and streaming behaviour. CLI helpers keep local smoke tests close to production traffic patterns.
 
 ## API Overview
@@ -15,6 +15,8 @@
 ```python
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
+from kestrel.skills import QueryRequest, QuerySettings
+import pyvips
 
 cfg = RuntimeConfig(
     weights_path="~/code/moondream/model.pt",
@@ -25,16 +27,20 @@ cfg = RuntimeConfig(
 )
 engine = await InferenceEngine.create(cfg)
 
-result = await engine.query(
+image = pyvips.Image.new_from_file("demo.jpg")
+request = QueryRequest(
     question="Describe the image.",
-    image=pyvips.Image.new_from_file("demo.jpg"),
-    max_new_tokens=128,
-    temperature=0.0,
+    image=image,
+    reasoning=False,
+    stream=False,
+    settings=QuerySettings(temperature=0.0, top_p=1.0),
 )
-print(result.text)
+
+result = await engine.query(request, max_new_tokens=128)
+print(result.extras["answer"])
 ```
 
-- `InferenceEngine.query(...)` routes to the `query` skill (the default text+image path).
+- `InferenceEngine.query(...)` routes to the `query` skill (the default text+image path) using a validated `QueryRequest`.
 - `InferenceEngine.submit(...)` remains available for advanced callers who want to pass raw prompt tokens or experiment with additional skills.
 
 ### Skills

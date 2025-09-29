@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
-from kestrel.skills import QuerySkill
+from kestrel.skills import QueryRequest, QuerySettings, QuerySkill
 
 
 @dataclass
@@ -144,7 +144,18 @@ def _prepare_payloads(
     skill = QuerySkill()
     payloads: List[PromptSpec] = []
     for text in prompts:
-        tokens = skill.build_prompt_tokens(runtime, text).to("cpu")
+        request = QueryRequest(
+            question=text,
+            image=image,
+            reasoning=False,
+            stream=False,
+            settings=QuerySettings(temperature=0.0, top_p=1.0),
+        )
+        tokens = skill.build_prompt_tokens(
+            runtime,
+            text,
+            image=image,
+        ).to("cpu")
         payloads.append(PromptSpec(text=text, tokens=tokens, image=image))
     return payloads
 

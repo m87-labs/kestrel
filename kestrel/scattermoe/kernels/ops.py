@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 BLOCK_M = 128
-ALLOW_TF32 = False
+ALLOW_TF32 = True
 
 
 @torch.library.custom_op("scattermoe::bincount", mutates_args={})

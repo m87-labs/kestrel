@@ -7,7 +7,7 @@ from .base import (
     SkillSpec,
     SkillState,
 )
-from .query import QuerySkill
+from .query import QueryDefaults, QueryInvocation, QueryRequest, QuerySettings, QuerySkill
 
 __all__ = [
     "DecodeStep",
@@ -15,5 +15,9 @@ __all__ = [
     "SkillRegistry",
     "SkillSpec",
     "SkillState",
+    "QueryDefaults",
+    "QueryInvocation",
+    "QueryRequest",
+    "QuerySettings",
     "QuerySkill",
 ]

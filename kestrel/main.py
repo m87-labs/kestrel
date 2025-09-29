@@ -12,6 +12,7 @@ import torch
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
+from kestrel.skills import QueryRequest, QuerySettings
 
 
 def _parse_dtype(value: str) -> torch.dtype:
@@ -162,11 +163,23 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         if args.stream:
             streams = []
             for prompt in args.prompts:
+                request = QueryRequest(
+                    question=prompt,
+                    image=None,
+                    reasoning=False,
+                    stream=True,
+                    settings=QuerySettings(
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                    ),
+                )
                 stream = await engine.submit_streaming(
                     prompt,
                     max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
+                    temperature=request.settings.temperature,
+                    top_p=request.settings.top_p,
+                    skill="query",
+                    skill_context=request,
                 )
                 streams.append(stream)
 
@@ -183,6 +196,17 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
+                    skill="query",
+                    skill_context=QueryRequest(
+                        question=prompt,
+                        image=None,
+                        reasoning=False,
+                        stream=False,
+                        settings=QuerySettings(
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                        ),
+                    ),
                 )
                 for prompt in args.prompts
             ]

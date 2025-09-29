@@ -425,7 +425,10 @@ _QUERY_SKILL = QuerySkill()
 
 
 def _tokenize_prompt(runtime: MoondreamRuntime, prompt: str) -> torch.Tensor:
-    return _QUERY_SKILL.build_prompt_tokens(runtime, prompt)
+    return _QUERY_SKILL.build_prompt_tokens(
+        runtime,
+        prompt,
+    )
 
 
 @dataclasses.dataclass

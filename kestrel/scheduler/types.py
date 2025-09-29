@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import pyvips
 import torch
@@ -30,6 +30,7 @@ class GenerationRequest:
     image: Optional[pyvips.Image] = None
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0
+    skill_state: Optional[SkillState] = field(default=None, repr=False)
 
     prompt_length: int = field(init=False)
 
@@ -109,6 +110,7 @@ class SchedulerResult:
     text: str
     finish_reason: str
     metrics: "RequestMetrics"
+    extras: Dict[str, object]
 
 
 @dataclass

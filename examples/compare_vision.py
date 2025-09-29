@@ -27,9 +27,8 @@ from moondream.torch.weights import load_weights_into_model as load_reference_we
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.utils.image import ensure_srgb
-from kestrel.skills import QuerySkill
+from kestrel.skills import QueryRequest, QuerySettings, QuerySkill, SkillRegistry
 from kestrel.engine import InferenceEngine
-from kestrel.skills import SkillRegistry
 
 
 @dataclass
@@ -123,17 +122,29 @@ async def run_kestrel(
     registry = SkillRegistry([skill])
     engine = await InferenceEngine.create(runtime_cfg, skills=registry)
     try:
-        prompt_tokens = skill.build_prompt_tokens(engine.runtime, prompt)
+        request = QueryRequest(
+            question=prompt,
+            image=image,
+            reasoning=False,
+            stream=False,
+            settings=QuerySettings(temperature=0.0, top_p=1.0),
+        )
+        prompt_tokens = skill.build_prompt_tokens(
+            engine.runtime,
+            prompt,
+            image=image,
+        )
         result = await engine.submit(
             prompt,
             prompt_tokens=prompt_tokens,
             image=image,
             max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            top_p=1.0,
+            temperature=request.settings.temperature,
+            top_p=request.settings.top_p,
             skill=skill,
+            skill_context=request,
         )
-        answer = result.text
+        answer = result.extras.get("answer", result.text)
     finally:
         await engine.shutdown()
     if device.type == "cuda":
