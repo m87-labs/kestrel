@@ -25,7 +25,7 @@ from moondream.torch.moondream import MoondreamModel as ReferenceModel
 from moondream.torch.weights import load_weights_into_model as load_reference_weights
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.utils.image import ensure_srgb
 
 
@@ -116,7 +116,7 @@ def run_kestrel(
         max_seq_length=max_seq_length,
     )
 
-    runtime = MoondreamTextRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg)
     answer, _ = runtime.greedy_generate(
         prompt,
         image=image,

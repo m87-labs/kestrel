@@ -3,7 +3,7 @@ name = "kestrel"
 version = "0.1.0"
 description = "inference engine for moondream"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "torch==2.8.0",
     "tokenizers>=0.15",
@@ -17,3 +17,6 @@ dependencies = [
     "uvicorn>=0.30",
     "flashinfer-python>=0.3.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["kestrel*"]

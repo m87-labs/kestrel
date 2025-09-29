@@ -10,8 +10,9 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec
 
 from .queues import RequestQueue, RunningQueue
 from .types import (
@@ -30,10 +31,11 @@ class GenerationScheduler:
 
     def __init__(
         self,
-        runtime: MoondreamTextRuntime,
+        runtime: MoondreamRuntime,
         *,
         default_temperature: float = 0.0,
         default_top_p: float = 1.0,
+        skill_registry: Optional[SkillRegistry] = None,
     ) -> None:
         self.runtime = runtime
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
@@ -44,6 +46,7 @@ class GenerationScheduler:
         self._default_top_p = float(default_top_p)
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
+        self._skills = skill_registry or SkillRegistry([QuerySkill()])
 
     # ------------------------------------------------------------------
     # Submission
@@ -60,11 +63,20 @@ class GenerationScheduler:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
+        skill: Optional[str | SkillSpec] = None,
     ) -> int:
         """Queue a new prompt for generation."""
 
+        skill_spec = self._skills.resolve(skill)
+
         if prompt_tokens is None:
-            prompt_tokens = self.runtime.build_prompt_tokens(prompt)
+            prompt_tokens = skill_spec.build_prompt_tokens(
+                self.runtime,
+                prompt,
+                image=image,
+                image_crops=image_crops,
+                options=None,
+            )
         if image is not None and not hasattr(self.runtime.model, "vision"):
             raise ValueError("Runtime does not support image inputs")
         image_length = (
@@ -83,6 +95,7 @@ class GenerationScheduler:
             image=image,
             image_crops=image_crops,
             image_length=image_length,
+            skill=skill_spec,
         )
         self.waiting.push(request)
         return request.request_id
@@ -97,6 +110,7 @@ class GenerationScheduler:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream_callback: Optional[StreamCallback] = None,
+        skill: Optional[str | SkillSpec] = None,
     ) -> List[int]:
         ids: List[int] = []
         image_iter = iter(images) if images is not None else None
@@ -113,6 +127,7 @@ class GenerationScheduler:
                     temperature=temperature,
                     top_p=top_p,
                     stream_callback=stream_callback,
+                    skill=skill,
                 )
             )
         if image_iter is not None:
@@ -312,7 +327,7 @@ class GenerationScheduler:
         token_index = len(seq.generated_tokens) - 1
         token_id = seq.generated_tokens[token_index]
         new_tokens = seq.generated_tokens[seq.stream_offset :]
-        text = self.runtime.tokenizer.decode(new_tokens) if new_tokens else ""
+        text = seq.request.skill.stream_text(self.runtime, new_tokens)
         update = StreamUpdate(
             request_id=seq.request.request_id,
             token=token_id,
@@ -334,7 +349,7 @@ class GenerationScheduler:
         return value
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
-        text = self.runtime.tokenizer.decode(seq.generated_tokens) if seq.generated_tokens else ""
+        text = seq.request.skill.decode_tokens(self.runtime, seq.generated_tokens)
         prompt_tokens = seq.state.prompt_length
         decode_tokens = len(seq.generated_tokens)
         started_at = seq.started_at

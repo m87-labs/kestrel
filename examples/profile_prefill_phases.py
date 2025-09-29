@@ -19,7 +19,7 @@ from PIL import Image
 import numpy as np
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream import text as text_mod
 from kestrel.moondream import vision as vision_mod
 from kestrel.moondream.layers import (
@@ -398,7 +398,7 @@ text_mod.moe_mlp = _moe_mlp_instrumented  # type: ignore[assignment]
 text_mod.mlp = _dense_mlp_instrumented  # type: ignore[assignment]
 
 
-_original_prefill_method = MoondreamTextRuntime._prefill
+_original_prefill_method = MoondreamRuntime._prefill
 
 
 def _prefill_wrapper(self, inputs_embeds, attn_mask, position_ids):
@@ -406,7 +406,7 @@ def _prefill_wrapper(self, inputs_embeds, attn_mask, position_ids):
         return _original_prefill_method(self, inputs_embeds, attn_mask, position_ids)
 
 
-MoondreamTextRuntime._prefill = _prefill_wrapper  # type: ignore[assignment]
+MoondreamRuntime._prefill = _prefill_wrapper  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ def _build_runtime(
     max_seq_length: int,
     enable_cuda_graphs: bool,
     enable_compile: bool,
-) -> MoondreamTextRuntime:
+) -> MoondreamRuntime:
     dtype_map = {
         "bf16": torch.bfloat16,
         "bfloat16": torch.bfloat16,
@@ -449,10 +449,10 @@ def _build_runtime(
         max_batch_size=max_batch_size,
         max_seq_length=max_seq_length,
     )
-    return MoondreamTextRuntime(rt_cfg)
+    return MoondreamRuntime(rt_cfg)
 
 
-def _tokenize_prompt(runtime: MoondreamTextRuntime, prompt: str) -> torch.Tensor:
+def _tokenize_prompt(runtime: MoondreamRuntime, prompt: str) -> torch.Tensor:
     prompt_tokens = runtime.build_prompt_tokens(prompt)
     return prompt_tokens
 

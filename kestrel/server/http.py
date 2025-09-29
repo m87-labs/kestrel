@@ -158,8 +158,8 @@ class _ServerState:
 
         start_time = time.perf_counter()
         try:
-            result = await engine.submit(
-                question,
+            result = await engine.query(
+                question=question,
                 max_new_tokens=max_new_tokens,
                 image=image,
                 temperature=temperature,

@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.utils.image import ensure_srgb
 
 
@@ -121,7 +121,7 @@ class KVCalibrationCollector:
 
     def __init__(
         self,
-        runtime: MoondreamTextRuntime,
+        runtime: MoondreamRuntime,
         *,
         percentile: Optional[float] = None,
     ) -> None:
@@ -258,7 +258,7 @@ def _pair_prompts(prompts: Sequence[str], images: Sequence[pyvips.Image]) -> Lis
     return specs
 
 
-def _prepare_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
+def _prepare_runtime(args: argparse.Namespace) -> MoondreamRuntime:
     dtype = _resolve_dtype(args.dtype)
     model_paths = ModelPaths(
         weights=args.weights,
@@ -275,7 +275,7 @@ def _prepare_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
         enable_compile=not args.disable_compile,
         enable_cuda_graphs=not args.disable_cuda_graphs,
     )
-    return MoondreamTextRuntime(cfg)
+    return MoondreamRuntime(cfg)
 
 
 def _compute_scales(

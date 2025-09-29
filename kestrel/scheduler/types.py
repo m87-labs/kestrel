@@ -10,8 +10,9 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.models import SequenceState
+from kestrel.moondream.runtime import SequenceState
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.skills import SkillSpec
 
 
 @dataclass
@@ -22,6 +23,7 @@ class GenerationRequest:
     prompt: str
     prompt_tokens: Tensor
     max_new_tokens: int
+    skill: SkillSpec = field(repr=False)
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None

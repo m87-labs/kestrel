@@ -26,7 +26,7 @@ from kestrel.moondream.config import DEFAULT_MOONDREAM3_CONFIG
 from kestrel.moondream.rope import apply_rotary_emb as internal_apply_rotary
 from kestrel.moondream.text import layer_norm as internal_layer_norm
 from kestrel.moondream.text import text_encoder as internal_text_encoder
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 
 from moondream.torch.config import MoondreamConfig, TextMoeConfig as ExternalTextMoeConfig
 from moondream.torch.moondream import MoondreamModel

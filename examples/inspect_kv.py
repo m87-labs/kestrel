@@ -29,7 +29,7 @@ import moondream.torch.text as external_text
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.config import DEFAULT_MOONDREAM3_CONFIG
-from kestrel.models import MoondreamTextRuntime, SequenceState
+from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
 
 from moondream.torch.config import MoondreamConfig, TextMoeConfig as ExternalTextMoeConfig
 from moondream.torch.moondream import MoondreamModel
@@ -420,7 +420,7 @@ def _gather_external_kv(model: MoondreamModel, length: int) -> tuple[list[torch.
     return k_list, v_list
 
 
-def _gather_internal_kv(runtime: MoondreamTextRuntime, batch_idx: int, length: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+def _gather_internal_kv(runtime: MoondreamRuntime, batch_idx: int, length: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     page_size = runtime.page_table.page_size
     page_table = runtime.page_table.page_table[batch_idx].detach().cpu()
     logical = torch.arange(length, dtype=torch.long)
@@ -515,7 +515,7 @@ def _run_reference(
 
 
 def _run_internal(
-    runtime: MoondreamTextRuntime,
+    runtime: MoondreamRuntime,
     prompt_ids: list[int],
     reference_tokens: list[int],
     max_new_tokens: int,
@@ -586,7 +586,7 @@ def main() -> None:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
     )
-    runtime = MoondreamTextRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg)
 
     _, pref_kv_int, decode_kv_int = _run_internal(
         runtime,

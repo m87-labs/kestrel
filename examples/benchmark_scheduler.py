@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 
 
 @dataclass
@@ -110,7 +110,7 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 def _synthetic_prompts(
-    runtime: MoondreamTextRuntime,
+    runtime: MoondreamRuntime,
     *,
     count: int,
     min_tokens: int,

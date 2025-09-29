@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime, SequenceState
+from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
 
 
 @dataclass
@@ -136,7 +136,7 @@ def _load_prompts(args: argparse.Namespace) -> List[str]:
 
 
 def _prepare_payloads(
-    runtime: MoondreamTextRuntime,
+    runtime: MoondreamRuntime,
     prompts: Sequence[str],
     image: Optional["pyvips.Image"],
 ) -> List[PromptSpec]:
@@ -172,7 +172,7 @@ def _maybe_sync(device: torch.device) -> None:
 
 
 def _run_trial(
-    runtime: MoondreamTextRuntime,
+    runtime: MoondreamRuntime,
     payloads: Sequence[PromptSpec],
     batch_size: int,
     decode_steps: int,
@@ -261,7 +261,7 @@ def main() -> None:
         enable_cuda_graphs=not args.disable_cuda_graphs,
     )
 
-    runtime = MoondreamTextRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg)
     effective_max_batch = runtime.max_batch_size - 1  # batch index 0 reserved by paged cache
     print(
         f"Loaded runtime on {runtime.device} (dtype {runtime.dtype}), runtime max_batch_size={runtime.max_batch_size}"

@@ -161,7 +161,7 @@ class _LayerPagedCache(torch.nn.Module):
         )
 
 
-class MoondreamTextRuntime:
+class MoondreamRuntime:
     """High-level runtime for paged text-only Moondream inference."""
 
     def __init__(self, cfg: RuntimeConfig) -> None:
@@ -794,4 +794,4 @@ class MoondreamTextRuntime:
         workspace.position_buffer[:limit].zero_()
 
 
-__all__ = ["MoondreamTextRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]
+__all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]

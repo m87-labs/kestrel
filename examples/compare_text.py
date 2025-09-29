@@ -23,7 +23,7 @@ from tokenizers import Tokenizer
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.config import DEFAULT_MOONDREAM3_CONFIG
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 
 from moondream.torch.config import MoondreamConfig, TextMoeConfig as ExternalTextMoeConfig
 from moondream.torch.moondream import MoondreamModel
@@ -165,7 +165,7 @@ def main() -> None:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
     )
-    runtime = MoondreamTextRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg)
 
     prompt_tensor = torch.tensor(prompt_ids, device=runtime.device, dtype=torch.long).unsqueeze(0)
     with torch.no_grad():

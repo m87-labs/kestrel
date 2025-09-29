@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream import text as text_mod
 from kestrel.moondream.layers import (
     LayerNormWeights,
@@ -264,7 +264,7 @@ def summarise(records: Dict[str, List[PhaseSample]], steps: int) -> List[Summary
     return rows
 
 
-def build_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
+def build_runtime(args: argparse.Namespace) -> MoondreamRuntime:
     paths = ModelPaths(weights=args.weights)
     cfg = RuntimeConfig(
         model_paths=paths,
@@ -275,10 +275,10 @@ def build_runtime(args: argparse.Namespace) -> MoondreamTextRuntime:
         enable_compile=False,
         enable_cuda_graphs=False,
     )
-    return MoondreamTextRuntime(cfg)
+    return MoondreamRuntime(cfg)
 
 
-def make_prompt_tokens(runtime: MoondreamTextRuntime, length: int) -> torch.Tensor:
+def make_prompt_tokens(runtime: MoondreamRuntime, length: int) -> torch.Tensor:
     vocab = runtime.model.text.wte.shape[0]
     tokens = torch.randint(
         0, vocab, (1, length), device=runtime.device, dtype=torch.long

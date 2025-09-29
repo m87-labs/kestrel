@@ -13,10 +13,11 @@ import torch
 import pyvips
 
 from kestrel.config import RuntimeConfig
-from kestrel.models import MoondreamTextRuntime
+from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.scheduler import GenerationScheduler, SchedulerResult, StreamUpdate
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
+from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec
 
 
 @dataclass(slots=True)
@@ -122,6 +123,7 @@ class _PendingRequest:
     submitted_at: float
     future: asyncio.Future[EngineResult]
     stream_queue: Optional["_StreamQueue"]
+    skill: SkillSpec
 
 
 class InferenceEngine:
@@ -132,20 +134,22 @@ class InferenceEngine:
         runtime_cfg: RuntimeConfig,
         *,
         batch_timeout_s: float = 0.02,
+        skills: Optional[SkillRegistry] = None,
     ) -> None:
         self._runtime_cfg = runtime_cfg
         self._batch_timeout_s = batch_timeout_s
 
-        self._runtime: MoondreamTextRuntime | None = None
+        self._runtime: MoondreamRuntime | None = None
         self._queue: asyncio.Queue[_PendingRequest | None] = asyncio.Queue()
         self._worker_task: asyncio.Task[None] | None = None
         self._request_ids = itertools.count()
         self._shutdown = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._image_executor: ThreadPoolExecutor | None = None
+        self._skills = skills or SkillRegistry([QuerySkill()])
 
     @property
-    def runtime(self) -> MoondreamTextRuntime:
+    def runtime(self) -> MoondreamRuntime:
         if self._runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
         return self._runtime
@@ -160,8 +164,9 @@ class InferenceEngine:
         runtime_cfg: RuntimeConfig,
         *,
         batch_timeout_s: float = 0.02,
+        skills: Optional[SkillRegistry] = None,
     ) -> "InferenceEngine":
-        engine = cls(runtime_cfg, batch_timeout_s=batch_timeout_s)
+        engine = cls(runtime_cfg, batch_timeout_s=batch_timeout_s, skills=skills)
         await engine._initialize()
         return engine
 
@@ -170,7 +175,7 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
-        self._runtime = await loop.run_in_executor(None, MoondreamTextRuntime, self._runtime_cfg)
+        self._runtime = await loop.run_in_executor(None, MoondreamRuntime, self._runtime_cfg)
         await loop.run_in_executor(None, self._warmup)
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
@@ -213,6 +218,7 @@ class InferenceEngine:
         image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        skill: Optional[str | SkillSpec] = None,
     ) -> EngineResult:
         future, _ = await self._submit_request(
             prompt,
@@ -222,8 +228,27 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             stream_queue=None,
+            skill=skill,
         )
         return await future
+
+    async def query(
+        self,
+        *,
+        question: str,
+        max_new_tokens: int,
+        image: Optional[pyvips.Image] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> EngineResult:
+        return await self.submit(
+            question,
+            max_new_tokens=max_new_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
+            skill="query",
+        )
 
     async def submit_streaming(
         self,
@@ -234,6 +259,7 @@ class InferenceEngine:
         image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        skill: Optional[str | SkillSpec] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         future, request_id = await self._submit_request(
@@ -244,6 +270,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             stream_queue=queue,
+            skill=skill,
         )
         return EngineStream(request_id=request_id, queue=queue, result_future=future)
 
@@ -257,6 +284,7 @@ class InferenceEngine:
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
+        skill: Optional[str | SkillSpec],
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -265,6 +293,8 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
+
+        skill_spec = self._skills.resolve(skill)
 
         image_obj: Optional[pyvips.Image] = None
         if image is not None:
@@ -275,7 +305,13 @@ class InferenceEngine:
             image_obj = image
 
         if prompt_tokens is None:
-            tokens = self.runtime.build_prompt_tokens(prompt)
+            tokens = skill_spec.build_prompt_tokens(
+                self.runtime,
+                prompt,
+                image=image_obj,
+                image_crops=None,
+                options=None,
+            )
         else:
             tokens = prompt_tokens
 
@@ -292,6 +328,7 @@ class InferenceEngine:
             submitted_at=time.perf_counter(),
             future=future,
             stream_queue=stream_queue,
+            skill=skill_spec,
         )
         await self._queue.put(payload)
         return future, req_id
@@ -472,6 +509,7 @@ class InferenceEngine:
             self.runtime,
             default_temperature=0.0,
             default_top_p=1.0,
+            skill_registry=self._skills,
         )
         for req in batch:
             scheduler.submit(
@@ -484,6 +522,7 @@ class InferenceEngine:
                 temperature=req.temperature,
                 top_p=req.top_p,
                 stream_callback=self._build_stream_callback(req),
+                skill=req.skill,
             )
         results = scheduler.run()
         return {result.request_id: result for result in results}
