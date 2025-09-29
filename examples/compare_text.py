@@ -42,12 +42,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--page-size", type=int, default=128)
     parser.add_argument("--max-seq-length", type=int, default=None)
-    parser.add_argument(
-        "--kv-calibration",
-        type=Path,
-        default=None,
-        help="Path to FP8 calibration JSON to enable FP8 KV cache",
-    )
     return parser.parse_args()
 
 
@@ -170,7 +164,6 @@ def main() -> None:
         max_batch_size=2,
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
-        kv_calibration=args.kv_calibration,
     )
     runtime = MoondreamTextRuntime(runtime_cfg)
 

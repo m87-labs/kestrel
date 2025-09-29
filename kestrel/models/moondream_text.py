@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, cast
 
 import warnings
 
@@ -178,10 +178,6 @@ class MoondreamTextRuntime:
 
         self._kv_layer_k_scales: list[float] | None = None
         self._kv_layer_v_scales: list[float] | None = None
-        if cfg.kv_calibration is not None:
-            self._kv_layer_k_scales, self._kv_layer_v_scales = self._load_kv_calibration(
-                cfg.kv_calibration
-            )
 
         self.max_seq_length = cfg.max_seq_length or self.config.text.max_context
         if self.max_seq_length % cfg.page_size != 0:
@@ -202,14 +198,6 @@ class MoondreamTextRuntime:
             device=str(self.device),
         )
 
-        kv_cache_dtype = (
-            torch.float8_e4m3fn
-            if self._kv_layer_k_scales is not None and self._kv_layer_v_scales is not None
-            else self.dtype
-        )
-        self.kv_cache_dtype = kv_cache_dtype
-        self.kv_layout = "HND"
-
         self.model = MoondreamModel(
             self.config,
             dtype=self.dtype,
@@ -221,7 +209,60 @@ class MoondreamTextRuntime:
             if hasattr(self.model, "vision")
             else 0
         )
-        load_moondream_weights(str(cfg.model_paths.weights), self.model)
+        n_layers = self.config.text.n_layers
+        captured_k_scales: list[Optional[float]] = [None] * n_layers
+        captured_v_scales: list[Optional[float]] = [None] * n_layers
+
+        def _capture_kv_scale(name: str, tensor: torch.Tensor) -> None:
+            if not name.startswith("text_model.transformer.h."):
+                return
+            parts = name.split(".")
+            if len(parts) < 6:
+                return
+            try:
+                layer_idx = int(parts[3])
+            except ValueError:
+                return
+            if not (0 <= layer_idx < n_layers):
+                return
+            if parts[4] != "kv_quantizer":
+                return
+            target = parts[5]
+            value_tensor = tensor.detach()
+            if value_tensor.numel() != 1:
+                return
+            value = float(value_tensor.cpu().item())
+            if target == "k_scale":
+                captured_k_scales[layer_idx] = value
+            elif target == "v_scale":
+                captured_v_scales[layer_idx] = value
+
+        load_moondream_weights(
+            str(cfg.model_paths.weights),
+            self.model,
+            tensor_hook=_capture_kv_scale,
+        )
+
+        if all(val is not None for val in captured_k_scales) and all(
+            val is not None for val in captured_v_scales
+        ):
+            self._kv_layer_k_scales = [cast(float, val) for val in captured_k_scales]
+            self._kv_layer_v_scales = [cast(float, val) for val in captured_v_scales]
+        elif any(val is not None for val in captured_k_scales) or any(
+            val is not None for val in captured_v_scales
+        ):
+            warnings.warn(
+                "Partial KV scales found in checkpoint; falling back to standard KV cache.",
+                stacklevel=2,
+            )
+
+        if (
+            self._kv_layer_k_scales is not None
+            and self._kv_layer_v_scales is not None
+        ):
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        else:
+            self.kv_cache_dtype = self.dtype
 
         tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
@@ -243,7 +284,7 @@ class MoondreamTextRuntime:
                 page_table=self.page_table,
                 n_kv_heads=self.config.text.n_kv_heads,
                 head_dim=head_dim,
-                dtype=kv_cache_dtype,
+                dtype=self.kv_cache_dtype,
                 device=self.device,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -262,7 +303,6 @@ class MoondreamTextRuntime:
             device=self.device,
             q_dtype=self.dtype,
             kv_dtype=self.kv_cache_dtype,
-            kv_layout=self.kv_layout,
             page_size=self.page_size,
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_length,
@@ -449,41 +489,6 @@ class MoondreamTextRuntime:
     @torch.inference_mode()
     def _prefill(self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor) -> Tensor:
         return self._prefill_fn(inputs_embeds, attn_mask, position_ids)
-
-    def _load_kv_calibration(self, path: Path) -> tuple[list[float], list[float]]:
-        with Path(path).open("r", encoding="utf-8") as fp:
-            payload = json.load(fp)
-
-        try:
-            k_section = payload["k"]
-            v_section = payload["v"]
-        except KeyError as exc:  # pragma: no cover - defensive
-            raise ValueError("Invalid calibration file: missing 'k' or 'v' section") from exc
-
-        def _scales(section: dict[str, object]) -> list[float]:
-            if "per_layer_scale" in section:
-                values = section["per_layer_scale"]
-            else:
-                amax = section.get("per_layer_amax")
-                if amax is None:
-                    raise ValueError("Calibration file missing per-layer scale data")
-                metadata = payload.get("metadata", {})
-                fp8_max = metadata.get("fp8_max", 448.0)
-                guard = metadata.get("guard_factor", 1.0)
-                denom = fp8_max * guard if guard else fp8_max
-                values = [float(val) / denom for val in amax]
-            return [float(val) for val in values]
-
-        k_scales = _scales(k_section)
-        v_scales = _scales(v_section)
-
-        n_layers = self.config.text.n_layers
-        if len(k_scales) != n_layers or len(v_scales) != n_layers:
-            raise ValueError(
-                f"Calibration scales do not match model layers (expected {n_layers})"
-            )
-
-        return k_scales, v_scales
 
     def _prefill_impl(
         self,

@@ -104,7 +104,6 @@ def run_kestrel(
     enable_compile: bool,
     enable_cuda_graphs: bool,
     max_seq_length: int,
-    kv_calibration: Path | None,
 ) -> GenerationResult:
     paths = ModelPaths(weights=weights)
     runtime_cfg = RuntimeConfig(
@@ -115,7 +114,6 @@ def run_kestrel(
         enable_cuda_graphs=enable_cuda_graphs,
         max_batch_size=2,
         max_seq_length=max_seq_length,
-        kv_calibration=kv_calibration,
     )
 
     runtime = MoondreamTextRuntime(runtime_cfg)
@@ -155,12 +153,6 @@ def main() -> None:
         required=True,
         help="Which implementation to run. Invoke twice (once per mode) to compare outputs without loading both models concurrently.",
     )
-    parser.add_argument(
-        "--kv-calibration",
-        type=Path,
-        default=None,
-        help="Optional FP8 KV calibration JSON for Kestrel mode",
-    )
     args = parser.parse_args()
 
     device = _resolve_device(args.device)
@@ -194,7 +186,6 @@ def main() -> None:
             enable_compile=args.enable_compile,
             enable_cuda_graphs=args.enable_cuda_graphs,
             max_seq_length=args.kestrel_max_seq_length,
-            kv_calibration=args.kv_calibration,
         )
         print("Kestrel answer:")
         print(result.answer)

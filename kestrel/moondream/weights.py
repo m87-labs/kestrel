@@ -139,11 +139,22 @@ def _refresh_rotary_tables(model: nn.Module) -> None:
     )
 
 
-def load_text_weights(path: str, model: nn.Module) -> None:
-    load_moondream_weights(path, model, load_vision=False)
+def load_text_weights(
+    path: str,
+    model: nn.Module,
+    *,
+    tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+) -> None:
+    load_moondream_weights(path, model, load_vision=False, tensor_hook=tensor_hook)
 
 
-def load_moondream_weights(path: str, model: nn.Module, *, load_vision: bool = True) -> None:
+def load_moondream_weights(
+    path: str,
+    model: nn.Module,
+    *,
+    load_vision: bool = True,
+    tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+) -> None:
     target_dtype = next(model.text.parameters()).dtype
 
     def convert(tensor: torch.Tensor) -> torch.Tensor:
@@ -154,14 +165,22 @@ def load_moondream_weights(path: str, model: nn.Module, *, load_vision: bool = T
             name_map = {k.replace("._orig_mod", ""): k for k in get_tensor.keys()}
 
             def getter(name: str) -> torch.Tensor:
-                return convert(get_tensor(name_map[name]))
+                raw = get_tensor(name_map[name])
+                if tensor_hook is not None:
+                    tensor_hook(name, raw)
+                return convert(raw)
 
             _assign_text_weights(getter, model)
             if load_vision:
                 _assign_vision_weights(getter, model)
     else:
-        tensors = torch.load(path, map_location="cpu", weights_only=True)
-        tensors = {k.replace("._orig_mod", ""): convert(v) for k, v in tensors.items()}
+        tensors_raw = torch.load(path, map_location="cpu", weights_only=True)
+        tensors: dict[str, torch.Tensor] = {}
+        for key, value in tensors_raw.items():
+            name = key.replace("._orig_mod", "")
+            if tensor_hook is not None:
+                tensor_hook(name, value)
+            tensors[name] = convert(value)
 
         def getter(name: str) -> torch.Tensor:
             return tensors[name]

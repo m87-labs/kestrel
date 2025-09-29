@@ -116,8 +116,6 @@ class _PendingRequest:
     prompt_tokens: torch.Tensor
     prompt_length: int
     image: Optional[pyvips.Image]
-    precomputed_crops: Optional[OverlapCropOutput]
-    image_length: int
     max_new_tokens: int
     temperature: float
     top_p: float
@@ -282,15 +280,12 @@ class InferenceEngine:
             tokens = prompt_tokens
 
         tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
-        image_length = self.runtime.image_prefix_length if image_obj is not None else 0
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt,
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
             image=image_obj,
-            precomputed_crops=None,
-            image_length=image_length,
             max_new_tokens=max_new_tokens,
             temperature=self._normalize_temperature(temperature),
             top_p=self._normalize_top_p(top_p),
@@ -456,21 +451,22 @@ class InferenceEngine:
         queue.put_nowait(completion)
 
     def _run_batch(self, batch: Iterable[_PendingRequest]) -> dict[int, SchedulerResult]:
+        image_crops: dict[int, OverlapCropOutput] = {}
         if self._image_executor is not None:
-            futures: List[tuple[_PendingRequest, Future[OverlapCropOutput]]] = []
+            futures: List[tuple[int, Future[OverlapCropOutput]]] = []
             vision_config = self.runtime.config.vision
             for req in batch:
                 if req.image is not None:
                     futures.append(
                         (
-                            req,
+                            req.request_id,
                             self._image_executor.submit(
                                 compute_overlap_crops, req.image, vision_config
                             ),
                         )
                     )
-            for req, future in futures:
-                req.precomputed_crops = future.result()
+            for req_id, future in futures:
+                image_crops[req_id] = future.result()
 
         scheduler = GenerationScheduler(
             self.runtime,
@@ -483,7 +479,7 @@ class InferenceEngine:
                 max_new_tokens=req.max_new_tokens,
                 prompt_tokens=req.prompt_tokens.clone(),
                 image=req.image,
-                image_crops=req.precomputed_crops,
+                image_crops=image_crops.get(req.request_id),
                 request_id=req.request_id,
                 temperature=req.temperature,
                 top_p=req.top_p,

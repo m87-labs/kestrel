@@ -55,11 +55,6 @@ def _parse_args() -> argparse.Namespace:
         default=4096,
         help="Maximum total tokens (prompt + decode)",
     )
-    parser.add_argument(
-        "--kv-calibration",
-        type=Path,
-        help="Path to FP8 calibration JSON (enables FP8 KV cache)",
-    )
     parser.add_argument("--disable-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument(
         "--disable-cuda-graphs",
@@ -264,7 +259,6 @@ def main() -> None:
         max_seq_length=args.max_seq_length,
         enable_compile=not args.disable_compile,
         enable_cuda_graphs=not args.disable_cuda_graphs,
-        kv_calibration=args.kv_calibration,
     )
 
     runtime = MoondreamTextRuntime(runtime_cfg)

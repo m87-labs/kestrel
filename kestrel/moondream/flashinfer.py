@@ -47,7 +47,6 @@ class FlashInferDecodeContext:
         device: torch.device,
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
-        kv_layout: str,
         page_size: int,
         max_batch_size: int,
         max_seq_len: int,
@@ -57,13 +56,12 @@ class FlashInferDecodeContext:
         self.device = device
         self.q_dtype = q_dtype
         self.kv_dtype = kv_dtype
-        self.kv_layout = kv_layout
         self.page_size = page_size
         self.use_cuda_graphs = use_cuda_graphs
 
         self._workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
         self._decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-            self._workspace, kv_layout
+            self._workspace, "HND"
         )
 
         self._max_batch_size = max_batch_size
@@ -191,7 +189,7 @@ class FlashInferDecodeContext:
             kv_indptr,
             kv_indices,
             kv_last,
-            kv_layout=self.kv_layout,
+            kv_layout="HND",
         )
         state = _GraphState(
             wrapper=wrapper,
