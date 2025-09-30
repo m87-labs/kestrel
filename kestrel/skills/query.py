@@ -9,6 +9,8 @@ import pyvips
 import torch
 from torch import Tensor
 
+from kestrel.moondream.runtime import TextToken
+
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
@@ -218,7 +220,10 @@ class QuerySkillState(SkillState):
         *,
         reason: str,
     ) -> SkillFinalizeResult:
-        text = runtime.tokenizer.decode(list(self.tokens)) if self.tokens else ""
+        text_tokens = [
+            token.token_id for token in self.tokens if isinstance(token, TextToken)
+        ]
+        text = runtime.tokenizer.decode(text_tokens) if text_tokens else ""
         return SkillFinalizeResult(
             text=text,
             tokens=list(self.tokens),

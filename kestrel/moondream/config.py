@@ -58,9 +58,19 @@ class TokenizerConfig:
 
 
 @dataclass(frozen=True)
+class RegionConfig:
+    dim: int = 2048
+    coord_feat_dim: int = 256
+    coord_out_dim: int = 1024
+    size_feat_dim: int = 512
+    size_out_dim: int = 2048
+
+
+@dataclass(frozen=True)
 class MoondreamTextConfig:
     text: TextConfig = TextConfig()
     tokenizer: TokenizerConfig = TokenizerConfig()
+    region: RegionConfig = RegionConfig()
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> "MoondreamTextConfig":
@@ -72,14 +82,21 @@ class MoondreamTextConfig:
 
         tokenizer_dict = dict(config_dict.get("tokenizer", {}))
         tokenizer_cfg = TokenizerConfig(**tokenizer_dict)
-        return cls(text=text_cfg, tokenizer=tokenizer_cfg)
+
+        region_dict = dict(config_dict.get("region", {}))
+        region_cfg = RegionConfig(**region_dict)
+        return cls(text=text_cfg, tokenizer=tokenizer_cfg, region=region_cfg)
 
     def to_dict(self) -> Dict:
         text_dict = self.text.__dict__.copy()
         moe_cfg = text_dict.get("moe")
         if isinstance(moe_cfg, TextMoeConfig):
             text_dict["moe"] = moe_cfg.__dict__.copy()
-        return {"text": text_dict, "tokenizer": self.tokenizer.__dict__.copy()}
+        return {
+            "text": text_dict,
+            "tokenizer": self.tokenizer.__dict__.copy(),
+            "region": self.region.__dict__.copy(),
+        }
 
 
 DEFAULT_MOONDREAM3_CONFIG = {
@@ -120,6 +137,13 @@ DEFAULT_MOONDREAM3_CONFIG = {
             "point": {"prefix": [1, 2581, 2], "suffix": [3]},
         },
     },
+    "region": {
+        "dim": 2048,
+        "coord_feat_dim": 256,
+        "coord_out_dim": 1024,
+        "size_feat_dim": 512,
+        "size_out_dim": 2048,
+    },
 }
 
 @dataclass(frozen=True)
@@ -142,6 +166,7 @@ class MoondreamConfig:
     text: TextConfig = TextConfig()
     vision: VisionConfig = VisionConfig()
     tokenizer: TokenizerConfig = TokenizerConfig()
+    region: RegionConfig = RegionConfig()
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> "MoondreamConfig":
@@ -156,7 +181,9 @@ class MoondreamConfig:
 
         vision_dict = dict(config_dict.get("vision", {}))
         vision_cfg = VisionConfig(**vision_dict)
-        return cls(text=text_cfg, vision=vision_cfg, tokenizer=tokenizer_cfg)
+        region_dict = dict(config_dict.get("region", {}))
+        region_cfg = RegionConfig(**region_dict)
+        return cls(text=text_cfg, vision=vision_cfg, tokenizer=tokenizer_cfg, region=region_cfg)
 
     def to_dict(self) -> Dict:
         text_dict = self.text.__dict__.copy()
@@ -167,6 +194,7 @@ class MoondreamConfig:
             "text": text_dict,
             "vision": self.vision.__dict__.copy(),
             "tokenizer": self.tokenizer.__dict__.copy(),
+            "region": self.region.__dict__.copy(),
         }
 
 
@@ -174,12 +202,14 @@ DEFAULT_MOONDREAM_CONFIG = {
     "text": deepcopy(DEFAULT_MOONDREAM3_CONFIG["text"]),
     "vision": VisionConfig().__dict__.copy(),
     "tokenizer": deepcopy(DEFAULT_MOONDREAM3_CONFIG["tokenizer"]),
+    "region": RegionConfig().__dict__.copy(),
 }
 
 __all__ = [
     "TextMoeConfig",
     "TextConfig",
     "TokenizerConfig",
+    "RegionConfig",
     "VisionConfig",
     "MoondreamTextConfig",
     "MoondreamConfig",

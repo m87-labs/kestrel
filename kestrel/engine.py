@@ -42,6 +42,7 @@ from kestrel.scheduler import GenerationScheduler, GenerationRequest, SchedulerR
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
 from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec
+from kestrel.moondream.runtime import Token
 from kestrel.skills.query import QueryRequest
 
 
@@ -73,7 +74,7 @@ class EngineResult:
     request_id: int
     prompt: str
     text: str
-    tokens: List[int]
+    tokens: List[Token]
     finish_reason: str
     metrics: EngineMetrics
     extras: Dict[str, object]

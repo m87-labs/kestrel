@@ -10,7 +10,7 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.moondream.runtime import MoondreamRuntime, SequenceState
+from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
@@ -64,7 +64,7 @@ class ScheduledSequence:
     request: GenerationRequest
     state: SequenceState
     skill_state: SkillState
-    pending_token: Optional[int] = None
+    pending_token: Optional[Token] = None
     finished: bool = False
     finish_reason: Optional[str] = None
     started_at: float = field(default=0.0)
@@ -76,11 +76,18 @@ class ScheduledSequence:
         runtime: MoondreamRuntime,
         token_id: int,
     ) -> None:
-        token = int(token_id)
+        hidden = self.state.last_hidden
+        if hidden is None:
+            raise RuntimeError("SequenceState.last_hidden is not available")
+        token = runtime.render_token(token_id, hidden)
         self.pending_token = token
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
-        step = DecodeStep(token=token, position=self.skill_state.token_count)
+        step = DecodeStep(
+            token=token,
+            position=self.skill_state.token_count,
+            hidden=hidden,
+        )
         self.skill_state.consume_step(runtime, step)
 
     @property
@@ -92,8 +99,8 @@ class ScheduledSequence:
         )
 
     @property
-    def last_token(self) -> Optional[int]:
-        tokens: Sequence[int] = self.skill_state.tokens
+    def last_token(self) -> Optional[Token]:
+        tokens: Sequence[Token] = self.skill_state.tokens
         return tokens[-1] if tokens else None
 
     def needs_decode(self) -> bool:
@@ -106,7 +113,7 @@ class SchedulerResult:
 
     request_id: int
     prompt: str
-    tokens: List[int]
+    tokens: List[Token]
     text: str
     finish_reason: str
     metrics: "RequestMetrics"
@@ -118,7 +125,7 @@ class StreamUpdate:
     """Incremental token update emitted while a request is decoding."""
 
     request_id: int
-    token: int
+    token: Token
     text: str
     token_index: int
 

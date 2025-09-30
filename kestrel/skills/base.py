@@ -10,6 +10,7 @@ from torch import Tensor
 if False:  # pragma: no cover - type-checking imports
     from kestrel.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
+    from kestrel.moondream.runtime import Token
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,7 @@ class SkillSpec:
 class DecodeStep:
     """Raw token emission from the runtime decode loop."""
 
-    token: int
+    token: "Token"
     position: int
     phase: str = "answer"
     hidden: Optional[Tensor] = None
@@ -53,7 +54,7 @@ class SkillFinalizeResult:
     """Final materialisation of a skill-driven request."""
 
     text: str
-    tokens: List[int]
+    tokens: List["Token"]
     extras: Dict[str, object] = field(default_factory=dict)
 
 
@@ -63,7 +64,7 @@ class SkillState:
     def __init__(self, spec: SkillSpec, request: "GenerationRequest") -> None:
         self.spec = spec
         self.request = request
-        self._tokens: List[int] = []
+        self._tokens: List["Token"] = []
 
     # ------------------------------------------------------------------
 
@@ -88,11 +89,11 @@ class SkillState:
 
     # ------------------------------------------------------------------
 
-    def append_token(self, token: int) -> None:
+    def append_token(self, token: "Token") -> None:
         self._tokens.append(token)
 
     @property
-    def tokens(self) -> Sequence[int]:
+    def tokens(self) -> Sequence["Token"]:
         return self._tokens
 
     @property

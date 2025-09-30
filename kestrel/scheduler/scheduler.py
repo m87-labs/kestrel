@@ -10,7 +10,7 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.moondream.runtime import MoondreamRuntime
+from kestrel.moondream.runtime import MoondreamRuntime, TextToken, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec, SkillState
 
@@ -275,10 +275,26 @@ class GenerationScheduler:
             self.running.extend(idle)
             return False
 
-        token_ids = torch.tensor(
-            [seq.pending_token for seq in active], dtype=torch.long
+        pending_tokens: list[Token] = []
+        all_text = True
+        for seq in active:
+            token = seq.pending_token
+            if token is None:
+                raise RuntimeError("ScheduledSequence has no pending token during decode")
+            pending_tokens.append(token)
+            if not isinstance(token, TextToken):
+                all_text = False
+
+        if all_text:
+            token_input: Tensor | Sequence[Token] = torch.tensor(
+                [token.token_id for token in pending_tokens], dtype=torch.long
+            )
+        else:
+            token_input = pending_tokens
+
+        logits = self.runtime.decode_batch(
+            [seq.state for seq in active], token_input
         )
-        logits = self.runtime.decode_batch([seq.state for seq in active], token_ids)
 
         sampled_tokens = self._sample_batch(
             logits, [seq.request for seq in active]
@@ -318,7 +334,7 @@ class GenerationScheduler:
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token
         eos_id = self.runtime.config.tokenizer.eos_id
-        eos_hit = last_token == eos_id
+        eos_hit = isinstance(last_token, TextToken) and last_token.token_id == eos_id
         max_new_hit = seq.skill_state.token_count >= seq.request.max_new_tokens
         max_len_hit = seq.total_length >= seq.state.max_length
 

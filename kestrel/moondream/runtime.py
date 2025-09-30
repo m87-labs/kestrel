@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+import functools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, cast
+from typing import NamedTuple, Optional, Sequence, cast
 
 import warnings
 
@@ -33,10 +34,44 @@ from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
 )
+from .region import (
+    build_region_module,
+    encode_coordinate,
+    encode_size,
+    decode_coordinate,
+    decode_size,
+)
 
 
 
 DEFAULT_MAX_TOKENS = 768
+
+
+class TextToken(NamedTuple):
+    """Discrete text token represented by its vocabulary id."""
+
+    token_id: int
+
+
+class CoordToken(NamedTuple):
+    """Normalized positional token emitted or consumed by the region model."""
+
+    pos: float
+
+
+class SizeToken(NamedTuple):
+    """Normalized width/height token emitted or consumed by the region model."""
+
+    width: float
+    height: float
+
+
+Token = TextToken | CoordToken | SizeToken
+
+
+class RuntimeDecodeResult(NamedTuple):
+    logits: Tensor
+    hidden: Tensor
 
 
 @dataclass
@@ -48,6 +83,7 @@ class SequenceState:
     max_length: int
     prompt_length: int | None = None
     image_length: int = 0
+    last_hidden: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.prompt_length is None:
@@ -77,6 +113,7 @@ class _GraphWorkspace:
     batch_idx_buffer: Tensor
     position_buffer: Tensor
     output_buffer: Tensor
+    hidden_buffer: Tensor
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -200,6 +237,7 @@ class MoondreamRuntime:
             device=self.device,
             setup_caches=False,
         ).eval()
+        self.region = build_region_module(self.config.region, self.dtype).to(self.device)
         self.image_prefix_length = (
             self.model.vision.pos_emb.shape[1]
             if hasattr(self.model, "vision")
@@ -337,6 +375,162 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # Prompt helpers
 
+    @functools.cached_property
+    def bos_embed(self) -> Tensor:
+        bos = torch.tensor(
+            [[self.config.tokenizer.bos_id]],
+            device=self.device,
+            dtype=torch.long,
+        )
+        return text_encoder(bos, self.model.text)
+
+    def _embed_tokens(self, tokens: Sequence[Token]) -> Tensor:
+        """Embed an in-order prompt (single sequence) into shape (1, L, dim)."""
+
+        if not tokens:
+            dim = self.model.text.wte.weight.shape[1]
+            return torch.empty((1, 0, dim), device=self.device, dtype=self.dtype)
+
+        length = len(tokens)
+        width = self.model.text.wte.weight.shape[1]
+        out = torch.empty((1, length, width), device=self.device, dtype=self.dtype)
+
+        text_pos: list[int] = []
+        coord_pos: list[int] = []
+        size_pos: list[int] = []
+        text_ids: list[int] = []
+        coord_vals: list[float] = []
+        size_vals: list[tuple[float, float]] = []
+
+        for idx, token in enumerate(tokens):
+            if isinstance(token, TextToken):
+                text_pos.append(idx)
+                text_ids.append(token.token_id)
+            elif isinstance(token, CoordToken):
+                coord_pos.append(idx)
+                coord_vals.append(token.pos)
+            elif isinstance(token, SizeToken):
+                size_pos.append(idx)
+                size_vals.append((token.width, token.height))
+            else:  # pragma: no cover - defensive
+                raise TypeError(f"Unsupported token type: {type(token)!r}")
+
+        if text_ids:
+            ids = torch.tensor([text_ids], device=self.device, dtype=torch.long)
+            text_emb = text_encoder(ids, self.model.text)
+            out[:, text_pos, :] = text_emb
+
+        if coord_vals:
+            coords = torch.tensor(
+                coord_vals,
+                device=self.device,
+                dtype=self.region.coord_features.dtype,
+            ).view(-1, 1)
+            coord_emb = encode_coordinate(coords, self.region).to(dtype=self.dtype)
+            out[:, coord_pos, :] = coord_emb.unsqueeze(0)
+
+        if size_vals:
+            sizes = torch.tensor(
+                size_vals,
+                device=self.device,
+                dtype=self.region.size_features.dtype,
+            )
+            size_emb = encode_size(sizes, self.region).to(dtype=self.dtype)
+            out[:, size_pos, :] = size_emb.unsqueeze(0)
+
+        return out
+
+    def _embed_token_batch(self, tokens: Sequence[Token]) -> Tensor:
+        """Embed N pending tokens (one per active sequence) into (N, 1, dim)."""
+        if not tokens:
+            dim = self.model.text.wte.weight.shape[1]
+            return torch.empty((0, 1, dim), device=self.device, dtype=self.dtype)
+
+        batch = len(tokens)
+        dim = self.model.text.wte.weight.shape[1]
+        out = torch.empty((batch, 1, dim), device=self.device, dtype=self.dtype)
+
+        text_idx: list[int] = []
+        text_ids: list[int] = []
+        coord_idx: list[int] = []
+        coord_vals: list[float] = []
+        size_idx: list[int] = []
+        size_vals: list[tuple[float, float]] = []
+
+        for i, token in enumerate(tokens):
+            if isinstance(token, TextToken):
+                text_idx.append(i)
+                text_ids.append(token.token_id)
+            elif isinstance(token, CoordToken):
+                coord_idx.append(i)
+                coord_vals.append(token.pos)
+            elif isinstance(token, SizeToken):
+                size_idx.append(i)
+                size_vals.append((token.width, token.height))
+            else:  # pragma: no cover - defensive
+                raise TypeError(f"Unsupported token type: {type(token)!r}")
+
+        if text_idx:
+            ids = torch.tensor(text_ids, device=self.device, dtype=torch.long).view(
+                len(text_idx), 1
+            )
+            embeds = text_encoder(ids, self.model.text)
+            out[text_idx, :, :] = embeds
+
+        if coord_idx:
+            coords = torch.tensor(
+                coord_vals,
+                device=self.device,
+                dtype=self.region.coord_features.dtype,
+            ).view(len(coord_idx), 1)
+            embeds = encode_coordinate(coords, self.region).to(dtype=self.dtype)
+            out[coord_idx, 0, :] = embeds
+
+        if size_idx:
+            sizes = torch.tensor(
+                size_vals,
+                device=self.device,
+                dtype=self.region.size_features.dtype,
+            )
+            embeds = encode_size(sizes, self.region).to(dtype=self.dtype)
+            out[size_idx, 0, :] = embeds
+
+        return out
+
+    def render_token(self, token_id: int, hidden: Tensor) -> Token:
+        """Materialise a sampled id into its typed token, decoding coords/sizes."""
+        coord_id = self.config.tokenizer.coord_id
+        size_id = self.config.tokenizer.size_id
+
+        if hidden.ndim == 2:
+            hidden_row = hidden.squeeze(0)
+        else:
+            hidden_row = hidden
+
+        if token_id == coord_id:
+            logits = decode_coordinate(hidden_row.unsqueeze(0), self.region).squeeze(0)
+            bins = logits.shape[-1]
+            index = torch.argmax(logits).item()
+            denom = max(bins - 1, 1)
+            pos = float(min(max(index / denom, 0.0), 1.0))
+            return CoordToken(pos=pos)
+
+        if token_id == size_id:
+            logits = decode_size(hidden_row.unsqueeze(0), self.region)
+            width_logits = logits[0]
+            height_logits = logits[1]
+            bins = width_logits.shape[-1]
+            width_bin = torch.argmax(width_logits).item()
+            height_bin = torch.argmax(height_logits).item()
+            scale = float(bins - 1) if bins > 1 else 1.0
+            width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
+            height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
+            width = float(min(max(width, 0.0), 1.0))
+            height = float(min(max(height, 0.0), 1.0))
+            return SizeToken(width=width, height=height)
+
+        return TextToken(token_id=token_id)
+
     def encode_image(
         self,
         image: Optional[pyvips.Image],
@@ -354,47 +548,47 @@ class MoondreamRuntime:
 
     def start_sequence(
         self,
-        prompt_tokens: Tensor,
+        prompt_tokens: Tensor | Sequence[Token],
         *,
         image: Optional[pyvips.Image] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
     ) -> tuple[SequenceState, Tensor]:
-        prompt_tokens = prompt_tokens.to(device=self.device, dtype=torch.long)
-        if prompt_tokens.ndim != 2:
-            raise ValueError(
-                f"prompt_tokens must have shape (1, N); received {prompt_tokens.shape}"
-            )
-
-        embeddings: list[Tensor] = []
-        image_length = 0
-        # Always prepend the BOS embedding regardless of image presence so callers
-        # only provide skill-specific tokens.
-        bos_token = torch.tensor(
-            [[self.config.tokenizer.bos_id]], device=self.device, dtype=torch.long
+        bos_embed = text_encoder(
+            torch.tensor(
+                [[self.config.tokenizer.bos_id]],
+                device=self.device,
+                dtype=torch.long,
+            ),
+            self.model.text,
         )
-        bos_embed = text_encoder(bos_token, self.model.text)
-        embeddings.append(bos_embed)
 
-        remainder: Optional[Tensor] = None
-        if prompt_tokens.shape[1] > 0:
-            remainder = text_encoder(prompt_tokens, self.model.text)
+        if isinstance(prompt_tokens, Tensor):
+            tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
+            if tokens_view.ndim != 2:
+                raise ValueError(
+                    f"prompt_tokens must have shape (1, N); received {tokens_view.shape}"
+                )
+            prompt_embed = (
+                text_encoder(tokens_view, self.model.text)
+                if tokens_view.shape[1]
+                else None
+            )
+        else:
+            prompt_embed = self._embed_tokens(list(prompt_tokens))
+            if prompt_embed.shape[1] == 0:
+                prompt_embed = None
 
+        segments: list[Tensor] = [self.bos_embed]
+        image_length = 0
         if image is not None or image_crops is not None:
-            image_proj = self.encode_image(
-                image,
-                overlap=image_crops,
-            ).unsqueeze(0)
-            embeddings.append(image_proj)
-            if remainder is not None:
-                embeddings.append(remainder)
-            image_length = image_proj.shape[1]
-        elif remainder is not None:
-            embeddings.append(remainder)
+            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
+            segments.append(image_embed)
+            image_length = image_embed.shape[1]
+        if prompt_embed is not None:
+            segments.append(prompt_embed)
 
-        # Filter out any None placeholders before concatenation (e.g., when prompt
-        # tokens are empty).
-        inputs_embeds = torch.cat([emb for emb in embeddings if emb is not None], dim=1)
+        inputs_embeds = torch.cat(segments, dim=1)
 
         prompt_len = inputs_embeds.shape[1]
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
@@ -423,13 +617,14 @@ class MoondreamRuntime:
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
             max_length=target_length,
             prompt_length=prompt_len,
             image_length=image_length,
+            last_hidden=hidden[:, -1, :].squeeze(0).detach(),
         )
         self.active_sequences[batch_idx] = state
         return state, logits
@@ -442,15 +637,18 @@ class MoondreamRuntime:
     # Core forward paths
 
     @torch.inference_mode()
-    def _prefill(self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor) -> Tensor:
-        return self._prefill_fn(inputs_embeds, attn_mask, position_ids)
+    def _prefill(
+        self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids)
+        return hidden, logits
 
     def _prefill_impl(
         self,
         inputs_embeds: Tensor,
         attn_mask: Tensor,
         position_ids: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         hidden = text_decoder(
             inputs_embeds,
             self.model.text,
@@ -460,12 +658,11 @@ class MoondreamRuntime:
             mode="prefill",
         )
         logits = lm_head(hidden, self.model.text)
-        return logits
+        return hidden, logits
 
     @torch.inference_mode()
-    def decode(self, state: SequenceState, token_id: Tensor) -> Tensor:
-        token_vector = token_id.view(-1)
-        logits = self.decode_batch([state], token_vector)[0]
+    def decode(self, state: SequenceState, token_id: Tensor | Token) -> Tensor:
+        logits = self.decode_batch([state], token_id)[0]
         state.advance()
         return logits.unsqueeze(0)
 
@@ -473,16 +670,10 @@ class MoondreamRuntime:
     def decode_batch(
         self,
         states: Sequence[SequenceState],
-        token_ids: Tensor,
+        token_inputs: Tensor | Sequence[Token],
     ) -> Tensor:
         if not states:
             raise ValueError("states must not be empty")
-
-        if token_ids.ndim > 1:
-            token_ids = token_ids.view(-1)
-
-        if token_ids.shape[0] != len(states):
-            raise ValueError("token_ids and states must have matching batch dimensions")
 
         batch_idx = torch.tensor(
             [state.batch_idx for state in states],
@@ -495,15 +686,49 @@ class MoondreamRuntime:
             dtype=torch.int32,
         )
 
-        tokens = token_ids.to(device=self.device, dtype=torch.long)
+        tokens_tensor: Optional[Tensor] = None
+        token_seq: Optional[Sequence[Token]] = None
+
+        if isinstance(token_inputs, Tensor):
+            tokens_tensor = token_inputs
+            if tokens_tensor.ndim > 1:
+                tokens_tensor = tokens_tensor.view(-1)
+            if tokens_tensor.shape[0] != len(states):
+                raise ValueError(
+                    "token_ids and states must have matching batch dimensions"
+                )
+            tokens_tensor = tokens_tensor.to(device=self.device, dtype=torch.long)
+        else:
+            token_seq = list(token_inputs)
+            if len(token_seq) != len(states):
+                raise ValueError(
+                    "token list and states must have matching batch dimensions"
+                )
+
         batch_size = batch_idx.shape[0]
-        if self._use_cuda_graphs and batch_size > 0:
+        result: RuntimeDecodeResult
+        if (
+            tokens_tensor is not None
+            and self._use_cuda_graphs
+            and batch_size > 0
+        ):
             graph_batch_size = self._select_graph_batch_size(batch_size)
             if graph_batch_size is not None and self._cuda_graphs:
-                return self._decode_with_graph(
-                    batch_idx, tokens, input_pos, graph_batch_size
+                result = self._decode_with_graph(
+                    batch_idx, tokens_tensor, input_pos, graph_batch_size
                 )
-        return self._decode_step(batch_idx, tokens, input_pos)
+            else:
+                result = self._decode_step(batch_idx, tokens_tensor, input_pos)
+        else:
+            token_arg: Tensor | Sequence[Token]
+            token_arg = tokens_tensor if tokens_tensor is not None else token_seq  # type: ignore[assignment]
+            result = self._decode_step(batch_idx, token_arg, input_pos)
+
+        hidden_last = result.hidden[:, -1, :]
+        for state, vec in zip(states, hidden_last):
+            state.last_hidden = vec.detach()
+
+        return result.logits
 
     def _build_flashinfer_metadata(
         self,
@@ -539,18 +764,21 @@ class MoondreamRuntime:
     def _decode_step(
         self,
         batch_idx: Tensor,
-        tokens: Tensor,
+        token_inputs: Tensor | Sequence[Token],
         input_pos: Tensor,
         *,
         use_graph: bool = False,
         full_batch_size: Optional[int] = None,
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
         skip_plan: bool = False,
-    ) -> Tensor:
+    ) -> RuntimeDecodeResult:
         for cache in self.layer_caches:
             cache.set_active_batch(batch_idx)
 
-        embeds = text_encoder(tokens.view(-1, 1), self.model.text)
+        if isinstance(token_inputs, Tensor):
+            embeds = text_encoder(token_inputs.view(-1, 1), self.model.text)
+        else:
+            embeds = self._embed_token_batch(token_inputs)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
 
         metadata = flashinfer_metadata
@@ -580,7 +808,7 @@ class MoondreamRuntime:
             mode="decode",
         )
         logits = lm_head(hidden, self.model.text)
-        return logits
+        return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
     def _decode_with_graph(
         self,
@@ -588,7 +816,7 @@ class MoondreamRuntime:
         tokens: Tensor,
         input_pos: Tensor,
         graph_batch_size: int,
-    ) -> Tensor:
+    ) -> RuntimeDecodeResult:
         workspace = self._graph_workspace
         if workspace is None:
             raise RuntimeError("CUDA graph workspace is not initialized")
@@ -618,7 +846,9 @@ class MoondreamRuntime:
 
         graph = self._cuda_graphs[graph_batch_size]
         graph.replay()
-        return workspace.output_buffer[:batch_size].clone()
+        logits = workspace.output_buffer[:batch_size].clone()
+        hidden = workspace.hidden_buffer[:batch_size].clone().unsqueeze(1)
+        return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
     def _ensure_cuda_graphs_ready(self) -> None:
         if not self._use_cuda_graphs or self._cuda_graphs:
@@ -645,11 +875,17 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.model.text.lm_head.weight.dtype,
         )
+        hidden_buffer = torch.zeros(
+            (max_effective_batch, self.model.text.lm_head.weight.shape[1]),
+            device=self.device,
+            dtype=self.model.text.lm_head.weight.dtype,
+        )
         self._graph_workspace = _GraphWorkspace(
             token_buffer=token_buffer,
             batch_idx_buffer=batch_idx_buffer,
             position_buffer=position_buffer,
             output_buffer=output_buffer,
+            hidden_buffer=hidden_buffer,
         )
         self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
 
@@ -707,7 +943,8 @@ class MoondreamRuntime:
                         flashinfer_metadata=metadata,
                         skip_plan=False,
                     )
-                    workspace.output_buffer[:bs].copy_(warmup)
+                    workspace.output_buffer[:bs].copy_(warmup.logits)
+                    workspace.hidden_buffer[:bs].copy_(warmup.hidden[:, 0, :])
 
                     torch.cuda.synchronize(device=device)
 
@@ -721,7 +958,8 @@ class MoondreamRuntime:
                             flashinfer_metadata=metadata,
                             skip_plan=True,
                         )
-                        workspace.output_buffer[:bs].copy_(out)
+                        workspace.output_buffer[:bs].copy_(out.logits)
+                        workspace.hidden_buffer[:bs].copy_(out.hidden[:, 0, :])
 
                 if self._graph_pool is None:
                     self._graph_pool = graph.pool()
@@ -747,6 +985,7 @@ class MoondreamRuntime:
         workspace.token_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
+        workspace.hidden_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]
