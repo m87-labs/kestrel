@@ -17,11 +17,11 @@ Internal API overview:
 
 - :meth:`InferenceEngine.create` / :meth:`InferenceEngine.shutdown`: manage runtime instantiation and cleanup.
 - :meth:`InferenceEngine.submit` / :meth:`InferenceEngine.submit_streaming`: enqueue non-streaming or streaming requests with optional pre-tokenised prompts.
-- :meth:`InferenceEngine.query`: helper that wraps the default query skill with a validated :class:`QueryRequest`.
+- :meth:`InferenceEngine.query`: helper that mirrors ``moondream.query`` while internally materialising the skill context.
 - `_submit_request`: normalises parameters, resolves the skill, builds prompt tokens when missing, and stashes a ``skill_context`` so the scheduler receives a fully initialised ``SkillState``.
 - `_worker_loop`: background task that batches queued requests, invokes the scheduler, and delivers results or stream completions back to callers.
 
-Clients should construct skill-specific request objects (e.g. ``QueryRequest``) whenever possible so the engine can enforce validation before work reaches the scheduler.
+Callers provide raw questions/objects; the engine derives skill-specific contexts and validation before handing work to the scheduler.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import itertools
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import AsyncIterator, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import pyvips
@@ -43,8 +43,8 @@ from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
 from kestrel.skills import PointSkill, QuerySkill, SkillRegistry, SkillSpec
 from kestrel.moondream.runtime import Token
-from kestrel.skills.query import QueryRequest
-from kestrel.skills.point import PointRequest
+from kestrel.skills.query import QueryRequest, QuerySettings
+from kestrel.skills.point import PointRequest, PointSettings
 
 
 @dataclass(slots=True)
@@ -176,6 +176,9 @@ class InferenceEngine:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._image_executor: ThreadPoolExecutor | None = None
         self._skills = skills or SkillRegistry([QuerySkill(), PointSkill()])
+        self._default_max_new_tokens = 64
+        self._default_temperature = 0.0
+        self._default_top_p = 1.0
 
     @property
     def runtime(self) -> MoondreamRuntime:
@@ -270,32 +273,96 @@ class InferenceEngine:
 
     async def query(
         self,
-        request: QueryRequest,
-        *,
-        max_new_tokens: int,
-    ) -> EngineResult:
+        image: Optional[pyvips.Image] = None,
+        question: Optional[str] = None,
+        reasoning: bool = True,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
+        stream: bool = False,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> EngineResult | EngineStream:
+        if question is None:
+            raise ValueError("question must be provided")
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise ValueError("question must be a non-empty string")
+        if reasoning:
+            raise ValueError("Reasoning mode is not implemented")
+        if spatial_refs is not None:
+            raise ValueError("spatial_refs are not supported")
+        if stream:
+            raise ValueError("Streaming query responses are not implemented")
+
+        temperature = self._default_temperature
+        top_p = self._default_top_p
+        max_tokens = self._default_max_new_tokens
+        if settings is not None:
+            if "temperature" in settings:
+                temperature = float(settings["temperature"])
+            if "top_p" in settings:
+                top_p = float(settings["top_p"])
+            if "max_tokens" in settings:
+                max_tokens = int(settings["max_tokens"])
+
+        if temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p must be in the range (0, 1]")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        request = QueryRequest(
+            question=normalized_question,
+            image=image,
+            reasoning=False,
+            stream=False,
+            settings=QuerySettings(temperature=temperature, top_p=top_p),
+        )
         return await self.submit(
-            request.question,
-            max_new_tokens=max_new_tokens,
-            image=request.image,
-            temperature=request.settings.temperature,
-            top_p=request.settings.top_p,
+            normalized_question,
+            max_new_tokens=max_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
             skill="query",
             skill_context=request,
         )
 
     async def point(
         self,
-        request: PointRequest,
-        *,
-        max_new_tokens: int,
+        image: Optional[pyvips.Image],
+        object: str,
+        settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
+        normalized_object = object.strip()
+        if not normalized_object:
+            raise ValueError("object must be a non-empty string")
+
+        max_tokens = self._default_max_new_tokens
+        temperature = 0.0
+        top_p = 1.0
+        if settings is not None:
+            if "max_tokens" in settings:
+                max_tokens = int(settings["max_tokens"])
+            if "temperature" in settings:
+                temperature = float(settings["temperature"])
+            if "top_p" in settings:
+                top_p = float(settings["top_p"])
+
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        request = PointRequest(
+            object=normalized_object,
+            image=image,
+            stream=False,
+            settings=PointSettings(temperature=temperature, top_p=top_p),
+        )
         return await self.submit(
-            request.object,
-            max_new_tokens=max_new_tokens,
-            image=request.image,
-            temperature=request.settings.temperature,
-            top_p=request.settings.top_p,
+            normalized_object,
+            max_new_tokens=max_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
             skill="point",
             skill_context=request,
         )

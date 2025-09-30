@@ -160,6 +160,12 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         batch_timeout_s=args.batch_timeout_ms / 1000.0,
     )
     try:
+        query_settings = {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_new_tokens,
+        }
+
         if args.stream:
             streams = []
             for prompt in args.prompts:
@@ -176,8 +182,8 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
                 stream = await engine.submit_streaming(
                     prompt,
                     max_new_tokens=args.max_new_tokens,
-                    temperature=request.settings.temperature,
-                    top_p=request.settings.top_p,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
                     skill="query",
                     skill_context=request,
                 )
@@ -190,27 +196,16 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
 
             results = await asyncio.gather(*(consume(stream) for stream in streams))
         else:
-            submissions = [
-                engine.submit(
-                    prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    skill="query",
-                    skill_context=QueryRequest(
+            results = await asyncio.gather(
+                *[
+                    engine.query(
                         question=prompt,
-                        image=None,
                         reasoning=False,
-                        stream=False,
-                        settings=QuerySettings(
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                        ),
-                    ),
-                )
-                for prompt in args.prompts
-            ]
-            results = await asyncio.gather(*submissions)
+                        settings=query_settings,
+                    )
+                    for prompt in args.prompts
+                ]
+            )
     finally:
         await engine.shutdown()
 

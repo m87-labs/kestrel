@@ -27,7 +27,7 @@ from moondream.torch.weights import load_weights_into_model as load_reference_we
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.utils.image import ensure_srgb
-from kestrel.skills import QueryRequest, QuerySettings, QuerySkill, SkillRegistry
+from kestrel.skills import QuerySkill, SkillRegistry
 from kestrel.engine import InferenceEngine
 
 
@@ -122,27 +122,16 @@ async def run_kestrel(
     registry = SkillRegistry([skill])
     engine = await InferenceEngine.create(runtime_cfg, skills=registry)
     try:
-        request = QueryRequest(
-            question=prompt,
+        result = await engine.query(
             image=image,
+            question=prompt,
             reasoning=False,
             stream=False,
-            settings=QuerySettings(temperature=0.0, top_p=1.0),
-        )
-        prompt_tokens = skill.build_prompt_tokens(
-            engine.runtime,
-            prompt,
-            image=image,
-        )
-        result = await engine.submit(
-            prompt,
-            prompt_tokens=prompt_tokens,
-            image=image,
-            max_new_tokens=max_new_tokens,
-            temperature=request.settings.temperature,
-            top_p=request.settings.top_p,
-            skill=skill,
-            skill_context=request,
+            settings={
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_tokens": max_new_tokens,
+            },
         )
         answer = result.extras.get("answer", result.text)
     finally:

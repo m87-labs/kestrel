@@ -7,8 +7,8 @@ from .base import (
     SkillSpec,
     SkillState,
 )
-from .point import PointDefaults, PointInvocation, PointRequest, PointSettings, PointSkill
-from .query import QueryDefaults, QueryInvocation, QueryRequest, QuerySettings, QuerySkill
+from .point import PointRequest, PointSettings, PointSkill
+from .query import QueryRequest, QuerySettings, QuerySkill
 
 __all__ = [
     "DecodeStep",
@@ -16,13 +16,9 @@ __all__ = [
     "SkillRegistry",
     "SkillSpec",
     "SkillState",
-    "PointDefaults",
-    "PointInvocation",
     "PointRequest",
     "PointSettings",
     "PointSkill",
-    "QueryDefaults",
-    "QueryInvocation",
     "QueryRequest",
     "QuerySettings",
     "QuerySkill",

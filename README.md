@@ -15,7 +15,6 @@
 ```python
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
-from kestrel.skills import QueryRequest, QuerySettings
 import pyvips
 
 cfg = RuntimeConfig(
@@ -28,19 +27,26 @@ cfg = RuntimeConfig(
 engine = await InferenceEngine.create(cfg)
 
 image = pyvips.Image.new_from_file("demo.jpg")
-request = QueryRequest(
-    question="Describe the image.",
+result = await engine.query(
     image=image,
-    reasoning=False,
-    stream=False,
-    settings=QuerySettings(temperature=0.0, top_p=1.0),
+    question="Describe the image.",
+    settings={
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 128,
+    },
 )
-
-result = await engine.query(request, max_new_tokens=128)
 print(result.extras["answer"])
+
+point_result = await engine.point(
+    image,
+    "cat",
+    settings={"max_tokens": 10},
+)
+print(point_result.extras["points"])
 ```
 
-- `InferenceEngine.query(...)` routes to the `query` skill (the default text+image path) using a validated `QueryRequest`.
+- `InferenceEngine.query(...)` and `InferenceEngine.point(...)` mirror the `moondream` reference API (async, with optional ``settings`` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
 - `InferenceEngine.submit(...)` remains available for advanced callers who want to pass raw prompt tokens or experiment with additional skills.
 
 ### Skills
@@ -62,10 +68,10 @@ print(result.extras["answer"])
 {
   "question": "Describe the image",
   "image_url": "data:image/png;base64,<...>",
-  "max_new_tokens": 128,
   "settings": {
     "temperature": 0.0,
-    "top_p": 1.0
+    "top_p": 1.0,
+    "max_tokens": 128
   }
 }
 ```
@@ -78,10 +84,11 @@ Response fields include the generated `answer`, `finish_reason`, and timing metr
 {
   "object": "burger",
   "image_url": "data:image/png;base64,<...>",
-  "max_points": 16
+  "settings": {
+    "max_tokens": 10
+  }
 }
 ```
-
 Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request metadata, and the same timing metrics as `/v1/query`.
 
 ## Usage Examples

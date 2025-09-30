@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.moondream.runtime import MoondreamRuntime
-from kestrel.skills import QueryRequest, QuerySettings, QuerySkill
+from kestrel.skills import QuerySkill
 
 
 @dataclass
@@ -35,7 +35,6 @@ class PromptPayload:
     tokens: torch.Tensor  # stored on CPU for reuse
     length: int  # number of tokens including BOS/prefix/suffix
     image: Optional[pyvips.Image] = None
-    request: QueryRequest
 
 
 def _parse_args() -> argparse.Namespace:
@@ -156,13 +155,6 @@ def _synthetic_prompts(
             base = tokenizer.decode(token_ids)
 
         current_image = next(image_iter) if image_iter is not None else None
-        request = QueryRequest(
-            question=base,
-            image=current_image,
-            reasoning=False,
-            stream=False,
-            settings=QuerySettings(temperature=0.0, top_p=1.0),
-        )
         prompt_tokens = skill.build_prompt_tokens(
             runtime,
             base,
@@ -174,7 +166,6 @@ def _synthetic_prompts(
                 tokens=prompt_tokens,
                 length=prompt_tokens.shape[1],
                 image=current_image,
-                request=request,
             )
         )
 
@@ -199,10 +190,9 @@ async def _run_round(
             max_new_tokens=max_new_tokens,
             prompt_tokens=payload.tokens.clone(),
             image=payload.image,
-            temperature=payload.request.settings.temperature,
-            top_p=payload.request.settings.top_p,
+            temperature=0.0,
+            top_p=1.0,
             skill="query",
-            skill_context=payload.request,
         )
         for payload in prompts
     ]
