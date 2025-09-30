@@ -8,6 +8,7 @@ from .base import (
     SkillState,
 )
 from .detect import DetectRequest, DetectSettings, DetectSkill
+from .caption import CaptionRequest, CaptionSettings, CaptionSkill
 from .point import PointRequest, PointSettings, PointSkill
 from .query import QueryRequest, QuerySettings, QuerySkill
 
@@ -20,6 +21,9 @@ __all__ = [
     "DetectRequest",
     "DetectSettings",
     "DetectSkill",
+    "CaptionRequest",
+    "CaptionSettings",
+    "CaptionSkill",
     "PointRequest",
     "PointSettings",
     "PointSkill",

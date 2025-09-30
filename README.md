@@ -112,6 +112,22 @@ Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request
 
 Returns `objects` (each `{ "x_min", "y_min", "x_max", "y_max" }`), the finish reason, and latency metrics matching `/v1/query`.
 
+`POST /v1/caption`
+
+```json
+{
+  "image_url": "data:image/png;base64,<...>",
+  "length": "normal",
+  "settings": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_tokens": 64
+  }
+}
+```
+
+Responses include the generated `caption`, finish reason, and the standard metrics block.
+
 ## Usage Examples
 
 ### Vision + Text Parity Check (reference run)

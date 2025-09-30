@@ -31,18 +31,42 @@ import itertools
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 import pyvips
 
 from kestrel.config import RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
-from kestrel.scheduler import GenerationScheduler, GenerationRequest, SchedulerResult, StreamUpdate
+from kestrel.scheduler import (
+    GenerationScheduler,
+    GenerationRequest,
+    SchedulerResult,
+    StreamUpdate,
+)
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
-from kestrel.skills import DetectSkill, PointSkill, QuerySkill, SkillRegistry, SkillSpec
+from kestrel.skills import (
+    CaptionSkill,
+    DetectSkill,
+    PointSkill,
+    QuerySkill,
+    SkillRegistry,
+    SkillSpec,
+)
 from kestrel.moondream.runtime import Token
+from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
@@ -139,6 +163,7 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         self._final_result = result
         return result
 
+
 @dataclass(slots=True)
 class _PendingRequest:
     request_id: int
@@ -176,8 +201,10 @@ class InferenceEngine:
         self._shutdown = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._image_executor: ThreadPoolExecutor | None = None
-        self._skills = skills or SkillRegistry([QuerySkill(), PointSkill(), DetectSkill()])
-        self._default_max_new_tokens = 64
+        self._skills = skills or SkillRegistry(
+            [QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill()]
+        )
+        self._default_max_new_tokens = 512
         self._default_temperature = 0.0
         self._default_top_p = 1.0
 
@@ -212,7 +239,9 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
-        self._runtime = await loop.run_in_executor(None, MoondreamRuntime, self._runtime_cfg)
+        self._runtime = await loop.run_in_executor(
+            None, MoondreamRuntime, self._runtime_cfg
+        )
         await loop.run_in_executor(None, self._warmup)
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
@@ -371,6 +400,57 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             skill="point",
+            skill_context=request,
+        )
+
+    async def caption(
+        self,
+        image: pyvips.Image,
+        *,
+        length: str = "normal",
+        stream: bool = False,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> EngineResult:
+        if image is None:
+            raise ValueError("image must be provided for captioning")
+        normalized_length = length.strip().lower() or "normal"
+        if normalized_length not in CaptionSkill.VALID_LENGTHS:
+            valid = ", ".join(sorted(CaptionSkill.VALID_LENGTHS))
+            raise ValueError(f"length must be one of: {valid}")
+        if stream:
+            raise ValueError("Streaming captions are not supported")
+
+        temperature = self._default_temperature
+        top_p = self._default_top_p
+        max_tokens = self._default_max_new_tokens
+        if settings is not None:
+            if "temperature" in settings:
+                temperature = float(settings["temperature"])
+            if "top_p" in settings:
+                top_p = float(settings["top_p"])
+            if "max_tokens" in settings:
+                max_tokens = int(settings["max_tokens"])
+
+        if temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p must be in the range (0, 1]")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        request = CaptionRequest(
+            length=normalized_length,
+            image=image,
+            stream=False,
+            settings=CaptionSettings(temperature=temperature, top_p=top_p),
+        )
+        return await self.submit(
+            normalized_length,
+            max_new_tokens=max_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
+            skill="caption",
             skill_context=request,
         )
 
@@ -656,7 +736,9 @@ class InferenceEngine:
         completion = _StreamCompletion(result=result, error=error)
         queue.put_nowait(completion)
 
-    def _run_batch(self, batch: Iterable[_PendingRequest]) -> dict[int, SchedulerResult]:
+    def _run_batch(
+        self, batch: Iterable[_PendingRequest]
+    ) -> dict[int, SchedulerResult]:
         image_crops: dict[int, OverlapCropOutput] = {}
         if self._image_executor is not None:
             futures: List[tuple[int, Future[OverlapCropOutput]]] = []
@@ -685,7 +767,11 @@ class InferenceEngine:
             prompt_tokens = req.prompt_tokens.clone()
             stream_cb = self._build_stream_callback(req)
             crops = image_crops.get(req.request_id)
-            image_length = runtime.image_prefix_length if (req.image is not None or crops is not None) else 0
+            image_length = (
+                runtime.image_prefix_length
+                if (req.image is not None or crops is not None)
+                else 0
+            )
             request_obj = GenerationRequest(
                 request_id=req.request_id,
                 prompt=req.prompt,
@@ -699,7 +785,9 @@ class InferenceEngine:
                 image_length=image_length,
                 skill=req.skill,
             )
-            skill_state = req.skill.create_state(runtime, request_obj, context=req.skill_context)
+            skill_state = req.skill.create_state(
+                runtime, request_obj, context=req.skill_context
+            )
             scheduler.enqueue_request(request_obj, skill_state)
         results = scheduler.run()
         return {result.request_id: result for result in results}
