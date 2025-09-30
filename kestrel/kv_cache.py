@@ -59,13 +59,18 @@ class PagedKVCache(torch.nn.Module):
         if not self.quantized:
             return tensor
         scale = self.k_inv_scale_tensor.to(dtype=tensor.dtype)
-        return (tensor * scale).to(self.k_cache.dtype)
+        scaled = tensor * scale
+        # float8_e4m3fn saturates around ±448; clamp to avoid Inf/NaN during cast.
+        scaled = torch.clamp(scaled, min=-448.0, max=448.0)
+        return scaled.to(self.k_cache.dtype)
 
     def _prepare_value_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self.quantized:
             return tensor
         scale = self.v_inv_scale_tensor.to(dtype=tensor.dtype)
-        return (tensor * scale).to(self.v_cache.dtype)
+        scaled = tensor * scale
+        scaled = torch.clamp(scaled, min=-448.0, max=448.0)
+        return scaled.to(self.v_cache.dtype)
 
     def update(self, input_pos, k_val, v_val, batch_idx=None):
         assert (

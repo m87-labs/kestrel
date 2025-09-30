@@ -275,6 +275,7 @@ class MoondreamRuntime:
             str(cfg.model_paths.weights),
             self.model,
             tensor_hook=_capture_kv_scale,
+            region=self.region,
         )
 
         if all(val is not None for val in captured_k_scales) and all(
@@ -388,11 +389,11 @@ class MoondreamRuntime:
         """Embed an in-order prompt (single sequence) into shape (1, L, dim)."""
 
         if not tokens:
-            dim = self.model.text.wte.weight.shape[1]
+            dim = self.bos_embed.shape[-1]
             return torch.empty((1, 0, dim), device=self.device, dtype=self.dtype)
 
         length = len(tokens)
-        width = self.model.text.wte.weight.shape[1]
+        width = self.bos_embed.shape[-1]
         out = torch.empty((1, length, width), device=self.device, dtype=self.dtype)
 
         text_pos: list[int] = []
@@ -426,7 +427,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.region.coord_features.dtype,
             ).view(-1, 1)
-            coord_emb = encode_coordinate(coords, self.region).to(dtype=self.dtype)
+            coord_emb = encode_coordinate(coords, self.region)
             out[:, coord_pos, :] = coord_emb.unsqueeze(0)
 
         if size_vals:
@@ -435,7 +436,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.region.size_features.dtype,
             )
-            size_emb = encode_size(sizes, self.region).to(dtype=self.dtype)
+            size_emb = encode_size(sizes, self.region)
             out[:, size_pos, :] = size_emb.unsqueeze(0)
 
         return out
@@ -443,11 +444,11 @@ class MoondreamRuntime:
     def _embed_token_batch(self, tokens: Sequence[Token]) -> Tensor:
         """Embed N pending tokens (one per active sequence) into (N, 1, dim)."""
         if not tokens:
-            dim = self.model.text.wte.weight.shape[1]
+            dim = self.bos_embed.shape[-1]
             return torch.empty((0, 1, dim), device=self.device, dtype=self.dtype)
 
         batch = len(tokens)
-        dim = self.model.text.wte.weight.shape[1]
+        dim = self.bos_embed.shape[-1]
         out = torch.empty((batch, 1, dim), device=self.device, dtype=self.dtype)
 
         text_idx: list[int] = []
@@ -483,7 +484,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.region.coord_features.dtype,
             ).view(len(coord_idx), 1)
-            embeds = encode_coordinate(coords, self.region).to(dtype=self.dtype)
+            embeds = encode_coordinate(coords, self.region)
             out[coord_idx, 0, :] = embeds
 
         if size_idx:
@@ -492,7 +493,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.region.size_features.dtype,
             )
-            embeds = encode_size(sizes, self.region).to(dtype=self.dtype)
+            embeds = encode_size(sizes, self.region)
             out[size_idx, 0, :] = embeds
 
         return out
@@ -502,32 +503,31 @@ class MoondreamRuntime:
         coord_id = self.config.tokenizer.coord_id
         size_id = self.config.tokenizer.size_id
 
-        if hidden.ndim == 2:
-            hidden_row = hidden.squeeze(0)
-        else:
-            hidden_row = hidden
+        hidden_row = hidden.squeeze(0) if hidden.ndim == 2 else hidden
+        hidden_batch = hidden_row.unsqueeze(0)
 
-        if token_id == coord_id:
-            logits = decode_coordinate(hidden_row.unsqueeze(0), self.region).squeeze(0)
-            bins = logits.shape[-1]
-            index = torch.argmax(logits).item()
-            denom = max(bins - 1, 1)
-            pos = float(min(max(index / denom, 0.0), 1.0))
-            return CoordToken(pos=pos)
+        with torch.inference_mode():
+            if token_id == coord_id:
+                logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
+                bins = logits.shape[-1]
+                index = torch.argmax(logits).item()
+                denom = max(bins - 1, 1)
+                pos = float(min(max(index / denom, 0.0), 1.0))
+                return CoordToken(pos=pos)
 
-        if token_id == size_id:
-            logits = decode_size(hidden_row.unsqueeze(0), self.region)
-            width_logits = logits[0]
-            height_logits = logits[1]
-            bins = width_logits.shape[-1]
-            width_bin = torch.argmax(width_logits).item()
-            height_bin = torch.argmax(height_logits).item()
-            scale = float(bins - 1) if bins > 1 else 1.0
-            width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
-            height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
-            width = float(min(max(width, 0.0), 1.0))
-            height = float(min(max(height, 0.0), 1.0))
-            return SizeToken(width=width, height=height)
+            if token_id == size_id:
+                logits = decode_size(hidden_batch, self.region)
+                width_logits = logits[0]
+                height_logits = logits[1]
+                bins = width_logits.shape[-1]
+                width_bin = torch.argmax(width_logits).item()
+                height_bin = torch.argmax(height_logits).item()
+                scale = float(bins - 1) if bins > 1 else 1.0
+                width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
+                height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
+                width = float(min(max(width, 0.0), 1.0))
+                height = float(min(max(height, 0.0), 1.0))
+                return SizeToken(width=width, height=height)
 
         return TextToken(token_id=token_id)
 

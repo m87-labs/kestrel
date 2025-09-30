@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Mapping, Optional
+from typing import Iterable, List, Optional
 
 import time
 
@@ -84,9 +84,12 @@ class GenerationScheduler:
             else 0
         )
         request = GenerationRequest(
-            request_id=request_id if request_id is not None else self._issue_request_id(),
+            request_id=(
+                request_id if request_id is not None else self._issue_request_id()
+            ),
             prompt=prompt,
-            prompt_tokens=prompt_tokens.detach().clone().to("cpu"),
+            # TODO: maybe this shouldn't be a tensor
+            prompt_tokens=prompt_tokens.to(device="cpu"),
             max_new_tokens=max_new_tokens,
             temperature=self._resolve_temperature(temperature),
             top_p=self._resolve_top_p(top_p),
@@ -161,14 +164,18 @@ class GenerationScheduler:
             except StopIteration:
                 pass
             else:
-                raise ValueError("Number of image_crops entries does not match number of prompts")
+                raise ValueError(
+                    "Number of image_crops entries does not match number of prompts"
+                )
         if state_iter is not None:
             try:
                 next(state_iter)
             except StopIteration:
                 pass
             else:
-                raise ValueError("Number of skill_states entries does not match number of prompts")
+                raise ValueError(
+                    "Number of skill_states entries does not match number of prompts"
+                )
         return ids
 
     # ------------------------------------------------------------------
@@ -184,7 +191,9 @@ class GenerationScheduler:
 
             if not progressed:
                 stalled = self.waiting.peek()
-                if stalled is not None and not self.runtime.can_reserve(stalled.target_length):
+                if stalled is not None and not self.runtime.can_reserve(
+                    stalled.target_length
+                ):
                     raise RuntimeError(
                         "Scheduler stalled: insufficient KV cache capacity for request "
                         f"{stalled.request_id} (needs {stalled.target_length} tokens)."
@@ -204,10 +213,7 @@ class GenerationScheduler:
 
     def _try_prefill(self) -> bool:
         progress = False
-        while (
-            len(self.waiting)
-            and len(self.running) < self.runtime.max_batch_size
-        ):
+        while len(self.waiting) and len(self.running) < self.runtime.max_batch_size:
             request = self.waiting.peek()
             if request is None:
                 break
@@ -280,7 +286,9 @@ class GenerationScheduler:
         for seq in active:
             token = seq.pending_token
             if token is None:
-                raise RuntimeError("ScheduledSequence has no pending token during decode")
+                raise RuntimeError(
+                    "ScheduledSequence has no pending token during decode"
+                )
             pending_tokens.append(token)
             if not isinstance(token, TextToken):
                 all_text = False
@@ -292,13 +300,9 @@ class GenerationScheduler:
         else:
             token_input = pending_tokens
 
-        logits = self.runtime.decode_batch(
-            [seq.state for seq in active], token_input
-        )
+        logits = self.runtime.decode_batch([seq.state for seq in active], token_input)
 
-        sampled_tokens = self._sample_batch(
-            logits, [seq.request for seq in active]
-        )
+        sampled_tokens = self._sample_batch(logits, [seq.request for seq in active])
         sampled_cpu = sampled_tokens.cpu().tolist()
 
         for seq, row, token_value in zip(active, logits, sampled_cpu):
@@ -316,6 +320,29 @@ class GenerationScheduler:
         batch = len(requests)
         if batch == 0:
             return torch.empty(0, dtype=torch.long, device=logits.device)
+
+        allowed_tokens: list[Optional[Sequence[int]]] = []
+        restrict = False
+        for req in requests:
+            state = req.skill_state
+            if state is None:
+                allowed_tokens.append(None)
+                continue
+            allowed = state.allowed_token_ids(self.runtime)
+            allowed_tokens.append(allowed)
+            if allowed:
+                restrict = True
+
+        if restrict:
+            logits = logits.clone()
+            for i, allowed in enumerate(allowed_tokens):
+                if not allowed:
+                    continue
+                idx = torch.tensor(allowed, device=logits.device, dtype=torch.long)
+                row = logits[i]
+                pruned = torch.full_like(row, float("-inf"))
+                pruned[idx] = row[idx]
+                logits[i] = pruned
 
         if all(req.temperature <= 0.0 for req in requests) and all(
             req.top_p >= 1.0 for req in requests

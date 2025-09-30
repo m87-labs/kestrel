@@ -41,9 +41,10 @@ from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.scheduler import GenerationScheduler, GenerationRequest, SchedulerResult, StreamUpdate
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
-from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec
+from kestrel.skills import PointSkill, QuerySkill, SkillRegistry, SkillSpec
 from kestrel.moondream.runtime import Token
 from kestrel.skills.query import QueryRequest
+from kestrel.skills.point import PointRequest
 
 
 @dataclass(slots=True)
@@ -174,7 +175,7 @@ class InferenceEngine:
         self._shutdown = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._image_executor: ThreadPoolExecutor | None = None
-        self._skills = skills or SkillRegistry([QuerySkill()])
+        self._skills = skills or SkillRegistry([QuerySkill(), PointSkill()])
 
     @property
     def runtime(self) -> MoondreamRuntime:
@@ -280,6 +281,22 @@ class InferenceEngine:
             temperature=request.settings.temperature,
             top_p=request.settings.top_p,
             skill="query",
+            skill_context=request,
+        )
+
+    async def point(
+        self,
+        request: PointRequest,
+        *,
+        max_new_tokens: int,
+    ) -> EngineResult:
+        return await self.submit(
+            request.object,
+            max_new_tokens=max_new_tokens,
+            image=request.image,
+            temperature=request.settings.temperature,
+            top_p=request.settings.top_p,
+            skill="point",
             skill_context=request,
         )
 

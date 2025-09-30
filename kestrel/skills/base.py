@@ -100,6 +100,10 @@ class SkillState:
     def token_count(self) -> int:
         return len(self._tokens)
 
+    def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+        """Optional per-skill restriction on the next sampled token ids."""
+        return None
+
 class SkillRegistry:
     """Lookup table for skills with a default entry."""
 

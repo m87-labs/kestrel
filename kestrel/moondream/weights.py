@@ -6,7 +6,7 @@ Adapted from the Moondream project (Apache-2.0).
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import safetensors
 import torch
@@ -127,6 +127,34 @@ def _assign_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.
         param.data = param.data.contiguous()
 
 
+def _assign_region_weights(
+    get_tensor: Callable[[str], torch.Tensor],
+    region: nn.Module,
+    *,
+    convert: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    if not isinstance(region, nn.Module):
+        raise TypeError("region must be an nn.Module with encoder/decoder attributes")
+
+    # Linear layers
+    region["coord_encoder"].weight.data.copy_(convert(get_tensor("region_model.coordinate_encoder.weight")))
+    region["coord_encoder"].bias.data.copy_(convert(get_tensor("region_model.coordinate_encoder.bias")))
+    region["coord_decoder"].weight.data.copy_(convert(get_tensor("region_model.coordinate_head.weight")))
+    region["coord_decoder"].bias.data.copy_(convert(get_tensor("region_model.coordinate_head.bias")))
+    region["size_encoder"].weight.data.copy_(convert(get_tensor("region_model.size_encoder.weight")))
+    region["size_encoder"].bias.data.copy_(convert(get_tensor("region_model.size_encoder.bias")))
+    region["size_decoder"].weight.data.copy_(convert(get_tensor("region_model.size_head.weight")))
+    region["size_decoder"].bias.data.copy_(convert(get_tensor("region_model.size_head.bias")))
+
+    # Fourier feature parameters are stored transposed in checkpoints.
+    region.coord_features.data.copy_(
+        convert(get_tensor("region_model.coordinate_features.weight")).T
+    )
+    region.size_features.data.copy_(
+        convert(get_tensor("region_model.size_features.weight")).T
+    )
+
+
 def _refresh_rotary_tables(model: nn.Module) -> None:
     if not hasattr(model, "text") or not hasattr(model, "config"):
         return
@@ -145,7 +173,13 @@ def load_text_weights(
     *,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
 ) -> None:
-    load_moondream_weights(path, model, load_vision=False, tensor_hook=tensor_hook)
+    load_moondream_weights(
+        path,
+        model,
+        load_vision=False,
+        tensor_hook=tensor_hook,
+        region=None,
+    )
 
 
 def load_moondream_weights(
@@ -154,6 +188,7 @@ def load_moondream_weights(
     *,
     load_vision: bool = True,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    region: Optional[nn.Module] = None,
 ) -> None:
     target_dtype = next(model.text.parameters()).dtype
 
@@ -173,6 +208,8 @@ def load_moondream_weights(
             _assign_text_weights(getter, model)
             if load_vision:
                 _assign_vision_weights(getter, model)
+            if region is not None:
+                _assign_region_weights(getter, region, convert=convert)
     else:
         tensors_raw = torch.load(path, map_location="cpu", weights_only=True)
         tensors: dict[str, torch.Tensor] = {}
@@ -188,6 +225,8 @@ def load_moondream_weights(
         _assign_text_weights(getter, model)
         if load_vision:
             _assign_vision_weights(getter, model)
+        if region is not None:
+            _assign_region_weights(getter, region, convert=convert)
 
     _refresh_rotary_tables(model)
 
