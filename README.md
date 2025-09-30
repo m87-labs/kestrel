@@ -41,12 +41,19 @@ print(result.extras["answer"])
 point_result = await engine.point(
     image,
     "cat",
-    settings={"max_tokens": 10},
+    settings={"max_objects": 2},
 )
 print(point_result.extras["points"])
+
+detect_result = await engine.detect(
+    image,
+    "cat",
+    settings={"max_objects": 4},
+)
+print(detect_result.extras["objects"])
 ```
 
-- `InferenceEngine.query(...)` and `InferenceEngine.point(...)` mirror the `moondream` reference API (async, with optional ``settings`` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
+- `InferenceEngine.query(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional ``settings`` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
 - `InferenceEngine.submit(...)` remains available for advanced callers who want to pass raw prompt tokens or experiment with additional skills.
 
 ### Skills
@@ -85,11 +92,25 @@ Response fields include the generated `answer`, `finish_reason`, and timing metr
   "object": "burger",
   "image_url": "data:image/png;base64,<...>",
   "settings": {
-    "max_tokens": 10
+    "max_objects": 2
   }
 }
 ```
 Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request metadata, and the same timing metrics as `/v1/query`.
+
+`POST /v1/detect`
+
+```json
+{
+  "object": "burger",
+  "image_url": "data:image/png;base64,<...>",
+  "settings": {
+    "max_objects": 10
+  }
+}
+```
+
+Returns `objects` (each `{ "x_min", "y_min", "x_max", "y_max" }`), the finish reason, and latency metrics matching `/v1/query`.
 
 ## Usage Examples
 

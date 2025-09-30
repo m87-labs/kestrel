@@ -7,6 +7,7 @@ from .base import (
     SkillSpec,
     SkillState,
 )
+from .detect import DetectRequest, DetectSettings, DetectSkill
 from .point import PointRequest, PointSettings, PointSkill
 from .query import QueryRequest, QuerySettings, QuerySkill
 
@@ -16,6 +17,9 @@ __all__ = [
     "SkillRegistry",
     "SkillSpec",
     "SkillState",
+    "DetectRequest",
+    "DetectSettings",
+    "DetectSkill",
     "PointRequest",
     "PointSettings",
     "PointSkill",

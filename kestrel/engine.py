@@ -41,10 +41,11 @@ from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.scheduler import GenerationScheduler, GenerationRequest, SchedulerResult, StreamUpdate
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.moondream.vision import compute_overlap_crops
-from kestrel.skills import PointSkill, QuerySkill, SkillRegistry, SkillSpec
+from kestrel.skills import DetectSkill, PointSkill, QuerySkill, SkillRegistry, SkillSpec
 from kestrel.moondream.runtime import Token
-from kestrel.skills.query import QueryRequest, QuerySettings
+from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
+from kestrel.skills.query import QueryRequest, QuerySettings
 
 
 @dataclass(slots=True)
@@ -175,7 +176,7 @@ class InferenceEngine:
         self._shutdown = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._image_executor: ThreadPoolExecutor | None = None
-        self._skills = skills or SkillRegistry([QuerySkill(), PointSkill()])
+        self._skills = skills or SkillRegistry([QuerySkill(), PointSkill(), DetectSkill()])
         self._default_max_new_tokens = 64
         self._default_temperature = 0.0
         self._default_top_p = 1.0
@@ -338,15 +339,21 @@ class InferenceEngine:
             raise ValueError("object must be a non-empty string")
 
         max_tokens = self._default_max_new_tokens
+        max_objects = None
         temperature = 0.0
         top_p = 1.0
         if settings is not None:
+            if "max_objects" in settings:
+                max_objects = max(1, int(settings["max_objects"]))
             if "max_tokens" in settings:
                 max_tokens = int(settings["max_tokens"])
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
             if "top_p" in settings:
                 top_p = float(settings["top_p"])
+
+        if max_objects is not None:
+            max_tokens = max(2 * max_objects + 1, 2)
 
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
@@ -364,6 +371,47 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             skill="point",
+            skill_context=request,
+        )
+
+    async def detect(
+        self,
+        image: Optional[pyvips.Image],
+        object: str,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> EngineResult:
+        normalized_object = object.strip()
+        if not normalized_object:
+            raise ValueError("object must be a non-empty string")
+
+        max_objects = 150
+        temperature = 0.0
+        top_p = 1.0
+        if settings is not None:
+            if "max_objects" in settings:
+                max_objects = max(1, int(settings["max_objects"]))
+            if "temperature" in settings:
+                temperature = float(settings["temperature"])
+            if "top_p" in settings:
+                top_p = float(settings["top_p"])
+
+        # Each object consumes up to 3 tokens (x, y, size); allow one extra for EOS.
+        max_tokens = max(3 * max_objects + 1, 3)
+
+        request = DetectRequest(
+            object=normalized_object,
+            image=image,
+            stream=False,
+            settings=DetectSettings(temperature=temperature, top_p=top_p),
+            max_objects=max_objects,
+        )
+        return await self.submit(
+            normalized_object,
+            max_new_tokens=max_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
+            skill="detect",
             skill_context=request,
         )
 

@@ -193,15 +193,15 @@ class _ServerState:
             object_name = _parse_required_str(payload, "object")
             settings_payload = payload.get("settings")
             if settings_payload is None:
-                max_tokens = _parse_int(
-                    payload.get("max_tokens", self.config.default_max_new_tokens),
-                    "max_tokens",
+                max_objects = _parse_int(
+                    payload.get("max_objects", 150),
+                    "max_objects",
                     minimum=1,
                 )
             elif isinstance(settings_payload, dict):
-                max_tokens = _parse_int(
-                    settings_payload.get("max_tokens", self.config.default_max_new_tokens),
-                    "settings.max_tokens",
+                max_objects = _parse_int(
+                    settings_payload.get("max_objects", 150),
+                    "settings.max_objects",
                     minimum=1,
                 )
             else:
@@ -224,7 +224,7 @@ class _ServerState:
             result = await engine.point(
                 image=image,
                 object=object_name,
-                settings={"max_tokens": max_tokens},
+                settings={"max_objects": max_objects},
             )
         except Exception as exc:  # pragma: no cover
             logger.exception("Inference request failed")
@@ -238,6 +238,81 @@ class _ServerState:
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "points": result.extras.get("points"),
+            "metrics": {
+                "prompt_tokens": metrics.prompt_tokens,
+                "decode_tokens": metrics.decode_tokens,
+                "processing_latency_s": metrics.processing_latency_s,
+                "ttft_s": metrics.ttft_s,
+                "decode_latency_s": metrics.decode_latency_s,
+                "decode_tokens_per_s": metrics.decode_tokens_per_s,
+                "total_latency_s": total_latency,
+            },
+        }
+        return JSONResponse(response_payload)
+
+    async def handle_detect(self, request: Request) -> Response:
+        if self.engine is None:
+            return JSONResponse({"error": "Engine is not ready"}, status_code=503)
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Request body must be an object"}, status_code=400)
+
+        try:
+            object_name = _parse_required_str(payload, "object")
+            settings_payload = payload.get("settings")
+            if settings_payload is None:
+                max_objects = _parse_int(
+                    payload.get("max_objects", 150),
+                    "max_objects",
+                    minimum=1,
+                )
+            elif isinstance(settings_payload, dict):
+                max_objects = _parse_int(
+                    settings_payload.get("max_objects", 150),
+                    "settings.max_objects",
+                    minimum=1,
+                )
+            else:
+                raise ValueError("Field 'settings' must be an object if provided")
+
+            image_data = payload.get("image_url")
+            if image_data is None:
+                image: Optional[pyvips.Image] = None
+            elif isinstance(image_data, str):
+                image = load_vips_from_base64(image_data)
+            else:
+                raise ValueError("Field 'image_url' must be a string if provided")
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        start_time = time.perf_counter()
+        try:
+            engine = self.engine
+            assert engine is not None
+            result = await engine.detect(
+                image=image,
+                object=object_name,
+                settings={"max_objects": max_objects},
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Inference request failed")
+            return JSONResponse(
+                {"error": "Inference failed", "detail": str(exc)}, status_code=500
+            )
+
+        metrics = result.metrics
+        total_latency = time.perf_counter() - start_time
+        response_payload = {
+            "request_id": str(result.request_id),
+            "finish_reason": result.finish_reason,
+            "objects": result.extras.get("objects"),
             "metrics": {
                 "prompt_tokens": metrics.prompt_tokens,
                 "decode_tokens": metrics.decode_tokens,
@@ -282,6 +357,7 @@ def create_app(
     routes = [
         Route("/v1/query", state.handle_query, methods=["POST"]),
         Route("/v1/point", state.handle_point, methods=["POST"]),
+        Route("/v1/detect", state.handle_detect, methods=["POST"]),
         Route("/healthz", state.handle_health, methods=["GET"]),
     ]
 
