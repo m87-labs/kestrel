@@ -100,6 +100,13 @@ class SkillState:
         """Optional per-skill restriction on the next sampled token ids."""
         return None
 
+    # Streaming -------------------------------------------------------
+
+    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+        """Return newly available human-readable text for streaming clients."""
+
+        return None
+
 class SkillRegistry:
     """Lookup table for skills with a default entry."""
 

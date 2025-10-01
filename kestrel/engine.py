@@ -42,6 +42,8 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    overload,
+    Literal,
 )
 
 import torch
@@ -311,6 +313,42 @@ class InferenceEngine:
         )
         return await future
 
+    @overload
+    async def query(
+        self,
+        image: Optional[pyvips.Image] = ...,
+        question: Optional[str] = ...,
+        reasoning: bool = ...,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
+        stream: Literal[True] = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> "EngineStream":
+        ...
+
+    @overload
+    async def query(
+        self,
+        image: Optional[pyvips.Image] = ...,
+        question: Optional[str] = ...,
+        reasoning: bool = ...,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
+        stream: Literal[False] = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> EngineResult:
+        ...
+
+    @overload
+    async def query(
+        self,
+        image: Optional[pyvips.Image] = None,
+        question: Optional[str] = None,
+        reasoning: bool = True,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
+        stream: bool = False,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> Union[EngineResult, EngineStream]:
+        ...
+
     async def query(
         self,
         image: Optional[pyvips.Image] = None,
@@ -327,8 +365,6 @@ class InferenceEngine:
             raise ValueError("question must be a non-empty string")
         if spatial_refs is not None:
             raise ValueError("spatial_refs are not supported")
-        if stream:
-            raise ValueError("Streaming query responses are not implemented")
 
         temperature = self._default_temperature
         top_p = self._default_top_p
@@ -352,13 +388,22 @@ class InferenceEngine:
             question=normalized_question,
             image=image,
             reasoning=reasoning,
-            stream=False,
+            stream=stream,
             settings=QuerySettings(
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
             ),
         )
+        if stream:
+            return await self.submit_streaming(
+                request,
+                max_new_tokens=max_tokens,
+                image=image,
+                temperature=temperature,
+                top_p=top_p,
+                skill="query",
+            )
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
@@ -413,6 +458,39 @@ class InferenceEngine:
             skill="point",
         )
 
+    @overload
+    async def caption(
+        self,
+        image: pyvips.Image,
+        *,
+        length: str = ...,
+        stream: Literal[True],
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> "EngineStream":
+        ...
+
+    @overload
+    async def caption(
+        self,
+        image: pyvips.Image,
+        *,
+        length: str = ...,
+        stream: Literal[False] = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> EngineResult:
+        ...
+
+    @overload
+    async def caption(
+        self,
+        image: pyvips.Image,
+        *,
+        length: str = ...,
+        stream: bool = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> Union[EngineResult, EngineStream]:
+        ...
+
     async def caption(
         self,
         image: pyvips.Image,
@@ -420,15 +498,13 @@ class InferenceEngine:
         length: str = "normal",
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
-    ) -> EngineResult:
+    ) -> Union[EngineResult, EngineStream]:
         if image is None:
             raise ValueError("image must be provided for captioning")
         normalized_length = length.strip().lower() or "normal"
         if normalized_length not in CaptionSkill.VALID_LENGTHS:
             valid = ", ".join(sorted(CaptionSkill.VALID_LENGTHS))
             raise ValueError(f"length must be one of: {valid}")
-        if stream:
-            raise ValueError("Streaming captions are not supported")
 
         temperature = self._default_temperature
         top_p = self._default_top_p
@@ -451,9 +527,18 @@ class InferenceEngine:
         request = CaptionRequest(
             length=normalized_length,
             image=image,
-            stream=False,
+            stream=stream,
             settings=CaptionSettings(temperature=temperature, top_p=top_p),
         )
+        if stream:
+            return await self.submit_streaming(
+                request,
+                max_new_tokens=max_tokens,
+                image=image,
+                temperature=temperature,
+                top_p=top_p,
+                skill="caption",
+            )
         return await self.submit(
             request,
             max_new_tokens=max_tokens,

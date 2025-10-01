@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 import pyvips
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from kestrel.config import RuntimeConfig
@@ -19,6 +19,30 @@ from kestrel.engine import InferenceEngine
 from kestrel.utils.image import load_vips_from_base64
 
 logger = logging.getLogger(__name__)
+
+
+STREAM_CHUNK_SIZE = 3
+STREAM_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _format_metrics(result_metrics, total_latency: float) -> Dict[str, float]:
+    return {
+        "prompt_tokens": result_metrics.prompt_tokens,
+        "decode_tokens": result_metrics.decode_tokens,
+        "processing_latency_s": result_metrics.processing_latency_s,
+        "ttft_s": result_metrics.ttft_s,
+        "decode_latency_s": result_metrics.decode_latency_s,
+        "decode_tokens_per_s": result_metrics.decode_tokens_per_s,
+        "total_latency_s": total_latency,
+    }
+
+
+def _sse_payload(data: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
 
 @dataclass(slots=True)
@@ -85,10 +109,6 @@ class _ServerState:
             reasoning = _parse_bool(payload.get("reasoning", False), "reasoning")
 
             stream = _parse_bool(payload.get("stream", False), "stream")
-            if stream:
-                return JSONResponse(
-                    {"error": "Streaming is not supported"}, status_code=400
-                )
 
             settings_payload = payload.get("settings")
             if settings_payload is None:
@@ -123,43 +143,105 @@ class _ServerState:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        if stream and reasoning:
+            return JSONResponse(
+                {"error": "Streaming is not supported when reasoning is enabled"},
+                status_code=400,
+            )
+
+        engine = self.engine
+        assert engine is not None
+        settings_dict = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+
         start_time = time.perf_counter()
+
+        if stream:
+            try:
+                query_stream = await engine.query(
+                    image=image,
+                    question=question,
+                    reasoning=reasoning,
+                    stream=True,
+                    settings=settings_dict,
+                )
+            except Exception as exc:  # pragma: no cover - defensive path
+                logger.exception("Streaming query failed to start")
+                return JSONResponse(
+                    {"error": "Inference failed", "detail": str(exc)},
+                    status_code=500,
+                )
+
+            async def event_generator():
+                chunk_buffer: list[str] = []
+                tokens_emitted = 0
+                try:
+                    async for update in query_stream:
+                        text = update.text
+                        if not text:
+                            continue
+                        chunk_buffer.append(text)
+                        tokens_emitted += 1
+                        if tokens_emitted % STREAM_CHUNK_SIZE == 0:
+                            payload = {
+                                "chunk": "".join(chunk_buffer),
+                                "completed": False,
+                                "token_index": update.token_index,
+                            }
+                            chunk_buffer.clear()
+                            yield _sse_payload(payload)
+                    result = await query_stream.result()
+                except Exception as exc:  # pragma: no cover - defensive path
+                    logger.exception("Streaming query errored")
+                    raise exc
+
+                final_chunk = "".join(chunk_buffer)
+                chunk_buffer.clear()
+                total_latency = time.perf_counter() - start_time
+                metrics = _format_metrics(result.metrics, total_latency)
+                payload = {
+                    "chunk": final_chunk,
+                    "completed": True,
+                    "request_id": str(result.request_id),
+                    "finish_reason": result.finish_reason,
+                    "answer": result.output.get("answer", ""),
+                    "metrics": metrics,
+                }
+                if "reasoning" in result.output:
+                    payload["reasoning"] = result.output["reasoning"]
+                yield _sse_payload(payload)
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers=STREAM_HEADERS,
+            )
+
         try:
-            engine = self.engine
-            assert engine is not None
             result = await engine.query(
                 image=image,
                 question=question,
                 reasoning=reasoning,
                 stream=False,
-                settings={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "max_tokens": max_tokens,
-                },
+                settings=settings_dict,
             )
         except Exception as exc:  # pragma: no cover - defensive path
             logger.exception("Inference request failed")
             return JSONResponse(
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
-        metrics = result.metrics
         total_latency = time.perf_counter() - start_time
+        metrics = _format_metrics(result.metrics, total_latency)
         output = result.output
         answer = output.get("answer", "")
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "answer": answer,
-            "metrics": {
-                "prompt_tokens": metrics.prompt_tokens,
-                "decode_tokens": metrics.decode_tokens,
-                "processing_latency_s": metrics.processing_latency_s,
-                "ttft_s": metrics.ttft_s,
-                "decode_latency_s": metrics.decode_latency_s,
-                "decode_tokens_per_s": metrics.decode_tokens_per_s,
-                "total_latency_s": total_latency,
-            },
+            "metrics": metrics,
         }
         if "reasoning" in output:
             response_payload["reasoning"] = output["reasoning"]
@@ -255,10 +337,6 @@ class _ServerState:
             if not isinstance(length, str):
                 raise ValueError("Field 'length' must be a string")
             stream = _parse_bool(payload.get("stream", False), "stream")
-            if stream:
-                return JSONResponse(
-                    {"error": "Streaming is not supported"}, status_code=400
-                )
 
             settings_payload = payload.get("settings")
             if settings_payload is None:
@@ -291,19 +369,80 @@ class _ServerState:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        engine = self.engine
+        assert engine is not None
+        settings_dict = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+
         start_time = time.perf_counter()
+
+        if stream:
+            try:
+                caption_stream = await engine.caption(
+                    image=image,
+                    length=length,
+                    stream=True,
+                    settings=settings_dict,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Streaming caption failed to start")
+                return JSONResponse(
+                    {"error": "Inference failed", "detail": str(exc)},
+                    status_code=500,
+                )
+
+            async def event_generator():
+                chunk_buffer: list[str] = []
+                tokens_emitted = 0
+                try:
+                    async for update in caption_stream:
+                        text = update.text
+                        if not text:
+                            continue
+                        chunk_buffer.append(text)
+                        tokens_emitted += 1
+                        if tokens_emitted % STREAM_CHUNK_SIZE == 0:
+                            payload = {
+                                "chunk": "".join(chunk_buffer),
+                                "completed": False,
+                                "token_index": update.token_index,
+                            }
+                            chunk_buffer.clear()
+                            yield _sse_payload(payload)
+                    result = await caption_stream.result()
+                except Exception as exc:  # pragma: no cover
+                    logger.exception("Streaming caption errored")
+                    raise exc
+
+                final_chunk = "".join(chunk_buffer)
+                chunk_buffer.clear()
+                total_latency = time.perf_counter() - start_time
+                metrics = _format_metrics(result.metrics, total_latency)
+                payload = {
+                    "chunk": final_chunk,
+                    "completed": True,
+                    "request_id": str(result.request_id),
+                    "finish_reason": result.finish_reason,
+                    "caption": result.output.get("caption", ""),
+                    "metrics": metrics,
+                }
+                yield _sse_payload(payload)
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers=STREAM_HEADERS,
+            )
+
         try:
-            engine = self.engine
-            assert engine is not None
             result = await engine.caption(
                 image=image,
                 length=length,
                 stream=False,
-                settings={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "max_tokens": max_tokens,
-                },
+                settings=settings_dict,
             )
         except Exception as exc:  # pragma: no cover
             logger.exception("Inference request failed")
@@ -311,22 +450,14 @@ class _ServerState:
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
 
-        metrics = result.metrics
         total_latency = time.perf_counter() - start_time
+        metrics = _format_metrics(result.metrics, total_latency)
         caption = result.output.get("caption", "")
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "caption": caption,
-            "metrics": {
-                "prompt_tokens": metrics.prompt_tokens,
-                "decode_tokens": metrics.decode_tokens,
-                "processing_latency_s": metrics.processing_latency_s,
-                "ttft_s": metrics.ttft_s,
-                "decode_latency_s": metrics.decode_latency_s,
-                "decode_tokens_per_s": metrics.decode_tokens_per_s,
-                "total_latency_s": total_latency,
-            },
+            "metrics": metrics,
         }
         return JSONResponse(response_payload)
 

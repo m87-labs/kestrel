@@ -87,6 +87,8 @@ class CaptionSkillState(SkillState):
     ) -> None:
         super().__init__(spec, request)
         self._request = caption_request
+        self._streaming = bool(caption_request.stream)
+        self._stream_offset = 0
 
     def consume_step(
         self,
@@ -95,6 +97,23 @@ class CaptionSkillState(SkillState):
     ) -> None:
         self.append_token(step.token)
         return None
+
+    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+        if not self._streaming:
+            return None
+        text_tokens = [
+            token.token_id for token in self.tokens if isinstance(token, TextToken)
+        ]
+        if not text_tokens:
+            return None
+        caption = runtime.tokenizer.decode(text_tokens)
+        if len(caption) <= self._stream_offset:
+            return None
+        chunk = caption[self._stream_offset :]
+        self._stream_offset = len(caption)
+        if not chunk:
+            return None
+        return chunk
 
     def finalize(
         self,

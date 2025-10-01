@@ -99,6 +99,8 @@ class QuerySkillState(SkillState):
         self._answer_id: Optional[int] = None
         self._start_ground_id: Optional[int] = None
         self._end_ground_id: Optional[int] = None
+        self._streaming = bool(query_request.stream)
+        self._answer_stream_offset = 0
 
     def consume_step(
         self,
@@ -122,6 +124,7 @@ class QuerySkillState(SkillState):
                     self._collecting_reasoning = False
                     self._flush_current_chunk()
                     self._pending_coord = None
+                    self._answer_stream_offset = 0
                     return None
                 if token_id == self._start_ground_id or token_id == self._end_ground_id:
                     self._flush_current_chunk()
@@ -145,6 +148,22 @@ class QuerySkillState(SkillState):
         if isinstance(step.token, TextToken):
             self._answer_tokens.append(step.token.token_id)
         return None
+
+    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+        if not self._streaming:
+            return None
+        if self._collecting_reasoning:
+            return None
+        if not self._answer_tokens:
+            return None
+        text = runtime.tokenizer.decode(self._answer_tokens)
+        if len(text) <= self._answer_stream_offset:
+            return None
+        chunk = text[self._answer_stream_offset :]
+        self._answer_stream_offset = len(text)
+        if not chunk:
+            return None
+        return chunk
 
     def finalize(
         self,

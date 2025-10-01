@@ -69,8 +69,35 @@ caption_result = await engine.caption(
 print(caption_result.output["caption"])
 ```
 
-- `InferenceEngine.query(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
+- `InferenceEngine.query(...)`, `.caption(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). When `stream=True` is passed to `query` or `caption`, the helpers now return an `EngineStream` async iterator that yields incremental text chunks while decoding continues. Reasoning traces remain opt-in via the `reasoning` flag.
 - Direct helpers like `engine.query(...)`, `engine.point(...)`, `engine.detect(...)`, and `engine.caption(...)` remain the supported public surface.
+
+#### Streaming usage
+
+```python
+query_stream = await engine.query(
+    question="Summarize the scene.",
+    reasoning=False,
+    stream=True,
+    settings={"max_tokens": 64},
+)
+async for update in query_stream:
+    print(f"answer += {update.text}")
+query_result = await query_stream.result()
+print("final", query_result.output["answer"])
+
+caption_stream = await engine.caption(
+    image=image,
+    length="short",
+    stream=True,
+    settings={"temperature": 0.2, "max_tokens": 80},
+)
+chunks = []
+async for update in caption_stream:
+    chunks.append(update.text)
+caption_result = await caption_stream.result()
+assert "".join(chunks) == caption_result.output["caption"]
+```
 
 ### Skills
 
@@ -99,7 +126,7 @@ print(caption_result.output["caption"])
 }
 ```
 
-Response fields include the generated `answer`, `finish_reason`, and timing metrics (`processing_latency_s`, `ttft_s`, `decode_latency_s`, token counts/throughput). Streaming responses emit Server-Sent Events with the same structure.
+Response fields include the generated `answer`, `finish_reason`, and timing metrics (`processing_latency_s`, `ttft_s`, `decode_latency_s`, token counts/throughput). When `"stream": true` is supplied, the endpoint upgrades to Server-Sent Events and emits incremental `chunk` payloads; the final event carries the completed answer alongside metrics.
 
 `POST /v1/point`
 

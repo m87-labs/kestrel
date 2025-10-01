@@ -92,6 +92,18 @@ class ScheduledSequence:
             hidden=hidden,
         )
         self.skill_state.consume_step(runtime, step)
+        callback = self.request.stream_callback
+        if callback is not None:
+            delta = self.skill_state.pop_stream_delta(runtime)
+            if delta:
+                callback(
+                    StreamUpdate(
+                        request_id=self.request.request_id,
+                        token=token,
+                        text=delta,
+                        token_index=self.skill_state.token_count - 1,
+                    )
+                )
 
     @property
     def total_length(self) -> int:
