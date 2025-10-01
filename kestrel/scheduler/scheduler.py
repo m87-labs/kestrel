@@ -291,7 +291,6 @@ class GenerationScheduler:
         finalize = seq.skill_state.finalize(
             self.runtime, reason=seq.finish_reason or "unknown"
         )
-        text = finalize.text
         prompt_tokens = seq.state.prompt_length
         decode_tokens = len(finalize.tokens)
         started_at = seq.started_at
@@ -309,10 +308,8 @@ class GenerationScheduler:
         )
         return SchedulerResult(
             request_id=seq.request.request_id,
-            prompt=seq.request.prompt,
             tokens=finalize.tokens,
-            text=text,
             finish_reason=seq.finish_reason or "unknown",
             metrics=metrics,
-            extras=finalize.extras,
+            output=finalize.output,
         )

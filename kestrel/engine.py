@@ -5,7 +5,7 @@ The engine is the high-level entry point for clients. It owns:
 - Lifecycle of the shared :class:`~kestrel.moondream.runtime.MoondreamRuntime`, including warmup and shutdown.
 - A micro-batching worker that pulls pending requests, prepares image crops, and runs the scheduler.
 - Skill orchestration — resolving the active :class:`~kestrel.skills.base.SkillSpec`, building prompt tokens when necessary, instantiating :class:`~kestrel.skills.base.SkillState` with skill-specific request contexts, and bridging streaming callbacks back to callers.
-- Conversion between scheduler outputs (``SchedulerResult``) and user-facing ``EngineResult`` objects augmented with metrics and per-skill extras.
+- Conversion between scheduler outputs (``SchedulerResult``) and user-facing ``EngineResult`` objects augmented with metrics and per-skill output payloads.
 
 Relationship to other components:
 
@@ -98,12 +98,10 @@ class EngineResult:
     """Inference output returned to callers."""
 
     request_id: int
-    prompt: str
-    text: str
     tokens: List[Token]
     finish_reason: str
     metrics: EngineMetrics
-    extras: Dict[str, object]
+    output: Dict[str, object]
 
 
 @dataclass(slots=True)
@@ -666,12 +664,10 @@ class InferenceEngine:
                 )
                 engine_result = EngineResult(
                     request_id=req.request_id,
-                    prompt=req.prompt,
-                    text=result.text,
                     tokens=result.tokens,
                     finish_reason=result.finish_reason,
                     metrics=metrics,
-                    extras=result.extras,
+                    output=result.output,
                 )
                 if not future.done():
                     future.set_result(engine_result)

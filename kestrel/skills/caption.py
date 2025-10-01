@@ -109,7 +109,7 @@ class CaptionSkillState(SkillState):
         return SkillFinalizeResult(
             text=caption,
             tokens=list(self.tokens),
-            extras={"caption": caption},
+            output={"caption": caption},
         )
 
 

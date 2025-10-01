@@ -41,21 +41,21 @@ result = await engine.query(
         "max_tokens": 128,
     },
 )
-print(result.extras["answer"])
+print(result.output["answer"])
 
 point_result = await engine.point(
     image,
     "cat",
     settings={"max_objects": 2},
 )
-print(point_result.extras["points"])
+print(point_result.output["points"])
 
 detect_result = await engine.detect(
     image,
     "cat",
     settings={"max_objects": 4},
 )
-print(detect_result.extras["objects"])
+print(detect_result.output["objects"])
 
 caption_result = await engine.caption(
     image,
@@ -66,7 +66,7 @@ caption_result = await engine.caption(
         "max_tokens": 64,
     },
 )
-print(caption_result.extras["caption"])
+print(caption_result.output["caption"])
 ```
 
 - `InferenceEngine.query(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.

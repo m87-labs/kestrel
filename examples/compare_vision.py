@@ -133,7 +133,7 @@ async def run_kestrel(
                 "max_tokens": max_new_tokens,
             },
         )
-        answer = result.extras.get("answer", result.text)
+        answer = result.output.get("answer", "")
     finally:
         await engine.shutdown()
     if device.type == "cuda":

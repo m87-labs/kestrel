@@ -115,7 +115,7 @@ class DetectSkillState(SkillState):
         return SkillFinalizeResult(
             text=text,
             tokens=list(self.tokens),
-            extras={"objects": objects},
+            output={"objects": objects},
         )
 
     def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Sequence[int]:

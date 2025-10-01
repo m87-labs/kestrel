@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from functools import partial
 from pathlib import Path
 from typing import List, Optional
@@ -211,8 +212,20 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
 
     for result in results:
         metrics = result.metrics
+        payload = result.output
+        display_text = ""
+        if isinstance(payload, dict):
+            for key in ("answer", "caption", "points", "objects"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    display_text = value
+                    break
+            if not display_text:
+                display_text = json.dumps(payload, ensure_ascii=False)
+        else:
+            display_text = str(payload)
         print(
-            f"[{result.request_id}] {result.finish_reason}: {result.text} "
+            f"[{result.request_id}] {result.finish_reason}: {display_text} "
             f"(processing={metrics.processing_latency_s:.3f}s, ttft={metrics.ttft_s:.3f}s, "
             f"decode={metrics.decode_latency_s:.3f}s, decode_tokens={metrics.decode_tokens})"
         )

@@ -145,8 +145,8 @@ class _ServerState:
             )
         metrics = result.metrics
         total_latency = time.perf_counter() - start_time
-        extras = result.extras
-        answer = extras.get("answer", result.text)
+        output = result.output
+        answer = output.get("answer", "")
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
@@ -161,8 +161,8 @@ class _ServerState:
                 "total_latency_s": total_latency,
             },
         }
-        if "reasoning" in extras:
-            response_payload["reasoning"] = extras["reasoning"]
+        if "reasoning" in output:
+            response_payload["reasoning"] = output["reasoning"]
         return JSONResponse(response_payload)
 
     async def handle_point(self, request: Request) -> Response:
@@ -223,7 +223,7 @@ class _ServerState:
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
-            "points": result.extras.get("points"),
+            "points": result.output.get("points"),
             "metrics": {
                 "prompt_tokens": metrics.prompt_tokens,
                 "decode_tokens": metrics.decode_tokens,
@@ -313,7 +313,7 @@ class _ServerState:
 
         metrics = result.metrics
         total_latency = time.perf_counter() - start_time
-        caption = result.extras.get("caption", result.text)
+        caption = result.output.get("caption", "")
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
@@ -388,7 +388,7 @@ class _ServerState:
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
-            "objects": result.extras.get("objects"),
+            "objects": result.output.get("objects"),
             "metrics": {
                 "prompt_tokens": metrics.prompt_tokens,
                 "decode_tokens": metrics.decode_tokens,

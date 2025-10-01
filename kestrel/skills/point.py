@@ -110,7 +110,7 @@ class PointSkillState(SkillState):
         return SkillFinalizeResult(
             text=text,
             tokens=list(self.tokens),
-            extras={"points": points},
+            output={"points": points},
         )
 
     def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Sequence[int]:

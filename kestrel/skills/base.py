@@ -51,7 +51,7 @@ class SkillFinalizeResult:
 
     text: str
     tokens: List["Token"]
-    extras: Dict[str, object] = field(default_factory=dict)
+    output: Dict[str, object] = field(default_factory=dict)
 
 
 class SkillState:

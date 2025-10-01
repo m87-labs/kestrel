@@ -160,7 +160,7 @@ class QuerySkillState(SkillState):
             tokenizer.decode(self._answer_tokens) if self._answer_tokens else ""
         )
 
-        extras: Dict[str, Any] = {"answer": answer_text}
+        output: Dict[str, Any] = {"answer": answer_text}
 
         if self._reasoning_enabled:
             reasoning_text = (
@@ -182,12 +182,12 @@ class QuerySkillState(SkillState):
                         }
                     )
                 cursor += length
-            extras["reasoning"] = {"text": reasoning_text, "grounding": grounding}
+            output["reasoning"] = {"text": reasoning_text, "grounding": grounding}
 
         return SkillFinalizeResult(
             text=answer_text,
             tokens=list(self.tokens),
-            extras=extras,
+            output=output,
         )
 
     def on_prefill(self, runtime: "MoondreamRuntime") -> None:

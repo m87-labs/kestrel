@@ -115,12 +115,10 @@ class SchedulerResult:
     """Final materialisation of a completed request."""
 
     request_id: int
-    prompt: str
     tokens: List[Token]
-    text: str
     finish_reason: str
     metrics: "RequestMetrics"
-    extras: Dict[str, object]
+    output: Dict[str, object]
 
 
 @dataclass
