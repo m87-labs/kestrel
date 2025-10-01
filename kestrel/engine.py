@@ -4,7 +4,7 @@ The engine is the high-level entry point for clients. It owns:
 
 - Lifecycle of the shared :class:`~kestrel.moondream.runtime.MoondreamRuntime`, including warmup and shutdown.
 - A micro-batching worker that pulls pending requests, prepares image crops, and runs the scheduler.
-- Skill orchestration — resolving the active :class:`~kestrel.skills.base.SkillSpec`, building prompt tokens when necessary, instantiating :class:`~kestrel.skills.base.SkillState` with skill-specific context, and bridging streaming callbacks back to callers.
+- Skill orchestration — resolving the active :class:`~kestrel.skills.base.SkillSpec`, building prompt tokens when necessary, instantiating :class:`~kestrel.skills.base.SkillState` with skill-specific request contexts, and bridging streaming callbacks back to callers.
 - Conversion between scheduler outputs (``SchedulerResult``) and user-facing ``EngineResult`` objects augmented with metrics and per-skill extras.
 
 Relationship to other components:
@@ -16,9 +16,9 @@ Relationship to other components:
 Internal API overview:
 
 - :meth:`InferenceEngine.create` / :meth:`InferenceEngine.shutdown`: manage runtime instantiation and cleanup.
-- :meth:`InferenceEngine.submit` / :meth:`InferenceEngine.submit_streaming`: enqueue non-streaming or streaming requests with optional pre-tokenised prompts.
-- :meth:`InferenceEngine.query`: helper that mirrors ``moondream.query`` while internally materialising the skill context.
-- `_submit_request`: normalises parameters, resolves the skill, builds prompt tokens when missing, and stashes a ``skill_context`` so the scheduler receives a fully initialised ``SkillState``.
+- :meth:`InferenceEngine.submit` / :meth:`InferenceEngine.submit_streaming`: enqueue non-streaming or streaming requests.
+- :meth:`InferenceEngine.query`: helper that mirrors ``moondream.query`` while internally materialising the skill request context.
+- `_submit_request`: normalises parameters, resolves the skill, builds prompt tokens, and stashes the per-request context so the scheduler receives a fully initialised ``SkillState``.
 - `_worker_loop`: background task that batches queued requests, invokes the scheduler, and delivers results or stream completions back to callers.
 
 Callers provide raw questions/objects; the engine derives skill-specific contexts and validation before handing work to the scheduler.
@@ -178,7 +178,7 @@ class _PendingRequest:
     future: asyncio.Future[EngineResult]
     stream_queue: Optional["_StreamQueue"]
     skill: SkillSpec
-    skill_context: Optional[object]
+    request_context: object
 
 
 class InferenceEngine:
@@ -194,13 +194,13 @@ class InferenceEngine:
         self._runtime_cfg = runtime_cfg
         self._batch_timeout_s = batch_timeout_s
 
-        self._runtime: MoondreamRuntime | None = None
-        self._queue: asyncio.Queue[_PendingRequest | None] = asyncio.Queue()
-        self._worker_task: asyncio.Task[None] | None = None
+        self._runtime: Optional[MoondreamRuntime] = None
+        self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task[None]] = None
         self._request_ids = itertools.count()
         self._shutdown = False
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._image_executor: ThreadPoolExecutor | None = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._image_executor: Optional[ThreadPoolExecutor] = None
         self._skills = skills or SkillRegistry(
             [QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill()]
         )
@@ -256,7 +256,23 @@ class InferenceEngine:
         runtime = self._runtime
         prompt = "Warmup prompt."
         skill = self._skills.default
-        tokens = skill.build_prompt_tokens(runtime, prompt)
+        if isinstance(skill, QuerySkill):
+            warmup_request = QueryRequest(
+                question=prompt,
+                image=None,
+                reasoning=False,
+                stream=False,
+                settings=QuerySettings(
+                    temperature=self._default_temperature,
+                    top_p=self._default_top_p,
+                    max_tokens=1,
+                ),
+            )
+        else:
+            raise RuntimeError(
+                "Warmup currently requires the default skill to be QuerySkill"
+            )
+        tokens = skill.build_prompt_tokens(runtime, warmup_request)
         state, logits = runtime.start_sequence(prompt_tokens=tokens, max_new_tokens=1)
         try:
             next_token = torch.argmax(logits, dim=-1)
@@ -278,26 +294,22 @@ class InferenceEngine:
 
     async def submit(
         self,
-        prompt: str,
+        request_context: object,
         *,
         max_new_tokens: int,
-        prompt_tokens: Optional[torch.Tensor] = None,
+        skill: str,
         image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        skill: Optional[str | SkillSpec] = None,
-        skill_context: Optional[object] = None,
     ) -> EngineResult:
         future, _ = await self._submit_request(
-            prompt,
             max_new_tokens=max_new_tokens,
-            prompt_tokens=prompt_tokens,
+            request_context=request_context,
             image=image,
             temperature=temperature,
             top_p=top_p,
             stream_queue=None,
             skill=skill,
-            skill_context=skill_context,
         )
         return await future
 
@@ -309,14 +321,12 @@ class InferenceEngine:
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
-    ) -> EngineResult | EngineStream:
+    ) -> Union[EngineResult, EngineStream]:
         if question is None:
             raise ValueError("question must be provided")
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("question must be a non-empty string")
-        if reasoning:
-            raise ValueError("Reasoning mode is not implemented")
         if spatial_refs is not None:
             raise ValueError("spatial_refs are not supported")
         if stream:
@@ -343,18 +353,21 @@ class InferenceEngine:
         request = QueryRequest(
             question=normalized_question,
             image=image,
-            reasoning=False,
+            reasoning=reasoning,
             stream=False,
-            settings=QuerySettings(temperature=temperature, top_p=top_p),
+            settings=QuerySettings(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            ),
         )
         return await self.submit(
-            normalized_question,
+            request,
             max_new_tokens=max_tokens,
             image=image,
             temperature=temperature,
             top_p=top_p,
             skill="query",
-            skill_context=request,
         )
 
     async def point(
@@ -394,13 +407,12 @@ class InferenceEngine:
             settings=PointSettings(temperature=temperature, top_p=top_p),
         )
         return await self.submit(
-            normalized_object,
+            request,
             max_new_tokens=max_tokens,
             image=image,
             temperature=temperature,
             top_p=top_p,
             skill="point",
-            skill_context=request,
         )
 
     async def caption(
@@ -445,13 +457,12 @@ class InferenceEngine:
             settings=CaptionSettings(temperature=temperature, top_p=top_p),
         )
         return await self.submit(
-            normalized_length,
+            request,
             max_new_tokens=max_tokens,
             image=image,
             temperature=temperature,
             top_p=top_p,
             skill="caption",
-            skill_context=request,
         )
 
     async def detect(
@@ -486,53 +497,46 @@ class InferenceEngine:
             max_objects=max_objects,
         )
         return await self.submit(
-            normalized_object,
+            request,
             max_new_tokens=max_tokens,
             image=image,
             temperature=temperature,
             top_p=top_p,
             skill="detect",
-            skill_context=request,
         )
 
     async def submit_streaming(
         self,
-        prompt: str,
+        request_context: object,
         *,
         max_new_tokens: int,
-        prompt_tokens: Optional[torch.Tensor] = None,
+        skill: str,
         image: Optional[pyvips.Image] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        skill: Optional[str | SkillSpec] = None,
-        skill_context: Optional[object] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         future, request_id = await self._submit_request(
-            prompt,
             max_new_tokens=max_new_tokens,
-            prompt_tokens=prompt_tokens,
+            request_context=request_context,
             image=image,
             temperature=temperature,
             top_p=top_p,
             stream_queue=queue,
             skill=skill,
-            skill_context=skill_context,
         )
         return EngineStream(request_id=request_id, queue=queue, result_future=future)
 
     async def _submit_request(
         self,
-        prompt: str,
         *,
         max_new_tokens: int,
-        prompt_tokens: Optional[torch.Tensor],
+        request_context: object,
         image: Optional[pyvips.Image],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
-        skill: Optional[str | SkillSpec],
-        skill_context: Optional[object],
+        skill: str,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -552,20 +556,13 @@ class InferenceEngine:
                 raise TypeError("image must be a pyvips.Image")
             image_obj = image
 
-        if prompt_tokens is None:
-            tokens = skill_spec.build_prompt_tokens(
-                self.runtime,
-                prompt,
-                image=image_obj,
-                image_crops=None,
-            )
-        else:
-            tokens = prompt_tokens
+        prompt_str = self._extract_prompt_text(skill_spec, request_context)
+        tokens = skill_spec.build_prompt_tokens(self.runtime, request_context)
 
         tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
         payload = _PendingRequest(
             request_id=req_id,
-            prompt=prompt,
+            prompt=prompt_str,
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
             image=image_obj,
@@ -576,7 +573,7 @@ class InferenceEngine:
             future=future,
             stream_queue=stream_queue,
             skill=skill_spec,
-            skill_context=skill_context,
+            request_context=request_context,
         )
         await self._queue.put(payload)
         return future, req_id
@@ -736,6 +733,17 @@ class InferenceEngine:
         completion = _StreamCompletion(result=result, error=error)
         queue.put_nowait(completion)
 
+    def _extract_prompt_text(self, skill: SkillSpec, request_context: object) -> str:
+        if isinstance(request_context, QueryRequest):
+            return request_context.question
+        if isinstance(request_context, PointRequest):
+            return request_context.object
+        if isinstance(request_context, DetectRequest):
+            return request_context.object
+        if isinstance(request_context, CaptionRequest):
+            return request_context.length
+        return str(request_context)
+
     def _run_batch(
         self, batch: Iterable[_PendingRequest]
     ) -> dict[int, SchedulerResult]:
@@ -784,9 +792,12 @@ class InferenceEngine:
                 image_crops=crops,
                 image_length=image_length,
                 skill=req.skill,
+                request_context=req.request_context,
             )
             skill_state = req.skill.create_state(
-                runtime, request_obj, context=req.skill_context
+                runtime,
+                request_obj,
+                request_context=request_obj.request_context,
             )
             scheduler.enqueue_request(request_obj, skill_state)
         results = scheduler.run()

@@ -45,16 +45,16 @@ class PointSkill(SkillSpec):
     def build_prompt_tokens(
         self,
         runtime: "MoondreamRuntime",
-        prompt: str,
-        *,
-        image: Optional[object] = None,
-        image_crops: Optional[object] = None,
+        request_context: object,
     ) -> Tensor:
+        if not isinstance(request_context, PointRequest):
+            raise ValueError("PointSkill.build_prompt_tokens requires a PointRequest")
         template = runtime.config.tokenizer.templates["point"]
         if template is None:
             raise ValueError("Model configuration does not include point templates")
         prefix: Sequence[int] = template["prefix"]
         suffix: Sequence[int] = template["suffix"]
+        prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(prompt).ids if prompt else []
         ids = [*prefix, *object_tokens, *suffix]
         if not ids:
@@ -65,22 +65,11 @@ class PointSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request: "GenerationRequest",
-        *,
-        context: Optional[object] = None,
+        request_context: "PointRequest",
     ) -> "PointSkillState":
-        if context is None:
-            context = PointRequest(
-                object=request.prompt,
-                image=request.image,
-                stream=False,
-                settings=PointSettings(
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                ),
-            )
-        if not isinstance(context, PointRequest):
+        if not isinstance(request_context, PointRequest):
             raise ValueError("PointSkill.create_state requires a PointRequest context")
-        return PointSkillState(self, request, context)
+        return PointSkillState(self, request, request_context)
 
 
 class PointSkillState(SkillState):

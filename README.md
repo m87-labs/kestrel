@@ -13,16 +13,21 @@
 ### Python Engine
 
 ```python
-from kestrel.config import RuntimeConfig
+from pathlib import Path
+
+import torch
+
+from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
 import pyvips
 
 cfg = RuntimeConfig(
-    weights_path="~/code/moondream/model.pt",
+    model_paths=ModelPaths(
+        weights=Path("~/code/moondream/model.pt").expanduser(),
+    ),
     device="cuda",
-    dtype="bfloat16",
+    dtype=torch.bfloat16,
     max_batch_size=4,
-    max_seq_length=4096,
 )
 engine = await InferenceEngine.create(cfg)
 
@@ -51,10 +56,21 @@ detect_result = await engine.detect(
     settings={"max_objects": 4},
 )
 print(detect_result.extras["objects"])
+
+caption_result = await engine.caption(
+    image,
+    length="normal",
+    settings={
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 64,
+    },
+)
+print(caption_result.extras["caption"])
 ```
 
-- `InferenceEngine.query(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional ``settings`` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
-- `InferenceEngine.submit(...)` remains available for advanced callers who want to pass raw prompt tokens or experiment with additional skills.
+- `InferenceEngine.query(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). Streaming and reasoning modes are not yet implemented; the HTTP server is responsible for translating JSON payloads into these calls.
+- Direct helpers like `engine.query(...)`, `engine.point(...)`, `engine.detect(...)`, and `engine.caption(...)` remain the supported public surface.
 
 ### Skills
 
@@ -96,6 +112,7 @@ Response fields include the generated `answer`, `finish_reason`, and timing metr
   }
 }
 ```
+
 Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request metadata, and the same timing metrics as `/v1/query`.
 
 `POST /v1/detect`

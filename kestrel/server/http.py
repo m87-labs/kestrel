@@ -83,10 +83,6 @@ class _ServerState:
         try:
             question = _parse_required_str(payload, "question")
             reasoning = _parse_bool(payload.get("reasoning", False), "reasoning")
-            if reasoning:
-                return JSONResponse(
-                    {"error": "Reasoning mode is not supported"}, status_code=400
-                )
 
             stream = _parse_bool(payload.get("stream", False), "stream")
             if stream:
@@ -134,7 +130,7 @@ class _ServerState:
             result = await engine.query(
                 image=image,
                 question=question,
-                reasoning=False,
+                reasoning=reasoning,
                 stream=False,
                 settings={
                     "temperature": temperature,

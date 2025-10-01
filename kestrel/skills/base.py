@@ -22,10 +22,7 @@ class SkillSpec:
     def build_prompt_tokens(
         self,
         runtime: "MoondreamRuntime",
-        prompt: str,
-        *,
-        image: Optional[object] = None,
-        image_crops: Optional[object] = None,
+        request_context: object,
     ) -> Tensor:
         raise NotImplementedError
 
@@ -33,8 +30,7 @@ class SkillSpec:
         self,
         runtime: "MoondreamRuntime",
         request: "GenerationRequest",
-        *,
-        context: Optional[object] = None,
+        request_context: object,
     ) -> "SkillState":
         raise NotImplementedError
 
@@ -126,11 +122,7 @@ class SkillRegistry:
     def default(self) -> SkillSpec:
         return self._skills[self._default]  # type: ignore[index]
 
-    def resolve(self, skill: Optional[str | SkillSpec]) -> SkillSpec:
-        if isinstance(skill, SkillSpec):
-            return skill
-        if skill is None:
-            return self.default
+    def resolve(self, skill: str) -> SkillSpec:
         try:
             return self._skills[skill]
         except KeyError as exc:  # pragma: no cover - defensive guard

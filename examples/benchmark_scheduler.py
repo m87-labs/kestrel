@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.moondream.runtime import MoondreamRuntime
-from kestrel.skills import QuerySkill
+from kestrel.skills import QueryRequest, QuerySettings, QuerySkill
 
 
 @dataclass
@@ -32,9 +32,9 @@ class PromptPayload:
     """Cached prompt metadata used for repeated benchmark rounds."""
 
     text: str
-    tokens: torch.Tensor  # stored on CPU for reuse
     length: int  # number of tokens including BOS/prefix/suffix
     image: Optional[pyvips.Image] = None
+    request: QueryRequest
 
 
 def _parse_args() -> argparse.Namespace:
@@ -155,17 +155,24 @@ def _synthetic_prompts(
             base = tokenizer.decode(token_ids)
 
         current_image = next(image_iter) if image_iter is not None else None
-        prompt_tokens = skill.build_prompt_tokens(
-            runtime,
-            base,
+        request = QueryRequest(
+            question=base,
             image=current_image,
-        ).to("cpu")
+            reasoning=False,
+            stream=False,
+            settings=QuerySettings(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max_new_tokens,
+            ),
+        )
+        prompt_tokens = skill.build_prompt_tokens(runtime, request)
         payloads.append(
             PromptPayload(
                 text=base,
-                tokens=prompt_tokens,
                 length=prompt_tokens.shape[1],
                 image=current_image,
+                request=request,
             )
         )
 
@@ -186,9 +193,8 @@ async def _run_round(
     start = time.perf_counter()
     tasks = [
         engine.submit(
-            payload.text,
+            payload.request,
             max_new_tokens=max_new_tokens,
-            prompt_tokens=payload.tokens.clone(),
             image=payload.image,
             temperature=0.0,
             top_p=1.0,

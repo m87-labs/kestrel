@@ -46,16 +46,16 @@ class DetectSkill(SkillSpec):
     def build_prompt_tokens(
         self,
         runtime: "MoondreamRuntime",
-        prompt: str,
-        *,
-        image: Optional[object] = None,
-        image_crops: Optional[object] = None,
+        request_context: object,
     ) -> Tensor:
+        if not isinstance(request_context, DetectRequest):
+            raise ValueError("DetectSkill.build_prompt_tokens requires a DetectRequest")
         template = runtime.config.tokenizer.templates["detect"]
         if template is None:
             raise ValueError("Model configuration does not include detect templates")
         prefix: Sequence[int] = template["prefix"]
         suffix: Sequence[int] = template["suffix"]
+        prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(prompt).ids if prompt else []
         ids = [*prefix, *object_tokens, *suffix]
         if not ids:
@@ -66,23 +66,11 @@ class DetectSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request: "GenerationRequest",
-        *,
-        context: Optional[object] = None,
+        request_context: "DetectRequest",
     ) -> "DetectSkillState":
-        if context is None:
-            context = DetectRequest(
-                object=request.prompt,
-                image=request.image,
-                stream=False,
-                settings=DetectSettings(
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                ),
-                max_objects=request.max_new_tokens,
-            )
-        if not isinstance(context, DetectRequest):
+        if not isinstance(request_context, DetectRequest):
             raise ValueError("DetectSkill.create_state requires a DetectRequest context")
-        return DetectSkillState(self, request, context)
+        return DetectSkillState(self, request, request_context)
 
 
 class DetectSkillState(SkillState):

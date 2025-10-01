@@ -24,6 +24,7 @@ class GenerationRequest:
     prompt_tokens: Tensor
     max_new_tokens: int
     skill: SkillSpec = field(repr=False)
+    request_context: object = field(repr=False)
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
@@ -47,6 +48,8 @@ class GenerationRequest:
         # prompt length even though individual skills omit it from their token
         # buffers.
         self.prompt_length = int(self.prompt_tokens.shape[0]) + 1
+        if self.request_context is None:
+            raise ValueError("request_context must be provided")
         if self.temperature < 0.0:
             raise ValueError("temperature must be non-negative")
         if not (0.0 < self.top_p <= 1.0):

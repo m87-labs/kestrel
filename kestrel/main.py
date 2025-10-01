@@ -177,15 +177,15 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
                     settings=QuerySettings(
                         temperature=args.temperature,
                         top_p=args.top_p,
+                        max_tokens=args.max_new_tokens,
                     ),
                 )
                 stream = await engine.submit_streaming(
-                    prompt,
+                    request,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     skill="query",
-                    skill_context=request,
                 )
                 streams.append(stream)
 

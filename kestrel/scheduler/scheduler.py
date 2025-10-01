@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 import time
 
@@ -50,61 +50,6 @@ class GenerationScheduler:
     # ------------------------------------------------------------------
     # Submission
 
-    def submit(
-        self,
-        prompt: str,
-        *,
-        max_new_tokens: int,
-        prompt_tokens: Optional[Tensor] = None,
-        request_id: Optional[int] = None,
-        image: Optional[pyvips.Image] = None,
-        image_crops: Optional[OverlapCropOutput] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        stream_callback: Optional[StreamCallback] = None,
-        skill: Optional[str | SkillSpec] = None,
-        skill_state: Optional[SkillState] = None,
-    ) -> int:
-        """Queue a new prompt for generation."""
-
-        skill_spec = self._skills.resolve(skill)
-
-        if prompt_tokens is None:
-            prompt_tokens = skill_spec.build_prompt_tokens(
-                self.runtime,
-                prompt,
-                image=image,
-                image_crops=image_crops,
-            )
-        if image is not None and not hasattr(self.runtime.model, "vision"):
-            raise ValueError("Runtime does not support image inputs")
-        image_length = (
-            self.runtime.image_prefix_length
-            if (image is not None or image_crops is not None)
-            else 0
-        )
-        request = GenerationRequest(
-            request_id=(
-                request_id if request_id is not None else self._issue_request_id()
-            ),
-            prompt=prompt,
-            # TODO: maybe this shouldn't be a tensor
-            prompt_tokens=prompt_tokens.to(device="cpu"),
-            max_new_tokens=max_new_tokens,
-            temperature=self._resolve_temperature(temperature),
-            top_p=self._resolve_top_p(top_p),
-            stream_callback=stream_callback,
-            image=image,
-            image_crops=image_crops,
-            image_length=image_length,
-            skill=skill_spec,
-        )
-        if skill_state is None:
-            skill_state = skill_spec.create_state(self.runtime, request)
-        request.skill_state = skill_state
-        self.waiting.push(request)
-        return request.request_id
-
     def enqueue_request(
         self,
         request: GenerationRequest,
@@ -116,67 +61,6 @@ class GenerationScheduler:
             raise ValueError("GenerationRequest already has an associated SkillState")
         request.skill_state = skill_state
         self.waiting.push(request)
-
-    def submit_many(
-        self,
-        prompts: Iterable[str],
-        *,
-        max_new_tokens: int,
-        images: Optional[Iterable[Optional[pyvips.Image]]] = None,
-        image_crops: Optional[Iterable[Optional[OverlapCropOutput]]] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        stream_callback: Optional[StreamCallback] = None,
-        skill: Optional[str | SkillSpec] = None,
-        skill_states: Optional[Iterable[Optional[SkillState]]] = None,
-    ) -> List[int]:
-        ids: List[int] = []
-        image_iter = iter(images) if images is not None else None
-        crops_iter = iter(image_crops) if image_crops is not None else None
-        state_iter = iter(skill_states) if skill_states is not None else None
-        for prompt in prompts:
-            image = next(image_iter) if image_iter is not None else None
-            crops = next(crops_iter) if crops_iter is not None else None
-            state = next(state_iter) if state_iter is not None else None
-            ids.append(
-                self.submit(
-                    prompt,
-                    max_new_tokens=max_new_tokens,
-                    image=image,
-                    image_crops=crops,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stream_callback=stream_callback,
-                    skill=skill,
-                    skill_state=state,
-                )
-            )
-        if image_iter is not None:
-            try:
-                next(image_iter)
-            except StopIteration:
-                pass
-            else:
-                raise ValueError("Number of images does not match number of prompts")
-        if crops_iter is not None:
-            try:
-                next(crops_iter)
-            except StopIteration:
-                pass
-            else:
-                raise ValueError(
-                    "Number of image_crops entries does not match number of prompts"
-                )
-        if state_iter is not None:
-            try:
-                next(state_iter)
-            except StopIteration:
-                pass
-            else:
-                raise ValueError(
-                    "Number of skill_states entries does not match number of prompts"
-                )
-        return ids
 
     # ------------------------------------------------------------------
     # Execution
@@ -233,7 +117,9 @@ class GenerationScheduler:
             )
             skill_state = request.skill_state
             if skill_state is None:
-                skill_state = request.skill.create_state(self.runtime, request)
+                skill_state = request.skill.create_state(
+                    self.runtime, request, request.request_context
+                )
             request.skill_state = skill_state
             seq = ScheduledSequence(
                 request=request,

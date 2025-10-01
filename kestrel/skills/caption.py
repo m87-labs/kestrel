@@ -47,18 +47,20 @@ class CaptionSkill(SkillSpec):
     def build_prompt_tokens(
         self,
         runtime: "MoondreamRuntime",
-        prompt: str,
-        *,
-        image: Optional[object] = None,
-        image_crops: Optional[object] = None,
+        request_context: object,
     ) -> Tensor:
+        if not isinstance(request_context, CaptionRequest):
+            raise ValueError("CaptionSkill.build_prompt_tokens requires a CaptionRequest")
         templates = runtime.config.tokenizer.templates["caption"]
         if templates is None:
             raise ValueError("Model configuration does not include caption templates")
-        if prompt not in templates:
+        length_key = request_context.length
+        if length_key not in templates:
             valid = ", ".join(sorted(templates.keys()))
-            raise ValueError(f"Unsupported caption length '{prompt}'. Expected one of: {valid}")
-        tokens = templates[prompt]
+            raise ValueError(
+                f"Unsupported caption length '{length_key}'. Expected one of: {valid}"
+            )
+        tokens = templates[length_key]
         if not tokens:
             return torch.empty((1, 0), dtype=torch.long)
         return torch.tensor([tokens], dtype=torch.long)
@@ -67,22 +69,11 @@ class CaptionSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request: "GenerationRequest",
-        *,
-        context: Optional[object] = None,
+        request_context: "CaptionRequest",
     ) -> "CaptionSkillState":
-        if context is None:
-            context = CaptionRequest(
-                length=request.prompt,
-                image=request.image,
-                stream=False,
-                settings=CaptionSettings(
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                ),
-            )
-        if not isinstance(context, CaptionRequest):
+        if not isinstance(request_context, CaptionRequest):
             raise ValueError("CaptionSkill.create_state requires a CaptionRequest context")
-        return CaptionSkillState(self, request, context)
+        return CaptionSkillState(self, request, request_context)
 
 
 class CaptionSkillState(SkillState):

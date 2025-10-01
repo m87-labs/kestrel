@@ -22,7 +22,7 @@ from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.moondream import text as text_mod
 from kestrel.moondream import vision as vision_mod
-from kestrel.skills import QuerySkill
+from kestrel.skills import QueryRequest, QuerySettings, QuerySkill
 from kestrel.moondream.layers import (
     LayerNormWeights,
     LinearWeights,
@@ -425,10 +425,18 @@ _QUERY_SKILL = QuerySkill()
 
 
 def _tokenize_prompt(runtime: MoondreamRuntime, prompt: str) -> torch.Tensor:
-    return _QUERY_SKILL.build_prompt_tokens(
-        runtime,
-        prompt,
+    request = QueryRequest(
+        question=prompt,
+        image=None,
+        reasoning=False,
+        stream=False,
+        settings=QuerySettings(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=runtime.max_seq_length,
+        ),
     )
+    return _QUERY_SKILL.build_prompt_tokens(runtime, request)
 
 
 @dataclasses.dataclass
