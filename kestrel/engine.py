@@ -194,9 +194,9 @@ class InferenceEngine:
         self._skills = skills or SkillRegistry(
             [QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill()]
         )
-        self._default_max_new_tokens = 512
-        self._default_temperature = 0.0
-        self._default_top_p = 1.0
+        self._default_max_new_tokens = 768
+        self._default_temperature = 0.5
+        self._default_top_p = 0.9
 
     @property
     def runtime(self) -> MoondreamRuntime:
@@ -840,8 +840,8 @@ class InferenceEngine:
 
         scheduler = GenerationScheduler(
             self.runtime,
-            default_temperature=0.0,
-            default_top_p=1.0,
+            default_temperature=0.5,
+            default_top_p=0.9,
             skill_registry=self._skills,
         )
         runtime = self.runtime

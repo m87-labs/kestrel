@@ -67,7 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     schedule = subparsers.add_parser("schedule", help="Run batched text generation")
     schedule.add_argument("prompts", nargs="+", help="Prompts to generate responses for")
     _add_runtime_args(schedule)
-    schedule.add_argument("--max-new-tokens", type=int, default=64, help="Tokens to sample per request")
+    schedule.add_argument("--max-new-tokens", type=int, default=768, help="Tokens to sample per request")
     schedule.add_argument(
         "--batch-timeout-ms",
         type=float,
@@ -77,13 +77,13 @@ def _build_parser() -> argparse.ArgumentParser:
     schedule.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Softmax temperature; 0 selects greedy decoding",
     )
     schedule.add_argument(
         "--top-p",
         type=float,
-        default=1.0,
+        default=0.9,
         help="Nucleus sampling mass (0 < p <= 1)",
     )
     schedule.add_argument(
@@ -103,19 +103,19 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--default-max-new-tokens",
         type=int,
-        default=64,
+        default=768,
         help="Default max tokens to generate when a request does not specify it",
     )
     serve.add_argument(
         "--default-temperature",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Default sampling temperature when a request omits it",
     )
     serve.add_argument(
         "--default-top-p",
         type=float,
-        default=1.0,
+        default=0.9,
         help="Default nucleus sampling mass when a request omits it",
     )
     serve.add_argument("--host", default="0.0.0.0", help="Host address to bind the HTTP server")
