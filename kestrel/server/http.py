@@ -15,7 +15,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from kestrel.config import RuntimeConfig
-from kestrel.engine import InferenceEngine
+from kestrel.engine import EngineMetrics, InferenceEngine
 from kestrel.utils.image import load_vips_from_base64
 
 logger = logging.getLogger(__name__)
@@ -29,15 +29,13 @@ STREAM_HEADERS = {
 }
 
 
-def _format_metrics(result_metrics, total_latency: float) -> Dict[str, float]:
+def _format_metrics(result_metrics: EngineMetrics) -> Dict[str, float]:
     return {
-        "prompt_tokens": result_metrics.prompt_tokens,
-        "decode_tokens": result_metrics.decode_tokens,
-        "processing_latency_s": result_metrics.processing_latency_s,
-        "ttft_s": result_metrics.ttft_s,
-        "decode_latency_s": result_metrics.decode_latency_s,
-        "decode_tokens_per_s": result_metrics.decode_tokens_per_s,
-        "total_latency_s": total_latency,
+        "input_tokens": result_metrics.input_tokens,
+        "output_tokens": result_metrics.output_tokens,
+        "prefill_time_ms": result_metrics.prefill_time_ms,
+        "decode_time_ms": result_metrics.decode_time_ms,
+        "ttft_ms": result_metrics.ttft_ms,
     }
 
 
@@ -157,8 +155,6 @@ class _ServerState:
             "max_tokens": max_tokens,
         }
 
-        start_time = time.perf_counter()
-
         if stream:
             try:
                 query_stream = await engine.query(
@@ -200,8 +196,7 @@ class _ServerState:
 
                 final_chunk = "".join(chunk_buffer)
                 chunk_buffer.clear()
-                total_latency = time.perf_counter() - start_time
-                metrics = _format_metrics(result.metrics, total_latency)
+                metrics = _format_metrics(result.metrics)
                 payload = {
                     "chunk": final_chunk,
                     "completed": True,
@@ -233,8 +228,7 @@ class _ServerState:
             return JSONResponse(
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
-        total_latency = time.perf_counter() - start_time
-        metrics = _format_metrics(result.metrics, total_latency)
+        metrics = _format_metrics(result.metrics)
         output = result.output
         answer = output.get("answer", "")
         response_payload = {
@@ -285,7 +279,6 @@ class _ServerState:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
-        start_time = time.perf_counter()
         try:
             engine = self.engine
             assert engine is not None
@@ -300,21 +293,12 @@ class _ServerState:
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
 
-        metrics = result.metrics
-        total_latency = time.perf_counter() - start_time
+        metrics_payload = _format_metrics(result.metrics)
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "points": result.output.get("points"),
-            "metrics": {
-                "prompt_tokens": metrics.prompt_tokens,
-                "decode_tokens": metrics.decode_tokens,
-                "processing_latency_s": metrics.processing_latency_s,
-                "ttft_s": metrics.ttft_s,
-                "decode_latency_s": metrics.decode_latency_s,
-                "decode_tokens_per_s": metrics.decode_tokens_per_s,
-                "total_latency_s": total_latency,
-            },
+            "metrics": metrics_payload,
         }
         return JSONResponse(response_payload)
 
@@ -377,8 +361,6 @@ class _ServerState:
             "max_tokens": max_tokens,
         }
 
-        start_time = time.perf_counter()
-
         if stream:
             try:
                 caption_stream = await engine.caption(
@@ -419,8 +401,7 @@ class _ServerState:
 
                 final_chunk = "".join(chunk_buffer)
                 chunk_buffer.clear()
-                total_latency = time.perf_counter() - start_time
-                metrics = _format_metrics(result.metrics, total_latency)
+                metrics = _format_metrics(result.metrics)
                 payload = {
                     "chunk": final_chunk,
                     "completed": True,
@@ -450,8 +431,7 @@ class _ServerState:
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
 
-        total_latency = time.perf_counter() - start_time
-        metrics = _format_metrics(result.metrics, total_latency)
+        metrics = _format_metrics(result.metrics)
         caption = result.output.get("caption", "")
         response_payload = {
             "request_id": str(result.request_id),
@@ -499,7 +479,6 @@ class _ServerState:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
-        start_time = time.perf_counter()
         try:
             engine = self.engine
             assert engine is not None
@@ -514,21 +493,12 @@ class _ServerState:
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
 
-        metrics = result.metrics
-        total_latency = time.perf_counter() - start_time
+        metrics_payload = _format_metrics(result.metrics)
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "objects": result.output.get("objects"),
-            "metrics": {
-                "prompt_tokens": metrics.prompt_tokens,
-                "decode_tokens": metrics.decode_tokens,
-                "processing_latency_s": metrics.processing_latency_s,
-                "ttft_s": metrics.ttft_s,
-                "decode_latency_s": metrics.decode_latency_s,
-                "decode_tokens_per_s": metrics.decode_tokens_per_s,
-                "total_latency_s": total_latency,
-            },
+            "metrics": metrics_payload,
         }
         return JSONResponse(response_payload)
 

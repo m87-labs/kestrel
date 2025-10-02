@@ -31,6 +31,7 @@ class GenerationRequest:
     image: Optional[pyvips.Image] = None
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0
+    submitted_at: float = 0.0
     skill_state: Optional[SkillState] = field(default=None, repr=False)
 
     prompt_length: int = field(init=False)
@@ -71,6 +72,7 @@ class ScheduledSequence:
     finished: bool = False
     finish_reason: Optional[str] = None
     started_at: float = field(default=0.0)
+    prefill_started_at: Optional[float] = None
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
 
@@ -150,6 +152,6 @@ StreamCallback = Callable[[StreamUpdate], None]
 class RequestMetrics:
     prompt_tokens: int
     decode_tokens: int
-    processing_latency_s: float
+    prefill_time_s: float
     ttft_s: float
-    decode_latency_s: float
+    decode_time_s: float

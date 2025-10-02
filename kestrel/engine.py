@@ -76,23 +76,13 @@ from kestrel.skills.query import QueryRequest, QuerySettings
 
 @dataclass(slots=True)
 class EngineMetrics:
-    """Timing and token accounting for a single request."""
+    """Token counts and timing for a single request."""
 
-    prompt_tokens: int
-    decode_tokens: int
-    processing_latency_s: float
-    ttft_s: float
-    decode_latency_s: float
-
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.decode_tokens
-
-    @property
-    def decode_tokens_per_s(self) -> float:
-        if self.decode_latency_s <= 0 or self.decode_tokens <= 0:
-            return 0.0
-        return self.decode_tokens / self.decode_latency_s
+    input_tokens: int
+    output_tokens: int
+    prefill_time_ms: float
+    decode_time_ms: float
+    ttft_ms: float
 
 
 @dataclass(slots=True)
@@ -740,12 +730,15 @@ class InferenceEngine:
                     self._complete_stream(req, error=error)
                     continue
                 sched_metrics = result.metrics
+                prefill_time_ms = max(sched_metrics.prefill_time_s * 1000.0, 0.0)
+                decode_time_ms = max(sched_metrics.decode_time_s * 1000.0, 0.0)
+                ttft_ms = max(sched_metrics.ttft_s * 1000.0, 0.0)
                 metrics = EngineMetrics(
-                    prompt_tokens=sched_metrics.prompt_tokens,
-                    decode_tokens=sched_metrics.decode_tokens,
-                    processing_latency_s=sched_metrics.processing_latency_s,
-                    ttft_s=sched_metrics.ttft_s,
-                    decode_latency_s=sched_metrics.decode_latency_s,
+                    input_tokens=sched_metrics.prompt_tokens,
+                    output_tokens=sched_metrics.decode_tokens,
+                    prefill_time_ms=prefill_time_ms,
+                    decode_time_ms=decode_time_ms,
+                    ttft_ms=ttft_ms,
                 )
                 engine_result = EngineResult(
                     request_id=req.request_id,
@@ -872,6 +865,7 @@ class InferenceEngine:
                 image=req.image,
                 image_crops=crops,
                 image_length=image_length,
+                submitted_at=req.submitted_at,
                 skill=req.skill,
                 request_context=req.request_context,
             )

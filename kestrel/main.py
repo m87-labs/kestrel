@@ -226,8 +226,8 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
             display_text = str(payload)
         print(
             f"[{result.request_id}] {result.finish_reason}: {display_text} "
-            f"(processing={metrics.processing_latency_s:.3f}s, ttft={metrics.ttft_s:.3f}s, "
-            f"decode={metrics.decode_latency_s:.3f}s, decode_tokens={metrics.decode_tokens})"
+            f"(prefill={metrics.prefill_time_ms:.1f}ms, ttft={metrics.ttft_ms:.1f}ms, "
+            f"decode={metrics.decode_time_ms:.1f}ms, output_tokens={metrics.output_tokens})"
         )
 
 

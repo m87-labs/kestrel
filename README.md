@@ -126,7 +126,7 @@ assert "".join(chunks) == caption_result.output["caption"]
 }
 ```
 
-Response fields include the generated `answer`, `finish_reason`, and timing metrics (`processing_latency_s`, `ttft_s`, `decode_latency_s`, token counts/throughput). When `"stream": true` is supplied, the endpoint upgrades to Server-Sent Events and emits incremental `chunk` payloads; the final event carries the completed answer alongside metrics.
+Response fields include the generated `answer`, a `finish_reason` aligned with OpenAI semantics (`stop` or `length` today), and timing metrics (`input_tokens`, `output_tokens`, `prefill_time_ms`, `decode_time_ms`, `ttft_ms`). When `"stream": true` is supplied, the endpoint upgrades to Server-Sent Events and emits incremental `chunk` payloads; the final event carries the completed answer alongside metrics.
 
 `POST /v1/point`
 
@@ -242,7 +242,7 @@ uv run python examples/compare_vision.py \
   }
   ```
 
-  `image_url` must be a base64 blob (raw or `data:image/...;base64,<payload>`). Responses include the generated `answer`, `request_id`, `finish_reason`, and engine timings (`ttft_s`, `decode_tokens_per_s`, etc.).
+  `image_url` must be a base64 blob (raw or `data:image/...;base64,<payload>`). Responses include the generated `answer`, `request_id`, `finish_reason`, and engine timings (`input_tokens`, `output_tokens`, `prefill_time_ms`, `decode_time_ms`, `ttft_ms`).
 
 - **Load testing workflow**
 

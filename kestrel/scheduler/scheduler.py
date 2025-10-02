@@ -127,7 +127,8 @@ class GenerationScheduler:
                 skill_state=skill_state,
             )
             seq.skill_state.on_prefill(self.runtime)
-            seq.started_at = prefill_start
+            seq.started_at = request.submitted_at
+            seq.prefill_started_at = prefill_start
 
             if request.max_new_tokens <= 0:
                 seq.first_token_time = prefill_start
@@ -288,28 +289,39 @@ class GenerationScheduler:
         return value
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
+        internal_reason = seq.finish_reason or "unknown"
+        finish_reason = self._map_finish_reason(internal_reason)
         finalize = seq.skill_state.finalize(
-            self.runtime, reason=seq.finish_reason or "unknown"
+            self.runtime, reason=finish_reason
         )
         prompt_tokens = seq.state.prompt_length
         decode_tokens = len(finalize.tokens)
-        started_at = seq.started_at
+        queued_at = seq.request.submitted_at
+        prefill_started_at = seq.prefill_started_at or queued_at
         completed_at = seq.completed_at or time.perf_counter()
         first_token_time = seq.first_token_time or completed_at
-        processing_latency = max(completed_at - started_at, 0.0)
-        ttft = max(first_token_time - started_at, 0.0)
-        decode_latency = max(completed_at - first_token_time, 0.0)
+        prefill_time = max(first_token_time - prefill_started_at, 0.0)
+        ttft = max(first_token_time - queued_at, 0.0)
+        decode_time = max(completed_at - first_token_time, 0.0)
         metrics = RequestMetrics(
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
-            processing_latency_s=processing_latency,
+            prefill_time_s=prefill_time,
             ttft_s=ttft,
-            decode_latency_s=decode_latency,
+            decode_time_s=decode_time,
         )
         return SchedulerResult(
             request_id=seq.request.request_id,
             tokens=finalize.tokens,
-            finish_reason=seq.finish_reason or "unknown",
+            finish_reason=finish_reason,
             metrics=metrics,
             output=finalize.output,
         )
+
+    @staticmethod
+    def _map_finish_reason(reason: str) -> str:
+        if reason == "eos":
+            return "stop"
+        if reason in ("max_new_tokens", "length"):
+            return "length"
+        return reason or "unknown"
