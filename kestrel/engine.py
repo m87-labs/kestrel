@@ -730,9 +730,9 @@ class InferenceEngine:
                     self._complete_stream(req, error=error)
                     continue
                 sched_metrics = result.metrics
-                prefill_time_ms = max(sched_metrics.prefill_time_s * 1000.0, 0.0)
-                decode_time_ms = max(sched_metrics.decode_time_s * 1000.0, 0.0)
-                ttft_ms = max(sched_metrics.ttft_s * 1000.0, 0.0)
+                prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
+                decode_time_ms = max(sched_metrics.decode_time_ms, 0.0)
+                ttft_ms = max(sched_metrics.ttft_ms, 0.0)
                 metrics = EngineMetrics(
                     input_tokens=sched_metrics.prompt_tokens,
                     output_tokens=sched_metrics.decode_tokens,

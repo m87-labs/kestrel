@@ -152,6 +152,6 @@ StreamCallback = Callable[[StreamUpdate], None]
 class RequestMetrics:
     prompt_tokens: int
     decode_tokens: int
-    prefill_time_s: float
-    ttft_s: float
-    decode_time_s: float
+    prefill_time_ms: float
+    ttft_ms: float
+    decode_time_ms: float

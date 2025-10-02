@@ -41,18 +41,18 @@ class RequestRecord:
     server_metrics: Dict[str, Any]
 
     @property
-    def ttft_s(self) -> Optional[float]:
-        value = self.server_metrics.get("ttft_s")
+    def ttft_ms(self) -> Optional[float]:
+        value = self.server_metrics.get("ttft_ms")
         return float(value) if isinstance(value, (int, float)) else None
 
     @property
-    def decode_latency_s(self) -> Optional[float]:
-        value = self.server_metrics.get("decode_latency_s")
+    def decode_latency_ms(self) -> Optional[float]:
+        value = self.server_metrics.get("decode_time_ms")
         return float(value) if isinstance(value, (int, float)) else None
 
     @property
-    def processing_latency_s(self) -> Optional[float]:
-        value = self.server_metrics.get("processing_latency_s")
+    def processing_latency_ms(self) -> Optional[float]:
+        value = self.server_metrics.get("processing_latency_ms")
         return float(value) if isinstance(value, (int, float)) else None
 
 
@@ -363,6 +363,14 @@ async def send_request(
             metrics = body.get("metrics")
             if not isinstance(metrics, dict):
                 metrics = {}
+            else:
+                prefill_val = metrics.get("prefill_time_ms")
+                decode_val = metrics.get("decode_time_ms")
+                if isinstance(prefill_val, (int, float)) and isinstance(decode_val, (int, float)):
+                    metrics.setdefault(
+                        "processing_latency_ms",
+                        float(prefill_val) + float(decode_val),
+                    )
             record = RequestRecord(
                 start_time=start,
                 end_time=time.perf_counter(),
@@ -436,7 +444,7 @@ async def run_stage(
 def compute_overload(
     result: StageResult,
     latency_threshold_s: float,
-    ttft_threshold_s: float,
+    ttft_threshold_ms: float,
     error_threshold: float,
 ) -> List[str]:
     reasons: List[str] = []
@@ -452,13 +460,13 @@ def compute_overload(
             f"latency_p95 {p95_latency*1000:.1f}ms > {latency_threshold_s*1000:.1f}ms"
         )
     ttft_values = sorted(
-        rec.ttft_s for rec in result.records if isinstance(rec.ttft_s, (int, float))
+        rec.ttft_ms for rec in result.records if isinstance(rec.ttft_ms, (int, float))
     )
     if ttft_values:
         p95_ttft = percentile(ttft_values, 95)
-        if p95_ttft is not None and p95_ttft > ttft_threshold_s:
+        if p95_ttft is not None and p95_ttft > ttft_threshold_ms:
             reasons.append(
-                f"ttft_p95 {p95_ttft*1000:.1f}ms > {ttft_threshold_s*1000:.1f}ms"
+                f"ttft_p95 {p95_ttft:.1f}ms > {ttft_threshold_ms:.1f}ms"
             )
     return reasons
 
@@ -507,9 +515,9 @@ def render_stage_summary(result: StageResult) -> Dict[str, Any]:
     success = result.success_count
     total = result.total_requests
     latency_summary = summarize_latency(result.records)
-    ttft_summary = summarize_server_metric(result.records, "ttft_s")
-    decode_summary = summarize_server_metric(result.records, "decode_latency_s")
-    processing_summary = summarize_server_metric(result.records, "processing_latency_s")
+    ttft_summary = summarize_server_metric(result.records, "ttft_ms")
+    decode_summary = summarize_server_metric(result.records, "decode_time_ms")
+    processing_summary = summarize_server_metric(result.records, "processing_latency_ms")
     token_summary = aggregate_token_stats(result.records, duration_s=result.actual_duration_s)
     return {
         "target_concurrency": result.config.concurrency,
@@ -542,7 +550,7 @@ def print_stage_line(summary: Dict[str, Any]) -> None:
         f"succ={summary['requests_success']}/{summary['requests_total']} | "
         f"err={summary['error_rate']*100:.1f}% | "
         f"lat-p95={latency['p95']*1000 if latency['p95'] is not None else float('nan'):.1f}ms | "
-        f"ttft-p95={ttft['p95']*1000 if ttft['p95'] is not None else float('nan'):.1f}ms | "
+        f"ttft-p95={ttft['p95'] if ttft['p95'] is not None else float('nan'):.1f}ms | "
         f"tok-in/s={tokens['input_per_s']:.1f} | tok-out/s={tokens['output_per_s']:.1f} | "
         f"overloaded={summary['overloaded']}"
     )
@@ -565,7 +573,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
 
     stage_configs = build_stage_configs(args)
     latency_threshold_s = args.latency_threshold_ms / 1000.0
-    ttft_threshold_s = args.ttft_threshold_ms / 1000.0
+    ttft_threshold_ms = args.ttft_threshold_ms
 
     results: List[Dict[str, Any]] = []
 
@@ -591,7 +599,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             stage_result.overload_reasons = compute_overload(
                 stage_result,
                 latency_threshold_s,
-                ttft_threshold_s,
+                ttft_threshold_ms,
                 args.error_threshold,
             )
             summary = render_stage_summary(stage_result)
