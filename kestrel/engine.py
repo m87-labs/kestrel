@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -72,6 +73,9 @@ from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -683,42 +687,21 @@ class InferenceEngine:
                 continue
 
             try:
-                results = await loop.run_in_executor(None, self._run_batch, batch)
+                results, failures = await loop.run_in_executor(
+                    None, self._run_batch, batch
+                )
             except Exception as exc:
+                _LOGGER.exception("Batch execution failed", exc_info=exc)
                 for req in batch:
-                    future = req.future
-                    if future and not future.done():
-                        future.set_exception(exc)
-                    self._complete_stream(req, error=exc)
-
-                self._shutdown = True
-
-                # Best-effort cleanup of any sequences that may have been admitted.
-                try:
-                    runtime_sequences = list(self.runtime.active_sequences.values())
-                except Exception:  # pragma: no cover - defensive cleanup
-                    runtime_sequences = []
-                for state in runtime_sequences:
-                    try:
-                        self.runtime.release_sequence(state)
-                    except Exception:
-                        pass
-
-                # Propagate the same failure to anything still queued.
-                try:
-                    while True:
-                        pending = self._queue.get_nowait()
-                        if pending is None:
-                            continue
-                        future = pending.future
-                        if future and not future.done():
-                            future.set_exception(exc)
-                except asyncio.QueueEmpty:
-                    pass
-
-                break
+                    self._fail_request(req, exc)
+                self._release_active_sequences()
+                continue
 
             for req in batch:
+                failure = failures.get(req.request_id)
+                if failure is not None:
+                    self._fail_request(req, failure)
+                    continue
                 future = req.future
                 try:
                     result = results[req.request_id]
@@ -726,8 +709,7 @@ class InferenceEngine:
                     error = RuntimeError(
                         f"Request {req.request_id} missing from scheduler results"
                     )
-                    future.set_exception(error)
-                    self._complete_stream(req, error=error)
+                    self._fail_request(req, error)
                     continue
                 sched_metrics = result.metrics
                 prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
@@ -807,6 +789,23 @@ class InferenceEngine:
         completion = _StreamCompletion(result=result, error=error)
         queue.put_nowait(completion)
 
+    def _fail_request(self, req: _PendingRequest, error: BaseException) -> None:
+        future = req.future
+        if future and not future.done():
+            future.set_exception(error)
+        self._complete_stream(req, error=error)
+
+    def _release_active_sequences(self) -> None:
+        try:
+            runtime_sequences = list(self.runtime.active_sequences.values())
+        except Exception:  # pragma: no cover - defensive cleanup
+            return
+        for state in runtime_sequences:
+            try:
+                self.runtime.release_sequence(state)
+            except Exception:
+                pass
+
     def _extract_prompt_text(self, skill: SkillSpec, request_context: object) -> str:
         if isinstance(request_context, QueryRequest):
             return request_context.question
@@ -820,23 +819,31 @@ class InferenceEngine:
 
     def _run_batch(
         self, batch: Iterable[_PendingRequest]
-    ) -> dict[int, SchedulerResult]:
+    ) -> Tuple[dict[int, SchedulerResult], Dict[int, BaseException]]:
+        batch_list = list(batch)
+        failures: Dict[int, BaseException] = {}
         image_crops: dict[int, OverlapCropOutput] = {}
         if self._image_executor is not None:
             futures: List[tuple[int, Future[OverlapCropOutput]]] = []
             vision_config = self.runtime.config.vision
-            for req in batch:
-                if req.image is not None:
-                    futures.append(
-                        (
-                            req.request_id,
-                            self._image_executor.submit(
-                                compute_overlap_crops, req.image, vision_config
-                            ),
-                        )
+            for req in batch_list:
+                if req.image is None:
+                    continue
+                try:
+                    future = self._image_executor.submit(
+                        compute_overlap_crops, req.image, vision_config
                     )
+                except Exception as exc:
+                    failures[req.request_id] = exc
+                    continue
+                futures.append((req.request_id, future))
             for req_id, future in futures:
-                image_crops[req_id] = future.result()
+                if req_id in failures:
+                    continue
+                try:
+                    image_crops[req_id] = future.result()
+                except Exception as exc:
+                    failures[req_id] = exc
 
         scheduler = GenerationScheduler(
             self.runtime,
@@ -845,38 +852,46 @@ class InferenceEngine:
             skill_registry=self._skills,
         )
         runtime = self.runtime
-        for req in batch:
-            prompt_tokens = req.prompt_tokens.clone()
-            stream_cb = self._build_stream_callback(req)
-            crops = image_crops.get(req.request_id)
-            image_length = (
-                runtime.image_prefix_length
-                if (req.image is not None or crops is not None)
-                else 0
-            )
-            request_obj = GenerationRequest(
-                request_id=req.request_id,
-                prompt=req.prompt,
-                prompt_tokens=prompt_tokens,
-                max_new_tokens=req.max_new_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                stream_callback=stream_cb,
-                image=req.image,
-                image_crops=crops,
-                image_length=image_length,
-                submitted_at=req.submitted_at,
-                skill=req.skill,
-                request_context=req.request_context,
-            )
-            skill_state = req.skill.create_state(
-                runtime,
-                request_obj,
-                request_context=request_obj.request_context,
-            )
+        for req in batch_list:
+            if req.request_id in failures:
+                continue
+            try:
+                prompt_tokens = req.prompt_tokens.clone()
+                stream_cb = self._build_stream_callback(req)
+                crops = image_crops.get(req.request_id)
+                image_length = (
+                    runtime.image_prefix_length
+                    if (req.image is not None or crops is not None)
+                    else 0
+                )
+                request_obj = GenerationRequest(
+                    request_id=req.request_id,
+                    prompt=req.prompt,
+                    prompt_tokens=prompt_tokens,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    stream_callback=stream_cb,
+                    image=req.image,
+                    image_crops=crops,
+                    image_length=image_length,
+                    submitted_at=req.submitted_at,
+                    skill=req.skill,
+                    request_context=req.request_context,
+                )
+                skill_state = req.skill.create_state(
+                    runtime,
+                    request_obj,
+                    request_context=request_obj.request_context,
+                )
+            except Exception as exc:
+                failures[req.request_id] = exc
+                continue
             scheduler.enqueue_request(request_obj, skill_state)
-        results = scheduler.run()
-        return {result.request_id: result for result in results}
+
+        results = scheduler.run() if scheduler.waiting or scheduler.running else []
+        results_map = {result.request_id: result for result in results}
+        return results_map, failures
 
 
 __all__ = ["InferenceEngine", "EngineResult", "EngineMetrics", "EngineStream"]
