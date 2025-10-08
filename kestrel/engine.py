@@ -787,7 +787,14 @@ class InferenceEngine:
             return
         req.stream_queue = None
         completion = _StreamCompletion(result=result, error=error)
-        queue.put_nowait(completion)
+        loop = self._loop
+        if loop is None:
+            queue.put_nowait(completion)
+            return
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, completion)
+        except RuntimeError:
+            queue.put_nowait(completion)
 
     def _fail_request(self, req: _PendingRequest, error: BaseException) -> None:
         future = req.future
