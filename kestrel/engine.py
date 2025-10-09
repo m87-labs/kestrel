@@ -757,9 +757,11 @@ class InferenceEngine:
         self, req: _PendingRequest
     ) -> Optional[Callable[[StreamUpdate], None]]:
         queue = req.stream_queue
-        loop = self._loop
-        if queue is None or loop is None:
+        if queue is None:
             return None
+
+        loop = self._loop
+        assert loop is not None
 
         target_queue = queue
         target_loop = loop
