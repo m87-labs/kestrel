@@ -510,7 +510,7 @@ def create_app(
     *,
     batch_timeout_s: float = 0.02,
     default_max_new_tokens: int = 768,
-    default_temperature: float = 0.5,
+    default_temperature: float = 0.2,
     default_top_p: float = 0.9,
 ) -> Starlette:
     """Create a Starlette application bound to the given runtime configuration."""

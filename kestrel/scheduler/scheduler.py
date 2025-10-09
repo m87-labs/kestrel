@@ -32,7 +32,7 @@ class GenerationScheduler:
         self,
         runtime: MoondreamRuntime,
         *,
-        default_temperature: float = 0.5,
+        default_temperature: float = 0.2,
         default_top_p: float = 0.9,
         skill_registry: Optional[SkillRegistry] = None,
     ) -> None:
