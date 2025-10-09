@@ -317,8 +317,8 @@ def aggregate_token_stats(
     decode_total = 0.0
     success = 0
     for rec in records:
-        prompt_val = rec.server_metrics.get("prompt_tokens")
-        decode_val = rec.server_metrics.get("decode_tokens")
+        prompt_val = rec.server_metrics.get("input_tokens")
+        decode_val = rec.server_metrics.get("output_tokens")
         if isinstance(prompt_val, (int, float)):
             prompt_total += float(prompt_val)
         if isinstance(decode_val, (int, float)):
