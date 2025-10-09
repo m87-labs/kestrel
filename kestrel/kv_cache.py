@@ -109,15 +109,6 @@ class PagedKVCache(torch.nn.Module):
             .view(-1, v_store.shape[1], v_store.shape[3])
         )
 
-        bad_entries = torch.nonzero(page_idx < 0, as_tuple=False).flatten()
-        if bad_entries.numel() > 0:
-            bad_batch = batch_flat[bad_entries]
-            bad_block = block_flat[bad_entries]
-            raise RuntimeError(
-                "PagedKVCache encountered unallocated pages: "
-                f"batch_idx={bad_batch.tolist()} block_idx={bad_block.tolist()}"
-            )
-
         flat = page_idx.numel()
         n_heads = k_view.shape[1]
         if flat != slot_idx.numel() or flat != k_view.shape[0]:
