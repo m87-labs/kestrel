@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
     schedule.add_argument(
         "--temperature",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Softmax temperature; 0 selects greedy decoding",
     )
     schedule.add_argument(
@@ -109,7 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--default-temperature",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Default sampling temperature when a request omits it",
     )
     serve.add_argument(

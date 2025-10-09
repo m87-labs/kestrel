@@ -199,7 +199,7 @@ class InferenceEngine:
             [QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill()]
         )
         self._default_max_new_tokens = 768
-        self._default_temperature = 0.5
+        self._default_temperature = 0.2
         self._default_top_p = 0.9
 
     @property
@@ -844,8 +844,8 @@ class InferenceEngine:
 
         scheduler = GenerationScheduler(
             self.runtime,
-            default_temperature=0.5,
-            default_top_p=0.9,
+            default_temperature=self._default_temperature,
+            default_top_p=self._default_top_p,
             skill_registry=self._skills,
         )
         runtime = self.runtime

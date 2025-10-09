@@ -36,7 +36,7 @@ result = await engine.query(
     image=image,
     question="Describe the image.",
     settings={
-        "temperature": 0.5,
+        "temperature": 0.2,
         "top_p": 0.9,
         "max_tokens": 768,
     },
@@ -61,7 +61,7 @@ caption_result = await engine.caption(
     image,
     length="normal",
     settings={
-        "temperature": 0.5,
+        "temperature": 0.2,
         "top_p": 0.9,
         "max_tokens": 768,
     },
@@ -71,7 +71,7 @@ print(caption_result.output["caption"])
 
 - `InferenceEngine.query(...)`, `.caption(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). When `stream=True` is passed to `query` or `caption`, the helpers now return an `EngineStream` async iterator that yields incremental text chunks while decoding continues. Reasoning traces remain opt-in via the `reasoning` flag.
 - Direct helpers like `engine.query(...)`, `engine.point(...)`, `engine.detect(...)`, and `engine.caption(...)` remain the supported public surface.
-- Default sampling settings mirror `external/moondream`: temperature `0.5`, top-p `0.9`, and a `max_tokens` budget of `768`. Structured skills continue to expose `max_objects=150` unless callers override it.
+- Default sampling settings mirror `external/moondream`: temperature `0.2`, top-p `0.9`, and a `max_tokens` budget of `768`. Structured skills continue to expose `max_objects=150` unless callers override it.
 
 #### Streaming usage
 
@@ -120,7 +120,7 @@ assert "".join(chunks) == caption_result.output["caption"]
   "question": "Describe the image",
   "image_url": "data:image/png;base64,<...>",
   "settings": {
-    "temperature": 0.5,
+    "temperature": 0.2,
     "top_p": 0.9,
     "max_tokens": 768
   }
@@ -164,7 +164,7 @@ Returns `objects` (each `{ "x_min", "y_min", "x_max", "y_max" }`), the finish re
   "image_url": "data:image/png;base64,<...>",
   "length": "normal",
   "settings": {
-    "temperature": 0.5,
+    "temperature": 0.2,
     "top_p": 0.9,
     "max_tokens": 768
   }
@@ -237,7 +237,7 @@ uv run python examples/compare_vision.py \
     "question": "Describe the image",
     "image_url": "data:image/png;base64,<...>",
     "settings": {
-      "temperature": 0.5,
+      "temperature": 0.2,
       "top_p": 0.9
     }
   }
