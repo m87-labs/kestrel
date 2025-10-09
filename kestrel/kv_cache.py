@@ -109,8 +109,20 @@ class PagedKVCache(torch.nn.Module):
             .view(-1, v_store.shape[1], v_store.shape[3])
         )
 
-        self.k_cache[page_idx, :, slot_idx, :] = k_view
-        self.v_cache[page_idx, :, slot_idx, :] = v_view
+        flat = page_idx.numel()
+        n_heads = k_view.shape[1]
+        if flat != slot_idx.numel() or flat != k_view.shape[0]:
+            raise RuntimeError(
+                "PagedKVCache.update shape mismatch for flattened indices"
+            )
+        head_idx = torch.arange(n_heads, device=page_idx.device)
+
+        page_ix = page_idx.view(-1, 1).expand(flat, n_heads)
+        head_ix = head_idx.view(1, -1).expand(flat, n_heads)
+        slot_ix = slot_idx.view(-1, 1).expand(flat, n_heads)
+
+        self.k_cache[page_ix, head_ix, slot_ix, :] = k_view
+        self.v_cache[page_ix, head_ix, slot_ix, :] = v_view
 
         return k_val, v_val
 
