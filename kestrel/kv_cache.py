@@ -109,11 +109,10 @@ class PagedKVCache(torch.nn.Module):
             .view(-1, v_store.shape[1], v_store.shape[3])
         )
 
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        if not capturing and torch.any(page_idx < 0):
-            bad_mask = page_idx < 0
-            bad_batch = batch_flat[bad_mask]
-            bad_block = block_flat[bad_mask]
+        bad_entries = torch.nonzero(page_idx < 0, as_tuple=False).flatten()
+        if bad_entries.numel() > 0:
+            bad_batch = batch_flat[bad_entries]
+            bad_block = block_flat[bad_entries]
             raise RuntimeError(
                 "PagedKVCache encountered unallocated pages: "
                 f"batch_idx={bad_batch.tolist()} block_idx={bad_block.tolist()}"
