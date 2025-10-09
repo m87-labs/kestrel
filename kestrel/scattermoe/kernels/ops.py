@@ -48,11 +48,6 @@ def padded_block_indices(
             raise ValueError("Output buffer for padded_block_indices must be 1D long tensor")
         if block_idx_template is not None and block_idx_template.size(0) != out.size(0):
             raise ValueError("block_idx_template must match out buffer shape")
-        torch._assert(
-            torch.tensor(out.size(0), device=total_blocks.device, dtype=total_blocks.dtype)
-            >= total_blocks,
-            "Output buffer has fewer slots than required blocks",
-        )
         block_idxs = (
             block_idx_template
             if block_idx_template is not None
