@@ -6,23 +6,20 @@ BLOCK_M = 128
 ALLOW_TF32 = True
 
 
-@torch.library.custom_op("scattermoe::bincount", mutates_args={})
 def compileable_bincount(x: torch.Tensor, minlength: int) -> torch.Tensor:
-    return x.bincount(minlength=minlength)
+    counts = torch.zeros(minlength, dtype=torch.long, device=x.device)
+    if x.numel() == 0:
+        return counts
+    ones = torch.ones_like(x, dtype=torch.long)
+    counts.scatter_add_(0, x, ones)
+    return counts
 
 
-@compileable_bincount.register_fake
-def _(x: torch.Tensor, minlength: int) -> torch.Tensor:
-    return torch.empty(minlength, dtype=torch.long, device=x.device)
-
-
-@torch.compile
 def flatten_and_sort(expert_idxs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     flattened = expert_idxs.reshape(-1)
     return torch.sort(flattened)
 
 
-@torch.compile
 def padded_block_indices(
     sorted_expert_idxs: torch.Tensor,
     k: int,
@@ -30,6 +27,7 @@ def padded_block_indices(
     *,
     out: torch.Tensor | None = None,
     block_idx_template: torch.Tensor | None = None,
+    capturing: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     expert_counts = compileable_bincount(sorted_expert_idxs, minlength=k)
     padded_block_counts = ((expert_counts - 1) // N_BLOCK_SIZE) + 1
@@ -51,11 +49,12 @@ def padded_block_indices(
             raise ValueError("Output buffer for padded_block_indices must be 1D long tensor")
         if block_idx_template is not None and block_idx_template.size(0) != out.size(0):
             raise ValueError("block_idx_template must match out buffer shape")
-        torch._assert(
-            torch.tensor(out.size(0), device=total_blocks.device, dtype=total_blocks.dtype)
-            >= total_blocks,
-            "Output buffer has fewer slots than required blocks",
-        )
+        if not capturing:
+            torch._assert(
+                torch.tensor(out.size(0), device=total_blocks.device, dtype=total_blocks.dtype)
+                >= total_blocks,
+                "Output buffer has fewer slots than required blocks",
+            )
         block_idxs = (
             block_idx_template
             if block_idx_template is not None

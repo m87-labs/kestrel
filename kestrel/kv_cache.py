@@ -109,8 +109,30 @@ class PagedKVCache(torch.nn.Module):
             .view(-1, v_store.shape[1], v_store.shape[3])
         )
 
-        self.k_cache[page_idx, :, slot_idx, :] = k_view
-        self.v_cache[page_idx, :, slot_idx, :] = v_view
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if not capturing and torch.any(page_idx < 0):
+            bad_mask = page_idx < 0
+            bad_batch = batch_flat[bad_mask]
+            bad_block = block_flat[bad_mask]
+            raise RuntimeError(
+                "PagedKVCache encountered unallocated pages: "
+                f"batch_idx={bad_batch.tolist()} block_idx={bad_block.tolist()}"
+            )
+
+        flat = page_idx.numel()
+        n_heads = k_view.shape[1]
+        if flat != slot_idx.numel() or flat != k_view.shape[0]:
+            raise RuntimeError(
+                "PagedKVCache.update shape mismatch for flattened indices"
+            )
+        head_idx = torch.arange(n_heads, device=page_idx.device)
+
+        page_ix = page_idx.view(-1, 1).expand(flat, n_heads)
+        head_ix = head_idx.view(1, -1).expand(flat, n_heads)
+        slot_ix = slot_idx.view(-1, 1).expand(flat, n_heads)
+
+        self.k_cache[page_ix, head_ix, slot_ix, :] = k_view
+        self.v_cache[page_ix, head_ix, slot_ix, :] = v_view
 
         return k_val, v_val
 
