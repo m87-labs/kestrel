@@ -724,7 +724,7 @@ class InferenceEngine:
                     output=result.output,
                 )
                 if not future.done():
-                    future.set_result(engine_result)
+                    loop.call_soon_threadsafe(future.set_result, engine_result)
                 self._complete_stream(req, result=engine_result)
 
             if self._shutdown:
@@ -735,7 +735,7 @@ class InferenceEngine:
             pending = self._queue.get_nowait()
             if pending and pending.future and not pending.future.done():
                 error = RuntimeError("Engine shut down")
-                pending.future.set_exception(error)
+                loop.call_soon_threadsafe(pending.future.set_exception, error)
                 self._complete_stream(pending, error=error)
 
     def _normalize_temperature(self, value: Optional[float]) -> float:
@@ -786,7 +786,8 @@ class InferenceEngine:
     def _fail_request(self, req: _PendingRequest, error: BaseException) -> None:
         future = req.future
         if future and not future.done():
-            future.set_exception(error)
+            assert self._loop is not None
+            self._loop.call_soon_threadsafe(future.set_exception, error)
         self._complete_stream(req, error=error)
 
     def _release_active_sequences(self) -> None:
