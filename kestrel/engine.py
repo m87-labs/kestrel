@@ -316,8 +316,7 @@ class InferenceEngine:
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
         stream: Literal[True] = ...,
         settings: Optional[Mapping[str, object]] = ...,
-    ) -> "EngineStream":
-        ...
+    ) -> "EngineStream": ...
 
     @overload
     async def query(
@@ -328,8 +327,7 @@ class InferenceEngine:
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
         stream: Literal[False] = ...,
         settings: Optional[Mapping[str, object]] = ...,
-    ) -> EngineResult:
-        ...
+    ) -> EngineResult: ...
 
     @overload
     async def query(
@@ -340,8 +338,7 @@ class InferenceEngine:
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
-    ) -> Union[EngineResult, EngineStream]:
-        ...
+    ) -> Union[EngineResult, EngineStream]: ...
 
     async def query(
         self,
@@ -460,8 +457,7 @@ class InferenceEngine:
         length: str = ...,
         stream: Literal[True],
         settings: Optional[Mapping[str, object]] = ...,
-    ) -> "EngineStream":
-        ...
+    ) -> "EngineStream": ...
 
     @overload
     async def caption(
@@ -471,8 +467,7 @@ class InferenceEngine:
         length: str = ...,
         stream: Literal[False] = ...,
         settings: Optional[Mapping[str, object]] = ...,
-    ) -> EngineResult:
-        ...
+    ) -> EngineResult: ...
 
     @overload
     async def caption(
@@ -482,8 +477,7 @@ class InferenceEngine:
         length: str = ...,
         stream: bool = ...,
         settings: Optional[Mapping[str, object]] = ...,
-    ) -> Union[EngineResult, EngineStream]:
-        ...
+    ) -> Union[EngineResult, EngineStream]: ...
 
     async def caption(
         self,
@@ -787,7 +781,7 @@ class InferenceEngine:
             return
         req.stream_queue = None
         completion = _StreamCompletion(result=result, error=error)
-        queue.put_nowait(completion)
+        self._loop.call_soon_threadsafe(queue.put_nowait, completion)
 
     def _fail_request(self, req: _PendingRequest, error: BaseException) -> None:
         future = req.future
