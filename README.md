@@ -1,6 +1,19 @@
 # Kestrel Inference Engine
 
-## Design Overview
+<p align="center">
+  <img src="assets/kestrel-overview.png" alt="Kestrel inference engine diagram" width="640" />
+</p>
+
+Kestrel wraps the Moondream vision-language model in an async, micro-batched serving stack. Every request flows through a skill-driven pipeline that normalises inputs, schedules compute, and streams results back to clients without compromising throughput.
+
+- **Request lifecycle** – Front-ends (CLI, HTTP) hand prompts to the shared inference engine, which resolves the active skill, prepares prompt and image tensors, and tracks latency metrics while streaming updates back to clients.
+- **Skills layer** – Query, caption, point, and detect skills ship by default. Each skill owns its prompt template, decode phases, and result shaping, and new modalities integrate by registering additional skills without modifying scheduler internals.
+- **Generation scheduler** – A cooperative scheduler batches work across requests, drains async queues, and applies temperature/top-p sampling so heterogeneous skills can share one decode loop while preserving per-request state machines.
+- **Runtime & attention core** – The Moondream runtime manages tensor allocation, paged prefill and decode, FlashInfer-backed attention, and image-token fusion, exposing entry points the scheduler drives during prefill and incremental decoding.
+- **Paged KV cache** – A vLLM-style paged cache lets sequences claim and release fixed-size pages so large numbers of long-context requests remain resident while keeping attention updates proportional to the active tokens.
+- **Vision preprocessing** – Optional image tiling and cropping run in a background thread pool before scheduling, and the resulting embeddings are stitched into the text prompt so multimodal and text-only requests follow the same execution path.
+- **Streaming & observability** – Streaming iterators surface incremental text chunks in real time, and finished results report token counts plus prefill, decode, and first-token latencies that the HTTP server forwards to clients.
+- **Serving surfaces & ops** – The CLI and Starlette HTTP server share the same engine wiring, ensuring smoke tests, benchmarks, and production traffic all exercise identical scheduling logic while respecting the central runtime configuration.
 
 ## API Overview
 
