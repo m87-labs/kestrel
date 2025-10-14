@@ -2,12 +2,6 @@
 
 ## Design Overview
 
-- **Skill‑first architecture** – Every request is routed through a `SkillSpec`. Skills build prompts, describe decoding phases, and format results. The default `QuerySkill` emits plain text; structured skills (e.g., `PointSkill`) reuse the same interfaces without touching scheduler internals.
-- **Runtime core** – `MoondreamRuntime` owns memory planning, paged KV caches, FlashInfer decode, and image encoding. It exposes generic helpers (`prefill_prompt`, `run_structured_phase`, `append_tokens`) that skills consume.
-- **Generation scheduler** – `kestrel/scheduler/GenerationScheduler` batches prefill/decode steps across requests, tracks per-request phase state, and streams tokens. It is skill-agnostic: all decoding/formatting decisions come from the attached skill object.
-- **Async engine** – `kestrel/engine.InferenceEngine` mediates between clients and the scheduler. It resolves skills, builds skill-specific request objects, gathers metrics, and exposes high-level entrypoints such as `engine.query(...)`.
-- **Serving surfaces** – `kestrel.main serve` launches a Starlette app (`kestrel/server/http.py`) that shares the async engine, providing HTTP endpoints with consistent metrics and streaming behaviour. CLI helpers keep local smoke tests close to production traffic patterns.
-
 ## API Overview
 
 ### Python Engine
@@ -109,7 +103,6 @@ assert "".join(chunks) == caption_result.output["caption"]
 
 - `uv run python -m kestrel.main serve` – launch the HTTP server (see usage examples below for full command).
 - `uv run python -m kestrel.main schedule ...` – push one-off prompts through the async engine for smoke testing or benchmarking.
-- `examples/` – self-contained scripts for parity checks, benchmarks, and diagnostics. They all run through the shared runtime so results match production.
 
 ### HTTP Endpoints
 
@@ -175,17 +168,6 @@ Responses include the generated `caption`, finish reason, and the standard metri
 
 ## Usage Examples
 
-### Vision + Text Parity Check (reference run)
-
-```bash
-uv run python examples/compare_vision.py \
-    --mode reference \
-    --weights ~/code/moondream/model.pt \
-    --image external/moondream/assets/demo-1.jpg \
-    --prompt "Describe the image." \
-    --device cuda --dtype bfloat16 --max-new-tokens 64
-```
-
 ### Sampling & Benchmarking How-To
 
 - **Sampling smoke test**
@@ -201,19 +183,6 @@ uv run python examples/compare_vision.py \
   ```
 
   Exercises the asynchronous engine end-to-end; expect full responses (no immediate EOS) on the first decode step.
-
-- **Scheduler benchmark**
-
-  ```bash
-  uv run python examples/benchmark_scheduler.py \
-      --weights ~/code/moondream/model.pt \
-      --device cuda --dtype bfloat16 \
-      --num-prompts 32 --max-new-tokens 512 \
-      --max-batch-size 8 --max-seq-length 4096 \
-      --image external/moondream/assets/demo-1.jpg
-  ```
-
-  Add `--image` (repeatable) or `--image-dir` to exercise vision-conditioned prompts; images cycle if fewer than prompts. The script prints prefill/decode throughput and latency per round; use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on GPU hosts.
 
 ### HTTP Server
 
@@ -245,17 +214,6 @@ uv run python examples/compare_vision.py \
 
   `image_url` must be a base64 blob (raw or `data:image/...;base64,<payload>`). Responses include the generated `answer`, `request_id`, `finish_reason`, and engine timings (`input_tokens`, `output_tokens`, `prefill_time_ms`, `decode_time_ms`, `ttft_ms`).
 
-- **Load testing workflow**
-
-  ```bash
-  uv run python examples/benchmark_http_server.py \
-      --url http://127.0.0.1:8080/v1/query \
-      --image external/moondream/assets/demo-1.jpg \
-      --stage-duration 30 --start-concurrency 1 --concurrency-step 4 --max-concurrency 64
-  ```
-
-  Increase concurrency until overload while tracking observed throughput, latency, TTFT, and error rates. Use `--output` to capture JSON metrics; the helper script in `examples/benchmark_http_server.py` can render an HTML summary from those artifacts.
-
 - **Point detection example**
 
   ```bash
@@ -268,3 +226,15 @@ uv run python examples/compare_vision.py \
   ```
 
   Returns normalised coordinates under the `points` key.
+
+## Contributing
+
+- No vibecoded PRs. I know how to vibecode, I don't need your help on that front.
+- Share your plan upfront (issue or discussion) and wait for approval before touching code. I'm very picky and would rather you don't waste your time.
+- Keep changes surgical: match the code style, include tests or benchmarks for kernel/scheduler tweaks, and document assumptions.
+
+### Areas Looking For Help
+
+1. **Hugging Face weight compatibility** – Extend the runtime to accept an already-loaded Hugging Face checkpoint and wire tensors by reference instead of copying. Expect close scrutiny of layout and memory semantics.
+2. **ScatterMoE quantization on H100** – Develop a dynamic-input, static-weight quantization kernel (FP8 or lower) that keeps CUDA graph support and beats the BF16 baseline on H100, backed by reproducible profiling.
+3. **Tau attention + RoPE fusion** – Revisit the fused tau-attention/RoPE path to deliver measurable latency wins over the current split operators without destabilizing outputs.
