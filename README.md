@@ -239,15 +239,3 @@ Responses include the generated `caption`, finish reason, and the standard metri
   ```
 
   Returns normalised coordinates under the `points` key.
-
-## Contributing
-
-- No vibecoded PRs. I know how to vibecode, I don't need your help on that front.
-- Share your plan upfront (issue or discussion) and wait for approval before touching code. I'm very picky and would rather you don't waste your time.
-- Keep changes surgical: match the code style, include tests or benchmarks for kernel/scheduler tweaks, and document assumptions.
-
-### Areas Looking For Help
-
-1. **Hugging Face weight compatibility** – Extend the runtime to accept an already-loaded Hugging Face checkpoint and wire tensors by reference instead of copying. Expect close scrutiny of layout and memory semantics.
-2. **ScatterMoE quantization on H100** – Develop a dynamic-input, static-weight quantization kernel (FP8 or lower) that keeps CUDA graph support and beats the BF16 baseline on H100, backed by reproducible profiling.
-3. **Tau attention + RoPE fusion** – Revisit the fused tau-attention/RoPE path to deliver measurable latency wins over the current split operators without destabilizing outputs.
