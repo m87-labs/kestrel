@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -65,6 +66,7 @@ from kestrel.skills import (
     DetectSkill,
     PointSkill,
     QuerySkill,
+    SegmentSkill,
     SkillRegistry,
     SkillSpec,
 )
@@ -73,6 +75,7 @@ from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
+from kestrel.skills.segment import SegmentRequest, SegmentSettings
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,7 +199,13 @@ class InferenceEngine:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._image_executor: Optional[ThreadPoolExecutor] = None
         self._skills = skills or SkillRegistry(
-            [QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill()]
+            [
+                QuerySkill(),
+                PointSkill(),
+                DetectSkill(),
+                CaptionSkill(),
+                SegmentSkill(),
+            ]
         )
         self._default_max_new_tokens = 768
         self._default_temperature = 0.2
@@ -576,6 +585,76 @@ class InferenceEngine:
             skill="detect",
         )
 
+    async def segment(
+        self,
+        image: Optional[pyvips.Image],
+        label: str,
+        *,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> EngineResult:
+        normalized_label = label.strip()
+        if not normalized_label:
+            raise ValueError("label must be a non-empty string")
+
+        temperature = 0.0
+        top_p = 1.0
+        max_tokens = self._default_max_new_tokens
+        if settings is not None:
+            if "temperature" in settings:
+                temperature = float(settings["temperature"])
+            if "top_p" in settings:
+                top_p = float(settings["top_p"])
+            if "max_tokens" in settings:
+                max_tokens = int(settings["max_tokens"])
+
+        if temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p must be in the range (0, 1]")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        normalized_refs: Optional[List[Tuple[float, ...]]] = None
+        if spatial_refs is not None:
+            normalized_refs = []
+            for idx, ref in enumerate(spatial_refs):
+                if len(ref) not in (2, 4):
+                    raise ValueError(
+                        f"spatial_refs[{idx}] must contain 2 (point) or 4 (bbox) values"
+                    )
+                converted = [float(value) for value in ref]
+                if not all(math.isfinite(value) for value in converted):
+                    raise ValueError(
+                        f"spatial_refs[{idx}] contains non-finite values"
+                    )
+                if not all(0.0 <= value <= 1.0 for value in converted):
+                    raise ValueError(
+                        f"spatial_refs[{idx}] values must be normalised to [0, 1]"
+                    )
+                normalized_refs.append(tuple(converted))
+
+        request = SegmentRequest(
+            label=normalized_label,
+            image=image,
+            stream=False,
+            settings=SegmentSettings(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            ),
+            spatial_refs=tuple(normalized_refs) if normalized_refs else None,
+        )
+
+        return await self.submit(
+            request,
+            max_new_tokens=max_tokens,
+            image=image,
+            temperature=temperature,
+            top_p=top_p,
+            skill="segment",
+        )
+
     async def submit_streaming(
         self,
         request_context: object,
@@ -810,6 +889,8 @@ class InferenceEngine:
             return request_context.object
         if isinstance(request_context, DetectRequest):
             return request_context.object
+        if isinstance(request_context, SegmentRequest):
+            return request_context.label
         if isinstance(request_context, CaptionRequest):
             return request_context.length
         return str(request_context)
