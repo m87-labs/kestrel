@@ -15,7 +15,7 @@ dependencies = [
     "starlette>=0.37",
     "httpx>=0.27",
     "uvicorn>=0.30",
-    "flashinfer-python>=0.3.0",
+    "flashinfer-python>=0.4.1",
 ]
 
 [tool.setuptools.packages.find]
