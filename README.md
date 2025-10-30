@@ -181,6 +181,21 @@ Responses include the generated `caption`, finish reason, and the standard metri
 
 ## Usage Examples
 
+### Downloading Checkpoint
+
+To test inference, you will need a Moondream checkpoint in vixtral weights format. You can obtain by running the following. You will first need to request access to [vikhyatk/moondream-next](https://huggingface.co/vikhyatk/moondream-next) and reach out to vik to get the access request approved (be sure to mention your Hugging Face username when making this request).
+
+```
+from huggingface_hub import hf_hub_download
+
+pt_file = hf_hub_download(
+    "vikhyatk/moondream-next",
+    # moe-glu-3c-warp4_1/s1921
+    revision="d7af1649689208e30e657a8ad52017346e137c39",
+    filename="model.pt",
+)
+```
+
 ### Sampling & Benchmarking How-To
 
 - **Sampling smoke test**
