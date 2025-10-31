@@ -217,6 +217,10 @@ class InferenceEngine:
     def is_running(self) -> bool:
         return self._worker_task is not None and not self._worker_task.done()
 
+    def create_adapter(self, rank: int) -> LoRA:
+        runtime = self.runtime
+        return LoRA.for_vision(runtime.model.vision, rank=rank)
+
     @classmethod
     async def create(
         cls,

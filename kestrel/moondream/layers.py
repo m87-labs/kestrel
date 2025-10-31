@@ -62,8 +62,6 @@ class LoRALinear:
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         rank = int(self.down.shape[0])
-        if rank <= 0:
-            raise ValueError("LoRALinear.down must have positive first dimension")
         scale = self.alpha / float(rank)
         down_proj = F.linear(x, self.down)
         return F.linear(down_proj, self.up) * scale
@@ -74,6 +72,23 @@ class LoRA:
     """Container for optional LoRA adapters."""
 
     vision: Mapping[str, LoRALinear] = field(default_factory=dict)
+
+    @classmethod
+    def for_vision(cls, module: nn.Module, rank: int) -> "LoRA":
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive")
+        proj_mlp = module.proj_mlp
+        fc2 = proj_mlp["fc2"]
+        in_dim = fc2.in_features
+        out_dim = fc2.out_features
+        device = fc2.weight.device
+        dtype = fc2.weight.dtype
+
+        down = torch.zeros(rank, in_dim, device=device, dtype=dtype)
+        std = 1.0 / float(rank)
+        up = torch.randn(out_dim, rank, device=device, dtype=dtype) * std
+        adapter = LoRALinear(down=down, up=up, alpha=float(rank))
+        return cls(vision={"proj_mlp.fc2": adapter})
 
 
 def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDict:
