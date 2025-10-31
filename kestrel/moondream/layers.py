@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Literal, Mapping
 
 from ..scattermoe import MLP as ScatterMoEMLP
 
@@ -50,6 +50,30 @@ def mlp(x: torch.Tensor, w: MLPWeights) -> torch.Tensor:
     x = linear(x, w.fc1)
     x = gelu_approx(x)
     return linear(x, w.fc2)
+
+
+@dataclass(frozen=True)
+class LoRALinear:
+    """LoRA weights for a single linear projection."""
+
+    down: torch.Tensor
+    up: torch.Tensor
+    alpha: float = 1.0
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        rank = int(self.down.shape[0])
+        if rank <= 0:
+            raise ValueError("LoRALinear.down must have positive first dimension")
+        scale = self.alpha / float(rank)
+        down_proj = F.linear(x, self.down)
+        return F.linear(down_proj, self.up) * scale
+
+
+@dataclass(frozen=True)
+class LoRA:
+    """Container for optional LoRA adapters."""
+
+    vision: Mapping[str, LoRALinear] = field(default_factory=dict)
 
 
 def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDict:
@@ -113,4 +137,6 @@ __all__ = [
     "moe_mlp",
     "build_dense_mlp",
     "build_moe_mlp",
+    "LoRA",
+    "LoRALinear",
 ]

@@ -73,6 +73,7 @@ from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
+from kestrel.moondream.layers import LoRA
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -360,6 +361,7 @@ class InferenceEngine:
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
+        adapter: Optional[LoRA] = None
         if settings is not None:
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
@@ -367,6 +369,11 @@ class InferenceEngine:
                 top_p = float(settings["top_p"])
             if "max_tokens" in settings:
                 max_tokens = int(settings["max_tokens"])
+            if "adapter" in settings:
+                maybe_adapter = settings["adapter"]
+                if maybe_adapter is not None and not isinstance(maybe_adapter, LoRA):
+                    raise TypeError("adapter must be a LoRA instance or None")
+                adapter = maybe_adapter
 
         if temperature < 0.0:
             raise ValueError("temperature must be non-negative")
@@ -384,6 +391,7 @@ class InferenceEngine:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
+                adapter=adapter,
             ),
         )
         if stream:
@@ -771,6 +779,11 @@ class InferenceEngine:
 
         return _callback
 
+    def _extract_adapter(self, request_context: object) -> Optional[LoRA]:
+        if isinstance(request_context, QueryRequest):
+            return request_context.settings.adapter
+        return None
+
     def _complete_stream(
         self,
         req: _PendingRequest,
@@ -861,6 +874,7 @@ class InferenceEngine:
                     if (req.image is not None or crops is not None)
                     else 0
                 )
+                adapter = self._extract_adapter(req.request_context)
                 request_obj = GenerationRequest(
                     request_id=req.request_id,
                     prompt=req.prompt,
@@ -875,6 +889,7 @@ class InferenceEngine:
                     submitted_at=req.submitted_at,
                     skill=req.skill,
                     request_context=req.request_context,
+                    adapter=adapter,
                 )
                 skill_state = req.skill.create_state(
                     runtime,

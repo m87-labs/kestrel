@@ -12,6 +12,7 @@ from torch import Tensor
 
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.moondream.layers import LoRA
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
@@ -33,6 +34,7 @@ class GenerationRequest:
     image_length: int = 0
     submitted_at: float = 0.0
     skill_state: Optional[SkillState] = field(default=None, repr=False)
+    adapter: Optional[LoRA] = None
 
     prompt_length: int = field(init=False)
 
