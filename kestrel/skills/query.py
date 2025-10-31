@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, TextToken
+from kestrel.moondream.layers import LoRA
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -25,6 +26,7 @@ class QuerySettings:
     temperature: float
     top_p: float
     max_tokens: int
+    adapter: Optional[LoRA] = None
 
 
 @dataclass(slots=True)

@@ -29,6 +29,7 @@ from .text import (
     text_encoder,
 )
 from .vision import encode_image
+from .layers import LoRA
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -536,6 +537,7 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image],
         *,
         overlap: Optional[OverlapCropOutput] = None,
+        adapter: Optional[LoRA] = None,
     ) -> Tensor:
         return encode_image(
             image,
@@ -544,6 +546,7 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.dtype,
             overlap=overlap,
+            adapter=adapter,
         )
 
     def start_sequence(
@@ -553,6 +556,7 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
+        adapter: Optional[LoRA] = None,
     ) -> tuple[SequenceState, Tensor]:
         bos_embed = text_encoder(
             torch.tensor(
@@ -582,7 +586,9 @@ class MoondreamRuntime:
         segments: list[Tensor] = [self.bos_embed]
         image_length = 0
         if image is not None or image_crops is not None:
-            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
+            image_embed = self.encode_image(
+                image, overlap=image_crops, adapter=adapter
+            ).unsqueeze(0)
             segments.append(image_embed)
             image_length = image_embed.shape[1]
         if prompt_embed is not None:
