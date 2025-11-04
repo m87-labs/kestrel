@@ -36,7 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.engine import InferenceEngine
+from kestrel.engine import EngineMetrics, InferenceEngine
 
 try:
     import pyvips  # type: ignore
@@ -298,7 +298,7 @@ async def query_engine(
     reasoning: bool,
     max_tokens: int,
     temperature: float,
-) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]], EngineMetrics]:
     response = await engine.query(
         image=image,
         question=prompt,
@@ -316,7 +316,7 @@ async def query_engine(
     if isinstance(reasoning_output, dict):
         reasoning_text = reasoning_output.get("text")
         grounding = reasoning_output.get("grounding")
-    return answer, reasoning_text, grounding
+    return answer, reasoning_text, grounding, response.metrics
 
 
 async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
@@ -337,6 +337,21 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     per_chart_results: List[List[Optional[Dict[str, Any]]]] = [
         [None] * len(row["qa"]) for row in rows
     ]
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_prefill_ms = 0.0
+    total_decode_ms = 0.0
+    request_count = 0
+
+    def record_metrics(metrics: EngineMetrics) -> None:
+        nonlocal total_input_tokens, total_output_tokens
+        nonlocal total_prefill_ms, total_decode_ms, request_count
+        total_input_tokens += metrics.input_tokens
+        total_output_tokens += metrics.output_tokens
+        total_prefill_ms += metrics.prefill_time_ms
+        total_decode_ms += metrics.decode_time_ms
+        request_count += 1
 
     async def evaluate_single(
         row_idx: int,
@@ -367,6 +382,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     candidate_answer,
                     candidate_reasoning,
                     candidate_grounding,
+                    candidate_metrics,
                 ) = await query_engine(
                     engine,
                     image=image,
@@ -375,6 +391,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
+                record_metrics(candidate_metrics)
                 candidate_answer = strip_trailing_percent(candidate_answer)
                 candidates.append(candidate_answer)
                 if idx == 0:
@@ -386,7 +403,12 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             else:
                 model_answer = ""
         else:
-            model_answer, chart_reasoning, chart_grounding = await query_engine(
+            (
+                model_answer,
+                chart_reasoning,
+                chart_grounding,
+                metrics,
+            ) = await query_engine(
                 engine,
                 image=image,
                 prompt=prompt,
@@ -394,6 +416,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+            record_metrics(metrics)
             model_answer = strip_trailing_percent(model_answer)
 
         if cfg.use_pot:
@@ -485,6 +508,13 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         "human_total": human_total,
         "human_correct": human_correct,
         "results": results,
+        "token_usage": {
+            "request_count": request_count,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "total_prefill_ms": total_prefill_ms,
+            "total_decode_ms": total_decode_ms,
+        },
     }
 
 
@@ -566,6 +596,34 @@ def print_results(results: Dict[str, Any]) -> None:
         f"Human Accuracy: {results['human_acc']:.2f}% "
         f"({results['human_correct']} / {results['human_total']})"
     )
+
+    usage = results.get("token_usage")
+    if usage:
+        request_count = usage.get("request_count", 0)
+        total_input_tokens = usage.get("total_input_tokens", 0)
+        total_output_tokens = usage.get("total_output_tokens", 0)
+        total_prefill_ms = usage.get("total_prefill_ms", 0.0)
+        total_decode_ms = usage.get("total_decode_ms", 0.0)
+
+        avg_input_tokens = (
+            total_input_tokens / request_count if request_count else 0.0
+        )
+        avg_output_tokens = (
+            total_output_tokens / request_count if request_count else 0.0
+        )
+        total_prefill_s = total_prefill_ms / 1000.0
+        total_decode_s = total_decode_ms / 1000.0
+        aggregate_prefill = (
+            total_input_tokens / total_prefill_s if total_prefill_s > 0 else 0.0
+        )
+        aggregate_decode = (
+            total_output_tokens / total_decode_s if total_decode_s > 0 else 0.0
+        )
+
+        print(f"Avg Input Tokens / Request: {avg_input_tokens:.2f}")
+        print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
+        print(f"Aggregate Prefill Throughput: {aggregate_prefill:.2f} tok/s")
+        print(f"Aggregate Decode Throughput: {aggregate_decode:.2f} tok/s")
 
 
 async def async_main() -> None:
