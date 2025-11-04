@@ -117,6 +117,25 @@ assert "".join(chunks) == caption_result.output["caption"]
 - `uv run python -m kestrel.main serve` – launch the HTTP server (see usage examples below for full command).
 - `uv run python -m kestrel.main schedule ...` – push one-off prompts through the async engine for smoke testing or benchmarking.
 
+### Evaluation Scripts
+
+- `scripts/chartqa_eval.py` – Internal helper for running ChartQA accuracy checks against a local or remote GPU install.
+
+  ```bash
+  # Install optional evaluation dependencies (datasets, tqdm) into your uv environment
+  UV_PRERELEASE=allow uv sync --extra eval
+
+  # Run a short sanity sweep over 20 examples (requires a CUDA-capable host)
+  UV_PRERELEASE=allow uv run --extra eval \
+    python scripts/chartqa_eval.py \
+    --weights ~/code/moondream/model.pt \
+    --limit 20
+
+  # Omit --limit (or pass --limit -1) once you're ready to process the full ChartQA split
+  ```
+
+  The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
+
 ### HTTP Endpoints
 
 `POST /v1/query`
