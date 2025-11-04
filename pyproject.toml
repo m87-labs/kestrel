@@ -15,8 +15,14 @@ dependencies = [
     "starlette>=0.37",
     "httpx>=0.27",
     "uvicorn>=0.30",
-    "flashinfer-python>=0.4.1",
+    "flashinfer-python>=0.4.1,<0.5",
 ]
 
 [tool.setuptools.packages.find]
 include = ["kestrel*"]
+
+[project.optional-dependencies]
+eval = [
+    "datasets>=3.0",
+    "tqdm>=4.66",
+]
