@@ -558,15 +558,6 @@ class MoondreamRuntime:
         max_new_tokens: Optional[int] = None,
         adapter: Optional[LoRA] = None,
     ) -> tuple[SequenceState, Tensor]:
-        bos_embed = text_encoder(
-            torch.tensor(
-                [[self.config.tokenizer.bos_id]],
-                device=self.device,
-                dtype=torch.long,
-            ),
-            self.model.text,
-        )
-
         if isinstance(prompt_tokens, Tensor):
             tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
             if tokens_view.ndim != 2:
@@ -614,11 +605,12 @@ class MoondreamRuntime:
         for cache in self.layer_caches:
             cache.bind(batch_idx=batch_idx, device=self.device)
 
-        attention_mask = torch.tril(
-            torch.ones(1, 1, prompt_len, prompt_len, dtype=torch.bool, device=self.device)
-        )
+        attention_mask = torch.ones(
+            1, 1, prompt_len, prompt_len, dtype=torch.bool, device=self.device
+        ).tril_()
         if image_length:
-            attention_mask[:, :, :image_length, :image_length] = True
+            prefix_len = image_length + 1
+            attention_mask[:, :, :prefix_len, :prefix_len] = True
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
