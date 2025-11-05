@@ -246,20 +246,17 @@ def build_prompt_and_settings(
         prompt = question.strip()
         reasoning = True
         max_tokens = COT_MAX_TOKENS
-        if cot_samples > 1:
+        if cot_samples > 1 and temperature == 0.0:
+            # Preserve legacy behaviour of injecting small stochasticity for CoT@N
             temperature = 1.0
-        else:
-            temperature = 0.0
     elif use_pot:
         prompt = f"{POT_PREFIX}{question.strip()}"
         reasoning = False
         max_tokens = POT_MAX_TOKENS
-        temperature = 0.0
     else:
         prompt = f"{PREFIX}{question.strip()}"
         reasoning = False
         max_tokens = DEFAULT_MAX_TOKENS
-        temperature = 0.0
     return prompt, reasoning, max_tokens, temperature
 
 
@@ -562,7 +559,7 @@ def parse_args() -> EvalConfig:
         "--temperature",
         type=float,
         default=0.0,
-        help="Base temperature for sampling (used when CoT>1).",
+        help="Base sampling temperature. Applies to all modes unless overridden.",
     )
     parser.add_argument(
         "--debug",
