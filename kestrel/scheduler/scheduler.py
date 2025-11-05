@@ -232,9 +232,7 @@ class GenerationScheduler:
                 pruned[idx] = row[idx]
                 logits[i] = pruned
 
-        if all(req.temperature <= 0.0 for req in requests) and all(
-            req.top_p >= 1.0 for req in requests
-        ):
+        if all(req.temperature <= 0.0 for req in requests):
             return torch.argmax(logits, dim=-1)
 
         temps = torch.empty(batch, dtype=torch.float32)
