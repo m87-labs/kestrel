@@ -139,7 +139,12 @@ def moe_mlp(
     if mode == "decode":
         scatter_mlp.ensure_workspaces(num_tokens, x_flat.device, x_flat.dtype)
 
-    mlp_out = scatter_mlp(x_flat, topk_weights, topk_idxs).view(B, T, C)
+    mlp_out = scatter_mlp(
+        x_flat,
+        topk_weights,
+        topk_idxs,
+        mode=mode,
+    ).view(B, T, C)
     return mlp_out
 
 
