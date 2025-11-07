@@ -221,6 +221,8 @@ def invoke_fused_moe_kernel(
         compute_type=compute_type,
         HAS_BIAS=bias is not None,
         ALLOW_TF32=allow_tf32,
+        num_warps=config["NUM_WARPS"],
+        num_stages=config["NUM_STAGES"],
     )
 
 
