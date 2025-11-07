@@ -230,3 +230,56 @@ def gelu_and_mul_plus_one(tensor: torch.Tensor) -> torch.Tensor:
     h, g = tensor.chunk(2, dim=-1)
     h = F.gelu(h)
     return h * (g + 1)
+
+
+@triton.jit
+def _gelu_and_mul_kernel(
+    inp_ptr,
+    out_ptr,
+    stride_in_row,
+    stride_in_col,
+    stride_out_row,
+    stride_out_col,
+    hidden_dim,
+    BLOCK_SIZE: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    row_id = tl.program_id(axis=0)
+    row_in = inp_ptr + row_id * stride_in_row
+    row_out = out_ptr + row_id * stride_out_row
+
+    inv_sqrt2 = 0.7071067690849304
+    for col in range(0, hidden_dim, BLOCK_SIZE):
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < hidden_dim
+        h = tl.load(row_in + offs * stride_in_col, mask=mask, other=0.0)
+        g = tl.load(row_in + (offs + hidden_dim) * stride_in_col, mask=mask, other=0.0)
+        h_fp32 = h.to(tl.float32)
+        gelu = 0.5 * h_fp32 * (1.0 + tl.math.erf(h_fp32 * inv_sqrt2))
+        gated = gelu * (g.to(tl.float32) + 1.0)
+        tl.store(
+            row_out + offs * stride_out_col,
+            gated.to(OUTPUT_DTYPE),
+            mask=mask,
+        )
+
+
+def fused_gelu_and_mul(input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> None:
+    assert input_tensor.is_contiguous(), "Input activations must be contiguous"
+    assert output_tensor.is_contiguous(), "Activation workspace must be contiguous"
+    rows, twice_hidden = input_tensor.shape
+    hidden = output_tensor.shape[1]
+    assert twice_hidden == hidden * 2, "Input tensor must have 2x hidden dimension"
+
+    grid = (rows,)
+    _gelu_and_mul_kernel[grid](
+        input_tensor,
+        output_tensor,
+        input_tensor.stride(0),
+        input_tensor.stride(1),
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        hidden,
+        BLOCK_SIZE=128,
+        OUTPUT_DTYPE=dtype_to_triton(output_tensor.dtype),
+    )

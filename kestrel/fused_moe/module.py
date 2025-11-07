@@ -9,9 +9,11 @@ from vllm import _custom_ops as ops
 
 from .kernels import (
     dtype_to_triton,
-    gelu_and_mul_plus_one,
+    fused_gelu_and_mul,
     invoke_fused_moe_kernel,
 )
+from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
+from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
 
@@ -47,6 +49,7 @@ class _MoEWorkspaces:
         self.up = _ResizableBuffer()
         self.down = _ResizableBuffer()
         self.output = _ResizableBuffer()
+        self.activation = _ResizableBuffer()
 
 
 @dataclass
@@ -97,6 +100,7 @@ class FusedMoEModule:
         self._debug_up: torch.Tensor | None = None
         self._debug_h: torch.Tensor | None = None
         self._workspaces = _MoEWorkspaces()
+        self._tuned_configs: dict[int, dict[str, int] | None] = {}
 
     def __call__(
         self,
@@ -148,8 +152,12 @@ class FusedMoEModule:
             return hidden_states
 
         assignments = num_tokens * self.top_k
-        block_size_m = self._select_block_size(assignments)
-        triton_config = self.config.as_triton(block_size_m=block_size_m)
+        triton_config = self._get_triton_config(
+            num_tokens=num_tokens,
+            assignments=assignments,
+            dtype=hidden_states.dtype,
+        )
+        block_size_m = triton_config["BLOCK_SIZE_M"]
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, self.num_experts
@@ -194,9 +202,16 @@ class FusedMoEModule:
         )
         if debug_enabled:
             self._debug_up = up_out[:num_tokens].detach().cpu()
-        activated = gelu_and_mul_plus_one(up_out.view(num_tokens * self.top_k, -1))
 
-        down_in = activated.view(num_tokens * self.top_k, self.hidden_size)
+        activation_in = up_out.view(num_tokens * self.top_k, -1)
+        activation_out = self._workspaces.activation.get(
+            (num_tokens * self.top_k, self.hidden_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        fused_gelu_and_mul(activation_in, activation_out)
+
+        down_in = activation_out
         if debug_enabled:
             self._debug_h = down_in.view(num_tokens, self.top_k, self.hidden_size).detach().cpu()
         down_out = self._workspaces.down.get(
@@ -237,3 +252,43 @@ class FusedMoEModule:
         if assignments <= 64:
             return min(64, block_m)
         return block_m
+
+    def _get_triton_config(
+        self,
+        *,
+        num_tokens: int,
+        assignments: int,
+        dtype: torch.dtype,
+    ) -> dict[str, int]:
+        base = self.config.as_triton(
+            block_size_m=self._select_block_size(assignments)
+        ).copy()
+        base.setdefault("NUM_WARPS", self.config.num_warps)
+        base.setdefault("NUM_STAGES", self.config.num_stages)
+
+        tuned = self._get_tuned_config(num_tokens=num_tokens, dtype=dtype)
+        if tuned is not None:
+            base.update(tuned)
+        return base
+
+    def _get_tuned_config(
+        self,
+        *,
+        num_tokens: int,
+        dtype: torch.dtype,
+    ) -> dict[str, int] | None:
+        if num_tokens in self._tuned_configs:
+            return self._tuned_configs[num_tokens]
+
+        config_name = FUSED_MOE_UNQUANTIZED_CONFIG.config_name(dtype)
+        raw = try_get_optimal_moe_config(
+            self.up_experts.weight.shape,
+            self.down_experts.weight.shape,
+            self.top_k,
+            config_name,
+            num_tokens,
+        )
+        tuned = {k.upper(): int(v) for k, v in raw.items()} if raw is not None else None
+
+        self._tuned_configs[num_tokens] = tuned
+        return tuned
