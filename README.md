@@ -172,6 +172,7 @@ The `scripts/profile_scattermoe.py` helper drives the Moondream ScatterMoE MLP w
         --section Occupancy \
         --section SchedulerStats \
         --section WarpStateStats \
+        --section SourceCounters \
         --section MemoryWorkloadAnalysis \
         --target-processes all \
         --force-overwrite \
