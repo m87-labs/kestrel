@@ -2,14 +2,51 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import prod
 
 import torch
+from vllm import _custom_ops as ops
+
 from .kernels import (
     dtype_to_triton,
     gelu_and_mul_plus_one,
     invoke_fused_moe_kernel,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+
+class _ResizableBuffer:
+    """Device-aware buffer that grows as needed and reuses storage."""
+
+    def __init__(self) -> None:
+        self._tensor: torch.Tensor | None = None
+
+    def get(
+        self,
+        shape: tuple[int, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        numel = prod(shape)
+        if numel == 0:
+            return torch.empty(shape, device=device, dtype=dtype)
+
+        if (
+            self._tensor is None
+            or self._tensor.numel() < numel
+            or self._tensor.device != device
+            or self._tensor.dtype != dtype
+        ):
+            self._tensor = torch.empty(numel, device=device, dtype=dtype)
+        return self._tensor[:numel].view(*shape)
+
+
+class _MoEWorkspaces:
+    def __init__(self) -> None:
+        self.up = _ResizableBuffer()
+        self.down = _ResizableBuffer()
+        self.output = _ResizableBuffer()
 
 
 @dataclass
@@ -59,6 +96,7 @@ class FusedMoEModule:
         self._metadata_debug_done = False
         self._debug_up: torch.Tensor | None = None
         self._debug_h: torch.Tensor | None = None
+        self._workspaces = _MoEWorkspaces()
 
     def __call__(
         self,
@@ -131,10 +169,10 @@ class FusedMoEModule:
             )
             self._metadata_debug_done = True
 
-        up_out = torch.empty(
+        up_out = self._workspaces.up.get(
             (num_tokens, self.top_k, self.hidden_size * 2),
-            dtype=hidden_states.dtype,
             device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
 
         compute_type = dtype_to_triton(hidden_states.dtype)
@@ -161,10 +199,10 @@ class FusedMoEModule:
         down_in = activated.view(num_tokens * self.top_k, self.hidden_size)
         if debug_enabled:
             self._debug_h = down_in.view(num_tokens, self.top_k, self.hidden_size).detach().cpu()
-        down_out = torch.empty(
+        down_out = self._workspaces.down.get(
             (num_tokens, self.top_k, self.input_size),
-            dtype=hidden_states.dtype,
             device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         invoke_fused_moe_kernel(
             down_in,
@@ -181,7 +219,14 @@ class FusedMoEModule:
             bias=None,
             allow_tf32=self.config.allow_tf32,
         )
-        return down_out.sum(dim=1)
+
+        fused = self._workspaces.output.get(
+            (num_tokens, self.input_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        ops.moe_sum(down_out, fused)
+        return fused
 
     def _select_block_size(self, assignments: int) -> int:
         block_m = self.config.block_size_m
