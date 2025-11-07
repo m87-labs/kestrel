@@ -112,6 +112,7 @@ def build_moe_mlp(
                 num_experts=n_experts,
                 top_k=top_k,
                 dtype=dtype,
+                decode_backend="fused",
             ),
         }
     )

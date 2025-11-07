@@ -136,6 +136,61 @@ assert "".join(chunks) == caption_result.output["caption"]
 
   The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
 
+### Profiling ScatterMoE Kernels
+
+The `scripts/profile_scattermoe.py` helper drives the Moondream ScatterMoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the fused kernels.
+
+1. Sync the repository to the target GPU host (e.g. `./sync.sh p1`) and ensure `uv` is on the PATH.
+2. Collect a prefill profile with richer counters:
+
+   ```bash
+   sudo bash -lc '
+     cd /home/ubuntu/code/kestrel &&
+     /opt/nvidia/nsight-compute/2024.1.1/ncu \
+       --set default \
+       --target-processes all \
+       --force-overwrite \
+       --metrics gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum \
+       --export /tmp/profile_scattermoe_prefill \
+       /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
+         --mode prefill \
+         --iterations 5 \
+         --warmup-iters 3 \
+         --nvtx
+   '
+   ```
+
+3. Collect the decode profile with deeper pipeline sections and expanded stall metrics:
+
+   ```bash
+   sudo bash -lc '
+     cd /home/ubuntu/code/kestrel &&
+     /opt/nvidia/nsight-compute/2024.1.1/ncu \
+        --set default \
+        --section LaunchStats \
+        --section SpeedOfLight \
+        --section Occupancy \
+        --section SchedulerStats \
+        --section WarpStateStats \
+        --section MemoryWorkloadAnalysis \
+        --target-processes all \
+        --force-overwrite \
+        --metrics \
+gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,smsp__warp_issue_stalled_long_scoreboard.sum,smsp__warp_issue_stalled_short_scoreboard.sum,smsp__warps_eligible_per_scheduler.avg,sm__pipe_fma_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,lts__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed \
+        --export /tmp/profile_scattermoe_decode \
+        /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
+        --mode decode \
+        --iterations 10 \
+        --warmup-iters 5 \
+        --refresh-routing \
+        --nvtx
+   '
+   ```
+
+The resulting `.ncu-rep` files can be opened locally via `ncu --import /tmp/profile_scattermoe_prefill.ncu-rep --page raw --csv` (or in the Nsight Compute GUI). Running under `sudo` sidesteps the performance-counter permission requirement; alternatively configure `NVreg_RestrictProfilingToAdminUsers=0` on the host.
+
+For a one-off launch-overhead snapshot, reuse the same command with `--metrics gpu__time_duration.sum` (and optionally `--kernel-name ::scatter2scatter`) so you can divide the reported duration by the kernel count.
+
 ### HTTP Endpoints
 
 `POST /v1/query`

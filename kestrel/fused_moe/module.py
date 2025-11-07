@@ -9,15 +9,17 @@ from .kernels import (
     gelu_and_mul_plus_one,
     invoke_fused_moe_kernel,
 )
-from .routing import moe_align_block_size
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
 
 @dataclass
 class FusedMoEConfig:
-    block_size_m: int = 64
+    block_size_m: int = 16
     block_size_n: int = 64
     block_size_k: int = 32
     group_size_m: int = 8
+    num_warps: int = 4
+    num_stages: int = 2
     allow_tf32: bool = True
 
     def as_triton(self, *, block_size_m: int | None = None) -> dict[str, int]:
@@ -26,6 +28,8 @@ class FusedMoEConfig:
             "BLOCK_SIZE_N": self.block_size_n,
             "BLOCK_SIZE_K": self.block_size_k,
             "GROUP_SIZE_M": self.group_size_m,
+            "NUM_WARPS": self.num_warps,
+            "NUM_STAGES": self.num_stages,
         }
         return config
 
