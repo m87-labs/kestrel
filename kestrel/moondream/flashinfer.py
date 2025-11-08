@@ -1,14 +1,15 @@
-"""FlashInfer integration helpers for Moondream decoding."""
+"""FlashInfer integration helpers for Moondream prefill and decode."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
 
 import flashinfer  # type: ignore
-
+from torch.compiler import disable as torch_compiler_disable
 
 @dataclass
 class FlashInferBatchMetadata:
@@ -22,6 +23,112 @@ class FlashInferBatchMetadata:
     @property
     def total_pages(self) -> int:
         return int(self.kv_indices.shape[0])
+
+
+@dataclass
+class FlashInferPrefillBatchMetadata:
+    """Per-step metadata required by FlashInfer batch prefill kernels."""
+
+    batch_size: int
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    kv_last_page_len: torch.Tensor
+
+    @property
+    def total_queries(self) -> int:
+        return int(self.qo_indptr[-1].item())
+
+
+class FlashInferPrefillContext:
+    """Stateful wrapper around FlashInfer batch prefill kernels."""
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        page_size: int,
+        workspace_bytes: int = 128 * 1024 * 1024,
+        backend: str = "fa2",
+    ) -> None:
+        self.device = device
+        self.q_dtype = q_dtype
+        self.kv_dtype = kv_dtype
+        self.page_size = page_size
+        self._backend = backend
+
+        self._workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+        self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self._workspace,
+            "HND",
+            backend=self._backend,
+        )
+
+    def plan(
+        self,
+        metadata: FlashInferPrefillBatchMetadata,
+        *,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        custom_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if metadata.batch_size == 0:
+            return
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        self._prefill_wrapper.plan(
+            metadata.qo_indptr,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            metadata.kv_last_page_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            self.page_size,
+            causal=True,
+            sm_scale=sm_scale,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            custom_mask=custom_mask,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
+        *,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self._prefill_wrapper.run(
+            q,
+            paged_kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out,
+        )
+
+
+@torch_compiler_disable()
+def run_flashinfer_prefill(
+    ctx: FlashInferPrefillContext,
+    q: torch.Tensor,
+    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
+    *,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return ctx.run(
+        q,
+        paged_kv_cache,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        out=out,
+    )
 
 
 @dataclass
@@ -199,5 +306,8 @@ class FlashInferDecodeContext:
 
 __all__ = [
     "FlashInferBatchMetadata",
+    "FlashInferPrefillBatchMetadata",
     "FlashInferDecodeContext",
+    "FlashInferPrefillContext",
+    "run_flashinfer_prefill",
 ]
