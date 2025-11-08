@@ -148,6 +148,13 @@ The `scripts/profile_scattermoe.py` helper drives the Moondream ScatterMoE MLP w
      cd /home/ubuntu/code/kestrel &&
      /opt/nvidia/nsight-compute/2024.1.1/ncu \
        --set default \
+       --section LaunchStats \
+       --section SpeedOfLight \
+       --section Occupancy \
+       --section SchedulerStats \
+       --section WarpStateStats \
+       --section SourceCounters \
+       --section MemoryWorkloadAnalysis \
        --target-processes all \
        --force-overwrite \
        --metrics gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum \
