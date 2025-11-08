@@ -34,6 +34,8 @@ from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
+    FlashInferPrefillBatchMetadata,
+    FlashInferPrefillContext,
 )
 from .region import (
     build_region_module,
@@ -344,6 +346,14 @@ class MoondreamRuntime:
             max_seq_len=self.max_seq_length,
             use_cuda_graphs=self._use_cuda_graphs,
         )
+        # Force fa2 backend: fa3 lacks mixed-precision attention (see flashinfer#2038).
+        self._flashinfer_prefill_ctx = FlashInferPrefillContext(
+            device=self.device,
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_cache_dtype,
+            page_size=self.page_size,
+        )
+        self._active_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None
 
         self._graph_workspace: _GraphWorkspace | None = None
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -359,7 +369,8 @@ class MoondreamRuntime:
                 self._prefill_fn = torch.compile(self._prefill_impl, **compile_kwargs)
             except Exception as exc:  # pragma: no cover - torch.compile optional path
                 warnings.warn(
-                    f"torch.compile failed for prefill path, continuing without compilation: {exc}"
+                    f"torch.compile failed for prefill path, continuing without compilation: {exc}",
+                    stacklevel=2,
                 )
                 self._prefill_fn = self._prefill_impl
 
@@ -605,17 +616,41 @@ class MoondreamRuntime:
         for cache in self.layer_caches:
             cache.bind(batch_idx=batch_idx, device=self.device)
 
-        attention_mask = torch.ones(
-            1, 1, prompt_len, prompt_len, dtype=torch.bool, device=self.device
-        ).tril_()
-        if image_length:
-            prefix_len = image_length + 1
-            attention_mask[:, :, :prefix_len, :prefix_len] = True
+        attention_mask = None
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        query_lens = torch.tensor(
+            [prompt_len], dtype=torch.int32, device=self.device
+        )
+        prefill_metadata = self._build_flashinfer_prefill_metadata(
+            batch_tensor, query_lens
+        )
+        custom_mask = None
+        if image_length:
+            mask_matrix = torch.tril(
+                torch.ones(
+                    (prompt_len, prompt_len),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+            prefix_len = image_length + 1
+            mask_matrix[:prefix_len, :prefix_len] = True
+            custom_mask = mask_matrix.flatten()
+        self._flashinfer_prefill_ctx.plan(
+            prefill_metadata,
+            num_q_heads=self.config.text.n_heads,
+            num_kv_heads=self.config.text.n_kv_heads,
+            head_dim=self.head_dim,
+            custom_mask=custom_mask,
+        )
+        self._active_prefill_metadata = prefill_metadata
+        try:
+            hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        finally:
+            self._active_prefill_metadata = None
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
@@ -636,7 +671,10 @@ class MoondreamRuntime:
 
     @torch.inference_mode()
     def _prefill(
-        self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor
+        self,
+        inputs_embeds: Tensor,
+        attn_mask: Optional[Tensor],
+        position_ids: Tensor,
     ) -> tuple[Tensor, Tensor]:
         hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids)
         return hidden, logits
@@ -644,9 +682,12 @@ class MoondreamRuntime:
     def _prefill_impl(
         self,
         inputs_embeds: Tensor,
-        attn_mask: Tensor,
+        attn_mask: Optional[Tensor],
         position_ids: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        prefill_metadata = self._active_prefill_metadata
+        use_flashinfer_prefill = prefill_metadata is not None
+
         hidden = text_decoder(
             inputs_embeds,
             self.model.text,
@@ -654,6 +695,11 @@ class MoondreamRuntime:
             position_ids,
             self.config.text,
             mode="prefill",
+            flashinfer_prefill_ctx=(
+                self._flashinfer_prefill_ctx if use_flashinfer_prefill else None
+            ),
+            flashinfer_prefill_metadata=prefill_metadata,
+            use_flashinfer_prefill=use_flashinfer_prefill,
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
@@ -754,6 +800,36 @@ class MoondreamRuntime:
         )
         return FlashInferBatchMetadata(
             batch_size=expanded_batch.shape[0],
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            kv_last_page_len=kv_last_page_len,
+        )
+
+    def _build_flashinfer_prefill_metadata(
+        self,
+        batch_idx: Tensor,
+        query_lens: Tensor,
+    ) -> FlashInferPrefillBatchMetadata:
+        if batch_idx.ndim != 1:
+            raise ValueError("batch_idx must be 1D for FlashInfer prefill metadata")
+        if query_lens.ndim != 1:
+            raise ValueError("query_lens must be 1D for FlashInfer prefill metadata")
+
+        seq_lens = query_lens.to(dtype=torch.int32, device=self.device)
+        kv_indptr, kv_indices, kv_last_page_len = (
+            self.page_table.build_flashinfer_kv_metadata(batch_idx, seq_lens)
+        )
+        qo_indptr = torch.zeros(
+            batch_idx.shape[0] + 1, dtype=torch.int32, device=self.device
+        )
+        if query_lens.numel():
+            qo_indptr[1:] = torch.cumsum(
+                query_lens.to(dtype=torch.int32, device=self.device), dim=0
+            )
+
+        return FlashInferPrefillBatchMetadata(
+            batch_size=batch_idx.shape[0],
+            qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             kv_last_page_len=kv_last_page_len,

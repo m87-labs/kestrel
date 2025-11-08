@@ -23,7 +23,13 @@ from .layers import (
     MLPWeights,
 )
 from ..ops import apply_rotary_emb, precompute_freqs_cis
-from .flashinfer import FlashInferBatchMetadata, FlashInferDecodeContext
+from .flashinfer import (
+    FlashInferBatchMetadata,
+    FlashInferDecodeContext,
+    FlashInferPrefillBatchMetadata,
+    FlashInferPrefillContext,
+    run_flashinfer_prefill,
+)
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -42,6 +48,10 @@ def attn(
     flashinfer_state: Optional[
         tuple[FlashInferDecodeContext, FlashInferBatchMetadata, bool]
     ] = None,
+    flashinfer_prefill_state: Optional[
+        tuple[FlashInferPrefillContext, FlashInferPrefillBatchMetadata]
+    ] = None,
+    mode: Literal["prefill", "decode"] = "decode",
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -103,6 +113,15 @@ def attn(
                 f"Unexpected flashinfer_state tuple length {len(flashinfer_state)}"
             )
 
+    prefill_ctx = None
+    prefill_metadata = None
+    if flashinfer_prefill_state is not None:
+        if len(flashinfer_prefill_state) != 2:
+            raise ValueError(
+                "flashinfer_prefill_state must contain a context and metadata tuple"
+            )
+        prefill_ctx, prefill_metadata = flashinfer_prefill_state
+
     if kv_cache is not None:
         kv_result = kv_cache.update(position_ids, k, v)
     else:
@@ -125,6 +144,29 @@ def attn(
             v_scale=v_scale,
         )
         out = attn_heads.unsqueeze(2)
+    elif prefill_ctx is not None:
+        if kv_cache is None:
+            raise RuntimeError("FlashInfer prefill requires a KV cache")
+        if prefill_metadata is None:
+            raise RuntimeError("FlashInfer prefill requires metadata")
+        q_heads = q.transpose(1, 2).reshape(-1, n_heads, head_dim).contiguous()
+        paged_cache = kv_cache.cache  # type: ignore[attr-defined]
+        k_scale = getattr(paged_cache, "k_scale", None)
+        v_scale = getattr(paged_cache, "v_scale", None)
+        out_buf = torch.empty_like(q_heads)
+        attn_heads = run_flashinfer_prefill(
+            prefill_ctx,
+            q_heads,
+            (paged_cache.k_cache, paged_cache.v_cache),
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out_buf,
+        )
+        out = (
+            attn_heads.view(bsz, q_len, n_heads, head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
     else:
         k_attn, v_attn = kv_result
         out = F.scaled_dot_product_attention(
@@ -133,6 +175,7 @@ def attn(
             v_attn,
             attn_mask=attn_mask,
             enable_gqa=n_heads != n_kv_heads,
+            is_causal=(mode == "prefill") and attn_mask is None,
         )
 
     out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
@@ -150,6 +193,9 @@ def text_decoder(
     flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
     use_flashinfer: bool = False,
     use_graph: bool = False,
+    flashinfer_prefill_ctx: Optional[FlashInferPrefillContext] = None,
+    flashinfer_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None,
+    use_flashinfer_prefill: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
@@ -164,6 +210,15 @@ def text_decoder(
         ):
             flash_state = (flashinfer_ctx, flashinfer_metadata, use_graph)
 
+        prefill_state = None
+        if (
+            mode == "prefill"
+            and use_flashinfer_prefill
+            and flashinfer_prefill_ctx is not None
+            and flashinfer_prefill_metadata is not None
+        ):
+            prefill_state = (flashinfer_prefill_ctx, flashinfer_prefill_metadata)
+
         attn_out = attn(
             x_norm,
             block.attn,
@@ -174,6 +229,8 @@ def text_decoder(
             config.n_kv_heads,
             position_ids,
             flashinfer_state=flash_state,
+            flashinfer_prefill_state=prefill_state,
+            mode=mode,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
