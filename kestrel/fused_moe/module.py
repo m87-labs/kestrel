@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from math import prod
 
 import torch
+from torch import nn
+from torch.compiler import disable as torch_compiler_disable
 from vllm import _custom_ops as ops
 
 from .kernels import (
@@ -227,8 +229,8 @@ class FusedMoEConfig:
         return config
 
 
-class FusedMoEModule:
-    """Hybrid MoE backend that reuses ScatterMoE weights with vLLM-style kernels."""
+class FusedMoEModule(nn.Module):
+    """Hybrid MoE backend that wraps vLLM's fused kernels for single-GPU use."""
 
     def __init__(
         self,
@@ -241,6 +243,7 @@ class FusedMoEModule:
         num_experts: int,
         config: FusedMoEConfig | None = None,
     ) -> None:
+        super().__init__()
         self.up_experts = up_experts
         self.down_experts = down_experts
         self.top_k = top_k
@@ -267,6 +270,7 @@ class FusedMoEModule:
     def available(self) -> bool:
         return (not self._disabled) and torch.cuda.is_available()
 
+    @torch_compiler_disable()
     def forward(
         self,
         hidden_states: torch.Tensor,
