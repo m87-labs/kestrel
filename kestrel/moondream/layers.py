@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
-from ..scattermoe import MLP as ScatterMoEMLP
+from ..fused_moe import ExpertWeights, FusedMoEModule
 
 
 def gelu_approx(x: torch.Tensor) -> torch.Tensor:
@@ -103,19 +103,18 @@ def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDi
 def build_moe_mlp(
     d_model: int, d_ffn: int, n_experts: int, dtype: torch.dtype, *, top_k: int
 ) -> nn.ModuleDict:
-    return nn.ModuleDict(
-        {
-            "router": nn.Linear(d_model, n_experts, dtype=dtype),
-            "mlp": ScatterMoEMLP(
-                input_size=d_model,
-                hidden_size=d_ffn,
-                num_experts=n_experts,
-                top_k=top_k,
-                dtype=dtype,
-                decode_backend="fused",
-            ),
-        }
+    router = nn.Linear(d_model, n_experts, dtype=dtype)
+    up_experts = ExpertWeights(n_experts, d_model, d_ffn * 2, dtype=dtype)
+    down_experts = ExpertWeights(n_experts, d_ffn, d_model, dtype=dtype)
+    fused = FusedMoEModule(
+        up_experts,
+        down_experts,
+        top_k=top_k,
+        hidden_size=d_ffn,
+        input_size=d_model,
+        num_experts=n_experts,
     )
+    return nn.ModuleDict({"router": router, "mlp": fused})
 
 
 def moe_mlp(
@@ -129,22 +128,16 @@ def moe_mlp(
     x_flat = x.reshape(-1, C)
 
     router = mlp_module["router"]
-    scatter_mlp = mlp_module["mlp"]
+    fused_mlp = mlp_module["mlp"]
 
     router_logits = router(x_flat)
     topk_logits, topk_idxs = torch.topk(router_logits, experts_per_token, dim=-1)
     topk_weights = F.softmax(topk_logits, dim=-1, dtype=torch.float32).to(x.dtype)
 
-    num_tokens = topk_idxs.shape[0]
-
-    if mode == "decode":
-        scatter_mlp.ensure_workspaces(num_tokens, x_flat.device, x_flat.dtype)
-
-    mlp_out = scatter_mlp(
+    mlp_out = fused_mlp(
         x_flat,
         topk_weights,
         topk_idxs,
-        mode=mode,
     ).view(B, T, C)
     return mlp_out
 

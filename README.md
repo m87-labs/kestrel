@@ -136,9 +136,9 @@ assert "".join(chunks) == caption_result.output["caption"]
 
   The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
 
-### Profiling ScatterMoE Kernels
+### Profiling the Fused MoE Kernel
 
-The `scripts/profile_scattermoe.py` helper drives the Moondream ScatterMoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the fused kernels.
+The `scripts/profile_scattermoe.py` helper (name retained for compatibility) drives the Moondream fused MoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the Triton kernels.
 
 1. Sync the repository to the target GPU host (e.g. `./sync.sh p1`) and ensure `uv` is on the PATH.
 2. Collect a prefill profile with richer counters:
@@ -197,7 +197,7 @@ gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pip
 
 The resulting `.ncu-rep` files can be opened locally via `ncu --import /tmp/profile_scattermoe_prefill.ncu-rep --page raw --csv` (or in the Nsight Compute GUI). Running under `sudo` sidesteps the performance-counter permission requirement; alternatively configure `NVreg_RestrictProfilingToAdminUsers=0` on the host.
 
-For a one-off launch-overhead snapshot, reuse the same command with `--metrics gpu__time_duration.sum` (and optionally `--kernel-name ::scatter2scatter`) so you can divide the reported duration by the kernel count.
+For a one-off launch-overhead snapshot, reuse the same command with `--metrics gpu__time_duration.sum` so you can divide the reported duration by the kernel count.
 
 ### HTTP Endpoints
 
