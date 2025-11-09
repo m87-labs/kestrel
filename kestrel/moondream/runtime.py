@@ -11,6 +11,7 @@ from typing import NamedTuple, Optional, Sequence, cast
 
 import warnings
 
+import numpy as np
 import pyvips
 import torch
 from torch import Tensor
@@ -779,29 +780,85 @@ class MoondreamRuntime:
         input_pos: Tensor,
         *,
         full_batch_size: Optional[int] = None,
+        use_graph: bool = False,
     ) -> FlashInferBatchMetadata:
         if batch_idx.ndim != 1:
             raise ValueError("batch_idx must be 1D")
 
-        seq_lens = input_pos.to(dtype=torch.int32) + 1
-        expanded_batch = batch_idx
-        expanded_seq = seq_lens
-
-        if full_batch_size is not None and full_batch_size > batch_idx.shape[0]:
-            pad = full_batch_size - batch_idx.shape[0]
-            pad_batch = torch.zeros(pad, dtype=torch.long, device=self.device)
-            pad_seq = torch.ones(pad, dtype=torch.int32, device=self.device)
-            expanded_batch = torch.cat([batch_idx, pad_batch], dim=0)
-            expanded_seq = torch.cat([seq_lens, pad_seq], dim=0)
-
-        kv_indptr, kv_indices, kv_last_page_len = (
-            self.page_table.build_flashinfer_kv_metadata(expanded_batch, expanded_seq)
+        batch_size = batch_idx.shape[0]
+        target_batch = full_batch_size or batch_size
+        buffers = self._flashinfer_ctx.acquire_plan_buffers(
+            target_batch, use_graph=use_graph
         )
+
+        seq_lens_np = buffers.seq_lens_np[:target_batch]
+        seq_lens_np.fill(0)
+        if batch_size:
+            seq_lens_cpu_tensor = buffers.seq_lens_cpu[:batch_size]
+            seq_lens_cpu_tensor.copy_(input_pos[:batch_size])
+            seq_lens_np[:batch_size] += 1
+
+        num_pages_np = buffers.num_pages_np[:target_batch]
+        if target_batch:
+            np.add(seq_lens_np, self.page_size - 1, out=num_pages_np)
+            np.floor_divide(num_pages_np, self.page_size, out=num_pages_np)
+        else:
+            num_pages_np.fill(0)
+
+        kv_indptr_np = buffers.kv_indptr_np[: target_batch + 1]
+        kv_indptr_np.fill(0)
+        if target_batch:
+            kv_indptr_np[1:] = np.cumsum(num_pages_np, dtype=np.int32)
+
+        kv_last_page_len_np = buffers.kv_last_page_len_np[:target_batch]
+        if target_batch:
+            np.subtract(seq_lens_np[:target_batch], 1, out=kv_last_page_len_np)
+            np.mod(kv_last_page_len_np, self.page_size, out=kv_last_page_len_np)
+            kv_last_page_len_np += 1
+            kv_last_page_len_np[num_pages_np == 0] = 0
+        else:
+            kv_last_page_len_np.fill(0)
+
+        batch_count = target_batch
+
+        kv_indptr = buffers.kv_indptr[: target_batch + 1]
+        kv_indptr.copy_(buffers.kv_indptr_cpu[: target_batch + 1], non_blocking=True)
+        kv_last_page_len = buffers.kv_last_page_len[:target_batch]
+        kv_last_page_len.copy_(buffers.kv_last_page_len_cpu[:target_batch], non_blocking=True)
+
+        if buffers.graph_state is not None or target_batch != batch_size:
+            batch_buf = buffers.batch_indices[:target_batch]
+            batch_buf.zero_()
+            if batch_size:
+                batch_buf[:batch_size].copy_(batch_idx)
+            expanded_batch = batch_buf
+        else:
+            expanded_batch = batch_idx
+
+        total_pages = int(buffers.kv_indptr_cpu[target_batch].item())
+        if total_pages > buffers.page_capacity:
+            raise RuntimeError(
+                f"FlashInfer plan buffer overflow: need {total_pages} pages but capacity is {buffers.page_capacity}"
+            )
+
+        kv_indices = buffers.kv_indices[:total_pages]
+        if total_pages > 0:
+            self.page_table.populate_flashinfer_kv_indices(
+                batch_idx=expanded_batch,
+                kv_indptr=kv_indptr,
+                out_kv_indices=kv_indices,
+            )
+
+        pages_filled = total_pages
+        buffers.pages_filled = pages_filled
+        if buffers.graph_state is not None:
+            buffers.graph_state.pages_filled = pages_filled
         return FlashInferBatchMetadata(
-            batch_size=expanded_batch.shape[0],
+            batch_size=batch_count,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             kv_last_page_len=kv_last_page_len,
+            graph_state=buffers.graph_state if use_graph else None,
         )
 
     def _build_flashinfer_prefill_metadata(
@@ -857,7 +914,10 @@ class MoondreamRuntime:
         metadata = flashinfer_metadata
         if metadata is None:
             metadata = self._build_flashinfer_metadata(
-                batch_idx, input_pos, full_batch_size=full_batch_size
+                batch_idx,
+                input_pos,
+                full_batch_size=full_batch_size,
+                use_graph=use_graph,
             )
 
         if not skip_plan:
@@ -903,11 +963,11 @@ class MoondreamRuntime:
         workspace.token_buffer[:batch_size, 0].copy_(tokens)
         workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
         workspace.position_buffer[:batch_size].copy_(input_pos)
-
         metadata = self._build_flashinfer_metadata(
             workspace.batch_idx_buffer[:graph_batch_size],
             workspace.position_buffer[:graph_batch_size],
             full_batch_size=graph_batch_size,
+            use_graph=True,
         )
         self._flashinfer_ctx.plan(
             metadata,
@@ -1006,6 +1066,7 @@ class MoondreamRuntime:
                         workspace.batch_idx_buffer[:bs],
                         workspace.position_buffer[:bs],
                         full_batch_size=bs,
+                        use_graph=True,
                     )
                     warmup = self._decode_step(
                         workspace.batch_idx_buffer[:bs],
@@ -1058,7 +1119,6 @@ class MoondreamRuntime:
         workspace.token_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
-        workspace.hidden_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]
