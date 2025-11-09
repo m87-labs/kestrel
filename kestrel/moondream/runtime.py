@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from copy import deepcopy
-import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Optional, Sequence, cast
@@ -705,10 +705,9 @@ class MoondreamRuntime:
         return hidden, logits
 
     @torch.inference_mode()
-    def decode(self, state: SequenceState, token_id: Tensor | Token) -> Tensor:
-        logits = self.decode_batch([state], token_id)[0]
+    def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
+        self.decode_batch([state], token_id)
         state.advance()
-        return logits.unsqueeze(0)
 
     @torch.inference_mode()
     def decode_batch(
@@ -920,8 +919,8 @@ class MoondreamRuntime:
 
         graph = self._cuda_graphs[graph_batch_size]
         graph.replay()
-        logits = workspace.output_buffer[:batch_size].clone()
-        hidden = workspace.hidden_buffer[:batch_size].clone().unsqueeze(1)
+        logits = workspace.output_buffer[:batch_size]
+        hidden = workspace.hidden_buffer[:batch_size].unsqueeze(1)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
     def _ensure_cuda_graphs_ready(self) -> None:
