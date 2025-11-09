@@ -222,7 +222,6 @@ class GenerationScheduler:
                 restrict = True
 
         if restrict:
-            logits = logits.clone()
             for i, allowed in enumerate(allowed_tokens):
                 if not allowed:
                     continue
