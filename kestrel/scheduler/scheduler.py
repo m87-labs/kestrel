@@ -24,6 +24,46 @@ from .types import (
     StreamCallback,
 )
 from .sampling import sample_tokens
+from kestrel.utils.buffers import CpuGpuBuffer
+
+
+class _SampleBuffer:
+    """Pinned host buffer for sampled token ids with optional async copy."""
+
+    def __init__(self, max_batch: int, device: torch.device) -> None:
+        self._buffer = CpuGpuBuffer(
+            max_batch,
+            dtype=torch.long,
+            device=device,
+            pin_memory=True,
+        )
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device)
+        self._event = torch.cuda.Event(enable_timing=False, blocking=False)
+
+    class TransferHandle:
+        def __init__(self, event: torch.cuda.Event, cpu_view: Tensor, count: int) -> None:
+            self._event = event
+            self._cpu_view = cpu_view
+            self._count = count
+
+        def wait(self) -> Tensor:
+            if self._count == 0:
+                return self._cpu_view[:0]
+            self._event.synchronize()
+            return self._cpu_view[: self._count]
+
+    def transfer(self, tensor: Tensor) -> "_SampleBuffer.TransferHandle":
+        count = int(tensor.shape[0])
+        if count == 0:
+            return _SampleBuffer.TransferHandle(self._event, self._buffer.cpu, 0)
+
+        current = torch.cuda.current_stream(device=self._device)
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_stream(current)
+            self._buffer.cpu[:count].copy_(tensor, non_blocking=True)
+            self._event.record(self._stream)
+        return _SampleBuffer.TransferHandle(self._event, self._buffer.cpu, count)
 
 
 class GenerationScheduler:
@@ -51,6 +91,7 @@ class GenerationScheduler:
             runtime.max_batch_size, dtype=torch.long, device="cpu"
         ).pin_memory()
         self._pinned_token_np = self._pinned_token_buffer.numpy()
+        self._sample_buffer = _SampleBuffer(runtime.max_batch_size, runtime.device)
 
     # ------------------------------------------------------------------
     # Submission
@@ -159,7 +200,9 @@ class GenerationScheduler:
 
             first_logits = logits.squeeze(0)
             sampled = self._sample_batch(first_logits.unsqueeze(0), [seq.request])
-            token_value = int(sampled[0])
+            transfer = self._sample_buffer.transfer(sampled)
+            sampled_host = transfer.wait()
+            token_value = int(sampled_host[0].item())
             seq.stage_token(self.runtime, token_value)
 
             if self._mark_finished_if_needed(seq):
@@ -211,11 +254,16 @@ class GenerationScheduler:
         logits = self.runtime.decode_batch([seq.state for seq in active], token_input)
 
         sampled_tokens = self._sample_batch(logits, [seq.request for seq in active])
-        sampled_cpu = sampled_tokens.to(device="cpu")
+        transfer = self._sample_buffer.transfer(sampled_tokens)
+
+        # Overlap advances/length bookkeeping with the host copy.
+        for seq in active:
+            seq.state.advance()
+
+        sampled_cpu = transfer.wait()
         sampled_np = sampled_cpu.numpy().reshape(-1)
 
         for seq, token_value in zip(active, sampled_np):
-            seq.state.advance()
             seq.stage_token(self.runtime, int(token_value))
             if not self._mark_finished_if_needed(seq):
                 idle.append(seq)
