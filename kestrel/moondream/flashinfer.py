@@ -13,6 +13,8 @@ import torch
 import flashinfer  # type: ignore
 from torch.compiler import disable as torch_compiler_disable
 
+from kestrel.utils import CpuGpuBuffer
+
 @dataclass
 class FlashInferBatchMetadata:
     """Per-step metadata required by FlashInfer batch decode kernels."""
@@ -152,6 +154,8 @@ class _GraphState:
     kv_last_page_len_np: np.ndarray
     num_pages_np: np.ndarray
     seq_lens_np: np.ndarray
+    kv_indptr_buffer: CpuGpuBuffer
+    kv_last_page_len_buffer: CpuGpuBuffer
     pages_filled: int = 0
 
 
@@ -171,6 +175,8 @@ class FlashInferPlanBuffers:
     kv_last_page_len_np: np.ndarray
     num_pages_np: np.ndarray
     seq_lens_np: np.ndarray
+    _kv_indptr: CpuGpuBuffer
+    _kv_last_page_len: CpuGpuBuffer
     graph_state: Optional[_GraphState] = None
     pages_filled: int = 0
 
@@ -289,6 +295,8 @@ class FlashInferDecodeContext:
                 kv_last_page_len_np=state.kv_last_page_len_np,
                 num_pages_np=state.num_pages_np,
                 seq_lens_np=state.seq_lens_np,
+                _kv_indptr=state.kv_indptr_buffer,
+                _kv_last_page_len=state.kv_last_page_len_buffer,
                 graph_state=state,
                 pages_filled=state.pages_filled,
             )
@@ -309,35 +317,43 @@ class FlashInferDecodeContext:
     def _allocate_plan_buffers(self, batch_capacity: int) -> FlashInferPlanBuffers:
         batch_capacity = max(1, min(batch_capacity, self._max_effective_batch))
         page_capacity = batch_capacity * self._max_pages_per_seq
-        kv_indptr = torch.empty(batch_capacity + 1, dtype=torch.int32, device=self.device)
+        kv_indptr_pair = CpuGpuBuffer(
+            batch_capacity + 1,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+        )
+        kv_last_page_len_pair = CpuGpuBuffer(
+            batch_capacity,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+        )
         kv_indices = torch.empty(page_capacity, dtype=torch.int32, device=self.device)
-        kv_last_page_len = torch.empty(batch_capacity, dtype=torch.int32, device=self.device)
         batch_indices = torch.empty(batch_capacity, dtype=torch.long, device=self.device)
 
         pin_kwargs = dict(device="cpu", dtype=torch.int32, pin_memory=True)
-        kv_indptr_cpu = torch.zeros(batch_capacity + 1, **pin_kwargs)
-        kv_last_page_len_cpu = torch.zeros(batch_capacity, **pin_kwargs)
         num_pages_cpu = torch.zeros(batch_capacity, **pin_kwargs)
         seq_lens_cpu = torch.zeros(batch_capacity, **pin_kwargs)
-        kv_indptr_np = kv_indptr_cpu.numpy()
-        kv_last_page_len_np = kv_last_page_len_cpu.numpy()
         num_pages_np = num_pages_cpu.numpy()
         seq_lens_np = seq_lens_cpu.numpy()
         return FlashInferPlanBuffers(
             batch_capacity=batch_capacity,
             page_capacity=page_capacity,
-            kv_indptr=kv_indptr,
+            kv_indptr=kv_indptr_pair.gpu,
             kv_indices=kv_indices,
-            kv_last_page_len=kv_last_page_len,
+            kv_last_page_len=kv_last_page_len_pair.gpu,
             batch_indices=batch_indices,
-            kv_indptr_cpu=kv_indptr_cpu,
-            kv_last_page_len_cpu=kv_last_page_len_cpu,
+            kv_indptr_cpu=kv_indptr_pair.cpu,
+            kv_last_page_len_cpu=kv_last_page_len_pair.cpu,
             num_pages_cpu=num_pages_cpu,
             seq_lens_cpu=seq_lens_cpu,
-            kv_indptr_np=kv_indptr_np,
-            kv_last_page_len_np=kv_last_page_len_np,
+            kv_indptr_np=kv_indptr_pair.np,
+            kv_last_page_len_np=kv_last_page_len_pair.np,
             num_pages_np=num_pages_np,
             seq_lens_np=seq_lens_np,
+            _kv_indptr=kv_indptr_pair,
+            _kv_last_page_len=kv_last_page_len_pair,
             pages_filled=0,
         )
 
@@ -423,6 +439,8 @@ class FlashInferDecodeContext:
             kv_last_page_len_np=plan_buffers.kv_last_page_len_np,
             num_pages_np=plan_buffers.num_pages_np,
             seq_lens_np=plan_buffers.seq_lens_np,
+            kv_indptr_buffer=plan_buffers._kv_indptr,
+            kv_last_page_len_buffer=plan_buffers._kv_last_page_len,
             pages_filled=0,
         )
         self._graph_states[batch_size] = state

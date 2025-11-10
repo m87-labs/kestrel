@@ -16,6 +16,8 @@ import pyvips
 import torch
 from torch import Tensor
 
+from kestrel.utils import CpuGpuBuffer
+
 from tokenizers import Tokenizer
 
 from kestrel.config import RuntimeConfig
@@ -360,19 +362,23 @@ class MoondreamRuntime:
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._graph_batch_sizes: list[int] = []
         self._graph_pool: object | None = None
-        self._host_batch_idx = torch.empty(
-            self.max_batch_size, dtype=torch.int64, device="cpu"
-        ).pin_memory()
-        self._host_input_pos = torch.empty(
-            self.max_batch_size, dtype=torch.int32, device="cpu"
-        ).pin_memory()
-        self._host_batch_idx_np = self._host_batch_idx.numpy()
-        self._host_input_pos_np = self._host_input_pos.numpy()
-        self._device_batch_idx = torch.empty(
-            self.max_batch_size, dtype=torch.int64, device=self.device
+        self._batch_idx = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=True,
         )
-        self._device_input_pos = torch.empty(
-            self.max_batch_size, dtype=torch.int32, device=self.device
+        self._input_pos = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+        )
+        self._tokens = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=self.device,
+            pin_memory=True,
         )
 
         self._prefill_fn = self._prefill_impl
@@ -730,14 +736,10 @@ class MoondreamRuntime:
             raise ValueError("states must not be empty")
 
         batch_size = len(states)
-        self._host_batch_idx_np[:batch_size] = [state.batch_idx for state in states]
-        self._host_input_pos_np[:batch_size] = [state.length for state in states]
-        host_batch_idx = self._host_batch_idx[:batch_size]
-        host_input_pos = self._host_input_pos[:batch_size]
-        batch_idx = self._device_batch_idx[:batch_size]
-        batch_idx.copy_(host_batch_idx, non_blocking=True)
-        input_pos = self._device_input_pos[:batch_size]
-        input_pos.copy_(host_input_pos, non_blocking=True)
+        self._batch_idx.np[:batch_size] = [state.batch_idx for state in states]
+        self._input_pos.np[:batch_size] = [state.length for state in states]
+        batch_idx = self._batch_idx.copy_to_gpu(batch_size)
+        input_pos = self._input_pos.copy_to_gpu(batch_size)
 
         tokens_tensor: Optional[Tensor] = None
         token_seq: Optional[Sequence[Token]] = None
@@ -750,10 +752,12 @@ class MoondreamRuntime:
                 raise ValueError(
                     "token_ids and states must have matching batch dimensions"
                 )
-            tokens_tensor = tokens_tensor.pin_memory()
-            tokens_tensor = tokens_tensor.to(
-                device=self.device, dtype=torch.long, non_blocking=True
-            )
+            if tokens_tensor.device.type != "cpu":
+                tokens_tensor = tokens_tensor.to(device="cpu")
+            tokens_tensor = tokens_tensor.to(dtype=torch.long)
+            host_tokens = self._tokens.cpu[:batch_size]
+            host_tokens.copy_(tokens_tensor)
+            tokens_tensor = self._tokens.copy_to_gpu(batch_size)
         else:
             token_seq = list(token_inputs)
             if len(token_seq) != len(states):
@@ -833,10 +837,8 @@ class MoondreamRuntime:
 
         batch_count = target_batch
 
-        kv_indptr = buffers.kv_indptr[: target_batch + 1]
-        kv_indptr.copy_(buffers.kv_indptr_cpu[: target_batch + 1], non_blocking=True)
-        kv_last_page_len = buffers.kv_last_page_len[:target_batch]
-        kv_last_page_len.copy_(buffers.kv_last_page_len_cpu[:target_batch], non_blocking=True)
+        kv_indptr = buffers._kv_indptr.copy_to_gpu(target_batch + 1)
+        kv_last_page_len = buffers._kv_last_page_len.copy_to_gpu(target_batch)
 
         if buffers.graph_state is not None or target_batch != batch_size:
             batch_buf = buffers.batch_indices[:target_batch]
