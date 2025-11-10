@@ -122,6 +122,11 @@ class _GraphWorkspace:
     hidden_buffer: Tensor
 
 
+@dataclass
+class _BatchBinding:
+    tensor: Tensor | None = None
+
+
 class _LayerPagedCache(torch.nn.Module):
     """Adapter that wires :class:`PagedKVCache` into the text blocks."""
 
@@ -145,20 +150,10 @@ class _LayerPagedCache(torch.nn.Module):
             k_scale=k_scale,
             v_scale=v_scale,
         ).to(device)
-        self._batch_idx_tensor: Optional[Tensor] = None
+        self._batch_binding = _BatchBinding()
 
-    def bind(self, batch_idx: int, device: torch.device) -> None:
-        self.set_active_batch(torch.tensor([batch_idx], device=device, dtype=torch.int64))
-
-    def set_active_batch(self, batch_indices: Tensor) -> None:
-        idx = torch.atleast_1d(batch_indices)
-        if idx.ndim != 1:
-            raise ValueError(
-                f"batch_indices must be 1D, received shape {batch_indices.shape}"
-            )
-        self._batch_idx_tensor = idx.to(
-            device=self.cache.k_cache.device, dtype=torch.int64
-        )
+    def attach_batch_binding(self, binding: _BatchBinding) -> None:
+        self._batch_binding = binding
 
     def update(
         self,
@@ -168,9 +163,6 @@ class _LayerPagedCache(torch.nn.Module):
         *,
         slot_mapping: Tensor,
     ):
-        if self._batch_idx_tensor is None:
-            raise RuntimeError("Paged cache must be bound before update calls")
-
         if k_val.shape[2] != v_val.shape[2]:
             raise ValueError("k_val and v_val must share the sequence dimension")
 
@@ -188,15 +180,11 @@ class _LayerPagedCache(torch.nn.Module):
                 f"KV sequence length {k_val.shape[2]} does not match position tensor {input_pos.shape}"
             )
 
-        batch_idx = self._batch_idx_tensor
-        if batch_idx is None:
-            raise RuntimeError("Paged cache must be bound before update calls")
+        batch_idx = self._batch_binding.tensor
 
         if seq_len == 1:
             batch_idx_arg = batch_idx.expand(k_val.shape[0])
         else:
-            if batch_idx.numel() == 0:
-                raise ValueError("No batch index bound for prefill update")
             batch_idx_arg = batch_idx.view(1).expand_as(input_pos)
 
         return self.cache.update(
@@ -377,6 +365,7 @@ class MoondreamRuntime:
             device=self.device,
             pin_memory=True,
         )
+        self._batch_binding: _BatchBinding = _BatchBinding()
         self._input_pos = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.int32,
@@ -389,6 +378,23 @@ class MoondreamRuntime:
             device=self.device,
             pin_memory=True,
         )
+        self._prefill_batch_idx = CpuGpuBuffer(
+            1,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
+        self._prefill_query_lens = CpuGpuBuffer(
+            1,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
+
+        for cache in self.layer_caches:
+            cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
         if cfg.enable_compile:
@@ -636,23 +642,22 @@ class MoondreamRuntime:
             )
 
         batch_idx = self.page_table.allocate()
-        batch_tensor = torch.tensor([batch_idx], device=self.device, dtype=torch.int64)
+        self._prefill_batch_idx.cpu[0] = batch_idx
+        batch_tensor = self._prefill_batch_idx.copy_to_gpu()
         self.page_table.reserve(
             batch_idx_int=batch_idx,
             batch_idx=batch_tensor,
             seq_len=target_length,
         )
-        for cache in self.layer_caches:
-            cache.bind(batch_idx=batch_idx, device=self.device)
+        self._batch_binding.tensor = batch_tensor
 
         attention_mask = None
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        query_lens = torch.tensor(
-            [prompt_len], dtype=torch.int32, device=self.device
-        )
+        self._prefill_query_lens.cpu[0] = prompt_len
+        query_lens = self._prefill_query_lens.copy_to_gpu()
         prefill_metadata = self._build_flashinfer_prefill_metadata(
             batch_tensor, query_lens
         )
@@ -934,8 +939,7 @@ class MoondreamRuntime:
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
         skip_plan: bool = False,
     ) -> RuntimeDecodeResult:
-        for cache in self.layer_caches:
-            cache.set_active_batch(batch_idx)
+        self._batch_binding.tensor = batch_idx
 
         if isinstance(token_inputs, Tensor):
             embeds = text_encoder(token_inputs.view(-1, 1), self.model.text)
@@ -1005,6 +1009,7 @@ class MoondreamRuntime:
             full_batch_size=graph_batch_size,
             use_graph=True,
         )
+        self._batch_binding.tensor = workspace.batch_idx_buffer[:graph_batch_size]
         self._flashinfer_ctx.plan(
             metadata,
             num_q_heads=self.config.text.n_heads,
@@ -1015,6 +1020,7 @@ class MoondreamRuntime:
 
         graph = self._cuda_graphs[graph_batch_size]
         graph.replay()
+        self._batch_binding.tensor = batch_idx
         logits = workspace.output_buffer[:batch_size]
         hidden = workspace.hidden_buffer[:batch_size].unsqueeze(1)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
