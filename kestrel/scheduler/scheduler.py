@@ -216,9 +216,10 @@ class GenerationScheduler:
         logits = self.runtime.decode_batch([seq.state for seq in active], token_input)
 
         sampled_tokens = self._sample_batch(logits, [seq.request for seq in active])
-        sampled_cpu = sampled_tokens.cpu().tolist()
+        sampled_cpu = sampled_tokens.to(device="cpu")
+        sampled_np = sampled_cpu.numpy().reshape(-1)
 
-        for seq, row, token_value in zip(active, logits, sampled_cpu):
+        for seq, token_value in zip(active, sampled_np):
             seq.state.advance()
             seq.stage_token(self.runtime, int(token_value))
             if not self._mark_finished_if_needed(seq):
