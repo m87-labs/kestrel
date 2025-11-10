@@ -160,7 +160,14 @@ class _LayerPagedCache(torch.nn.Module):
             device=self.cache.k_cache.device, dtype=torch.int64
         )
 
-    def update(self, pos_ids: Tensor, k_val: Tensor, v_val: Tensor):
+    def update(
+        self,
+        pos_ids: Tensor,
+        k_val: Tensor,
+        v_val: Tensor,
+        *,
+        slot_mapping: Tensor,
+    ):
         if self._batch_idx_tensor is None:
             raise RuntimeError("Paged cache must be bound before update calls")
 
@@ -197,6 +204,7 @@ class _LayerPagedCache(torch.nn.Module):
             k_val=k_val,
             v_val=v_val,
             batch_idx=batch_idx_arg,
+            slot_mapping=slot_mapping,
         )
 
 
@@ -357,6 +365,7 @@ class MoondreamRuntime:
             page_size=self.page_size,
         )
         self._active_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None
+        self._active_prefill_batch_idx: Optional[Tensor] = None
 
         self._graph_workspace: _GraphWorkspace | None = None
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -667,10 +676,12 @@ class MoondreamRuntime:
             custom_mask=custom_mask,
         )
         self._active_prefill_metadata = prefill_metadata
+        self._active_prefill_batch_idx = batch_tensor
         try:
             hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
         finally:
             self._active_prefill_metadata = None
+            self._active_prefill_batch_idx = None
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
@@ -706,6 +717,12 @@ class MoondreamRuntime:
     ) -> tuple[Tensor, Tensor]:
         prefill_metadata = self._active_prefill_metadata
         use_flashinfer_prefill = prefill_metadata is not None
+        batch_idx = self._active_prefill_batch_idx
+        if batch_idx is None:
+            raise RuntimeError("Prefill batch index missing during warmup")
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=batch_idx, positions=position_ids
+        )
 
         hidden = text_decoder(
             inputs_embeds,
@@ -713,6 +730,7 @@ class MoondreamRuntime:
             attn_mask,
             position_ids,
             self.config.text,
+            slot_mapping=slot_mapping,
             mode="prefill",
             flashinfer_prefill_ctx=(
                 self._flashinfer_prefill_ctx if use_flashinfer_prefill else None
@@ -924,6 +942,9 @@ class MoondreamRuntime:
         else:
             embeds = self._embed_token_batch(token_inputs)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=batch_idx.view(-1, 1), positions=position_ids
+        )
 
         metadata = flashinfer_metadata
         if metadata is None:
@@ -953,6 +974,7 @@ class MoondreamRuntime:
             use_flashinfer=True,
             use_graph=use_graph,
             mode="decode",
+            slot_mapping=slot_mapping,
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
