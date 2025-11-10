@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import queue
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -36,7 +38,6 @@ from typing import (
     AsyncIterator,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     Optional,
@@ -67,6 +68,7 @@ from kestrel.skills import (
     QuerySkill,
     SkillRegistry,
     SkillSpec,
+    SkillState,
 )
 from kestrel.moondream.runtime import Token
 from kestrel.skills.caption import CaptionRequest, CaptionSettings
@@ -191,6 +193,9 @@ class InferenceEngine:
 
         self._runtime: Optional[MoondreamRuntime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
+        self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
+        self._scheduler_event = threading.Event()
+        self._scheduler_thread: Optional[threading.Thread] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._request_ids = itertools.count()
         self._shutdown = False
@@ -248,6 +253,13 @@ class InferenceEngine:
         self._image_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="kestrel-img"
         )
+        if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
+            self._scheduler_thread = threading.Thread(
+                target=self._scheduler_loop,
+                name="kestrel-scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
         self._worker_task = asyncio.create_task(self._worker_loop())
 
     def _warmup(self) -> None:
@@ -287,6 +299,10 @@ class InferenceEngine:
         if self._worker_task is not None:
             await self._worker_task
         self._worker_task = None
+        if self._scheduler_thread is not None:
+            self._scheduler_event.set()
+            self._scheduler_thread.join()
+            self._scheduler_thread = None
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
             self._image_executor = None
@@ -666,89 +682,22 @@ class InferenceEngine:
             await self._initialize()
 
     async def _worker_loop(self) -> None:
-        assert self._runtime is not None
-        max_batch = self._runtime.max_batch_size
-        loop = asyncio.get_running_loop()
+        shutdown_error = RuntimeError("Engine shut down")
 
         while True:
-            batch: List[_PendingRequest] = []
-
             request = await self._queue.get()
             if request is None:
+                self._scheduler_queue.put(None)
+                self._scheduler_event.set()
                 break
-            batch.append(request)
+            self._scheduler_queue.put(request)
+            self._scheduler_event.set()
 
-            timeout = self._batch_timeout_s
-            while len(batch) < max_batch:
-                try:
-                    req = await asyncio.wait_for(self._queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
-                if req is None:
-                    # Drain existing work before stopping.
-                    self._shutdown = True
-                    break
-                batch.append(req)
-            if not batch:
-                continue
-
-            try:
-                results, failures = await loop.run_in_executor(
-                    None, self._run_batch, batch
-                )
-            except Exception as exc:
-                _LOGGER.exception("Batch execution failed", exc_info=exc)
-                for req in batch:
-                    self._fail_request(req, exc)
-                self._release_active_sequences()
-                continue
-
-            for req in batch:
-                failure = failures.get(req.request_id)
-                if failure is not None:
-                    self._fail_request(req, failure)
-                    continue
-                future = req.future
-                try:
-                    result = results[req.request_id]
-                except KeyError:
-                    error = RuntimeError(
-                        f"Request {req.request_id} missing from scheduler results"
-                    )
-                    self._fail_request(req, error)
-                    continue
-                sched_metrics = result.metrics
-                prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
-                decode_time_ms = max(sched_metrics.decode_time_ms, 0.0)
-                ttft_ms = max(sched_metrics.ttft_ms, 0.0)
-                metrics = EngineMetrics(
-                    input_tokens=sched_metrics.prompt_tokens,
-                    output_tokens=sched_metrics.decode_tokens,
-                    prefill_time_ms=prefill_time_ms,
-                    decode_time_ms=decode_time_ms,
-                    ttft_ms=ttft_ms,
-                )
-                engine_result = EngineResult(
-                    request_id=req.request_id,
-                    tokens=result.tokens,
-                    finish_reason=result.finish_reason,
-                    metrics=metrics,
-                    output=result.output,
-                )
-                if not future.done():
-                    loop.call_soon_threadsafe(future.set_result, engine_result)
-                self._complete_stream(req, result=engine_result)
-
-            if self._shutdown:
-                break
-
-        # Cancel any pending futures in the queue.
         while not self._queue.empty():
             pending = self._queue.get_nowait()
-            if pending and pending.future and not pending.future.done():
-                error = RuntimeError("Engine shut down")
-                loop.call_soon_threadsafe(pending.future.set_exception, error)
-                self._complete_stream(pending, error=error)
+            if pending is None:
+                continue
+            self._fail_request(pending, shutdown_error)
 
     def _normalize_temperature(self, value: Optional[float]) -> float:
         if value is None:
@@ -831,83 +780,274 @@ class InferenceEngine:
             return request_context.length
         return str(request_context)
 
-    def _run_batch(
-        self, batch: Iterable[_PendingRequest]
-    ) -> Tuple[dict[int, SchedulerResult], Dict[int, BaseException]]:
-        batch_list = list(batch)
-        failures: Dict[int, BaseException] = {}
-        image_crops: dict[int, OverlapCropOutput] = {}
-        if self._image_executor is not None:
-            futures: List[tuple[int, Future[OverlapCropOutput]]] = []
-            vision_config = self.runtime.config.vision
-            for req in batch_list:
-                if req.image is None:
-                    continue
-                try:
-                    future = self._image_executor.submit(
-                        compute_overlap_crops, req.image, vision_config
-                    )
-                except Exception as exc:
-                    failures[req.request_id] = exc
-                    continue
-                futures.append((req.request_id, future))
-            for req_id, future in futures:
-                if req_id in failures:
-                    continue
-                try:
-                    image_crops[req_id] = future.result()
-                except Exception as exc:
-                    failures[req_id] = exc
+    def _scheduler_loop(self) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            return
 
         scheduler = GenerationScheduler(
-            self.runtime,
+            runtime,
             default_temperature=self._default_temperature,
             default_top_p=self._default_top_p,
             skill_registry=self._skills,
         )
-        runtime = self.runtime
-        for req in batch_list:
-            if req.request_id in failures:
-                continue
+
+        pending_crops: Dict[int, tuple[_PendingRequest, Future[OverlapCropOutput]]] = {}
+        ready_crops: queue.Queue[int] = queue.Queue()
+        active_requests: Dict[int, _PendingRequest] = {}
+        shutdown_requested = False
+        idle_timeout = max(self._batch_timeout_s, 0.0)
+        max_batch = max(1, runtime.max_batch_size)
+        wake_event = self._scheduler_event
+
+        def admit_request(
+            req: _PendingRequest, crops: Optional[OverlapCropOutput]
+        ) -> None:
             try:
-                prompt_tokens = req.prompt_tokens.clone()
-                stream_cb = self._build_stream_callback(req)
-                crops = image_crops.get(req.request_id)
-                image_length = (
-                    runtime.image_prefix_length
-                    if (req.image is not None or crops is not None)
-                    else 0
-                )
-                adapter = self._extract_adapter(req.request_context)
-                request_obj = GenerationRequest(
-                    request_id=req.request_id,
-                    prompt=req.prompt,
-                    prompt_tokens=prompt_tokens,
-                    max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    stream_callback=stream_cb,
-                    image=req.image,
-                    image_crops=crops,
-                    image_length=image_length,
-                    submitted_at=req.submitted_at,
-                    skill=req.skill,
-                    request_context=req.request_context,
-                    adapter=adapter,
-                )
-                skill_state = req.skill.create_state(
-                    runtime,
-                    request_obj,
-                    request_context=request_obj.request_context,
+                generation_req, skill_state = self._build_generation_request(
+                    runtime, req, crops
                 )
             except Exception as exc:
-                failures[req.request_id] = exc
-                continue
-            scheduler.enqueue_request(request_obj, skill_state)
+                self._fail_request(req, exc)
+                return
+            scheduler.enqueue_request(generation_req, skill_state)
+            active_requests[req.request_id] = req
 
-        results = scheduler.run() if scheduler.waiting or scheduler.running else []
-        results_map = {result.request_id: result for result in results}
-        return results_map, failures
+        def handle_incoming(req: _PendingRequest) -> None:
+            if req.image is None:
+                admit_request(req, None)
+                return
+            executor = self._image_executor
+            if executor is None:
+                try:
+                    crops = compute_overlap_crops(req.image, runtime.config.vision)
+                except Exception as exc:
+                    self._fail_request(req, exc)
+                    return
+                admit_request(req, crops)
+                return
+            try:
+                future = executor.submit(
+                    compute_overlap_crops, req.image, runtime.config.vision
+                )
+            except Exception as exc:
+                self._fail_request(req, exc)
+                return
+            req_id = req.request_id
+            pending_crops[req_id] = (req, future)
+
+            def _on_crops_ready(fut: Future[OverlapCropOutput], rid: int = req_id) -> None:
+                ready_crops.put(rid)
+                wake_event.set()
+
+            future.add_done_callback(_on_crops_ready)
+
+        def gather_idle_requests(flag: bool) -> tuple[list[_PendingRequest], bool]:
+            requests: list[_PendingRequest] = []
+            item = self._scheduler_queue.get()
+            if item is None:
+                return requests, True
+            requests.append(item)
+            if idle_timeout <= 0:
+                return requests, flag
+            deadline = time.perf_counter() + idle_timeout
+            while len(requests) < max_batch:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._scheduler_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is None:
+                    flag = True
+                    continue
+                requests.append(item)
+            return requests, flag
+
+        def drain_nowait(flag: bool) -> bool:
+            while True:
+                try:
+                    item = self._scheduler_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    flag = True
+                    continue
+                handle_incoming(item)
+            return flag
+
+        def promote_crops() -> bool:
+            promoted = False
+            while True:
+                try:
+                    rid = ready_crops.get_nowait()
+                except queue.Empty:
+                    break
+                req_fut = pending_crops.pop(rid, None)
+                if req_fut is None:
+                    continue
+                req, fut = req_fut
+                try:
+                    crops = fut.result()
+                except Exception as exc:
+                    self._fail_request(req, exc)
+                    continue
+                admit_request(req, crops)
+                promoted = True
+            return promoted
+
+        def deliver_results(results: List[SchedulerResult]) -> None:
+            if not results:
+                return
+            loop = self._loop
+            assert loop is not None
+            for result in results:
+                req = active_requests.pop(result.request_id, None)
+                if req is None:
+                    _LOGGER.error(
+                        "Scheduler produced unknown request_id %s",
+                        result.request_id,
+                    )
+                    continue
+                engine_result = self._to_engine_result(result)
+                future = req.future
+                if future and not future.done():
+                    loop.call_soon_threadsafe(future.set_result, engine_result)
+                self._complete_stream(req, result=engine_result)
+
+        try:
+            while True:
+                if not scheduler.has_pending_work() and not pending_crops:
+                    if shutdown_requested:
+                        break
+                    batch, shutdown_requested = gather_idle_requests(shutdown_requested)
+                    if not batch:
+                        if shutdown_requested:
+                            break
+                        continue
+                    for req in batch:
+                        handle_incoming(req)
+                    continue
+
+                shutdown_requested = drain_nowait(shutdown_requested)
+                progressed = promote_crops()
+
+                try:
+                    if scheduler.has_pending_work():
+                        progressed = scheduler.advance() or progressed
+                except Exception as exc:
+                    _LOGGER.exception("Scheduler advance failed", exc_info=exc)
+                    self._fail_all_pending(active_requests, pending_crops, exc)
+                    self._release_active_sequences()
+                    return
+
+                results = scheduler.pop_completed()
+                if results:
+                    deliver_results(results)
+                    progressed = True
+
+                if (
+                    shutdown_requested
+                    and not scheduler.has_pending_work()
+                    and not pending_crops
+                    and not active_requests
+                ):
+                    break
+
+                if not progressed:
+                    wake_event.wait()
+                    wake_event.clear()
+        finally:
+            while True:
+                try:
+                    ready_crops.get_nowait()
+                except queue.Empty:
+                    break
+            self._fail_all_pending(active_requests, pending_crops)
+
+    def _build_generation_request(
+        self,
+        runtime: MoondreamRuntime,
+        req: _PendingRequest,
+        image_crops: Optional[OverlapCropOutput],
+    ) -> tuple[GenerationRequest, SkillState]:
+        prompt_tokens = req.prompt_tokens
+        stream_cb = self._build_stream_callback(req)
+        image_length = (
+            runtime.image_prefix_length
+            if (req.image is not None or image_crops is not None)
+            else 0
+        )
+        adapter = self._extract_adapter(req.request_context)
+        request_obj = GenerationRequest(
+            request_id=req.request_id,
+            prompt=req.prompt,
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            stream_callback=stream_cb,
+            image=req.image,
+            image_crops=image_crops,
+            image_length=image_length,
+            submitted_at=req.submitted_at,
+            skill=req.skill,
+            request_context=req.request_context,
+            adapter=adapter,
+        )
+        skill_state = req.skill.create_state(
+            runtime,
+            request_obj,
+            request_context=request_obj.request_context,
+        )
+        return request_obj, skill_state
+
+    def _to_engine_result(self, result: SchedulerResult) -> EngineResult:
+        sched_metrics = result.metrics
+        prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
+        decode_time_ms = max(sched_metrics.decode_time_ms, 0.0)
+        ttft_ms = max(sched_metrics.ttft_ms, 0.0)
+        metrics = EngineMetrics(
+            input_tokens=sched_metrics.prompt_tokens,
+            output_tokens=sched_metrics.decode_tokens,
+            prefill_time_ms=prefill_time_ms,
+            decode_time_ms=decode_time_ms,
+            ttft_ms=ttft_ms,
+        )
+        return EngineResult(
+            request_id=result.request_id,
+            tokens=result.tokens,
+            finish_reason=result.finish_reason,
+            metrics=metrics,
+            output=result.output,
+        )
+
+    def _fail_all_pending(
+        self,
+        active_requests: Dict[int, _PendingRequest],
+        pending_crops: Dict[int, tuple[_PendingRequest, Future[OverlapCropOutput]]],
+        error: Optional[BaseException] = None,
+    ) -> None:
+        exc = error or RuntimeError("Engine shut down")
+        if active_requests:
+            for req in list(active_requests.values()):
+                self._fail_request(req, exc)
+            active_requests.clear()
+        if pending_crops:
+            for req, future in list(pending_crops.values()):
+                if future and not future.done():
+                    future.cancel()
+                self._fail_request(req, exc)
+            pending_crops.clear()
+        while True:
+            try:
+                pending = self._scheduler_queue.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                continue
+            self._fail_request(pending, exc)
 
 
 __all__ = ["InferenceEngine", "EngineResult", "EngineMetrics", "EngineStream"]
