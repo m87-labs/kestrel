@@ -1,6 +1,15 @@
+from __future__ import annotations
+
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+
+from kestrel.ops.reshape_and_cache import reshape_and_cache_hnd
+
+from kestrel.utils import CpuGpuBuffer
 
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
@@ -30,6 +39,7 @@ class PagedKVCache(torch.nn.Module):
 
         self.page_table = page_table
         self.quantized = dtype == torch.float8_e4m3fn
+        self._kv_cache_dtype = "fp8_e4m3" if self.quantized else "auto"
         if self.quantized:
             if k_scale is None or v_scale is None:
                 raise ValueError("FP8 KV cache requires per-layer k/v scales")
@@ -45,6 +55,12 @@ class PagedKVCache(torch.nn.Module):
                 "v_inv_scale_tensor",
                 torch.tensor(self._v_inv_scale, dtype=torch.float32),
             )
+            self.register_buffer(
+                "k_scale_tensor", torch.tensor(self.k_scale, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "v_scale_tensor", torch.tensor(self.v_scale, dtype=torch.float32)
+            )
         else:
             self.k_scale = None
             self.v_scale = None
@@ -55,6 +71,12 @@ class PagedKVCache(torch.nn.Module):
             )
             self.register_buffer(
                 "v_inv_scale_tensor", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "k_scale_tensor", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "v_scale_tensor", torch.tensor(1.0, dtype=torch.float32)
             )
 
     def _prepare_key_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -112,19 +134,26 @@ class PagedKVCache(torch.nn.Module):
         )
 
         flat = page_idx.numel()
-        n_heads = k_view.shape[1]
+        if flat == 0:
+            return k_val, v_val
         if flat != slot_idx.numel() or flat != k_view.shape[0]:
             raise RuntimeError(
                 "PagedKVCache.update shape mismatch for flattened indices"
             )
-        head_idx = torch.arange(n_heads, device=page_idx.device)
 
-        page_ix = page_idx.view(-1, 1).expand(flat, n_heads)
-        head_ix = head_idx.view(1, -1).expand(flat, n_heads)
-        slot_ix = slot_idx.view(-1, 1).expand(flat, n_heads)
+        slot_mapping = page_idx * page_size + slot_idx
+        slot_mapping = slot_mapping.to(dtype=torch.int32).contiguous()
 
-        self.k_cache[page_ix, head_ix, slot_ix, :] = k_view
-        self.v_cache[page_ix, head_ix, slot_ix, :] = v_view
+        reshape_and_cache_hnd(
+            k_view,
+            v_view,
+            self.k_cache,
+            self.v_cache,
+            slot_mapping,
+            self._kv_cache_dtype,
+            self.k_scale_tensor,
+            self.v_scale_tensor,
+        )
 
         return k_val, v_val
 
@@ -153,10 +182,19 @@ class PageTable:
         self.device = device
 
         # page table: [logical_batch_idx, logical_block_idx] -> physical_page_idx
-        self.page_table = -torch.ones(
-            (max_batch_size, self.n_pages), dtype=torch.int64, device=device
+        self._page_table_buffer = CpuGpuBuffer(
+            max_batch_size,
+            self.n_pages,
+            dtype=torch.int64,
+            device=torch.device(device),
+            pin_memory=True,
         )
-        self.page_table[0, :] = 0  # keep page 0 reserved for internal bookkeeping
+        self.page_table = self._page_table_buffer.gpu
+        self._page_table_cpu_tensor = self._page_table_buffer.cpu
+        self._page_table_cpu_tensor.fill_(-1)
+        self._sync_full_page_table()
+        self._page_table_cpu_tensor[0, :].fill_(0)  # reserve row 0 for bookkeeping
+        self._sync_page_table_row(0)
         self.page_table_cpu = [[] for _ in range(max_batch_size)]
 
         self.capacity = [
@@ -190,7 +228,8 @@ class PageTable:
 
         self.capacity[batch_idx] = 0
         self.physical_to_logical[batch_idx, :] = -1
-        self.page_table[batch_idx, :] = -1
+        self._page_table_cpu_tensor[batch_idx, :].fill_(-1)
+        self._sync_page_table_row(batch_idx)
         return batch_idx
 
     @property
@@ -240,11 +279,17 @@ class PageTable:
 
         # find empty physical pages
         allocated_pages_list = self.free_pages[-num_pages_to_allocate:]
-        allocated_pages = torch.tensor(allocated_pages_list, device=self.device)
-        # update page table
-        self.page_table[batch_idx, start_page_idx:end_page_idx] = allocated_pages
+        allocated_pages_cpu = torch.as_tensor(
+            allocated_pages_list, dtype=torch.int64
+        )
+        # update page table on host first, then sync the touched slice once
+        self._page_table_cpu_tensor[
+            batch_idx_int, start_page_idx:end_page_idx
+        ] = allocated_pages_cpu
+        self._sync_page_table_row(batch_idx_int, start_page_idx, end_page_idx)
 
         # update metadata
+        allocated_pages = allocated_pages_cpu.to(device=self.device)
         self.physical_to_logical[batch_idx, allocated_pages] = torch.arange(
             start_page_idx,
             end_page_idx,
@@ -362,6 +407,20 @@ class PageTable:
             BLOCK_SIZE=128,
         )
         return out_kv_indices[:total_pages]
+
+    def _sync_page_table_row(
+        self, batch_idx: int, start: int = 0, end: Optional[int] = None
+    ) -> None:
+        if end is None:
+            end = self.n_pages
+        if start >= end:
+            return
+        gpu_slice = self.page_table[batch_idx, start:end]
+        cpu_slice = self._page_table_cpu_tensor[batch_idx, start:end]
+        gpu_slice.copy_(cpu_slice, non_blocking=True)
+
+    def _sync_full_page_table(self) -> None:
+        self._page_table_buffer.copy_to_gpu()
 
 
 @triton.jit
