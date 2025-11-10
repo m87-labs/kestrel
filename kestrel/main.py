@@ -69,12 +69,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_runtime_args(schedule)
     schedule.add_argument("--max-new-tokens", type=int, default=768, help="Tokens to sample per request")
     schedule.add_argument(
-        "--batch-timeout-ms",
-        type=float,
-        default=20.0,
-        help="Maximum idle wait (ms) to coalesce requests before starting a new batch",
-    )
-    schedule.add_argument(
         "--temperature",
         type=float,
         default=0.2,
@@ -94,12 +88,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser("serve", help="Run the HTTP inference server")
     _add_runtime_args(serve)
-    serve.add_argument(
-        "--batch-timeout-ms",
-        type=float,
-        default=20.0,
-        help="Maximum idle wait (ms) to coalesce requests before starting a new batch",
-    )
     serve.add_argument(
         "--default-max-new-tokens",
         type=int,
@@ -156,10 +144,7 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
 
     runtime_cfg = _create_runtime_config(args)
 
-    engine = await InferenceEngine.create(
-        runtime_cfg,
-        batch_timeout_s=args.batch_timeout_ms / 1000.0,
-    )
+    engine = await InferenceEngine.create(runtime_cfg)
     try:
         query_settings = {
             "temperature": args.temperature,
@@ -242,7 +227,6 @@ def _handle_serve(args: argparse.Namespace) -> None:
         raise SystemExit("port must be between 1 and 65535")
 
     runtime_cfg = _create_runtime_config(args)
-    batch_timeout = args.batch_timeout_ms / 1000.0
 
     try:
         import uvicorn
@@ -259,7 +243,6 @@ def _handle_serve(args: argparse.Namespace) -> None:
     app_factory = partial(
         create_app,
         runtime_cfg=runtime_cfg,
-        batch_timeout_s=batch_timeout,
         default_max_new_tokens=args.default_max_new_tokens,
         default_temperature=args.default_temperature,
         default_top_p=args.default_top_p,

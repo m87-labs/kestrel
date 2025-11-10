@@ -185,11 +185,9 @@ class InferenceEngine:
         self,
         runtime_cfg: RuntimeConfig,
         *,
-        batch_timeout_s: float = 0.02,
         skills: Optional[SkillRegistry] = None,
     ) -> None:
         self._runtime_cfg = runtime_cfg
-        self._batch_timeout_s = batch_timeout_s
 
         self._runtime: Optional[MoondreamRuntime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
@@ -231,10 +229,9 @@ class InferenceEngine:
         cls,
         runtime_cfg: RuntimeConfig,
         *,
-        batch_timeout_s: float = 0.02,
         skills: Optional[SkillRegistry] = None,
     ) -> "InferenceEngine":
-        engine = cls(runtime_cfg, batch_timeout_s=batch_timeout_s, skills=skills)
+        engine = cls(runtime_cfg, skills=skills)
         await engine._initialize()
         return engine
 
@@ -796,8 +793,6 @@ class InferenceEngine:
         ready_crops: queue.Queue[int] = queue.Queue()
         active_requests: Dict[int, _PendingRequest] = {}
         shutdown_requested = False
-        idle_timeout = max(self._batch_timeout_s, 0.0)
-        max_batch = max(1, runtime.max_batch_size)
         wake_event = self._scheduler_event
 
         def admit_request(
@@ -842,41 +837,6 @@ class InferenceEngine:
 
             future.add_done_callback(_on_crops_ready)
 
-        def gather_idle_requests(flag: bool) -> tuple[list[_PendingRequest], bool]:
-            requests: list[_PendingRequest] = []
-            item = self._scheduler_queue.get()
-            if item is None:
-                return requests, True
-            requests.append(item)
-            if idle_timeout <= 0:
-                return requests, flag
-            deadline = time.perf_counter() + idle_timeout
-            while len(requests) < max_batch:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    break
-                try:
-                    item = self._scheduler_queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if item is None:
-                    flag = True
-                    continue
-                requests.append(item)
-            return requests, flag
-
-        def drain_nowait(flag: bool) -> bool:
-            while True:
-                try:
-                    item = self._scheduler_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item is None:
-                    flag = True
-                    continue
-                handle_incoming(item)
-            return flag
-
         def promote_crops() -> bool:
             promoted = False
             while True:
@@ -917,47 +877,50 @@ class InferenceEngine:
                 self._complete_stream(req, result=engine_result)
 
         try:
-            while True:
-                if not scheduler.has_pending_work() and not pending_crops:
-                    if shutdown_requested:
+            with torch.inference_mode():
+                while True:
+                    progressed = False
+                    while True:
+                        try:
+                            item = self._scheduler_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            shutdown_requested = True
+                            continue
+                        handle_incoming(item)
+                        progressed = True
+
+                    if promote_crops():
+                        progressed = True
+
+                    try:
+                        if scheduler.has_pending_work():
+                            progressed = scheduler.advance() or progressed
+                    except Exception as exc:
+                        _LOGGER.exception("Scheduler advance failed", exc_info=exc)
+                        self._fail_all_pending(active_requests, pending_crops, exc)
+                        self._release_active_sequences()
+                        return
+
+                    results = scheduler.pop_completed()
+                    if results:
+                        deliver_results(results)
+                        progressed = True
+
+                    if (
+                        shutdown_requested
+                        and not scheduler.has_pending_work()
+                        and not pending_crops
+                        and not active_requests
+                    ):
                         break
-                    batch, shutdown_requested = gather_idle_requests(shutdown_requested)
-                    if not batch:
+
+                    if not progressed:
                         if shutdown_requested:
                             break
-                        continue
-                    for req in batch:
-                        handle_incoming(req)
-                    continue
-
-                shutdown_requested = drain_nowait(shutdown_requested)
-                progressed = promote_crops()
-
-                try:
-                    if scheduler.has_pending_work():
-                        progressed = scheduler.advance() or progressed
-                except Exception as exc:
-                    _LOGGER.exception("Scheduler advance failed", exc_info=exc)
-                    self._fail_all_pending(active_requests, pending_crops, exc)
-                    self._release_active_sequences()
-                    return
-
-                results = scheduler.pop_completed()
-                if results:
-                    deliver_results(results)
-                    progressed = True
-
-                if (
-                    shutdown_requested
-                    and not scheduler.has_pending_work()
-                    and not pending_crops
-                    and not active_requests
-                ):
-                    break
-
-                if not progressed:
-                    wake_event.wait()
-                    wake_event.clear()
+                        wake_event.wait()
+                        wake_event.clear()
         finally:
             while True:
                 try:

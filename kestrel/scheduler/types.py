@@ -157,3 +157,4 @@ class RequestMetrics:
     prefill_time_ms: float
     ttft_ms: float
     decode_time_ms: float
+

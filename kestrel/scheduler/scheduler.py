@@ -71,6 +71,7 @@ class GenerationScheduler:
 
         return len(self.waiting) > 0 or len(self.running) > 0
 
+    @torch.inference_mode()
     def advance(self) -> bool:
         """Attempt to make progress by running prefill/decode once.
 

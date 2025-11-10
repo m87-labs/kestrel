@@ -615,31 +615,27 @@ def print_results(results: Dict[str, Any]) -> None:
         )
         total_prefill_s = total_prefill_ms / 1000.0
         total_decode_s = total_decode_ms / 1000.0
-        avg_prefill = (
+        effective_prefill = (
             total_input_tokens / total_prefill_s if total_prefill_s > 0 else 0.0
         )
-        avg_decode = (
+        effective_decode = (
             total_output_tokens / total_decode_s if total_decode_s > 0 else 0.0
         )
 
         wall_time_s = results.get("wall_time_s", 0.0) or 0.0
-        actual_prefill = (
-            total_input_tokens / wall_time_s if wall_time_s > 0 else 0.0
-        )
-        actual_decode = (
-            total_output_tokens / wall_time_s if wall_time_s > 0 else 0.0
-        )
 
         print(f"Avg Input Tokens / Request: {avg_input_tokens:.2f}")
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
-        print(f"Average Prefill Throughput (per request): {avg_prefill:.2f} tok/s")
-        print(f"Average Decode Throughput (per request): {avg_decode:.2f} tok/s")
+        print(
+            f"Effective Prefill Throughput (per request): {effective_prefill:.2f} tok/s"
+        )
+        print(
+            f"Effective Decode Throughput (per request): {effective_decode:.2f} tok/s"
+        )
         if wall_time_s > 0.0:
+            wall_decode = total_output_tokens / wall_time_s
             print(
-                f"Actual Aggregate Prefill Throughput: {actual_prefill:.2f} tok/s"
-            )
-            print(
-                f"Actual Aggregate Decode Throughput: {actual_decode:.2f} tok/s"
+                f"Overall Decode Throughput (wall clock): {wall_decode:.2f} tok/s"
             )
 
 
