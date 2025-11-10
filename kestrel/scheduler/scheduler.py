@@ -71,7 +71,6 @@ class GenerationScheduler:
 
         return len(self.waiting) > 0 or len(self.running) > 0
 
-    @torch.inference_mode()
     def advance(self) -> bool:
         """Attempt to make progress by running prefill/decode once.
 
@@ -103,14 +102,6 @@ class GenerationScheduler:
         items = list(self._completed)
         self._completed.clear()
         return items
-
-    def run(self) -> List[SchedulerResult]:
-        """Compatibility helper for legacy batch-style execution."""
-
-        while self.has_pending_work():
-            if not self.advance():
-                break
-        return self.pop_completed()
 
     # ------------------------------------------------------------------
     # Internal helpers
