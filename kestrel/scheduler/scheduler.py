@@ -47,6 +47,10 @@ class GenerationScheduler:
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
+        self._pinned_token_buffer = torch.empty(
+            runtime.max_batch_size, dtype=torch.long, device="cpu"
+        ).pin_memory()
+        self._pinned_token_np = self._pinned_token_buffer.numpy()
 
     # ------------------------------------------------------------------
     # Submission
@@ -198,9 +202,9 @@ class GenerationScheduler:
                 all_text = False
 
         if all_text:
-            token_input: Tensor | Sequence[Token] = torch.tensor(
-                [token.token_id for token in pending_tokens], dtype=torch.long
-            )
+            count = len(pending_tokens)
+            self._pinned_token_np[:count] = [token.token_id for token in pending_tokens]
+            token_input = self._pinned_token_buffer[:count]
         else:
             token_input = pending_tokens
 
