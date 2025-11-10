@@ -46,7 +46,6 @@ def _sse_payload(data: Dict[str, Any]) -> str:
 @dataclass(slots=True)
 class _ServerConfig:
     runtime_cfg: RuntimeConfig
-    batch_timeout_s: float
     default_max_new_tokens: int
     default_temperature: float
     default_top_p: float
@@ -68,9 +67,7 @@ class _ServerState:
         if self.engine is not None:
             return
         logger.info("Starting inference engine")
-        self.engine = await InferenceEngine.create(
-            self.config.runtime_cfg, batch_timeout_s=self.config.batch_timeout_s
-        )
+        self.engine = await InferenceEngine.create(self.config.runtime_cfg)
         logger.info("Inference engine ready")
 
     async def shutdown(self) -> None:
@@ -508,7 +505,6 @@ class _ServerState:
 def create_app(
     runtime_cfg: RuntimeConfig,
     *,
-    batch_timeout_s: float = 0.02,
     default_max_new_tokens: int = 768,
     default_temperature: float = 0.2,
     default_top_p: float = 0.9,
@@ -524,7 +520,6 @@ def create_app(
 
     config = _ServerConfig(
         runtime_cfg=runtime_cfg,
-        batch_timeout_s=batch_timeout_s,
         default_max_new_tokens=default_max_new_tokens,
         default_temperature=default_temperature,
         default_top_p=default_top_p,
