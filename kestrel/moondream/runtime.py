@@ -519,28 +519,27 @@ class MoondreamRuntime:
         hidden_row = hidden.squeeze(0) if hidden.ndim == 2 else hidden
         hidden_batch = hidden_row.unsqueeze(0)
 
-        with torch.inference_mode():
-            if token_id == coord_id:
-                logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
-                bins = logits.shape[-1]
-                index = torch.argmax(logits).item()
-                denom = max(bins - 1, 1)
-                pos = float(min(max(index / denom, 0.0), 1.0))
-                return CoordToken(pos=pos)
+        if token_id == coord_id:
+            logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
+            bins = logits.shape[-1]
+            index = torch.argmax(logits).item()
+            denom = max(bins - 1, 1)
+            pos = float(min(max(index / denom, 0.0), 1.0))
+            return CoordToken(pos=pos)
 
-            if token_id == size_id:
-                logits = decode_size(hidden_batch, self.region)
-                width_logits = logits[0]
-                height_logits = logits[1]
-                bins = width_logits.shape[-1]
-                width_bin = torch.argmax(width_logits).item()
-                height_bin = torch.argmax(height_logits).item()
-                scale = float(bins - 1) if bins > 1 else 1.0
-                width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
-                height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
-                width = float(min(max(width, 0.0), 1.0))
-                height = float(min(max(height, 0.0), 1.0))
-                return SizeToken(width=width, height=height)
+        if token_id == size_id:
+            logits = decode_size(hidden_batch, self.region)
+            width_logits = logits[0]
+            height_logits = logits[1]
+            bins = width_logits.shape[-1]
+            width_bin = torch.argmax(width_logits).item()
+            height_bin = torch.argmax(height_logits).item()
+            scale = float(bins - 1) if bins > 1 else 1.0
+            width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
+            height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
+            width = float(min(max(width, 0.0), 1.0))
+            height = float(min(max(height, 0.0), 1.0))
+            return SizeToken(width=width, height=height)
 
         return TextToken(token_id=token_id)
 
