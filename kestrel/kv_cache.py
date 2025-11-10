@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 
-from kestrel.ops.reshape_and_cache import reshape_and_cache_hnd
+from vllm import _custom_ops as vllm_ops
 
 from kestrel.utils import CpuGpuBuffer
 
@@ -107,8 +107,8 @@ class PagedKVCache(torch.nn.Module):
             assert batch_idx.ndim == 2, "batch_idx must be 1D or 2D"
             batch_indices = batch_idx
 
-        k_store = self._prepare_key_tensor(k_val)
-        v_store = self._prepare_value_tensor(v_val)
+        k_store = k_val
+        v_store = v_val
 
         page_size = self.page_table.page_size
         logical_block_idx = input_pos // page_size
@@ -142,13 +142,19 @@ class PagedKVCache(torch.nn.Module):
             )
 
         slot_mapping = page_idx * page_size + slot_idx
-        slot_mapping = slot_mapping.to(dtype=torch.int32).contiguous()
+        slot_mapping = slot_mapping.to(dtype=torch.int64).contiguous()
 
-        reshape_and_cache_hnd(
+        key_cache = self.k_cache.permute(0, 2, 1, 3)
+        value_cache = self.v_cache.permute(0, 2, 1, 3)
+        if self._kv_cache_dtype.startswith("fp8"):
+            key_cache = key_cache.view(torch.uint8)
+            value_cache = value_cache.view(torch.uint8)
+
+        vllm_ops.reshape_and_cache_flash(
             k_view,
             v_view,
-            self.k_cache,
-            self.v_cache,
+            key_cache,
+            value_cache,
             slot_mapping,
             self._kv_cache_dtype,
             self.k_scale_tensor,
