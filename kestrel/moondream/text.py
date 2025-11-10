@@ -52,6 +52,8 @@ def attn(
         tuple[FlashInferPrefillContext, FlashInferPrefillBatchMetadata]
     ] = None,
     mode: Literal["prefill", "decode"] = "decode",
+    *,
+    slot_mapping: torch.Tensor,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -123,7 +125,7 @@ def attn(
         prefill_ctx, prefill_metadata = flashinfer_prefill_state
 
     if kv_cache is not None:
-        kv_result = kv_cache.update(position_ids, k, v)
+        kv_result = kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
     else:
         kv_result = (k, v)
 
@@ -189,6 +191,7 @@ def text_decoder(
     position_ids: torch.Tensor,
     config: TextConfig,
     *,
+    slot_mapping: torch.Tensor,
     flashinfer_ctx: Optional[FlashInferDecodeContext] = None,
     flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
     use_flashinfer: bool = False,
@@ -231,6 +234,7 @@ def text_decoder(
             flashinfer_state=flash_state,
             flashinfer_prefill_state=prefill_state,
             mode=mode,
+            slot_mapping=slot_mapping,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
