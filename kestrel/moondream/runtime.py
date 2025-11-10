@@ -669,7 +669,6 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # Core forward paths
 
-    @torch.inference_mode()
     def _prefill(
         self,
         inputs_embeds: Tensor,
@@ -704,12 +703,10 @@ class MoondreamRuntime:
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
 
-    @torch.inference_mode()
     def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
         self.decode_batch([state], token_id)
         state.advance()
 
-    @torch.inference_mode()
     def decode_batch(
         self,
         states: Sequence[SequenceState],

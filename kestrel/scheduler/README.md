@@ -21,12 +21,10 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 2. **Prefill** (`_try_prefill`): whenever capacity allows, the scheduler pops waiting requests, runs `runtime.start_sequence`, and primes the `SkillState` with the first sampled token.
 3. **Decode Loop** (`_decode_step`): batches active sequences, feeds pending tokens into `runtime.decode_batch`, stages new tokens on each `SkillState`, and re-queues sequences until they finish or hit limits.
 4. **Finalization** (`_finalize_sequence`): once a sequence ends, the scheduler releases runtime resources, asks the `SkillState` to `finalize`, and records a `SchedulerResult`.
-5. **Completion**: `run()` drains all work and returns the list of finished results to the engine.
 
 ## Internal API Summary
 
 - `GenerationScheduler.enqueue_request(request, skill_state)`: enqueue a fully prepared request/skill state duo. Used by the engine when it wants full control over state creation.
-- `GenerationScheduler.run() -> list[SchedulerResult]`: main driver; processes queues until no runnable work remains.
 - `GenerationScheduler.waiting` / `GenerationScheduler.running`: FIFO queues (`RequestQueue` / `RunningQueue`) tracking pending vs. active sequences.
 - `ScheduledSequence`: groups the runtime `SequenceState`, the user-facing `GenerationRequest`, and the `SkillState`. The scheduler only mutates decode bookkeeping on this container.
 - `GenerationRequest`: immutable request metadata plus the associated `skill_state`/`request_context` set during submission.
@@ -36,6 +34,6 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 
 - Always ensure `GenerationRequest.skill_state` is set before enqueuing; the scheduler assumes it is present when prefill begins.
 - Keep skill-specific behavior inside `SkillState.consume_step` and `SkillState.finalize` so the scheduler remains generic.
-- Batch sizing is governed by `MoondreamRuntime.max_batch_size` and KV-cache availability. If `run()` exits early with work still queued, the engine should investigate capacity issues.
+- Batch sizing is governed by `MoondreamRuntime.max_batch_size` and KV-cache availability.
 - Stream callbacks run on the engine's loop via `call_soon_threadsafe`; they should avoid long blocking operations.
 - Tokens staged on `SkillState`s are typed (`TextToken`, `CoordToken`, `SizeToken`). The scheduler asks the runtime to render sampled ids into these structures before handing them to skills, and the runtime re-embeds them (including region values) on the next decode step.
