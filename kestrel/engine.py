@@ -287,7 +287,12 @@ class InferenceEngine:
             )
             try:
                 next_token = torch.argmax(logits, dim=-1)
-                runtime.decode(state, next_token.view(-1))
+                token_input = (
+                    next_token.view(-1)
+                    .to(device="cpu", dtype=torch.long)
+                    .pin_memory()
+                )
+                runtime.decode(state, token_input)
             finally:
                 runtime.release_sequence(state)
 

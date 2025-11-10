@@ -360,6 +360,20 @@ class MoondreamRuntime:
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._graph_batch_sizes: list[int] = []
         self._graph_pool: object | None = None
+        self._host_batch_idx = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device="cpu"
+        ).pin_memory()
+        self._host_input_pos = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device="cpu"
+        ).pin_memory()
+        self._host_batch_idx_np = self._host_batch_idx.numpy()
+        self._host_input_pos_np = self._host_input_pos.numpy()
+        self._device_batch_idx = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=self.device
+        )
+        self._device_input_pos = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=self.device
+        )
 
         self._prefill_fn = self._prefill_impl
         if cfg.enable_compile:
@@ -715,16 +729,15 @@ class MoondreamRuntime:
         if not states:
             raise ValueError("states must not be empty")
 
-        batch_idx = torch.tensor(
-            [state.batch_idx for state in states],
-            device=self.device,
-            dtype=torch.int64,
-        )
-        input_pos = torch.tensor(
-            [state.length for state in states],
-            device=self.device,
-            dtype=torch.int32,
-        )
+        batch_size = len(states)
+        self._host_batch_idx_np[:batch_size] = [state.batch_idx for state in states]
+        self._host_input_pos_np[:batch_size] = [state.length for state in states]
+        host_batch_idx = self._host_batch_idx[:batch_size]
+        host_input_pos = self._host_input_pos[:batch_size]
+        batch_idx = self._device_batch_idx[:batch_size]
+        batch_idx.copy_(host_batch_idx, non_blocking=True)
+        input_pos = self._device_input_pos[:batch_size]
+        input_pos.copy_(host_input_pos, non_blocking=True)
 
         tokens_tensor: Optional[Tensor] = None
         token_seq: Optional[Sequence[Token]] = None
@@ -737,7 +750,10 @@ class MoondreamRuntime:
                 raise ValueError(
                     "token_ids and states must have matching batch dimensions"
                 )
-            tokens_tensor = tokens_tensor.to(device=self.device, dtype=torch.long)
+            tokens_tensor = tokens_tensor.pin_memory()
+            tokens_tensor = tokens_tensor.to(
+                device=self.device, dtype=torch.long, non_blocking=True
+            )
         else:
             token_seq = list(token_inputs)
             if len(token_seq) != len(states):
