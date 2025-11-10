@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from collections import deque
+from typing import Deque, List, Optional
 
 import time
 
@@ -39,7 +40,7 @@ class GenerationScheduler:
         self.runtime = runtime
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
         self.running: RunningQueue[ScheduledSequence] = RunningQueue()
-        self.completed: list[ScheduledSequence] = []
+        self._completed: Deque[SchedulerResult] = deque()
         self._next_request_id = 0
         self._default_temperature = max(float(default_temperature), 0.0)
         self._default_top_p = float(default_top_p)
@@ -65,27 +66,50 @@ class GenerationScheduler:
     # ------------------------------------------------------------------
     # Execution
 
+    def has_pending_work(self) -> bool:
+        """Return ``True`` if there is anything left to prefill or decode."""
+
+        return len(self.waiting) > 0 or len(self.running) > 0
+
+    def advance(self) -> bool:
+        """Attempt to make progress by running prefill/decode once.
+
+        Returns ``True`` if any state changed (e.g. tokens decoded, new
+        sequences admitted). Callers can keep invoking ``advance`` while it
+        returns ``True`` to drain ready work before sleeping.
+        """
+
+        progressed = False
+        progressed |= self._try_prefill()
+        progressed |= self._decode_step()
+
+        if not progressed:
+            stalled = self.waiting.peek()
+            if stalled is not None and not self.runtime.can_reserve(
+                stalled.target_length
+            ):
+                raise RuntimeError(
+                    "Scheduler stalled: insufficient KV cache capacity for request "
+                    f"{stalled.request_id} (needs {stalled.target_length} tokens)."
+                )
+        return progressed
+
+    def pop_completed(self) -> List[SchedulerResult]:
+        """Retrieve all completed results accumulated so far."""
+
+        if not self._completed:
+            return []
+        items = list(self._completed)
+        self._completed.clear()
+        return items
+
     def run(self) -> List[SchedulerResult]:
-        """Process queued requests until completion and return their outputs."""
+        """Compatibility helper for legacy batch-style execution."""
 
-        while len(self.waiting) or len(self.running):
-            progressed = False
-            progressed |= self._try_prefill()
-            progressed |= self._decode_step()
-
-            if not progressed:
-                stalled = self.waiting.peek()
-                if stalled is not None and not self.runtime.can_reserve(
-                    stalled.target_length
-                ):
-                    raise RuntimeError(
-                        "Scheduler stalled: insufficient KV cache capacity for request "
-                        f"{stalled.request_id} (needs {stalled.target_length} tokens)."
-                    )
-                # No work left that we can process right now.
+        while self.has_pending_work():
+            if not self.advance():
                 break
-
-        return [self._build_result(seq) for seq in self.completed]
+        return self.pop_completed()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -271,7 +295,7 @@ class GenerationScheduler:
             seq.first_token_time = seq.completed_at
         if seq.state.batch_idx in self.runtime.active_sequences:
             self.runtime.release_sequence(seq.state)
-        self.completed.append(seq)
+        self._completed.append(self._build_result(seq))
 
     def _resolve_temperature(self, temperature: Optional[float]) -> float:
         if temperature is None:

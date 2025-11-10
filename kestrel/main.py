@@ -72,7 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--batch-timeout-ms",
         type=float,
         default=20.0,
-        help="Micro-batching timeout (in milliseconds) before dispatching queued requests",
+        help="Maximum idle wait (ms) to coalesce requests before starting a new batch",
     )
     schedule.add_argument(
         "--temperature",
@@ -98,7 +98,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--batch-timeout-ms",
         type=float,
         default=20.0,
-        help="Micro-batching timeout (in milliseconds) before dispatching queued requests",
+        help="Maximum idle wait (ms) to coalesce requests before starting a new batch",
     )
     serve.add_argument(
         "--default-max-new-tokens",
