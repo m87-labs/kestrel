@@ -5,6 +5,7 @@ import contextlib
 import io
 import subprocess
 import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -463,6 +464,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         return row_idx, qa_idx, result_entry, is_correct, source == "human"
 
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
+    start_time = time.perf_counter()
     for row_idx, row in enumerate(rows):
         image = pil_to_pyvips(row["image"])
         for qa_idx, qa in enumerate(row["qa"]):
@@ -489,6 +491,8 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         progress.close()
         await engine.shutdown()
 
+    wall_time_s = max(time.perf_counter() - start_time, 0.0)
+
     results = [
         [entry for entry in chart_entries if entry is not None]
         for chart_entries in per_chart_results
@@ -512,6 +516,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "total_prefill_ms": total_prefill_ms,
             "total_decode_ms": total_decode_ms,
         },
+        "wall_time_s": wall_time_s,
     }
 
 
@@ -610,17 +615,32 @@ def print_results(results: Dict[str, Any]) -> None:
         )
         total_prefill_s = total_prefill_ms / 1000.0
         total_decode_s = total_decode_ms / 1000.0
-        aggregate_prefill = (
+        avg_prefill = (
             total_input_tokens / total_prefill_s if total_prefill_s > 0 else 0.0
         )
-        aggregate_decode = (
+        avg_decode = (
             total_output_tokens / total_decode_s if total_decode_s > 0 else 0.0
+        )
+
+        wall_time_s = results.get("wall_time_s", 0.0) or 0.0
+        actual_prefill = (
+            total_input_tokens / wall_time_s if wall_time_s > 0 else 0.0
+        )
+        actual_decode = (
+            total_output_tokens / wall_time_s if wall_time_s > 0 else 0.0
         )
 
         print(f"Avg Input Tokens / Request: {avg_input_tokens:.2f}")
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
-        print(f"Aggregate Prefill Throughput: {aggregate_prefill:.2f} tok/s")
-        print(f"Aggregate Decode Throughput: {aggregate_decode:.2f} tok/s")
+        print(f"Average Prefill Throughput (per request): {avg_prefill:.2f} tok/s")
+        print(f"Average Decode Throughput (per request): {avg_decode:.2f} tok/s")
+        if wall_time_s > 0.0:
+            print(
+                f"Actual Aggregate Prefill Throughput: {actual_prefill:.2f} tok/s"
+            )
+            print(
+                f"Actual Aggregate Decode Throughput: {actual_decode:.2f} tok/s"
+            )
 
 
 async def async_main() -> None:
