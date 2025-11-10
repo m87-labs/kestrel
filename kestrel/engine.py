@@ -281,12 +281,15 @@ class InferenceEngine:
                 "Warmup currently requires the default skill to be QuerySkill"
             )
         tokens = skill.build_prompt_tokens(runtime, warmup_request)
-        state, logits = runtime.start_sequence(prompt_tokens=tokens, max_new_tokens=1)
-        try:
-            next_token = torch.argmax(logits, dim=-1)
-            runtime.decode(state, next_token.view(-1))
-        finally:
-            runtime.release_sequence(state)
+        with torch.inference_mode():
+            state, logits = runtime.start_sequence(
+                prompt_tokens=tokens, max_new_tokens=1
+            )
+            try:
+                next_token = torch.argmax(logits, dim=-1)
+                runtime.decode(state, next_token.view(-1))
+            finally:
+                runtime.release_sequence(state)
 
     async def shutdown(self) -> None:
         if self._shutdown:
