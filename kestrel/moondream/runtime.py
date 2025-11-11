@@ -209,12 +209,23 @@ class MoondreamRuntime:
                 raw_config = json.load(fp)
         else:
             raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
+
+        text_section = raw_config.setdefault("text", {})
+        default_context = int(
+            text_section.get("max_context", DEFAULT_MOONDREAM_CONFIG["text"]["max_context"])
+        )
+        requested_context = cfg.max_seq_length
+        if requested_context is not None and requested_context != default_context:
+            text_section["max_context"] = int(requested_context)
+
         self.config = MoondreamConfig.from_dict(raw_config)
 
         self._kv_layer_k_scales: list[float] | None = None
         self._kv_layer_v_scales: list[float] | None = None
 
-        self.max_seq_length = cfg.max_seq_length or self.config.text.max_context
+        self.max_seq_length = int(
+            cfg.max_seq_length if cfg.max_seq_length is not None else self.config.text.max_context
+        )
         if self.max_seq_length % cfg.page_size != 0:
             raise ValueError("max_seq_length must be divisible by page_size")
 
