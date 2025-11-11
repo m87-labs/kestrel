@@ -117,6 +117,88 @@ assert "".join(chunks) == caption_result.output["caption"]
 - `uv run python -m kestrel.main serve` – launch the HTTP server (see usage examples below for full command).
 - `uv run python -m kestrel.main schedule ...` – push one-off prompts through the async engine for smoke testing or benchmarking.
 
+### Evaluation Scripts
+
+- `scripts/chartqa_eval.py` – Internal helper for running ChartQA accuracy checks against a local or remote GPU install.
+
+  ```bash
+  # Install optional evaluation dependencies (datasets, tqdm) into your uv environment
+  UV_PRERELEASE=allow uv sync --extra eval
+
+  # Run a short sanity sweep over 20 examples (requires a CUDA-capable host)
+  UV_PRERELEASE=allow uv run --extra eval \
+    python scripts/chartqa_eval.py \
+    --weights ~/code/moondream/model.pt \
+    --limit 20
+
+  # Omit --limit (or pass --limit -1) once you're ready to process the full ChartQA split
+  ```
+
+  The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
+
+### Profiling the Fused MoE Kernel
+
+The `scripts/profile_scattermoe.py` helper (name retained for compatibility) drives the Moondream fused MoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the Triton kernels.
+
+1. Sync the repository to the target GPU host (e.g. `./sync.sh p1`) and ensure `uv` is on the PATH.
+2. Collect a prefill profile with richer counters:
+
+   ```bash
+   sudo bash -lc '
+     cd /home/ubuntu/code/kestrel &&
+     /opt/nvidia/nsight-compute/2024.1.1/ncu \
+       --set default \
+       --section LaunchStats \
+       --section SpeedOfLight \
+       --section Occupancy \
+       --section SchedulerStats \
+       --section WarpStateStats \
+       --section SourceCounters \
+       --section MemoryWorkloadAnalysis \
+       --target-processes all \
+       --force-overwrite \
+       --metrics gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum \
+       --export /tmp/profile_scattermoe_prefill \
+       /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
+         --mode prefill \
+         --iterations 5 \
+         --warmup-iters 3 \
+         --nvtx
+   '
+   ```
+
+3. Collect the decode profile with deeper pipeline sections and expanded stall metrics:
+
+   ```bash
+   sudo bash -lc '
+     cd /home/ubuntu/code/kestrel &&
+     /opt/nvidia/nsight-compute/2024.1.1/ncu \
+        --set default \
+        --section LaunchStats \
+        --section SpeedOfLight \
+        --section Occupancy \
+        --section SchedulerStats \
+        --section WarpStateStats \
+        --section SourceCounters \
+        --section MemoryWorkloadAnalysis \
+        --target-processes all \
+        --force-overwrite \
+        --metrics \
+gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,smsp__warp_issue_stalled_long_scoreboard.sum,smsp__warp_issue_stalled_short_scoreboard.sum,smsp__warps_eligible_per_scheduler.avg,sm__pipe_fma_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,lts__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed \
+        --export /tmp/profile_scattermoe_decode \
+        /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
+        --mode decode \
+        --iterations 10 \
+        --warmup-iters 5 \
+        --refresh-routing \
+        --nvtx
+   '
+   ```
+
+The resulting `.ncu-rep` files can be opened locally via `ncu --import /tmp/profile_scattermoe_prefill.ncu-rep --page raw --csv` (or in the Nsight Compute GUI). Running under `sudo` sidesteps the performance-counter permission requirement; alternatively configure `NVreg_RestrictProfilingToAdminUsers=0` on the host.
+
+For a one-off launch-overhead snapshot, reuse the same command with `--metrics gpu__time_duration.sum` so you can divide the reported duration by the kernel count.
+
 ### HTTP Endpoints
 
 `POST /v1/query`
@@ -180,6 +262,21 @@ Returns `objects` (each `{ "x_min", "y_min", "x_max", "y_max" }`), the finish re
 Responses include the generated `caption`, finish reason, and the standard metrics block.
 
 ## Usage Examples
+
+### Downloading Checkpoint
+
+To test inference, you will need a Moondream checkpoint in vixtral weights format. You can obtain by running the following. You will first need to request access to [vikhyatk/moondream-next](https://huggingface.co/vikhyatk/moondream-next) and reach out to vik to get the access request approved (be sure to mention your Hugging Face username when making this request).
+
+```
+from huggingface_hub import hf_hub_download
+
+pt_file = hf_hub_download(
+    "vikhyatk/moondream-next",
+    # moe-glu-3c-warp4_1/s1921
+    revision="d7af1649689208e30e657a8ad52017346e137c39",
+    filename="model.pt",
+)
+```
 
 ### Sampling & Benchmarking How-To
 

@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from copy import deepcopy
-import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Optional, Sequence, cast
 
 import warnings
 
+import numpy as np
 import pyvips
 import torch
 from torch import Tensor
+
+from kestrel.utils import CpuGpuBuffer
 
 from tokenizers import Tokenizer
 
@@ -29,10 +32,13 @@ from .text import (
     text_encoder,
 )
 from .vision import encode_image
+from .layers import LoRA
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
+    FlashInferPrefillBatchMetadata,
+    FlashInferPrefillContext,
 )
 from .region import (
     build_region_module,
@@ -116,6 +122,11 @@ class _GraphWorkspace:
     hidden_buffer: Tensor
 
 
+@dataclass
+class _BatchBinding:
+    tensor: Tensor | None = None
+
+
 class _LayerPagedCache(torch.nn.Module):
     """Adapter that wires :class:`PagedKVCache` into the text blocks."""
 
@@ -139,25 +150,19 @@ class _LayerPagedCache(torch.nn.Module):
             k_scale=k_scale,
             v_scale=v_scale,
         ).to(device)
-        self._batch_idx_tensor: Optional[Tensor] = None
+        self._batch_binding = _BatchBinding()
 
-    def bind(self, batch_idx: int, device: torch.device) -> None:
-        self.set_active_batch(torch.tensor([batch_idx], device=device, dtype=torch.int64))
+    def attach_batch_binding(self, binding: _BatchBinding) -> None:
+        self._batch_binding = binding
 
-    def set_active_batch(self, batch_indices: Tensor) -> None:
-        idx = torch.atleast_1d(batch_indices)
-        if idx.ndim != 1:
-            raise ValueError(
-                f"batch_indices must be 1D, received shape {batch_indices.shape}"
-            )
-        self._batch_idx_tensor = idx.to(
-            device=self.cache.k_cache.device, dtype=torch.int64
-        )
-
-    def update(self, pos_ids: Tensor, k_val: Tensor, v_val: Tensor):
-        if self._batch_idx_tensor is None:
-            raise RuntimeError("Paged cache must be bound before update calls")
-
+    def update(
+        self,
+        pos_ids: Tensor,
+        k_val: Tensor,
+        v_val: Tensor,
+        *,
+        slot_mapping: Tensor,
+    ):
         if k_val.shape[2] != v_val.shape[2]:
             raise ValueError("k_val and v_val must share the sequence dimension")
 
@@ -175,15 +180,11 @@ class _LayerPagedCache(torch.nn.Module):
                 f"KV sequence length {k_val.shape[2]} does not match position tensor {input_pos.shape}"
             )
 
-        batch_idx = self._batch_idx_tensor
-        if batch_idx is None:
-            raise RuntimeError("Paged cache must be bound before update calls")
+        batch_idx = self._batch_binding.tensor
 
         if seq_len == 1:
             batch_idx_arg = batch_idx.expand(k_val.shape[0])
         else:
-            if batch_idx.numel() == 0:
-                raise ValueError("No batch index bound for prefill update")
             batch_idx_arg = batch_idx.view(1).expand_as(input_pos)
 
         return self.cache.update(
@@ -191,6 +192,7 @@ class _LayerPagedCache(torch.nn.Module):
             k_val=k_val,
             v_val=v_val,
             batch_idx=batch_idx_arg,
+            slot_mapping=slot_mapping,
         )
 
 
@@ -343,11 +345,56 @@ class MoondreamRuntime:
             max_seq_len=self.max_seq_length,
             use_cuda_graphs=self._use_cuda_graphs,
         )
+        # Force fa2 backend: fa3 lacks mixed-precision attention (see flashinfer#2038).
+        self._flashinfer_prefill_ctx = FlashInferPrefillContext(
+            device=self.device,
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_cache_dtype,
+            page_size=self.page_size,
+        )
+        self._active_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None
+        self._active_prefill_batch_idx: Optional[Tensor] = None
 
         self._graph_workspace: _GraphWorkspace | None = None
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._graph_batch_sizes: list[int] = []
         self._graph_pool: object | None = None
+        self._batch_idx = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=True,
+        )
+        self._batch_binding: _BatchBinding = _BatchBinding()
+        self._input_pos = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+        )
+        self._tokens = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=self.device,
+            pin_memory=True,
+        )
+        self._prefill_batch_idx = CpuGpuBuffer(
+            1,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
+        self._prefill_query_lens = CpuGpuBuffer(
+            1,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
+
+        for cache in self.layer_caches:
+            cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
         if cfg.enable_compile:
@@ -358,7 +405,8 @@ class MoondreamRuntime:
                 self._prefill_fn = torch.compile(self._prefill_impl, **compile_kwargs)
             except Exception as exc:  # pragma: no cover - torch.compile optional path
                 warnings.warn(
-                    f"torch.compile failed for prefill path, continuing without compilation: {exc}"
+                    f"torch.compile failed for prefill path, continuing without compilation: {exc}",
+                    stacklevel=2,
                 )
                 self._prefill_fn = self._prefill_impl
 
@@ -506,28 +554,27 @@ class MoondreamRuntime:
         hidden_row = hidden.squeeze(0) if hidden.ndim == 2 else hidden
         hidden_batch = hidden_row.unsqueeze(0)
 
-        with torch.inference_mode():
-            if token_id == coord_id:
-                logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
-                bins = logits.shape[-1]
-                index = torch.argmax(logits).item()
-                denom = max(bins - 1, 1)
-                pos = float(min(max(index / denom, 0.0), 1.0))
-                return CoordToken(pos=pos)
+        if token_id == coord_id:
+            logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
+            bins = logits.shape[-1]
+            index = torch.argmax(logits).item()
+            denom = max(bins - 1, 1)
+            pos = float(min(max(index / denom, 0.0), 1.0))
+            return CoordToken(pos=pos)
 
-            if token_id == size_id:
-                logits = decode_size(hidden_batch, self.region)
-                width_logits = logits[0]
-                height_logits = logits[1]
-                bins = width_logits.shape[-1]
-                width_bin = torch.argmax(width_logits).item()
-                height_bin = torch.argmax(height_logits).item()
-                scale = float(bins - 1) if bins > 1 else 1.0
-                width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
-                height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
-                width = float(min(max(width, 0.0), 1.0))
-                height = float(min(max(height, 0.0), 1.0))
-                return SizeToken(width=width, height=height)
+        if token_id == size_id:
+            logits = decode_size(hidden_batch, self.region)
+            width_logits = logits[0]
+            height_logits = logits[1]
+            bins = width_logits.shape[-1]
+            width_bin = torch.argmax(width_logits).item()
+            height_bin = torch.argmax(height_logits).item()
+            scale = float(bins - 1) if bins > 1 else 1.0
+            width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
+            height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
+            width = float(min(max(width, 0.0), 1.0))
+            height = float(min(max(height, 0.0), 1.0))
+            return SizeToken(width=width, height=height)
 
         return TextToken(token_id=token_id)
 
@@ -536,6 +583,7 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image],
         *,
         overlap: Optional[OverlapCropOutput] = None,
+        adapter: Optional[LoRA] = None,
     ) -> Tensor:
         return encode_image(
             image,
@@ -544,6 +592,7 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.dtype,
             overlap=overlap,
+            adapter=adapter,
         )
 
     def start_sequence(
@@ -553,16 +602,8 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
+        adapter: Optional[LoRA] = None,
     ) -> tuple[SequenceState, Tensor]:
-        bos_embed = text_encoder(
-            torch.tensor(
-                [[self.config.tokenizer.bos_id]],
-                device=self.device,
-                dtype=torch.long,
-            ),
-            self.model.text,
-        )
-
         if isinstance(prompt_tokens, Tensor):
             tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
             if tokens_view.ndim != 2:
@@ -582,7 +623,9 @@ class MoondreamRuntime:
         segments: list[Tensor] = [self.bos_embed]
         image_length = 0
         if image is not None or image_crops is not None:
-            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
+            image_embed = self.encode_image(
+                image, overlap=image_crops, adapter=adapter
+            ).unsqueeze(0)
             segments.append(image_embed)
             image_length = image_embed.shape[1]
         if prompt_embed is not None:
@@ -599,25 +642,51 @@ class MoondreamRuntime:
             )
 
         batch_idx = self.page_table.allocate()
-        batch_tensor = torch.tensor([batch_idx], device=self.device, dtype=torch.int64)
+        self._prefill_batch_idx.cpu[0] = batch_idx
+        batch_tensor = self._prefill_batch_idx.copy_to_gpu()
         self.page_table.reserve(
             batch_idx_int=batch_idx,
             batch_idx=batch_tensor,
             seq_len=target_length,
         )
-        for cache in self.layer_caches:
-            cache.bind(batch_idx=batch_idx, device=self.device)
+        self._batch_binding.tensor = batch_tensor
 
-        attention_mask = torch.tril(
-            torch.ones(1, 1, prompt_len, prompt_len, dtype=torch.bool, device=self.device)
-        )
-        if image_length:
-            attention_mask[:, :, :image_length, :image_length] = True
+        attention_mask = None
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        self._prefill_query_lens.cpu[0] = prompt_len
+        query_lens = self._prefill_query_lens.copy_to_gpu()
+        prefill_metadata = self._build_flashinfer_prefill_metadata(
+            batch_tensor, query_lens
+        )
+        custom_mask = None
+        if image_length:
+            mask_matrix = torch.tril(
+                torch.ones(
+                    (prompt_len, prompt_len),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+            prefix_len = image_length + 1
+            mask_matrix[:prefix_len, :prefix_len] = True
+            custom_mask = mask_matrix.flatten()
+        self._flashinfer_prefill_ctx.plan(
+            prefill_metadata,
+            num_q_heads=self.config.text.n_heads,
+            num_kv_heads=self.config.text.n_kv_heads,
+            head_dim=self.head_dim,
+            custom_mask=custom_mask,
+        )
+        self._active_prefill_metadata = prefill_metadata
+        self._active_prefill_batch_idx = batch_tensor
+        try:
+            hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+        finally:
+            self._active_prefill_metadata = None
+            self._active_prefill_batch_idx = None
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
@@ -636,9 +705,11 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # Core forward paths
 
-    @torch.inference_mode()
     def _prefill(
-        self, inputs_embeds: Tensor, attn_mask: Tensor, position_ids: Tensor
+        self,
+        inputs_embeds: Tensor,
+        attn_mask: Optional[Tensor],
+        position_ids: Tensor,
     ) -> tuple[Tensor, Tensor]:
         hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids)
         return hidden, logits
@@ -646,27 +717,39 @@ class MoondreamRuntime:
     def _prefill_impl(
         self,
         inputs_embeds: Tensor,
-        attn_mask: Tensor,
+        attn_mask: Optional[Tensor],
         position_ids: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        prefill_metadata = self._active_prefill_metadata
+        use_flashinfer_prefill = prefill_metadata is not None
+        batch_idx = self._active_prefill_batch_idx
+        if batch_idx is None:
+            raise RuntimeError("Prefill batch index missing during warmup")
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=batch_idx, positions=position_ids
+        )
+
         hidden = text_decoder(
             inputs_embeds,
             self.model.text,
             attn_mask,
             position_ids,
             self.config.text,
+            slot_mapping=slot_mapping,
             mode="prefill",
+            flashinfer_prefill_ctx=(
+                self._flashinfer_prefill_ctx if use_flashinfer_prefill else None
+            ),
+            flashinfer_prefill_metadata=prefill_metadata,
+            use_flashinfer_prefill=use_flashinfer_prefill,
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
 
-    @torch.inference_mode()
-    def decode(self, state: SequenceState, token_id: Tensor | Token) -> Tensor:
-        logits = self.decode_batch([state], token_id)[0]
+    def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
+        self.decode_batch([state], token_id)
         state.advance()
-        return logits.unsqueeze(0)
 
-    @torch.inference_mode()
     def decode_batch(
         self,
         states: Sequence[SequenceState],
@@ -675,16 +758,11 @@ class MoondreamRuntime:
         if not states:
             raise ValueError("states must not be empty")
 
-        batch_idx = torch.tensor(
-            [state.batch_idx for state in states],
-            device=self.device,
-            dtype=torch.int64,
-        )
-        input_pos = torch.tensor(
-            [state.length for state in states],
-            device=self.device,
-            dtype=torch.int32,
-        )
+        batch_size = len(states)
+        self._batch_idx.np[:batch_size] = [state.batch_idx for state in states]
+        self._input_pos.np[:batch_size] = [state.length for state in states]
+        batch_idx = self._batch_idx.copy_to_gpu(batch_size)
+        input_pos = self._input_pos.copy_to_gpu(batch_size)
 
         tokens_tensor: Optional[Tensor] = None
         token_seq: Optional[Sequence[Token]] = None
@@ -697,7 +775,12 @@ class MoondreamRuntime:
                 raise ValueError(
                     "token_ids and states must have matching batch dimensions"
                 )
-            tokens_tensor = tokens_tensor.to(device=self.device, dtype=torch.long)
+            if tokens_tensor.device.type != "cpu":
+                tokens_tensor = tokens_tensor.to(device="cpu")
+            tokens_tensor = tokens_tensor.to(dtype=torch.long)
+            host_tokens = self._tokens.cpu[:batch_size]
+            host_tokens.copy_(tokens_tensor)
+            tokens_tensor = self._tokens.copy_to_gpu(batch_size)
         else:
             token_seq = list(token_inputs)
             if len(token_seq) != len(states):
@@ -736,26 +819,110 @@ class MoondreamRuntime:
         input_pos: Tensor,
         *,
         full_batch_size: Optional[int] = None,
+        use_graph: bool = False,
     ) -> FlashInferBatchMetadata:
         if batch_idx.ndim != 1:
             raise ValueError("batch_idx must be 1D")
 
-        seq_lens = input_pos.to(dtype=torch.int32) + 1
-        expanded_batch = batch_idx
-        expanded_seq = seq_lens
-
-        if full_batch_size is not None and full_batch_size > batch_idx.shape[0]:
-            pad = full_batch_size - batch_idx.shape[0]
-            pad_batch = torch.zeros(pad, dtype=torch.long, device=self.device)
-            pad_seq = torch.ones(pad, dtype=torch.int32, device=self.device)
-            expanded_batch = torch.cat([batch_idx, pad_batch], dim=0)
-            expanded_seq = torch.cat([seq_lens, pad_seq], dim=0)
-
-        kv_indptr, kv_indices, kv_last_page_len = (
-            self.page_table.build_flashinfer_kv_metadata(expanded_batch, expanded_seq)
+        batch_size = batch_idx.shape[0]
+        target_batch = full_batch_size or batch_size
+        buffers = self._flashinfer_ctx.acquire_plan_buffers(
+            target_batch, use_graph=use_graph
         )
+
+        seq_lens_np = buffers.seq_lens_np[:target_batch]
+        seq_lens_np.fill(0)
+        if batch_size:
+            seq_lens_cpu_tensor = buffers.seq_lens_cpu[:batch_size]
+            seq_lens_cpu_tensor.copy_(input_pos[:batch_size])
+            seq_lens_np[:batch_size] += 1
+
+        num_pages_np = buffers.num_pages_np[:target_batch]
+        if target_batch:
+            np.add(seq_lens_np, self.page_size - 1, out=num_pages_np)
+            np.floor_divide(num_pages_np, self.page_size, out=num_pages_np)
+        else:
+            num_pages_np.fill(0)
+
+        kv_indptr_np = buffers.kv_indptr_np[: target_batch + 1]
+        kv_indptr_np.fill(0)
+        if target_batch:
+            kv_indptr_np[1:] = np.cumsum(num_pages_np, dtype=np.int32)
+
+        kv_last_page_len_np = buffers.kv_last_page_len_np[:target_batch]
+        if target_batch:
+            np.subtract(seq_lens_np[:target_batch], 1, out=kv_last_page_len_np)
+            np.mod(kv_last_page_len_np, self.page_size, out=kv_last_page_len_np)
+            kv_last_page_len_np += 1
+            kv_last_page_len_np[num_pages_np == 0] = 0
+        else:
+            kv_last_page_len_np.fill(0)
+
+        batch_count = target_batch
+
+        kv_indptr = buffers._kv_indptr.copy_to_gpu(target_batch + 1)
+        kv_last_page_len = buffers._kv_last_page_len.copy_to_gpu(target_batch)
+
+        if buffers.graph_state is not None or target_batch != batch_size:
+            batch_buf = buffers.batch_indices[:target_batch]
+            batch_buf.zero_()
+            if batch_size:
+                batch_buf[:batch_size].copy_(batch_idx)
+            expanded_batch = batch_buf
+        else:
+            expanded_batch = batch_idx
+
+        total_pages = int(buffers.kv_indptr_cpu[target_batch].item())
+        if total_pages > buffers.page_capacity:
+            raise RuntimeError(
+                f"FlashInfer plan buffer overflow: need {total_pages} pages but capacity is {buffers.page_capacity}"
+            )
+
+        kv_indices = buffers.kv_indices[:total_pages]
+        if total_pages > 0:
+            self.page_table.populate_flashinfer_kv_indices(
+                batch_idx=expanded_batch,
+                kv_indptr=kv_indptr,
+                out_kv_indices=kv_indices,
+            )
+
+        pages_filled = total_pages
+        buffers.pages_filled = pages_filled
+        if buffers.graph_state is not None:
+            buffers.graph_state.pages_filled = pages_filled
         return FlashInferBatchMetadata(
-            batch_size=expanded_batch.shape[0],
+            batch_size=batch_count,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            kv_last_page_len=kv_last_page_len,
+            graph_state=buffers.graph_state if use_graph else None,
+        )
+
+    def _build_flashinfer_prefill_metadata(
+        self,
+        batch_idx: Tensor,
+        query_lens: Tensor,
+    ) -> FlashInferPrefillBatchMetadata:
+        if batch_idx.ndim != 1:
+            raise ValueError("batch_idx must be 1D for FlashInfer prefill metadata")
+        if query_lens.ndim != 1:
+            raise ValueError("query_lens must be 1D for FlashInfer prefill metadata")
+
+        seq_lens = query_lens.to(dtype=torch.int32, device=self.device)
+        kv_indptr, kv_indices, kv_last_page_len = (
+            self.page_table.build_flashinfer_kv_metadata(batch_idx, seq_lens)
+        )
+        qo_indptr = torch.zeros(
+            batch_idx.shape[0] + 1, dtype=torch.int32, device=self.device
+        )
+        if query_lens.numel():
+            qo_indptr[1:] = torch.cumsum(
+                query_lens.to(dtype=torch.int32, device=self.device), dim=0
+            )
+
+        return FlashInferPrefillBatchMetadata(
+            batch_size=batch_idx.shape[0],
+            qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             kv_last_page_len=kv_last_page_len,
@@ -772,19 +939,24 @@ class MoondreamRuntime:
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
         skip_plan: bool = False,
     ) -> RuntimeDecodeResult:
-        for cache in self.layer_caches:
-            cache.set_active_batch(batch_idx)
+        self._batch_binding.tensor = batch_idx
 
         if isinstance(token_inputs, Tensor):
             embeds = text_encoder(token_inputs.view(-1, 1), self.model.text)
         else:
             embeds = self._embed_token_batch(token_inputs)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=batch_idx.view(-1, 1), positions=position_ids
+        )
 
         metadata = flashinfer_metadata
         if metadata is None:
             metadata = self._build_flashinfer_metadata(
-                batch_idx, input_pos, full_batch_size=full_batch_size
+                batch_idx,
+                input_pos,
+                full_batch_size=full_batch_size,
+                use_graph=use_graph,
             )
 
         if not skip_plan:
@@ -806,6 +978,7 @@ class MoondreamRuntime:
             use_flashinfer=True,
             use_graph=use_graph,
             mode="decode",
+            slot_mapping=slot_mapping,
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
@@ -830,12 +1003,13 @@ class MoondreamRuntime:
         workspace.token_buffer[:batch_size, 0].copy_(tokens)
         workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
         workspace.position_buffer[:batch_size].copy_(input_pos)
-
         metadata = self._build_flashinfer_metadata(
             workspace.batch_idx_buffer[:graph_batch_size],
             workspace.position_buffer[:graph_batch_size],
             full_batch_size=graph_batch_size,
+            use_graph=True,
         )
+        self._batch_binding.tensor = workspace.batch_idx_buffer[:graph_batch_size]
         self._flashinfer_ctx.plan(
             metadata,
             num_q_heads=self.config.text.n_heads,
@@ -846,8 +1020,9 @@ class MoondreamRuntime:
 
         graph = self._cuda_graphs[graph_batch_size]
         graph.replay()
-        logits = workspace.output_buffer[:batch_size].clone()
-        hidden = workspace.hidden_buffer[:batch_size].clone().unsqueeze(1)
+        self._batch_binding.tensor = batch_idx
+        logits = workspace.output_buffer[:batch_size]
+        hidden = workspace.hidden_buffer[:batch_size].unsqueeze(1)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
     def _ensure_cuda_graphs_ready(self) -> None:
@@ -933,6 +1108,7 @@ class MoondreamRuntime:
                         workspace.batch_idx_buffer[:bs],
                         workspace.position_buffer[:bs],
                         full_batch_size=bs,
+                        use_graph=True,
                     )
                     warmup = self._decode_step(
                         workspace.batch_idx_buffer[:bs],
@@ -985,7 +1161,6 @@ class MoondreamRuntime:
         workspace.token_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
-        workspace.hidden_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]

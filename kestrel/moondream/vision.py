@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import pyvips
 
 from .config import VisionConfig
+from .layers import LoRA, LoRALinear
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 
@@ -86,6 +87,7 @@ def vision_projection(
     local_features: torch.Tensor,
     module: nn.Module,
     config: VisionConfig,
+    adapter: Optional[LoRA] = None,
 ) -> torch.Tensor:
     dtype = global_features.dtype
     reconstructed = local_features.to(dtype=dtype).permute(2, 0, 1)
@@ -95,7 +97,13 @@ def vision_projection(
     ).to(dtype)
     reconstructed = reconstructed.permute(1, 2, 0).reshape(-1, config.enc_dim)
     features = torch.cat([global_features, reconstructed], dim=-1)
-    return _vision_mlp(features, module.proj_mlp)
+    hidden = F.gelu(module.proj_mlp["fc1"](features), approximate="tanh")
+    output = module.proj_mlp["fc2"](hidden)
+    if adapter is not None:
+        lora: Optional[LoRALinear] = adapter.vision.get("proj_mlp.fc2")
+        if lora is not None:
+            output = output + lora.apply(hidden)
+    return output
 
 
 def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
@@ -150,6 +158,7 @@ def encode_image(
     device: torch.device,
     dtype: torch.dtype,
     overlap: Optional[OverlapCropOutput] = None,
+    adapter: Optional[LoRA] = None,
 ) -> torch.Tensor:
     with torch.inference_mode():
         if overlap is not None:
@@ -174,7 +183,13 @@ def encode_image(
             patch_size=1,
         )
         reconstructed = reconstructed.to(device=device, dtype=outputs.dtype)
-        projected = vision_projection(global_features, reconstructed, module, config)
+        projected = vision_projection(
+            global_features,
+            reconstructed,
+            module,
+            config,
+            adapter=adapter,
+        )
     return projected
 
 

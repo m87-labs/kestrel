@@ -59,8 +59,8 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
                 {
                     f"{prefix}.gate.weight": block["mlp"]["router"].weight,
                     f"{prefix}.gate.bias": block["mlp"]["router"].bias,
-                    f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].experts.weight,
-                    f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].output_experts.weight,
+                    f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].up_experts.weight,
+                    f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].down_experts.weight,
                 }
             )
         else:
