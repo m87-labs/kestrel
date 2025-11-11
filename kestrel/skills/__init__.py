@@ -11,6 +11,7 @@ from .detect import DetectRequest, DetectSettings, DetectSkill
 from .caption import CaptionRequest, CaptionSettings, CaptionSkill
 from .point import PointRequest, PointSettings, PointSkill
 from .query import QueryRequest, QuerySettings, QuerySkill
+from .segment import SegmentRequest, SegmentSettings, SegmentSkill
 
 __all__ = [
     "DecodeStep",
@@ -30,4 +31,7 @@ __all__ = [
     "QueryRequest",
     "QuerySettings",
     "QuerySkill",
+    "SegmentRequest",
+    "SegmentSettings",
+    "SegmentSkill",
 ]
