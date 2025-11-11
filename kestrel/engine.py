@@ -967,6 +967,13 @@ class InferenceEngine:
             request_context=req.request_context,
             adapter=adapter,
         )
+        limit = runtime.max_seq_length
+        target_total = request_obj.target_length
+        if target_total > limit:
+            raise ValueError(
+                "Request length exceeds runtime max_seq_length: "
+                f"needs {target_total} tokens but limit is {limit}."
+            )
         skill_state = req.skill.create_state(
             runtime,
             request_obj,
