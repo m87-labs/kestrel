@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pyvips
 from starlette.applications import Starlette
@@ -499,6 +499,89 @@ class _ServerState:
         }
         return JSONResponse(response_payload)
 
+    async def handle_segment(self, request: Request) -> Response:
+        if self.engine is None:
+            return JSONResponse({"error": "Engine is not ready"}, status_code=503)
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Request body must be an object"}, status_code=400)
+
+        try:
+            label = _parse_required_str(payload, "label")
+            settings_payload = payload.get("settings")
+            if settings_payload is None:
+                settings_payload = {}
+            if isinstance(settings_payload, dict):
+                temperature = _parse_float(
+                    settings_payload.get("temperature", 0.0),
+                    "settings.temperature",
+                    minimum=0.0,
+                )
+                top_p = _parse_float(
+                    settings_payload.get("top_p", 1.0),
+                    "settings.top_p",
+                    minimum_exclusive=0.0,
+                    maximum=1.0,
+                )
+                max_tokens = _parse_int(
+                    settings_payload.get(
+                        "max_tokens", self.config.default_max_new_tokens
+                    ),
+                    "settings.max_tokens",
+                    minimum=1,
+                )
+            else:
+                raise ValueError("Field 'settings' must be an object if provided")
+
+            spatial_refs = _parse_spatial_refs(payload.get("spatial_refs"))
+
+            image_data = payload.get("image_url")
+            if image_data is None:
+                image: Optional[pyvips.Image] = None
+            elif isinstance(image_data, str):
+                image = load_vips_from_base64(image_data)
+            else:
+                raise ValueError("Field 'image_url' must be a string if provided")
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        settings_dict = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+
+        try:
+            engine = self.engine
+            assert engine is not None
+            result = await engine.segment(
+                image=image,
+                label=label,
+                spatial_refs=spatial_refs,
+                settings=settings_dict,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Inference request failed")
+            return JSONResponse(
+                {"error": "Inference failed", "detail": str(exc)}, status_code=500
+            )
+
+        metrics_payload = _format_metrics(result.metrics)
+        response_payload = {
+            "request_id": str(result.request_id),
+            "finish_reason": result.finish_reason,
+            "segments": result.output.get("segments"),
+            "metrics": metrics_payload,
+        }
+        return JSONResponse(response_payload)
+
 
 
 
@@ -530,6 +613,7 @@ def create_app(
         Route("/v1/query", state.handle_query, methods=["POST"]),
         Route("/v1/point", state.handle_point, methods=["POST"]),
         Route("/v1/detect", state.handle_detect, methods=["POST"]),
+        Route("/v1/segment", state.handle_segment, methods=["POST"]),
         Route("/v1/caption", state.handle_caption, methods=["POST"]),
         Route("/healthz", state.handle_health, methods=["GET"]),
     ]
@@ -600,6 +684,37 @@ def _parse_float(
             f"Field '{field}' must be <= {maximum}, received {out}"
         )
     return out
+
+
+def _parse_spatial_refs(value: Any) -> Optional[List[List[float]]]:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("Field 'spatial_refs' must be a list of coordinate lists")
+    parsed: List[List[float]] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, (list, tuple)):
+            raise ValueError(
+                f"spatial_refs[{idx}] must be a list of floats"
+            )
+        if len(item) not in (2, 4):
+            raise ValueError(
+                f"spatial_refs[{idx}] must contain 2 (point) or 4 (bbox) values"
+            )
+        coord: List[float] = []
+        for j, raw in enumerate(item):
+            if not isinstance(raw, (int, float)):
+                raise ValueError(
+                    f"spatial_refs[{idx}][{j}] must be a number"
+                )
+            value_f = float(raw)
+            if value_f < 0.0 or value_f > 1.0:
+                raise ValueError(
+                    f"spatial_refs[{idx}][{j}] must be within [0, 1]"
+                )
+            coord.append(value_f)
+        parsed.append(coord)
+    return parsed
 
 
 __all__ = ["create_app"]

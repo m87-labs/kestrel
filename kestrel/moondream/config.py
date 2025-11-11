@@ -53,6 +53,7 @@ class TokenizerConfig:
             "query": {"prefix": [1, 15381, 2], "suffix": [3]},
             "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
             "point": {"prefix": [1, 2581, 2], "suffix": [3]},
+            "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
         }
     )
 
@@ -135,6 +136,7 @@ DEFAULT_MOONDREAM3_CONFIG = {
             "query": {"prefix": [1, 15381, 2], "suffix": [3]},
             "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
             "point": {"prefix": [1, 2581, 2], "suffix": [3]},
+            "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
         },
     },
     "region": {
