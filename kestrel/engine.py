@@ -252,7 +252,6 @@ class InferenceEngine:
         self._runtime = await loop.run_in_executor(
             None, MoondreamRuntime, self._runtime_cfg
         )
-        await loop.run_in_executor(None, self._warmup)
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
         max_workers = max(1, self._runtime.max_batch_size)
@@ -267,43 +266,26 @@ class InferenceEngine:
             )
             self._scheduler_thread.start()
         self._worker_task = asyncio.create_task(self._worker_loop())
+        await self._warmup_query_pipeline()
 
-    def _warmup(self) -> None:
-        assert self._runtime is not None
-        runtime = self._runtime
-        prompt = "Warmup prompt."
-        skill = self._skills.default
-        if isinstance(skill, QuerySkill):
-            warmup_request = QueryRequest(
-                question=prompt,
+    async def _warmup_query_pipeline(self) -> None:
+        """Ensure the high-level query path is exercised before serving traffic."""
+
+        try:
+            await self.query(
                 image=None,
+                question="Warmup prompt.",
                 reasoning=False,
                 stream=False,
-                settings=QuerySettings(
-                    temperature=self._default_temperature,
-                    top_p=self._default_top_p,
-                    max_tokens=1,
-                ),
+                settings={
+                    "temperature": self._default_temperature,
+                    "top_p": self._default_top_p,
+                    "max_tokens": 1,
+                },
             )
-        else:
-            raise RuntimeError(
-                "Warmup currently requires the default skill to be QuerySkill"
-            )
-        tokens = skill.build_prompt_tokens(runtime, warmup_request)
-        with torch.inference_mode():
-            state, logits = runtime.start_sequence(
-                prompt_tokens=tokens, max_new_tokens=1
-            )
-            try:
-                next_token = torch.argmax(logits, dim=-1)
-                token_input = (
-                    next_token.view(-1)
-                    .to(device="cpu", dtype=torch.long)
-                    .pin_memory()
-                )
-                runtime.decode(state, token_input)
-            finally:
-                runtime.release_sequence(state)
+        except Exception:
+            _LOGGER.exception("Warmup query pipeline failed")
+            raise
 
     async def shutdown(self) -> None:
         if self._shutdown:
