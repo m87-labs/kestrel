@@ -408,18 +408,6 @@ class MoondreamRuntime:
             cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
-        if cfg.enable_compile:
-            compile_kwargs: dict[str, object] = {"dynamic": True}
-            if cfg.compile_mode:
-                compile_kwargs["mode"] = cfg.compile_mode
-            try:
-                self._prefill_fn = torch.compile(self._prefill_impl, **compile_kwargs)
-            except Exception as exc:  # pragma: no cover - torch.compile optional path
-                warnings.warn(
-                    f"torch.compile failed for prefill path, continuing without compilation: {exc}",
-                    stacklevel=2,
-                )
-                self._prefill_fn = self._prefill_impl
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
