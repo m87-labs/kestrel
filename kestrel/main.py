@@ -49,11 +49,6 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum total sequence length (prompt + generation)",
     )
     parser.add_argument(
-        "--disable-compile",
-        action="store_true",
-        help="Disable torch.compile for eligible runtime paths",
-    )
-    parser.add_argument(
         "--disable-cuda-graphs",
         action="store_true",
         help="Disable CUDA graph capture for batched decode",
@@ -131,7 +126,6 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         max_batch_size=args.max_batch_size,
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
-        enable_compile=not args.disable_compile,
         enable_cuda_graphs=not args.disable_cuda_graphs,
     )
 
