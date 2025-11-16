@@ -203,6 +203,7 @@ class MoondreamRuntime:
         self._cfg = cfg
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
+        torch.cuda.set_device(self.device)
 
         if cfg.model_paths.config_json:
             with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
