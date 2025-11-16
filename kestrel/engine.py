@@ -852,8 +852,7 @@ class InferenceEngine:
         runtime = self._runtime
         if runtime is None:
             return
-        if runtime.device.type == "cuda":
-            torch.cuda.set_device(runtime.device)
+        torch.cuda.set_device(runtime.device)
 
         scheduler = GenerationScheduler(
             runtime,
