@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
+import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyvips
@@ -13,6 +15,7 @@ from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.svg import (
     decode_svg_token_strings,
     svg_path_from_token_ids,
+    PATH_COMMANDS,
 )
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
@@ -93,8 +96,9 @@ class SegmentSkillState(SkillState):
         self._coord_values: List[float] = []
         self._size_values: List[Tuple[float, float]] = []
         self._streaming: bool = bool(segment_request.stream)
-        self._stream_offset: int = 0
+        self._stream_cursor: int = 0  # index into decoded tokens processed for streaming
         self._pending_stream: Optional[str] = None
+        self._bbox_sent: bool = False
 
     def consume_step(
         self,
@@ -174,15 +178,39 @@ class SegmentSkillState(SkillState):
     def _update_stream(self, runtime: "MoondreamRuntime") -> None:
         if not self._streaming:
             return
-        try:
-            path, _ = svg_path_from_token_ids(runtime.tokenizer, self._text_token_ids)
-        except Exception:
-            return  # Don't stream until the path is parseable.
-        if not path:
+
+        # Send bbox once, as soon as we have center+size.
+        if not self._bbox_sent:
+            bbox = _build_bbox(self._coord_values, self._size_values)
+            if bbox and set(bbox.keys()) == {
+                "x_center",
+                "y_center",
+                "width",
+                "height",
+                "x_min",
+                "x_max",
+                "y_min",
+                "y_max",
+            }:
+                bbox_minmax = {
+                    "x_min": bbox["x_min"],
+                    "y_min": bbox["y_min"],
+                    "x_max": bbox["x_max"],
+                    "y_max": bbox["y_max"],
+                }
+                self._pending_stream = "__BBOX__" + json.dumps(bbox_minmax)
+                self._bbox_sent = True
+                return
+
+        # Emit one path chunk per call: previous command + its args.
+        decoded = decode_svg_token_strings(runtime.tokenizer, self._text_token_ids)
+        if not decoded:
             return
-        if len(path) > self._stream_offset:
-            self._pending_stream = path[self._stream_offset :]
-            self._stream_offset = len(path)
+        end, chunk = _next_command_chunk(decoded, self._stream_cursor)
+        if chunk and end > self._stream_cursor:
+            first = self._stream_cursor == 0
+            self._pending_stream = _format_chunk(chunk, first=first)
+            self._stream_cursor = end
 
 
 def _coords_to_points(coords: Sequence[float]) -> List[Dict[str, float]]:
@@ -219,6 +247,41 @@ def _build_bbox(
 
 def _clamp_unit(value: float) -> float:
     return min(max(value, 0.0), 1.0)
+
+
+def _next_command_chunk(tokens: Sequence[str], start: int) -> tuple[int, str]:
+    """Return a command-plus-args chunk ending just before the next command."""
+
+    n = len(tokens)
+    if start >= n:
+        return start, ""
+
+    # Find the next command
+    cmd_idx = start
+    while cmd_idx < n and tokens[cmd_idx] not in PATH_COMMANDS:
+        cmd_idx += 1
+    if cmd_idx >= n:
+        return start, ""
+
+    # Collect until the following command (or end)
+    end = cmd_idx + 1
+    while end < n and tokens[end] not in PATH_COMMANDS:
+        end += 1
+
+    # Require enough args for the command
+    cmd = tokens[cmd_idx]
+    required = 1 if cmd in {"Z", "z"} else (2 if cmd in {"H", "h", "V", "v"} else 3)
+    if end - cmd_idx < required:
+        return start, ""
+
+    chunk = " ".join(tokens[cmd_idx:end])
+    return end, chunk
+
+
+def _format_chunk(chunk: str, *, first: bool) -> str:
+    if not chunk:
+        return ""
+    return chunk if first else " " + chunk
 
 
 __all__ = [

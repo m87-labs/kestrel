@@ -16,7 +16,11 @@ from starlette.routing import Route
 
 from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
+from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.utils.image import load_vips_from_base64
+
+# ---------------------------------------------------------------------------
+# Helpers
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,93 @@ class _ServerState:
         if self.engine is None or not self.engine.is_running:
             return JSONResponse({"status": "starting"}, status_code=503)
         return JSONResponse({"status": "ok"})
+
+    async def handle_segment(self, request: Request) -> Response:
+        if self.engine is None:
+            return JSONResponse({"error": "Engine is not ready"}, status_code=503)
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "Request body must be an object"}, status_code=400)
+
+        try:
+            label = _parse_required_str(payload, "label")
+            settings_payload = payload.get("settings") or {}
+            if not isinstance(settings_payload, dict):
+                raise ValueError("Field 'settings' must be an object if provided")
+            temperature = _parse_float(
+                settings_payload.get("temperature", self.config.default_temperature),
+                "settings.temperature",
+                minimum=0.0,
+            )
+            top_p = _parse_float(
+                settings_payload.get("top_p", self.config.default_top_p),
+                "settings.top_p",
+                minimum_exclusive=0.0,
+                maximum=1.0,
+            )
+            max_tokens = _parse_int(
+                settings_payload.get("max_tokens", self.config.default_max_new_tokens),
+                "settings.max_tokens",
+                minimum=1,
+            )
+
+            image_data = payload.get("image_url")
+            if image_data is None:
+                raise ValueError("Field 'image_url' must be provided")
+            if not isinstance(image_data, str):
+                raise ValueError("Field 'image_url' must be a string")
+            image = load_vips_from_base64(image_data)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        engine = self.engine
+        assert engine is not None
+        try:
+            result = await engine.segment(
+                image=image,
+                label=label,
+                settings={
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": max_tokens,
+                },
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Inference request failed")
+            return JSONResponse(
+                {"error": "Inference failed", "detail": str(exc)}, status_code=500
+            )
+
+        segment = (result.output.get("segments") or [{}])[0]
+        bbox = segment.get("bbox")
+        path = segment.get("svg_path") or ""
+        if bbox and set(bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
+            bbox = {
+                "x_min": bbox["x_min"],
+                "y_min": bbox["y_min"],
+                "x_max": bbox["x_max"],
+                "y_max": bbox["y_max"],
+            }
+
+        response_payload = {
+            "request_id": str(result.request_id),
+            "finish_reason": result.finish_reason,
+            "bbox": bbox,
+            "path": path,
+            "metrics": _format_metrics(result.metrics),
+        }
+        parse_error = segment.get("parse_error")
+        if parse_error:
+            response_payload["parse_error"] = parse_error
+
+        return JSONResponse(response_payload)
 
     async def handle_query(self, request: Request) -> Response:
         if self.engine is None:
@@ -515,6 +606,7 @@ class _ServerState:
 
         try:
             label = _parse_required_str(payload, "label")
+            stream = _parse_bool(payload.get("stream", False), "stream")
             settings_payload = payload.get("settings")
             if settings_payload is None:
                 settings_payload = {}
@@ -561,25 +653,132 @@ class _ServerState:
         try:
             engine = self.engine
             assert engine is not None
-            result = await engine.segment(
-                image=image,
-                label=label,
-                spatial_refs=spatial_refs,
-                settings=settings_dict,
-            )
+            if stream:
+                segment_stream = await engine.submit_streaming(
+                    request_context=SegmentRequest(
+                        label=label,
+                        image=image,
+                        stream=True,
+                        settings=SegmentSettings(
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                        ),
+                        spatial_refs=spatial_refs,
+                    ),
+                    max_new_tokens=max_tokens,
+                    skill="segment",
+                    image=image,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+
+                async def event_generator():
+                    latest_bbox = None
+                    try:
+                        async for update in segment_stream:
+                            text = update.text
+                            if not text:
+                                continue
+                            if text.startswith("__BBOX__"):
+                                try:
+                                    latest_bbox = json.loads(text[len("__BBOX__") :])
+                                except Exception:
+                                    latest_bbox = None
+                                if latest_bbox:
+                                    yield _sse_payload({"type": "bbox", "bbox": latest_bbox})
+                                continue
+                            # Path fragment is a valid suffix; client appends to previous chunks.
+                            payload_chunk = {
+                                "type": "path_delta",
+                                "chunk": text,
+                                "completed": False,
+                                "token_index": update.token_index,
+                            }
+                            yield _sse_payload(payload_chunk)
+                        result = await segment_stream.result()
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.exception("Streaming segment errored")
+                        raise exc
+
+                    segment = (result.output.get("segments") or [{}])[0]
+                    bbox_full = segment.get("bbox")
+                    bbox_minmax = latest_bbox
+                    if bbox_minmax is None and bbox_full and set(bbox_full.keys()) == {
+                        "x_center",
+                        "y_center",
+                        "width",
+                        "height",
+                        "x_min",
+                        "x_max",
+                        "y_min",
+                        "y_max",
+                    }:
+                        bbox_minmax = {
+                            "x_min": bbox_full["x_min"],
+                            "y_min": bbox_full["y_min"],
+                            "x_max": bbox_full["x_max"],
+                            "y_max": bbox_full["y_max"],
+                        }
+
+                    path = segment.get("svg_path") or ""
+                    parse_error = segment.get("parse_error")
+                    metrics_payload = _format_metrics(result.metrics)
+                    payload_final = {
+                        "type": "final",
+                        "chunk": "",
+                        "completed": True,
+                        "request_id": str(result.request_id),
+                        "finish_reason": result.finish_reason,
+                        "path": path,
+                        "bbox": bbox_minmax,
+                        "metrics": metrics_payload,
+                    }
+                    if parse_error:
+                        payload_final["parse_error"] = parse_error
+                    yield _sse_payload(payload_final)
+
+                return StreamingResponse(
+                    event_generator(),
+                    media_type="text/event-stream",
+                    headers=STREAM_HEADERS,
+                )
+            else:
+                result = await engine.segment(
+                    image=image,
+                    label=label,
+                    spatial_refs=spatial_refs,
+                    settings=settings_dict,
+                )
         except Exception as exc:  # pragma: no cover
             logger.exception("Inference request failed")
             return JSONResponse(
                 {"error": "Inference failed", "detail": str(exc)}, status_code=500
             )
 
+        segment = (result.output.get("segments") or [{}])[0]
+        bbox = segment.get("bbox")
+        path = segment.get("svg_path") or ""
+        if bbox and set(bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
+            bbox = {
+                "x_min": bbox["x_min"],
+                "y_min": bbox["y_min"],
+                "x_max": bbox["x_max"],
+                "y_max": bbox["y_max"],
+            }
+
         metrics_payload = _format_metrics(result.metrics)
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
-            "segments": result.output.get("segments"),
+            "bbox": bbox,
+            "path": path,
             "metrics": metrics_payload,
         }
+        parse_error = segment.get("parse_error")
+        if parse_error:
+            response_payload["parse_error"] = parse_error
+
         return JSONResponse(response_payload)
 
 
