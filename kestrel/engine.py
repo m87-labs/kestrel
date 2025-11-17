@@ -603,14 +603,14 @@ class InferenceEngine:
     async def segment(
         self,
         image: Optional[pyvips.Image],
-        label: str,
+        object: str,
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
-        normalized_label = label.strip()
-        if not normalized_label:
-            raise ValueError("label must be a non-empty string")
+        normalized_object = object.strip()
+        if not normalized_object:
+            raise ValueError("object must be a non-empty string")
 
         temperature = 0.0
         top_p = 1.0
@@ -650,7 +650,7 @@ class InferenceEngine:
                 normalized_refs.append(tuple(converted))
 
         request = SegmentRequest(
-            label=normalized_label,
+            object=normalized_object,
             image=image,
             stream=False,
             settings=SegmentSettings(
@@ -843,7 +843,7 @@ class InferenceEngine:
         if isinstance(request_context, DetectRequest):
             return request_context.object
         if isinstance(request_context, SegmentRequest):
-            return request_context.label
+            return request_context.object
         if isinstance(request_context, CaptionRequest):
             return request_context.length
         return str(request_context)

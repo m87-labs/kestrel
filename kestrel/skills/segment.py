@@ -38,7 +38,7 @@ class SegmentSettings:
 class SegmentRequest:
     """Segment payload used internally by the scheduler."""
 
-    label: str
+    object: str
     image: Optional[pyvips.Image]
     stream: bool
     settings: SegmentSettings
@@ -46,7 +46,7 @@ class SegmentRequest:
 
 
 class SegmentSkill(SkillSpec):
-    """Skill that emits SVG paths for the requested label."""
+    """Skill that emits SVG paths for the requested object."""
 
     def __init__(self) -> None:
         super().__init__(name="segment")
@@ -63,9 +63,9 @@ class SegmentSkill(SkillSpec):
             raise ValueError("Model configuration does not include segment templates")
         prefix: Sequence[int] = template.get("prefix", [])
         suffix: Sequence[int] = template.get("suffix", [])
-        label = request_context.label
-        label_tokens = runtime.tokenizer.encode(label).ids if label else []
-        ids = [*prefix, *label_tokens, *suffix]
+        object_name = request_context.object
+        object_tokens = runtime.tokenizer.encode(object_name).ids if object_name else []
+        ids = [*prefix, *object_tokens, *suffix]
         if not ids:
             return torch.empty((1, 0), dtype=torch.long)
         return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
@@ -141,7 +141,7 @@ class SegmentSkillState(SkillState):
         bbox = _build_bbox(self._coord_values, self._size_values)
 
         segment: Dict[str, object] = {
-            "label": self._request.label,
+            "object": self._request.object,
             "text": raw_text.strip(),
             "svg_path": svg_path,
             "path_tokens": decoded_tokens,
