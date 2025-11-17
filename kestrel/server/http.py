@@ -104,7 +104,7 @@ class _ServerState:
             return JSONResponse({"error": "Request body must be an object"}, status_code=400)
 
         try:
-            label = _parse_required_str(payload, "label")
+            object_name = _parse_required_str(payload, "object")
             settings_payload = payload.get("settings") or {}
             if not isinstance(settings_payload, dict):
                 raise ValueError("Field 'settings' must be an object if provided")
@@ -139,7 +139,7 @@ class _ServerState:
         try:
             result = await engine.segment(
                 image=image,
-                label=label,
+                object=object_name,
                 settings={
                     "temperature": temperature,
                     "top_p": top_p,
@@ -605,7 +605,7 @@ class _ServerState:
             return JSONResponse({"error": "Request body must be an object"}, status_code=400)
 
         try:
-            label = _parse_required_str(payload, "label")
+            object_name = _parse_required_str(payload, "object")
             stream = _parse_bool(payload.get("stream", False), "stream")
             settings_payload = payload.get("settings")
             if settings_payload is None:
@@ -656,7 +656,7 @@ class _ServerState:
             if stream:
                 segment_stream = await engine.submit_streaming(
                     request_context=SegmentRequest(
-                        label=label,
+                        object=object_name,
                         image=image,
                         stream=True,
                         settings=SegmentSettings(
@@ -746,7 +746,7 @@ class _ServerState:
             else:
                 result = await engine.segment(
                     image=image,
-                    label=label,
+                    object=object_name,
                     spatial_refs=spatial_refs,
                     settings=settings_dict,
                 )
