@@ -14,6 +14,8 @@ from torch import Tensor
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.svg import (
     decode_svg_token_strings,
+    parse_svg_tokens,
+    scale_svg_path_tokens,
     svg_path_from_token_ids,
     PATH_COMMANDS,
 )
@@ -203,10 +205,15 @@ class SegmentSkillState(SkillState):
                 return
 
         # Emit one path chunk per call: previous command + its args.
-        decoded = decode_svg_token_strings(runtime.tokenizer, self._text_token_ids)
-        if not decoded:
+        decoded_tokens = decode_svg_token_strings(runtime.tokenizer, self._text_token_ids)
+        if not decoded_tokens:
             return
-        end, chunk = _next_command_chunk(decoded, self._stream_cursor)
+        try:
+            parsed_tokens = parse_svg_tokens(decoded_tokens)
+        except Exception:
+            return
+        scaled_tokens = scale_svg_path_tokens(parsed_tokens)
+        end, chunk = _next_command_chunk(scaled_tokens, self._stream_cursor)
         if chunk and end > self._stream_cursor:
             first = self._stream_cursor == 0
             self._pending_stream = _format_chunk(chunk, first=first)

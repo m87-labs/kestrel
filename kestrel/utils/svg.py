@@ -29,6 +29,8 @@ PATH_COMMANDS = {
     "z",
 }
 
+DEFAULT_VIEWBOX_SIZE = 960.0
+
 
 def decode_svg_token_strings(
     tokenizer: Tokenizer, token_ids: Sequence[int]
@@ -74,7 +76,7 @@ def parse_svg_tokens(tokens: Sequence[str]) -> List[str | List[int]]:
     return result
 
 
-def svg_tokens_to_path(path: Sequence[str | Sequence[int]]) -> str:
+def svg_tokens_to_path(path: Sequence[str | Sequence[int | float | str]]) -> str:
     """Convert grouped SVG tokens into a canonical path string."""
 
     parts: List[str] = []
@@ -94,16 +96,54 @@ def svg_tokens_to_path(path: Sequence[str | Sequence[int]]) -> str:
     return "".join(parts)
 
 
+def _format_number(value: float, decimals: int) -> str:
+    """Format a float with up to ``decimals`` decimal places, stripping trailing zeros."""
+
+    formatted = f"{value:.{decimals}f}"
+    return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+
+
+def scale_svg_path_tokens(
+    parsed: Sequence[str | Sequence[int]],
+    *,
+    viewbox_size: float = DEFAULT_VIEWBOX_SIZE,
+    decimals: int = 3,
+) -> List[str]:
+    """Scale parsed SVG tokens from a pixel viewbox to unit coords."""
+
+    if viewbox_size == 0:
+        raise ValueError("viewbox_size must be non-zero")
+
+    scaled_tokens: List[str] = []
+    for element in parsed:
+        if isinstance(element, str):
+            scaled_tokens.append(element)
+            continue
+        for value in element:
+            scaled_value = float(value) / viewbox_size
+            scaled_tokens.append(_format_number(scaled_value, decimals))
+    return scaled_tokens
+
+
+def tokens_to_path_string(tokens: Sequence[str]) -> str:
+    """Join a flat list of tokens into a canonical path string."""
+
+    if not tokens:
+        return ""
+    return " ".join(tokens)
+
+
 def svg_path_from_token_ids(
     tokenizer: Tokenizer, token_ids: Sequence[int]
 ) -> tuple[str, List[str]]:
-    """Decode token ids into a canonical SVG path and decoded token strings."""
+    """Decode token ids into a scaled SVG path and decoded token strings."""
 
     decoded = decode_svg_token_strings(tokenizer, token_ids)
     if not decoded:
         return "", []
     parsed = parse_svg_tokens(decoded)
-    path = svg_tokens_to_path(parsed)
+    scaled_tokens = scale_svg_path_tokens(parsed)
+    path = tokens_to_path_string(scaled_tokens)
     return path, decoded
 
 
@@ -111,5 +151,7 @@ __all__ = [
     "decode_svg_token_strings",
     "parse_svg_tokens",
     "svg_tokens_to_path",
+    "scale_svg_path_tokens",
+    "tokens_to_path_string",
     "svg_path_from_token_ids",
 ]
