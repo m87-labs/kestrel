@@ -78,19 +78,19 @@ def svg_tokens_to_path(path: Sequence[str | Sequence[int]]) -> str:
     """Convert grouped SVG tokens into a canonical path string."""
 
     parts: List[str] = []
-    pending_comma = False
+    pending_space = False
     for element in path:
         if isinstance(element, str):
-            if pending_comma:
-                parts.append(",")
+            if pending_space:
+                parts.append(" ")
             parts.append(element)
-            pending_comma = False
+            pending_space = True
         else:
             for idx, value in enumerate(element):
-                if pending_comma or idx > 0:
-                    parts.append(",")
+                if pending_space:
+                    parts.append(" ")
                 parts.append(str(value))
-            pending_comma = True
+                pending_space = True
     return "".join(parts)
 
 
@@ -107,16 +107,9 @@ def svg_path_from_token_ids(
     return path, decoded
 
 
-def svg_path_token_length(tokens: Iterable[str]) -> int:
-    """Return the length of an SVG path expressed as decoded tokens."""
-
-    return sum(1 for _ in tokens)
-
-
 __all__ = [
     "decode_svg_token_strings",
     "parse_svg_tokens",
     "svg_tokens_to_path",
     "svg_path_from_token_ids",
-    "svg_path_token_length",
 ]

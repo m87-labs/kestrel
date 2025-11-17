@@ -92,6 +92,9 @@ class SegmentSkillState(SkillState):
         self._text_token_ids: List[int] = []
         self._coord_values: List[float] = []
         self._size_values: List[Tuple[float, float]] = []
+        self._streaming: bool = bool(segment_request.stream)
+        self._stream_offset: int = 0
+        self._pending_stream: Optional[str] = None
 
     def consume_step(
         self,
@@ -102,6 +105,7 @@ class SegmentSkillState(SkillState):
         self.append_token(token)
         if isinstance(token, TextToken):
             self._text_token_ids.append(token.token_id)
+            self._update_stream(runtime)
         elif isinstance(token, CoordToken):
             self._coord_values.append(float(token.pos))
         elif isinstance(token, SizeToken):
@@ -119,9 +123,15 @@ class SegmentSkillState(SkillState):
             tokenizer.decode(self._text_token_ids) if self._text_token_ids else ""
         )
 
-        svg_path, decoded_tokens = svg_path_from_token_ids(
-            tokenizer, self._text_token_ids
-        )
+        try:
+            svg_path, decoded_tokens = svg_path_from_token_ids(
+                tokenizer, self._text_token_ids
+            )
+            parse_error: Optional[str] = None
+        except Exception as exc:  # pragma: no cover - defensive
+            decoded_tokens = decode_svg_token_strings(tokenizer, self._text_token_ids)
+            svg_path = ""
+            parse_error = str(exc)
 
         points = _coords_to_points(self._coord_values)
         bbox = _build_bbox(self._coord_values, self._size_values)
@@ -134,6 +144,8 @@ class SegmentSkillState(SkillState):
             "token_ids": list(self._text_token_ids),
             "points": points,
         }
+        if parse_error:
+            segment["parse_error"] = parse_error
         if bbox is not None:
             segment["bbox"] = bbox
         if self._size_values:
@@ -149,6 +161,28 @@ class SegmentSkillState(SkillState):
             tokens=list(self.tokens),
             output={"segments": [segment]},
         )
+
+    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+        if not self._streaming:
+            return None
+        if not self._pending_stream:
+            return None
+        delta = self._pending_stream
+        self._pending_stream = None
+        return delta
+
+    def _update_stream(self, runtime: "MoondreamRuntime") -> None:
+        if not self._streaming:
+            return
+        try:
+            path, _ = svg_path_from_token_ids(runtime.tokenizer, self._text_token_ids)
+        except Exception:
+            return  # Don't stream until the path is parseable.
+        if not path:
+            return
+        if len(path) > self._stream_offset:
+            self._pending_stream = path[self._stream_offset :]
+            self._stream_offset = len(path)
 
 
 def _coords_to_points(coords: Sequence[float]) -> List[Dict[str, float]]:
