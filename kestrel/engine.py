@@ -942,6 +942,11 @@ class InferenceEngine:
                         result.request_id,
                     )
                     continue
+                if result.finish_reason == "error" and "error" in result.output:
+                    # Fail only the offending request while keeping the engine running.
+                    self._fail_request(req, RuntimeError(result.output["error"]))
+                    continue
+
                 engine_result = self._to_engine_result(result)
                 future = req.future
                 if future and not future.done():

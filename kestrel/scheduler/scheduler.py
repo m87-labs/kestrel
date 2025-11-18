@@ -6,6 +6,7 @@ from collections import deque
 from typing import Deque, List, Optional
 
 import time
+import logging
 
 import pyvips
 import torch
@@ -26,6 +27,8 @@ from .types import (
 from .sampling import sample_tokens
 from kestrel.utils.buffers import CpuGpuBuffer
 
+
+_LOGGER = logging.getLogger(__name__)
 
 class _SampleBuffer:
     """Pinned host buffer for sampled token ids with optional async copy."""
@@ -355,11 +358,23 @@ class GenerationScheduler:
 
     def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"
-        finalize = seq.skill_state.finalize(
-            self.runtime, reason=finish_reason
-        )
+
+        # Finalization can raise (e.g., malformed tokens during decode). Catch
+        # and package the error so only the offending request fails.
+        try:
+            finalize = seq.skill_state.finalize(
+                self.runtime, reason=finish_reason
+            )
+            tokens = finalize.tokens
+            output = finalize.output
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.exception("Failed to finalize sequence %s", seq.request.request_id)
+            finish_reason = "error"
+            tokens = []
+            output = {"error": str(exc)}
+
         prompt_tokens = seq.state.prompt_length
-        decode_tokens = len(finalize.tokens)
+        decode_tokens = len(tokens) if tokens else len(seq.skill_state.tokens)
         queued_at = seq.request.submitted_at
         prefill_started_at = seq.prefill_started_at or queued_at
         completed_at = seq.completed_at or time.perf_counter()
@@ -376,8 +391,8 @@ class GenerationScheduler:
         )
         return SchedulerResult(
             request_id=seq.request.request_id,
-            tokens=finalize.tokens,
+            tokens=tokens,
             finish_reason=finish_reason,
             metrics=metrics,
-            output=finalize.output,
+            output=output,
         )
