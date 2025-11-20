@@ -67,7 +67,29 @@ class SegmentSkill(SkillSpec):
         suffix: Sequence[int] = template.get("suffix", [])
         object_name = request_context.object
         object_tokens = runtime.tokenizer.encode(object_name).ids if object_name else []
-        ids = [*prefix, *object_tokens, *suffix]
+
+        # Assemble ids in vixtral order:
+        # <prefix> <spatial placeholders> object <suffix>
+        ids: List[int] = [*prefix]
+
+        refs = request_context.spatial_refs
+        if refs:
+            coord_id = runtime.config.tokenizer.coord_id
+            size_id = runtime.config.tokenizer.size_id
+            for ref in refs:
+                n = len(ref)
+                if n == 2:
+                    ids.extend([coord_id, coord_id])
+                elif n == 4:
+                    ids.extend([coord_id, coord_id, size_id])
+                else:
+                    raise ValueError(
+                        "Each spatial_ref must contain 2 (point) or 4 (bbox) values"
+                    )
+
+        ids.extend(object_tokens)
+        ids.extend(suffix)
+
         if not ids:
             return torch.empty((1, 0), dtype=torch.long)
         return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
@@ -159,9 +181,6 @@ class SegmentSkillState(SkillState):
                 {"width": max(min(w, 1.0), 0.0), "height": max(min(h, 1.0), 0.0)}
                 for w, h in self._size_values
             ]
-        if self._request.spatial_refs is not None:
-            segment["spatial_refs"] = [list(ref) for ref in self._request.spatial_refs]
-
         return SkillFinalizeResult(
             text=svg_path or raw_text,
             tokens=list(self.tokens),
