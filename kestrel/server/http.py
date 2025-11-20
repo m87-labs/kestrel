@@ -912,6 +912,12 @@ def _parse_spatial_refs(value: Any) -> Optional[List[List[float]]]:
                     f"spatial_refs[{idx}][{j}] must be within [0, 1]"
                 )
             coord.append(value_f)
+        if len(coord) == 4:
+            x_min, y_min, x_max, y_max = coord
+            if x_min > x_max or y_min > y_max:
+                raise ValueError(
+                    f"spatial_refs[{idx}] must be [x_min, y_min, x_max, y_max] with x_min<=x_max and y_min<=y_max"
+                )
         parsed.append(coord)
     return parsed
 

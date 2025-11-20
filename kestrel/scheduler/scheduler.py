@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, List, Optional
+from typing import Deque, List, Optional, Sequence
 
 import time
 import logging
@@ -12,9 +12,21 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.moondream.runtime import MoondreamRuntime, TextToken, Token
+from kestrel.moondream.runtime import (
+    MoondreamRuntime,
+    TextToken,
+    CoordToken,
+    SizeToken,
+    Token,
+)
 from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.skills import QuerySkill, SkillRegistry, SkillSpec, SkillState
+from kestrel.skills import (
+    QuerySkill,
+    SegmentRequest,
+    SkillRegistry,
+    SkillSpec,
+    SkillState,
+)
 
 from .queues import RequestQueue, RunningQueue
 from .types import (
@@ -29,6 +41,102 @@ from kestrel.utils.buffers import CpuGpuBuffer
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _prompt_with_spatial_tokens(
+    prompt_tokens: Tensor,
+    coord_id: int,
+    size_id: int,
+    spatial_refs: Sequence[Sequence[float]],
+) -> list[Token]:
+    """Replace coord/size placeholder ids in ``prompt_tokens`` with typed tokens.
+
+    - 2-value refs are treated as points: ``[x, y]``.
+    - 4-value refs are treated strictly as bounding boxes in
+      ``[x_min, y_min, x_max, y_max]`` format.
+    """
+    if prompt_tokens.ndim != 1:
+        tokens_1d = prompt_tokens.view(-1)
+    else:
+        tokens_1d = prompt_tokens
+    ids = tokens_1d.cpu().tolist()
+
+    # Precompute expected placeholder counts
+    coord_placeholders = sum(1 for t in ids if t == coord_id)
+    size_placeholders = sum(1 for t in ids if t == size_id)
+
+    # Build coord and size lists from spatial refs
+    coord_vals: list[float] = []
+    size_vals: list[tuple[float, float]] = []
+    for ref in spatial_refs:
+        n = len(ref)
+        if n == 2:
+            x, y = float(ref[0]), float(ref[1])
+            x = min(max(x, 0.0), 1.0)
+            y = min(max(y, 0.0), 1.0)
+            coord_vals.extend([x, y])
+        elif n == 4:
+            x_min, y_min, x_max, y_max = map(float, ref)
+            if not (0.0 <= x_min <= x_max <= 1.0 and 0.0 <= y_min <= y_max <= 1.0):
+                raise ValueError(
+                    "bbox spatial_ref must satisfy 0<=x_min<=x_max<=1 and 0<=y_min<=y_max<=1"
+                )
+            x_c = (x_min + x_max) / 2.0
+            y_c = (y_min + y_max) / 2.0
+            width = x_max - x_min
+            height = y_max - y_min
+            coord_vals.extend([x_c, y_c])
+            size_vals.append((width, height))
+        else:
+            raise ValueError(
+                "Each spatial_ref must contain 2 (point) or 4 (bbox) values"
+            )
+
+    expected_coords = 2 * len(spatial_refs)
+    expected_sizes = sum(1 for r in spatial_refs if len(r) == 4)
+    if coord_placeholders != expected_coords or size_placeholders != expected_sizes:
+        raise ValueError(
+            "Mismatch between spatial_refs and placeholder tokens: "
+            f"prompt has {coord_placeholders} coord and {size_placeholders} size placeholders, "
+            f"but refs require {expected_coords} coord and {expected_sizes} size placeholders."
+        )
+
+    # Replace placeholders in order of appearance
+    coord_iter = iter(coord_vals)
+    size_iter = iter(size_vals)
+    out: list[Token] = []
+    for tid in ids:
+        if tid == coord_id:
+            try:
+                pos = next(coord_iter)
+            except StopIteration as exc:
+                raise ValueError("Insufficient coord placeholders for spatial_refs") from exc
+            out.append(CoordToken(pos=float(pos)))
+        elif tid == size_id:
+            try:
+                w, h = next(size_iter)
+            except StopIteration as exc:
+                raise ValueError("Insufficient size placeholders for bbox spatial_refs") from exc
+            # Clamp sizes to [0, 1]
+            w = min(max(float(w), 0.0), 1.0)
+            h = min(max(float(h), 0.0), 1.0)
+            out.append(SizeToken(width=w, height=h))
+        else:
+            out.append(TextToken(token_id=int(tid)))
+
+    # Ensure all refs were consumed
+    try:
+        next(coord_iter)
+        raise ValueError("Unconsumed coord values after placeholder replacement")
+    except StopIteration:
+        pass
+    try:
+        next(size_iter)
+        raise ValueError("Unconsumed size values after placeholder replacement")
+    except StopIteration:
+        pass
+
+    return out
 
 class _SampleBuffer:
     """Pinned host buffer for sampled token ids with optional async copy."""
@@ -169,12 +277,28 @@ class GenerationScheduler:
                 break
 
             request = self.waiting.pop()
-            tokens = request.prompt_tokens.view(1, -1).to(
-                device=self.runtime.device, dtype=torch.long
-            )
+            # If this is a segmentation request with spatial refs, convert
+            # placeholder coord/size ids into typed CoordToken/SizeToken
+            # so the runtime embeds region features during prefill.
+            prompt_inputs: Tensor | list[Token]
+            ctx = request.request_context
+            if isinstance(ctx, SegmentRequest) and ctx.spatial_refs:
+                coord_id = self.runtime.config.tokenizer.coord_id
+                size_id = self.runtime.config.tokenizer.size_id
+                prompt_inputs = _prompt_with_spatial_tokens(
+                    request.prompt_tokens,
+                    coord_id,
+                    size_id,
+                    ctx.spatial_refs,
+                )
+            else:
+                tokens = request.prompt_tokens.view(1, -1).to(
+                    device=self.runtime.device, dtype=torch.long
+                )
+                prompt_inputs = tokens
             prefill_start = time.perf_counter()
             state, logits = self.runtime.start_sequence(
-                prompt_tokens=tokens,
+                prompt_tokens=prompt_inputs,
                 image=request.image,
                 image_crops=request.image_crops,
                 max_new_tokens=request.max_new_tokens,

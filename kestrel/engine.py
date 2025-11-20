@@ -647,6 +647,12 @@ class InferenceEngine:
                     raise ValueError(
                         f"spatial_refs[{idx}] values must be normalised to [0, 1]"
                     )
+                if len(converted) == 4:
+                    x_min, y_min, x_max, y_max = converted
+                    if x_min > x_max or y_min > y_max:
+                        raise ValueError(
+                            f"spatial_refs[{idx}] bbox must satisfy x_min<=x_max and y_min<=y_max"
+                        )
                 normalized_refs.append(tuple(converted))
 
         request = SegmentRequest(
