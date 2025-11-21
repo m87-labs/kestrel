@@ -203,6 +203,8 @@ class GenerationScheduler:
         ).pin_memory()
         self._pinned_token_np = self._pinned_token_buffer.numpy()
         self._sample_buffer = _SampleBuffer(runtime.max_batch_size, runtime.device)
+        self._flashinfer_rng = torch.Generator(device=runtime.device)
+        self._flashinfer_rng.manual_seed(torch.seed())
 
     # ------------------------------------------------------------------
     # Submission
@@ -437,7 +439,7 @@ class GenerationScheduler:
             top_ps[i] = req.top_p
         temps = temps.to(device=logits.device)
         top_ps = top_ps.to(device=logits.device)
-        return sample_tokens(logits, temps, top_ps)
+        return sample_tokens(logits, temps, top_ps, generator=self._flashinfer_rng)
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token
