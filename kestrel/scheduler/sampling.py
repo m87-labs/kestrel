@@ -18,7 +18,13 @@ def _(probs: Tensor, top_p: Tensor) -> Tensor:
     return flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
 
 
-def sample_tokens(logits: Tensor, temperatures: Tensor, top_ps: Tensor) -> Tensor:
+def sample_tokens(
+    logits: Tensor,
+    temperatures: Tensor,
+    top_ps: Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> Tensor:
     if logits.ndim != 2:
         raise ValueError(f"logits must be 2D (batch, vocab); received shape {logits.shape}")
 
@@ -45,6 +51,6 @@ def sample_tokens(logits: Tensor, temperatures: Tensor, top_ps: Tensor) -> Tenso
     probs.masked_fill_(force_greedy.unsqueeze(1), 0.)
     probs.scatter_add_(1, greedy_ids.unsqueeze(1), force_greedy.to(probs.dtype).unsqueeze(1))
 
-    # return flashinfer.sampling.top_p_sampling_from_probs(probs, topp)
-    return torch.ops.fi.topp_from_probs(probs, topp)
-
+    return flashinfer.sampling.top_p_sampling_from_probs(
+        probs, topp, generator=generator
+    )
