@@ -196,6 +196,10 @@ class InferenceEngine:
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
         self._scheduler_event = threading.Event()
+        self._run_gate = threading.Event()
+        self._run_gate.set()  # set == running
+        self._paused_flag = threading.Event()  # set == paused
+        self._paused_event = threading.Event()  # acknowledgment for callers
         self._scheduler_thread: Optional[threading.Thread] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._request_ids = itertools.count()
@@ -228,6 +232,12 @@ class InferenceEngine:
     @property
     def is_running(self) -> bool:
         return self._worker_task is not None and not self._worker_task.done()
+
+    @property
+    def is_paused(self) -> bool:
+        """Return True when the scheduler loop is currently paused."""
+
+        return self._paused_flag.is_set()
 
     def create_adapter(self, rank: int) -> LoRA:
         runtime = self.runtime
@@ -291,6 +301,7 @@ class InferenceEngine:
         if self._shutdown:
             return
         self._shutdown = True
+        self._pause_gate.set()
         await self._queue.put(None)
         if self._worker_task is not None:
             await self._worker_task
@@ -698,6 +709,35 @@ class InferenceEngine:
         )
         return EngineStream(request_id=request_id, queue=queue, result_future=future)
 
+    # ------------------------------------------------------------------
+    # Control APIs
+
+    def pause(self, *, timeout: Optional[float] = None) -> None:
+        """Pause scheduler progress and wait until GPU work is drained.
+
+        In-flight sequences remain allocated; new work is not admitted until
+        ``resume`` is called. Returns only after the scheduler loop acknowledges
+        the pause (or ``timeout`` elapses).
+        """
+
+        if self._shutdown:
+            return
+        self._run_gate.clear()
+        self._paused_flag.set()
+        self._paused_event.clear()
+        self._scheduler_event.set()
+        self._paused_event.wait(timeout)
+
+    def resume(self) -> None:
+        """Resume scheduler progress after a pause."""
+
+        if self._shutdown:
+            return
+        self._paused_event.clear()
+        self._paused_flag.clear()
+        self._run_gate.set()
+        self._scheduler_event.set()
+
     async def _submit_request(
         self,
         *,
@@ -872,6 +912,9 @@ class InferenceEngine:
         active_requests: Dict[int, _PendingRequest] = {}
         shutdown_requested = False
         wake_event = self._scheduler_event
+        run_gate = self._run_gate
+        paused_flag = self._paused_flag
+        paused_event = self._paused_event
 
         def admit_request(
             req: _PendingRequest, crops: Optional[OverlapCropOutput]
@@ -962,6 +1005,21 @@ class InferenceEngine:
         try:
             with torch.inference_mode():
                 while True:
+                    # If paused, wait until resumed or shutdown completes.
+                    if paused_flag.is_set():
+                        with runtime.graph_capture_lock:
+                            torch.cuda.synchronize(runtime.device)
+                        paused_event.set()
+                        if (
+                            shutdown_requested
+                            and not scheduler.has_pending_work()
+                            and not pending_crops
+                            and not active_requests
+                        ):
+                            break
+                        run_gate.wait(timeout=0.1)
+                        continue
+
                     progressed = False
                     while True:
                         try:
