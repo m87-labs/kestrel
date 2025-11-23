@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional, Sequence, cast
 
 import warnings
+import threading
 
 import numpy as np
 import pyvips
@@ -204,6 +205,8 @@ class MoondreamRuntime:
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
         torch.cuda.set_device(self.device)
+        # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
+        self.graph_capture_lock = threading.RLock()
 
         if cfg.model_paths.config_json:
             with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
@@ -1071,80 +1074,81 @@ class MoondreamRuntime:
         return sizes
 
     def _capture_decode_graphs(self) -> None:
-        workspace = self._graph_workspace
-        if workspace is None:
-            raise RuntimeError("CUDA graph workspace must be initialized before capture")
-        max_batch = workspace.token_buffer.shape[0]
-        if max_batch == 0:
-            return
+        with self.graph_capture_lock:
+            workspace = self._graph_workspace
+            if workspace is None:
+                raise RuntimeError("CUDA graph workspace must be initialized before capture")
+            max_batch = workspace.token_buffer.shape[0]
+            if max_batch == 0:
+                return
 
-        device = self.device
-        batch_indices = torch.arange(1, max_batch + 1, device=device, dtype=torch.long)
-        workspace.batch_idx_buffer.copy_(batch_indices)
-        workspace.token_buffer.zero_()
-        workspace.position_buffer.zero_()
+            device = self.device
+            batch_indices = torch.arange(1, max_batch + 1, device=device, dtype=torch.long)
+            workspace.batch_idx_buffer.copy_(batch_indices)
+            workspace.token_buffer.zero_()
+            workspace.position_buffer.zero_()
 
-        allocated_batches: list[int] = []
-        try:
-            for idx in batch_indices.tolist():
-                allocated = self.page_table.allocate()
-                if allocated != idx:
-                    raise RuntimeError(
-                        f"Expected batch index {idx} during CUDA graph capture, got {allocated}"
+            allocated_batches: list[int] = []
+            try:
+                for idx in batch_indices.tolist():
+                    allocated = self.page_table.allocate()
+                    if allocated != idx:
+                        raise RuntimeError(
+                            f"Expected batch index {idx} during CUDA graph capture, got {allocated}"
+                        )
+                    batch_tensor = torch.tensor([idx], device=device, dtype=torch.int64)
+                    self.page_table.reserve(
+                        batch_idx_int=idx,
+                        batch_idx=batch_tensor,
+                        seq_len=1,
                     )
-                batch_tensor = torch.tensor([idx], device=device, dtype=torch.int64)
-                self.page_table.reserve(
-                    batch_idx_int=idx,
-                    batch_idx=batch_tensor,
-                    seq_len=1,
-                )
-                allocated_batches.append(idx)
+                    allocated_batches.append(idx)
 
-            torch.cuda.synchronize(device=device)
-            for bs in reversed(self._graph_batch_sizes):
-                graph = torch.cuda.CUDAGraph()
-                with torch.inference_mode():
-                    metadata = self._build_flashinfer_metadata(
-                        workspace.batch_idx_buffer[:bs],
-                        workspace.position_buffer[:bs],
-                        full_batch_size=bs,
-                        use_graph=True,
-                    )
-                    warmup = self._decode_step(
-                        workspace.batch_idx_buffer[:bs],
-                        workspace.token_buffer[:bs, 0],
-                        workspace.position_buffer[:bs],
-                        use_graph=True,
-                        full_batch_size=bs,
-                        flashinfer_metadata=metadata,
-                        skip_plan=False,
-                    )
-                    workspace.output_buffer[:bs].copy_(warmup.logits)
-                    workspace.hidden_buffer[:bs].copy_(warmup.hidden[:, 0, :])
-
-                    torch.cuda.synchronize(device=device)
-
-                    with torch.cuda.graph(graph, self._graph_pool):
-                        out = self._decode_step(
+                torch.cuda.synchronize(device=device)
+                for bs in reversed(self._graph_batch_sizes):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.inference_mode():
+                        metadata = self._build_flashinfer_metadata(
+                            workspace.batch_idx_buffer[:bs],
+                            workspace.position_buffer[:bs],
+                            full_batch_size=bs,
+                            use_graph=True,
+                        )
+                        warmup = self._decode_step(
                             workspace.batch_idx_buffer[:bs],
                             workspace.token_buffer[:bs, 0],
                             workspace.position_buffer[:bs],
                             use_graph=True,
                             full_batch_size=bs,
                             flashinfer_metadata=metadata,
-                            skip_plan=True,
+                            skip_plan=False,
                         )
-                        workspace.output_buffer[:bs].copy_(out.logits)
-                        workspace.hidden_buffer[:bs].copy_(out.hidden[:, 0, :])
+                        workspace.output_buffer[:bs].copy_(warmup.logits)
+                        workspace.hidden_buffer[:bs].copy_(warmup.hidden[:, 0, :])
 
-                if self._graph_pool is None:
-                    self._graph_pool = graph.pool()
-                self._cuda_graphs[bs] = graph
-                torch.cuda.synchronize(device=device)
-        finally:
-            for idx in reversed(allocated_batches):
-                self.page_table.erase(idx)
-            self._clear_graph_inputs(0)
+                        torch.cuda.synchronize(device=device)
+
+                        with torch.cuda.graph(graph, self._graph_pool):
+                            out = self._decode_step(
+                                workspace.batch_idx_buffer[:bs],
+                                workspace.token_buffer[:bs, 0],
+                                workspace.position_buffer[:bs],
+                                use_graph=True,
+                                full_batch_size=bs,
+                                flashinfer_metadata=metadata,
+                                skip_plan=True,
+                            )
+                            workspace.output_buffer[:bs].copy_(out.logits)
+                            workspace.hidden_buffer[:bs].copy_(out.hidden[:, 0, :])
+
+                    if self._graph_pool is None:
+                        self._graph_pool = graph.pool()
+                    self._cuda_graphs[bs] = graph
+                    torch.cuda.synchronize(device=device)
+            finally:
+                for idx in reversed(allocated_batches):
+                    self.page_table.erase(idx)
+                self._clear_graph_inputs(0)
 
     def _select_graph_batch_size(self, batch_size: int) -> int | None:
         for size in self._graph_batch_sizes:
