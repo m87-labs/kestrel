@@ -32,6 +32,11 @@ class RuntimeConfig:
     page_size: int = 128
     max_seq_length: Optional[int] = None
     enable_cuda_graphs: bool = True
+    enable_sam_hq_refiner: bool = False
+    sam_hq_checkpoint: Optional[Path] = None
+    sam_hq_model_type: str = "vit_h"
+    sam_hq_device: str = "cuda"
+    sam_hq_iters: int = 3
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

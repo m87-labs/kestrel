@@ -17,6 +17,9 @@ dependencies = [
     "uvicorn>=0.30",
     "flashinfer-python>=0.5,<0.6",
     "vllm==0.11.0",
+    "opencv-python-headless>=4.8",
+    "FastGeodis",
+    "pypotrace",
 ]
 
 [tool.setuptools.packages.find]

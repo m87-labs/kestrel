@@ -155,6 +155,8 @@ class _ServerState:
         segment = (result.output.get("segments") or [{}])[0]
         bbox = segment.get("bbox")
         path = segment.get("svg_path") or ""
+        refined_path = segment.get("refined_svg_path") or ""
+        refined_bbox = segment.get("refined_bbox")
         if bbox and set(bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
             bbox = {
                 "x_min": bbox["x_min"],
@@ -162,17 +164,29 @@ class _ServerState:
                 "x_max": bbox["x_max"],
                 "y_max": bbox["y_max"],
             }
+        if refined_bbox and set(refined_bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
+            refined_bbox = {
+                "x_min": refined_bbox["x_min"],
+                "y_min": refined_bbox["y_min"],
+                "x_max": refined_bbox["x_max"],
+                "y_max": refined_bbox["y_max"],
+            }
 
         response_payload = {
             "request_id": str(result.request_id),
             "finish_reason": result.finish_reason,
             "bbox": bbox,
             "path": path,
+            "refined_path": refined_path,
+            "refined_bbox": refined_bbox,
             "metrics": _format_metrics(result.metrics),
         }
         parse_error = segment.get("parse_error")
         if parse_error:
             response_payload["parse_error"] = parse_error
+        refine_timing = segment.get("sam_refine_timing")
+        if refine_timing:
+            response_payload["sam_refine_timing"] = refine_timing
 
         return JSONResponse(response_payload)
 
@@ -722,6 +736,25 @@ class _ServerState:
                         }
 
                     path = segment.get("svg_path") or ""
+                    refined_path = segment.get("refined_svg_path") or ""
+                    refined_bbox_full = segment.get("refined_bbox")
+                    refined_bbox = None
+                    if refined_bbox_full and set(refined_bbox_full.keys()) == {
+                        "x_center",
+                        "y_center",
+                        "width",
+                        "height",
+                        "x_min",
+                        "x_max",
+                        "y_min",
+                        "y_max",
+                    }:
+                        refined_bbox = {
+                            "x_min": refined_bbox_full["x_min"],
+                            "y_min": refined_bbox_full["y_min"],
+                            "x_max": refined_bbox_full["x_max"],
+                            "y_max": refined_bbox_full["y_max"],
+                        }
                     parse_error = segment.get("parse_error")
                     metrics_payload = _format_metrics(result.metrics)
                     payload_final = {
@@ -732,10 +765,15 @@ class _ServerState:
                         "finish_reason": result.finish_reason,
                         "path": path,
                         "bbox": bbox_minmax,
+                        "refined_path": refined_path,
+                        "refined_bbox": refined_bbox,
                         "metrics": metrics_payload,
                     }
                     if parse_error:
                         payload_final["parse_error"] = parse_error
+                    refine_timing = segment.get("sam_refine_timing")
+                    if refine_timing:
+                        payload_final["sam_refine_timing"] = refine_timing
                     yield _sse_payload(payload_final)
 
                 return StreamingResponse(
@@ -759,12 +797,21 @@ class _ServerState:
         segment = (result.output.get("segments") or [{}])[0]
         bbox = segment.get("bbox")
         path = segment.get("svg_path") or ""
+        refined_path = segment.get("refined_svg_path") or ""
+        refined_bbox = segment.get("refined_bbox")
         if bbox and set(bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
             bbox = {
                 "x_min": bbox["x_min"],
                 "y_min": bbox["y_min"],
                 "x_max": bbox["x_max"],
                 "y_max": bbox["y_max"],
+            }
+        if refined_bbox and set(refined_bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
+            refined_bbox = {
+                "x_min": refined_bbox["x_min"],
+                "y_min": refined_bbox["y_min"],
+                "x_max": refined_bbox["x_max"],
+                "y_max": refined_bbox["y_max"],
             }
 
         metrics_payload = _format_metrics(result.metrics)
@@ -773,11 +820,16 @@ class _ServerState:
             "finish_reason": result.finish_reason,
             "bbox": bbox,
             "path": path,
+            "refined_path": refined_path,
+            "refined_bbox": refined_bbox,
             "metrics": metrics_payload,
         }
         parse_error = segment.get("parse_error")
         if parse_error:
             response_payload["parse_error"] = parse_error
+        refine_timing = segment.get("sam_refine_timing")
+        if refine_timing:
+            response_payload["sam_refine_timing"] = refine_timing
 
         return JSONResponse(response_payload)
 

@@ -53,6 +53,32 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Disable CUDA graph capture for batched decode",
     )
+    parser.add_argument(
+        "--enable-sam-hq-refiner",
+        action="store_true",
+        help="Enable HQ-SAM refiner for segmentation outputs",
+    )
+    parser.add_argument(
+        "--sam-hq-checkpoint",
+        type=Path,
+        help="Path to HQ-SAM checkpoint",
+    )
+    parser.add_argument(
+        "--sam-hq-model-type",
+        default="vit_h",
+        help="HQ-SAM model type (e.g., vit_h)",
+    )
+    parser.add_argument(
+        "--sam-hq-device",
+        type=str,
+        help="Device for HQ-SAM refiner (defaults to --device)",
+    )
+    parser.add_argument(
+        "--sam-hq-iters",
+        type=int,
+        default=3,
+        help="Iterations for HQ-SAM refiner",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -127,6 +153,11 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
+        enable_sam_hq_refiner=args.enable_sam_hq_refiner,
+        sam_hq_checkpoint=args.sam_hq_checkpoint,
+        sam_hq_model_type=args.sam_hq_model_type,
+        sam_hq_device=args.sam_hq_device or args.device,
+        sam_hq_iters=args.sam_hq_iters,
     )
 
 

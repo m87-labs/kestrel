@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Sequence
+
+import numpy as np
+import pyvips
 
 from tokenizers import Tokenizer
 
@@ -154,4 +158,94 @@ __all__ = [
     "scale_svg_path_tokens",
     "tokens_to_path_string",
     "svg_path_from_token_ids",
+    "tokens_to_raw_path",
+    "split_path_tokens",
+    "svg_from_path",
+    "render_svg_to_mask",
 ]
+
+
+def tokens_to_raw_path(tokens: Sequence[str]) -> str:
+    """Convert decoded SVG tokens into an unscaled path string."""
+
+    if not tokens:
+        return ""
+    parsed = parse_svg_tokens(tokens)
+    return svg_tokens_to_path(parsed)
+
+
+def split_path_tokens(path: str) -> List[str]:
+    """Tokenize a raw SVG path string into command/number tokens."""
+
+    tokens: List[str] = []
+    for cmd, rest in re.findall(r"([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)", path):
+        tokens.append(cmd)
+        if not rest:
+            continue
+        for num in re.findall(r"-?\d+(?:\.\d+)?", rest):
+            if num.startswith("-"):
+                tokens.append("-")
+                num = num[1:]
+            try:
+                ival = int(round(float(num)))
+            except Exception:
+                continue
+            tokens.append(str(ival))
+    return tokens
+
+
+def svg_from_path(
+    svg_path: str,
+    width: float,
+    height: float,
+    bbox: Sequence[float],
+    viewbox: float = DEFAULT_VIEWBOX_SIZE,
+) -> str:
+    """
+    Project a viewbox-space SVG path into image space using a normalized bbox [cx, cy, w, h].
+    """
+
+    x0 = (bbox[0] - bbox[2] / 2) * viewbox
+    y0 = (bbox[1] - bbox[3] / 2) * viewbox
+    sx = bbox[2]
+    sy = bbox[3]
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {int(viewbox)} {int(viewbox)}" '
+        f'preserveAspectRatio="none" width="{width}" height="{height}">'
+        f'<path d="{svg_path}" fill="white" transform="translate({x0},{y0}) scale({sx},{sy})"/></svg>'
+    )
+
+
+def render_svg_to_mask(svg: str, width: int, height: int) -> np.ndarray:
+    """Rasterize an SVG string to a boolean mask using pyvips."""
+
+    width = int(round(width))
+    height = int(round(height))
+
+    normalized_svg = (
+        svg.replace(",M", " M")
+        .replace(",m", " m")
+        .replace(",L", " L")
+        .replace(",l", " l")
+        .replace(",C", " C")
+        .replace(",c", " c")
+        .replace(",Z", " Z")
+        .replace(",z", " z")
+    )
+
+    image = pyvips.Image.svgload_buffer(normalized_svg.encode("utf-8"), unlimited=True)
+
+    if image.width != width or image.height != height:
+        scale_x = width / image.width if image.width else 1.0
+        scale_y = height / image.height if image.height else 1.0
+        image = image.resize(scale_x, vscale=scale_y)
+
+    if image.hasalpha():
+        alpha = image.extract_band(image.bands - 1)
+    else:
+        alpha = image.colourspace("b-w")
+
+    buffer = alpha.write_to_memory()
+    mask = np.frombuffer(buffer, dtype=np.uint8).reshape(image.height, image.width)
+    return mask > 0

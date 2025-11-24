@@ -284,7 +284,7 @@ def build_text_model(
 
     text = nn.ModuleDict(
         {
-            "blocks": nn.ModuleList(
+            "blocks": nn.ModuleList(W
                 [
                     nn.ModuleDict(
                         {

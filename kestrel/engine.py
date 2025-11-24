@@ -49,6 +49,8 @@ from typing import (
     Literal,
 )
 
+import cv2
+import numpy as np
 import torch
 import pyvips
 
@@ -79,6 +81,22 @@ from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.moondream.layers import LoRA
+from kestrel.utils.image import vips_to_uint8_numpy
+from kestrel.utils.svg import (
+    parse_svg_tokens,
+    render_svg_to_mask,
+    scale_svg_path_tokens,
+    split_path_tokens,
+    svg_from_path,
+    tokens_to_path_string,
+    tokens_to_raw_path,
+)
+from kestrel.third_party.hqsam.segment_anything import sam_model_registry
+from kestrel.third_party.hqsam.segment_anything.utils.transforms import (
+    ResizeLongestSide,
+)
+from kestrel.third_party.sam_hq_refiner.bitmap_to_svg import bitmap_to_svg
+from kestrel.third_party.sam_hq_refiner.sam_refiner import sam_refiner
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -218,6 +236,14 @@ class InferenceEngine:
         self._default_max_new_tokens = 768
         self._default_temperature = 0.2
         self._default_top_p = 0.9
+        self._sam_hq_model = None
+        self._sam_hq_resize = None
+        self._sam_hq_lock = threading.Lock()
+        self._sam_hq_enabled = bool(runtime_cfg.enable_sam_hq_refiner)
+        self._sam_hq_checkpoint = runtime_cfg.sam_hq_checkpoint
+        self._sam_hq_device = runtime_cfg.sam_hq_device
+        self._sam_hq_model_type = runtime_cfg.sam_hq_model_type
+        self._sam_hq_iters = int(runtime_cfg.sam_hq_iters)
 
     @property
     def runtime(self) -> MoondreamRuntime:
@@ -849,6 +875,204 @@ class InferenceEngine:
             return request_context.settings.adapter
         return None
 
+    def _ensure_sam_hq(self):
+        if not self._sam_hq_enabled:
+            return None, None
+        if self._sam_hq_model is not None and self._sam_hq_resize is not None:
+            return self._sam_hq_model, self._sam_hq_resize
+        with self._sam_hq_lock:
+            if self._sam_hq_model is not None and self._sam_hq_resize is not None:
+                return self._sam_hq_model, self._sam_hq_resize
+            ckpt = self._sam_hq_checkpoint
+            if ckpt is None:
+                raise RuntimeError("sam_hq_checkpoint not configured")
+            if not ckpt.exists():
+                raise FileNotFoundError(f"SAM HQ checkpoint not found: {ckpt}")
+            print(
+                f"[sam-debug] loading sam-hq model type={self._sam_hq_model_type} ckpt={ckpt} device={self._sam_hq_device}"
+            )
+            model = sam_model_registry[self._sam_hq_model_type](checkpoint=str(ckpt))
+            model.to(device=self._sam_hq_device)
+            resize = ResizeLongestSide(model.image_encoder.img_size)
+            self._sam_hq_model = model
+            self._sam_hq_resize = resize
+            return model, resize
+
+    def _refine_segment_output(
+        self, segment: Dict[str, object], image: pyvips.Image
+    ) -> Optional[Dict[str, object]]:
+        if not self._sam_hq_enabled:
+            return None
+
+        try:
+            sam_model, resize_transform = self._ensure_sam_hq()
+        except Exception:
+            return None
+        if sam_model is None or resize_transform is None:
+            return None
+
+        svg_tokens = segment.get("path_tokens")
+        bbox = segment.get("bbox")
+        if not svg_tokens or not bbox or image is None:
+            return None
+
+        try:
+            bbox_vals = [
+                float(bbox["x_center"]),
+                float(bbox["y_center"]),
+                float(bbox["width"]),
+                float(bbox["height"]),
+            ]
+        except Exception:
+            return None
+
+        width = image.width
+        height = image.height
+
+        try:
+            raw_path = tokens_to_raw_path(svg_tokens)
+            svg_full = svg_from_path(raw_path, width, height, bbox_vals)
+            coarse_mask = render_svg_to_mask(svg_full, width, height)
+        except Exception:
+            return None
+        if not coarse_mask.any():
+            return None
+        print(
+            "[sam-debug] coarse mask",
+            coarse_mask.shape,
+            "mask_sum",
+            int(coarse_mask.sum()),
+            "bbox",
+            bbox_vals,
+        )
+
+        cx, cy, bw, bh = bbox_vals
+        x1 = max(0.0, (cx - bw / 2) * width)
+        y1 = max(0.0, (cy - bh / 2) * height)
+        x2 = min(float(width), (cx + bw / 2) * width)
+        y2 = min(float(height), (cy + bh / 2) * height)
+        grow_w = 0.1 * (x2 - x1)
+        grow_h = 0.1 * (y2 - y1)
+        x1 = max(0.0, x1 - grow_w)
+        y1 = max(0.0, y1 - grow_h)
+        x2 = min(float(width), x2 + grow_w)
+        y2 = min(float(height), y2 + grow_h)
+
+        x1i = int(math.floor(x1))
+        y1i = int(math.floor(y1))
+        x2i = int(math.ceil(x2))
+        y2i = int(math.ceil(y2))
+
+        np_image = vips_to_uint8_numpy(image)
+        crop_img = np_image[y1i:y2i, x1i:x2i]
+        crop_mask = coarse_mask[y1i:y2i, x1i:x2i]
+        if crop_img.size == 0 or crop_mask.size == 0:
+            return None
+        print(
+            "[sam-debug] crop coords",
+            (x1i, y1i, x2i, y2i),
+            "crop_img",
+            crop_img.shape,
+            "crop_mask",
+            crop_mask.shape,
+        )
+
+        crop_bgr = cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR)
+        crop_h, crop_w = crop_mask.shape[:2]
+        boxes = torch.tensor(
+            [[0.0, 0.0, float(crop_w), float(crop_h)]], device=sam_model.device
+        )
+
+        refine_timing: Dict[str, object] = {}
+        try:
+            refined_masks, _, _, refine_timing = sam_refiner(
+                crop_bgr,
+                [crop_mask.astype(np.uint8)],
+                sam_model,
+                resize_transform=resize_transform,
+                iters=self._sam_hq_iters,
+                boxes_xyxy=boxes,
+                timing=refine_timing,
+            )
+        except Exception:
+            return None
+        refined_crop = refined_masks[0]
+        if refined_crop.shape != crop_mask.shape:
+            refined_crop = cv2.resize(
+                refined_crop.astype(np.uint8),
+                (crop_w, crop_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        refined_crop = refined_crop.astype(bool)
+        print(
+            "[sam-debug] refined_crop",
+            refined_crop.shape,
+            "sum",
+            int(refined_crop.sum()),
+            "iters",
+            self._sam_hq_iters,
+            "timing",
+            refine_timing,
+        )
+
+        refined_full = np.zeros_like(coarse_mask, dtype=bool)
+        refined_full[y1i : y1i + crop_h, x1i : x1i + crop_w] = refined_crop[
+            : crop_h, : crop_w
+        ]
+
+        ys, xs = np.nonzero(refined_full)
+        if xs.size == 0 or ys.size == 0:
+            return None
+
+        x_min = xs.min()
+        x_max = xs.max()
+        y_min = ys.min()
+        y_max = ys.max()
+        w_norm = (x_max - x_min + 1) / float(width)
+        h_norm = (y_max - y_min + 1) / float(height)
+        cx_norm = (x_min + x_max + 1) / 2.0 / float(width)
+        cy_norm = (y_min + y_max + 1) / 2.0 / float(height)
+        refined_bbox = {
+            "x_center": cx_norm,
+            "y_center": cy_norm,
+            "width": w_norm,
+            "height": h_norm,
+            "x_min": x_min / float(width),
+            "x_max": x_max / float(width),
+            "y_min": y_min / float(height),
+            "y_max": y_max / float(height),
+        }
+
+        try:
+            svg_result = bitmap_to_svg(refined_full.astype(np.uint8))
+            if not svg_result:
+                return None
+            path_str = "".join(svg_result.paths)
+            refined_tokens = split_path_tokens(path_str)
+            parsed = parse_svg_tokens(refined_tokens)
+            scaled_tokens = scale_svg_path_tokens(parsed)
+            refined_svg_path = tokens_to_path_string(scaled_tokens)
+        except Exception:
+            return None
+        print(
+            "[sam-debug] refined_svg_path_len",
+            len(refined_svg_path),
+            "refined_bbox",
+            refined_bbox,
+        )
+
+        timing_payload = {
+            "iter_s": refine_timing.get("iter_s"),
+            "image_encoding_s": refine_timing.get("image_encoding_s"),
+            "total_refine_s": refine_timing.get("total_refine_s"),
+        }
+
+        return {
+            "refined_svg_path": refined_svg_path,
+            "refined_bbox": refined_bbox,
+            "sam_refine_timing": timing_payload,
+        }
+
     def _complete_stream(
         self,
         req: _PendingRequest,
@@ -995,6 +1219,13 @@ class InferenceEngine:
                     # Fail only the offending request while keeping the engine running.
                     self._fail_request(req, RuntimeError(result.output["error"]))
                     continue
+
+                if req.skill.name == "segment":
+                    segments = result.output.get("segments") if result.output else None
+                    if segments and req.image is not None:
+                        refined = self._refine_segment_output(segments[0], req.image)
+                        if refined:
+                            segments[0].update(refined)
 
                 engine_result = self._to_engine_result(result)
                 future = req.future

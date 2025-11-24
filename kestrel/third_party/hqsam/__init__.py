@@ -1,0 +1,1 @@
+"""Vendored HQ-SAM package."""
