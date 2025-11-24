@@ -36,7 +36,7 @@ class RuntimeConfig:
     sam_hq_checkpoint: Optional[Path] = None
     sam_hq_model_type: str = "vit_h"
     sam_hq_device: str = "cuda"
-    sam_hq_iters: int = 3
+    sam_hq_iters: int = 8
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

@@ -224,6 +224,8 @@ class InferenceEngine:
         self._shutdown = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._image_executor: Optional[ThreadPoolExecutor] = None
+        self._pause_gate = threading.Event()
+        self._pause_gate.set()
         self._skills = skills or SkillRegistry(
             [
                 QuerySkill(),
@@ -677,9 +679,7 @@ class InferenceEngine:
                     )
                 converted = [float(value) for value in ref]
                 if not all(math.isfinite(value) for value in converted):
-                    raise ValueError(
-                        f"spatial_refs[{idx}] contains non-finite values"
-                    )
+                    raise ValueError(f"spatial_refs[{idx}] contains non-finite values")
                 if not all(0.0 <= value <= 1.0 for value in converted):
                     raise ValueError(
                         f"spatial_refs[{idx}] values must be normalised to [0, 1]"
@@ -907,14 +907,14 @@ class InferenceEngine:
         try:
             sam_model, resize_transform = self._ensure_sam_hq()
         except Exception:
-            return None
+            raise
         if sam_model is None or resize_transform is None:
-            return None
+            raise RuntimeError("SAM HQ not initialized")
 
         svg_tokens = segment.get("path_tokens")
         bbox = segment.get("bbox")
         if not svg_tokens or not bbox or image is None:
-            return None
+            raise RuntimeError("Missing tokens or bbox for refinement")
 
         try:
             bbox_vals = [
@@ -924,7 +924,7 @@ class InferenceEngine:
                 float(bbox["height"]),
             ]
         except Exception:
-            return None
+            raise RuntimeError("Invalid bbox values for refinement")
 
         width = image.width
         height = image.height
@@ -934,9 +934,9 @@ class InferenceEngine:
             svg_full = svg_from_path(raw_path, width, height, bbox_vals)
             coarse_mask = render_svg_to_mask(svg_full, width, height)
         except Exception:
-            return None
+            raise RuntimeError("Failed to rasterize coarse SVG for refinement")
         if not coarse_mask.any():
-            return None
+            raise RuntimeError("Empty coarse mask; cannot refine")
         print(
             "[sam-debug] coarse mask",
             coarse_mask.shape,
@@ -967,7 +967,7 @@ class InferenceEngine:
         crop_img = np_image[y1i:y2i, x1i:x2i]
         crop_mask = coarse_mask[y1i:y2i, x1i:x2i]
         if crop_img.size == 0 or crop_mask.size == 0:
-            return None
+            raise RuntimeError("Empty crop for refinement")
         print(
             "[sam-debug] crop coords",
             (x1i, y1i, x2i, y2i),
@@ -995,7 +995,7 @@ class InferenceEngine:
                 timing=refine_timing,
             )
         except Exception:
-            return None
+            raise RuntimeError("SAM HQ refine failed")
         refined_crop = refined_masks[0]
         if refined_crop.shape != crop_mask.shape:
             refined_crop = cv2.resize(
@@ -1017,12 +1017,12 @@ class InferenceEngine:
 
         refined_full = np.zeros_like(coarse_mask, dtype=bool)
         refined_full[y1i : y1i + crop_h, x1i : x1i + crop_w] = refined_crop[
-            : crop_h, : crop_w
+            :crop_h, :crop_w
         ]
 
         ys, xs = np.nonzero(refined_full)
         if xs.size == 0 or ys.size == 0:
-            return None
+            raise RuntimeError("Refined mask empty")
 
         x_min = xs.min()
         x_max = xs.max()
@@ -1044,16 +1044,21 @@ class InferenceEngine:
         }
 
         try:
-            svg_result = bitmap_to_svg(refined_full.astype(np.uint8))
+            svg_result = bitmap_to_svg(
+                refined_full.astype(np.uint8),
+                turdsize=2,
+                alphamax=1.0,
+                opttolerance=0.2,
+            )
             if not svg_result:
-                return None
+                raise RuntimeError("bitmap_to_svg returned empty")
             path_str = "".join(svg_result.paths)
             refined_tokens = split_path_tokens(path_str)
             parsed = parse_svg_tokens(refined_tokens)
             scaled_tokens = scale_svg_path_tokens(parsed)
             refined_svg_path = tokens_to_path_string(scaled_tokens)
         except Exception:
-            return None
+            raise RuntimeError("Failed to convert refined mask to SVG")
         print(
             "[sam-debug] refined_svg_path_len",
             len(refined_svg_path),
@@ -1176,7 +1181,9 @@ class InferenceEngine:
             req_id = req.request_id
             pending_crops[req_id] = (req, future)
 
-            def _on_crops_ready(fut: Future[OverlapCropOutput], rid: int = req_id) -> None:
+            def _on_crops_ready(
+                fut: Future[OverlapCropOutput], rid: int = req_id
+            ) -> None:
                 ready_crops.put(rid)
                 wake_event.set()
 
@@ -1223,9 +1230,23 @@ class InferenceEngine:
                 if req.skill.name == "segment":
                     segments = result.output.get("segments") if result.output else None
                     if segments and req.image is not None:
-                        refined = self._refine_segment_output(segments[0], req.image)
-                        if refined:
+                        print("[sam-debug] refinement start request_id", req.request_id)
+                        try:
+                            refined = self._refine_segment_output(segments[0], req.image)
+                            if "refined_svg_path" not in refined or "refined_bbox" not in refined:
+                                raise RuntimeError("Refinement did not produce refined outputs")
+                            print(
+                                "[sam-debug] refinement complete",
+                                "refined_bbox",
+                                refined.get("refined_bbox"),
+                                "refined_path_len",
+                                len(refined.get("refined_svg_path", "")),
+                            )
                             segments[0].update(refined)
+                        except Exception as exc:
+                            print("[sam-debug] refinement failed", exc)
+                            self._fail_request(req, exc)
+                            continue
 
                 engine_result = self._to_engine_result(result)
                 future = req.future

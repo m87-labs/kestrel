@@ -100,11 +100,18 @@ def _make_svg(segment: dict, width: int, height: int) -> tuple[str, np.ndarray]:
         if raw_tokens:
             viewbox_path = tokens_to_raw_path(raw_tokens)
         else:
-            viewbox_path = ""
+            raise RuntimeError("No SVG path or tokens available for overlay")
     else:
         viewbox_path = _path_to_viewbox(path, DEFAULT_VIEWBOX)
-    if not viewbox_path:
-        return "", np.zeros((height, width), dtype=bool)
+    print(
+        "[sam-debug] building svg",
+        "bbox",
+        bbox,
+        "refined",
+        bool(refined_path),
+        "path_len",
+        len(viewbox_path),
+    )
     svg_full = svg_from_path(viewbox_path, width, height, [cx, cy, bw, bh], viewbox=DEFAULT_VIEWBOX)
     mask = render_svg_to_mask(svg_full, width, height)
     return svg_full, mask
@@ -120,7 +127,7 @@ async def _run(args: argparse.Namespace) -> None:
         model_paths=model_paths,
         device=args.device,
         dtype=args.dtype,
-        max_batch_size=1,
+        max_batch_size=args.max_batch_size,
         page_size=128,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
@@ -158,18 +165,32 @@ async def _run(args: argparse.Namespace) -> None:
                 },
             )
             segment = (result.output.get("segments") or [{}])[0]
-            svg_full, mask = _make_svg(segment, width, height)
-            if not mask.any():
-                print("[sam-debug] empty mask; skipping overlay")
-                continue
+            print(
+                "[sam-debug] segment output keys",
+                list(segment.keys()),
+                "bbox",
+                segment.get("bbox"),
+                "refined_bbox",
+                segment.get("refined_bbox"),
+            )
+            refined_path = segment.get("refined_svg_path")
+            refined_bbox = segment.get("refined_bbox")
+            if not refined_path or not refined_bbox:
+                raise RuntimeError("Refined mask missing from segment output")
 
-            overlay = _build_overlay(np_image, mask)
-            out_path = str(Path(image_path).with_suffix("")) + "_overlay.png"
-            Image.fromarray(overlay).save(out_path)
-            svg_path = str(Path(image_path).with_suffix("")) + "_mask.svg"
-            with open(svg_path, "w", encoding="utf-8") as f:
-                f.write(svg_full)
-            print(f"[sam-debug] saved overlay={out_path} svg={svg_path}")
+            refined_svg, refined_mask = _make_svg(segment, width, height)
+            if not refined_mask.any():
+                raise RuntimeError("Refined mask empty; cannot overlay")
+
+            refined_overlay = _build_overlay(np_image, refined_mask)
+            refined_out = str(Path(image_path).with_suffix("")) + "_overlay_refined.png"
+            Image.fromarray(refined_overlay).save(refined_out)
+            refined_svg_path = str(Path(image_path).with_suffix("")) + "_mask_refined.svg"
+            with open(refined_svg_path, "w", encoding="utf-8") as f:
+                f.write(refined_svg)
+            print(
+                f"[sam-debug] saved refined_overlay={refined_out} refined_svg={refined_svg_path}"
+            )
     finally:
         await engine.shutdown()
 
@@ -190,8 +211,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--sam-hq-checkpoint", type=Path, required=True, help="Path to SAM HQ checkpoint")
     parser.add_argument("--sam-hq-model-type", default="vit_h", help="SAM HQ model type (e.g., vit_h)")
     parser.add_argument("--sam-hq-device", type=str, help="Device for SAM HQ (defaults to --device)")
-    parser.add_argument("--sam-hq-iters", type=int, default=3, help="Iterations for SAM HQ refiner")
+    parser.add_argument("--sam-hq-iters", type=int, default=8, help="Iterations for SAM HQ refiner")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max segmentation tokens")
+    parser.add_argument("--max-batch-size", type=int, default=2, help="Max batch size (>=2 for runtime)")
     parser.add_argument("--max-seq-length", type=int, default=131072, help="Maximum total sequence length")
     parser.add_argument(
         "--disable-cuda-graphs",

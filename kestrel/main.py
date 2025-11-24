@@ -76,7 +76,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sam-hq-iters",
         type=int,
-        default=3,
+        default=8,
         help="Iterations for HQ-SAM refiner",
     )
 

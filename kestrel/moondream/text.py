@@ -165,9 +165,7 @@ def attn(
             out=out_buf,
         )
         out = (
-            attn_heads.view(bsz, q_len, n_heads, head_dim)
-            .transpose(1, 2)
-            .contiguous()
+            attn_heads.view(bsz, q_len, n_heads, head_dim).transpose(1, 2).contiguous()
         )
     else:
         k_attn, v_attn = kv_result
@@ -284,7 +282,7 @@ def build_text_model(
 
     text = nn.ModuleDict(
         {
-            "blocks": nn.ModuleList(W
+            "blocks": nn.ModuleList(
                 [
                     nn.ModuleDict(
                         {
