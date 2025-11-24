@@ -1,6 +1,5 @@
 """Trimmed Triton kernels adapted from vLLM's fused MoE implementation."""
 
-from __future__ import annotations
 
 from typing import Any, Dict
 

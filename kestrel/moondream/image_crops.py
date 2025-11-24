@@ -1,16 +1,15 @@
 """Image tiling helpers for the Moondream vision encoder."""
 
-from __future__ import annotations
 
 import math
 from typing import Tuple, TypedDict
 
 import numpy as np
 import torch
-
 import pyvips
+from PIL import Image
 
-from kestrel.utils.image import vips_to_uint8_numpy
+from kestrel.utils.image import _vips_to_uint8_numpy
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -45,7 +44,7 @@ class OverlapCropOutput(TypedDict):
 
 
 def overlap_crop_image(
-    image: pyvips.Image,
+    image: pyvips.Image | np.ndarray,
     *,
     overlap_margin: int,
     max_crops: int,
@@ -54,7 +53,12 @@ def overlap_crop_image(
 ) -> OverlapCropOutput:
     """Create a global crop plus overlapping local crops with consistent margins."""
 
-    original_h, original_w = image.height, image.width
+    if isinstance(image, np.ndarray):
+        original_h, original_w = image.shape[:2]
+        num_bands = image.shape[2] if image.ndim == 3 else 1
+    else:
+        original_h, original_w = image.height, image.width
+        num_bands = image.bands
 
     margin_pixels = patch_size * overlap_margin
     total_margin_pixels = margin_pixels * 2
@@ -71,30 +75,41 @@ def overlap_crop_image(
     )
 
     num_crops = tiling[0] * tiling[1] + 1
-    crops = np.zeros((num_crops, base_size[0], base_size[1], image.bands), dtype=np.uint8)
+    crops = np.zeros((num_crops, base_size[0], base_size[1], num_bands), dtype=np.uint8)
 
     target_size = (
         tiling[0] * crop_window_size + total_margin_pixels,
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
+    if isinstance(image, np.ndarray):
+        original_numpy = image
+    else:
+        original_numpy = _vips_to_uint8_numpy(image)
+
+    pil_image = Image.fromarray(original_numpy)
+
     scale_x = target_size[1] / original_w
     scale_y = target_size[0] / original_h
-    resized = image.resize(scale_x, vscale=scale_y)
-    resized_numpy = vips_to_uint8_numpy(resized)
+    target_width = int(round(original_w * scale_x))
+    target_height = int(round(original_h * scale_y))
+    resized_pil = pil_image.resize((target_width, target_height), Image.LANCZOS)
+    resized_numpy = np.array(resized_pil, dtype=np.uint8)
 
     scale_x_global = base_size[1] / original_w
     scale_y_global = base_size[0] / original_h
-    global_vips = image.resize(scale_x_global, vscale=scale_y_global)
-    crops[0] = vips_to_uint8_numpy(global_vips)
+    global_width = int(round(original_w * scale_x_global))
+    global_height = int(round(original_h * scale_y_global))
+    global_pil = pil_image.resize((global_width, global_height), Image.LANCZOS)
+    crops[0] = np.array(global_pil, dtype=np.uint8)
 
     for tile_y in range(tiling[0]):
         for tile_x in range(tiling[1]):
             y0 = tile_y * crop_window_size
             x0 = tile_x * crop_window_size
 
-            y1 = min(y0 + base_size[0], resized.height)
-            x1 = min(x0 + base_size[1], resized.width)
+            y1 = min(y0 + base_size[0], resized_numpy.shape[0])
+            x1 = min(x0 + base_size[1], resized_numpy.shape[1])
 
             idx = 1 + tile_y * tiling[1] + tile_x
             width = max(0, x1 - x0)

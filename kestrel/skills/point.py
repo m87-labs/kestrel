@@ -1,6 +1,5 @@
 """Point skill that extracts spatial coordinates from model outputs."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
@@ -31,7 +30,7 @@ class PointRequest:
     """Validated point payload aligned with the planned API."""
 
     object: str
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     stream: bool
     settings: PointSettings
 

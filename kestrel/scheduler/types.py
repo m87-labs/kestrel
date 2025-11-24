@@ -1,7 +1,6 @@
 """Typed containers used by the scheduler."""
 
-from __future__ import annotations
-
+import numpy as np
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
@@ -29,7 +28,7 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
-    image: Optional[pyvips.Image] = None
+    image: Optional[pyvips.Image | np.ndarray] = None
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0
     submitted_at: float = 0.0

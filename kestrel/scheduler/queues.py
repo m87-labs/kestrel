@@ -1,6 +1,5 @@
 """Lightweight FIFO queues used by the scheduler."""
 
-from __future__ import annotations
 
 from collections import deque
 from typing import Deque, Generic, Iterable, Iterator, Optional, TypeVar

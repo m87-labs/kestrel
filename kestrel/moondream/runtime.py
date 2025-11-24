@@ -1,6 +1,5 @@
 """Moondream runtime with paged KV cache and optional image prefixes."""
 
-from __future__ import annotations
 
 import functools
 import json
@@ -583,7 +582,7 @@ class MoondreamRuntime:
 
     def encode_image(
         self,
-        image: Optional[pyvips.Image],
+        image: Optional[pyvips.Image | np.ndarray],
         *,
         overlap: Optional[OverlapCropOutput] = None,
         adapter: Optional[LoRA] = None,
@@ -602,7 +601,7 @@ class MoondreamRuntime:
         self,
         prompt_tokens: Tensor | Sequence[Token],
         *,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
         adapter: Optional[LoRA] = None,

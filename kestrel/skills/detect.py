@@ -1,6 +1,5 @@
 """Detect skill that extracts bounding boxes from model outputs."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
@@ -31,7 +30,7 @@ class DetectRequest:
     """Detect payload used internally by the scheduler."""
 
     object: str
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     stream: bool
     settings: DetectSettings
     max_objects: int
