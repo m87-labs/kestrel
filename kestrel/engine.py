@@ -888,9 +888,6 @@ class InferenceEngine:
                 raise RuntimeError("sam_hq_checkpoint not configured")
             if not ckpt.exists():
                 raise FileNotFoundError(f"SAM HQ checkpoint not found: {ckpt}")
-            print(
-                f"[sam-debug] loading sam-hq model type={self._sam_hq_model_type} ckpt={ckpt} device={self._sam_hq_device}"
-            )
             model = sam_model_registry[self._sam_hq_model_type](checkpoint=str(ckpt))
             model.to(device=self._sam_hq_device)
             resize = ResizeLongestSide(model.image_encoder.img_size)
@@ -937,14 +934,6 @@ class InferenceEngine:
             raise RuntimeError("Failed to rasterize coarse SVG for refinement")
         if not coarse_mask.any():
             raise RuntimeError("Empty coarse mask; cannot refine")
-        print(
-            "[sam-debug] coarse mask",
-            coarse_mask.shape,
-            "mask_sum",
-            int(coarse_mask.sum()),
-            "bbox",
-            bbox_vals,
-        )
 
         cx, cy, bw, bh = bbox_vals
         x1 = max(0.0, (cx - bw / 2) * width)
@@ -968,14 +957,6 @@ class InferenceEngine:
         crop_mask = coarse_mask[y1i:y2i, x1i:x2i]
         if crop_img.size == 0 or crop_mask.size == 0:
             raise RuntimeError("Empty crop for refinement")
-        print(
-            "[sam-debug] crop coords",
-            (x1i, y1i, x2i, y2i),
-            "crop_img",
-            crop_img.shape,
-            "crop_mask",
-            crop_mask.shape,
-        )
 
         crop_bgr = cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR)
         crop_h, crop_w = crop_mask.shape[:2]
@@ -1004,16 +985,6 @@ class InferenceEngine:
                 interpolation=cv2.INTER_NEAREST,
             )
         refined_crop = refined_crop.astype(bool)
-        print(
-            "[sam-debug] refined_crop",
-            refined_crop.shape,
-            "sum",
-            int(refined_crop.sum()),
-            "iters",
-            self._sam_hq_iters,
-            "timing",
-            refine_timing,
-        )
 
         refined_full = np.zeros_like(coarse_mask, dtype=bool)
         refined_full[y1i : y1i + crop_h, x1i : x1i + crop_w] = refined_crop[
@@ -1059,12 +1030,6 @@ class InferenceEngine:
             refined_svg_path = tokens_to_path_string(scaled_tokens)
         except Exception:
             raise RuntimeError("Failed to convert refined mask to SVG")
-        print(
-            "[sam-debug] refined_svg_path_len",
-            len(refined_svg_path),
-            "refined_bbox",
-            refined_bbox,
-        )
 
         timing_payload = {
             "iter_s": refine_timing.get("iter_s"),
@@ -1230,21 +1195,12 @@ class InferenceEngine:
                 if req.skill.name == "segment":
                     segments = result.output.get("segments") if result.output else None
                     if segments and req.image is not None:
-                        print("[sam-debug] refinement start request_id", req.request_id)
                         try:
                             refined = self._refine_segment_output(segments[0], req.image)
                             if "refined_svg_path" not in refined or "refined_bbox" not in refined:
                                 raise RuntimeError("Refinement did not produce refined outputs")
-                            print(
-                                "[sam-debug] refinement complete",
-                                "refined_bbox",
-                                refined.get("refined_bbox"),
-                                "refined_path_len",
-                                len(refined.get("refined_svg_path", "")),
-                            )
                             segments[0].update(refined)
                         except Exception as exc:
-                            print("[sam-debug] refinement failed", exc)
                             self._fail_request(req, exc)
                             continue
 

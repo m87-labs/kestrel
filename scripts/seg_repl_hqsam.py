@@ -103,16 +103,9 @@ def _make_svg(segment: dict, width: int, height: int) -> tuple[str, np.ndarray]:
             raise RuntimeError("No SVG path or tokens available for overlay")
     else:
         viewbox_path = _path_to_viewbox(path, DEFAULT_VIEWBOX)
-    print(
-        "[sam-debug] building svg",
-        "bbox",
-        bbox,
-        "refined",
-        bool(refined_path),
-        "path_len",
-        len(viewbox_path),
+    svg_full = svg_from_path(
+        viewbox_path, width, height, [cx, cy, bw, bh], viewbox=DEFAULT_VIEWBOX
     )
-    svg_full = svg_from_path(viewbox_path, width, height, [cx, cy, bw, bh], viewbox=DEFAULT_VIEWBOX)
     mask = render_svg_to_mask(svg_full, width, height)
     return svg_full, mask
 
@@ -165,14 +158,6 @@ async def _run(args: argparse.Namespace) -> None:
                 },
             )
             segment = (result.output.get("segments") or [{}])[0]
-            print(
-                "[sam-debug] segment output keys",
-                list(segment.keys()),
-                "bbox",
-                segment.get("bbox"),
-                "refined_bbox",
-                segment.get("refined_bbox"),
-            )
             refined_path = segment.get("refined_svg_path")
             refined_bbox = segment.get("refined_bbox")
             if not refined_path or not refined_bbox:
@@ -185,22 +170,29 @@ async def _run(args: argparse.Namespace) -> None:
             refined_overlay = _build_overlay(np_image, refined_mask)
             refined_out = str(Path(image_path).with_suffix("")) + "_overlay_refined.png"
             Image.fromarray(refined_overlay).save(refined_out)
-            refined_svg_path = str(Path(image_path).with_suffix("")) + "_mask_refined.svg"
+            refined_svg_path = (
+                str(Path(image_path).with_suffix("")) + "_mask_refined.svg"
+            )
             with open(refined_svg_path, "w", encoding="utf-8") as f:
                 f.write(refined_svg)
-            print(
-                f"[sam-debug] saved refined_overlay={refined_out} refined_svg={refined_svg_path}"
-            )
+            print(f"Saved refined overlay: {refined_out}")
+            print(f"Saved refined SVG: {refined_svg_path}")
     finally:
         await engine.shutdown()
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Kestrel segmentation REPL with HQ-SAM refiner")
-    parser.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
+    parser = argparse.ArgumentParser(
+        description="Kestrel segmentation REPL with HQ-SAM refiner"
+    )
+    parser.add_argument(
+        "--weights", type=Path, required=True, help="Path to text weights file"
+    )
     parser.add_argument("--config", type=Path, help="Optional model config JSON")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
-    parser.add_argument("--device", default="cuda", help="Torch device")
+
+    # I had to add cuda:0, older version of kest did not give me this issue.
+    parser.add_argument("--device", default="cuda:0", help="Torch device")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -208,13 +200,36 @@ def main(argv: list[str] | None = None) -> None:
         choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"],
         help="Computation dtype",
     )
-    parser.add_argument("--sam-hq-checkpoint", type=Path, required=True, help="Path to SAM HQ checkpoint")
-    parser.add_argument("--sam-hq-model-type", default="vit_h", help="SAM HQ model type (e.g., vit_h)")
-    parser.add_argument("--sam-hq-device", type=str, help="Device for SAM HQ (defaults to --device)")
-    parser.add_argument("--sam-hq-iters", type=int, default=8, help="Iterations for SAM HQ refiner")
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max segmentation tokens")
-    parser.add_argument("--max-batch-size", type=int, default=2, help="Max batch size (>=2 for runtime)")
-    parser.add_argument("--max-seq-length", type=int, default=131072, help="Maximum total sequence length")
+    parser.add_argument(
+        "--sam-hq-checkpoint",
+        type=Path,
+        required=True,
+        help="Path to SAM HQ checkpoint",
+    )
+    parser.add_argument(
+        "--sam-hq-model-type", default="vit_h", help="SAM HQ model type (e.g., vit_h)"
+    )
+    parser.add_argument(
+        "--sam-hq-device", type=str, help="Device for SAM HQ (defaults to --device)"
+    )
+    parser.add_argument(
+        "--sam-hq-iters", type=int, default=8, help="Iterations for SAM HQ refiner"
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Max segmentation tokens",
+    )
+    parser.add_argument(
+        "--max-batch-size", type=int, default=2, help="Max batch size (>=2 for runtime)"
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=131072,
+        help="Maximum total sequence length",
+    )
     parser.add_argument(
         "--disable-cuda-graphs",
         action="store_true",
