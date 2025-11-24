@@ -3,7 +3,6 @@
 Adapted from the Moondream project (Apache-2.0).
 """
 
-from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional

@@ -3,7 +3,6 @@
 Adapted from the Moondream project (Apache-2.0).
 """
 
-from __future__ import annotations
 
 from typing import Literal, Optional
 

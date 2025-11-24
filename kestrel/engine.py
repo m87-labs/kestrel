@@ -24,7 +24,6 @@ Internal API overview:
 Callers provide raw questions/objects; the engine derives skill-specific contexts and validation before handing work to the scheduler.
 """
 
-from __future__ import annotations
 
 import asyncio
 import itertools
@@ -49,6 +48,7 @@ from typing import (
     Literal,
 )
 
+import numpy as np
 import torch
 import pyvips
 
@@ -170,7 +170,7 @@ class _PendingRequest:
     prompt: str
     prompt_tokens: torch.Tensor
     prompt_length: int
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     max_new_tokens: int
     temperature: float
     top_p: float
@@ -320,7 +320,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         skill: str,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[pyvips.Image | np.ndarray] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineResult:
@@ -338,7 +338,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image] = ...,
+        image: Optional[pyvips.Image | np.ndarray] = ...,
         question: Optional[str] = ...,
         reasoning: bool = ...,
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
@@ -349,7 +349,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image] = ...,
+        image: Optional[pyvips.Image | np.ndarray] = ...,
         question: Optional[str] = ...,
         reasoning: bool = ...,
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
@@ -360,7 +360,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[pyvips.Image | np.ndarray] = None,
         question: Optional[str] = None,
         reasoning: bool = True,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -370,7 +370,7 @@ class InferenceEngine:
 
     async def query(
         self,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[pyvips.Image | np.ndarray] = None,
         question: Optional[str] = None,
         reasoning: bool = True,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -441,7 +441,7 @@ class InferenceEngine:
 
     async def point(
         self,
-        image: Optional[pyvips.Image],
+        image: Optional[pyvips.Image | np.ndarray],
         object: str,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
@@ -487,7 +487,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image,
+        image: pyvips.Image | np.ndarray,
         *,
         length: str = ...,
         stream: Literal[True],
@@ -497,7 +497,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image,
+        image: pyvips.Image | np.ndarray,
         *,
         length: str = ...,
         stream: Literal[False] = ...,
@@ -507,7 +507,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image,
+        image: pyvips.Image | np.ndarray,
         *,
         length: str = ...,
         stream: bool = ...,
@@ -516,7 +516,7 @@ class InferenceEngine:
 
     async def caption(
         self,
-        image: pyvips.Image,
+        image: pyvips.Image | np.ndarray,
         *,
         length: str = "normal",
         stream: bool = False,
@@ -573,7 +573,7 @@ class InferenceEngine:
 
     async def detect(
         self,
-        image: Optional[pyvips.Image],
+        image: Optional[pyvips.Image | np.ndarray],
         object: str,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
@@ -613,7 +613,7 @@ class InferenceEngine:
 
     async def segment(
         self,
-        image: Optional[pyvips.Image],
+        image: Optional[pyvips.Image | np.ndarray],
         object: str,
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -693,7 +693,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         skill: str,
-        image: Optional[pyvips.Image] = None,
+        image: Optional[pyvips.Image | np.ndarray] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineStream:
@@ -743,7 +743,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         request_context: object,
-        image: Optional[pyvips.Image],
+        image: Optional[pyvips.Image | np.ndarray],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
@@ -759,12 +759,12 @@ class InferenceEngine:
 
         skill_spec = self._skills.resolve(skill)
 
-        image_obj: Optional[pyvips.Image] = None
+        image_obj: Optional[pyvips.Image | np.ndarray] = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
-            if not isinstance(image, pyvips.Image):
-                raise TypeError("image must be a pyvips.Image")
+            if not isinstance(image, (pyvips.Image, np.ndarray)):
+                raise TypeError("image must be a pyvips.Image or np.ndarray")
             image_obj = image
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)

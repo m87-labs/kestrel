@@ -1,6 +1,5 @@
 """Utilities for working with pyvips images within Kestrel."""
 
-from __future__ import annotations
 
 import base64
 import binascii
@@ -28,14 +27,28 @@ def load_vips_from_base64(data: str) -> pyvips.Image:
     return ensure_srgb(image)
 
 
-def ensure_srgb(image: pyvips.Image) -> pyvips.Image:
+def ensure_srgb(image: pyvips.Image | np.ndarray) -> pyvips.Image | np.ndarray:
     """Return an image in 8-bit sRGB without alpha."""
+
+    if isinstance(image, np.ndarray):
+        np_image = np.clip(image, 0, 255).astype(np.uint8)
+
+        if np_image.ndim == 2:
+            np_image = np.stack([np_image] * 3, axis=-1)
+        elif np_image.ndim == 3:
+            if np_image.shape[2] == 1:
+                np_image = np.repeat(np_image, 3, axis=2)
+            elif np_image.shape[2] == 4:
+                np_image = np_image[:, :, :3]
+            elif np_image.shape[2] > 3:
+                np_image = np_image[:, :, :3]
+
+        return np_image
 
     if image.format != "uchar":
         image = image.cast("uchar")
 
     if image.hasalpha():
-        # Remove alpha channel by premultiplying over an opaque black background
         image = image.flatten(background=[0, 0, 0])
 
     if image.bands == 1:
@@ -47,7 +60,6 @@ def ensure_srgb(image: pyvips.Image) -> pyvips.Image:
         if image.interpretation not in ("srgb", "rgb", "rgb16"):
             image = image.colourspace("srgb")
     except pyvips.Error:
-        # Some formats (e.g. already linear) may not support conversion; fall back.
         pass
 
     if image.bands == 1:
@@ -57,7 +69,7 @@ def ensure_srgb(image: pyvips.Image) -> pyvips.Image:
     return image.copy_memory()
 
 
-def vips_to_uint8_numpy(image: pyvips.Image) -> np.ndarray:
+def _vips_to_uint8_numpy(image: pyvips.Image) -> np.ndarray:
     """Convert a pyvips image into a HxWxC uint8 NumPy array."""
 
     memory = image.write_to_memory()
@@ -79,5 +91,4 @@ def _b64decode(payload: str) -> bytes:
 __all__ = [
     "ensure_srgb",
     "load_vips_from_base64",
-    "vips_to_uint8_numpy",
 ]

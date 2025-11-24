@@ -1,6 +1,5 @@
 """Region encoding and decoding utilities for spatial skills."""
 
-from __future__ import annotations
 
 import math
 from typing import Iterable, List, Tuple, Union

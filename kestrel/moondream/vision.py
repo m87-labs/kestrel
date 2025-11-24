@@ -1,6 +1,5 @@
 """Vision encoder components ported from the Moondream reference implementation."""
 
-from __future__ import annotations
 
 from typing import Tuple, Optional
 
@@ -16,7 +15,7 @@ from kestrel.utils.image import ensure_srgb
 
 
 def prepare_crops(
-    image: pyvips.Image,
+    image: pyvips.Image | np.ndarray,
     config: VisionConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -151,7 +150,7 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
 
 
 def encode_image(
-    image: Optional[pyvips.Image],
+    image: Optional[pyvips.Image | np.ndarray],
     module: nn.Module,
     config: VisionConfig,
     *,
@@ -194,7 +193,7 @@ def encode_image(
 
 
 def compute_overlap_crops(
-    image: pyvips.Image, config: VisionConfig
+    image: pyvips.Image | np.ndarray, config: VisionConfig
 ) -> OverlapCropOutput:
     normalized = ensure_srgb(image)
     return overlap_crop_image(

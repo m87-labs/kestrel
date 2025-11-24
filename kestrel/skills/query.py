@@ -1,6 +1,5 @@
 """Query skill leveraging the existing text generation flow."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -34,7 +33,7 @@ class QueryRequest:
     """Validated query payload aligned with the fal_inference API."""
 
     question: str
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     reasoning: bool
     stream: bool
     settings: QuerySettings

@@ -1,6 +1,5 @@
 """Segmentation skill that returns SVG paths and bounding boxes."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
@@ -41,7 +40,7 @@ class SegmentRequest:
     """Segment payload used internally by the scheduler."""
 
     object: str
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     stream: bool
     settings: SegmentSettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None

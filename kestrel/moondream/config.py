@@ -4,7 +4,6 @@ This module is adapted from the open-source Moondream project
 (https://github.com/vikhyat/moondream) which is licensed under Apache-2.0.
 """
 
-from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field

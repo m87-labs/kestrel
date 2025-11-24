@@ -1,6 +1,5 @@
 """Caption skill that generates text summaries for images."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -31,7 +30,7 @@ class CaptionRequest:
     """Caption payload carried through the scheduler."""
 
     length: str
-    image: Optional[pyvips.Image]
+    image: Optional[pyvips.Image | np.ndarray]
     stream: bool
     settings: CaptionSettings
 
