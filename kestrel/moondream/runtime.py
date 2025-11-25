@@ -47,6 +47,7 @@ from .region import (
     decode_coordinate,
     decode_size,
 )
+from ..refiner import build_sam_model
 
 
 
@@ -411,6 +412,7 @@ class MoondreamRuntime:
             cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
+        self.sam_model = build_sam_model(device=self.device)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()

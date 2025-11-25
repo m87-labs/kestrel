@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyvips
 import torch
+import numpy as np
 from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
@@ -18,6 +19,7 @@ from kestrel.utils.svg import (
     svg_path_from_token_ids,
     PATH_COMMANDS,
 )
+from ..refiner import refine_segmentation
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -163,6 +165,21 @@ class SegmentSkillState(SkillState):
         points = _coords_to_points(self._coord_values)
         bbox = _build_bbox(self._coord_values, self._size_values)
 
+        coarse_path = svg_path
+        coarse_bbox = bbox
+
+        if svg_path and bbox and not parse_error and self._request.image is not None:
+            refined_path, refined_bbox = refine_segmentation(
+                self._request.image,
+                svg_path,
+                bbox,
+                runtime.sam_model,
+                iters=6,
+            )
+            if refined_path is not None and refined_bbox is not None:
+                svg_path = refined_path
+                bbox = refined_bbox
+
         segment: Dict[str, object] = {
             "object": self._request.object,
             "text": raw_text.strip(),
@@ -170,11 +187,14 @@ class SegmentSkillState(SkillState):
             "path_tokens": decoded_tokens,
             "token_ids": list(self._text_token_ids),
             "points": points,
+            "coarse_path": coarse_path,
         }
         if parse_error:
             segment["parse_error"] = parse_error
         if bbox is not None:
             segment["bbox"] = bbox
+        if coarse_bbox is not None:
+            segment["coarse_bbox"] = coarse_bbox
         if self._size_values:
             segment["sizes"] = [
                 {"width": max(min(w, 1.0), 0.0), "height": max(min(h, 1.0), 0.0)}
@@ -199,26 +219,10 @@ class SegmentSkillState(SkillState):
         if not self._streaming:
             return
 
-        # Send bbox once, as soon as we have center+size.
         if not self._bbox_sent:
             bbox = _build_bbox(self._coord_values, self._size_values)
-            if bbox and set(bbox.keys()) == {
-                "x_center",
-                "y_center",
-                "width",
-                "height",
-                "x_min",
-                "x_max",
-                "y_min",
-                "y_max",
-            }:
-                bbox_minmax = {
-                    "x_min": bbox["x_min"],
-                    "y_min": bbox["y_min"],
-                    "x_max": bbox["x_max"],
-                    "y_max": bbox["y_max"],
-                }
-                self._pending_stream = "__BBOX__" + json.dumps(bbox_minmax)
+            if bbox:
+                self._pending_stream = "__BBOX__" + json.dumps(bbox)
                 self._bbox_sent = True
                 return
 
@@ -259,10 +263,6 @@ def _build_bbox(
     half_w = width / 2.0
     half_h = height / 2.0
     return {
-        "x_center": cx,
-        "y_center": cy,
-        "width": width,
-        "height": height,
         "x_min": max(cx - half_w, 0.0),
         "x_max": min(cx + half_w, 1.0),
         "y_min": max(cy - half_h, 0.0),
