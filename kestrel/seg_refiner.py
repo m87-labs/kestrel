@@ -316,13 +316,13 @@ def _build_mask_inputs(
     return mask_inputs
 
 
-def build_sam_model(device: Optional[torch.device] = None, model_id: str = "syscv-community/sam-hq-vit-huge"):
-    """Build SAM-HQ model from HuggingFace with attached processor."""
-    from transformers import SamHQModel, SamHQProcessor
+def build_sam_model(device: Optional[torch.device] = None, model_id: str = "facebook/sam2.1-hiera-large"):
+    """Build SAM2 model from HuggingFace with attached processor."""
+    from transformers import Sam2Model, Sam2Processor
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    processor = SamHQProcessor.from_pretrained(model_id)
-    model = SamHQModel.from_pretrained(model_id)
+    processor = Sam2Processor.from_pretrained(model_id)
+    model = Sam2Model.from_pretrained(model_id)
     model = model.to(device)
     model.processor = processor
     return model
@@ -332,17 +332,17 @@ def sam_refine(
     image: np.ndarray,
     coarse_mask: np.ndarray,
     sam_model,
-    iters: int = 6,
-    strength: float = 15.0,
+    iters: int = 8,
+    strength: float = 30.0,
     gamma: float = 4.0,
 ) -> np.ndarray:
     """
-    SAM-HQ iterative mask refinement.
+    SAM2 iterative mask refinement.
 
     Args:
         image: RGB numpy array (H, W, 3), uint8.
         coarse_mask: Binary mask (H, W), uint8.
-        sam_model: SamHQModel with attached processor.
+        sam_model: Sam2Model with attached processor.
         iters: Number of refinement iterations.
         strength: Mask prompt strength.
         gamma: Gaussian spread for mask prompt.
@@ -367,48 +367,42 @@ def sam_refine(
 
     current_mask = torch.tensor(coarse_mask, dtype=torch.uint8, device=device)
 
-    # Get image embeddings once
     base_inputs = processor(image, return_tensors="pt")
     pixel_values = base_inputs["pixel_values"].to(device)
-    reshaped_sizes = base_inputs["reshaped_input_sizes"][0].tolist()
-    reshaped_h, reshaped_w = int(reshaped_sizes[0]), int(reshaped_sizes[1])
 
-    image_embeddings, interm_embeddings = sam_model.get_image_embeddings(pixel_values)
+    # Sam2 expects points/boxes in 1024x1024 square space (non-aspect-preserving)
+    reshaped_h = 1024
+    reshaped_w = 1024
 
-    # Compute coordinate scale factors (original -> resized space)
+    image_embeddings = sam_model.get_image_embeddings(pixel_values)
+
     scale_x = reshaped_w / img_w
     scale_y = reshaped_h / img_h
 
     for _ in range(iters):
         point_coords, point_labels, box, gaus_dt = _extract_points_and_mask(current_mask, gamma)
 
-        # Build mask inputs following SAMRefiner's extract_mask exactly
         mask_inputs = _build_mask_inputs(
             current_mask, gaus_dt, (reshaped_h, reshaped_w), strength
         ).to(device)
 
-        # Transform coordinates from original image space to resized space
-        # Points: list of [x, y] -> tensor (1, 1, N, 2)
         points_np = np.array(point_coords, dtype=np.float32)
-        points_np[:, 0] *= scale_x  # x
-        points_np[:, 1] *= scale_y  # y
+        points_np[:, 0] *= scale_x
+        points_np[:, 1] *= scale_y
         input_points = torch.from_numpy(points_np).unsqueeze(0).unsqueeze(0).to(device)
 
-        # Labels: list -> tensor (1, 1, N)
         input_labels = torch.tensor(point_labels, dtype=torch.long, device=device).unsqueeze(0).unsqueeze(0)
 
-        # Box: [x1, y1, x2, y2] -> tensor (1, 1, 4)
         box_np = np.array(box, dtype=np.float32)
-        box_np[0] *= scale_x  # x1
-        box_np[1] *= scale_y  # y1
-        box_np[2] *= scale_x  # x2
-        box_np[3] *= scale_y  # y2
+        box_np[0] *= scale_x
+        box_np[1] *= scale_y
+        box_np[2] *= scale_x
+        box_np[3] *= scale_y
         input_boxes = torch.from_numpy(box_np).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
             outputs = sam_model(
                 image_embeddings=image_embeddings,
-                intermediate_embeddings=interm_embeddings,
                 input_points=input_points,
                 input_labels=input_labels,
                 input_boxes=input_boxes,
@@ -416,31 +410,43 @@ def sam_refine(
                 multimask_output=True,
             )
 
-        sam_ious = outputs.iou_scores  # (batch, point_batch, num_masks)
-        sam_logits_multi = outputs.pred_masks  # (batch, point_batch, num_masks, H, W)
+        sam_ious = outputs.iou_scores
+        sam_logits_multi = outputs.pred_masks
 
-        # Select best mask based on IoU (HF already sorts by IoU, so index 0 is best)
-        # But use argmax to be safe
         best_idx = sam_ious[0, 0].argmax()
-        sam_logits = sam_logits_multi[0, 0, best_idx:best_idx+1]  # keep dims: (1, H, W)
+        sam_logits = sam_logits_multi[0, 0, best_idx:best_idx+1]
 
-        # Upscale mask: 256 -> 1024 -> crop -> original
-        # Use bicubic for smoother edges than default bilinear
-        target_size = (1024, 1024)
-        sam_logits_4d = sam_logits.unsqueeze(0)  # (1, 1, H, W)
-
-        # Step 1: 256 -> 1024 with bicubic
-        upscaled = F.interpolate(sam_logits_4d, target_size, mode="bicubic", align_corners=False)
-
-        # Step 2: Crop padding (image was resized to fit in 1024x1024 maintaining aspect)
+        sam_logits_4d = sam_logits.unsqueeze(0)
+        upscaled = F.interpolate(sam_logits_4d, (1024, 1024), mode="bicubic", align_corners=False)
         upscaled = upscaled[..., :reshaped_h, :reshaped_w]
-
-        # Step 3: Resize to original with bicubic
         processed_masks = F.interpolate(upscaled, (img_h, img_w), mode="bicubic", align_corners=False)
 
         current_mask = (processed_masks.squeeze() > 0).to(torch.uint8)
 
     return current_mask.detach().cpu().numpy()
+
+
+# --- Mask post-processing ----------------------------------------------------
+
+def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
+    """Remove small holes/islands and apply morphological close."""
+    h, w = mask.shape
+    area_thresh = max(1.0, area_frac * h * w)
+    mask = mask.astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+
+    for fill_holes in [True, False]:
+        working = ((mask == 0) if fill_holes else mask).astype(np.uint8)
+        n_labels, regions, stats, _ = cv2.connectedComponentsWithStats(working, 8)
+        sizes = stats[1:, -1]
+        small = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
+        if small:
+            fill = [0] + small if fill_holes else [i for i in range(n_labels) if i not in [0] + small]
+            if not fill_holes and not fill:
+                fill = [int(np.argmax(sizes)) + 1]
+            mask = np.isin(regions, fill).astype(np.uint8)
+
+    return cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel) > 0
 
 
 # --- High-level refinement API -----------------------------------------------
@@ -501,13 +507,13 @@ def refine_segmentation(
     iters: int = 8,
 ) -> Tuple[Optional[str], Optional[dict]]:
     """
-    Refine a coarse SVG segmentation using SAM-HQ.
+    Refine a coarse SVG segmentation using SAM2.
 
     Args:
         image: RGB image (numpy array or pyvips Image).
         svg_path: SVG path string from model output.
         bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
-        sam_model: SamHQModel with attached processor.
+        sam_model: Sam2Model with attached processor.
         iters: Number of refinement iterations.
 
     Returns:
@@ -550,23 +556,14 @@ def refine_segmentation(
         # Run SAM refinement
         refined_crop = sam_refine(crop_img, crop_mask, sam_model, iters=iters)
 
-        # Paste back to full size
+        # Paste back to full size and clean up
         refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
+        refined_mask = _clean_mask(refined_mask).astype(np.uint8)
 
         if refined_mask.sum() == 0:
             print("[refiner] refined_mask is empty, skipping refinement")
             return None, None
 
-        # Apply morphological smoothing to reduce aliasing artifacts
-        # Opening removes small protrusions, closing fills small holes
-        kernel_size = max(3, min(img_w, img_h) // 200)  # Scale with image size
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_CLOSE, kernel)
-        refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel)
-
-        # Convert refined mask back to SVG (returns path and consistent bbox)
         result = bitmap_to_path(refined_mask)
         if result is None:
             print("[refiner] bitmap_to_path failed, skipping refinement")
