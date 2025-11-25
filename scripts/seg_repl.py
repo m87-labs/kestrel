@@ -56,7 +56,7 @@ def _render_overlay(
 ):
     cxcywh = _bbox_minmax_to_cxcywh(bbox)
     svg_full = svg_from_path(path, width, height, cxcywh)
-    mask = render_svg_to_mask(svg_full, width, height)
+    mask = render_svg_to_soft_mask(svg_full, width, height)
     if not mask.any():
         raise RuntimeError("Rendered mask is empty")
     overlay = _build_overlay(np_image, mask)
