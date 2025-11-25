@@ -615,25 +615,7 @@ class _ServerState:
                         raise exc
 
                     segment = (result.output.get("segments") or [{}])[0]
-                    bbox_full = segment.get("bbox")
-                    bbox_minmax = latest_bbox
-                    if bbox_minmax is None and bbox_full and set(bbox_full.keys()) == {
-                        "x_center",
-                        "y_center",
-                        "width",
-                        "height",
-                        "x_min",
-                        "x_max",
-                        "y_min",
-                        "y_max",
-                    }:
-                        bbox_minmax = {
-                            "x_min": bbox_full["x_min"],
-                            "y_min": bbox_full["y_min"],
-                            "x_max": bbox_full["x_max"],
-                            "y_max": bbox_full["y_max"],
-                        }
-
+                    bbox = segment.get("bbox") or latest_bbox
                     path = segment.get("svg_path") or ""
                     parse_error = segment.get("parse_error")
                     metrics_payload = _format_metrics(result.metrics)
@@ -644,7 +626,7 @@ class _ServerState:
                         "request_id": str(result.request_id),
                         "finish_reason": result.finish_reason,
                         "path": path,
-                        "bbox": bbox_minmax,
+                        "bbox": bbox,
                         "metrics": metrics_payload,
                     }
                     if parse_error:
@@ -672,14 +654,6 @@ class _ServerState:
         segment = (result.output.get("segments") or [{}])[0]
         bbox = segment.get("bbox")
         path = segment.get("svg_path") or ""
-        if bbox and set(bbox.keys()) == {"x_center", "y_center", "width", "height", "x_min", "x_max", "y_min", "y_max"}:
-            bbox = {
-                "x_min": bbox["x_min"],
-                "y_min": bbox["y_min"],
-                "x_max": bbox["x_max"],
-                "y_max": bbox["y_max"],
-            }
-
         metrics_payload = _format_metrics(result.metrics)
         response_payload = {
             "request_id": str(result.request_id),

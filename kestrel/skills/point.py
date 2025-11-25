@@ -6,6 +6,7 @@ from typing import Dict, Optional, Sequence
 
 import pyvips
 import torch
+import numpy as np
 from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token

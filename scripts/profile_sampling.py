@@ -7,7 +7,6 @@ Examples
       --batch-size 64 --vocab-size 65536 --iterations 200
 """
 
-from __future__ import annotations
 
 import argparse
 import sys

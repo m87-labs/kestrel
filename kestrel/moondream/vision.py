@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pyvips
+import numpy as np
 
 from .config import VisionConfig
 from .layers import LoRA, LoRALinear
