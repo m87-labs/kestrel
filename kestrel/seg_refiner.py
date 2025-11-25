@@ -356,7 +356,7 @@ def _build_mask_inputs(
 
 
 def build_sam_model(
-    device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta3"
+    device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"
 ):
     """Build HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
     from transformers import AutoModel
