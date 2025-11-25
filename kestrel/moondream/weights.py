@@ -189,7 +189,9 @@ def load_moondream_weights(
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
     region: Optional[nn.Module] = None,
 ) -> None:
-    target_dtype = next(model.text.parameters()).dtype
+    target_param = next(model.text.parameters())
+    target_dtype = target_param.dtype
+    target_device = target_param.device
 
     def convert(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to(target_dtype)
@@ -210,7 +212,7 @@ def load_moondream_weights(
             if region is not None:
                 _assign_region_weights(getter, region, convert=convert)
     else:
-        tensors_raw = torch.load(path, map_location="cpu", weights_only=True)
+        tensors_raw = torch.load(path, map_location=target_device, weights_only=True)
         tensors: dict[str, torch.Tensor] = {}
         for key, value in tensors_raw.items():
             name = key.replace("._orig_mod", "")
