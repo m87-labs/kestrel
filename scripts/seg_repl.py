@@ -8,7 +8,7 @@ from PIL import Image
 
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
-from kestrel.refiner import render_svg_to_mask, svg_from_path
+from kestrel.seg_refiner import render_svg_to_soft_mask, svg_from_path
 from kestrel.utils.image import ensure_srgb
 
 

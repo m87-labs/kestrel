@@ -46,7 +46,7 @@ from .region import (
     decode_coordinate,
     decode_size,
 )
-from ..refiner import build_sam_model
+from ..seg_refiner import build_sam_model
 
 
 DEFAULT_MAX_TOKENS = 768
