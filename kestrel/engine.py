@@ -97,6 +97,7 @@ from kestrel.third_party.hqsam.segment_anything.utils.transforms import (
 )
 from kestrel.third_party.sam_hq_refiner.bitmap_to_svg import bitmap_to_svg
 from kestrel.third_party.sam_hq_refiner.sam_refiner import sam_refiner
+from scripts.post_process import clean_refined_mask
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -990,6 +991,7 @@ class InferenceEngine:
         refined_full[y1i : y1i + crop_h, x1i : x1i + crop_w] = refined_crop[
             :crop_h, :crop_w
         ]
+        refined_full = clean_refined_mask(refined_full.astype(np.uint8))
 
         ys, xs = np.nonzero(refined_full)
         if xs.size == 0 or ys.size == 0:
