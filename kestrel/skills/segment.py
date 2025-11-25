@@ -274,6 +274,17 @@ def _clamp_unit(value: float) -> float:
     return min(max(value, 0.0), 1.0)
 
 
+# Number of coordinate values each SVG path command expects.
+_COMMAND_ARITY = {
+    "Z": 0, "z": 0,
+    "H": 1, "h": 1, "V": 1, "v": 1,
+    "M": 2, "m": 2, "L": 2, "l": 2, "T": 2, "t": 2,
+    "S": 4, "s": 4, "Q": 4, "q": 4,
+    "C": 6, "c": 6,
+    "A": 7, "a": 7,
+}
+
+
 def _next_command_chunk(tokens: Sequence[str], start: int) -> tuple[int, str]:
     """Return a command-plus-args chunk ending just before the next command."""
 
@@ -293,9 +304,9 @@ def _next_command_chunk(tokens: Sequence[str], start: int) -> tuple[int, str]:
     while end < n and tokens[end] not in PATH_COMMANDS:
         end += 1
 
-    # Require enough args for the command
+    # Require enough args for the command (1 for command + arity)
     cmd = tokens[cmd_idx]
-    required = 1 if cmd in {"Z", "z"} else (2 if cmd in {"H", "h", "V", "v"} else 3)
+    required = 1 + _COMMAND_ARITY.get(cmd, 2)
     if end - cmd_idx < required:
         return start, ""
 
