@@ -74,10 +74,16 @@ This document explains how segmentation refinement is implemented in Kestrel usi
 - Bbox is normalized to [0,1] relative to image width/height. Pixel XYXY is computed as:
   - `x1 = (cx - w/2) * img_w`, `x2 = (cx + w/2) * img_w`, similarly for y, then grown by 25% and clamped.
 
-## REPL cropping logic (`scripts/seg_repl_hqsam.py`)
-- Uses the final segment output and requires refined fields. It builds the SVG using `refined_svg_path`/`refined_bbox` (falls back to tokens only if path missing, but raises if no refined outputs).
-- Saves refined overlay (`*_overlay_refined.png`) and refined SVG (`*_mask_refined.svg`). If refined outputs are missing or mask is empty, it raises.
+## REPL cropping/postprocessing (`scripts/seg_repl_hqsam.py`)
+- Uses the final segment output and requires refined fields. It builds the SVG using `refined_svg_path`/`refined_bbox`; if missing, it raises.
+- Saves refined overlay (`*_overlay_refined.png`) and refined SVG (`*_mask_refined.svg`).
+- Runs post-processing on the refined mask (hole/island removal + 3x3 close) and saves post-processed overlay (`*_overlay_refined_post.png`) and SVG (`*_mask_refined_post.svg`).
 - Bbox→image scaling matches engine: normalized bbox to pixel XYXY, then `svg_from_path` for rasterization.
+
+## Post-processing helpers (`scripts/post_process.py`)
+- `remove_small_regions(mask, area_thresh, mode)`: connected components cleanup; fills small holes (`mode="holes"`) or removes small foreground islands (`mode="islands"`) below `area_thresh`.
+- `morph_close(mask, k)`: 3x3 (default) morphological close to smooth edges/bridge small gaps.
+- `clean_refined_mask(mask, area_frac=0.0025)`: convenience pipeline applying hole fill, island removal (both with threshold = `area_frac * H * W`, min 1 px), then 3x3 close; returns a boolean mask. Used for evaluation/overlay only (not fed back into the refiner).
 
 ## Running the REPL
 ```

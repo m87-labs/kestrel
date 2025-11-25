@@ -8,6 +8,8 @@ import pyvips
 import torch
 from PIL import Image
 
+from scripts.post_process import clean_refined_mask
+
 from kestrel.config import ModelPaths, RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.utils.image import ensure_srgb, vips_to_uint8_numpy
@@ -143,40 +145,73 @@ async def _run(args: argparse.Namespace) -> None:
             if not prompt:
                 continue
 
-            image = pyvips.Image.new_from_file(image_path, access="sequential")
-            image = ensure_srgb(image)
-            width, height = image.width, image.height
-            np_image = vips_to_uint8_numpy(image)
+            try:
+                image = pyvips.Image.new_from_file(image_path, access="sequential")
+                image = ensure_srgb(image)
+                width, height = image.width, image.height
+                np_image = vips_to_uint8_numpy(image)
 
-            result = await engine.segment(
-                image=image,
-                object=prompt,
-                settings={
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "max_tokens": args.max_tokens,
-                },
-            )
-            segment = (result.output.get("segments") or [{}])[0]
-            refined_path = segment.get("refined_svg_path")
-            refined_bbox = segment.get("refined_bbox")
-            if not refined_path or not refined_bbox:
-                raise RuntimeError("Refined mask missing from segment output")
+                result = await engine.segment(
+                    image=image,
+                    object=prompt,
+                    settings={
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "max_tokens": args.max_tokens,
+                    },
+                )
+                segment = (result.output.get("segments") or [{}])[0]
+                refined_path = segment.get("refined_svg_path")
+                refined_bbox = segment.get("refined_bbox")
+                if not refined_path or not refined_bbox:
+                    raise RuntimeError("Refined mask missing from segment output")
 
-            refined_svg, refined_mask = _make_svg(segment, width, height)
-            if not refined_mask.any():
-                raise RuntimeError("Refined mask empty; cannot overlay")
+                refined_svg, refined_mask = _make_svg(segment, width, height)
+                if not refined_mask.any():
+                    raise RuntimeError("Refined mask empty; cannot overlay")
 
-            refined_overlay = _build_overlay(np_image, refined_mask)
-            refined_out = str(Path(image_path).with_suffix("")) + "_overlay_refined.png"
-            Image.fromarray(refined_overlay).save(refined_out)
-            refined_svg_path = (
-                str(Path(image_path).with_suffix("")) + "_mask_refined.svg"
-            )
-            with open(refined_svg_path, "w", encoding="utf-8") as f:
-                f.write(refined_svg)
-            print(f"Saved refined overlay: {refined_out}")
-            print(f"Saved refined SVG: {refined_svg_path}")
+                refined_overlay = _build_overlay(np_image, refined_mask)
+                refined_out = (
+                    str(Path(image_path).with_suffix("")) + "_overlay_refined.png"
+                )
+                Image.fromarray(refined_overlay).save(refined_out)
+                refined_svg_path = (
+                    str(Path(image_path).with_suffix("")) + "_mask_refined.svg"
+                )
+                with open(refined_svg_path, "w", encoding="utf-8") as f:
+                    f.write(refined_svg)
+                print(f"Saved refined overlay: {refined_out}")
+                print(f"Saved refined SVG: {refined_svg_path}")
+
+                cleaned_mask = clean_refined_mask(refined_mask.astype(np.uint8))
+                cleaned_overlay = _build_overlay(np_image, cleaned_mask)
+                cleaned_out = (
+                    str(Path(image_path).with_suffix(""))
+                    + "_overlay_refined_post.png"
+                )
+                Image.fromarray(cleaned_overlay).save(cleaned_out)
+                cleaned_svg_full = svg_from_path(
+                    refined_svg,
+                    width,
+                    height,
+                    [
+                        float(refined_bbox["x_center"]),
+                        float(refined_bbox["y_center"]),
+                        float(refined_bbox["width"]),
+                        float(refined_bbox["height"]),
+                    ],
+                    viewbox=DEFAULT_VIEWBOX,
+                )
+                cleaned_svg_path = (
+                    str(Path(image_path).with_suffix("")) + "_mask_refined_post.svg"
+                )
+                with open(cleaned_svg_path, "w", encoding="utf-8") as f:
+                    f.write(cleaned_svg_full)
+                print(f"Saved post-processed overlay: {cleaned_out}")
+                print(f"Saved post-processed SVG: {cleaned_svg_path}")
+            except Exception as exc:
+                print(f"Error: {exc}")
+                continue
     finally:
         await engine.shutdown()
 
