@@ -3,6 +3,7 @@
 import io
 import re
 import threading
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
@@ -317,7 +318,7 @@ def _build_mask_inputs(
 
 
 def build_sam_model(device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"):
-    """Build HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
+    """Build HQ-SAM (vit_h) via AutoModel with remote code."""
     from transformers import AutoModel
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")

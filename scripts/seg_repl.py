@@ -63,10 +63,12 @@ def _render_overlay(
     base = Path(suffix)
     overlay_path = str(base.with_suffix("")) + "_overlay.png"
     svg_path = str(base.with_suffix("")) + "_mask.svg"
+    mask_path = str(base.with_suffix("")) + "_mask.png"
     Image.fromarray(overlay).save(overlay_path)
+    Image.fromarray((mask.astype(np.uint8) * 255)).save(mask_path)
     with open(svg_path, "w", encoding="utf-8") as f:
         f.write(svg_full)
-    return overlay_path, svg_path
+    return overlay_path, svg_path, mask_path
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -121,7 +123,7 @@ async def _run(args: argparse.Namespace) -> None:
                     raise RuntimeError("Missing svg_path or bbox in segment output")
 
                 refined_base = Path(image_path).with_suffix("")
-                overlay_refined, svg_refined = _render_overlay(
+                overlay_refined, svg_refined, mask_refined = _render_overlay(
                     svg_path,
                     bbox,
                     width,
@@ -131,9 +133,10 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 print(f"Saved refined overlay: {overlay_refined}")
                 print(f"Saved refined SVG: {svg_refined}")
+                print(f"Saved refined mask: {mask_refined}")
 
                 if coarse_path and coarse_bbox:
-                    overlay_coarse, svg_coarse = _render_overlay(
+                    overlay_coarse, svg_coarse, mask_coarse = _render_overlay(
                         coarse_path,
                         coarse_bbox,
                         width,
@@ -143,6 +146,7 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     print(f"Saved coarse overlay: {overlay_coarse}")
                     print(f"Saved coarse SVG: {svg_coarse}")
+                    print(f"Saved coarse mask: {mask_coarse}")
             except Exception as exc:
                 print(f"Error: {exc}")
                 continue
