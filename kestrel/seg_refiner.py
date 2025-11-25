@@ -1,4 +1,4 @@
-"""SAM-HQ mask refinement and SVG conversion utilities."""
+"""HQ-SAM mask refinement and SVG conversion utilities."""
 
 import io
 import re
@@ -203,7 +203,7 @@ def bitmap_to_path(
     return "".join(svg_paths), bbox_minmax
 
 
-# --- SAM-HQ Refiner ----------------------------------------------------------
+# --- HQ-SAM Refiner ----------------------------------------------------------
 
 def _extract_points_and_mask(pred_mask: torch.Tensor, gamma: float) -> Tuple[list, list, list, torch.Tensor]:
     """Extract positive point, negative point, bounding box, and Gaussian mask prompt."""
@@ -316,15 +316,22 @@ def _build_mask_inputs(
     return mask_inputs
 
 
-def build_sam_model(device: Optional[torch.device] = None, model_id: str = "facebook/sam2.1-hiera-large"):
-    """Build SAM2 model from HuggingFace with attached processor."""
-    from transformers import Sam2Model, Sam2Processor
+def build_sam_model(device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"):
+    """Build HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
+    from transformers import AutoModel
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    processor = Sam2Processor.from_pretrained(model_id)
-    model = Sam2Model.from_pretrained(model_id)
+
+    model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
     model = model.to(device)
-    model.processor = processor
+    model.eval()
+
+    # MetaSamHQModel exposes .sam and .resize
+    if not hasattr(model, "sam"):
+        raise AttributeError("Loaded model missing sam attribute.")
+    if not hasattr(model, "resize"):
+        raise AttributeError("Loaded model missing resize transform.")
+
     return model
 
 
@@ -337,12 +344,12 @@ def sam_refine(
     gamma: float = 4.0,
 ) -> np.ndarray:
     """
-    SAM2 iterative mask refinement.
+    HQ-SAM iterative mask refinement.
 
     Args:
         image: RGB numpy array (H, W, 3), uint8.
         coarse_mask: Binary mask (H, W), uint8.
-        sam_model: Sam2Model with attached processor.
+        sam_model: Namespace with fields: sam (HQ-SAM), resize (ResizeLongestSide), device.
         iters: Number of refinement iterations.
         strength: Mask prompt strength.
         gamma: Gaussian spread for mask prompt.
@@ -357,7 +364,10 @@ def sam_refine(
     if coarse_mask.ndim != 2:
         raise ValueError(f"Expected 2D mask, got {coarse_mask.shape}")
 
-    processor = sam_model.processor
+    sam = sam_model.sam
+    resize = getattr(sam_model, "resize", None)
+    if resize is None:
+        raise AttributeError("sam_model missing resize transform.")
     device = next(sam_model.parameters()).device
 
     img_h, img_w = image.shape[0], image.shape[1]
@@ -367,61 +377,64 @@ def sam_refine(
 
     current_mask = torch.tensor(coarse_mask, dtype=torch.uint8, device=device)
 
-    base_inputs = processor(image, return_tensors="pt")
-    pixel_values = base_inputs["pixel_values"].to(device)
+    # Prepare resized image and embeddings once
+    resized_img = resize.apply_image(image)
+    resized_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).float().to(device)  # CHW
+    input_images = torch.stack([sam.preprocess(resized_tensor)], dim=0)
 
-    # Sam2 expects points/boxes in 1024x1024 square space (non-aspect-preserving)
-    reshaped_h = 1024
-    reshaped_w = 1024
-
-    image_embeddings = sam_model.get_image_embeddings(pixel_values)
-
-    scale_x = reshaped_w / img_w
-    scale_y = reshaped_h / img_h
+    with torch.no_grad():
+        image_embeddings, interm_embeddings = sam.image_encoder(input_images)
+    # HQ-SAM returns a list of intermediate embeddings; use the first one
+    interm_embeddings = interm_embeddings[0]
 
     for _ in range(iters):
         point_coords, point_labels, box, gaus_dt = _extract_points_and_mask(current_mask, gamma)
 
-        mask_inputs = _build_mask_inputs(
-            current_mask, gaus_dt, (reshaped_h, reshaped_w), strength
-        ).to(device)
+        # Build mask prompt at resized resolution
+        mask_inputs = _build_mask_inputs(current_mask, gaus_dt, resized_tensor.shape[-2:], strength).to(device)
 
+        # Scale prompts with ResizeLongestSide utilities
         points_np = np.array(point_coords, dtype=np.float32)
-        points_np[:, 0] *= scale_x
-        points_np[:, 1] *= scale_y
-        input_points = torch.from_numpy(points_np).unsqueeze(0).unsqueeze(0).to(device)
+        points_t = torch.from_numpy(points_np).unsqueeze(0).to(device)  # 1 x N x 2
+        points_scaled = resize.apply_coords_torch(points_t, (img_h, img_w))
+        input_points = points_scaled.unsqueeze(0)  # 1 x 1 x N x 2
 
         input_labels = torch.tensor(point_labels, dtype=torch.long, device=device).unsqueeze(0).unsqueeze(0)
 
         box_np = np.array(box, dtype=np.float32)
-        box_np[0] *= scale_x
-        box_np[1] *= scale_y
-        box_np[2] *= scale_x
-        box_np[3] *= scale_y
-        input_boxes = torch.from_numpy(box_np).unsqueeze(0).unsqueeze(0).to(device)
+        box_t = torch.from_numpy(box_np).unsqueeze(0).to(device)  # 1 x 4
+        box_scaled = resize.apply_boxes_torch(box_t, (img_h, img_w))
+        input_boxes = box_scaled.unsqueeze(0)  # 1 x 1 x 4
+
+        batched_input = [
+            {
+                "image": resized_tensor,
+                "original_size": (img_h, img_w),
+                "point_coords": input_points.squeeze(0),
+                "point_labels": input_labels.squeeze(0),
+                "boxes": input_boxes.squeeze(0),
+                "mask_inputs": mask_inputs,
+            }
+        ]
 
         with torch.no_grad():
-            outputs = sam_model(
+            outputs = sam.forward_with_image_embeddings(
                 image_embeddings=image_embeddings,
-                input_points=input_points,
-                input_labels=input_labels,
-                input_boxes=input_boxes,
-                input_masks=mask_inputs,
+                interm_embeddings=interm_embeddings,
+                batched_input=batched_input,
                 multimask_output=True,
+                hq_token_only=False,
             )
 
-        sam_ious = outputs.iou_scores
-        sam_logits_multi = outputs.pred_masks
+        out = outputs[0]
+        sam_ious = out["iou_predictions"]
+        sam_masks = out["masks"]  # already upsampled to original size
 
-        best_idx = sam_ious[0, 0].argmax()
-        sam_logits = sam_logits_multi[0, 0, best_idx:best_idx+1]
+        best_idx = sam_ious[0].argmax()
+        best_mask_logits = sam_masks[0, best_idx:best_idx+1]
 
-        sam_logits_4d = sam_logits.unsqueeze(0)
-        upscaled = F.interpolate(sam_logits_4d, (1024, 1024), mode="bicubic", align_corners=False)
-        upscaled = upscaled[..., :reshaped_h, :reshaped_w]
-        processed_masks = F.interpolate(upscaled, (img_h, img_w), mode="bicubic", align_corners=False)
-
-        current_mask = (processed_masks.squeeze() > 0).to(torch.uint8)
+        # Keep mask 2D for downstream processing
+        current_mask = (best_mask_logits > 0).squeeze(0).to(torch.uint8)
 
     return current_mask.detach().cpu().numpy()
 
@@ -507,13 +520,13 @@ def refine_segmentation(
     iters: int = 8,
 ) -> Tuple[Optional[str], Optional[dict]]:
     """
-    Refine a coarse SVG segmentation using SAM2.
+    Refine a coarse SVG segmentation using HQ-SAM.
 
     Args:
         image: RGB image (numpy array or pyvips Image).
         svg_path: SVG path string from model output.
         bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
-        sam_model: Sam2Model with attached processor.
+        sam_model: HQ-SAM wrapper from build_sam_model.
         iters: Number of refinement iterations.
 
     Returns:
@@ -572,7 +585,7 @@ def refine_segmentation(
         refined_path, refined_bbox = result
         return refined_path, refined_bbox
 
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         return None, None
