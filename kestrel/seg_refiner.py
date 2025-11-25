@@ -19,12 +19,10 @@ _resvg_tls = threading.local()
 
 # --- SVG Rendering -----------------------------------------------------------
 
-
 def _get_resvg_ctx():
     ctx = getattr(_resvg_tls, "ctx", None)
     if ctx is None:
         from resvg import usvg
-
         fontdb = usvg.FontDatabase.default()
         fontdb.load_system_fonts()
         opts = usvg.Options.default()
@@ -46,9 +44,7 @@ def svg_from_path(svg_path: str, width: float, height: float, bbox: List[float])
     )
 
 
-def render_svg_to_soft_mask(
-    svg: str, width: int, height: int, scale: int = 2
-) -> np.ndarray:
+def render_svg_to_soft_mask(svg: str, width: int, height: int, scale: int = 2) -> np.ndarray:
     """Render SVG to a soft mask using resvg backend. Returns float32 [0,1] array."""
     from resvg import render, usvg
 
@@ -59,33 +55,25 @@ def render_svg_to_soft_mask(
     opts, fontdb = _get_resvg_ctx()
 
     normalized_svg = (
-        svg.replace(",M", " M")
-        .replace(",m", " m")
-        .replace(",L", " L")
-        .replace(",l", " l")
-        .replace(",C", " C")
-        .replace(",c", " c")
-        .replace(",Z", " Z")
-        .replace(",z", " z")
+        svg.replace(",M", " M").replace(",m", " m")
+        .replace(",L", " L").replace(",l", " l")
+        .replace(",C", " C").replace(",c", " c")
+        .replace(",Z", " Z").replace(",z", " z")
     )
 
     render_width = max(1, int(round(width * scale)))
     render_height = max(1, int(round(height * scale)))
-    normalized_svg = re.sub(
-        r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg
-    )
-    normalized_svg = re.sub(
-        r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg
-    )
+    normalized_svg = re.sub(r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg)
+    normalized_svg = re.sub(r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg)
 
     tree = usvg.Tree.from_str(normalized_svg, opts, fontdb)
     png_bytes = bytes(render(tree, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)))
 
     pil_image = Image.open(io.BytesIO(png_bytes))
-    if pil_image.mode in ("RGBA", "LA"):
-        alpha_channel = pil_image.getchannel("A")
+    if pil_image.mode in ('RGBA', 'LA'):
+        alpha_channel = pil_image.getchannel('A')
     else:
-        alpha_channel = pil_image.convert("L")
+        alpha_channel = pil_image.convert('L')
 
     mask = np.array(alpha_channel, dtype=np.float32)
     if scale > 1:
@@ -125,9 +113,7 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[List[float], dict]]:
     return cxcywh, minmax
 
 
-def _coord(
-    pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int
-) -> str:
+def _coord(pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
     """Map traced point to bbox-normalized 0-1 path coords."""
     cx, cy, bw, bh = bbox_norm
     x_img = (pt[0] * scale) / img_w
@@ -139,9 +125,7 @@ def _coord(
     return f"{x_rel:.3f},{y_rel:.3f}".replace("0.", ".").replace("-.", "-0.")
 
 
-def _curve_to_path(
-    curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int
-) -> str:
+def _curve_to_path(curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
     """Convert a potrace curve to SVG path segment."""
     parts = [f"M{_coord(curve.start_point, bbox_norm, img_w, img_h, scale)}"]
     for seg in curve.segments:
@@ -196,9 +180,7 @@ def bitmap_to_path(
         scaled_w = max(1, w // downsample)
         scaled_h = max(1, h // downsample)
         arr = np.asarray(
-            Image.fromarray(arr * 255).resize(
-                (scaled_w, scaled_h), resample=Image.NEAREST
-            )
+            Image.fromarray(arr * 255).resize((scaled_w, scaled_h), resample=Image.NEAREST)
         )
         arr = (arr > 128).astype(np.uint8)
         scale = downsample
@@ -221,12 +203,9 @@ def bitmap_to_path(
     return "".join(svg_paths), bbox_minmax
 
 
-# --- SAM-HQ Refiner ----------------------------------------------------------
+# --- HQ-SAM Refiner ----------------------------------------------------------
 
-
-def _extract_points_and_mask(
-    pred_mask: torch.Tensor, gamma: float
-) -> Tuple[list, list, list, torch.Tensor]:
+def _extract_points_and_mask(pred_mask: torch.Tensor, gamma: float) -> Tuple[list, list, list, torch.Tensor]:
     """Extract positive point, negative point, bounding box, and Gaussian mask prompt."""
     pred_mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
     device = pred_mask.device
@@ -234,9 +213,7 @@ def _extract_points_and_mask(
     if pred_mask_np.sum() == 0:
         pred_mask_dt_np = np.zeros_like(pred_mask_np, dtype=np.float32)
     else:
-        pred_mask_dt_np = cv2.distanceTransform(
-            pred_mask_np, distanceType=cv2.DIST_L2, maskSize=3
-        )
+        pred_mask_dt_np = cv2.distanceTransform(pred_mask_np, distanceType=cv2.DIST_L2, maskSize=3)
     pred_mask_dt = torch.from_numpy(pred_mask_dt_np).to(device, torch.float32)
 
     pred_max_dist = pred_mask_dt.max()
@@ -259,14 +236,12 @@ def _extract_points_and_mask(
     # Find negative point: background pixel inside bbox with max distance from foreground
     pred_mask_rev_np = (pred_mask_np == 0).astype(np.uint8)
     box_mask_np = np.zeros_like(pred_mask_np, dtype=np.uint8)
-    box_mask_np[ymin : ymax + 1, xmin : xmax + 1] = 1
+    box_mask_np[ymin:ymax+1, xmin:xmax+1] = 1
     bg_in_box = pred_mask_rev_np & box_mask_np
 
     neg_x, neg_y = None, None
     if bg_in_box.sum() > 0:
-        bg_dt = cv2.distanceTransform(
-            pred_mask_rev_np, distanceType=cv2.DIST_L2, maskSize=3
-        )
+        bg_dt = cv2.distanceTransform(pred_mask_rev_np, distanceType=cv2.DIST_L2, maskSize=3)
         bg_dt[box_mask_np == 0] = 0  # only consider inside bbox
         if bg_dt.max() > 0:
             bg_dt_t = torch.from_numpy(bg_dt).to(device, torch.float32)
@@ -314,39 +289,25 @@ def _build_mask_inputs(
     gaus = gaus_dt.float().unsqueeze(0).unsqueeze(0)
 
     # Convert binary mask to signed: 0 -> -1, 1 -> +1
-    pred_masks = torch.where(
-        pred_masks == 0,
-        torch.tensor(-1.0, device=pred_masks.device),
-        torch.tensor(1.0, device=pred_masks.device),
-    )
+    pred_masks = torch.where(pred_masks == 0, torch.tensor(-1.0, device=pred_masks.device), torch.tensor(1.0, device=pred_masks.device))
 
     # Resize both to target size
-    pred_masks = F.interpolate(
-        pred_masks, target_size, mode="bilinear", align_corners=False
-    )
+    pred_masks = F.interpolate(pred_masks, target_size, mode="bilinear", align_corners=False)
     gaus = F.interpolate(gaus, target_size, mode="bilinear", align_corners=False)
 
     # Pad to 1024x1024
     h, w = pred_masks.shape[-2:]
     padh = 1024 - h
     padw = 1024 - w
-    pred_masks = F.pad(
-        pred_masks, (0, padw, 0, padh), "constant", -1.0
-    )  # pad with -1 (background)
+    pred_masks = F.pad(pred_masks, (0, padw, 0, padh), "constant", -1.0)  # pad with -1 (background)
     gaus = F.pad(gaus, (0, padw, 0, padh), "constant", 0.0)  # pad with 0
 
     # Resize to 256x256 for SAM
-    pred_masks = F.interpolate(
-        pred_masks, (256, 256), mode="bilinear", align_corners=False
-    )
+    pred_masks = F.interpolate(pred_masks, (256, 256), mode="bilinear", align_corners=False)
     gaus = F.interpolate(gaus, (256, 256), mode="bilinear", align_corners=False)
 
     # Apply strength: negative regions get -strength, positive get +strength
-    pred_masks = torch.where(
-        pred_masks <= 0,
-        -strength * torch.ones_like(pred_masks),
-        strength * torch.ones_like(pred_masks),
-    )
+    pred_masks = torch.where(pred_masks <= 0, -strength * torch.ones_like(pred_masks), strength * torch.ones_like(pred_masks))
 
     # Multiply by gaus_dt (background gaus is 0, set to 1 so it becomes -strength)
     gaus = torch.where(gaus <= 0, torch.ones_like(gaus), gaus)
@@ -355,9 +316,7 @@ def _build_mask_inputs(
     return mask_inputs
 
 
-def build_sam_model(
-    device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"
-):
+def build_sam_model(device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"):
     """Build HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
     from transformers import AutoModel
 
@@ -368,9 +327,9 @@ def build_sam_model(
     model.eval()
 
     # MetaSamHQModel exposes .sam and .resize
-    sam = model.sam
-    resize = getattr(model, "resize", None)
-    if resize is None:
+    if not hasattr(model, "sam"):
+        raise AttributeError("Loaded model missing sam attribute.")
+    if not hasattr(model, "resize"):
         raise AttributeError("Loaded model missing resize transform.")
 
     return model
@@ -414,19 +373,13 @@ def sam_refine(
     img_h, img_w = image.shape[0], image.shape[1]
 
     if coarse_mask.shape != (img_h, img_w):
-        coarse_mask = cv2.resize(
-            coarse_mask.astype(np.uint8),
-            (img_w, img_h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        coarse_mask = cv2.resize(coarse_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
 
     current_mask = torch.tensor(coarse_mask, dtype=torch.uint8, device=device)
 
     # Prepare resized image and embeddings once
     resized_img = resize.apply_image(image)
-    resized_tensor = (
-        torch.from_numpy(resized_img).permute(2, 0, 1).float().to(device)
-    )  # CHW
+    resized_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).float().to(device)  # CHW
     input_images = torch.stack([sam.preprocess(resized_tensor)], dim=0)
 
     with torch.no_grad():
@@ -435,14 +388,10 @@ def sam_refine(
     interm_embeddings = interm_embeddings[0]
 
     for _ in range(iters):
-        point_coords, point_labels, box, gaus_dt = _extract_points_and_mask(
-            current_mask, gamma
-        )
+        point_coords, point_labels, box, gaus_dt = _extract_points_and_mask(current_mask, gamma)
 
         # Build mask prompt at resized resolution
-        mask_inputs = _build_mask_inputs(
-            current_mask, gaus_dt, resized_tensor.shape[-2:], strength
-        ).to(device)
+        mask_inputs = _build_mask_inputs(current_mask, gaus_dt, resized_tensor.shape[-2:], strength).to(device)
 
         # Scale prompts with ResizeLongestSide utilities
         points_np = np.array(point_coords, dtype=np.float32)
@@ -450,11 +399,7 @@ def sam_refine(
         points_scaled = resize.apply_coords_torch(points_t, (img_h, img_w))
         input_points = points_scaled.unsqueeze(0)  # 1 x 1 x N x 2
 
-        input_labels = (
-            torch.tensor(point_labels, dtype=torch.long, device=device)
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )
+        input_labels = torch.tensor(point_labels, dtype=torch.long, device=device).unsqueeze(0).unsqueeze(0)
 
         box_np = np.array(box, dtype=np.float32)
         box_t = torch.from_numpy(box_np).unsqueeze(0).to(device)  # 1 x 4
@@ -486,7 +431,7 @@ def sam_refine(
         sam_masks = out["masks"]  # already upsampled to original size
 
         best_idx = sam_ious[0].argmax()
-        best_mask_logits = sam_masks[0, best_idx : best_idx + 1]
+        best_mask_logits = sam_masks[0, best_idx:best_idx+1]
 
         # Keep mask 2D for downstream processing
         current_mask = (best_mask_logits > 0).squeeze(0).to(torch.uint8)
@@ -495,7 +440,6 @@ def sam_refine(
 
 
 # --- Mask post-processing ----------------------------------------------------
-
 
 def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
     """Remove small holes/islands and apply morphological close."""
@@ -510,11 +454,7 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
         sizes = stats[1:, -1]
         small = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
         if small:
-            fill = (
-                [0] + small
-                if fill_holes
-                else [i for i in range(n_labels) if i not in [0] + small]
-            )
+            fill = [0] + small if fill_holes else [i for i in range(n_labels) if i not in [0] + small]
             if not fill_holes and not fill:
                 fill = [int(np.argmax(sizes)) + 1]
             mask = np.isin(regions, fill).astype(np.uint8)
@@ -524,10 +464,7 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
 
 # --- High-level refinement API -----------------------------------------------
 
-
-def _expand_bbox(
-    bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25
-) -> Tuple[int, int, int, int]:
+def _expand_bbox(bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25) -> Tuple[int, int, int, int]:
     """Expand bbox by margin and clip to image bounds. Returns (x1, y1, x2, y2) in pixels."""
     x_min = bbox_minmax["x_min"] * img_w
     y_min = bbox_minmax["y_min"] * img_h
@@ -547,12 +484,7 @@ def _expand_bbox(
     return x1, y1, x2, y2
 
 
-def _paste_mask(
-    full_h: int,
-    full_w: int,
-    crop_mask: np.ndarray,
-    crop_xyxy: Tuple[int, int, int, int],
-) -> np.ndarray:
+def _paste_mask(full_h: int, full_w: int, crop_mask: np.ndarray, crop_xyxy: Tuple[int, int, int, int]) -> np.ndarray:
     """Paste cropped mask back into full-size mask."""
     x1, y1, x2, y2 = crop_xyxy
     full_mask = np.zeros((full_h, full_w), dtype=np.uint8)
@@ -561,11 +493,7 @@ def _paste_mask(
     target_h, target_w = y2 - y1, x2 - x1
 
     if crop_h != target_h or crop_w != target_w:
-        crop_mask = cv2.resize(
-            crop_mask.astype(np.uint8),
-            (target_w, target_h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        crop_mask = cv2.resize(crop_mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
     full_mask[y1:y2, x1:x2] = crop_mask
     return full_mask
@@ -581,9 +509,7 @@ def _ensure_numpy_rgb(image) -> np.ndarray:
     elif image.bands == 1:
         image = image.bandjoin([image, image])
     mem = image.write_to_memory()
-    return np.frombuffer(mem, dtype=np.uint8).reshape(
-        image.height, image.width, image.bands
-    )
+    return np.frombuffer(mem, dtype=np.uint8).reshape(image.height, image.width, image.bands)
 
 
 def refine_segmentation(
@@ -659,9 +585,8 @@ def refine_segmentation(
         refined_path, refined_bbox = result
         return refined_path, refined_bbox
 
-    except Exception as e:
+    except Exception:
         import traceback
-
         traceback.print_exc()
         return None, None
 

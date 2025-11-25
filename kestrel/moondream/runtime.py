@@ -1,5 +1,6 @@
 """Moondream runtime with paged KV cache and optional image prefixes."""
 
+
 import functools
 import json
 from copy import deepcopy
@@ -47,6 +48,7 @@ from .region import (
     decode_size,
 )
 from ..seg_refiner import build_sam_model
+
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -165,7 +167,9 @@ class _LayerPagedCache(torch.nn.Module):
         if k_val.shape[2] != v_val.shape[2]:
             raise ValueError("k_val and v_val must share the sequence dimension")
 
-        input_pos = torch.atleast_2d(pos_ids).to(dtype=torch.int32, device=k_val.device)
+        input_pos = torch.atleast_2d(pos_ids).to(
+            dtype=torch.int32, device=k_val.device
+        )
         if input_pos.shape[0] != 1 and input_pos.shape[0] != k_val.shape[0]:
             raise ValueError(
                 f"Unsupported position shape {pos_ids.shape} for batch size {k_val.shape[0]}"
@@ -212,9 +216,7 @@ class MoondreamRuntime:
 
         text_section = raw_config.setdefault("text", {})
         default_context = int(
-            text_section.get(
-                "max_context", DEFAULT_MOONDREAM_CONFIG["text"]["max_context"]
-            )
+            text_section.get("max_context", DEFAULT_MOONDREAM_CONFIG["text"]["max_context"])
         )
         requested_context = cfg.max_seq_length
         if requested_context is not None and requested_context != default_context:
@@ -226,9 +228,7 @@ class MoondreamRuntime:
         self._kv_layer_v_scales: list[float] | None = None
 
         self.max_seq_length = int(
-            cfg.max_seq_length
-            if cfg.max_seq_length is not None
-            else self.config.text.max_context
+            cfg.max_seq_length if cfg.max_seq_length is not None else self.config.text.max_context
         )
         if self.max_seq_length % cfg.page_size != 0:
             raise ValueError("max_seq_length must be divisible by page_size")
@@ -254,11 +254,11 @@ class MoondreamRuntime:
             device=self.device,
             setup_caches=False,
         ).eval()
-        self.region = build_region_module(self.config.region, self.dtype).to(
-            self.device
-        )
+        self.region = build_region_module(self.config.region, self.dtype).to(self.device)
         self.image_prefix_length = (
-            self.model.vision.pos_emb.shape[1] if hasattr(self.model, "vision") else 0
+            self.model.vision.pos_emb.shape[1]
+            if hasattr(self.model, "vision")
+            else 0
         )
         n_layers = self.config.text.n_layers
         captured_k_scales: list[Optional[float]] = [None] * n_layers
@@ -308,7 +308,10 @@ class MoondreamRuntime:
                 stacklevel=2,
             )
 
-        if self._kv_layer_k_scales is not None and self._kv_layer_v_scales is not None:
+        if (
+            self._kv_layer_k_scales is not None
+            and self._kv_layer_v_scales is not None
+        ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             self.kv_cache_dtype = self.dtype
@@ -791,7 +794,11 @@ class MoondreamRuntime:
 
         batch_size = batch_idx.shape[0]
         result: RuntimeDecodeResult
-        if tokens_tensor is not None and self._use_cuda_graphs and batch_size > 0:
+        if (
+            tokens_tensor is not None
+            and self._use_cuda_graphs
+            and batch_size > 0
+        ):
             graph_batch_size = self._select_graph_batch_size(batch_size)
             if graph_batch_size is not None and self._cuda_graphs:
                 result = self._decode_with_graph(
@@ -1071,17 +1078,13 @@ class MoondreamRuntime:
         with self.graph_capture_lock:
             workspace = self._graph_workspace
             if workspace is None:
-                raise RuntimeError(
-                    "CUDA graph workspace must be initialized before capture"
-                )
+                raise RuntimeError("CUDA graph workspace must be initialized before capture")
             max_batch = workspace.token_buffer.shape[0]
             if max_batch == 0:
                 return
 
             device = self.device
-            batch_indices = torch.arange(
-                1, max_batch + 1, device=device, dtype=torch.long
-            )
+            batch_indices = torch.arange(1, max_batch + 1, device=device, dtype=torch.long)
             workspace.batch_idx_buffer.copy_(batch_indices)
             workspace.token_buffer.zero_()
             workspace.position_buffer.zero_()

@@ -1,5 +1,6 @@
 """Segmentation skill that returns SVG paths and bounding boxes."""
 
+
 from dataclasses import dataclass
 from typing import Iterable
 import json
@@ -59,9 +60,7 @@ class SegmentSkill(SkillSpec):
         request_context: object,
     ) -> Tensor:
         if not isinstance(request_context, SegmentRequest):
-            raise ValueError(
-                "SegmentSkill.build_prompt_tokens requires a SegmentRequest"
-            )
+            raise ValueError("SegmentSkill.build_prompt_tokens requires a SegmentRequest")
         template = runtime.config.tokenizer.templates.get("segment")
         if template is None:
             raise ValueError("Model configuration does not include segment templates")
@@ -103,9 +102,7 @@ class SegmentSkill(SkillSpec):
         request_context: "SegmentRequest",
     ) -> "SegmentSkillState":
         if not isinstance(request_context, SegmentRequest):
-            raise ValueError(
-                "SegmentSkill.create_state requires a SegmentRequest context"
-            )
+            raise ValueError("SegmentSkill.create_state requires a SegmentRequest context")
         return SegmentSkillState(self, request, request_context)
 
 
@@ -124,9 +121,7 @@ class SegmentSkillState(SkillState):
         self._coord_values: List[float] = []
         self._size_values: List[Tuple[float, float]] = []
         self._streaming: bool = bool(segment_request.stream)
-        self._stream_cursor: int = (
-            0  # index into decoded tokens processed for streaming
-        )
+        self._stream_cursor: int = 0  # index into decoded tokens processed for streaming
         self._pending_stream: Optional[str] = None
         self._bbox_sent: bool = False
 
@@ -232,9 +227,7 @@ class SegmentSkillState(SkillState):
                 return
 
         # Emit one path chunk per call: previous command + its args.
-        decoded_tokens = decode_svg_token_strings(
-            runtime.tokenizer, self._text_token_ids
-        )
+        decoded_tokens = decode_svg_token_strings(runtime.tokenizer, self._text_token_ids)
         if not decoded_tokens:
             return
         try:
