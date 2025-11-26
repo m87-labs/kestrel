@@ -301,7 +301,6 @@ class InferenceEngine:
         if self._shutdown:
             return
         self._shutdown = True
-        self._pause_gate.set()
         await self._queue.put(None)
         if self._worker_task is not None:
             await self._worker_task
