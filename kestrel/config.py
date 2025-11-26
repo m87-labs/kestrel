@@ -40,7 +40,11 @@ class RuntimeConfig:
     def resolved_device(self) -> torch.device:
         """Return the torch device requested for inference."""
 
-        return torch.device(self.device)
+        device = torch.device(self.device)
+        # Ensure CUDA devices have an explicit index for torch.cuda.set_device()
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return device
 
 
 __all__ = ["ModelPaths", "RuntimeConfig"]
