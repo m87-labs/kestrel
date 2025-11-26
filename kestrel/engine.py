@@ -960,7 +960,7 @@ class InferenceEngine:
 
         def promote_crops() -> bool:
             promoted = False
-            while True:
+            while len(scheduler.waiting) < runtime.max_batch_size * 2:
                 try:
                     rid = ready_crops.get_nowait()
                 except queue.Empty:
