@@ -322,7 +322,19 @@ def build_sam_model(device: Optional[torch.device] = None, model_id: str = "moon
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+    # Try loading from cache first to avoid network calls
+    try:
+        model = AutoModel.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception:
+        # Fall back to downloading if not cached
+        model = AutoModel.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+        )
     model = model.to(device)
     model.eval()
 
