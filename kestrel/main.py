@@ -38,7 +38,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, help="Optional model config JSON")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
     parser.add_argument("--head-refiner-weights", type=Path, help="Path to head refiner weights")
-    parser.add_argument("--use-head-refiner", action="store_true", help="Use head refiner instead of SAM")
+    parser.add_argument("--use-sam", action="store_true", help="Use SAM refiner instead of head refiner")
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
     parser.add_argument("--max-batch-size", type=int, default=4, help="Max sequences per decode step")
@@ -129,7 +129,7 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
-        use_head_refiner=getattr(args, "use_head_refiner", False),
+        use_head_refiner=not getattr(args, "use_sam", False),
     )
 
 
