@@ -177,6 +177,7 @@ class SegmentSkillState(SkillState):
                     bbox,
                     runtime.head_refiner,
                     runtime.model.vision,
+                    runtime.config.vision,
                     iters=6,
                 )
             else:
