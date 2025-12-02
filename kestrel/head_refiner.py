@@ -94,9 +94,8 @@ class MaskRefinerHead(nn.Module):
         return coarse_logits + delta_logits
 
 
-class HeadRefiner(nn.Module):
+class HeadRefiner:
     def __init__(self, ckpt_path, device="cuda"):
-        super().__init__()
         self.device = device
         self.head = MaskRefinerHead(enc_dim=1152, decoder_dim=128)
 
@@ -106,9 +105,12 @@ class HeadRefiner(nn.Module):
         self.head.eval()
 
     @torch.no_grad()
-    def forward(self, features, mask, n_iters=6):
+    def __call__(self, features, mask, n_iters=6):
         current_mask = mask
         for _ in range(n_iters):
             logits = self.head(features, current_mask)
             current_mask = torch.sigmoid(logits)
         return current_mask
+
+    def parameters(self):
+        return self.head.parameters()

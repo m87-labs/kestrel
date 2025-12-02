@@ -8,13 +8,15 @@ import torch
 import torch.nn.functional as F
 
 from .seg_refiner import bitmap_to_path, svg_from_path, render_svg_to_soft_mask, _clean_mask, _expand_bbox, _paste_mask, _ensure_numpy_rgb
+from .moondream.vision import vision_encoder, create_patches
 
 
 def head_refine(
     image: np.ndarray,
     coarse_mask: np.ndarray,
     head_refiner,
-    vision_model,
+    vision_module,
+    vision_config,
     iters: int = 6,
 ) -> np.ndarray:
     """
@@ -24,7 +26,8 @@ def head_refine(
         image: RGB numpy array (H, W, 3), uint8.
         coarse_mask: Binary mask (H, W), uint8.
         head_refiner: HeadRefiner instance.
-        vision_model: Vision encoder model (runtime.model.vision).
+        vision_module: runtime.model.vision (ModuleDict).
+        vision_config: runtime.config.vision (VisionConfig).
         iters: Number of refinement iterations.
 
     Returns:
@@ -58,9 +61,9 @@ def head_refine(
     # Convert mask to [0, 1] tensor (mask is already binary 0/1)
     mask_t = torch.from_numpy(mask_resized).float().to(device).unsqueeze(0).unsqueeze(0)
 
-    # Get vision features
+    # Get vision features using vision_encoder function
     with torch.no_grad():
-        features = vision_model(img_norm)  # (1, 729, 1152)
+        features = vision_encoder(img_norm, vision_module, vision_config)  # (1, 729, 1152)
         refined_mask = head_refiner(features, mask_t, n_iters=iters)  # (1, 1, 378, 378)
 
     # Resize back to original size
@@ -76,7 +79,8 @@ def refine_segmentation_with_head(
     svg_path: str,
     bbox: dict,
     head_refiner,
-    vision_model,
+    vision_module,
+    vision_config,
     iters: int = 6,
 ) -> Tuple[Optional[str], Optional[dict]]:
     """
@@ -87,7 +91,8 @@ def refine_segmentation_with_head(
         svg_path: SVG path string from model output.
         bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
         head_refiner: HeadRefiner instance.
-        vision_model: Vision encoder model.
+        vision_module: runtime.model.vision (ModuleDict).
+        vision_config: runtime.config.vision (VisionConfig).
         iters: Number of refinement iterations.
 
     Returns:
@@ -128,7 +133,7 @@ def refine_segmentation_with_head(
             return None, None
 
         # Run head refinement
-        refined_crop = head_refine(crop_img, crop_mask, head_refiner, vision_model, iters=iters)
+        refined_crop = head_refine(crop_img, crop_mask, head_refiner, vision_module, vision_config, iters=iters)
 
         # Paste back to full size and clean up
         refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
