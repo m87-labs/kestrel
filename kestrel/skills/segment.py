@@ -178,7 +178,7 @@ class SegmentSkillState(SkillState):
                     runtime.head_refiner,
                     runtime.model.vision,
                     runtime.config.vision,
-                    iters=6,
+                    iters=runtime.config.refiner_iters,
                 )
             else:
                 refined_path, refined_bbox = refine_segmentation(
@@ -186,7 +186,7 @@ class SegmentSkillState(SkillState):
                     svg_path,
                     bbox,
                     runtime.sam_model,
-                    iters=6,
+                    iters=runtime.config.refiner_iters,
                 )
             if refined_path is not None and refined_bbox is not None:
                 svg_path = refined_path

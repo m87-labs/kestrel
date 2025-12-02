@@ -33,6 +33,7 @@ class RuntimeConfig:
     max_seq_length: int = 32768
     enable_cuda_graphs: bool = True
     use_head_refiner: bool = True
+    refiner_iters: int = 6
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""
