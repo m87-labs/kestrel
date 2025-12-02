@@ -23,6 +23,7 @@ class REPLConfig:
     refiner: str
     refiner_iters: int
     device: str
+    temperature: float
 
 
 def create_overlay(image: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndarray:
@@ -40,6 +41,7 @@ async def segment_and_visualize(
     image_path: str,
     text_prompt: str,
     output_path: str,
+    temperature: float,
 ) -> dict:
     image = Image.open(image_path).convert("RGB")
     np_image = np.array(image)
@@ -47,7 +49,7 @@ async def segment_and_visualize(
     response = await engine.segment(
         image=np_image,
         object=text_prompt,
-        settings={"temperature": 0.0, "max_tokens": 2000},
+        settings={"temperature": temperature, "max_tokens": 2000},
     )
 
     segment = response.output["segments"][0]
@@ -96,6 +98,7 @@ async def init_engine(config: REPLConfig) -> InferenceEngine:
 async def repl_loop(engine: InferenceEngine, config: REPLConfig):
     print(f"\nKestrel Segmentation REPL")
     print(f"Refiner: {config.refiner} (iters={config.refiner_iters})")
+    print(f"Temperature: {config.temperature}")
     print(f"Press Ctrl+C to exit\n")
 
     iteration = 0
@@ -118,7 +121,7 @@ async def repl_loop(engine: InferenceEngine, config: REPLConfig):
         print(f"\nProcessing: {image_path}")
         print(f"Prompt: {text_prompt}")
 
-        result = await segment_and_visualize(engine, image_path, text_prompt, output_path)
+        result = await segment_and_visualize(engine, image_path, text_prompt, output_path, config.temperature)
 
         print(f"✓ Saved: {result['output_path']}")
         print(f"  BBox: {result['bbox']}")
@@ -131,6 +134,7 @@ async def async_main():
     parser.add_argument("--head-weights", type=Path)
     parser.add_argument("--refiner", choices=["head", "sam"], required=True)
     parser.add_argument("--refiner-iters", type=int, default=6)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -143,6 +147,7 @@ async def async_main():
         refiner=args.refiner,
         refiner_iters=args.refiner_iters,
         device=args.device,
+        temperature=args.temperature,
     )
 
     print("Initializing engine...")
