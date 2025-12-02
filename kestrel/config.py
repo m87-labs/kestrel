@@ -18,6 +18,7 @@ class ModelPaths:
     reference_weights: Optional[Path] = None
     reference_config: Optional[Path] = None
     reference_tokenizer: Optional[str | Path] = None
+    head_refiner_weights: Optional[Path] = None
 
 
 @dataclass
@@ -31,6 +32,7 @@ class RuntimeConfig:
     page_size: int = 128
     max_seq_length: int = 32768
     enable_cuda_graphs: bool = True
+    use_head_refiner: bool = True
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

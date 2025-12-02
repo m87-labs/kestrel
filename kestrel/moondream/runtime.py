@@ -48,6 +48,7 @@ from .region import (
     decode_size,
 )
 from ..seg_refiner import build_sam_model
+from ..head_refiner import HeadRefiner
 
 
 
@@ -413,7 +414,16 @@ class MoondreamRuntime:
             cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
-        self.sam_model = build_sam_model(device=self.device)
+
+        if cfg.use_head_refiner and cfg.model_paths.head_refiner_weights:
+            self.head_refiner = HeadRefiner(
+                ckpt_path=str(cfg.model_paths.head_refiner_weights),
+                device=self.device
+            )
+            self.sam_model = None
+        else:
+            self.head_refiner = None
+            self.sam_model = build_sam_model(device=self.device)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
