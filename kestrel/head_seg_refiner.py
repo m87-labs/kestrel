@@ -67,7 +67,7 @@ def head_refine(
         refined_mask = head_refiner(features, mask_t, n_iters=iters)  # (1, 1, 378, 378)
 
     # Resize back to original size
-    refined_mask_np = refined_mask.squeeze(0).squeeze(0).cpu().numpy()
+    refined_mask_np = refined_mask.squeeze(0).squeeze(0).float().cpu().numpy()
     refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
     refined_mask_binary = (refined_mask_full > 0.5).astype(np.uint8)
 
