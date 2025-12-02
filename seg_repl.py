@@ -84,7 +84,7 @@ async def init_engine(config: REPLConfig) -> InferenceEngine:
         ),
         device=config.device,
         dtype=torch.bfloat16,
-        max_batch_size=1,
+        max_batch_size=2,
         enable_cuda_graphs=False,
         use_head_refiner=(config.refiner == "head"),
     )
