@@ -59,7 +59,7 @@ def head_refine(
     img_norm = img_norm.to(torch.bfloat16)
 
     # Convert mask to [0, 1] tensor (mask is already binary 0/1)
-    mask_t = torch.from_numpy(mask_resized).float().to(device).unsqueeze(0).unsqueeze(0)
+    mask_t = torch.from_numpy(mask_resized).float().to(device).unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
 
     # Get vision features using vision_encoder function
     with torch.no_grad():
