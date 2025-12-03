@@ -170,7 +170,17 @@ class SegmentSkillState(SkillState):
         coarse_bbox = bbox
 
         if svg_path and bbox and not parse_error and self._request.image is not None:
-            if runtime.head_refiner is not None:
+            if runtime.sam_head_refiner is not None:
+                refined_path, refined_bbox = refine_segmentation_with_head(
+                    self._request.image,
+                    svg_path,
+                    bbox,
+                    runtime.sam_head_refiner,
+                    runtime.model.vision,
+                    runtime.config.vision,
+                    iters=runtime.config.refiner_iters,
+                )
+            elif runtime.head_refiner is not None:
                 refined_path, refined_bbox = refine_segmentation_with_head(
                     self._request.image,
                     svg_path,

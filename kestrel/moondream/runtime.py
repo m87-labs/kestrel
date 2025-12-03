@@ -49,6 +49,7 @@ from .region import (
 )
 from ..seg_refiner import build_sam_model
 from ..head_refiner import HeadRefiner
+from ..sam_head_refiner import SAMHeadRefiner
 
 
 
@@ -417,14 +418,21 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        if cfg.use_head_refiner and cfg.model_paths.head_refiner_weights:
+        self.head_refiner = None
+        self.sam_head_refiner = None
+        self.sam_model = None
+
+        if cfg.refiner_type == "samhead" and cfg.model_paths.sam_head_refiner_weights:
+            self.sam_head_refiner = SAMHeadRefiner(
+                ckpt_path=str(cfg.model_paths.sam_head_refiner_weights),
+                device=self.device
+            )
+        elif cfg.refiner_type == "head" and cfg.model_paths.head_refiner_weights:
             self.head_refiner = HeadRefiner(
                 ckpt_path=str(cfg.model_paths.head_refiner_weights),
                 device=self.device
             )
-            self.sam_model = None
         else:
-            self.head_refiner = None
             self.sam_model = build_sam_model(device=self.device)
 
         if self._use_cuda_graphs:

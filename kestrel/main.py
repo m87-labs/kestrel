@@ -37,8 +37,9 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
     parser.add_argument("--config", type=Path, help="Optional model config JSON")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
-    parser.add_argument("--head-refiner-weights", type=Path, help="Path to head refiner weights")
-    parser.add_argument("--use-sam", action="store_true", help="Use SAM refiner instead of head refiner")
+    parser.add_argument("--refiner-weights", type=Path, help="Path to refiner weights (for head or samhead)")
+    parser.add_argument("--use-sam", action="store_true", help="Use HQ-SAM refiner")
+    parser.add_argument("--use-samhead", action="store_true", help="Use SAM-style head refiner")
     parser.add_argument("--refiner-iters", type=int, default=6, help="Number of refiner iterations")
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
@@ -116,11 +117,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
+    # Determine refiner type from flags
+    use_sam = getattr(args, "use_sam", False)
+    use_samhead = getattr(args, "use_samhead", False)
+    refiner_weights = getattr(args, "refiner_weights", None)
+
+    if use_samhead:
+        refiner_type = "samhead"
+    elif use_sam:
+        refiner_type = "sam"
+    else:
+        refiner_type = "head"
+
     model_paths = ModelPaths(
         weights=args.weights,
         config_json=args.config,
         tokenizer=args.tokenizer,
-        head_refiner_weights=getattr(args, "head_refiner_weights", None),
+        head_refiner_weights=refiner_weights if refiner_type == "head" else None,
+        sam_head_refiner_weights=refiner_weights if refiner_type == "samhead" else None,
     )
     return RuntimeConfig(
         model_paths=model_paths,
@@ -130,7 +144,7 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
-        use_head_refiner=not getattr(args, "use_sam", False),
+        refiner_type=refiner_type,
         refiner_iters=getattr(args, "refiner_iters", 6),
     )
 

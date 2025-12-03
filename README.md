@@ -323,11 +323,13 @@ pt_file = hf_hub_download(
 
 ### HTTP Server
 
-- **Launch**
+- **Launch (with head refiner)**
 
   ```bash
   uv run python -m kestrel.main serve \
       --weights ~/code/moondream/model.pt \
+      --head-refiner-weights ~/code/moondream/head_refiner.pt \
+      --refiner-iters 6 \
       --device cuda --dtype bfloat16 \
       --max-batch-size 64 \
       --default-max-new-tokens 512 \
@@ -335,6 +337,24 @@ pt_file = hf_hub_download(
   ```
 
   The server primes the shared engine on startup and then serves concurrent POST requests at `http://<host>:<port>/v1/query`. `/healthz` returns 200 once the warmup finishes.
+
+  **Head refiner options:**
+  - `--head-refiner-weights`: Path to head refiner checkpoint (enables head refiner by default)
+  - `--refiner-iters`: Number of iterative refinement passes (default: 6)
+  - `--use-sam`: Use SAM refiner instead of head refiner (omit `--head-refiner-weights` when using SAM)
+
+- **Launch (with SAM refiner)**
+
+  ```bash
+  uv run python -m kestrel.main serve \
+      --weights ~/code/moondream/model.pt \
+      --use-sam \
+      --refiner-iters 6 \
+      --device cuda --dtype bfloat16 \
+      --max-batch-size 64 \
+      --default-max-new-tokens 512 \
+      --host 0.0.0.0 --port 8080
+  ```
 
 - **Request shape**
 

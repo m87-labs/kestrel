@@ -1,3 +1,18 @@
+"""
+uv run seg_repl.py \
+  --kestrel-weights /ephemeral/vixtral-train/ckpt/rl/seg-warp-3_1/s941/model.pt \
+  --refiner-weights /ephemeral/vixtral-train/ckpt/mask-refiner/test_train_refiner_01/s31000/model.pt \
+  --refiner head \
+  --refiner-iters 5
+
+# Or with samhead:
+# uv run seg_repl.py \
+#   --kestrel-weights /ephemeral/vixtral-train/ckpt/rl/seg-warp-3_1/s941/model.pt \
+#   --refiner-weights /path/to/samhead/model.pt \
+#   --refiner samhead \
+#   --refiner-iters 5
+"""
+
 import argparse
 import asyncio
 import os
@@ -19,19 +34,20 @@ from kestrel.seg_refiner import svg_from_path, render_svg_to_soft_mask
 @dataclass
 class REPLConfig:
     kestrel_weights: Path
-    head_weights: Optional[Path]
+    refiner_weights: Optional[Path]
     refiner: str
     refiner_iters: int
     device: str
     temperature: float
 
 
-def create_overlay(image: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndarray:
+def create_overlay(
+    image: np.ndarray, mask: np.ndarray, alpha: float = 0.4
+) -> np.ndarray:
     overlay = image.copy()
     mask_bool = mask > 0
     overlay[mask_bool] = (
-        overlay[mask_bool] * (1 - alpha) +
-        np.array([0, 255, 0]) * alpha
+        overlay[mask_bool] * (1 - alpha) + np.array([0, 255, 0]) * alpha
     ).astype(np.uint8)
     return overlay
 
@@ -82,13 +98,15 @@ async def init_engine(config: REPLConfig) -> InferenceEngine:
     runtime_cfg = RuntimeConfig(
         model_paths=ModelPaths(
             weights=config.kestrel_weights,
-            head_refiner_weights=config.head_weights,
+            head_refiner_weights=config.refiner_weights if config.refiner == "head" else None,
+            sam_head_refiner_weights=config.refiner_weights if config.refiner == "samhead" else None,
         ),
         device=config.device,
         dtype=torch.bfloat16,
         max_batch_size=2,
         enable_cuda_graphs=False,
-        use_head_refiner=(config.refiner == "head"),
+        refiner_type=config.refiner,
+        refiner_iters=config.refiner_iters,
     )
 
     torch.set_float32_matmul_precision("high")
@@ -121,7 +139,9 @@ async def repl_loop(engine: InferenceEngine, config: REPLConfig):
         print(f"\nProcessing: {image_path}")
         print(f"Prompt: {text_prompt}")
 
-        result = await segment_and_visualize(engine, image_path, text_prompt, output_path, config.temperature)
+        result = await segment_and_visualize(
+            engine, image_path, text_prompt, output_path, config.temperature
+        )
 
         print(f"✓ Saved: {result['output_path']}")
         print(f"  BBox: {result['bbox']}")
@@ -131,19 +151,19 @@ async def repl_loop(engine: InferenceEngine, config: REPLConfig):
 async def async_main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kestrel-weights", required=True, type=Path)
-    parser.add_argument("--head-weights", type=Path)
-    parser.add_argument("--refiner", choices=["head", "sam"], required=True)
+    parser.add_argument("--refiner-weights", type=Path)
+    parser.add_argument("--refiner", choices=["head", "sam", "samhead"], required=True)
     parser.add_argument("--refiner-iters", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    if args.refiner == "head" and not args.head_weights:
-        sys.exit("--head-weights required with --refiner head")
+    if args.refiner in ("head", "samhead") and not args.refiner_weights:
+        sys.exit(f"--refiner-weights required with --refiner {args.refiner}")
 
     config = REPLConfig(
         kestrel_weights=args.kestrel_weights,
-        head_weights=args.head_weights,
+        refiner_weights=args.refiner_weights,
         refiner=args.refiner,
         refiner_iters=args.refiner_iters,
         device=args.device,
