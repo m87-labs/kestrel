@@ -8,6 +8,7 @@ For text models with MoE (Mixture of Experts), the LoRA rank is distributed
 across active experts: each expert receives rank = total_rank / experts_per_token.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,8 +38,9 @@ class VisionLoRALinear(nn.Module):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
-        self.down = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype))
+        self.down = nn.Parameter(torch.empty(rank, in_features, dtype=dtype))
         self.up = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype))
+        nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute LoRA output to be added to the base layer output."""
@@ -124,12 +126,15 @@ class DenseMLPLoRA(nn.Module):
         self._alpha = alpha
 
         # fc1: [d_model] -> [d_ffn]
-        self.fc1_a = nn.Parameter(torch.zeros(rank, d_model, dtype=dtype))
+        self.fc1_a = nn.Parameter(torch.empty(rank, d_model, dtype=dtype))
         self.fc1_b = nn.Parameter(torch.zeros(d_ffn, rank, dtype=dtype))
 
         # fc2: [d_ffn] -> [d_model]
-        self.fc2_a = nn.Parameter(torch.zeros(rank, d_ffn, dtype=dtype))
+        self.fc2_a = nn.Parameter(torch.empty(rank, d_ffn, dtype=dtype))
         self.fc2_b = nn.Parameter(torch.zeros(d_model, rank, dtype=dtype))
+
+        nn.init.kaiming_uniform_(self.fc1_a, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.fc2_a, a=math.sqrt(5))
 
     @property
     def rank(self) -> int:
@@ -167,7 +172,7 @@ class MoEMLPLoRA(nn.Module):
 
         # up projection: [d_model] -> [d_expert * 2] (gate + up fused)
         self.up_a = nn.Parameter(
-            torch.zeros(num_experts, rank_per_expert, d_model, dtype=dtype)
+            torch.empty(num_experts, rank_per_expert, d_model, dtype=dtype)
         )
         self.up_b = nn.Parameter(
             torch.zeros(num_experts, d_expert * 2, rank_per_expert, dtype=dtype)
@@ -175,11 +180,16 @@ class MoEMLPLoRA(nn.Module):
 
         # down projection: [d_expert] -> [d_model]
         self.down_a = nn.Parameter(
-            torch.zeros(num_experts, rank_per_expert, d_expert, dtype=dtype)
+            torch.empty(num_experts, rank_per_expert, d_expert, dtype=dtype)
         )
         self.down_b = nn.Parameter(
             torch.zeros(num_experts, d_model, rank_per_expert, dtype=dtype)
         )
+
+        # Initialize A matrices with kaiming, B matrices stay zero
+        for i in range(num_experts):
+            nn.init.kaiming_uniform_(self.up_a[i], a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.down_a[i], a=math.sqrt(5))
 
     @property
     def rank_per_expert(self) -> int:
