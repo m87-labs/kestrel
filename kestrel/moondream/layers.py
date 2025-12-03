@@ -8,10 +8,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass, field
-from typing import Literal, Mapping
+from dataclasses import dataclass
+from typing import Literal
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
+
+# Re-export LoRA for convenience
+from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
 
 
 def gelu_approx(x: torch.Tensor) -> torch.Tensor:
@@ -45,49 +48,15 @@ class MLPWeights:
     act: Literal["gelu_approx"] = "gelu_approx"
 
 
-def mlp(x: torch.Tensor, w: MLPWeights) -> torch.Tensor:
-    x = linear(x, w.fc1)
-    x = gelu_approx(x)
-    return linear(x, w.fc2)
-
-
-@dataclass(frozen=True)
-class LoRALinear:
-    """LoRA weights for a single linear projection."""
-
-    down: torch.Tensor
-    up: torch.Tensor
-    alpha: float = 1.0
-
-    def apply(self, x: torch.Tensor) -> torch.Tensor:
-        rank = int(self.down.shape[0])
-        scale = self.alpha / float(rank)
-        down_proj = F.linear(x, self.down)
-        return F.linear(down_proj, self.up) * scale
-
-
-@dataclass(frozen=True)
-class LoRA:
-    """Container for optional LoRA adapters."""
-
-    vision: Mapping[str, LoRALinear] = field(default_factory=dict)
-
-    @classmethod
-    def for_vision(cls, module: nn.Module, rank: int) -> "LoRA":
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive")
-        proj_mlp = module.proj_mlp
-        fc2 = proj_mlp["fc2"]
-        in_dim = fc2.in_features
-        out_dim = fc2.out_features
-        device = fc2.weight.device
-        dtype = fc2.weight.dtype
-
-        down = torch.zeros(rank, in_dim, device=device, dtype=dtype)
-        std = 1.0 / float(rank)
-        up = torch.randn(out_dim, rank, device=device, dtype=dtype) * std
-        adapter = LoRALinear(down=down, up=up, alpha=float(rank))
-        return cls(vision={"proj_mlp.fc2": adapter})
+def mlp(x: torch.Tensor, w: MLPWeights, lora: DenseMLPLoRA | None = None) -> torch.Tensor:
+    h = linear(x, w.fc1)
+    if lora is not None:
+        h = h + F.linear(F.linear(x, lora.fc1_a), lora.fc1_b) * lora.scale
+    h = gelu_approx(h)
+    out = linear(h, w.fc2)
+    if lora is not None:
+        out = out + F.linear(F.linear(h, lora.fc2_a), lora.fc2_b) * lora.scale
+    return out
 
 
 def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDict:
@@ -122,6 +91,7 @@ def moe_mlp(
     experts_per_token: int,
     *,
     mode: Literal["prefill", "decode"] = "decode",
+    lora: MoEMLPLoRA | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
     x_flat = x.reshape(-1, C)
@@ -137,6 +107,7 @@ def moe_mlp(
         x_flat,
         topk_weights,
         topk_idxs,
+        lora,
     ).view(B, T, C)
     return mlp_out
 
@@ -151,5 +122,4 @@ __all__ = [
     "build_dense_mlp",
     "build_moe_mlp",
     "LoRA",
-    "LoRALinear",
 ]

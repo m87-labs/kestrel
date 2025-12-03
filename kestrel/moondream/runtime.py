@@ -32,7 +32,7 @@ from .text import (
     text_encoder,
 )
 from .vision import encode_image
-from .layers import LoRA
+from .lora import LoRA
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -200,8 +200,9 @@ class _LayerPagedCache(torch.nn.Module):
 class MoondreamRuntime:
     """High-level runtime for paged text-only Moondream inference."""
 
-    def __init__(self, cfg: RuntimeConfig) -> None:
+    def __init__(self, cfg: RuntimeConfig, *, lora: Optional[LoRA] = None) -> None:
         self._cfg = cfg
+        self._lora = lora
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
         torch.cuda.set_device(self.device)
@@ -746,6 +747,7 @@ class MoondreamRuntime:
             ),
             flashinfer_prefill_metadata=prefill_metadata,
             use_flashinfer_prefill=use_flashinfer_prefill,
+            text_lora=self._lora.text if self._lora else None,
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
@@ -983,6 +985,7 @@ class MoondreamRuntime:
             use_graph=use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
+            text_lora=self._lora.text if self._lora else None,
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)

@@ -21,6 +21,7 @@ from .layers import (
     LinearWeights,
     MLPWeights,
 )
+from .lora import TextLoRA, DenseMLPLoRA
 from ..ops import apply_rotary_emb, precompute_freqs_cis
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -199,6 +200,7 @@ def text_decoder(
     flashinfer_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None,
     use_flashinfer_prefill: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
+    text_lora: TextLoRA | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
@@ -237,11 +239,13 @@ def text_decoder(
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
+            moe_lora = text_lora.get_moe_lora(i) if text_lora else None
             mlp_out = moe_mlp(
                 x_norm,
                 block.mlp,
                 config.moe.experts_per_token,
                 mode=mode,
+                lora=moe_lora,
             )
         else:
             mlp_weights = MLPWeights(
@@ -252,7 +256,8 @@ def text_decoder(
                     weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
                 ),
             )
-            mlp_out = mlp(x_norm, mlp_weights)
+            dense_lora = text_lora.get_dense_lora(i) if text_lora else None
+            mlp_out = mlp(x_norm, mlp_weights, lora=dense_lora)
 
         x = x + attn_out + mlp_out
 

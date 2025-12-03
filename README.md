@@ -107,6 +107,33 @@ caption_result = await caption_stream.result()
 assert "".join(chunks) == caption_result.output["caption"]
 ```
 
+#### LoRA adapters (experimental)
+
+LoRA adapters can be attached to the text model's MLP layers (both dense and MoE) for parameter-efficient fine-tuning experiments.
+
+```python
+from kestrel.moondream.lora import LoRA, TextLoRAConfig
+from kestrel.moondream.config import load_config
+
+# Load model config (or use defaults with load_config(None))
+config = load_config(None)
+
+# Create LoRA adapter
+lora = LoRA.create(
+    text_config=config.text,
+    lora_config=TextLoRAConfig(rank=8, alpha=16.0),
+    dtype=torch.bfloat16,
+).to("cuda")
+
+# Pass to engine at creation time
+engine = await InferenceEngine.create(cfg, lora=lora)
+```
+
+**Limitations:**
+- LoRA must be created before engine initialization (required for CUDA graph capture).
+- A single LoRA is shared across all requests; per-request adapters are not yet supported.
+- Only text MLP layers are covered; attention LoRA is not implemented.
+
 ### Skills
 
 - `kestrel.skills.base.SkillSpec` defines the contract for prompt construction, structured phase recipes, and result formatting.

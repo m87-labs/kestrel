@@ -10,7 +10,7 @@ import pyvips
 import numpy as np
 
 from .config import VisionConfig
-from .layers import LoRA, LoRALinear
+from .lora import LoRA
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 
@@ -99,10 +99,8 @@ def vision_projection(
     features = torch.cat([global_features, reconstructed], dim=-1)
     hidden = F.gelu(module.proj_mlp["fc1"](features), approximate="tanh")
     output = module.proj_mlp["fc2"](hidden)
-    if adapter is not None:
-        lora: Optional[LoRALinear] = adapter.vision.get("proj_mlp.fc2")
-        if lora is not None:
-            output = output + lora.apply(hidden)
+    if adapter is not None and adapter.vision is not None:
+        output = output + adapter.vision.proj_fc2(hidden)
     return output
 
 
