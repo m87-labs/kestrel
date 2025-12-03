@@ -78,7 +78,7 @@ from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
-from kestrel.moondream.layers import LoRA
+from kestrel.moondream.lora import LoRA
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -189,8 +189,10 @@ class InferenceEngine:
         runtime_cfg: RuntimeConfig,
         *,
         skills: Optional[SkillRegistry] = None,
+        lora: Optional[LoRA] = None,
     ) -> None:
         self._runtime_cfg = runtime_cfg
+        self._lora = lora
 
         self._runtime: Optional[MoondreamRuntime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
@@ -239,18 +241,15 @@ class InferenceEngine:
 
         return self._paused_flag.is_set()
 
-    def create_adapter(self, rank: int) -> LoRA:
-        runtime = self.runtime
-        return LoRA.for_vision(runtime.model.vision, rank=rank)
-
     @classmethod
     async def create(
         cls,
         runtime_cfg: RuntimeConfig,
         *,
         skills: Optional[SkillRegistry] = None,
+        lora: Optional[LoRA] = None,
     ) -> "InferenceEngine":
-        engine = cls(runtime_cfg, skills=skills)
+        engine = cls(runtime_cfg, skills=skills, lora=lora)
         await engine._initialize()
         return engine
 
@@ -260,7 +259,7 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._runtime = await loop.run_in_executor(
-            None, MoondreamRuntime, self._runtime_cfg
+            None, lambda: MoondreamRuntime(self._runtime_cfg, lora=self._lora)
         )
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)

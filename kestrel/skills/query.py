@@ -10,7 +10,7 @@ import numpy as np
 from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, TextToken
-from kestrel.moondream.layers import LoRA
+from kestrel.moondream.lora import LoRA
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 

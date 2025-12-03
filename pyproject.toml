@@ -12,6 +12,7 @@ dependencies = [
     "pyvips>=2.3",
     "pyvips-binary>=2.48",
     "pillow>=10",
+    "torch-c-dlpack-ext>=0.1.3",
     "starlette>=0.37",
     "httpx>=0.27",
     "uvicorn>=0.30",

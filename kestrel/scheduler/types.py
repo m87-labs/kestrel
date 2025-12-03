@@ -11,7 +11,7 @@ from torch import Tensor
 
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.moondream.layers import LoRA
+from kestrel.moondream.lora import LoRA
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 

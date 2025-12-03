@@ -1,5 +1,4 @@
 
-import os
 from dataclasses import dataclass
 from math import prod
 
@@ -16,6 +15,50 @@ from .kernels import (
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+from kestrel.moondream.lora import MoEMLPLoRA
+
+
+def _apply_moe_lora(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    scale: float,
+    topk_weights: torch.Tensor | None = None,
+) -> None:
+    """Apply LoRA to MoE output in-place.
+
+    Computes: out[:, k, :] += (x_k @ A.T @ B.T) * scale [* topk_weights[:, k]]
+
+    Args:
+        x: Input tensor. [N, in_dim] (broadcast to all K) or [N, K, in_dim].
+        topk_ids: Expert assignments [N, K].
+        out: Output tensor to accumulate into [N, K, out_dim].
+        lora_a: LoRA A matrices [num_experts, rank, in_dim].
+        lora_b: LoRA B matrices [num_experts, out_dim, rank].
+        scale: LoRA scaling factor (alpha / rank).
+        topk_weights: Optional router weights [N, K] to apply (for down-proj).
+    """
+    top_k = topk_ids.shape[1]
+    per_expert_input = x.dim() == 3
+
+    for k in range(top_k):
+        expert_ids_k = topk_ids[:, k]
+        a_k = lora_a[expert_ids_k]  # [N, rank, in_dim]
+        b_k = lora_b[expert_ids_k]  # [N, out_dim, rank]
+        x_k = x[:, k, :] if per_expert_input else x  # [N, in_dim]
+
+        lora_out = torch.bmm(
+            torch.bmm(x_k.unsqueeze(1), a_k.transpose(1, 2)),
+            b_k.transpose(1, 2),
+        ).squeeze(1)  # [N, out_dim]
+
+        if topk_weights is not None:
+            lora_out = lora_out * topk_weights[:, k : k + 1]
+
+        out[:, k, :] += lora_out * scale
 
 
 class _ResizableBuffer:
@@ -250,10 +293,6 @@ class FusedMoEModule(nn.Module):
         self.input_size = input_size
         self.num_experts = num_experts
         self.config = config or FusedMoEConfig()
-        self._disabled = os.environ.get("KESTREL_DISABLE_FUSED_MOE") == "1"
-        self._metadata_debug_done = False
-        self._debug_up: torch.Tensor | None = None
-        self._debug_h: torch.Tensor | None = None
         self._workspaces = _MoEWorkspaces()
         self._tuned_configs: dict[int, dict[str, int] | None] = {}
 
@@ -262,12 +301,9 @@ class FusedMoEModule(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        lora: MoEMLPLoRA | None = None,
     ) -> torch.Tensor:
-        return self.forward(hidden_states, topk_weights, topk_ids)
-
-    @property
-    def available(self) -> bool:
-        return (not self._disabled) and torch.cuda.is_available()
+        return self.forward(hidden_states, topk_weights, topk_ids, lora)
 
     @torch_compiler_disable()
     def forward(
@@ -275,9 +311,8 @@ class FusedMoEModule(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        lora: MoEMLPLoRA | None = None,
     ) -> torch.Tensor:
-        if not self.available:
-            raise RuntimeError("Fused MoE backend is disabled or CUDA is unavailable")
         if hidden_states.device.type != "cuda":
             raise ValueError("Fused MoE backend only supports CUDA tensors")
         if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -298,10 +333,6 @@ class FusedMoEModule(nn.Module):
         hidden_states = hidden_states.contiguous()
         topk_weights = topk_weights.contiguous()
         topk_ids = topk_ids.contiguous()
-        debug_enabled = os.getenv("KESTREL_COMPARE_MOE_BACKENDS") == "1"
-        if not debug_enabled:
-            self._debug_up = None
-            self._debug_h = None
 
         num_tokens = hidden_states.size(0)
         if num_tokens == 0:
@@ -318,20 +349,6 @@ class FusedMoEModule(nn.Module):
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, self.num_experts
         )
-        if os.getenv("KESTREL_COMPARE_MOE_BACKENDS") == "1" and not self._metadata_debug_done:
-            flat_expert = topk_ids.reshape(-1)
-            valid_pairs = flat_expert.size(0)
-            fused_order = sorted_token_ids[: num_tokens_post_padded.item()]
-            mask = fused_order < valid_pairs
-            fused_sorted = flat_expert.index_select(0, fused_order[mask])
-            scatter_sorted, _ = torch.sort(flat_expert)
-            meta_diff = (fused_sorted - scatter_sorted[: fused_sorted.size(0)]).abs().max()
-            print(
-                "[FusedMoE][compare] routing max_diff="
-                f"{meta_diff.item():.6f}",
-                flush=True,
-            )
-            self._metadata_debug_done = True
 
         up_out = self._workspaces.up.get(
             (num_tokens, self.top_k, self.hidden_size * 2),
@@ -356,8 +373,11 @@ class FusedMoEModule(nn.Module):
             bias=None,
             allow_tf32=self.config.allow_tf32,
         )
-        if debug_enabled:
-            self._debug_up = up_out[:num_tokens].detach().cpu()
+
+        if lora is not None:
+            _apply_moe_lora(
+                hidden_states, topk_ids, up_out, lora.up_a, lora.up_b, lora.scale
+            )
 
         activation_in = up_out.view(num_tokens * self.top_k, -1)
         activation_out = self._workspaces.activation.get(
@@ -368,8 +388,6 @@ class FusedMoEModule(nn.Module):
         fused_gelu_and_mul(activation_in, activation_out)
 
         down_in = activation_out
-        if debug_enabled:
-            self._debug_h = down_in.view(num_tokens, self.top_k, self.hidden_size).detach().cpu()
         down_out = self._workspaces.down.get(
             (num_tokens, self.top_k, self.input_size),
             device=hidden_states.device,
@@ -390,6 +408,18 @@ class FusedMoEModule(nn.Module):
             bias=None,
             allow_tf32=self.config.allow_tf32,
         )
+
+        if lora is not None:
+            down_in_reshaped = down_in.view(num_tokens, self.top_k, -1)
+            _apply_moe_lora(
+                down_in_reshaped,
+                topk_ids,
+                down_out,
+                lora.down_a,
+                lora.down_b,
+                lora.scale,
+                topk_weights,
+            )
 
         fused = self._workspaces.output.get(
             (num_tokens, self.input_size),

@@ -206,6 +206,27 @@ DEFAULT_MOONDREAM_CONFIG = {
     "region": RegionConfig().__dict__.copy(),
 }
 
+
+def load_config(config_path: Optional[str] = None) -> MoondreamConfig:
+    """Load MoondreamConfig from a JSON file or return defaults.
+
+    Args:
+        config_path: Path to config JSON file. If None, returns default config.
+
+    Returns:
+        MoondreamConfig instance.
+    """
+    import json
+    from pathlib import Path
+
+    if config_path is None:
+        return MoondreamConfig.from_dict(deepcopy(DEFAULT_MOONDREAM_CONFIG))
+
+    with Path(config_path).open("r", encoding="utf-8") as fp:
+        raw_config = json.load(fp)
+
+    return MoondreamConfig.from_dict(raw_config)
+
 __all__ = [
     "TextMoeConfig",
     "TextConfig",
@@ -216,4 +237,5 @@ __all__ = [
     "MoondreamConfig",
     "DEFAULT_MOONDREAM3_CONFIG",
     "DEFAULT_MOONDREAM_CONFIG",
+    "load_config",
 ]
