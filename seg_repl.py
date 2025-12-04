@@ -11,6 +11,13 @@ uv run seg_repl.py \
 #   --refiner-weights /path/to/samhead/model.pt \
 #   --refiner samhead \
 #   --refiner-iters 5
+
+# Or with hqsamhead:
+# uv run seg_repl.py \
+#   --kestrel-weights /ephemeral/vixtral-train/ckpt/rl/seg-warp-3_1/s941/model.pt \
+#   --refiner-weights /path/to/hqsamhead/model.pt \
+#   --refiner hqsamhead \
+#   --refiner-iters 5
 """
 
 import argparse
@@ -100,6 +107,7 @@ async def init_engine(config: REPLConfig) -> InferenceEngine:
             weights=config.kestrel_weights,
             head_refiner_weights=config.refiner_weights if config.refiner == "head" else None,
             sam_head_refiner_weights=config.refiner_weights if config.refiner == "samhead" else None,
+            hqsam_head_refiner_weights=config.refiner_weights if config.refiner == "hqsamhead" else None,
         ),
         device=config.device,
         dtype=torch.bfloat16,
@@ -152,13 +160,13 @@ async def async_main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kestrel-weights", required=True, type=Path)
     parser.add_argument("--refiner-weights", type=Path)
-    parser.add_argument("--refiner", choices=["head", "sam", "samhead"], required=True)
+    parser.add_argument("--refiner", choices=["head", "sam", "samhead", "hqsamhead"], required=True)
     parser.add_argument("--refiner-iters", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    if args.refiner in ("head", "samhead") and not args.refiner_weights:
+    if args.refiner in ("head", "samhead", "hqsamhead") and not args.refiner_weights:
         sys.exit(f"--refiner-weights required with --refiner {args.refiner}")
 
     config = REPLConfig(
