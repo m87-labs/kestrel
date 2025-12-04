@@ -50,6 +50,7 @@ from .region import (
 from ..seg_refiner import build_sam_model
 from ..head_refiner import HeadRefiner
 from ..sam_head_refiner import SAMHeadRefiner
+from ..hqsam_head_refiner import HQSAMHeadRefiner
 
 
 
@@ -420,9 +421,15 @@ class MoondreamRuntime:
 
         self.head_refiner = None
         self.sam_head_refiner = None
+        self.hqsam_head_refiner = None
         self.sam_model = None
 
-        if cfg.refiner_type == "samhead" and cfg.model_paths.sam_head_refiner_weights:
+        if cfg.refiner_type == "hqsamhead" and cfg.model_paths.hqsam_head_refiner_weights:
+            self.hqsam_head_refiner = HQSAMHeadRefiner(
+                ckpt_path=str(cfg.model_paths.hqsam_head_refiner_weights),
+                device=self.device
+            )
+        elif cfg.refiner_type == "samhead" and cfg.model_paths.sam_head_refiner_weights:
             self.sam_head_refiner = SAMHeadRefiner(
                 ckpt_path=str(cfg.model_paths.sam_head_refiner_weights),
                 device=self.device

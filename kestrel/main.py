@@ -40,6 +40,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--refiner-weights", type=Path, help="Path to refiner weights (for head or samhead)")
     parser.add_argument("--use-sam", action="store_true", help="Use HQ-SAM refiner")
     parser.add_argument("--use-samhead", action="store_true", help="Use SAM-style head refiner")
+    parser.add_argument("--use-hqsamhead", action="store_true", help="Use HQ-SAM style head refiner with multi-scale features")
     parser.add_argument("--refiner-iters", type=int, default=6, help="Number of refiner iterations")
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
@@ -120,9 +121,12 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     # Determine refiner type from flags
     use_sam = getattr(args, "use_sam", False)
     use_samhead = getattr(args, "use_samhead", False)
+    use_hqsamhead = getattr(args, "use_hqsamhead", False)
     refiner_weights = getattr(args, "refiner_weights", None)
 
-    if use_samhead:
+    if use_hqsamhead:
+        refiner_type = "hqsamhead"
+    elif use_samhead:
         refiner_type = "samhead"
     elif use_sam:
         refiner_type = "sam"
@@ -135,6 +139,7 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         tokenizer=args.tokenizer,
         head_refiner_weights=refiner_weights if refiner_type == "head" else None,
         sam_head_refiner_weights=refiner_weights if refiner_type == "samhead" else None,
+        hqsam_head_refiner_weights=refiner_weights if refiner_type == "hqsamhead" else None,
     )
     return RuntimeConfig(
         model_paths=model_paths,

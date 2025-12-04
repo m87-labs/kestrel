@@ -1,4 +1,4 @@
-"""SAM-style mask refiner head with two-way transformer and dot-product mask generation."""
+"""HQ-SAM style mask refiner with multi-scale feature fusion."""
 
 import torch
 import torch.nn as nn
@@ -15,8 +15,6 @@ class LayerNorm2d(nn.Module):
 
 
 class MaskEncoder(nn.Module):
-    """Downsample mask from target resolution to 27x27 via strided convolutions."""
-
     def __init__(self, embed_dim):
         super().__init__()
         self.conv1 = nn.Sequential(
@@ -49,9 +47,32 @@ class MaskEncoder(nn.Module):
         return x
 
 
-class TwoWayBlock(nn.Module):
-    """Two-way transformer block: output tokens ↔ image tokens."""
+class HQFeatureFusion(nn.Module):
+    def __init__(self, enc_dim=1152, embed_dim=256):
+        super().__init__()
+        self.early_proj = nn.Sequential(
+            nn.Linear(enc_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(embed_dim * 2, embed_dim, 1),
+            nn.GroupNorm(32, embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, 3, padding=1),
+            nn.GroupNorm(32, embed_dim),
+            nn.GELU(),
+        )
 
+    def forward(self, early_feat, final_feat):
+        B = early_feat.shape[0]
+        early = self.early_proj(early_feat)
+        early = early.transpose(1, 2).view(B, -1, 27, 27)
+        fused = torch.cat([early, final_feat], dim=1)
+        return self.fusion(fused)
+
+
+class TwoWayBlock(nn.Module):
     def __init__(self, embed_dim, num_heads=8, mlp_ratio=8):
         super().__init__()
         self.embed_dim = embed_dim
@@ -74,21 +95,17 @@ class TwoWayBlock(nn.Module):
         self.norm4 = nn.LayerNorm(embed_dim)
 
     def forward(self, output_tokens, img_tokens, output_pe, img_pe):
-        # 1. Self-attention on output tokens (q,k get PE, v does not)
         q = k = output_tokens + output_pe
         attn_out = self.output_self_attn(q, k, output_tokens)[0]
         output_tokens = self.norm1(output_tokens + attn_out)
 
-        # 2. Cross-attention: output tokens attend to image tokens
         q = output_tokens + output_pe
         k = img_tokens + img_pe
         attn_out = self.cross_attn_token_to_image(q, k, img_tokens)[0]
         output_tokens = self.norm2(output_tokens + attn_out)
 
-        # 3. MLP on output tokens
         output_tokens = self.norm3(output_tokens + self.mlp(output_tokens))
 
-        # 4. Cross-attention: image tokens attend to output tokens
         q = img_tokens + img_pe
         k = output_tokens + output_pe
         attn_out = self.cross_attn_image_to_token(q, k, output_tokens)[0]
@@ -97,9 +114,7 @@ class TwoWayBlock(nn.Module):
         return output_tokens, img_tokens
 
 
-class SAMHead(nn.Module):
-    """SAM-style mask decoder with multi-mask output and IoU prediction."""
-
+class HQSAMHead(nn.Module):
     def __init__(self, enc_dim=1152, embed_dim=256, num_heads=8, num_layers=2, num_masks=4):
         super().__init__()
         self.enc_dim = enc_dim
@@ -109,6 +124,7 @@ class SAMHead(nn.Module):
         self.image_proj = nn.Conv2d(enc_dim, embed_dim, 1)
         self.image_pe = nn.Parameter(torch.randn(1, embed_dim, 27, 27) * 0.02)
 
+        self.hq_fusion = HQFeatureFusion(enc_dim, embed_dim)
         self.mask_encoder = MaskEncoder(embed_dim)
 
         self.mask_tokens = nn.Parameter(torch.randn(num_masks, embed_dim) * 0.02)
@@ -166,19 +182,18 @@ class SAMHead(nn.Module):
             nn.Linear(embed_dim, num_masks),
         )
 
-    def forward(self, features, coarse_mask):
-        B = features.shape[0]
+    def forward(self, final_features, early_features, coarse_mask):
+        B = final_features.shape[0]
         H, W = coarse_mask.shape[-2:]
 
-        # 1. Prepare image embedding (don't add PE to content, keep separate)
-        img = features.view(B, 27, 27, self.enc_dim).permute(0, 3, 1, 2)
+        img = final_features.view(B, 27, 27, self.enc_dim).permute(0, 3, 1, 2)
         img = self.image_proj(img)
 
-        # 2. Encode mask and ADD to image (dense fusion)
+        img = self.hq_fusion(early_features, img)
+
         mask_embed = self.mask_encoder(coarse_mask)
         img = img + mask_embed
 
-        # 3. Prepare tokens and positional embeddings
         img_tokens = img.flatten(2).transpose(1, 2)
         img_pe = self.image_pe.flatten(2).transpose(1, 2).expand(B, -1, -1)
 
@@ -188,21 +203,17 @@ class SAMHead(nn.Module):
         ], dim=1)
         output_pe = self.output_pe.unsqueeze(0).expand(B, -1, -1)
 
-        # 4. Two-way transformer (PE added to Q/K inside blocks)
         for block in self.transformer_blocks:
             output_tokens, img_tokens = block(output_tokens, img_tokens, output_pe, img_pe)
 
-        # 5. Final attention: tokens attend to image one more time
         q = output_tokens + output_pe
         k = img_tokens + img_pe
         attn_out = self.final_token_to_image(q, k, img_tokens)[0]
         output_tokens = self.final_norm(output_tokens + attn_out)
 
-        # 6. Upsample image features
         img_up = img_tokens.transpose(1, 2).view(B, self.embed_dim, 27, 27)
         img_up = self.upsample(img_up)
 
-        # 7. Final cross-attention at high resolution for mask tokens
         img_up_tokens = img_up.flatten(2).transpose(1, 2)
         mask_tokens = output_tokens[:, :self.num_masks]
         mask_tokens_proj = self.final_q_proj(mask_tokens)
@@ -210,7 +221,6 @@ class SAMHead(nn.Module):
             self.final_norm_up(mask_tokens_proj), img_up_tokens, img_up_tokens
         )[0]
 
-        # 8. Generate masks via dot product
         masks = []
         for i in range(self.num_masks):
             mask_weights = self.mask_mlps[i](mask_tokens_refined[:, i])
@@ -226,10 +236,10 @@ class SAMHead(nn.Module):
         return masks, iou_pred
 
 
-class SAMHeadRefiner:
+class HQSAMHeadRefiner:
     def __init__(self, ckpt_path, device="cuda"):
         self.device = device
-        self.head = SAMHead(enc_dim=1152, embed_dim=256, num_masks=4)
+        self.head = HQSAMHead(enc_dim=1152, embed_dim=256, num_masks=4)
 
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         self.head.load_state_dict(ckpt["head"])
@@ -237,10 +247,10 @@ class SAMHeadRefiner:
         self.head.eval()
 
     @torch.no_grad()
-    def __call__(self, features, mask, n_iters=6):
+    def __call__(self, final_features, early_features, mask, n_iters=6):
         current_mask = mask
         for _ in range(n_iters):
-            all_logits, iou_pred = self.head(features, current_mask)
+            all_logits, iou_pred = self.head(final_features, early_features, current_mask)
             best_idx = iou_pred.argmax(dim=1)
             batch_idx = torch.arange(all_logits.shape[0], device=all_logits.device)
             best_logits = all_logits[batch_idx, best_idx]

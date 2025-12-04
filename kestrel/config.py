@@ -20,6 +20,7 @@ class ModelPaths:
     reference_tokenizer: Optional[str | Path] = None
     head_refiner_weights: Optional[Path] = None
     sam_head_refiner_weights: Optional[Path] = None
+    hqsam_head_refiner_weights: Optional[Path] = None
 
 
 @dataclass
@@ -33,7 +34,7 @@ class RuntimeConfig:
     page_size: int = 128
     max_seq_length: int = 32768
     enable_cuda_graphs: bool = True
-    refiner_type: str = "head"  # "head", "sam", or "samhead"
+    refiner_type: str = "head"  # "head", "sam", "samhead", or "hqsamhead"
     refiner_iters: int = 6
 
     def resolved_dtype(self) -> torch.dtype:
