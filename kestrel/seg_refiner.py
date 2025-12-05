@@ -29,8 +29,8 @@ _resvg_tls = threading.local()
 class SegmentRefiner:
     """Refines coarse segmentation masks using HQ-SAM head."""
 
-    def __init__(self, hqsam_head: HQSAMHeadRefiner, vision_module: nn.Module, vision_config: VisionConfig):
-        self._hqsam_head = hqsam_head
+    def __init__(self, vision_module: nn.Module, vision_config: VisionConfig, device: torch.device):
+        self._hqsam_head = HQSAMHeadRefiner(device=device)
         self._vision_module = vision_module
         self._vision_config = vision_config
 

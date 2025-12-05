@@ -47,7 +47,6 @@ from .region import (
     decode_coordinate,
     decode_size,
 )
-from ..hqsam_head_refiner import HQSAMHeadRefiner
 from ..seg_refiner import SegmentRefiner
 
 
@@ -415,8 +414,7 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        hqsam_head = HQSAMHeadRefiner(device=self.device)
-        self.seg_refiner = SegmentRefiner(hqsam_head, self.model.vision, self.config.vision)
+        self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
