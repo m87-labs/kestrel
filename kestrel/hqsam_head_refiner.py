@@ -255,7 +255,7 @@ class HQSAMHeadRefiner:
         self.head.eval()
 
     @torch.no_grad()
-    def __call__(self, final_features, early_features, mask, n_iters=6):
+    def __call__(self, final_features, early_features, mask, n_iters=5):
         current_mask = mask
         for _ in range(n_iters):
             all_logits, iou_pred = self.head(final_features, early_features, current_mask)

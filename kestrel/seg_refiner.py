@@ -252,7 +252,7 @@ def hqsam_head_refine(
     hqsam_head_refiner,
     vision_module,
     vision_config,
-    iters: int = 6,
+    iters: int = 5,
 ) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"Expected RGB image (H,W,3), got {image.shape}")
@@ -297,7 +297,7 @@ def refine_segmentation_with_hqsam_head(
     hqsam_head_refiner,
     vision_module,
     vision_config,
-    iters: int = 6,
+    iters: int = 5,
 ) -> Tuple[Optional[str], Optional[dict]]:
     if hqsam_head_refiner is None:
         return None, None

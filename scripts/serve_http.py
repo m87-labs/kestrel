@@ -13,8 +13,7 @@ Configuration is taken from environment variables:
   KESTREL_PORT      (default: 8000)
   KESTREL_HOST      (default: 0.0.0.0)
   KESTREL_CUDA_GRAPHS (default: false)
-  KESTREL_REFINER_ITERS (default: 6) number of refinement iterations
-  HF_TOKEN          (required for private repo) HuggingFace token for refiner weights
+  KESTREL_REFINER_ITERS (default: 5) number of refinement iterations
 """
 
 import os

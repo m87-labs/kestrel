@@ -19,7 +19,7 @@ from kestrel.utils.svg import (
     svg_path_from_token_ids,
     PATH_COMMANDS,
 )
-from ..head_seg_refiner import refine_segmentation_with_hqsam_head
+from ..seg_refiner import refine_segmentation_with_hqsam_head
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
