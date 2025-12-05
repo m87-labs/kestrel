@@ -1098,26 +1098,14 @@ class MoondreamRuntime:
                 return
 
             device = self.device
-            batch_indices = torch.arange(1, max_batch + 1, device=device, dtype=torch.long)
-            workspace.batch_idx_buffer.copy_(batch_indices)
+            # Use batch index 0 for all entries during graph capture.
+            # Row 0 in the page table is pre-initialized and reserved for bookkeeping,
+            # so it provides valid memory access patterns without requiring allocation.
+            workspace.batch_idx_buffer.zero_()
             workspace.token_buffer.zero_()
             workspace.position_buffer.zero_()
 
-            allocated_batches: list[int] = []
             try:
-                for idx in batch_indices.tolist():
-                    allocated = self.page_table.allocate()
-                    if allocated != idx:
-                        raise RuntimeError(
-                            f"Expected batch index {idx} during CUDA graph capture, got {allocated}"
-                        )
-                    batch_tensor = torch.tensor([idx], device=device, dtype=torch.int64)
-                    self.page_table.reserve(
-                        batch_idx_int=idx,
-                        batch_idx=batch_tensor,
-                        seq_len=1,
-                    )
-                    allocated_batches.append(idx)
 
                 torch.cuda.synchronize(device=device)
                 for bs in reversed(self._graph_batch_sizes):
@@ -1161,8 +1149,6 @@ class MoondreamRuntime:
                     self._cuda_graphs[bs] = graph
                     torch.cuda.synchronize(device=device)
             finally:
-                for idx in reversed(allocated_batches):
-                    self.page_table.erase(idx)
                 self._clear_graph_inputs(0)
 
     def _select_graph_batch_size(self, batch_size: int) -> int | None:
