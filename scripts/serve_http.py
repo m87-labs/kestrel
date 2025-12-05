@@ -51,7 +51,7 @@ def main() -> None:
     host = os.getenv("KESTREL_HOST", "0.0.0.0")
     enable_cuda_graphs = env_bool("KESTREL_CUDA_GRAPHS", False)
 
-    refiner_iters = int(os.getenv("KESTREL_REFINER_ITERS", "6"))
+    refiner_iters = int(os.getenv("KESTREL_REFINER_ITERS", "5"))
 
     runtime_cfg = RuntimeConfig(
         model_paths=ModelPaths(

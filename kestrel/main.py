@@ -127,7 +127,7 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
-        refiner_iters=getattr(args, "refiner_iters", 6),
+        refiner_iters=getattr(args, "refiner_iters", 5),
     )
 
 
