@@ -802,12 +802,22 @@ class MoondreamRuntime:
             and batch_size > 0
         ):
             graph_batch_size = self._select_graph_batch_size(batch_size)
-            if graph_batch_size is not None and self._cuda_graphs:
-                result = self._decode_with_graph(
-                    batch_idx, tokens_tensor, input_pos, graph_batch_size
+            if graph_batch_size is None:
+                raise RuntimeError(
+                    f"Requested batch size {batch_size} exceeds captured graph capacity "
+                    f"{self._graph_batch_sizes[-1] if self._graph_batch_sizes else 0}"
                 )
-            else:
-                result = self._decode_step(batch_idx, tokens_tensor, input_pos)
+            if not self._cuda_graphs:
+                raise RuntimeError(
+                    "CUDA graphs requested but none were captured; initialization likely failed."
+                )
+            if graph_batch_size not in self._cuda_graphs:
+                raise RuntimeError(
+                    f"No CUDA graph captured for batch size {graph_batch_size}"
+                )
+            result = self._decode_with_graph(
+                batch_idx, tokens_tensor, input_pos, graph_batch_size
+            )
         else:
             token_arg: Tensor | Sequence[Token]
             token_arg = tokens_tensor if tokens_tensor is not None else token_seq  # type: ignore[assignment]
