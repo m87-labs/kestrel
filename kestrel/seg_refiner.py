@@ -3,12 +3,15 @@
 import io
 import re
 import threading
+import traceback
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
+from resvg import render, usvg
 
 from .moondream.vision import vision_encoder
 from .moondream.config import VisionConfig
@@ -17,7 +20,9 @@ from .hqsam_head_refiner import HQSAMHeadRefiner
 # Number of refinement iterations for HQ-SAM head
 REFINER_ITERS = 5
 
+# Lazy imports for optional dependencies
 _potrace = None
+_resvg_ctx = None
 _resvg_tls = threading.local()
 
 
@@ -46,11 +51,7 @@ class SegmentRefiner:
         img_h, img_w = image.shape[:2]
 
         if coarse_mask.shape != (img_h, img_w):
-            coarse_mask = cv2.resize(
-                coarse_mask.astype(np.uint8),
-                (img_w, img_h),
-                interpolation=cv2.INTER_NEAREST,
-            )
+            coarse_mask = cv2.resize(coarse_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
 
         img_resized = cv2.resize(image, (378, 378), interpolation=cv2.INTER_LINEAR)
         mask_resized = cv2.resize(coarse_mask, (378, 378), interpolation=cv2.INTER_NEAREST)
@@ -80,9 +81,7 @@ class SegmentRefiner:
             )
 
         refined_mask_np = refined_mask.squeeze(0).squeeze(0).float().cpu().numpy()
-        refined_mask_full = cv2.resize(
-            refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR
-        )
+        refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
         return (refined_mask_full > 0.5).astype(np.uint8)
 
     def __call__(self, image, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
@@ -137,16 +136,15 @@ class SegmentRefiner:
             return refined_path, refined_bbox
 
         except Exception:
-            import traceback
             traceback.print_exc()
             return None, None
 
 
+# --- SVG Rendering -----------------------------------------------------------
+
 def _get_resvg_ctx():
     ctx = getattr(_resvg_tls, "ctx", None)
     if ctx is None:
-        from resvg import usvg
-
         fontdb = usvg.FontDatabase.default()
         fontdb.load_system_fonts()
         opts = usvg.Options.default()
@@ -156,6 +154,7 @@ def _get_resvg_ctx():
 
 
 def svg_from_path(svg_path: str, width: float, height: float, bbox: List[float]) -> str:
+    """Build full SVG from path string (0-1 coords) and bbox [cx, cy, w, h] in normalized coords."""
     x0 = bbox[0] - bbox[2] / 2
     y0 = bbox[1] - bbox[3] / 2
     sx = bbox[2]
@@ -167,12 +166,8 @@ def svg_from_path(svg_path: str, width: float, height: float, bbox: List[float])
     )
 
 
-def render_svg_to_soft_mask(
-    svg: str, width: int, height: int, scale: int = 2
-) -> np.ndarray:
-    from PIL import Image
-    from resvg import render, usvg
-
+def render_svg_to_soft_mask(svg: str, width: int, height: int, scale: int = 2) -> np.ndarray:
+    """Render SVG to a soft mask using resvg backend. Returns float32 [0,1] array."""
     width = int(round(width))
     height = int(round(height))
     scale = max(1, int(scale))
@@ -180,33 +175,25 @@ def render_svg_to_soft_mask(
     opts, fontdb = _get_resvg_ctx()
 
     normalized_svg = (
-        svg.replace(",M", " M")
-        .replace(",m", " m")
-        .replace(",L", " L")
-        .replace(",l", " l")
-        .replace(",C", " C")
-        .replace(",c", " c")
-        .replace(",Z", " Z")
-        .replace(",z", " z")
+        svg.replace(",M", " M").replace(",m", " m")
+        .replace(",L", " L").replace(",l", " l")
+        .replace(",C", " C").replace(",c", " c")
+        .replace(",Z", " Z").replace(",z", " z")
     )
 
     render_width = max(1, int(round(width * scale)))
     render_height = max(1, int(round(height * scale)))
-    normalized_svg = re.sub(
-        r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg
-    )
-    normalized_svg = re.sub(
-        r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg
-    )
+    normalized_svg = re.sub(r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg)
+    normalized_svg = re.sub(r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg)
 
     tree = usvg.Tree.from_str(normalized_svg, opts, fontdb)
     png_bytes = bytes(render(tree, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)))
 
     pil_image = Image.open(io.BytesIO(png_bytes))
-    if pil_image.mode in ("RGBA", "LA"):
-        alpha_channel = pil_image.getchannel("A")
+    if pil_image.mode in ('RGBA', 'LA'):
+        alpha_channel = pil_image.getchannel('A')
     else:
-        alpha_channel = pil_image.convert("L")
+        alpha_channel = pil_image.convert('L')
 
     mask = np.array(alpha_channel, dtype=np.float32)
     if scale > 1:
@@ -215,13 +202,23 @@ def render_svg_to_soft_mask(
     return mask / 255.0
 
 
+# --- Bitmap to SVG (potrace) -------------------------------------------------
+
+
 def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[List[float], dict]]:
+    """Return (cxcywh, minmax) bbox from mask, or None if empty.
+
+    cxcywh: [cx, cy, w, h] for SVG path coordinate mapping
+    minmax: {x_min, y_min, x_max, y_max} for output
+    Both normalized to [0,1].
+    """
     ys, xs = np.where(mask > 0)
     if xs.size == 0:
         return None
     h, w = mask.shape[:2]
     x0, x1 = float(xs.min()), float(xs.max())
     y0, y1 = float(ys.min()), float(ys.max())
+    # Pixel-inclusive width/height
     bw = max(1.0, x1 - x0 + 1)
     bh = max(1.0, y1 - y0 + 1)
     cx = (x0 + x1 + 1) / 2.0
@@ -236,9 +233,8 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[List[float], dict]]:
     return cxcywh, minmax
 
 
-def _coord(
-    pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int
-) -> str:
+def _coord(pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
+    """Map traced point to bbox-normalized 0-1 path coords."""
     cx, cy, bw, bh = bbox_norm
     x_img = (pt[0] * scale) / img_w
     y_img = (pt[1] * scale) / img_h
@@ -249,9 +245,8 @@ def _coord(
     return f"{x_rel:.3f},{y_rel:.3f}".replace("0.", ".").replace("-.", "-0.")
 
 
-def _curve_to_path(
-    curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int
-) -> str:
+def _curve_to_path(curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
+    """Convert a potrace curve to SVG path segment."""
     parts = [f"M{_coord(curve.start_point, bbox_norm, img_w, img_h, scale)}"]
     for seg in curve.segments:
         if seg.is_corner:
@@ -278,9 +273,13 @@ def bitmap_to_path(
     opttolerance: float = 0.2,
     downsample: int = 1,
 ) -> Optional[Tuple[str, dict]]:
-    global _potrace
-    from PIL import Image
+    """Trace a binary mask into SVG path string and bbox.
 
+    Returns (svg_path, bbox_minmax) or None if mask is empty.
+    svg_path uses 0-1 coords relative to the bbox.
+    bbox_minmax is {x_min, y_min, x_max, y_max} normalized to image dims.
+    """
+    global _potrace
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
     if mask.max() == 0:
@@ -301,9 +300,7 @@ def bitmap_to_path(
         scaled_w = max(1, w // downsample)
         scaled_h = max(1, h // downsample)
         arr = np.asarray(
-            Image.fromarray(arr * 255).resize(
-                (scaled_w, scaled_h), resample=Image.NEAREST
-            )
+            Image.fromarray(arr * 255).resize((scaled_w, scaled_h), resample=Image.NEAREST)
         )
         arr = (arr > 128).astype(np.uint8)
         scale = downsample
@@ -326,7 +323,10 @@ def bitmap_to_path(
     return "".join(svg_paths), bbox_minmax
 
 
+# --- Mask post-processing ----------------------------------------------------
+
 def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
+    """Remove small holes/islands and apply morphological close."""
     h, w = mask.shape
     area_thresh = max(1.0, area_frac * h * w)
     mask = mask.astype(np.uint8)
@@ -338,11 +338,7 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
         sizes = stats[1:, -1]
         small = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
         if small:
-            fill = (
-                [0] + small
-                if fill_holes
-                else [i for i in range(n_labels) if i not in [0] + small]
-            )
+            fill = [0] + small if fill_holes else [i for i in range(n_labels) if i not in [0] + small]
             if not fill_holes and not fill:
                 fill = [int(np.argmax(sizes)) + 1]
             mask = np.isin(regions, fill).astype(np.uint8)
@@ -350,9 +346,8 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
     return cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel) > 0
 
 
-def _expand_bbox(
-    bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25
-) -> Tuple[int, int, int, int]:
+def _expand_bbox(bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25) -> Tuple[int, int, int, int]:
+    """Expand bbox by margin and clip to image bounds. Returns (x1, y1, x2, y2) in pixels."""
     x_min = bbox_minmax["x_min"] * img_w
     y_min = bbox_minmax["y_min"] * img_h
     x_max = bbox_minmax["x_max"] * img_w
@@ -371,12 +366,8 @@ def _expand_bbox(
     return x1, y1, x2, y2
 
 
-def _paste_mask(
-    full_h: int,
-    full_w: int,
-    crop_mask: np.ndarray,
-    crop_xyxy: Tuple[int, int, int, int],
-) -> np.ndarray:
+def _paste_mask(full_h: int, full_w: int, crop_mask: np.ndarray, crop_xyxy: Tuple[int, int, int, int]) -> np.ndarray:
+    """Paste cropped mask back into full-size mask."""
     x1, y1, x2, y2 = crop_xyxy
     full_mask = np.zeros((full_h, full_w), dtype=np.uint8)
 
@@ -384,27 +375,23 @@ def _paste_mask(
     target_h, target_w = y2 - y1, x2 - x1
 
     if crop_h != target_h or crop_w != target_w:
-        crop_mask = cv2.resize(
-            crop_mask.astype(np.uint8),
-            (target_w, target_h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        crop_mask = cv2.resize(crop_mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
     full_mask[y1:y2, x1:x2] = crop_mask
     return full_mask
 
 
 def _ensure_numpy_rgb(image) -> np.ndarray:
+    """Convert image to RGB numpy array (H, W, 3) uint8. Accepts numpy or pyvips."""
     if isinstance(image, np.ndarray):
         return image
+    # Assume pyvips
     if image.bands == 4:
         image = image.extract_band(0, n=3)
     elif image.bands == 1:
         image = image.bandjoin([image, image])
     mem = image.write_to_memory()
-    return np.frombuffer(mem, dtype=np.uint8).reshape(
-        image.height, image.width, image.bands
-    )
+    return np.frombuffer(mem, dtype=np.uint8).reshape(image.height, image.width, image.bands)
 
 
 __all__ = [
