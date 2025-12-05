@@ -1,15 +1,26 @@
-"""HQ-SAM mask refinement and SVG conversion utilities."""
+"""Mask refinement and SVG conversion utilities."""
 
 import io
+import os
 import re
 import threading
+import traceback
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 from PIL import Image
-from torch.nn import functional as F
+from resvg import render, usvg
+
+from .moondream.vision import vision_encoder
+from .moondream.config import VisionConfig
+
+# Number of refinement iterations
+_REFINER_ITERS = 5
 
 # Lazy imports for optional dependencies
 _potrace = None
@@ -17,12 +28,367 @@ _resvg_ctx = None
 _resvg_tls = threading.local()
 
 
+# --- Refinement head model ---------------------------------------------------
+
+class _LayerNorm2d(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class _MaskEncoder(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, embed_dim // 16, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(1, embed_dim // 16),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(embed_dim // 16, embed_dim // 8, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(min(8, embed_dim // 8), embed_dim // 8),
+            nn.GELU(),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(embed_dim // 8, embed_dim // 4, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(min(16, embed_dim // 4), embed_dim // 4),
+            nn.GELU(),
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(embed_dim // 4, embed_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(min(32, embed_dim), embed_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, mask):
+        x = self.conv1(mask)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = F.interpolate(x, size=(27, 27), mode="bilinear", align_corners=False)
+        return x
+
+
+class _FeatureFusion(nn.Module):
+    def __init__(self, enc_dim=1152, embed_dim=256):
+        super().__init__()
+        self.early_proj = nn.Sequential(
+            nn.Linear(enc_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(embed_dim * 2, embed_dim, 1),
+            nn.GroupNorm(32, embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, 3, padding=1),
+            nn.GroupNorm(32, embed_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, early_feat, final_feat):
+        B = early_feat.shape[0]
+        early = self.early_proj(early_feat)
+        early = early.transpose(1, 2).view(B, -1, 27, 27)
+        fused = torch.cat([early, final_feat], dim=1)
+        return self.fusion(fused)
+
+
+class _TwoWayBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, mlp_ratio=8):
+        super().__init__()
+        self.output_self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.cross_attn_token_to_image = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(embed_dim * mlp_ratio, embed_dim),
+        )
+        self.norm3 = nn.LayerNorm(embed_dim)
+        self.cross_attn_image_to_token = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm4 = nn.LayerNorm(embed_dim)
+
+    def forward(self, output_tokens, img_tokens, output_pe, img_pe):
+        q = k = output_tokens + output_pe
+        attn_out = self.output_self_attn(q, k, output_tokens)[0]
+        output_tokens = self.norm1(output_tokens + attn_out)
+
+        q = output_tokens + output_pe
+        k = img_tokens + img_pe
+        attn_out = self.cross_attn_token_to_image(q, k, img_tokens)[0]
+        output_tokens = self.norm2(output_tokens + attn_out)
+
+        output_tokens = self.norm3(output_tokens + self.mlp(output_tokens))
+
+        q = img_tokens + img_pe
+        k = output_tokens + output_pe
+        attn_out = self.cross_attn_image_to_token(q, k, output_tokens)[0]
+        img_tokens = self.norm4(img_tokens + attn_out)
+
+        return output_tokens, img_tokens
+
+
+class _RefinementHead(nn.Module):
+    def __init__(self, enc_dim=1152, embed_dim=256, num_heads=8, num_layers=2, num_masks=4):
+        super().__init__()
+        self.enc_dim = enc_dim
+        self.embed_dim = embed_dim
+        self.num_masks = num_masks
+
+        self.image_proj = nn.Conv2d(enc_dim, embed_dim, 1)
+        self.image_pe = nn.Parameter(torch.randn(1, embed_dim, 27, 27) * 0.02)
+
+        self.hq_fusion = _FeatureFusion(enc_dim, embed_dim)
+        self.mask_encoder = _MaskEncoder(embed_dim)
+
+        self.mask_tokens = nn.Parameter(torch.randn(num_masks, embed_dim) * 0.02)
+        self.iou_token = nn.Parameter(torch.randn(1, embed_dim) * 0.02)
+        self.output_pe = nn.Parameter(torch.randn(num_masks + 1, embed_dim) * 0.02)
+
+        self.transformer_blocks = nn.ModuleList(
+            [_TwoWayBlock(embed_dim, num_heads) for _ in range(num_layers)]
+        )
+
+        self.final_token_to_image = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.final_norm = nn.LayerNorm(embed_dim)
+
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, embed_dim // 2, kernel_size=2, stride=2),
+            _LayerNorm2d(embed_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(embed_dim // 2, embed_dim // 2, kernel_size=3, padding=1),
+            _LayerNorm2d(embed_dim // 2),
+            nn.GELU(),
+            nn.ConvTranspose2d(embed_dim // 2, embed_dim // 4, kernel_size=2, stride=2),
+            _LayerNorm2d(embed_dim // 4),
+            nn.GELU(),
+            nn.Conv2d(embed_dim // 4, embed_dim // 4, kernel_size=3, padding=1),
+            _LayerNorm2d(embed_dim // 4),
+            nn.GELU(),
+            nn.ConvTranspose2d(embed_dim // 4, embed_dim // 8, kernel_size=2, stride=2),
+            _LayerNorm2d(embed_dim // 8),
+            nn.GELU(),
+            nn.Conv2d(embed_dim // 8, embed_dim // 8, kernel_size=3, padding=1),
+            _LayerNorm2d(embed_dim // 8),
+            nn.GELU(),
+        )
+
+        self.final_q_proj = nn.Linear(embed_dim, embed_dim // 8)
+        self.final_attn_up = nn.MultiheadAttention(embed_dim // 8, num_heads=4, batch_first=True)
+        self.final_norm_up = nn.LayerNorm(embed_dim // 8)
+
+        self.mask_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim // 8, embed_dim // 8),
+                nn.GELU(),
+                nn.Linear(embed_dim // 8, embed_dim // 8),
+                nn.GELU(),
+                nn.Linear(embed_dim // 8, embed_dim // 8),
+            )
+            for _ in range(num_masks)
+        ])
+
+        self.iou_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, num_masks),
+        )
+
+    def forward(self, final_features, early_features, coarse_mask):
+        B = final_features.shape[0]
+        H, W = coarse_mask.shape[-2:]
+
+        img = final_features.view(B, 27, 27, self.enc_dim).permute(0, 3, 1, 2)
+        img = self.image_proj(img)
+        img = self.hq_fusion(early_features, img)
+
+        mask_embed = self.mask_encoder(coarse_mask)
+        img = img + mask_embed
+
+        img_tokens = img.flatten(2).transpose(1, 2)
+        img_pe = self.image_pe.flatten(2).transpose(1, 2).expand(B, -1, -1)
+
+        output_tokens = torch.cat([
+            self.mask_tokens.unsqueeze(0).expand(B, -1, -1),
+            self.iou_token.unsqueeze(0).expand(B, -1, -1),
+        ], dim=1)
+        output_pe = self.output_pe.unsqueeze(0).expand(B, -1, -1)
+
+        for block in self.transformer_blocks:
+            output_tokens, img_tokens = block(output_tokens, img_tokens, output_pe, img_pe)
+
+        q = output_tokens + output_pe
+        k = img_tokens + img_pe
+        attn_out = self.final_token_to_image(q, k, img_tokens)[0]
+        output_tokens = self.final_norm(output_tokens + attn_out)
+
+        img_up = img_tokens.transpose(1, 2).view(B, self.embed_dim, 27, 27)
+        img_up = self.upsample(img_up)
+
+        img_up_tokens = img_up.flatten(2).transpose(1, 2)
+        mask_tokens = output_tokens[:, :self.num_masks]
+        mask_tokens_proj = self.final_q_proj(mask_tokens)
+        mask_tokens_refined = (
+            mask_tokens_proj
+            + self.final_attn_up(self.final_norm_up(mask_tokens_proj), img_up_tokens, img_up_tokens)[0]
+        )
+
+        masks = []
+        for i in range(self.num_masks):
+            mask_weights = self.mask_mlps[i](mask_tokens_refined[:, i])
+            mask = torch.einsum("bc,bchw->bhw", mask_weights, img_up)
+            masks.append(mask)
+        masks = torch.stack(masks, dim=1)
+        masks = F.interpolate(masks, size=(H, W), mode="bilinear", align_corners=False)
+
+        iou_token = output_tokens[:, self.num_masks]
+        iou_pred = self.iou_head(iou_token)
+
+        return masks, iou_pred
+
+
+# --- SegmentRefiner ----------------------------------------------------------
+
+class SegmentRefiner:
+    """Refines coarse segmentation masks."""
+
+    def __init__(self, vision_module: nn.Module, vision_config: VisionConfig, device: torch.device):
+        self._device = device
+        self._vision_module = vision_module
+        self._vision_config = vision_config
+
+        # Cached normalization constants
+        self._img_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+        self._img_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+
+        self._head = _RefinementHead(enc_dim=1152, embed_dim=256, num_masks=4)
+        weights_path = hf_hub_download(
+            repo_id="moondream/SegHeadRefiner",
+            filename="model.pt",
+            token=os.environ.get("HF_TOKEN"),
+        )
+        ckpt = torch.load(weights_path, map_location=device, weights_only=True)
+        self._head.load_state_dict(ckpt["head"])
+        self._head = self._head.to(device).to(torch.bfloat16)
+        self._head.eval()
+
+    def _refine_mask(self, image: np.ndarray, coarse_mask: np.ndarray) -> np.ndarray:
+        """Refine a coarse binary mask using vision features and refinement head."""
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(f"Expected RGB image (H,W,3), got {image.shape}")
+        if image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+        if coarse_mask.ndim != 2:
+            raise ValueError(f"Expected 2D mask, got {coarse_mask.shape}")
+
+        device = self._device
+        img_h, img_w = image.shape[:2]
+
+        if coarse_mask.shape != (img_h, img_w):
+            coarse_mask = cv2.resize(coarse_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+
+        img_resized = cv2.resize(image, (378, 378), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(coarse_mask, (378, 378), interpolation=cv2.INTER_NEAREST)
+
+        img_norm = torch.from_numpy(img_resized).float().to(device)
+        img_norm = img_norm.permute(2, 0, 1).unsqueeze(0) / 255.0
+        img_norm = (img_norm - self._img_mean) / self._img_std
+        img_norm = img_norm.to(torch.bfloat16)
+
+        mask_t = (
+            torch.from_numpy(mask_resized)
+            .float()
+            .to(device)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(torch.bfloat16)
+        )
+
+        with torch.no_grad():
+            final_features, early_features = vision_encoder(
+                img_norm, self._vision_module, self._vision_config, early_layer=8
+            )
+            # Iterative refinement
+            current_mask = mask_t
+            for _ in range(_REFINER_ITERS):
+                all_logits, iou_pred = self._head(final_features, early_features, current_mask)
+                best_idx = iou_pred.argmax(dim=1)
+                batch_idx = torch.arange(all_logits.shape[0], device=all_logits.device)
+                best_logits = all_logits[batch_idx, best_idx]
+                current_mask = torch.sigmoid(best_logits).unsqueeze(1)
+
+        refined_mask_np = current_mask.squeeze(0).squeeze(0).float().cpu().numpy()
+        refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+        return (refined_mask_full > 0.5).astype(np.uint8)
+
+    def __call__(self, image, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
+        """Refine a coarse SVG segmentation.
+
+        Args:
+            image: RGB image (numpy array or pyvips Image).
+            svg_path: SVG path string from model output.
+            bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
+
+        Returns:
+            (refined_svg_path, refined_bbox) or (None, None) on failure.
+        """
+        try:
+            image = _ensure_numpy_rgb(image)
+            img_h, img_w = image.shape[:2]
+
+            cx = (bbox["x_min"] + bbox["x_max"]) / 2
+            cy = (bbox["y_min"] + bbox["y_max"]) / 2
+            bw = bbox["x_max"] - bbox["x_min"]
+            bh = bbox["y_max"] - bbox["y_min"]
+            bbox_cxcywh = [cx, cy, bw, bh]
+
+            full_svg = svg_from_path(svg_path, img_w, img_h, bbox_cxcywh)
+            coarse_soft = render_svg_to_soft_mask(full_svg, img_w, img_h)
+            coarse_mask = (coarse_soft > 0.5).astype(np.uint8)
+
+            if coarse_mask.sum() == 0:
+                return None, None
+
+            crop_xyxy = _expand_bbox(bbox, img_w, img_h, margin=0.25)
+            x1, y1, x2, y2 = crop_xyxy
+            crop_img = image[y1:y2, x1:x2, :]
+            crop_mask = coarse_mask[y1:y2, x1:x2]
+
+            if crop_mask.sum() == 0:
+                return None, None
+
+            refined_crop = self._refine_mask(crop_img, crop_mask)
+
+            refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
+            refined_mask = _clean_mask(refined_mask).astype(np.uint8)
+
+            if refined_mask.sum() == 0:
+                return None, None
+
+            result = bitmap_to_path(refined_mask)
+            if result is None:
+                return None, None
+
+            refined_path, refined_bbox = result
+            return refined_path, refined_bbox
+
+        except Exception:
+            traceback.print_exc()
+            return None, None
+
+
 # --- SVG Rendering -----------------------------------------------------------
 
 def _get_resvg_ctx():
     ctx = getattr(_resvg_tls, "ctx", None)
     if ctx is None:
-        from resvg import usvg
         fontdb = usvg.FontDatabase.default()
         fontdb.load_system_fonts()
         opts = usvg.Options.default()
@@ -46,8 +412,6 @@ def svg_from_path(svg_path: str, width: float, height: float, bbox: List[float])
 
 def render_svg_to_soft_mask(svg: str, width: int, height: int, scale: int = 2) -> np.ndarray:
     """Render SVG to a soft mask using resvg backend. Returns float32 [0,1] array."""
-    from resvg import render, usvg
-
     width = int(round(width))
     height = int(round(height))
     scale = max(1, int(scale))
@@ -203,254 +567,6 @@ def bitmap_to_path(
     return "".join(svg_paths), bbox_minmax
 
 
-# --- HQ-SAM Refiner ----------------------------------------------------------
-
-def _extract_points_and_mask(pred_mask: torch.Tensor, gamma: float) -> Tuple[list, list, list, torch.Tensor]:
-    """Extract positive point, negative point, bounding box, and Gaussian mask prompt."""
-    pred_mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
-    device = pred_mask.device
-
-    if pred_mask_np.sum() == 0:
-        pred_mask_dt_np = np.zeros_like(pred_mask_np, dtype=np.float32)
-    else:
-        pred_mask_dt_np = cv2.distanceTransform(pred_mask_np, distanceType=cv2.DIST_L2, maskSize=3)
-    pred_mask_dt = torch.from_numpy(pred_mask_dt_np).to(device, torch.float32)
-
-    pred_max_dist = pred_mask_dt.max()
-    coords_y, coords_x = torch.where(pred_mask_dt == pred_max_dist)
-    if coords_y.numel() == 0:
-        pos_x, pos_y = 0, 0
-    else:
-        pos_x, pos_y = int(coords_x[0]), int(coords_y[0])
-
-    coord = torch.nonzero(pred_mask)
-    if coord.numel() == 0:
-        ymin, xmin, ymax, xmax = 0, 0, 0, 0
-    else:
-        y_coord, x_coord = coord[:, 0], coord[:, 1]
-        ymin = int(y_coord.min())
-        xmin = int(x_coord.min())
-        ymax = int(y_coord.max())
-        xmax = int(x_coord.max())
-
-    # Find negative point: background pixel inside bbox with max distance from foreground
-    pred_mask_rev_np = (pred_mask_np == 0).astype(np.uint8)
-    box_mask_np = np.zeros_like(pred_mask_np, dtype=np.uint8)
-    box_mask_np[ymin:ymax+1, xmin:xmax+1] = 1
-    bg_in_box = pred_mask_rev_np & box_mask_np
-
-    neg_x, neg_y = None, None
-    if bg_in_box.sum() > 0:
-        bg_dt = cv2.distanceTransform(pred_mask_rev_np, distanceType=cv2.DIST_L2, maskSize=3)
-        bg_dt[box_mask_np == 0] = 0  # only consider inside bbox
-        if bg_dt.max() > 0:
-            bg_dt_t = torch.from_numpy(bg_dt).to(device, torch.float32)
-            coords_y_neg, coords_x_neg = torch.where(bg_dt_t == bg_dt_t.max())
-            if coords_y_neg.numel() > 0:
-                neg_x, neg_y = int(coords_x_neg[0]), int(coords_y_neg[0])
-
-    mask_area = max(pred_mask.sum() / gamma, 1)
-    pred_max_dist_tensor = pred_mask_dt.max()
-    gaus_dt = pred_mask_dt - pred_max_dist_tensor
-    gaus_dt = torch.exp(-gaus_dt * gaus_dt / mask_area)
-    gaus_dt[pred_mask_dt == 0] = 0
-
-    # Only include negative point if we found a valid one
-    if neg_x is not None:
-        point_coords = [[pos_x, pos_y], [neg_x, neg_y]]
-        point_labels = [1, 0]
-    else:
-        point_coords = [[pos_x, pos_y]]
-        point_labels = [1]
-    box = [xmin, ymin, xmax, ymax]
-
-    return point_coords, point_labels, box, gaus_dt
-
-
-def _build_mask_inputs(
-    pred_mask: torch.Tensor,
-    gaus_dt: torch.Tensor,
-    target_size: tuple,
-    strength: float,
-) -> torch.Tensor:
-    """Build mask input for SAM following SAMRefiner's extract_mask exactly.
-
-    Args:
-        pred_mask: Binary mask (H, W), uint8 tensor
-        gaus_dt: Gaussian distance transform (H, W), float tensor
-        target_size: (H, W) of resized image
-        strength: Mask prompt strength (default 30)
-
-    Returns:
-        Mask input tensor (1, 1, 256, 256)
-    """
-    # Convert to float and add batch/channel dims: (1, 1, H, W)
-    pred_masks = pred_mask.float().unsqueeze(0).unsqueeze(0)
-    gaus = gaus_dt.float().unsqueeze(0).unsqueeze(0)
-
-    # Convert binary mask to signed: 0 -> -1, 1 -> +1
-    pred_masks = torch.where(pred_masks == 0, torch.tensor(-1.0, device=pred_masks.device), torch.tensor(1.0, device=pred_masks.device))
-
-    # Resize both to target size
-    pred_masks = F.interpolate(pred_masks, target_size, mode="bilinear", align_corners=False)
-    gaus = F.interpolate(gaus, target_size, mode="bilinear", align_corners=False)
-
-    # Pad to 1024x1024
-    h, w = pred_masks.shape[-2:]
-    padh = 1024 - h
-    padw = 1024 - w
-    pred_masks = F.pad(pred_masks, (0, padw, 0, padh), "constant", -1.0)  # pad with -1 (background)
-    gaus = F.pad(gaus, (0, padw, 0, padh), "constant", 0.0)  # pad with 0
-
-    # Resize to 256x256 for SAM
-    pred_masks = F.interpolate(pred_masks, (256, 256), mode="bilinear", align_corners=False)
-    gaus = F.interpolate(gaus, (256, 256), mode="bilinear", align_corners=False)
-
-    # Apply strength: negative regions get -strength, positive get +strength
-    pred_masks = torch.where(pred_masks <= 0, -strength * torch.ones_like(pred_masks), strength * torch.ones_like(pred_masks))
-
-    # Multiply by gaus_dt (background gaus is 0, set to 1 so it becomes -strength)
-    gaus = torch.where(gaus <= 0, torch.ones_like(gaus), gaus)
-    mask_inputs = pred_masks * gaus
-
-    return mask_inputs
-
-
-def build_sam_model(device: Optional[torch.device] = None, model_id: str = "moondream/hqsam-vith-meta"):
-    """Build HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
-    from transformers import AutoModel
-
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Try loading from cache first to avoid network calls
-    try:
-        model = AutoModel.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-    except Exception:
-        # Fall back to downloading if not cached
-        model = AutoModel.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-        )
-    model = model.to(device)
-    model.eval()
-
-    # MetaSamHQModel exposes .sam and .resize
-    if not hasattr(model, "sam"):
-        raise AttributeError("Loaded model missing sam attribute.")
-    if not hasattr(model, "resize"):
-        raise AttributeError("Loaded model missing resize transform.")
-
-    return model
-
-
-def sam_refine(
-    image: np.ndarray,
-    coarse_mask: np.ndarray,
-    sam_model,
-    iters: int = 8,
-    strength: float = 30.0,
-    gamma: float = 4.0,
-) -> np.ndarray:
-    """
-    HQ-SAM iterative mask refinement.
-
-    Args:
-        image: RGB numpy array (H, W, 3), uint8.
-        coarse_mask: Binary mask (H, W), uint8.
-        sam_model: Namespace with fields: sam (HQ-SAM), resize (ResizeLongestSide), device.
-        iters: Number of refinement iterations.
-        strength: Mask prompt strength.
-        gamma: Gaussian spread for mask prompt.
-
-    Returns:
-        Refined binary mask (H, W), uint8.
-    """
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f"Expected RGB image (H,W,3), got {image.shape}")
-    if image.dtype != np.uint8:
-        image = image.astype(np.uint8)
-    if coarse_mask.ndim != 2:
-        raise ValueError(f"Expected 2D mask, got {coarse_mask.shape}")
-
-    sam = sam_model.sam
-    resize = getattr(sam_model, "resize", None)
-    if resize is None:
-        raise AttributeError("sam_model missing resize transform.")
-    device = next(sam_model.parameters()).device
-
-    img_h, img_w = image.shape[0], image.shape[1]
-
-    if coarse_mask.shape != (img_h, img_w):
-        coarse_mask = cv2.resize(coarse_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-
-    current_mask = torch.tensor(coarse_mask, dtype=torch.uint8, device=device)
-
-    # Prepare resized image and embeddings once
-    resized_img = resize.apply_image(image)
-    resized_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).float().to(device)  # CHW
-    input_images = torch.stack([sam.preprocess(resized_tensor)], dim=0)
-
-    with torch.no_grad():
-        image_embeddings, interm_embeddings = sam.image_encoder(input_images)
-    # HQ-SAM returns a list of intermediate embeddings; use the first one
-    interm_embeddings = interm_embeddings[0]
-
-    for _ in range(iters):
-        point_coords, point_labels, box, gaus_dt = _extract_points_and_mask(current_mask, gamma)
-
-        # Build mask prompt at resized resolution
-        mask_inputs = _build_mask_inputs(current_mask, gaus_dt, resized_tensor.shape[-2:], strength).to(device)
-
-        # Scale prompts with ResizeLongestSide utilities
-        points_np = np.array(point_coords, dtype=np.float32)
-        points_t = torch.from_numpy(points_np).unsqueeze(0).to(device)  # 1 x N x 2
-        points_scaled = resize.apply_coords_torch(points_t, (img_h, img_w))
-        input_points = points_scaled.unsqueeze(0)  # 1 x 1 x N x 2
-
-        input_labels = torch.tensor(point_labels, dtype=torch.long, device=device).unsqueeze(0).unsqueeze(0)
-
-        box_np = np.array(box, dtype=np.float32)
-        box_t = torch.from_numpy(box_np).unsqueeze(0).to(device)  # 1 x 4
-        box_scaled = resize.apply_boxes_torch(box_t, (img_h, img_w))
-        input_boxes = box_scaled.unsqueeze(0)  # 1 x 1 x 4
-
-        batched_input = [
-            {
-                "image": resized_tensor,
-                "original_size": (img_h, img_w),
-                "point_coords": input_points.squeeze(0),
-                "point_labels": input_labels.squeeze(0),
-                "boxes": input_boxes.squeeze(0),
-                "mask_inputs": mask_inputs,
-            }
-        ]
-
-        with torch.no_grad():
-            outputs = sam.forward_with_image_embeddings(
-                image_embeddings=image_embeddings,
-                interm_embeddings=interm_embeddings,
-                batched_input=batched_input,
-                multimask_output=True,
-                hq_token_only=False,
-            )
-
-        out = outputs[0]
-        sam_ious = out["iou_predictions"]
-        sam_masks = out["masks"]  # already upsampled to original size
-
-        best_idx = sam_ious[0].argmax()
-        best_mask_logits = sam_masks[0, best_idx:best_idx+1]
-
-        # Keep mask 2D for downstream processing
-        current_mask = (best_mask_logits > 0).squeeze(0).to(torch.uint8)
-
-    return current_mask.detach().cpu().numpy()
-
-
 # --- Mask post-processing ----------------------------------------------------
 
 def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
@@ -473,8 +589,6 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
 
     return cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel) > 0
 
-
-# --- High-level refinement API -----------------------------------------------
 
 def _expand_bbox(bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25) -> Tuple[int, int, int, int]:
     """Expand bbox by margin and clip to image bounds. Returns (x1, y1, x2, y2) in pixels."""
@@ -524,89 +638,9 @@ def _ensure_numpy_rgb(image) -> np.ndarray:
     return np.frombuffer(mem, dtype=np.uint8).reshape(image.height, image.width, image.bands)
 
 
-def refine_segmentation(
-    image,
-    svg_path: str,
-    bbox: dict,
-    sam_model,
-    iters: int = 8,
-) -> Tuple[Optional[str], Optional[dict]]:
-    """
-    Refine a coarse SVG segmentation using HQ-SAM.
-
-    Args:
-        image: RGB image (numpy array or pyvips Image).
-        svg_path: SVG path string from model output.
-        bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
-        sam_model: HQ-SAM wrapper from build_sam_model.
-        iters: Number of refinement iterations.
-
-    Returns:
-        (refined_svg_path, refined_bbox) or (None, None) on failure.
-    """
-    if sam_model is None:
-        print("[refiner] sam_model is None, skipping refinement")
-        return None, None
-
-    try:
-        image = _ensure_numpy_rgb(image)
-        img_h, img_w = image.shape[:2]
-
-        # Convert bbox from minmax to cxcywh for SVG rendering
-        cx = (bbox["x_min"] + bbox["x_max"]) / 2
-        cy = (bbox["y_min"] + bbox["y_max"]) / 2
-        bw = bbox["x_max"] - bbox["x_min"]
-        bh = bbox["y_max"] - bbox["y_min"]
-        bbox_cxcywh = [cx, cy, bw, bh]
-
-        # Render coarse SVG to mask
-        full_svg = svg_from_path(svg_path, img_w, img_h, bbox_cxcywh)
-        coarse_soft = render_svg_to_soft_mask(full_svg, img_w, img_h)
-        coarse_mask = (coarse_soft > 0.5).astype(np.uint8)
-
-        if coarse_mask.sum() == 0:
-            print("[refiner] coarse_mask is empty, skipping refinement")
-            return None, None
-
-        # Crop around bbox with margin
-        crop_xyxy = _expand_bbox(bbox, img_w, img_h, margin=0.25)
-        x1, y1, x2, y2 = crop_xyxy
-        crop_img = image[y1:y2, x1:x2, :]
-        crop_mask = coarse_mask[y1:y2, x1:x2]
-
-        if crop_mask.sum() == 0:
-            print("[refiner] crop_mask is empty, skipping refinement")
-            return None, None
-
-        # Run SAM refinement
-        refined_crop = sam_refine(crop_img, crop_mask, sam_model, iters=iters)
-
-        # Paste back to full size and clean up
-        refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
-        refined_mask = _clean_mask(refined_mask).astype(np.uint8)
-
-        if refined_mask.sum() == 0:
-            print("[refiner] refined_mask is empty, skipping refinement")
-            return None, None
-
-        result = bitmap_to_path(refined_mask)
-        if result is None:
-            print("[refiner] bitmap_to_path failed, skipping refinement")
-            return None, None
-
-        refined_path, refined_bbox = result
-        return refined_path, refined_bbox
-
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        return None, None
-
-
 __all__ = [
-    "build_sam_model",
-    "refine_segmentation",
-    "render_svg_to_soft_mask",
+    "SegmentRefiner",
     "svg_from_path",
+    "render_svg_to_soft_mask",
     "bitmap_to_path",
 ]
