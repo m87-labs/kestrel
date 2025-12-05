@@ -1,6 +1,5 @@
 """Command-line entrypoint for Kestrel demos."""
 
-
 import argparse
 import asyncio
 import json
@@ -34,13 +33,21 @@ def _parse_dtype(value: str) -> torch.dtype:
 
 
 def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
+    parser.add_argument(
+        "--weights", type=Path, required=True, help="Path to text weights file"
+    )
     parser.add_argument("--config", type=Path, help="Optional model config JSON")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
-    parser.add_argument("--refiner-iters", type=int, default=5, help="Number of refiner iterations")
+    parser.add_argument(
+        "--refiner-iters", type=int, default=5, help="Number of refiner iterations"
+    )
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
-    parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
-    parser.add_argument("--max-batch-size", type=int, default=4, help="Max sequences per decode step")
+    parser.add_argument(
+        "--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype"
+    )
+    parser.add_argument(
+        "--max-batch-size", type=int, default=4, help="Max sequences per decode step"
+    )
     parser.add_argument("--page-size", type=int, default=128, help="KV cache page size")
     parser.add_argument(
         "--max-seq-length",
@@ -60,9 +67,13 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     schedule = subparsers.add_parser("schedule", help="Run batched text generation")
-    schedule.add_argument("prompts", nargs="+", help="Prompts to generate responses for")
+    schedule.add_argument(
+        "prompts", nargs="+", help="Prompts to generate responses for"
+    )
     _add_runtime_args(schedule)
-    schedule.add_argument("--max-new-tokens", type=int, default=768, help="Tokens to sample per request")
+    schedule.add_argument(
+        "--max-new-tokens", type=int, default=768, help="Tokens to sample per request"
+    )
     schedule.add_argument(
         "--temperature",
         type=float,
@@ -101,8 +112,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.9,
         help="Default nucleus sampling mass when a request omits it",
     )
-    serve.add_argument("--host", default="0.0.0.0", help="Host address to bind the HTTP server")
-    serve.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server")
+    serve.add_argument(
+        "--host", default="0.0.0.0", help="Host address to bind the HTTP server"
+    )
+    serve.add_argument(
+        "--port", type=int, default=8000, help="Port to bind the HTTP server"
+    )
     serve.add_argument(
         "--log-level",
         choices=["critical", "error", "warning", "info", "debug", "trace"],

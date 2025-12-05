@@ -1,6 +1,5 @@
 """Vision encoder components ported from the Moondream reference implementation."""
 
-
 from typing import Tuple, Optional
 
 import torch
@@ -51,16 +50,24 @@ def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     return x
 
 
-def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig) -> torch.Tensor:
+def vision_encoder(
+    crops: torch.Tensor, module: nn.Module, config: VisionConfig
+) -> torch.Tensor:
     x = create_patches(crops, config.enc_patch_size)
     x = module.patch_emb(x)
     x = x + module.pos_emb
     for block in module.blocks:
-        x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
+        x_norm = F.layer_norm(
+            x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias
+        )
         x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
-        x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
+        x_norm = F.layer_norm(
+            x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias
+        )
         x = x + _vision_mlp(x_norm, block.mlp)
-    x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
+    x = F.layer_norm(
+        x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias
+    )
     return x
 
 
@@ -74,14 +81,20 @@ def vision_encoder_multiscale(
 
     early_feat = None
     for i, block in enumerate(module.blocks):
-        x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
+        x_norm = F.layer_norm(
+            x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias
+        )
         x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
-        x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
+        x_norm = F.layer_norm(
+            x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias
+        )
         x = x + _vision_mlp(x_norm, block.mlp)
         if i == early_block:
             early_feat = x.clone()
 
-    x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
+    x = F.layer_norm(
+        x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias
+    )
     return early_feat, x
 
 
@@ -140,15 +153,23 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
                             "ln1": nn.LayerNorm(config.enc_dim, dtype=dtype),
                             "attn": nn.ModuleDict(
                                 {
-                                    "qkv": nn.Linear(config.enc_dim, 3 * config.enc_dim, dtype=dtype),
-                                    "proj": nn.Linear(config.enc_dim, config.enc_dim, dtype=dtype),
+                                    "qkv": nn.Linear(
+                                        config.enc_dim, 3 * config.enc_dim, dtype=dtype
+                                    ),
+                                    "proj": nn.Linear(
+                                        config.enc_dim, config.enc_dim, dtype=dtype
+                                    ),
                                 }
                             ),
                             "ln2": nn.LayerNorm(config.enc_dim, dtype=dtype),
                             "mlp": nn.ModuleDict(
                                 {
-                                    "fc1": nn.Linear(config.enc_dim, config.enc_ff_dim, dtype=dtype),
-                                    "fc2": nn.Linear(config.enc_ff_dim, config.enc_dim, dtype=dtype),
+                                    "fc1": nn.Linear(
+                                        config.enc_dim, config.enc_ff_dim, dtype=dtype
+                                    ),
+                                    "fc2": nn.Linear(
+                                        config.enc_ff_dim, config.enc_dim, dtype=dtype
+                                    ),
                                 }
                             ),
                         }
@@ -159,13 +180,19 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
             "post_ln": nn.LayerNorm(config.enc_dim, dtype=dtype),
             "proj_mlp": nn.ModuleDict(
                 {
-                    "fc1": nn.Linear(config.enc_dim * 2, config.proj_inner_dim, dtype=dtype),
-                    "fc2": nn.Linear(config.proj_inner_dim, config.proj_out_dim, dtype=dtype),
+                    "fc1": nn.Linear(
+                        config.enc_dim * 2, config.proj_inner_dim, dtype=dtype
+                    ),
+                    "fc2": nn.Linear(
+                        config.proj_inner_dim, config.proj_out_dim, dtype=dtype
+                    ),
                 }
             ),
         }
     )
-    model.pos_emb = nn.Parameter(torch.zeros(1, num_patches, config.enc_dim, dtype=dtype))
+    model.pos_emb = nn.Parameter(
+        torch.zeros(1, num_patches, config.enc_dim, dtype=dtype)
+    )
     return model
 
 

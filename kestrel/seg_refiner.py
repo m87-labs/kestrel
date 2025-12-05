@@ -19,6 +19,7 @@ def _get_resvg_ctx():
     ctx = getattr(_resvg_tls, "ctx", None)
     if ctx is None:
         from resvg import usvg
+
         fontdb = usvg.FontDatabase.default()
         fontdb.load_system_fonts()
         opts = usvg.Options.default()
@@ -39,7 +40,9 @@ def svg_from_path(svg_path: str, width: float, height: float, bbox: List[float])
     )
 
 
-def render_svg_to_soft_mask(svg: str, width: int, height: int, scale: int = 2) -> np.ndarray:
+def render_svg_to_soft_mask(
+    svg: str, width: int, height: int, scale: int = 2
+) -> np.ndarray:
     from PIL import Image
     from resvg import render, usvg
 
@@ -50,25 +53,33 @@ def render_svg_to_soft_mask(svg: str, width: int, height: int, scale: int = 2) -
     opts, fontdb = _get_resvg_ctx()
 
     normalized_svg = (
-        svg.replace(",M", " M").replace(",m", " m")
-        .replace(",L", " L").replace(",l", " l")
-        .replace(",C", " C").replace(",c", " c")
-        .replace(",Z", " Z").replace(",z", " z")
+        svg.replace(",M", " M")
+        .replace(",m", " m")
+        .replace(",L", " L")
+        .replace(",l", " l")
+        .replace(",C", " C")
+        .replace(",c", " c")
+        .replace(",Z", " Z")
+        .replace(",z", " z")
     )
 
     render_width = max(1, int(round(width * scale)))
     render_height = max(1, int(round(height * scale)))
-    normalized_svg = re.sub(r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg)
-    normalized_svg = re.sub(r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg)
+    normalized_svg = re.sub(
+        r'width="[0-9.]+"', f'width="{render_width}"', normalized_svg
+    )
+    normalized_svg = re.sub(
+        r'height="[0-9.]+"', f'height="{render_height}"', normalized_svg
+    )
 
     tree = usvg.Tree.from_str(normalized_svg, opts, fontdb)
     png_bytes = bytes(render(tree, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)))
 
     pil_image = Image.open(io.BytesIO(png_bytes))
-    if pil_image.mode in ('RGBA', 'LA'):
-        alpha_channel = pil_image.getchannel('A')
+    if pil_image.mode in ("RGBA", "LA"):
+        alpha_channel = pil_image.getchannel("A")
     else:
-        alpha_channel = pil_image.convert('L')
+        alpha_channel = pil_image.convert("L")
 
     mask = np.array(alpha_channel, dtype=np.float32)
     if scale > 1:
@@ -98,7 +109,9 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[List[float], dict]]:
     return cxcywh, minmax
 
 
-def _coord(pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
+def _coord(
+    pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale: int
+) -> str:
     cx, cy, bw, bh = bbox_norm
     x_img = (pt[0] * scale) / img_w
     y_img = (pt[1] * scale) / img_h
@@ -109,7 +122,9 @@ def _coord(pt: np.ndarray, bbox_norm: List[float], img_w: int, img_h: int, scale
     return f"{x_rel:.3f},{y_rel:.3f}".replace("0.", ".").replace("-.", "-0.")
 
 
-def _curve_to_path(curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int) -> str:
+def _curve_to_path(
+    curve, bbox_norm: List[float], img_w: int, img_h: int, scale: int
+) -> str:
     parts = [f"M{_coord(curve.start_point, bbox_norm, img_w, img_h, scale)}"]
     for seg in curve.segments:
         if seg.is_corner:
@@ -159,7 +174,9 @@ def bitmap_to_path(
         scaled_w = max(1, w // downsample)
         scaled_h = max(1, h // downsample)
         arr = np.asarray(
-            Image.fromarray(arr * 255).resize((scaled_w, scaled_h), resample=Image.NEAREST)
+            Image.fromarray(arr * 255).resize(
+                (scaled_w, scaled_h), resample=Image.NEAREST
+            )
         )
         arr = (arr > 128).astype(np.uint8)
         scale = downsample
@@ -194,7 +211,11 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
         sizes = stats[1:, -1]
         small = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
         if small:
-            fill = [0] + small if fill_holes else [i for i in range(n_labels) if i not in [0] + small]
+            fill = (
+                [0] + small
+                if fill_holes
+                else [i for i in range(n_labels) if i not in [0] + small]
+            )
             if not fill_holes and not fill:
                 fill = [int(np.argmax(sizes)) + 1]
             mask = np.isin(regions, fill).astype(np.uint8)
@@ -202,7 +223,9 @@ def _clean_mask(mask: np.ndarray, area_frac: float = 0.0015) -> np.ndarray:
     return cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel) > 0
 
 
-def _expand_bbox(bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25) -> Tuple[int, int, int, int]:
+def _expand_bbox(
+    bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25
+) -> Tuple[int, int, int, int]:
     x_min = bbox_minmax["x_min"] * img_w
     y_min = bbox_minmax["y_min"] * img_h
     x_max = bbox_minmax["x_max"] * img_w
@@ -221,7 +244,12 @@ def _expand_bbox(bbox_minmax: dict, img_w: int, img_h: int, margin: float = 0.25
     return x1, y1, x2, y2
 
 
-def _paste_mask(full_h: int, full_w: int, crop_mask: np.ndarray, crop_xyxy: Tuple[int, int, int, int]) -> np.ndarray:
+def _paste_mask(
+    full_h: int,
+    full_w: int,
+    crop_mask: np.ndarray,
+    crop_xyxy: Tuple[int, int, int, int],
+) -> np.ndarray:
     x1, y1, x2, y2 = crop_xyxy
     full_mask = np.zeros((full_h, full_w), dtype=np.uint8)
 
@@ -229,7 +257,11 @@ def _paste_mask(full_h: int, full_w: int, crop_mask: np.ndarray, crop_xyxy: Tupl
     target_h, target_w = y2 - y1, x2 - x1
 
     if crop_h != target_h or crop_w != target_w:
-        crop_mask = cv2.resize(crop_mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        crop_mask = cv2.resize(
+            crop_mask.astype(np.uint8),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
 
     full_mask[y1:y2, x1:x2] = crop_mask
     return full_mask
@@ -243,7 +275,9 @@ def _ensure_numpy_rgb(image) -> np.ndarray:
     elif image.bands == 1:
         image = image.bandjoin([image, image])
     mem = image.write_to_memory()
-    return np.frombuffer(mem, dtype=np.uint8).reshape(image.height, image.width, image.bands)
+    return np.frombuffer(mem, dtype=np.uint8).reshape(
+        image.height, image.width, image.bands
+    )
 
 
 def hqsam_head_refine(
@@ -265,7 +299,11 @@ def hqsam_head_refine(
     img_h, img_w = image.shape[:2]
 
     if coarse_mask.shape != (img_h, img_w):
-        coarse_mask = cv2.resize(coarse_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+        coarse_mask = cv2.resize(
+            coarse_mask.astype(np.uint8),
+            (img_w, img_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
 
     img_resized = cv2.resize(image, (378, 378), interpolation=cv2.INTER_LINEAR)
     mask_resized = cv2.resize(coarse_mask, (378, 378), interpolation=cv2.INTER_NEAREST)
@@ -277,14 +315,27 @@ def hqsam_head_refine(
     img_norm = (img_norm - mean) / std
     img_norm = img_norm.to(torch.bfloat16)
 
-    mask_t = torch.from_numpy(mask_resized).float().to(device).unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
+    mask_t = (
+        torch.from_numpy(mask_resized)
+        .float()
+        .to(device)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .to(torch.bfloat16)
+    )
 
     with torch.no_grad():
-        early_features, final_features = vision_encoder_multiscale(img_norm, vision_module, vision_config)
-        refined_mask = hqsam_head_refiner(final_features, early_features, mask_t, n_iters=iters)
+        early_features, final_features = vision_encoder_multiscale(
+            img_norm, vision_module, vision_config
+        )
+        refined_mask = hqsam_head_refiner(
+            final_features, early_features, mask_t, n_iters=iters
+        )
 
     refined_mask_np = refined_mask.squeeze(0).squeeze(0).float().cpu().numpy()
-    refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+    refined_mask_full = cv2.resize(
+        refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR
+    )
     refined_mask_binary = (refined_mask_full > 0.5).astype(np.uint8)
 
     return refined_mask_binary
@@ -327,7 +378,14 @@ def refine_segmentation_with_hqsam_head(
         if crop_mask.sum() == 0:
             return None, None
 
-        refined_crop = hqsam_head_refine(crop_img, crop_mask, hqsam_head_refiner, vision_module, vision_config, iters=iters)
+        refined_crop = hqsam_head_refine(
+            crop_img,
+            crop_mask,
+            hqsam_head_refiner,
+            vision_module,
+            vision_config,
+            iters=iters,
+        )
 
         refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
         refined_mask = _clean_mask(refined_mask).astype(np.uint8)
@@ -344,6 +402,7 @@ def refine_segmentation_with_hqsam_head(
 
     except Exception:
         import traceback
+
         traceback.print_exc()
         return None, None
 

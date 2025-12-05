@@ -1,6 +1,5 @@
 """Runtime configuration objects for the Kestrel inference engine."""
 
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
