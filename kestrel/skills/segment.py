@@ -19,8 +19,7 @@ from kestrel.utils.svg import (
     svg_path_from_token_ids,
     PATH_COMMANDS,
 )
-from ..seg_refiner import refine_segmentation
-from ..head_seg_refiner import refine_segmentation_with_head, refine_segmentation_with_hqsam_head
+from ..head_seg_refiner import refine_segmentation_with_hqsam_head
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -170,44 +169,15 @@ class SegmentSkillState(SkillState):
         coarse_bbox = bbox
 
         if svg_path and bbox and not parse_error and self._request.image is not None:
-            if runtime.hqsam_head_refiner is not None:
-                refined_path, refined_bbox = refine_segmentation_with_hqsam_head(
-                    self._request.image,
-                    svg_path,
-                    bbox,
-                    runtime.hqsam_head_refiner,
-                    runtime.model.vision,
-                    runtime.config.vision,
-                    iters=runtime.config.refiner_iters,
-                )
-            elif runtime.sam_head_refiner is not None:
-                refined_path, refined_bbox = refine_segmentation_with_head(
-                    self._request.image,
-                    svg_path,
-                    bbox,
-                    runtime.sam_head_refiner,
-                    runtime.model.vision,
-                    runtime.config.vision,
-                    iters=runtime.config.refiner_iters,
-                )
-            elif runtime.head_refiner is not None:
-                refined_path, refined_bbox = refine_segmentation_with_head(
-                    self._request.image,
-                    svg_path,
-                    bbox,
-                    runtime.head_refiner,
-                    runtime.model.vision,
-                    runtime.config.vision,
-                    iters=runtime.config.refiner_iters,
-                )
-            else:
-                refined_path, refined_bbox = refine_segmentation(
-                    self._request.image,
-                    svg_path,
-                    bbox,
-                    runtime.sam_model,
-                    iters=runtime.config.refiner_iters,
-                )
+            refined_path, refined_bbox = refine_segmentation_with_hqsam_head(
+                self._request.image,
+                svg_path,
+                bbox,
+                runtime.hqsam_head_refiner,
+                runtime.model.vision,
+                runtime.config.vision,
+                iters=runtime.config.refiner_iters,
+            )
             if refined_path is not None and refined_bbox is not None:
                 svg_path = refined_path
                 bbox = refined_bbox

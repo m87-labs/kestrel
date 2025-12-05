@@ -13,10 +13,8 @@ Configuration is taken from environment variables:
   KESTREL_PORT      (default: 8000)
   KESTREL_HOST      (default: 0.0.0.0)
   KESTREL_CUDA_GRAPHS (default: false)
-  KESTREL_REFINER   (default: sam) one of: head, sam, samhead
-  KESTREL_HEAD_WEIGHTS (optional) path to head refiner weights
-  KESTREL_SAMHEAD_WEIGHTS (optional) path to samhead refiner weights
   KESTREL_REFINER_ITERS (default: 6) number of refinement iterations
+  HF_TOKEN          (required for private repo) HuggingFace token for refiner weights
 """
 
 import os
@@ -53,25 +51,16 @@ def main() -> None:
     host = os.getenv("KESTREL_HOST", "0.0.0.0")
     enable_cuda_graphs = env_bool("KESTREL_CUDA_GRAPHS", False)
 
-    refiner_type = os.getenv("KESTREL_REFINER", "sam")
-    head_weights_env = os.getenv("KESTREL_HEAD_WEIGHTS")
-    samhead_weights_env = os.getenv("KESTREL_SAMHEAD_WEIGHTS")
     refiner_iters = int(os.getenv("KESTREL_REFINER_ITERS", "6"))
-
-    head_weights = Path(head_weights_env).expanduser() if head_weights_env else None
-    samhead_weights = Path(samhead_weights_env).expanduser() if samhead_weights_env else None
 
     runtime_cfg = RuntimeConfig(
         model_paths=ModelPaths(
             weights=str(weights),
-            head_refiner_weights=head_weights,
-            sam_head_refiner_weights=samhead_weights,
         ),
         device=device,
         dtype=dtype,
         max_batch_size=max_batch,
         enable_cuda_graphs=enable_cuda_graphs,
-        refiner_type=refiner_type,
         refiner_iters=refiner_iters,
     )
 

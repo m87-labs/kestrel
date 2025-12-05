@@ -1,8 +1,11 @@
 """HQ-SAM style mask refiner with multi-scale feature fusion."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 
 
 class LayerNorm2d(nn.Module):
@@ -237,11 +240,16 @@ class HQSAMHead(nn.Module):
 
 
 class HQSAMHeadRefiner:
-    def __init__(self, ckpt_path, device="cuda"):
+    def __init__(self, device="cuda"):
         self.device = device
         self.head = HQSAMHead(enc_dim=1152, embed_dim=256, num_masks=4)
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        weights_path = hf_hub_download(
+            repo_id="moondream/SegHeadRefiner",
+            filename="model.pt",
+            token=os.environ.get("HF_TOKEN"),
+        )
+        ckpt = torch.load(weights_path, map_location=device, weights_only=True)
         self.head.load_state_dict(ckpt["head"])
         self.head = self.head.to(device).to(torch.bfloat16)
         self.head.eval()

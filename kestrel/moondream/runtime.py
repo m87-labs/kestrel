@@ -47,9 +47,6 @@ from .region import (
     decode_coordinate,
     decode_size,
 )
-from ..seg_refiner import build_sam_model
-from ..head_refiner import HeadRefiner
-from ..sam_head_refiner import SAMHeadRefiner
 from ..hqsam_head_refiner import HQSAMHeadRefiner
 
 
@@ -419,28 +416,7 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        self.head_refiner = None
-        self.sam_head_refiner = None
-        self.hqsam_head_refiner = None
-        self.sam_model = None
-
-        if cfg.refiner_type == "hqsamhead" and cfg.model_paths.hqsam_head_refiner_weights:
-            self.hqsam_head_refiner = HQSAMHeadRefiner(
-                ckpt_path=str(cfg.model_paths.hqsam_head_refiner_weights),
-                device=self.device
-            )
-        elif cfg.refiner_type == "samhead" and cfg.model_paths.sam_head_refiner_weights:
-            self.sam_head_refiner = SAMHeadRefiner(
-                ckpt_path=str(cfg.model_paths.sam_head_refiner_weights),
-                device=self.device
-            )
-        elif cfg.refiner_type == "head" and cfg.model_paths.head_refiner_weights:
-            self.head_refiner = HeadRefiner(
-                ckpt_path=str(cfg.model_paths.head_refiner_weights),
-                device=self.device
-            )
-        else:
-            self.sam_model = build_sam_model(device=self.device)
+        self.hqsam_head_refiner = HQSAMHeadRefiner(device=self.device)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
