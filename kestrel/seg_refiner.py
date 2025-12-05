@@ -264,6 +264,10 @@ class SegmentRefiner:
         self._vision_module = vision_module
         self._vision_config = vision_config
 
+        # Cached normalization constants
+        self._img_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+        self._img_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+
         self._head = _RefinementHead(enc_dim=1152, embed_dim=256, num_masks=4)
         weights_path = hf_hub_download(
             repo_id="moondream/SegHeadRefiner",
@@ -295,9 +299,7 @@ class SegmentRefiner:
 
         img_norm = torch.from_numpy(img_resized).float().to(device)
         img_norm = img_norm.permute(2, 0, 1).unsqueeze(0) / 255.0
-        mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-        img_norm = (img_norm - mean) / std
+        img_norm = (img_norm - self._img_mean) / self._img_std
         img_norm = img_norm.to(torch.bfloat16)
 
         mask_t = (
