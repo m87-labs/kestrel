@@ -51,16 +51,21 @@ def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     return x
 
 
-def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig) -> torch.Tensor:
+def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig, *, early_layer: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     x = create_patches(crops, config.enc_patch_size)
     x = module.patch_emb(x)
     x = x + module.pos_emb
-    for block in module.blocks:
+    early = None
+    for i, block in enumerate(module.blocks):
         x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
         x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
         x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
         x = x + _vision_mlp(x_norm, block.mlp)
+        if early_layer is not None and i == early_layer:
+            early = x
     x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
+    if early_layer is not None:
+        return x, early
     return x
 
 

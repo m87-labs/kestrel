@@ -47,7 +47,7 @@ from .region import (
     decode_coordinate,
     decode_size,
 )
-from ..seg_refiner import build_sam_model
+from ..seg_refiner import SegmentRefiner
 
 
 
@@ -413,7 +413,8 @@ class MoondreamRuntime:
             cache.attach_batch_binding(self._batch_binding)
 
         self._prefill_fn = self._prefill_impl
-        self.sam_model = build_sam_model(device=self.device)
+
+        self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()

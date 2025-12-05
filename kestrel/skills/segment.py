@@ -19,7 +19,6 @@ from kestrel.utils.svg import (
     svg_path_from_token_ids,
     PATH_COMMANDS,
 )
-from ..seg_refiner import refine_segmentation
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -169,12 +168,8 @@ class SegmentSkillState(SkillState):
         coarse_bbox = bbox
 
         if svg_path and bbox and not parse_error and self._request.image is not None:
-            refined_path, refined_bbox = refine_segmentation(
-                self._request.image,
-                svg_path,
-                bbox,
-                runtime.sam_model,
-                iters=6,
+            refined_path, refined_bbox = runtime.seg_refiner(
+                self._request.image, svg_path, bbox
             )
             if refined_path is not None and refined_bbox is not None:
                 svg_path = refined_path
