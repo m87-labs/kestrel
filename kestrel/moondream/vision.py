@@ -51,36 +51,22 @@ def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     return x
 
 
-def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig) -> torch.Tensor:
+def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig, *, early_layer: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     x = create_patches(crops, config.enc_patch_size)
     x = module.patch_emb(x)
     x = x + module.pos_emb
-    for block in module.blocks:
-        x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
-        x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
-        x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
-        x = x + _vision_mlp(x_norm, block.mlp)
-    x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
-    return x
-
-
-def vision_encoder_multiscale(crops: torch.Tensor, module: nn.Module, config: VisionConfig, early_block: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract features from early block and final block for HQ-SAM style fusion."""
-    x = create_patches(crops, config.enc_patch_size)
-    x = module.patch_emb(x)
-    x = x + module.pos_emb
-
-    early_feat = None
+    early = None
     for i, block in enumerate(module.blocks):
         x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
         x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
         x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
         x = x + _vision_mlp(x_norm, block.mlp)
-        if i == early_block:
-            early_feat = x.clone()
-
+        if early_layer is not None and i == early_layer:
+            early = x
     x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
-    return early_feat, x
+    if early_layer is not None:
+        return x, early
+    return x
 
 
 def _vision_attn(x: torch.Tensor, attn: nn.ModuleDict, n_heads: int) -> torch.Tensor:
@@ -228,7 +214,6 @@ __all__ = [
     "prepare_crops_from_overlap",
     "create_patches",
     "vision_encoder",
-    "vision_encoder_multiscale",
     "vision_projection",
     "build_vision_model",
     "encode_image",

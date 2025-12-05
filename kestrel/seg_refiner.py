@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import torch
 
-from .moondream.vision import vision_encoder_multiscale
+from .moondream.vision import vision_encoder
 
 # Number of refinement iterations for HQ-SAM head
 REFINER_ITERS = 5
@@ -327,8 +327,8 @@ def hqsam_head_refine(
     )
 
     with torch.no_grad():
-        early_features, final_features = vision_encoder_multiscale(
-            img_norm, vision_module, vision_config
+        final_features, early_features = vision_encoder(
+            img_norm, vision_module, vision_config, early_layer=8
         )
         refined_mask = hqsam_head_refiner(
             final_features, early_features, mask_t, n_iters=REFINER_ITERS
