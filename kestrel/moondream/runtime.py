@@ -223,8 +223,6 @@ class MoondreamRuntime:
         if requested_context is not None and requested_context != default_context:
             text_section["max_context"] = int(requested_context)
 
-        raw_config["refiner_iters"] = cfg.refiner_iters
-
         self.config = MoondreamConfig.from_dict(raw_config)
 
         self._kv_layer_k_scales: list[float] | None = None

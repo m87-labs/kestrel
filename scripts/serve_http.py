@@ -13,7 +13,6 @@ Configuration is taken from environment variables:
   KESTREL_PORT      (default: 8000)
   KESTREL_HOST      (default: 0.0.0.0)
   KESTREL_CUDA_GRAPHS (default: false)
-  KESTREL_REFINER_ITERS (default: 5) number of refinement iterations
 """
 
 import os
@@ -50,8 +49,6 @@ def main() -> None:
     host = os.getenv("KESTREL_HOST", "0.0.0.0")
     enable_cuda_graphs = env_bool("KESTREL_CUDA_GRAPHS", False)
 
-    refiner_iters = int(os.getenv("KESTREL_REFINER_ITERS", "5"))
-
     runtime_cfg = RuntimeConfig(
         model_paths=ModelPaths(
             weights=str(weights),
@@ -60,7 +57,6 @@ def main() -> None:
         dtype=dtype,
         max_batch_size=max_batch,
         enable_cuda_graphs=enable_cuda_graphs,
-        refiner_iters=refiner_iters,
     )
 
     app = create_app(

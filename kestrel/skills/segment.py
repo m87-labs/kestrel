@@ -176,7 +176,6 @@ class SegmentSkillState(SkillState):
                 runtime.hqsam_head_refiner,
                 runtime.model.vision,
                 runtime.config.vision,
-                iters=runtime.config.refiner_iters,
             )
             if refined_path is not None and refined_bbox is not None:
                 svg_path = refined_path

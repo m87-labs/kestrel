@@ -38,9 +38,6 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--config", type=Path, help="Optional model config JSON")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
-    parser.add_argument(
-        "--refiner-iters", type=int, default=5, help="Number of refiner iterations"
-    )
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument(
         "--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype"
@@ -142,7 +139,6 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         page_size=args.page_size,
         max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
-        refiner_iters=args.refiner_iters,
     )
 
 

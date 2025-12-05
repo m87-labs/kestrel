@@ -11,6 +11,9 @@ import torch
 
 from .moondream.vision import vision_encoder_multiscale
 
+# Number of refinement iterations for HQ-SAM head
+REFINER_ITERS = 5
+
 _potrace = None
 _resvg_tls = threading.local()
 
@@ -286,7 +289,6 @@ def hqsam_head_refine(
     hqsam_head_refiner,
     vision_module,
     vision_config,
-    iters: int = 5,
 ) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"Expected RGB image (H,W,3), got {image.shape}")
@@ -329,7 +331,7 @@ def hqsam_head_refine(
             img_norm, vision_module, vision_config
         )
         refined_mask = hqsam_head_refiner(
-            final_features, early_features, mask_t, n_iters=iters
+            final_features, early_features, mask_t, n_iters=REFINER_ITERS
         )
 
     refined_mask_np = refined_mask.squeeze(0).squeeze(0).float().cpu().numpy()
@@ -348,7 +350,6 @@ def refine_segmentation_with_hqsam_head(
     hqsam_head_refiner,
     vision_module,
     vision_config,
-    iters: int = 5,
 ) -> Tuple[Optional[str], Optional[dict]]:
     if hqsam_head_refiner is None:
         return None, None
@@ -384,7 +385,6 @@ def refine_segmentation_with_hqsam_head(
             hqsam_head_refiner,
             vision_module,
             vision_config,
-            iters=iters,
         )
 
         refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)

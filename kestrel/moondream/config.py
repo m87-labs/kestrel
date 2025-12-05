@@ -168,7 +168,6 @@ class MoondreamConfig:
     vision: VisionConfig = VisionConfig()
     tokenizer: TokenizerConfig = TokenizerConfig()
     region: RegionConfig = RegionConfig()
-    refiner_iters: int = 5
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> "MoondreamConfig":
@@ -185,8 +184,7 @@ class MoondreamConfig:
         vision_cfg = VisionConfig(**vision_dict)
         region_dict = dict(config_dict.get("region", {}))
         region_cfg = RegionConfig(**region_dict)
-        refiner_iters = config_dict.get("refiner_iters", 5)
-        return cls(text=text_cfg, vision=vision_cfg, tokenizer=tokenizer_cfg, region=region_cfg, refiner_iters=refiner_iters)
+        return cls(text=text_cfg, vision=vision_cfg, tokenizer=tokenizer_cfg, region=region_cfg)
 
     def to_dict(self) -> Dict:
         text_dict = self.text.__dict__.copy()
@@ -198,7 +196,6 @@ class MoondreamConfig:
             "vision": self.vision.__dict__.copy(),
             "tokenizer": self.tokenizer.__dict__.copy(),
             "region": self.region.__dict__.copy(),
-            "refiner_iters": self.refiner_iters,
         }
 
 
