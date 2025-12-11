@@ -12,53 +12,12 @@ from .kernels import (
     fused_gelu_and_mul,
     invoke_fused_moe_kernel,
 )
+from .lora_kernels import apply_moe_lora
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
 from kestrel.moondream.lora import MoEMLPLoRA
-
-
-def _apply_moe_lora(
-    x: torch.Tensor,
-    topk_ids: torch.Tensor,
-    out: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    scale: float,
-    topk_weights: torch.Tensor | None = None,
-) -> None:
-    """Apply LoRA to MoE output in-place.
-
-    Computes: out[:, k, :] += (x_k @ A.T @ B.T) * scale [* topk_weights[:, k]]
-
-    Args:
-        x: Input tensor. [N, in_dim] (broadcast to all K) or [N, K, in_dim].
-        topk_ids: Expert assignments [N, K].
-        out: Output tensor to accumulate into [N, K, out_dim].
-        lora_a: LoRA A matrices [num_experts, rank, in_dim].
-        lora_b: LoRA B matrices [num_experts, out_dim, rank].
-        scale: LoRA scaling factor (alpha / rank).
-        topk_weights: Optional router weights [N, K] to apply (for down-proj).
-    """
-    top_k = topk_ids.shape[1]
-    per_expert_input = x.dim() == 3
-
-    for k in range(top_k):
-        expert_ids_k = topk_ids[:, k]
-        a_k = lora_a[expert_ids_k]  # [N, rank, in_dim]
-        b_k = lora_b[expert_ids_k]  # [N, out_dim, rank]
-        x_k = x[:, k, :] if per_expert_input else x  # [N, in_dim]
-
-        lora_out = torch.bmm(
-            torch.bmm(x_k.unsqueeze(1), a_k.transpose(1, 2)),
-            b_k.transpose(1, 2),
-        ).squeeze(1)  # [N, out_dim]
-
-        if topk_weights is not None:
-            lora_out = lora_out * topk_weights[:, k : k + 1]
-
-        out[:, k, :] += lora_out * scale
 
 
 class _ResizableBuffer:
@@ -375,8 +334,20 @@ class FusedMoEModule(nn.Module):
         )
 
         if lora is not None:
-            _apply_moe_lora(
-                hidden_states, topk_ids, up_out, lora.up_a, lora.up_b, lora.scale
+            apply_moe_lora(
+                x=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=up_out,
+                lora_a=lora.up_a,
+                lora_b=lora.up_b,
+                scale=lora.scale,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                top_k=self.top_k,
+                config=triton_config,
+                mul_routed_weight=False,
             )
 
         activation_in = up_out.view(num_tokens * self.top_k, -1)
@@ -410,15 +381,20 @@ class FusedMoEModule(nn.Module):
         )
 
         if lora is not None:
-            down_in_reshaped = down_in.view(num_tokens, self.top_k, -1)
-            _apply_moe_lora(
-                down_in_reshaped,
-                topk_ids,
-                down_out,
-                lora.down_a,
-                lora.down_b,
-                lora.scale,
-                topk_weights,
+            apply_moe_lora(
+                x=down_in,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=down_out,
+                lora_a=lora.down_a,
+                lora_b=lora.down_b,
+                scale=lora.scale,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
+                config=triton_config,
+                mul_routed_weight=True,
             )
 
         fused = self._workspaces.output.get(
