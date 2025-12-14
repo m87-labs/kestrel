@@ -110,7 +110,11 @@ class TextLoRAConfig:
 class DenseMLPLoRA(nn.Module):
     """LoRA adapter for a dense (non-MoE) MLP layer.
 
-    Covers both fc1 (up-projection) and fc2 (down-projection).
+    Covers both up-projection and down-projection.
+
+    Naming convention:
+        - up == base MLP fc1
+        - down == base MLP fc2
     """
 
     def __init__(
@@ -125,16 +129,16 @@ class DenseMLPLoRA(nn.Module):
         self._rank = rank
         self._alpha = alpha
 
-        # fc1: [d_model] -> [d_ffn]
-        self.fc1_a = nn.Parameter(torch.empty(rank, d_model, dtype=dtype))
-        self.fc1_b = nn.Parameter(torch.zeros(d_ffn, rank, dtype=dtype))
+        # up: [d_model] -> [d_ffn]
+        self.up_a = nn.Parameter(torch.empty(rank, d_model, dtype=dtype))
+        self.up_b = nn.Parameter(torch.zeros(d_ffn, rank, dtype=dtype))
 
-        # fc2: [d_ffn] -> [d_model]
-        self.fc2_a = nn.Parameter(torch.empty(rank, d_ffn, dtype=dtype))
-        self.fc2_b = nn.Parameter(torch.zeros(d_model, rank, dtype=dtype))
+        # down: [d_ffn] -> [d_model]
+        self.down_a = nn.Parameter(torch.empty(rank, d_ffn, dtype=dtype))
+        self.down_b = nn.Parameter(torch.zeros(d_model, rank, dtype=dtype))
 
-        nn.init.kaiming_uniform_(self.fc1_a, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.fc2_a, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.up_a, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.down_a, a=math.sqrt(5))
 
     @property
     def rank(self) -> int:
