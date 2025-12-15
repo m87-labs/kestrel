@@ -10,7 +10,7 @@ across active experts: each expert receives rank = total_rank / experts_per_toke
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 import torch
 import torch.nn as nn
@@ -384,6 +384,25 @@ class LoRA(nn.Module):
         return cls(text=text_lora, vision=vision_lora)
 
 
+class AdapterProvider(Protocol):
+    """Provider interface for loading LoRA adapters by id.
+
+    Phase 1 notes:
+    - `config()` is temporary and used for eager CUDA graph capture.
+    - `default_adapter()` is used for engine warmup.
+    - `get()` must return CUDA tensors compatible with the runtime.
+    """
+
+    def config(self) -> TextLoRAConfig:
+        """Return the (rank, alpha) contract for all adapters."""
+
+    def default_adapter(self) -> str:
+        """Return the adapter id used for warmup and eager init paths."""
+
+    def get(self, adapter: str) -> "LoRA":
+        """Return the LoRA module for this adapter id."""
+
+
 __all__ = [
     # Vision LoRA
     "VisionLoRALinear",
@@ -395,4 +414,6 @@ __all__ = [
     "TextLoRA",
     # Unified
     "LoRA",
+    # Provider
+    "AdapterProvider",
 ]

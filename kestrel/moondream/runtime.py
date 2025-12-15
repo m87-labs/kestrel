@@ -32,7 +32,7 @@ from .text import (
     text_encoder,
 )
 from .vision import encode_image
-from .lora import LoRA
+from .lora import LoRA, TextLoRA, TextLoRAConfig
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -200,9 +200,13 @@ class _LayerPagedCache(torch.nn.Module):
 class MoondreamRuntime:
     """High-level runtime for paged text-only Moondream inference."""
 
-    def __init__(self, cfg: RuntimeConfig, *, lora: Optional[LoRA] = None) -> None:
+    def __init__(
+        self,
+        cfg: RuntimeConfig,
+        *,
+        adapter_config: TextLoRAConfig | None = None,
+    ) -> None:
         self._cfg = cfg
-        self._lora = lora
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
         torch.cuda.set_device(self.device)
@@ -416,6 +420,17 @@ class MoondreamRuntime:
 
         self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
 
+        self._text_lora: TextLoRA | None = None
+        if adapter_config is not None:
+            self._text_lora = TextLoRA(
+                text_config=self.config.text,
+                lora_config=adapter_config,
+                dtype=self.dtype,
+            ).to(device=self.device)
+            with torch.inference_mode():
+                for param in self._text_lora.parameters():
+                    param.zero_()
+
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
 
@@ -589,7 +604,6 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image | np.ndarray],
         *,
         overlap: Optional[OverlapCropOutput] = None,
-        adapter: Optional[LoRA] = None,
     ) -> Tensor:
         return encode_image(
             image,
@@ -598,7 +612,6 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.dtype,
             overlap=overlap,
-            adapter=adapter,
         )
 
     def start_sequence(
@@ -608,7 +621,6 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
-        adapter: Optional[LoRA] = None,
     ) -> tuple[SequenceState, Tensor]:
         if isinstance(prompt_tokens, Tensor):
             tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
@@ -629,9 +641,7 @@ class MoondreamRuntime:
         segments: list[Tensor] = [self.bos_embed]
         image_length = 0
         if image is not None or image_crops is not None:
-            image_embed = self.encode_image(
-                image, overlap=image_crops, adapter=adapter
-            ).unsqueeze(0)
+            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
             segments.append(image_embed)
             image_length = image_embed.shape[1]
         if prompt_embed is not None:
@@ -748,7 +758,7 @@ class MoondreamRuntime:
             ),
             flashinfer_prefill_metadata=prefill_metadata,
             use_flashinfer_prefill=use_flashinfer_prefill,
-            text_lora=self._lora.text if self._lora else None,
+            text_lora=self._text_lora,
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
@@ -996,10 +1006,43 @@ class MoondreamRuntime:
             use_graph=use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
-            text_lora=self._lora.text if self._lora else None,
+            text_lora=self._text_lora,
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
+
+    def load_adapter_(self, adapter: LoRA) -> None:
+        """Copy adapter weights into the runtime-owned LoRA workspace."""
+
+        if self._text_lora is None:
+            raise NotImplementedError(
+                "Adapter provider is not configured for this runtime."
+            )
+        if adapter.vision is not None:
+            raise NotImplementedError("Vision LoRA is not supported.")
+
+        expected = self._text_lora.lora_config
+        actual = adapter.text.lora_config
+        if actual.rank != expected.rank or actual.alpha != expected.alpha:
+            raise NotImplementedError(
+                "Adapter rank/alpha must match AdapterProvider.config() for eager CUDA graphs."
+            )
+
+        # Phase 1: require CUDA tensors and exact dtype/device matches.
+        try:
+            sample_param = next(adapter.text.parameters())
+        except StopIteration as exc:  # pragma: no cover - defensive
+            raise ValueError("Adapter contains no parameters") from exc
+        if sample_param.device != self.device:
+            raise NotImplementedError(
+                f"Adapter must be on device {self.device}; received {sample_param.device}."
+            )
+        if sample_param.dtype != self.dtype:
+            raise NotImplementedError(
+                f"Adapter must have dtype {self.dtype}; received {sample_param.dtype}."
+            )
+
+        self._text_lora.load_state_dict(adapter.text.state_dict(), strict=True)
 
     def _decode_with_graph(
         self,

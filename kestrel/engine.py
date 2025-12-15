@@ -78,7 +78,7 @@ from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
-from kestrel.moondream.lora import LoRA
+from kestrel.moondream.lora import AdapterProvider
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -179,6 +179,7 @@ class _PendingRequest:
     stream_queue: Optional["_StreamQueue"]
     skill: SkillSpec
     request_context: object
+    adapter: Optional[str] = None
 
 
 class InferenceEngine:
@@ -189,10 +190,10 @@ class InferenceEngine:
         runtime_cfg: RuntimeConfig,
         *,
         skills: Optional[SkillRegistry] = None,
-        lora: Optional[LoRA] = None,
+        adapter_provider: Optional[AdapterProvider] = None,
     ) -> None:
         self._runtime_cfg = runtime_cfg
-        self._lora = lora
+        self._adapter_provider = adapter_provider
 
         self._runtime: Optional[MoondreamRuntime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
@@ -247,9 +248,9 @@ class InferenceEngine:
         runtime_cfg: RuntimeConfig,
         *,
         skills: Optional[SkillRegistry] = None,
-        lora: Optional[LoRA] = None,
+        adapter_provider: Optional[AdapterProvider] = None,
     ) -> "InferenceEngine":
-        engine = cls(runtime_cfg, skills=skills, lora=lora)
+        engine = cls(runtime_cfg, skills=skills, adapter_provider=adapter_provider)
         await engine._initialize()
         return engine
 
@@ -258,8 +259,11 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
+        adapter_config = (
+            self._adapter_provider.config() if self._adapter_provider is not None else None
+        )
         self._runtime = await loop.run_in_executor(
-            None, lambda: MoondreamRuntime(self._runtime_cfg, lora=self._lora)
+            None, lambda: MoondreamRuntime(self._runtime_cfg, adapter_config=adapter_config)
         )
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
@@ -281,16 +285,19 @@ class InferenceEngine:
         """Ensure the high-level query path is exercised before serving traffic."""
 
         try:
+            warmup_settings: Dict[str, object] = {
+                "temperature": self._default_temperature,
+                "top_p": self._default_top_p,
+                "max_tokens": 1,
+            }
+            if self._adapter_provider is not None:
+                warmup_settings["adapter"] = self._adapter_provider.default_adapter()
             await self.query(
                 image=None,
                 question="Warmup prompt.",
                 reasoning=False,
                 stream=False,
-                settings={
-                    "temperature": self._default_temperature,
-                    "top_p": self._default_top_p,
-                    "max_tokens": 1,
-                },
+                settings=warmup_settings,
             )
         except Exception:
             _LOGGER.exception("Warmup query pipeline failed")
@@ -318,6 +325,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         skill: str,
+        adapter: Optional[str] = None,
         image: Optional[pyvips.Image | np.ndarray] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -325,6 +333,7 @@ class InferenceEngine:
         future, _ = await self._submit_request(
             max_new_tokens=max_new_tokens,
             request_context=request_context,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -386,7 +395,7 @@ class InferenceEngine:
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
-        adapter: Optional[LoRA] = None
+        adapter: Optional[str] = None
         if settings is not None:
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
@@ -396,9 +405,12 @@ class InferenceEngine:
                 max_tokens = int(settings["max_tokens"])
             if "adapter" in settings:
                 maybe_adapter = settings["adapter"]
-                if maybe_adapter is not None and not isinstance(maybe_adapter, LoRA):
-                    raise TypeError("adapter must be a LoRA instance or None")
-                adapter = maybe_adapter
+                if maybe_adapter is None:
+                    adapter = None
+                elif not isinstance(maybe_adapter, str):
+                    raise TypeError("settings.adapter must be a string or None")
+                else:
+                    adapter = maybe_adapter
 
         if temperature < 0.0:
             raise ValueError("temperature must be non-negative")
@@ -416,13 +428,13 @@ class InferenceEngine:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
-                adapter=adapter,
             ),
         )
         if stream:
             return await self.submit_streaming(
                 request,
                 max_new_tokens=max_tokens,
+                adapter=adapter,
                 image=image,
                 temperature=temperature,
                 top_p=top_p,
@@ -431,6 +443,7 @@ class InferenceEngine:
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -447,6 +460,7 @@ class InferenceEngine:
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
 
+        adapter = self._extract_adapter_id(settings)
         max_tokens = self._default_max_new_tokens
         max_objects = None
         temperature = 0.0
@@ -476,6 +490,7 @@ class InferenceEngine:
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -527,6 +542,7 @@ class InferenceEngine:
             valid = ", ".join(sorted(CaptionSkill.VALID_LENGTHS))
             raise ValueError(f"length must be one of: {valid}")
 
+        adapter = self._extract_adapter_id(settings)
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
@@ -555,6 +571,7 @@ class InferenceEngine:
             return await self.submit_streaming(
                 request,
                 max_new_tokens=max_tokens,
+                adapter=adapter,
                 image=image,
                 temperature=temperature,
                 top_p=top_p,
@@ -563,6 +580,7 @@ class InferenceEngine:
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -579,6 +597,7 @@ class InferenceEngine:
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
 
+        adapter = self._extract_adapter_id(settings)
         max_objects = 150
         temperature = 0.0
         top_p = 1.0
@@ -603,6 +622,7 @@ class InferenceEngine:
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -621,6 +641,7 @@ class InferenceEngine:
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
 
+        adapter = self._extract_adapter_id(settings)
         temperature = 0.0
         top_p = 1.0
         max_tokens = self._default_max_new_tokens
@@ -679,6 +700,7 @@ class InferenceEngine:
         return await self.submit(
             request,
             max_new_tokens=max_tokens,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -691,6 +713,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         skill: str,
+        adapter: Optional[str] = None,
         image: Optional[pyvips.Image | np.ndarray] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -699,6 +722,7 @@ class InferenceEngine:
         future, request_id = await self._submit_request(
             max_new_tokens=max_new_tokens,
             request_context=request_context,
+            adapter=adapter,
             image=image,
             temperature=temperature,
             top_p=top_p,
@@ -741,6 +765,7 @@ class InferenceEngine:
         *,
         max_new_tokens: int,
         request_context: object,
+        adapter: Optional[str],
         image: Optional[pyvips.Image | np.ndarray],
         temperature: Optional[float],
         top_p: Optional[float],
@@ -756,6 +781,17 @@ class InferenceEngine:
         future: asyncio.Future[EngineResult] = loop.create_future()
 
         skill_spec = self._skills.resolve(skill)
+        adapter_id = self._normalize_adapter_id(adapter)
+        if self._adapter_provider is None:
+            if adapter_id is not None:
+                raise NotImplementedError(
+                    "Adapter support requires an adapter_provider at engine creation."
+                )
+        else:
+            if adapter_id is None:
+                raise NotImplementedError(
+                    "adapter_provider is configured; requests must supply settings.adapter (Phase 1 staging)."
+                )
 
         image_obj: Optional[pyvips.Image | np.ndarray] = None
         if image is not None:
@@ -783,6 +819,7 @@ class InferenceEngine:
             stream_queue=stream_queue,
             skill=skill_spec,
             request_context=request_context,
+            adapter=adapter_id,
         )
         await self._queue.put(payload)
         return future, req_id
@@ -824,6 +861,26 @@ class InferenceEngine:
             raise ValueError("top_p must be in the range (0, 1]")
         return top_p
 
+    def _normalize_adapter_id(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("adapter must be a non-empty string")
+        return normalized
+
+    def _extract_adapter_id(
+        self, settings: Optional[Mapping[str, object]]
+    ) -> Optional[str]:
+        if settings is None or "adapter" not in settings:
+            return None
+        raw = settings["adapter"]
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise TypeError("settings.adapter must be a string or None")
+        return self._normalize_adapter_id(raw)
+
     def _build_stream_callback(
         self, req: _PendingRequest
     ) -> Optional[Callable[[StreamUpdate], None]]:
@@ -841,11 +898,6 @@ class InferenceEngine:
             target_loop.call_soon_threadsafe(target_queue.put_nowait, update)
 
         return _callback
-
-    def _extract_adapter(self, request_context: object) -> Optional[LoRA]:
-        if isinstance(request_context, QueryRequest):
-            return request_context.settings.adapter
-        return None
 
     def _complete_stream(
         self,
@@ -913,6 +965,37 @@ class InferenceEngine:
         run_gate = self._run_gate
         paused_flag = self._paused_flag
         paused_event = self._paused_event
+        adapter_provider = self._adapter_provider
+        active_adapter_id: Optional[str] = None
+
+        def engine_idle() -> bool:
+            return (
+                not scheduler.has_pending_work()
+                and not pending_crops
+                and not active_requests
+            )
+
+        def ensure_adapter(req: _PendingRequest) -> None:
+            nonlocal active_adapter_id
+            if adapter_provider is None:
+                return
+            adapter_id = req.adapter
+            if adapter_id is None:
+                raise NotImplementedError(
+                    "adapter_provider is configured; requests must supply settings.adapter (Phase 1 staging)."
+                )
+            if active_adapter_id is None:
+                runtime.load_adapter_(adapter_provider.get(adapter_id))
+                active_adapter_id = adapter_id
+                return
+            if adapter_id == active_adapter_id:
+                return
+            if not engine_idle():
+                raise NotImplementedError(
+                    "Multiple adapters concurrently is not implemented yet (Phase 1 staging)."
+                )
+            runtime.load_adapter_(adapter_provider.get(adapter_id))
+            active_adapter_id = adapter_id
 
         def admit_request(
             req: _PendingRequest, crops: Optional[OverlapCropOutput]
@@ -928,6 +1011,11 @@ class InferenceEngine:
             active_requests[req.request_id] = req
 
         def handle_incoming(req: _PendingRequest) -> None:
+            try:
+                ensure_adapter(req)
+            except Exception as exc:
+                self._fail_request(req, exc)
+                return
             if req.image is None:
                 admit_request(req, None)
                 return
@@ -1081,7 +1169,7 @@ class InferenceEngine:
             if (req.image is not None or image_crops is not None)
             else 0
         )
-        adapter = self._extract_adapter(req.request_context)
+        adapter = req.adapter
         request_obj = GenerationRequest(
             request_id=req.request_id,
             prompt=req.prompt,
