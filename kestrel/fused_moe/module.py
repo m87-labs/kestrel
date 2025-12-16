@@ -335,9 +335,20 @@ class FusedMoEModule(nn.Module):
             allow_tf32=self.config.allow_tf32,
         )
 
-        # For LoRA, run separate routing with super-expert IDs (slot * num_experts + expert)
-        # This keeps base MoE compute unchanged while enabling mixed-adapter batches
-        # Compute routing once here and reuse for both up and down LoRA
+        # For LoRA, run separate routing with super-expert IDs.
+        # This keeps base MoE compute unchanged while enabling mixed-adapter batches.
+        # Compute routing once here and reuse for both up and down LoRA.
+        #
+        # Super-expert mapping uses sentinel-based slot 0 filtering:
+        # - Slot 0 (no LoRA): Set to sentinel value >= max_super_experts, which
+        #   causes moe_align_block_size to skip these tokens (expert_id >= num_experts
+        #   are ignored in the kernel). These tokens get no LoRA contribution.
+        # - Slot N (N >= 1): Maps to super-expert (N-1)*num_experts + expert_id
+        #
+        # This allows the MoE workspace to exclude slot 0 entirely, reducing
+        # max_super_experts from max_slots*num_experts to (max_slots-1)*num_experts.
+        # With 64 experts, this keeps us under vLLM's 1024 super-expert limit
+        # (floor(1023/64) = 15 usable adapter slots).
         sorted_lora = None
         expert_ids_lora = None
         num_tokens_lora = None
@@ -345,11 +356,18 @@ class FusedMoEModule(nn.Module):
         if lora_workspace is not None and lora_slot_ids is not None:
             # Expand slot IDs: [M] -> [M, top_k] to match topk_ids shape
             expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, self.top_k)
-            combined_topk_ids = topk_ids + expanded_slots * self.num_experts
 
+            # Sentinel-based mapping: slot 0 -> sentinel (filtered), slot N -> (N-1)*E + expert
             max_super_experts = lora_workspace.up_a.shape[0]
+            sentinel = max_super_experts  # Any value >= max_super_experts will be filtered
+            combined_topk_ids = torch.where(
+                expanded_slots > 0,
+                topk_ids + (expanded_slots - 1) * self.num_experts,
+                sentinel,
+            ).to(torch.int32)
+
             sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-                combined_topk_ids.to(torch.int32), block_size_m, max_super_experts
+                combined_topk_ids, block_size_m, max_super_experts
             )
 
             apply_moe_lora(

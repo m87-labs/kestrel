@@ -99,34 +99,39 @@ class TestWorkspaceAllocation:
             assert layer.down_b.shape == (max_slots, moe_config.dim, max_rank)
 
         # Check MoE layer shapes with super-expert indexing
+        # MoE workspace excludes slot 0: size is (max_slots-1) * num_experts
         expected_rank_per_expert = max_rank // moe_cfg.experts_per_token
-        total_experts = max_slots * moe_cfg.num_experts
+        total_super_experts = (max_slots - 1) * moe_cfg.num_experts
 
         for layer in workspace.moe:
             assert layer.num_experts == moe_cfg.num_experts
             assert layer.up_a.shape == (
-                total_experts,
+                total_super_experts,
                 expected_rank_per_expert,
                 moe_config.dim,
             )
             assert layer.up_b.shape == (
-                total_experts,
+                total_super_experts,
                 moe_cfg.expert_inner_dim * 2,
                 expected_rank_per_expert,
             )
             assert layer.down_a.shape == (
-                total_experts,
+                total_super_experts,
                 expected_rank_per_expert,
                 moe_cfg.expert_inner_dim,
             )
             assert layer.down_b.shape == (
-                total_experts,
+                total_super_experts,
                 moe_config.dim,
                 expected_rank_per_expert,
             )
 
     def test_slot_zero_is_zeros(self, moe_config: TextConfig, device: torch.device):
-        """Slot 0 is initialized to zeros."""
+        """Slot 0 is initialized to zeros for dense layers.
+
+        Note: MoE workspace excludes slot 0 entirely (handled via sentinel filtering),
+        so we only check dense layers here.
+        """
         workspace = TextLoRAWorkspace(moe_config, max_slots=4, max_rank=8, device=device)
 
         for layer in workspace.dense:
@@ -134,15 +139,6 @@ class TestWorkspaceAllocation:
             assert torch.all(layer.up_b[0] == 0)
             assert torch.all(layer.down_a[0] == 0)
             assert torch.all(layer.down_b[0] == 0)
-
-        moe_cfg = moe_config.moe
-        assert moe_cfg is not None
-        for layer in workspace.moe:
-            # Slot 0 experts: indices [0, num_experts)
-            assert torch.all(layer.up_a[: moe_cfg.num_experts] == 0)
-            assert torch.all(layer.up_b[: moe_cfg.num_experts] == 0)
-            assert torch.all(layer.down_a[: moe_cfg.num_experts] == 0)
-            assert torch.all(layer.down_b[: moe_cfg.num_experts] == 0)
 
     def test_max_rank_per_expert_calculation(self, device: torch.device):
         """max_rank_per_expert is correctly computed as max_rank // experts_per_token."""
@@ -202,7 +198,8 @@ class TestClearSlot:
         moe_cfg = moe_config.moe
         assert moe_cfg is not None
         for layer in workspace.moe:
-            start = 1 * moe_cfg.num_experts
+            # MoE uses (slot-1) indexing since slot 0 is excluded
+            start = (1 - 1) * moe_cfg.num_experts
             end = start + moe_cfg.num_experts
             layer.up_a[start:end].fill_(1.0)
             layer.up_b[start:end].fill_(1.0)
@@ -220,7 +217,8 @@ class TestClearSlot:
             assert torch.all(layer.down_b[1] == 0)
 
         for layer in workspace.moe:
-            start = 1 * moe_cfg.num_experts
+            # MoE uses (slot-1) indexing since slot 0 is excluded
+            start = (1 - 1) * moe_cfg.num_experts
             end = start + moe_cfg.num_experts
             assert torch.all(layer.up_a[start:end] == 0)
             assert torch.all(layer.up_b[start:end] == 0)
@@ -344,13 +342,14 @@ class TestLoadSlot:
         assert moe_cfg is not None
 
         # Verify MoE weights were copied with correct super-expert indexing
+        # MoE uses (slot-1) indexing since slot 0 is excluded
         for moe_idx, layer in enumerate(workspace.moe):
             layer_idx = workspace.start_layer + moe_idx
             adapter_layer = adapter.text.get_moe_lora(layer_idx)
             assert adapter_layer is not None
 
             for expert_id in range(moe_cfg.num_experts):
-                ws_idx = 2 * moe_cfg.num_experts + expert_id
+                ws_idx = (2 - 1) * moe_cfg.num_experts + expert_id
                 rank_per_expert = adapter.text.rank_per_expert
                 assert torch.allclose(
                     layer.up_a[ws_idx, :rank_per_expert],
