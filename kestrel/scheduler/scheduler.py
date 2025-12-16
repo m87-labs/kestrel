@@ -303,6 +303,7 @@ class GenerationScheduler:
                 image=request.image,
                 image_crops=request.image_crops,
                 max_new_tokens=request.max_new_tokens,
+                lora_slot=request.lora_slot,
             )
             skill_state = request.skill_state
             if skill_state is None:

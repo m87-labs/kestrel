@@ -180,6 +180,7 @@ class _PendingRequest:
     skill: SkillSpec
     request_context: object
     adapter: Optional[str] = None
+    lora_slot: int = 0  # Assigned by acquire_adapter_slot(); 0 = no LoRA
 
 
 class InferenceEngine:
@@ -980,23 +981,23 @@ class InferenceEngine:
         def ensure_adapter(req: _PendingRequest) -> None:
             nonlocal active_adapter_id
             if adapter_provider is None:
+                req.lora_slot = 0
                 return
             adapter_id = req.adapter
             if adapter_id is None:
                 raise NotImplementedError(
                     "adapter_provider is configured; requests must supply settings.adapter (Phase 1 staging)."
                 )
-            if active_adapter_id is None:
-                runtime.load_adapter_(adapter_provider.get(adapter_id))
-                active_adapter_id = adapter_id
-                return
-            if adapter_id == active_adapter_id:
-                return
-            if not engine_idle():
-                raise NotImplementedError(
-                    "Multiple adapters concurrently is not implemented yet (Phase 1 staging)."
-                )
-            runtime.load_adapter_(adapter_provider.get(adapter_id))
+            # Phase 1: check if switching adapters while engine has work
+            if active_adapter_id is not None and adapter_id != active_adapter_id:
+                if not engine_idle():
+                    raise NotImplementedError(
+                        "Multiple adapters concurrently is not implemented yet (Phase 1 staging)."
+                    )
+            # Acquire slot (reuses if already resident, allocates + loads if new)
+            adapter = adapter_provider.get(adapter_id)
+            slot = runtime.acquire_adapter_slot(adapter_id, adapter)
+            req.lora_slot = slot
             active_adapter_id = adapter_id
 
         def admit_request(
@@ -1187,6 +1188,7 @@ class InferenceEngine:
             skill=req.skill,
             request_context=req.request_context,
             adapter=adapter,
+            lora_slot=req.lora_slot,
         )
         limit = runtime.max_seq_length
         target_total = request_obj.target_length
