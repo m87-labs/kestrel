@@ -123,6 +123,7 @@ class _GraphWorkspace:
     position_buffer: Tensor
     output_buffer: Tensor
     hidden_buffer: Tensor
+    lora_slot_ids_buffer: Tensor
 
 
 @dataclass
@@ -397,6 +398,12 @@ class MoondreamRuntime:
         self._tokens = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.long,
+            device=self.device,
+            pin_memory=True,
+        )
+        self._lora_slot_ids = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
             device=self.device,
             pin_memory=True,
         )
@@ -806,8 +813,10 @@ class MoondreamRuntime:
         batch_size = len(states)
         self._batch_idx.np[:batch_size] = [state.batch_idx for state in states]
         self._input_pos.np[:batch_size] = [state.length for state in states]
+        self._lora_slot_ids.np[:batch_size] = [state.lora_slot for state in states]
         batch_idx = self._batch_idx.copy_to_gpu(batch_size)
         input_pos = self._input_pos.copy_to_gpu(batch_size)
+        lora_slot_ids = self._lora_slot_ids.copy_to_gpu(batch_size)
 
         tokens_tensor: Optional[Tensor] = None
         token_seq: Optional[Sequence[Token]] = None
@@ -855,7 +864,7 @@ class MoondreamRuntime:
                     f"No CUDA graph captured for batch size {graph_batch_size}"
                 )
             result = self._decode_with_graph(
-                batch_idx, tokens_tensor, input_pos, graph_batch_size
+                batch_idx, tokens_tensor, input_pos, lora_slot_ids, graph_batch_size
             )
         else:
             token_arg: Tensor | Sequence[Token]
@@ -1132,6 +1141,7 @@ class MoondreamRuntime:
         batch_idx: Tensor,
         tokens: Tensor,
         input_pos: Tensor,
+        lora_slot_ids: Tensor,
         graph_batch_size: int,
     ) -> RuntimeDecodeResult:
         workspace = self._graph_workspace
@@ -1147,6 +1157,7 @@ class MoondreamRuntime:
         workspace.token_buffer[:batch_size, 0].copy_(tokens)
         workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
         workspace.position_buffer[:batch_size].copy_(input_pos)
+        workspace.lora_slot_ids_buffer[:batch_size].copy_(lora_slot_ids)
         metadata = self._build_flashinfer_metadata(
             workspace.batch_idx_buffer[:graph_batch_size],
             workspace.position_buffer[:graph_batch_size],
@@ -1227,12 +1238,16 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.model.text.lm_head.weight.dtype,
         )
+        lora_slot_ids_buffer = torch.zeros(
+            (max_effective_batch,), device=self.device, dtype=torch.int32
+        )
         self._graph_workspace = _GraphWorkspace(
             token_buffer=token_buffer,
             batch_idx_buffer=batch_idx_buffer,
             position_buffer=position_buffer,
             output_buffer=output_buffer,
             hidden_buffer=hidden_buffer,
+            lora_slot_ids_buffer=lora_slot_ids_buffer,
         )
         self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
 
@@ -1320,6 +1335,7 @@ class MoondreamRuntime:
         workspace.token_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
+        workspace.lora_slot_ids_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]

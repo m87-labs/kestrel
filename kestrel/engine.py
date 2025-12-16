@@ -180,7 +180,7 @@ class _PendingRequest:
     skill: SkillSpec
     request_context: object
     adapter: Optional[str] = None
-    lora_slot: int = 0  # Assigned by acquire_adapter_slot(); 0 = no LoRA
+    lora_slot: int = 0  # Always 0 here; scheduler assigns actual slot at admission
 
 
 class InferenceEngine:
@@ -785,16 +785,10 @@ class InferenceEngine:
 
         skill_spec = self._skills.resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
-        if self._adapter_provider is None:
-            if adapter_id is not None:
-                raise NotImplementedError(
-                    "Adapter support requires an adapter_provider at engine creation."
-                )
-        else:
-            if adapter_id is None:
-                raise NotImplementedError(
-                    "adapter_provider is configured; requests must supply settings.adapter (Phase 1 staging)."
-                )
+        if self._adapter_provider is None and adapter_id is not None:
+            raise NotImplementedError(
+                "Adapter support requires an adapter_provider at engine creation."
+            )
 
         image_obj: Optional[pyvips.Image | np.ndarray] = None
         if image is not None:
@@ -953,11 +947,13 @@ class InferenceEngine:
             return
         torch.cuda.set_device(runtime.device)
 
+        adapter_provider = self._adapter_provider
         scheduler = GenerationScheduler(
             runtime,
             default_temperature=self._default_temperature,
             default_top_p=self._default_top_p,
             skill_registry=self._skills,
+            adapter_provider=adapter_provider,
         )
 
         pending_crops: Dict[int, tuple[_PendingRequest, Future[OverlapCropOutput]]] = {}
@@ -968,37 +964,6 @@ class InferenceEngine:
         run_gate = self._run_gate
         paused_flag = self._paused_flag
         paused_event = self._paused_event
-        adapter_provider = self._adapter_provider
-        active_adapter_id: Optional[str] = None
-
-        def engine_idle() -> bool:
-            return (
-                not scheduler.has_pending_work()
-                and not pending_crops
-                and not active_requests
-            )
-
-        def ensure_adapter(req: _PendingRequest) -> None:
-            nonlocal active_adapter_id
-            if adapter_provider is None:
-                req.lora_slot = 0
-                return
-            adapter_id = req.adapter
-            if adapter_id is None:
-                raise NotImplementedError(
-                    "adapter_provider is configured; requests must supply settings.adapter (Phase 1 staging)."
-                )
-            # Phase 1: check if switching adapters while engine has work
-            if active_adapter_id is not None and adapter_id != active_adapter_id:
-                if not engine_idle():
-                    raise NotImplementedError(
-                        "Multiple adapters concurrently is not implemented yet (Phase 1 staging)."
-                    )
-            # Acquire slot (reuses if already resident, allocates + loads if new)
-            adapter = adapter_provider.get(adapter_id)
-            slot = runtime.acquire_adapter_slot(adapter_id, adapter)
-            req.lora_slot = slot
-            active_adapter_id = adapter_id
 
         def admit_request(
             req: _PendingRequest, crops: Optional[OverlapCropOutput]
@@ -1014,11 +979,6 @@ class InferenceEngine:
             active_requests[req.request_id] = req
 
         def handle_incoming(req: _PendingRequest) -> None:
-            try:
-                ensure_adapter(req)
-            except Exception as exc:
-                self._fail_request(req, exc)
-                return
             if req.image is None:
                 admit_request(req, None)
                 return
