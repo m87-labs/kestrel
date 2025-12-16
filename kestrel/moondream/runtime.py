@@ -1086,6 +1086,34 @@ class MoondreamRuntime:
         hidden = workspace.hidden_buffer[:batch_size].unsqueeze(1)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
+    def rebuild_cuda_graphs(self) -> None:
+        """Reset and recapture CUDA graphs used for decode.
+
+        This is intended for workflows that mutate runtime-owned tensors
+        (e.g. weight tying or hot-swapping checkpoints) where a previously
+        captured CUDA graph might replay with stale tensor pointers.
+
+        Callers must ensure no CUDA work is in flight (e.g. pause the engine)
+        before invoking this method.
+        """
+
+        if not self._use_cuda_graphs:
+            return
+
+        with self.graph_capture_lock:
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
+
+            ctx = self._flashinfer_ctx
+            ctx._graph_states.clear()
+            ctx._active_graph_state = None
+            self._cuda_graphs.clear()
+            self._graph_workspace = None
+            self._graph_batch_sizes = []
+            self._graph_pool = None
+
+            self._ensure_cuda_graphs_ready()
+
     def _ensure_cuda_graphs_ready(self) -> None:
         if not self._use_cuda_graphs or self._cuda_graphs:
             return
