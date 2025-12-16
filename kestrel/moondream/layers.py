@@ -51,11 +51,11 @@ class MLPWeights:
 def mlp(x: torch.Tensor, w: MLPWeights, lora: DenseMLPLoRA | None = None) -> torch.Tensor:
     h = linear(x, w.fc1)
     if lora is not None:
-        h = h + F.linear(F.linear(x, lora.up_a), lora.up_b) * lora.scale
+        h = h + F.linear(F.linear(x, lora.up_a), lora.up_b)
     h = gelu_approx(h)
     out = linear(h, w.fc2)
     if lora is not None:
-        out = out + F.linear(F.linear(h, lora.down_a), lora.down_b) * lora.scale
+        out = out + F.linear(F.linear(h, lora.down_a), lora.down_b)
     return out
 
 
