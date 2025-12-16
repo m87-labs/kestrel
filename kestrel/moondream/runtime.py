@@ -1023,9 +1023,9 @@ class MoondreamRuntime:
 
         expected = self._text_lora.lora_config
         actual = adapter.text.lora_config
-        if actual.rank != expected.rank or actual.alpha != expected.alpha:
+        if actual.rank != expected.rank:
             raise NotImplementedError(
-                "Adapter rank/alpha must match AdapterProvider.config() for eager CUDA graphs."
+                "Adapter rank must match AdapterProvider.config() for eager CUDA graphs."
             )
 
         # Phase 1: require CUDA tensors and exact dtype/device matches.

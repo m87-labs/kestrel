@@ -34,8 +34,6 @@ def _fused_moe_lora_kernel(
     # Strides for output [M, top_k, out_dim]
     stride_om,
     stride_on,
-    # Scale
-    scale,
     # Constexprs
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
@@ -44,7 +42,7 @@ def _fused_moe_lora_kernel(
     BLOCK_SIZE_HIDDEN: tl.constexpr,
     BLOCK_SIZE_OUT: tl.constexpr,
 ):
-    """Fused MoE LoRA kernel: computes (x @ A.T) * scale @ B.T in one kernel.
+    """Fused MoE LoRA kernel: computes x @ A.T @ B.T in one kernel.
 
     This fuses the shrink and expand phases to avoid intermediate buffer
     allocation and reduce kernel launch overhead.
@@ -87,9 +85,6 @@ def _fused_moe_lora_kernel(
         a_block = tl.load(a_ptrs, mask=k_mask[:, None] & (tl.arange(0, BLOCK_SIZE_RANK)[None, :] < rank), other=0.0).to(tl.float32)
 
         intermediate += tl.dot(x_block, a_block)
-
-    # Apply scale
-    intermediate = intermediate * scale
 
     # Phase 2: Expand - compute intermediate @ B.T -> [BLOCK_SIZE_M, BLOCK_SIZE_OUT]
     # B is [num_experts, out_dim, rank], we want B[expert].T = [rank, out_dim]
@@ -137,7 +132,6 @@ def apply_moe_lora(
     output: torch.Tensor,  # [M, top_k, out_dim]
     lora_a: torch.Tensor,  # [num_experts, rank, hidden_dim]
     lora_b: torch.Tensor,  # [num_experts, out_dim, rank]
-    scale: float,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -147,7 +141,7 @@ def apply_moe_lora(
 ) -> None:
     """Apply MoE LoRA using a fused Triton kernel.
 
-    Computes: output += (x @ A.T @ B.T) * scale [* topk_weights]
+    Computes: output += (x @ A.T @ B.T) [* topk_weights]
 
     Args:
         x: Input activations
@@ -156,7 +150,6 @@ def apply_moe_lora(
         output: Output tensor to accumulate into [M, top_k, out_dim]
         lora_a: LoRA A weights [num_experts, rank, hidden_dim]
         lora_b: LoRA B weights [num_experts, out_dim, rank]
-        scale: LoRA scaling factor (alpha / rank)
         sorted_token_ids: Pre-sorted token indices from moe_align_block_size
         expert_ids: Expert ID per block from moe_align_block_size
         num_tokens_post_padded: Padded token count
@@ -205,7 +198,6 @@ def apply_moe_lora(
         lora_b.stride(2),
         output.stride(1),  # stride for M (token*topk dim)
         output.stride(2),  # stride for N (out_dim)
-        scale,
         top_k=top_k,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         BLOCK_SIZE_M=block_size_m,

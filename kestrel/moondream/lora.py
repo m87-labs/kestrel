@@ -32,20 +32,17 @@ class VisionLoRALinear(nn.Module):
         in_features: int,
         out_features: int,
         rank: int,
-        alpha: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         self.rank = rank
-        self.alpha = alpha
         self.down = nn.Parameter(torch.empty(rank, in_features, dtype=dtype))
         self.up = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype))
         nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute LoRA output to be added to the base layer output."""
-        scale = self.alpha / self.rank
-        return F.linear(F.linear(x, self.down), self.up) * scale
+        return F.linear(F.linear(x, self.down), self.up)
 
 
 class VisionLoRA(nn.Module):
@@ -59,7 +56,6 @@ class VisionLoRA(nn.Module):
         self,
         vision_config: VisionConfig,
         rank: int,
-        alpha: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
@@ -68,24 +64,18 @@ class VisionLoRA(nn.Module):
 
         self.config = vision_config
         self._rank = rank
-        self._alpha = alpha
 
         # proj_mlp.fc2: [proj_inner_dim] -> [proj_out_dim]
         self.proj_fc2 = VisionLoRALinear(
             in_features=vision_config.proj_inner_dim,
             out_features=vision_config.proj_out_dim,
             rank=rank,
-            alpha=alpha,
             dtype=dtype,
         )
 
     @property
     def rank(self) -> int:
         return self._rank
-
-    @property
-    def alpha(self) -> float:
-        return self._alpha
 
 
 # -----------------------------------------------------------------------------
@@ -100,11 +90,9 @@ class TextLoRAConfig:
     Attributes:
         rank: Total LoRA rank. For MoE layers, this is divided by
             experts_per_token to get the per-expert rank.
-        alpha: Scaling factor applied to LoRA output (output *= alpha / rank).
     """
 
     rank: int
-    alpha: float = 1.0
 
 
 class DenseMLPLoRA(nn.Module):
@@ -122,12 +110,10 @@ class DenseMLPLoRA(nn.Module):
         d_model: int,
         d_ffn: int,
         rank: int,
-        alpha: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         self._rank = rank
-        self._alpha = alpha
 
         # up: [d_model] -> [d_ffn]
         self.up_a = nn.Parameter(torch.empty(rank, d_model, dtype=dtype))
@@ -144,14 +130,6 @@ class DenseMLPLoRA(nn.Module):
     def rank(self) -> int:
         return self._rank
 
-    @property
-    def alpha(self) -> float:
-        return self._alpha
-
-    @property
-    def scale(self) -> float:
-        return self._alpha / self._rank
-
 
 class MoEMLPLoRA(nn.Module):
     """LoRA adapter for a Mixture-of-Experts MLP layer.
@@ -166,12 +144,10 @@ class MoEMLPLoRA(nn.Module):
         d_expert: int,
         num_experts: int,
         rank_per_expert: int,
-        alpha: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         self._rank_per_expert = rank_per_expert
-        self._alpha = alpha
         self._num_experts = num_experts
 
         # up projection: [d_model] -> [d_expert * 2] (gate + up fused)
@@ -200,16 +176,8 @@ class MoEMLPLoRA(nn.Module):
         return self._rank_per_expert
 
     @property
-    def alpha(self) -> float:
-        return self._alpha
-
-    @property
     def num_experts(self) -> int:
         return self._num_experts
-
-    @property
-    def scale(self) -> float:
-        return self._alpha / self._rank_per_expert
 
 
 class TextLoRA(nn.Module):
@@ -239,7 +207,6 @@ class TextLoRA(nn.Module):
                     d_model=text_config.dim,
                     d_ffn=text_config.ff_dim,
                     rank=lora_config.rank,
-                    alpha=lora_config.alpha,
                     dtype=dtype,
                 )
                 for _ in range(start_layer)
@@ -261,7 +228,6 @@ class TextLoRA(nn.Module):
                         d_expert=moe_cfg.expert_inner_dim,
                         num_experts=moe_cfg.num_experts,
                         rank_per_expert=rank_per_expert,
-                        alpha=lora_config.alpha,
                         dtype=dtype,
                     )
                     for _ in range(text_config.n_layers - start_layer)
@@ -281,10 +247,6 @@ class TextLoRA(nn.Module):
     @property
     def rank(self) -> int:
         return self._lora_config.rank
-
-    @property
-    def alpha(self) -> float:
-        return self._lora_config.alpha
 
     @property
     def rank_per_expert(self) -> int:
@@ -348,7 +310,6 @@ class LoRA(nn.Module):
         lora_config: TextLoRAConfig,
         vision_config: Optional[VisionConfig] = None,
         vision_rank: Optional[int] = None,
-        vision_alpha: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
     ) -> "LoRA":
         """Create a LoRA adapter.
@@ -358,7 +319,6 @@ class LoRA(nn.Module):
             lora_config: LoRA configuration for text layers.
             vision_config: Vision model configuration (required if vision_rank is set).
             vision_rank: LoRA rank for vision projection. If None, no vision LoRA.
-            vision_alpha: Scaling factor for vision LoRA.
             dtype: Data type for LoRA parameters.
 
         Returns:
@@ -377,7 +337,6 @@ class LoRA(nn.Module):
             vision_lora = VisionLoRA(
                 vision_config=vision_config,
                 rank=vision_rank,
-                alpha=vision_alpha,
                 dtype=dtype,
             )
 
@@ -394,7 +353,7 @@ class AdapterProvider(Protocol):
     """
 
     def config(self) -> TextLoRAConfig:
-        """Return the (rank, alpha) contract for all adapters."""
+        """Return the rank contract for all adapters."""
 
     def default_adapter(self) -> str:
         """Return the adapter id used for warmup and eager init paths."""
