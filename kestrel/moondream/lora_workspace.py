@@ -4,8 +4,26 @@ This module provides fixed-address GPU tensors that hold LoRA weights for multip
 adapters simultaneously. The workspace is allocated once at engine creation and
 never reallocated, ensuring CUDA graph stability.
 
-Slot 0 is always zero (represents "no LoRA"). Active adapters are loaded into
-slots 1..max_slots-1.
+Slot 0 represents "no LoRA". Active adapters are loaded into slots 1..max_slots-1.
+
+Dense vs MoE Workspace Layout
+-----------------------------
+Dense layers use direct slot indexing: workspace shape is [max_slots, ...] and
+slot N maps to index N. Slot 0 contains zeros.
+
+MoE layers use "super-expert" indexing where each (slot, expert) pair is a unique
+index. However, vLLM's moe_align_block_size kernel has a hard limit of <1024
+experts due to CUB BlockScan using 1024 threads. With 64 physical experts, this
+limits us to floor(1023/64) = 15 usable slots.
+
+To maximize slot capacity, MoE workspaces exclude slot 0 entirely:
+- Workspace shape: [(max_slots-1) * num_experts, ...]
+- Slot N (N >= 1) maps to indices [(N-1)*num_experts, N*num_experts)
+- Slot 0 tokens are filtered out via sentinel values in moe_align_block_size
+  (expert IDs >= num_super_experts are skipped by the kernel)
+
+This allows max_slots usable adapter slots (1 through max_slots-1) while staying
+under the 1024 super-expert limit.
 """
 
 from dataclasses import dataclass
@@ -41,15 +59,14 @@ class DenseLoRALayerWorkspace:
 class MoELoRALayerWorkspace:
     """Fixed-address LoRA weight buffers for a single MoE layer.
 
-    Uses flattened "super-expert" indexing: super_expert = slot * num_experts + expert_id.
-    This allows the existing MoE LoRA kernel to handle mixed adapters by routing
-    to (slot, expert) pairs.
+    Uses flattened "super-expert" indexing with slot 0 excluded (see module docstring).
+    Slot N (N >= 1) maps to super-expert indices [(N-1)*num_experts, N*num_experts).
 
     Shapes:
-        up_a:   [max_slots * num_experts, max_rank_per_expert, d_model]
-        up_b:   [max_slots * num_experts, d_expert * 2,        max_rank_per_expert]
-        down_a: [max_slots * num_experts, max_rank_per_expert, d_expert]
-        down_b: [max_slots * num_experts, d_model,             max_rank_per_expert]
+        up_a:   [(max_slots-1) * num_experts, max_rank_per_expert, d_model]
+        up_b:   [(max_slots-1) * num_experts, d_expert * 2,        max_rank_per_expert]
+        down_a: [(max_slots-1) * num_experts, max_rank_per_expert, d_expert]
+        down_b: [(max_slots-1) * num_experts, d_model,             max_rank_per_expert]
     """
 
     up_a: torch.Tensor
@@ -125,28 +142,29 @@ class TextLoRAWorkspace:
             self.dense.append(workspace)
 
         # Allocate MoE layer workspaces: [start_layer, n_layers)
+        # MoE workspaces exclude slot 0 to stay under vLLM's 1024 super-expert limit
         self.moe: list[MoELoRALayerWorkspace] = []
         if moe_cfg is not None:
             num_experts = moe_cfg.num_experts
             d_expert = moe_cfg.expert_inner_dim
-            total_experts = max_slots * num_experts
+            total_super_experts = (max_slots - 1) * num_experts
 
             for _ in range(text_config.n_layers - self.start_layer):
                 workspace = MoELoRALayerWorkspace(
                     up_a=torch.zeros(
-                        total_experts, self.max_rank_per_expert, d_model,
+                        total_super_experts, self.max_rank_per_expert, d_model,
                         device=device, dtype=dtype
                     ),
                     up_b=torch.zeros(
-                        total_experts, d_expert * 2, self.max_rank_per_expert,
+                        total_super_experts, d_expert * 2, self.max_rank_per_expert,
                         device=device, dtype=dtype
                     ),
                     down_a=torch.zeros(
-                        total_experts, self.max_rank_per_expert, d_expert,
+                        total_super_experts, self.max_rank_per_expert, d_expert,
                         device=device, dtype=dtype
                     ),
                     down_b=torch.zeros(
-                        total_experts, d_model, self.max_rank_per_expert,
+                        total_super_experts, d_model, self.max_rank_per_expert,
                         device=device, dtype=dtype
                     ),
                     num_experts=num_experts,
@@ -187,8 +205,8 @@ class TextLoRAWorkspace:
             layer.down_b[slot].zero_()
 
         for layer in self.moe:
-            # MoE uses flattened indexing: [slot * num_experts : (slot+1) * num_experts]
-            start = slot * layer.num_experts
+            # MoE uses (slot-1) indexing since slot 0 is excluded from workspace
+            start = (slot - 1) * layer.num_experts
             end = start + layer.num_experts
             layer.up_a[start:end].zero_()
             layer.up_b[start:end].zero_()
@@ -249,9 +267,9 @@ class TextLoRAWorkspace:
                     f"(expected {len(self.moe)} MoE layers starting at {self.start_layer})"
                 )
 
-            # MoE uses flattened indexing
+            # MoE uses (slot-1) indexing since slot 0 is excluded from workspace
             for expert_id in range(layer.num_experts):
-                ws_idx = slot * layer.num_experts + expert_id
+                ws_idx = (slot - 1) * layer.num_experts + expert_id
                 # Copy with rank slicing
                 layer.up_a[ws_idx, :adapter_rank_per_expert, :].copy_(
                     adapter_layer.up_a[expert_id]
