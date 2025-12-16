@@ -18,7 +18,7 @@ from ..fused_moe.lora_kernels import apply_moe_lora
 
 # Re-export LoRA for convenience
 from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
-from .lora_workspace import DenseLoRALayerWorkspace
+from .lora_workspace import DenseLoRALayerWorkspace, MoELoRALayerWorkspace
 
 
 def gelu_approx(x: torch.Tensor) -> torch.Tensor:
@@ -182,7 +182,8 @@ def moe_mlp(
     experts_per_token: int,
     *,
     mode: Literal["prefill", "decode"] = "decode",
-    lora: MoEMLPLoRA | None = None,
+    lora_workspace: MoELoRALayerWorkspace | None = None,
+    lora_slot_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
     x_flat = x.reshape(-1, C)
@@ -194,11 +195,17 @@ def moe_mlp(
     topk_logits, topk_idxs = torch.topk(router_logits, experts_per_token, dim=-1)
     topk_weights = F.softmax(topk_logits, dim=-1, dtype=torch.float32).to(x.dtype)
 
+    # Expand slot IDs for all tokens if we have a sequence length > 1
+    expanded_slot_ids = None
+    if lora_slot_ids is not None:
+        expanded_slot_ids = lora_slot_ids.repeat_interleave(T)
+
     mlp_out = fused_mlp(
         x_flat,
         topk_weights,
         topk_idxs,
-        lora,
+        lora_workspace,
+        expanded_slot_ids,
     ).view(B, T, C)
     return mlp_out
 

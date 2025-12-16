@@ -17,7 +17,7 @@ from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CO
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
-from kestrel.moondream.lora import MoEMLPLoRA
+from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 
 
 class _ResizableBuffer:
@@ -260,9 +260,10 @@ class FusedMoEModule(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        lora: MoEMLPLoRA | None = None,
+        lora_workspace: MoELoRALayerWorkspace | None = None,
+        lora_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.forward(hidden_states, topk_weights, topk_ids, lora)
+        return self.forward(hidden_states, topk_weights, topk_ids, lora_workspace, lora_slot_ids)
 
     @torch_compiler_disable()
     def forward(
@@ -270,7 +271,8 @@ class FusedMoEModule(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        lora: MoEMLPLoRA | None = None,
+        lora_workspace: MoELoRALayerWorkspace | None = None,
+        lora_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.device.type != "cuda":
             raise ValueError("Fused MoE backend only supports CUDA tensors")
@@ -333,17 +335,33 @@ class FusedMoEModule(nn.Module):
             allow_tf32=self.config.allow_tf32,
         )
 
-        if lora is not None:
+        # For LoRA, run separate routing with super-expert IDs (slot * num_experts + expert)
+        # This keeps base MoE compute unchanged while enabling mixed-adapter batches
+        # Compute routing once here and reuse for both up and down LoRA
+        sorted_lora = None
+        expert_ids_lora = None
+        num_tokens_lora = None
+        combined_topk_ids = None
+        if lora_workspace is not None and lora_slot_ids is not None:
+            # Expand slot IDs: [M] -> [M, top_k] to match topk_ids shape
+            expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, self.top_k)
+            combined_topk_ids = topk_ids + expanded_slots * self.num_experts
+
+            max_super_experts = lora_workspace.up_a.shape[0]
+            sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
+                combined_topk_ids.to(torch.int32), block_size_m, max_super_experts
+            )
+
             apply_moe_lora(
                 x=hidden_states,
-                topk_ids=topk_ids,
+                topk_ids=combined_topk_ids,
                 topk_weights=topk_weights,
                 output=up_out,
-                lora_a=lora.up_a,
-                lora_b=lora.up_b,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
+                lora_a=lora_workspace.up_a,
+                lora_b=lora_workspace.up_b,
+                sorted_token_ids=sorted_lora,
+                expert_ids=expert_ids_lora,
+                num_tokens_post_padded=num_tokens_lora,
                 top_k=self.top_k,
                 config=triton_config,
                 mul_routed_weight=False,
@@ -379,17 +397,19 @@ class FusedMoEModule(nn.Module):
             allow_tf32=self.config.allow_tf32,
         )
 
-        if lora is not None:
+        if lora_workspace is not None and lora_slot_ids is not None:
+            # For down projection, input is already per-expert [M * top_k, dim]
+            # Reuse the same super-expert routing computed for up projection
             apply_moe_lora(
                 x=down_in,
-                topk_ids=topk_ids,
+                topk_ids=combined_topk_ids,
                 topk_weights=topk_weights,
                 output=down_out,
-                lora_a=lora.down_a,
-                lora_b=lora.down_b,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
+                lora_a=lora_workspace.down_a,
+                lora_b=lora_workspace.down_b,
+                sorted_token_ids=sorted_lora,
+                expert_ids=expert_ids_lora,
+                num_tokens_post_padded=num_tokens_lora,
                 top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
                 config=triton_config,
                 mul_routed_weight=True,
