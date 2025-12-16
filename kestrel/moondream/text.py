@@ -21,7 +21,8 @@ from .layers import (
     LinearWeights,
     MLPWeights,
 )
-from .lora import TextLoRA, DenseMLPLoRA
+from .lora import TextLoRA
+from .lora_workspace import TextLoRAWorkspace
 from ..ops import apply_rotary_emb, precompute_freqs_cis
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -200,6 +201,8 @@ def text_decoder(
     flashinfer_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None,
     use_flashinfer_prefill: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
+    lora_workspace: TextLoRAWorkspace | None = None,
+    lora_slot_ids: torch.Tensor | None = None,
     text_lora: TextLoRA | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
@@ -256,8 +259,13 @@ def text_decoder(
                     weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
                 ),
             )
-            dense_lora = text_lora.get_dense_lora(i) if text_lora else None
-            mlp_out = mlp(x_norm, mlp_weights, lora=dense_lora)
+            dense_workspace = lora_workspace.dense_layer(i) if lora_workspace else None
+            mlp_out = mlp(
+                x_norm,
+                mlp_weights,
+                lora_workspace=dense_workspace,
+                lora_slot_ids=lora_slot_ids,
+            )
 
         x = x + attn_out + mlp_out
 

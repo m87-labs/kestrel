@@ -719,7 +719,7 @@ class MoondreamRuntime:
         self._active_prefill_metadata = prefill_metadata
         self._active_prefill_batch_idx = batch_tensor
         try:
-            hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids)
+            hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids, lora_slot)
         finally:
             self._active_prefill_metadata = None
             self._active_prefill_batch_idx = None
@@ -749,8 +749,9 @@ class MoondreamRuntime:
         inputs_embeds: Tensor,
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
+        lora_slot: int = 0,
     ) -> tuple[Tensor, Tensor]:
-        hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids)
+        hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids, lora_slot)
         return hidden, logits
 
     def _prefill_impl(
@@ -758,6 +759,7 @@ class MoondreamRuntime:
         inputs_embeds: Tensor,
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
+        lora_slot: int = 0,
     ) -> tuple[Tensor, Tensor]:
         prefill_metadata = self._active_prefill_metadata
         use_flashinfer_prefill = prefill_metadata is not None
@@ -767,6 +769,9 @@ class MoondreamRuntime:
         slot_mapping = self.page_table.build_slot_mapping(
             batch_idx=batch_idx, positions=position_ids
         )
+
+        # Build single-element slot IDs tensor for prefill (batch_size=1)
+        lora_slot_ids = torch.tensor([lora_slot], dtype=torch.int32, device=self.device)
 
         hidden = text_decoder(
             inputs_embeds,
@@ -781,6 +786,8 @@ class MoondreamRuntime:
             ),
             flashinfer_prefill_metadata=prefill_metadata,
             use_flashinfer_prefill=use_flashinfer_prefill,
+            lora_workspace=self._lora_workspace,
+            lora_slot_ids=lora_slot_ids,
             text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
@@ -869,7 +876,7 @@ class MoondreamRuntime:
         else:
             token_arg: Tensor | Sequence[Token]
             token_arg = tokens_tensor if tokens_tensor is not None else token_seq  # type: ignore[assignment]
-            result = self._decode_step(batch_idx, token_arg, input_pos)
+            result = self._decode_step(batch_idx, token_arg, input_pos, lora_slot_ids)
 
         hidden_last = result.hidden[:, -1, :]
         for state, vec in zip(states, hidden_last):
@@ -997,6 +1004,7 @@ class MoondreamRuntime:
         batch_idx: Tensor,
         token_inputs: Tensor | Sequence[Token],
         input_pos: Tensor,
+        lora_slot_ids: Tensor,
         *,
         use_graph: bool = False,
         full_batch_size: Optional[int] = None,
@@ -1043,6 +1051,8 @@ class MoondreamRuntime:
             use_graph=use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
+            lora_workspace=self._lora_workspace,
+            lora_slot_ids=lora_slot_ids,
             text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
@@ -1290,6 +1300,7 @@ class MoondreamRuntime:
                             workspace.batch_idx_buffer[:bs],
                             workspace.token_buffer[:bs, 0],
                             workspace.position_buffer[:bs],
+                            workspace.lora_slot_ids_buffer[:bs],
                             use_graph=True,
                             full_batch_size=bs,
                             flashinfer_metadata=metadata,
@@ -1305,6 +1316,7 @@ class MoondreamRuntime:
                                 workspace.batch_idx_buffer[:bs],
                                 workspace.token_buffer[:bs, 0],
                                 workspace.position_buffer[:bs],
+                                workspace.lora_slot_ids_buffer[:bs],
                                 use_graph=True,
                                 full_batch_size=bs,
                                 flashinfer_metadata=metadata,
