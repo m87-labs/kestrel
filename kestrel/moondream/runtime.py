@@ -33,7 +33,7 @@ from .text import (
 )
 from .vision import encode_image
 from .lora import LoRA
-from .lora_workspace import AdapterSlotManager, TextLoRAWorkspace, TextLoRASlotView
+from .lora_workspace import AdapterSlotManager, TextLoRAWorkspace
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -788,22 +788,9 @@ class MoondreamRuntime:
             use_flashinfer_prefill=use_flashinfer_prefill,
             lora_workspace=self._lora_workspace,
             lora_slot_ids=lora_slot_ids,
-            text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
-
-    def _get_lora_slot_view(self) -> TextLoRASlotView | None:
-        """Get slot view for the current active adapter, or None if no LoRA.
-
-        Phase 1: All active sequences must use the same adapter, so we track a
-        single _current_lora_slot. Returns a view of that slot (or None if slot 0).
-        """
-        if self._lora_workspace is None:
-            return None
-        if self._current_lora_slot == 0:
-            return None
-        return TextLoRASlotView(self._lora_workspace, slot=self._current_lora_slot)
 
     def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
         self.decode_batch([state], token_id)
@@ -1053,7 +1040,6 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             lora_workspace=self._lora_workspace,
             lora_slot_ids=lora_slot_ids,
-            text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)

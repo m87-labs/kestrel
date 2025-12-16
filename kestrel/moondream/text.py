@@ -21,7 +21,6 @@ from .layers import (
     LinearWeights,
     MLPWeights,
 )
-from .lora import TextLoRA
 from .lora_workspace import TextLoRAWorkspace
 from ..ops import apply_rotary_emb, precompute_freqs_cis
 from .flashinfer import (
@@ -203,7 +202,6 @@ def text_decoder(
     mode: Literal["prefill", "decode"] = "decode",
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
-    text_lora: TextLoRA | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
@@ -242,13 +240,14 @@ def text_decoder(
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
-            moe_lora = text_lora.get_moe_lora(i) if text_lora else None
+            moe_workspace = lora_workspace.moe_layer(i) if lora_workspace else None
             mlp_out = moe_mlp(
                 x_norm,
                 block.mlp,
                 config.moe.experts_per_token,
                 mode=mode,
-                lora=moe_lora,
+                lora_workspace=moe_workspace,
+                lora_slot_ids=lora_slot_ids,
             )
         else:
             mlp_weights = MLPWeights(

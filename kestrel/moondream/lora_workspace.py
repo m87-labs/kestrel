@@ -414,90 +414,9 @@ class AdapterSlotManager:
         return len(self._free_slots)
 
 
-# -----------------------------------------------------------------------------
-# Temporary slot view classes (delete after Tasks 2.8/2.9)
-#
-# These exist only to bridge the gap between the multi-slot workspace and the
-# current text_decoder interface which expects single-adapter LoRA objects.
-# Tasks 2.8/2.9 will rewrite the forward pass to use per-token lora_slot_ids
-# and read directly from the workspace, at which point these classes are removed.
-# -----------------------------------------------------------------------------
-
-
-class DenseLoRASlotView:
-    """Temporary: View of a single slot's dense LoRA weights."""
-
-    __slots__ = ("up_a", "up_b", "down_a", "down_b")
-
-    def __init__(
-        self,
-        up_a: torch.Tensor,
-        up_b: torch.Tensor,
-        down_a: torch.Tensor,
-        down_b: torch.Tensor,
-    ) -> None:
-        self.up_a = up_a
-        self.up_b = up_b
-        self.down_a = down_a
-        self.down_b = down_b
-
-
-class MoELoRASlotView:
-    """Temporary: View of a single slot's MoE LoRA weights."""
-
-    __slots__ = ("up_a", "up_b", "down_a", "down_b")
-
-    def __init__(
-        self,
-        up_a: torch.Tensor,
-        up_b: torch.Tensor,
-        down_a: torch.Tensor,
-        down_b: torch.Tensor,
-    ) -> None:
-        self.up_a = up_a
-        self.up_b = up_b
-        self.down_a = down_a
-        self.down_b = down_b
-
-
-class TextLoRASlotView:
-    """Temporary: View of a single slot, compatible with TextLoRA interface."""
-
-    def __init__(self, workspace: TextLoRAWorkspace, slot: int) -> None:
-        self._workspace = workspace
-        self._slot = slot
-
-    def get_dense_lora(self, layer_idx: int) -> Optional[DenseLoRASlotView]:
-        """Get LoRA view for a dense layer, or None if layer is MoE."""
-        layer = self._workspace.dense_layer(layer_idx)
-        if layer is None:
-            return None
-        return DenseLoRASlotView(
-            up_a=layer.up_a[self._slot],
-            up_b=layer.up_b[self._slot],
-            down_a=layer.down_a[self._slot],
-            down_b=layer.down_b[self._slot],
-        )
-
-    def get_moe_lora(self, layer_idx: int) -> Optional[MoELoRASlotView]:
-        """Get LoRA view for a MoE layer, or None if layer is dense."""
-        layer = self._workspace.moe_layer(layer_idx)
-        if layer is None:
-            return None
-        start = self._slot * layer.num_experts
-        end = start + layer.num_experts
-        return MoELoRASlotView(
-            up_a=layer.up_a[start:end],
-            up_b=layer.up_b[start:end],
-            down_a=layer.down_a[start:end],
-            down_b=layer.down_b[start:end],
-        )
-
-
 __all__ = [
     "DenseLoRALayerWorkspace",
     "MoELoRALayerWorkspace",
     "TextLoRAWorkspace",
     "AdapterSlotManager",
-    "TextLoRASlotView",
 ]
