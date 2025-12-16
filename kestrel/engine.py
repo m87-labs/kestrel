@@ -259,11 +259,13 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
-        adapter_config = (
-            self._adapter_provider.config() if self._adapter_provider is not None else None
+        max_lora_rank = (
+            self._adapter_provider.config()["max_lora_rank"]
+            if self._adapter_provider is not None
+            else None
         )
         self._runtime = await loop.run_in_executor(
-            None, lambda: MoondreamRuntime(self._runtime_cfg, adapter_config=adapter_config)
+            None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
         )
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)

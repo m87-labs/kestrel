@@ -1,0 +1,349 @@
+"""Multi-slot LoRA workspace for CUDA-graph-compatible mixed-adapter inference.
+
+This module provides fixed-address GPU tensors that hold LoRA weights for multiple
+adapters simultaneously. The workspace is allocated once at engine creation and
+never reallocated, ensuring CUDA graph stability.
+
+Slot 0 is always zero (represents "no LoRA"). Active adapters are loaded into
+slots 1..max_slots-1.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+from .config import TextConfig
+from .lora import LoRA
+
+
+@dataclass(frozen=True)
+class DenseLoRALayerWorkspace:
+    """Fixed-address LoRA weight buffers for a single dense MLP layer.
+
+    Tensor layout treats slots as "experts" for compatibility with the MoE LoRA
+    kernel (top_k=1, topk_weights=1).
+
+    Shapes:
+        up_a:   [max_slots, max_rank, d_model]
+        up_b:   [max_slots, d_ffn,    max_rank]
+        down_a: [max_slots, max_rank, d_ffn]
+        down_b: [max_slots, d_model,  max_rank]
+    """
+
+    up_a: torch.Tensor
+    up_b: torch.Tensor
+    down_a: torch.Tensor
+    down_b: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MoELoRALayerWorkspace:
+    """Fixed-address LoRA weight buffers for a single MoE layer.
+
+    Uses flattened "super-expert" indexing: super_expert = slot * num_experts + expert_id.
+    This allows the existing MoE LoRA kernel to handle mixed adapters by routing
+    to (slot, expert) pairs.
+
+    Shapes:
+        up_a:   [max_slots * num_experts, max_rank_per_expert, d_model]
+        up_b:   [max_slots * num_experts, d_expert * 2,        max_rank_per_expert]
+        down_a: [max_slots * num_experts, max_rank_per_expert, d_expert]
+        down_b: [max_slots * num_experts, d_model,             max_rank_per_expert]
+    """
+
+    up_a: torch.Tensor
+    up_b: torch.Tensor
+    down_a: torch.Tensor
+    down_b: torch.Tensor
+    num_experts: int
+
+
+class TextLoRAWorkspace:
+    """Multi-slot LoRA workspace for text model MLP layers.
+
+    Allocates fixed-address GPU tensors for all dense and MoE layers. Slot 0 is
+    reserved (always zero) for "no LoRA" sequences.
+
+    Attributes:
+        max_slots: Maximum number of concurrent adapters (including slot 0).
+        max_rank: Maximum LoRA rank for dense layers.
+        max_rank_per_expert: Maximum LoRA rank per expert for MoE layers.
+        start_layer: First MoE layer index (dense layers are [0, start_layer)).
+        dense: Per-layer workspace for dense MLP layers.
+        moe: Per-layer workspace for MoE layers.
+    """
+
+    def __init__(
+        self,
+        text_config: TextConfig,
+        max_slots: int,
+        max_rank: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Allocate workspace tensors.
+
+        Args:
+            text_config: Model configuration (dimensions, layer counts, MoE config).
+            max_slots: Number of slots to allocate (including slot 0).
+            max_rank: Maximum LoRA rank for dense layers.
+            device: Device to allocate tensors on.
+            dtype: Data type for workspace tensors.
+        """
+        self.max_slots = max_slots
+        self.max_rank = max_rank
+        self.device = device
+        self.dtype = dtype
+
+        moe_cfg = text_config.moe
+        self.start_layer = moe_cfg.start_layer if moe_cfg else text_config.n_layers
+
+        # Compute max_rank_per_expert for MoE layers
+        if moe_cfg is not None:
+            self.max_rank_per_expert = max_rank // moe_cfg.experts_per_token
+            if self.max_rank_per_expert < 1:
+                raise ValueError(
+                    f"max_lora_rank ({max_rank}) must be >= experts_per_token "
+                    f"({moe_cfg.experts_per_token})"
+                )
+        else:
+            self.max_rank_per_expert = 0
+
+        d_model = text_config.dim
+        d_ffn = text_config.ff_dim
+
+        # Allocate dense layer workspaces: [0, start_layer)
+        self.dense: list[DenseLoRALayerWorkspace] = []
+        for _ in range(self.start_layer):
+            workspace = DenseLoRALayerWorkspace(
+                up_a=torch.zeros(max_slots, max_rank, d_model, device=device, dtype=dtype),
+                up_b=torch.zeros(max_slots, d_ffn, max_rank, device=device, dtype=dtype),
+                down_a=torch.zeros(max_slots, max_rank, d_ffn, device=device, dtype=dtype),
+                down_b=torch.zeros(max_slots, d_model, max_rank, device=device, dtype=dtype),
+            )
+            self.dense.append(workspace)
+
+        # Allocate MoE layer workspaces: [start_layer, n_layers)
+        self.moe: list[MoELoRALayerWorkspace] = []
+        if moe_cfg is not None:
+            num_experts = moe_cfg.num_experts
+            d_expert = moe_cfg.expert_inner_dim
+            total_experts = max_slots * num_experts
+
+            for _ in range(text_config.n_layers - self.start_layer):
+                workspace = MoELoRALayerWorkspace(
+                    up_a=torch.zeros(
+                        total_experts, self.max_rank_per_expert, d_model,
+                        device=device, dtype=dtype
+                    ),
+                    up_b=torch.zeros(
+                        total_experts, d_expert * 2, self.max_rank_per_expert,
+                        device=device, dtype=dtype
+                    ),
+                    down_a=torch.zeros(
+                        total_experts, self.max_rank_per_expert, d_expert,
+                        device=device, dtype=dtype
+                    ),
+                    down_b=torch.zeros(
+                        total_experts, d_model, self.max_rank_per_expert,
+                        device=device, dtype=dtype
+                    ),
+                    num_experts=num_experts,
+                )
+                self.moe.append(workspace)
+
+    def dense_layer(self, layer_idx: int) -> Optional[DenseLoRALayerWorkspace]:
+        """Get workspace for a dense layer, or None if layer is MoE."""
+        if layer_idx < len(self.dense):
+            return self.dense[layer_idx]
+        return None
+
+    def moe_layer(self, layer_idx: int) -> Optional[MoELoRALayerWorkspace]:
+        """Get workspace for a MoE layer, or None if layer is dense."""
+        moe_idx = layer_idx - self.start_layer
+        if 0 <= moe_idx < len(self.moe):
+            return self.moe[moe_idx]
+        return None
+
+    def clear_slot_(self, slot: int) -> None:
+        """Zero out all weights in a slot.
+
+        Args:
+            slot: Slot index to clear. Must be >= 1 (slot 0 is always zero).
+
+        Raises:
+            ValueError: If slot is 0 (reserved) or out of range.
+        """
+        if slot == 0:
+            raise ValueError("Slot 0 is reserved and cannot be modified")
+        if slot < 0 or slot >= self.max_slots:
+            raise ValueError(f"Slot {slot} out of range [1, {self.max_slots})")
+
+        for layer in self.dense:
+            layer.up_a[slot].zero_()
+            layer.up_b[slot].zero_()
+            layer.down_a[slot].zero_()
+            layer.down_b[slot].zero_()
+
+        for layer in self.moe:
+            # MoE uses flattened indexing: [slot * num_experts : (slot+1) * num_experts]
+            start = slot * layer.num_experts
+            end = start + layer.num_experts
+            layer.up_a[start:end].zero_()
+            layer.up_b[start:end].zero_()
+            layer.down_a[start:end].zero_()
+            layer.down_b[start:end].zero_()
+
+    def load_slot_(self, slot: int, adapter: LoRA) -> None:
+        """Load adapter weights into a slot.
+
+        Copies weights from the adapter into the workspace slot. The adapter's rank
+        may be smaller than max_rank; unused dimensions are zero-filled.
+
+        Args:
+            slot: Slot index to load into. Must be >= 1.
+            adapter: LoRA adapter to copy from (must be on same device/dtype).
+
+        Raises:
+            ValueError: If slot is 0 or out of range, or adapter rank > max_rank.
+        """
+        if slot == 0:
+            raise ValueError("Slot 0 is reserved and cannot be modified")
+        if slot < 0 or slot >= self.max_slots:
+            raise ValueError(f"Slot {slot} out of range [1, {self.max_slots})")
+
+        text_lora = adapter.text
+        if text_lora.rank > self.max_rank:
+            raise ValueError(
+                f"Adapter rank ({text_lora.rank}) exceeds max_lora_rank ({self.max_rank})"
+            )
+
+        # Clear the slot first (handles rank < max_rank case)
+        self.clear_slot_(slot)
+
+        adapter_rank = text_lora.rank
+
+        # Copy dense layer weights
+        for layer_idx, layer in enumerate(self.dense):
+            adapter_layer = text_lora.get_dense_lora(layer_idx)
+            if adapter_layer is None:
+                continue
+            # Copy with rank slicing: adapter may have smaller rank
+            layer.up_a[slot, :adapter_rank, :].copy_(adapter_layer.up_a)
+            layer.up_b[slot, :, :adapter_rank].copy_(adapter_layer.up_b)
+            layer.down_a[slot, :adapter_rank, :].copy_(adapter_layer.down_a)
+            layer.down_b[slot, :, :adapter_rank].copy_(adapter_layer.down_b)
+
+        # Copy MoE layer weights
+        adapter_rank_per_expert = text_lora.rank_per_expert
+        for moe_idx, layer in enumerate(self.moe):
+            layer_idx = self.start_layer + moe_idx
+            adapter_layer = text_lora.get_moe_lora(layer_idx)
+            if adapter_layer is None:
+                continue
+
+            # MoE uses flattened indexing
+            for expert_id in range(layer.num_experts):
+                ws_idx = slot * layer.num_experts + expert_id
+                # Copy with rank slicing
+                layer.up_a[ws_idx, :adapter_rank_per_expert, :].copy_(
+                    adapter_layer.up_a[expert_id]
+                )
+                layer.up_b[ws_idx, :, :adapter_rank_per_expert].copy_(
+                    adapter_layer.up_b[expert_id]
+                )
+                layer.down_a[ws_idx, :adapter_rank_per_expert, :].copy_(
+                    adapter_layer.down_a[expert_id]
+                )
+                layer.down_b[ws_idx, :, :adapter_rank_per_expert].copy_(
+                    adapter_layer.down_b[expert_id]
+                )
+
+
+# -----------------------------------------------------------------------------
+# Temporary slot view classes (delete after Tasks 2.8/2.9)
+#
+# These exist only to bridge the gap between the multi-slot workspace and the
+# current text_decoder interface which expects single-adapter LoRA objects.
+# Tasks 2.8/2.9 will rewrite the forward pass to use per-token lora_slot_ids
+# and read directly from the workspace, at which point these classes are removed.
+# -----------------------------------------------------------------------------
+
+
+class DenseLoRASlotView:
+    """Temporary: View of a single slot's dense LoRA weights."""
+
+    __slots__ = ("up_a", "up_b", "down_a", "down_b")
+
+    def __init__(
+        self,
+        up_a: torch.Tensor,
+        up_b: torch.Tensor,
+        down_a: torch.Tensor,
+        down_b: torch.Tensor,
+    ) -> None:
+        self.up_a = up_a
+        self.up_b = up_b
+        self.down_a = down_a
+        self.down_b = down_b
+
+
+class MoELoRASlotView:
+    """Temporary: View of a single slot's MoE LoRA weights."""
+
+    __slots__ = ("up_a", "up_b", "down_a", "down_b")
+
+    def __init__(
+        self,
+        up_a: torch.Tensor,
+        up_b: torch.Tensor,
+        down_a: torch.Tensor,
+        down_b: torch.Tensor,
+    ) -> None:
+        self.up_a = up_a
+        self.up_b = up_b
+        self.down_a = down_a
+        self.down_b = down_b
+
+
+class TextLoRASlotView:
+    """Temporary: View of a single slot, compatible with TextLoRA interface."""
+
+    def __init__(self, workspace: TextLoRAWorkspace, slot: int) -> None:
+        self._workspace = workspace
+        self._slot = slot
+
+    def get_dense_lora(self, layer_idx: int) -> Optional[DenseLoRASlotView]:
+        """Get LoRA view for a dense layer, or None if layer is MoE."""
+        layer = self._workspace.dense_layer(layer_idx)
+        if layer is None:
+            return None
+        return DenseLoRASlotView(
+            up_a=layer.up_a[self._slot],
+            up_b=layer.up_b[self._slot],
+            down_a=layer.down_a[self._slot],
+            down_b=layer.down_b[self._slot],
+        )
+
+    def get_moe_lora(self, layer_idx: int) -> Optional[MoELoRASlotView]:
+        """Get LoRA view for a MoE layer, or None if layer is dense."""
+        layer = self._workspace.moe_layer(layer_idx)
+        if layer is None:
+            return None
+        start = self._slot * layer.num_experts
+        end = start + layer.num_experts
+        return MoELoRASlotView(
+            up_a=layer.up_a[start:end],
+            up_b=layer.up_b[start:end],
+            down_a=layer.down_a[start:end],
+            down_b=layer.down_b[start:end],
+        )
+
+
+__all__ = [
+    "DenseLoRALayerWorkspace",
+    "MoELoRALayerWorkspace",
+    "TextLoRAWorkspace",
+    "TextLoRASlotView",
+]
