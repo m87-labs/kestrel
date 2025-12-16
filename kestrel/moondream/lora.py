@@ -360,9 +360,6 @@ class AdapterProvider(Protocol):
         returned by get() must have rank <= config()["max_lora_rank"].
         """
 
-    def default_adapter(self) -> str:
-        """Return the adapter id used for warmup and eager init paths."""
-
     def get(self, adapter: str) -> "LoRA":
         """Return the LoRA module for this adapter id."""
 

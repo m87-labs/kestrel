@@ -293,8 +293,8 @@ class InferenceEngine:
                 "top_p": self._default_top_p,
                 "max_tokens": 1,
             }
-            if self._adapter_provider is not None:
-                warmup_settings["adapter"] = self._adapter_provider.default_adapter()
+            # Warmup uses slot 0 (no LoRA) - adapter-specific warmup is not required
+            # since workspace tensors have fixed addresses.
             await self.query(
                 image=None,
                 question="Warmup prompt.",
