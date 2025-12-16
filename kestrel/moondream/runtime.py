@@ -434,10 +434,6 @@ class MoondreamRuntime:
         self._lora_workspace: TextLoRAWorkspace | None = None
         self._slot_manager: AdapterSlotManager | None = None
         self._max_lora_rank: int | None = max_lora_rank
-        # Tracks the current active LoRA slot for _get_lora_slot_view().
-        # Phase 1 restriction: all active sequences use the same adapter, so this
-        # is the slot for that adapter (or 0 if no adapter is active).
-        self._current_lora_slot: int = 0
         if max_lora_rank is not None:
             # max_slots = max_batch_size + 1 (slot 0 reserved for "no LoRA")
             max_slots = cfg.max_batch_size + 1
@@ -1076,7 +1072,7 @@ class MoondreamRuntime:
                 f"Adapter rank ({adapter.text.rank}) exceeds max_lora_rank ({self._max_lora_rank})."
             )
 
-        # Phase 1: require CUDA tensors and exact dtype/device matches.
+        # Require CUDA tensors and exact dtype/device matches.
         try:
             sample_param = next(adapter.text.parameters())
         except StopIteration as exc:  # pragma: no cover - defensive
@@ -1101,8 +1097,6 @@ class MoondreamRuntime:
                 self._slot_manager.release_on_error(slot)
                 raise
 
-        # Update current active slot (Phase 1: single adapter at a time)
-        self._current_lora_slot = slot
         return slot
 
     def release_adapter_slot(self, slot: int) -> None:
@@ -1121,16 +1115,6 @@ class MoondreamRuntime:
             return
 
         self._slot_manager.release(slot)
-
-        # Update current active slot if this was the last reference
-        # Phase 1: check if any sequences still use a LoRA slot
-        if self._slot_manager.refcount(slot) == 0:
-            # Check if there are other active adapter sequences
-            has_active_adapter = any(
-                seq.lora_slot != 0 for seq in self.active_sequences.values()
-            )
-            if not has_active_adapter:
-                self._current_lora_slot = 0
 
     def _decode_with_graph(
         self,
