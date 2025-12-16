@@ -346,14 +346,19 @@ class LoRA(nn.Module):
 class AdapterProvider(Protocol):
     """Provider interface for loading LoRA adapters by id.
 
-    Phase 1 notes:
-    - `config()` is temporary and used for eager CUDA graph capture.
-    - `default_adapter()` is used for engine warmup.
-    - `get()` must return CUDA tensors compatible with the runtime.
+    The provider owns adapter caching/eviction. Kestrel only manages workspace
+    slots and copies adapter weights into fixed-address GPU buffers.
     """
 
-    def config(self) -> TextLoRAConfig:
-        """Return the rank contract for all adapters."""
+    def config(self) -> dict:
+        """Return workspace configuration for this provider.
+
+        Required keys:
+            max_lora_rank (int): Maximum LoRA rank for any adapter.
+
+        This is a permanent contract for the lifetime of the engine. All adapters
+        returned by get() must have rank <= config()["max_lora_rank"].
+        """
 
     def default_adapter(self) -> str:
         """Return the adapter id used for warmup and eager init paths."""

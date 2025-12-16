@@ -26,6 +26,9 @@ dependencies = [
 include = ["kestrel*"]
 
 [project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
 eval = [
     "datasets>=3.0",
     "tqdm>=4.66",

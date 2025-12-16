@@ -32,7 +32,8 @@ from .text import (
     text_encoder,
 )
 from .vision import encode_image
-from .lora import LoRA, TextLoRA, TextLoRAConfig
+from .lora import LoRA
+from .lora_workspace import TextLoRAWorkspace, TextLoRASlotView
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -204,7 +205,7 @@ class MoondreamRuntime:
         self,
         cfg: RuntimeConfig,
         *,
-        adapter_config: TextLoRAConfig | None = None,
+        max_lora_rank: int | None = None,
     ) -> None:
         self._cfg = cfg
         self.device = cfg.resolved_device()
@@ -420,16 +421,20 @@ class MoondreamRuntime:
 
         self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
 
-        self._text_lora: TextLoRA | None = None
-        if adapter_config is not None:
-            self._text_lora = TextLoRA(
+        # Multi-slot LoRA workspace. Slot 0 is always zero (no LoRA).
+        # Phase 1 uses only slot 1 for the single active adapter.
+        self._lora_workspace: TextLoRAWorkspace | None = None
+        self._max_lora_rank: int | None = max_lora_rank
+        if max_lora_rank is not None:
+            # max_slots = max_batch_size + 1 (slot 0 reserved for "no LoRA")
+            max_slots = cfg.max_batch_size + 1
+            self._lora_workspace = TextLoRAWorkspace(
                 text_config=self.config.text,
-                lora_config=adapter_config,
+                max_slots=max_slots,
+                max_rank=max_lora_rank,
+                device=self.device,
                 dtype=self.dtype,
-            ).to(device=self.device)
-            with torch.inference_mode():
-                for param in self._text_lora.parameters():
-                    param.zero_()
+            )
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
@@ -758,10 +763,17 @@ class MoondreamRuntime:
             ),
             flashinfer_prefill_metadata=prefill_metadata,
             use_flashinfer_prefill=use_flashinfer_prefill,
-            text_lora=self._text_lora,
+            text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
+
+    def _get_lora_slot_view(self) -> TextLoRASlotView | None:
+        """Get slot view for the current adapter (slot 1), or None if no workspace."""
+        if self._lora_workspace is None:
+            return None
+        # Phase 1: always use slot 1 for the single active adapter
+        return TextLoRASlotView(self._lora_workspace, slot=1)
 
     def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
         self.decode_batch([state], token_id)
@@ -1006,26 +1018,24 @@ class MoondreamRuntime:
             use_graph=use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
-            text_lora=self._text_lora,
+            text_lora=self._get_lora_slot_view(),
         )
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
     def load_adapter_(self, adapter: LoRA) -> None:
-        """Copy adapter weights into the runtime-owned LoRA workspace."""
+        """Copy adapter weights into the runtime-owned LoRA workspace (slot 1)."""
 
-        if self._text_lora is None:
+        if self._lora_workspace is None:
             raise NotImplementedError(
                 "Adapter provider is not configured for this runtime."
             )
         if adapter.vision is not None:
             raise NotImplementedError("Vision LoRA is not supported.")
 
-        expected = self._text_lora.lora_config
-        actual = adapter.text.lora_config
-        if actual.rank != expected.rank:
-            raise NotImplementedError(
-                "Adapter rank must match AdapterProvider.config() for eager CUDA graphs."
+        if adapter.text.rank > self._max_lora_rank:
+            raise ValueError(
+                f"Adapter rank ({adapter.text.rank}) exceeds max_lora_rank ({self._max_lora_rank})."
             )
 
         # Phase 1: require CUDA tensors and exact dtype/device matches.
@@ -1042,7 +1052,8 @@ class MoondreamRuntime:
                 f"Adapter must have dtype {self.dtype}; received {sample_param.dtype}."
             )
 
-        self._text_lora.load_state_dict(adapter.text.state_dict(), strict=True)
+        # Phase 1: load into slot 1 (single active adapter)
+        self._lora_workspace.load_slot_(1, adapter)
 
     def _decode_with_graph(
         self,

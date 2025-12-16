@@ -163,6 +163,19 @@ engine = await InferenceEngine.create(cfg, lora=lora)
 
   The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
 
+### Running Unit Tests
+
+```bash
+# Install dev dependencies
+uv sync --extra dev
+
+# Run all tests
+uv run python -m pytest tests/ -v
+
+# Run a specific test file
+uv run python -m pytest tests/moondream/test_lora_workspace.py -v
+```
+
 ### Profiling the Fused MoE Kernel
 
 The `scripts/profile_scattermoe.py` helper (name retained for compatibility) drives the Moondream fused MoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the Triton kernels.
