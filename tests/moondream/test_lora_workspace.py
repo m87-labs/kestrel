@@ -6,6 +6,7 @@ import torch
 from kestrel.moondream.config import TextConfig, TextMoeConfig
 from kestrel.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
 from kestrel.moondream.lora_workspace import (
+    AdapterSlotManager,
     DenseLoRALayerWorkspace,
     MoELoRALayerWorkspace,
     TextLoRAWorkspace,
@@ -431,4 +432,174 @@ class TestLoadSlot:
         with pytest.raises(ValueError, match="Adapter rank.*exceeds max_lora_rank"):
             workspace.load_slot_(1, adapter)
 
+
+# -----------------------------------------------------------------------------
+# AdapterSlotManager tests
+# -----------------------------------------------------------------------------
+
+
+class TestAdapterSlotManager:
+    """Tests for AdapterSlotManager."""
+
+    def test_init_creates_free_slots(self):
+        """Initialization creates correct number of free slots."""
+        manager = AdapterSlotManager(max_slots=5)
+        assert manager.max_slots == 5
+        assert manager.num_free_slots() == 4  # slots 1-4, slot 0 reserved
+
+    def test_init_requires_at_least_2_slots(self):
+        """Raises ValueError if max_slots < 2."""
+        with pytest.raises(ValueError, match="max_slots must be >= 2"):
+            AdapterSlotManager(max_slots=1)
+
+    def test_acquire_allocates_new_slot(self):
+        """acquire() allocates a new slot for unknown adapter."""
+        manager = AdapterSlotManager(max_slots=4)
+        slot, is_new = manager.acquire("adapter_a")
+
+        assert slot >= 1  # Slot 0 is reserved
+        assert is_new is True
+        assert manager.refcount(slot) == 1
+        assert manager.get_adapter_id(slot) == "adapter_a"
+        assert manager.get_slot("adapter_a") == slot
+        assert manager.num_free_slots() == 2  # Started with 3 free, used 1
+
+    def test_acquire_reuses_existing_slot(self):
+        """acquire() reuses slot and increments refcount for existing adapter."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        slot1, is_new1 = manager.acquire("adapter_a")
+        slot2, is_new2 = manager.acquire("adapter_a")
+
+        assert slot1 == slot2
+        assert is_new1 is True
+        assert is_new2 is False
+        assert manager.refcount(slot1) == 2
+
+    def test_acquire_different_adapters_get_different_slots(self):
+        """Different adapters get different slots."""
+        manager = AdapterSlotManager(max_slots=5)
+
+        slot_a, _ = manager.acquire("adapter_a")
+        slot_b, _ = manager.acquire("adapter_b")
+        slot_c, _ = manager.acquire("adapter_c")
+
+        assert len({slot_a, slot_b, slot_c}) == 3  # All different
+        assert manager.num_free_slots() == 1  # Started with 4, used 3
+
+    def test_acquire_raises_when_out_of_slots(self):
+        """acquire() raises RuntimeError when no free slots."""
+        manager = AdapterSlotManager(max_slots=3)  # Only slots 1, 2 available
+
+        manager.acquire("adapter_a")
+        manager.acquire("adapter_b")
+
+        with pytest.raises(RuntimeError, match="Out of LoRA slots"):
+            manager.acquire("adapter_c")
+
+    def test_release_decrements_refcount(self):
+        """release() decrements refcount."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        slot, _ = manager.acquire("adapter_a")
+        manager.acquire("adapter_a")  # refcount = 2
+        assert manager.refcount(slot) == 2
+
+        manager.release(slot)
+        assert manager.refcount(slot) == 1
+        assert manager.get_adapter_id(slot) == "adapter_a"  # Still mapped
+
+    def test_release_frees_slot_when_refcount_zero(self):
+        """release() returns slot to free pool when refcount hits 0."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        slot, _ = manager.acquire("adapter_a")
+        initial_free = manager.num_free_slots()
+
+        manager.release(slot)
+
+        assert manager.refcount(slot) == 0
+        assert manager.get_adapter_id(slot) is None
+        assert manager.get_slot("adapter_a") is None
+        assert manager.num_free_slots() == initial_free + 1
+
+    def test_release_slot_zero_is_noop(self):
+        """release(0) is a no-op (slot 0 = no LoRA)."""
+        manager = AdapterSlotManager(max_slots=4)
+        manager.release(0)  # Should not raise
+
+    def test_release_out_of_range_raises(self):
+        """release() raises ValueError for out-of-range slots."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        with pytest.raises(ValueError, match="out of range"):
+            manager.release(4)
+
+        with pytest.raises(ValueError, match="out of range"):
+            manager.release(-1)
+
+    def test_release_unallocated_slot_raises(self):
+        """release() raises ValueError if slot has no references."""
+        manager = AdapterSlotManager(max_slots=4)
+        slot, _ = manager.acquire("adapter_a")
+        manager.release(slot)  # refcount = 0
+
+        with pytest.raises(ValueError, match="has no references"):
+            manager.release(slot)
+
+    def test_slot_can_be_reused_after_release(self):
+        """Released slots can be allocated to new adapters."""
+        manager = AdapterSlotManager(max_slots=3)  # Only slots 1, 2 available
+
+        slot_a, _ = manager.acquire("adapter_a")
+        slot_b, _ = manager.acquire("adapter_b")
+        assert manager.num_free_slots() == 0
+
+        # Release adapter_a
+        manager.release(slot_a)
+        assert manager.num_free_slots() == 1
+
+        # New adapter can use the freed slot
+        slot_c, is_new = manager.acquire("adapter_c")
+        assert is_new is True
+        assert slot_c == slot_a  # Reused the freed slot
+        assert manager.get_adapter_id(slot_c) == "adapter_c"
+
+    def test_release_on_error(self):
+        """release_on_error() behaves like release()."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        slot, _ = manager.acquire("adapter_a")
+        initial_free = manager.num_free_slots()
+
+        manager.release_on_error(slot)
+
+        assert manager.refcount(slot) == 0
+        assert manager.num_free_slots() == initial_free + 1
+
+    def test_multiple_sequences_sharing_adapter(self):
+        """Multiple sequences using the same adapter share one slot."""
+        manager = AdapterSlotManager(max_slots=4)
+
+        # Three sequences all using the same adapter
+        slot1, is_new1 = manager.acquire("shared_adapter")
+        slot2, is_new2 = manager.acquire("shared_adapter")
+        slot3, is_new3 = manager.acquire("shared_adapter")
+
+        assert slot1 == slot2 == slot3
+        assert is_new1 is True
+        assert is_new2 is False
+        assert is_new3 is False
+        assert manager.refcount(slot1) == 3
+
+        # Release two sequences
+        manager.release(slot1)
+        manager.release(slot1)
+        assert manager.refcount(slot1) == 1
+        assert manager.get_adapter_id(slot1) == "shared_adapter"
+
+        # Release the last one
+        manager.release(slot1)
+        assert manager.refcount(slot1) == 0
+        assert manager.get_adapter_id(slot1) is None
 

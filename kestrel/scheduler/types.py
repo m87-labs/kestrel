@@ -33,6 +33,7 @@ class GenerationRequest:
     submitted_at: float = 0.0
     skill_state: Optional[SkillState] = field(default=None, repr=False)
     adapter: Optional[str] = None
+    lora_slot: int = 0  # Slot in workspace; 0 = no LoRA
 
     prompt_length: int = field(init=False)
 

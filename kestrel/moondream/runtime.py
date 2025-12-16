@@ -33,7 +33,7 @@ from .text import (
 )
 from .vision import encode_image
 from .lora import LoRA
-from .lora_workspace import TextLoRAWorkspace, TextLoRASlotView
+from .lora_workspace import AdapterSlotManager, TextLoRAWorkspace, TextLoRASlotView
 from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
@@ -92,6 +92,7 @@ class SequenceState:
     prompt_length: int | None = None
     image_length: int = 0
     last_hidden: Tensor | None = None
+    lora_slot: int = 0  # 0 = no LoRA, >0 = slot in TextLoRAWorkspace
 
     def __post_init__(self) -> None:
         if self.prompt_length is None:
@@ -421,10 +422,15 @@ class MoondreamRuntime:
 
         self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
 
-        # Multi-slot LoRA workspace. Slot 0 is always zero (no LoRA).
-        # Phase 1 uses only slot 1 for the single active adapter.
+        # Multi-slot LoRA workspace and slot manager.
+        # Slot 0 is always zero (no LoRA). Active adapters are loaded into slots 1+.
         self._lora_workspace: TextLoRAWorkspace | None = None
+        self._slot_manager: AdapterSlotManager | None = None
         self._max_lora_rank: int | None = max_lora_rank
+        # Tracks the current active LoRA slot for _get_lora_slot_view().
+        # Phase 1 restriction: all active sequences use the same adapter, so this
+        # is the slot for that adapter (or 0 if no adapter is active).
+        self._current_lora_slot: int = 0
         if max_lora_rank is not None:
             # max_slots = max_batch_size + 1 (slot 0 reserved for "no LoRA")
             max_slots = cfg.max_batch_size + 1
@@ -435,6 +441,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.dtype,
             )
+            self._slot_manager = AdapterSlotManager(max_slots)
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
@@ -626,6 +633,7 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
+        lora_slot: int = 0,
     ) -> tuple[SequenceState, Tensor]:
         if isinstance(prompt_tokens, Tensor):
             tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
@@ -715,6 +723,7 @@ class MoondreamRuntime:
             prompt_length=prompt_len,
             image_length=image_length,
             last_hidden=hidden[:, -1, :].squeeze(0).detach(),
+            lora_slot=lora_slot,
         )
         self.active_sequences[batch_idx] = state
         return state, logits
@@ -722,6 +731,8 @@ class MoondreamRuntime:
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)
         self.page_table.erase(state.batch_idx)
+        # Release the adapter slot (no-op if lora_slot == 0)
+        self.release_adapter_slot(state.lora_slot)
 
     # ------------------------------------------------------------------
     # Core forward paths
@@ -769,11 +780,16 @@ class MoondreamRuntime:
         return hidden, logits
 
     def _get_lora_slot_view(self) -> TextLoRASlotView | None:
-        """Get slot view for the current adapter (slot 1), or None if no workspace."""
+        """Get slot view for the current active adapter, or None if no LoRA.
+
+        Phase 1: All active sequences must use the same adapter, so we track a
+        single _current_lora_slot. Returns a view of that slot (or None if slot 0).
+        """
         if self._lora_workspace is None:
             return None
-        # Phase 1: always use slot 1 for the single active adapter
-        return TextLoRASlotView(self._lora_workspace, slot=1)
+        if self._current_lora_slot == 0:
+            return None
+        return TextLoRASlotView(self._lora_workspace, slot=self._current_lora_slot)
 
     def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
         self.decode_batch([state], token_id)
@@ -1023,10 +1039,27 @@ class MoondreamRuntime:
         logits = lm_head(hidden, self.model.text)
         return RuntimeDecodeResult(logits=logits, hidden=hidden)
 
-    def load_adapter_(self, adapter: LoRA) -> None:
-        """Copy adapter weights into the runtime-owned LoRA workspace (slot 1)."""
+    def acquire_adapter_slot(self, adapter_id: str, adapter: LoRA) -> int:
+        """Acquire a slot for an adapter, loading weights if necessary.
 
-        if self._lora_workspace is None:
+        Uses the slot manager to either reuse an existing slot (if the adapter is
+        already resident) or allocate a new one. If newly allocated, copies the
+        adapter weights into the workspace.
+
+        Args:
+            adapter_id: Identifier for the adapter (from settings.adapter).
+            adapter: The LoRA adapter to load (must be on same device/dtype).
+
+        Returns:
+            The slot number assigned to this adapter.
+
+        Raises:
+            NotImplementedError: If no adapter provider is configured, vision LoRA
+                is provided, or adapter is on wrong device/dtype.
+            ValueError: If adapter rank exceeds max_lora_rank.
+            RuntimeError: If no free slots are available.
+        """
+        if self._lora_workspace is None or self._slot_manager is None:
             raise NotImplementedError(
                 "Adapter provider is not configured for this runtime."
             )
@@ -1052,8 +1085,47 @@ class MoondreamRuntime:
                 f"Adapter must have dtype {self.dtype}; received {sample_param.dtype}."
             )
 
-        # Phase 1: load into slot 1 (single active adapter)
-        self._lora_workspace.load_slot_(1, adapter)
+        # Acquire slot (reuse if already resident, allocate if new)
+        slot, is_new = self._slot_manager.acquire(adapter_id)
+
+        if is_new:
+            try:
+                self._lora_workspace.load_slot_(slot, adapter)
+            except Exception:
+                # Rollback on load failure
+                self._slot_manager.release_on_error(slot)
+                raise
+
+        # Update current active slot (Phase 1: single adapter at a time)
+        self._current_lora_slot = slot
+        return slot
+
+    def release_adapter_slot(self, slot: int) -> None:
+        """Release a reference to an adapter slot.
+
+        Decrements the slot's refcount. When the last reference is released,
+        the slot is returned to the free pool.
+
+        Args:
+            slot: The slot to release (0 is a no-op).
+        """
+        if slot == 0:
+            return  # No LoRA, nothing to release
+
+        if self._slot_manager is None:
+            return
+
+        self._slot_manager.release(slot)
+
+        # Update current active slot if this was the last reference
+        # Phase 1: check if any sequences still use a LoRA slot
+        if self._slot_manager.refcount(slot) == 0:
+            # Check if there are other active adapter sequences
+            has_active_adapter = any(
+                seq.lora_slot != 0 for seq in self.active_sequences.values()
+            )
+            if not has_active_adapter:
+                self._current_lora_slot = 0
 
     def _decode_with_graph(
         self,

@@ -262,6 +262,153 @@ class TextLoRAWorkspace:
 
 
 # -----------------------------------------------------------------------------
+# Slot allocator
+# -----------------------------------------------------------------------------
+
+
+class AdapterSlotManager:
+    """Manages adapter-to-slot mapping with reference counting.
+
+    Handles slot allocation/reuse for adapters:
+    - When an adapter is first requested, allocates a free slot
+    - When the same adapter is requested again, reuses the existing slot (refcount++)
+    - When a slot's refcount drops to zero, returns it to the free pool
+
+    Slot 0 is reserved for "no LoRA" and is never allocated or refcounted.
+
+    Thread-safety: This class is NOT thread-safe. It should only be called from
+    the scheduler thread (single owner pattern).
+    """
+
+    def __init__(self, max_slots: int) -> None:
+        """Initialize the slot manager.
+
+        Args:
+            max_slots: Total number of slots (including slot 0).
+        """
+        if max_slots < 2:
+            raise ValueError("max_slots must be >= 2 (slot 0 is reserved)")
+
+        self._max_slots = max_slots
+        self._adapter_to_slot: dict[str, int] = {}
+        self._slot_to_adapter: list[str | None] = [None] * max_slots
+        self._refcounts: list[int] = [0] * max_slots
+        # Free slots as a stack, initialized to [max_slots-1, ..., 2, 1]
+        # Slot 0 is never in this list
+        self._free_slots: list[int] = list(range(max_slots - 1, 0, -1))
+
+    @property
+    def max_slots(self) -> int:
+        return self._max_slots
+
+    def acquire(self, adapter_id: str) -> tuple[int, bool]:
+        """Acquire a slot for an adapter, allocating if necessary.
+
+        If the adapter is already resident, reuses the existing slot and increments
+        the refcount. Otherwise, allocates a new slot from the free pool.
+
+        Args:
+            adapter_id: Identifier for the adapter.
+
+        Returns:
+            Tuple of (slot, is_new) where:
+            - slot: The slot index assigned to this adapter
+            - is_new: True if this is a freshly allocated slot (caller must load weights)
+
+        Raises:
+            RuntimeError: If no free slots are available.
+        """
+        # Check if adapter is already resident
+        if adapter_id in self._adapter_to_slot:
+            slot = self._adapter_to_slot[adapter_id]
+            self._refcounts[slot] += 1
+            return slot, False
+
+        # Need to allocate a new slot
+        if not self._free_slots:
+            # Provide diagnostic info for debugging
+            active_slots = [
+                (slot, self._slot_to_adapter[slot], self._refcounts[slot])
+                for slot in range(1, self._max_slots)
+                if self._refcounts[slot] > 0
+            ]
+            raise RuntimeError(
+                f"Out of LoRA slots: all {self._max_slots - 1} slots are in use. "
+                f"Active slots: {active_slots}"
+            )
+
+        slot = self._free_slots.pop()
+        self._adapter_to_slot[adapter_id] = slot
+        self._slot_to_adapter[slot] = adapter_id
+        self._refcounts[slot] = 1
+        return slot, True
+
+    def release(self, slot: int) -> None:
+        """Release a reference to a slot.
+
+        Decrements the refcount. When it reaches zero, the slot is returned to
+        the free pool and the adapter mapping is cleared.
+
+        Args:
+            slot: The slot to release.
+
+        Raises:
+            ValueError: If slot is 0, out of range, or has no references.
+        """
+        if slot == 0:
+            # Slot 0 is "no LoRA" - no refcounting needed
+            return
+
+        if slot < 0 or slot >= self._max_slots:
+            raise ValueError(f"Slot {slot} out of range [1, {self._max_slots})")
+
+        if self._refcounts[slot] <= 0:
+            raise ValueError(f"Slot {slot} has no references to release")
+
+        self._refcounts[slot] -= 1
+
+        if self._refcounts[slot] == 0:
+            # Return slot to free pool
+            adapter_id = self._slot_to_adapter[slot]
+            if adapter_id is not None:
+                del self._adapter_to_slot[adapter_id]
+            self._slot_to_adapter[slot] = None
+            self._free_slots.append(slot)
+
+    def release_on_error(self, slot: int) -> None:
+        """Release a freshly allocated slot after a loading error.
+
+        This is for cleanup when acquire() succeeded but the subsequent load failed.
+        Only call this for slots that were just allocated (is_new=True from acquire).
+
+        Args:
+            slot: The slot to release.
+        """
+        # Same as release(), but semantically different (error cleanup vs normal release)
+        self.release(slot)
+
+    def get_adapter_id(self, slot: int) -> str | None:
+        """Get the adapter_id for a slot, or None if slot is empty/reserved."""
+        if slot < 0 or slot >= self._max_slots:
+            return None
+        return self._slot_to_adapter[slot]
+
+    def get_slot(self, adapter_id: str) -> int | None:
+        """Get the slot for an adapter_id, or None if not resident."""
+        return self._adapter_to_slot.get(adapter_id)
+
+    def refcount(self, slot: int) -> int:
+        """Get the current refcount for a slot."""
+        if slot < 0 or slot >= self._max_slots:
+            return 0
+        return self._refcounts[slot]
+
+    def num_free_slots(self) -> int:
+        """Get the number of available slots."""
+        return len(self._free_slots)
+
+
+# -----------------------------------------------------------------------------
 # Temporary slot view classes (delete after Tasks 2.8/2.9)
 #
 # These exist only to bridge the gap between the multi-slot workspace and the
@@ -345,5 +492,6 @@ __all__ = [
     "DenseLoRALayerWorkspace",
     "MoELoRALayerWorkspace",
     "TextLoRAWorkspace",
+    "AdapterSlotManager",
     "TextLoRASlotView",
 ]
