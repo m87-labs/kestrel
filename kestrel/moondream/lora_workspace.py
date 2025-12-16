@@ -228,7 +228,10 @@ class TextLoRAWorkspace:
         for layer_idx, layer in enumerate(self.dense):
             adapter_layer = text_lora.get_dense_lora(layer_idx)
             if adapter_layer is None:
-                continue
+                raise ValueError(
+                    f"Adapter missing dense LoRA for layer {layer_idx} "
+                    f"(expected {len(self.dense)} dense layers)"
+                )
             # Copy with rank slicing: adapter may have smaller rank
             layer.up_a[slot, :adapter_rank, :].copy_(adapter_layer.up_a)
             layer.up_b[slot, :, :adapter_rank].copy_(adapter_layer.up_b)
@@ -241,7 +244,10 @@ class TextLoRAWorkspace:
             layer_idx = self.start_layer + moe_idx
             adapter_layer = text_lora.get_moe_lora(layer_idx)
             if adapter_layer is None:
-                continue
+                raise ValueError(
+                    f"Adapter missing MoE LoRA for layer {layer_idx} "
+                    f"(expected {len(self.moe)} MoE layers starting at {self.start_layer})"
+                )
 
             # MoE uses flattened indexing
             for expert_id in range(layer.num_experts):
