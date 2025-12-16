@@ -18,6 +18,7 @@ from kestrel.moondream.runtime import (
     SizeToken,
     Token,
 )
+from kestrel.moondream.lora import AdapterProvider
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import (
     QuerySkill,
@@ -186,8 +187,10 @@ class GenerationScheduler:
         default_temperature: float = 0.2,
         default_top_p: float = 0.9,
         skill_registry: Optional[SkillRegistry] = None,
+        adapter_provider: Optional[AdapterProvider] = None,
     ) -> None:
         self.runtime = runtime
+        self._adapter_provider = adapter_provider
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
         self.running: RunningQueue[ScheduledSequence] = RunningQueue()
         self._completed: Deque[SchedulerResult] = deque()
@@ -268,6 +271,42 @@ class GenerationScheduler:
         self._next_request_id += 1
         return rid
 
+    def _acquire_adapter_slot(self, adapter_id: Optional[str]) -> int:
+        """Acquire a LoRA slot for an adapter at admission time.
+
+        Args:
+            adapter_id: The adapter identifier, or None for no LoRA.
+
+        Returns:
+            The slot index (0 for no LoRA, >0 for active adapter).
+        """
+        if self._adapter_provider is None or adapter_id is None:
+            return 0
+        adapter = self._adapter_provider.get(adapter_id)
+        return self.runtime.acquire_adapter_slot(adapter_id, adapter)
+
+    def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
+        """Fail a request that couldn't be admitted (e.g., adapter load failure)."""
+        _LOGGER.exception(
+            "Failed to admit request %s: %s", request.request_id, exc
+        )
+        now = time.perf_counter()
+        metrics = RequestMetrics(
+            prompt_tokens=request.prompt_length,
+            decode_tokens=0,
+            prefill_time_ms=0.0,
+            ttft_ms=max((now - request.submitted_at) * 1000.0, 0.0),
+            decode_time_ms=0.0,
+        )
+        result = SchedulerResult(
+            request_id=request.request_id,
+            tokens=[],
+            finish_reason="error",
+            metrics=metrics,
+            output={"error": "Request failed during admission"},
+        )
+        self._completed.append(result)
+
     def _try_prefill(self) -> bool:
         progress = False
         while len(self.waiting) and len(self.running) < self.runtime.max_batch_size:
@@ -278,33 +317,50 @@ class GenerationScheduler:
                 break
 
             request = self.waiting.pop()
+
+            # Acquire adapter slot at admission time (not earlier)
+            try:
+                lora_slot = self._acquire_adapter_slot(request.adapter)
+            except Exception as exc:
+                self._fail_request_early(request, exc)
+                progress = True
+                continue
+            request.lora_slot = lora_slot
+
             # If this is a segmentation request with spatial refs, convert
             # placeholder coord/size ids into typed CoordToken/SizeToken
             # so the runtime embeds region features during prefill.
-            prompt_inputs: Tensor | list[Token]
-            ctx = request.request_context
-            if isinstance(ctx, SegmentRequest) and ctx.spatial_refs:
-                coord_id = self.runtime.config.tokenizer.coord_id
-                size_id = self.runtime.config.tokenizer.size_id
-                prompt_inputs = _prompt_with_spatial_tokens(
-                    request.prompt_tokens,
-                    coord_id,
-                    size_id,
-                    ctx.spatial_refs,
+            try:
+                prompt_inputs: Tensor | list[Token]
+                ctx = request.request_context
+                if isinstance(ctx, SegmentRequest) and ctx.spatial_refs:
+                    coord_id = self.runtime.config.tokenizer.coord_id
+                    size_id = self.runtime.config.tokenizer.size_id
+                    prompt_inputs = _prompt_with_spatial_tokens(
+                        request.prompt_tokens,
+                        coord_id,
+                        size_id,
+                        ctx.spatial_refs,
+                    )
+                else:
+                    tokens = request.prompt_tokens.view(1, -1).to(
+                        device=self.runtime.device, dtype=torch.long
+                    )
+                    prompt_inputs = tokens
+                prefill_start = time.perf_counter()
+                state, logits = self.runtime.start_sequence(
+                    prompt_tokens=prompt_inputs,
+                    image=request.image,
+                    image_crops=request.image_crops,
+                    max_new_tokens=request.max_new_tokens,
+                    lora_slot=request.lora_slot,
                 )
-            else:
-                tokens = request.prompt_tokens.view(1, -1).to(
-                    device=self.runtime.device, dtype=torch.long
-                )
-                prompt_inputs = tokens
-            prefill_start = time.perf_counter()
-            state, logits = self.runtime.start_sequence(
-                prompt_tokens=prompt_inputs,
-                image=request.image,
-                image_crops=request.image_crops,
-                max_new_tokens=request.max_new_tokens,
-                lora_slot=request.lora_slot,
-            )
+            except Exception as exc:
+                # Release slot on failure to prevent leak
+                self.runtime.release_adapter_slot(lora_slot)
+                self._fail_request_early(request, exc)
+                progress = True
+                continue
             skill_state = request.skill_state
             if skill_state is None:
                 skill_state = request.skill.create_state(
