@@ -158,12 +158,14 @@ def _refresh_rotary_tables(model: nn.Module) -> None:
     if not hasattr(model, "text") or not hasattr(model, "config"):
         return
     text_cfg = model.config.text
-    model.text.freqs_cis = precompute_freqs_cis(
+    cache: torch.Tensor = model.text.cos_sin_cache
+    cos_sin_cache = precompute_freqs_cis(
         text_cfg.dim // (2 * text_cfg.n_heads),
         text_cfg.max_context,
-        dtype=torch.float32,
-        device=model.text.freqs_cis.device,
+        dtype=cache.dtype,
+        device=cache.device,
     )
+    cache.data.copy_(cos_sin_cache)
 
 
 def load_text_weights(
