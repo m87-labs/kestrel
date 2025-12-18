@@ -119,6 +119,8 @@ class SequenceState:
 @dataclass
 class _GraphWorkspace:
     token_buffer: Tensor
+    coord_values_buffer: Tensor
+    size_values_buffer: Tensor
     batch_idx_buffer: Tensor
     position_buffer: Tensor
     output_buffer: Tensor
@@ -401,6 +403,24 @@ class MoondreamRuntime:
             device=self.device,
             pin_memory=True,
         )
+        coord_dtype = self.region.coord_features.dtype
+        size_dtype = self.region.size_features.dtype
+        self._coord_values = CpuGpuBuffer(
+            self.max_batch_size,
+            1,
+            dtype=coord_dtype,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
+        self._size_values = CpuGpuBuffer(
+            self.max_batch_size,
+            2,
+            dtype=size_dtype,
+            device=self.device,
+            pin_memory=True,
+            with_numpy=False,
+        )
         self._lora_slot_ids = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.int32,
@@ -544,61 +564,40 @@ class MoondreamRuntime:
 
         return out
 
-    def _embed_token_batch(self, tokens: Sequence[Token]) -> Tensor:
-        """Embed N pending tokens (one per active sequence) into (N, 1, dim)."""
-        if not tokens:
+    def _embed_packed_token_batch(
+        self,
+        token_ids: Tensor,
+        coord_values: Tensor,
+        size_values: Tensor,
+    ) -> Tensor:
+        """Embed pending decode tokens from packed id/value tensors.
+
+        `coord_values`/`size_values` are meaningful only for rows whose token id is
+        the corresponding special token (coord_id/size_id); other rows should be
+        zero-filled.
+        """
+
+        if token_ids.ndim != 1:
+            token_ids = token_ids.view(-1)
+
+        batch = int(token_ids.shape[0])
+        if batch == 0:
             dim = self.bos_embed.shape[-1]
             return torch.empty((0, 1, dim), device=self.device, dtype=self.dtype)
 
-        batch = len(tokens)
-        dim = self.bos_embed.shape[-1]
-        out = torch.empty((batch, 1, dim), device=self.device, dtype=self.dtype)
+        ids = token_ids.to(dtype=torch.long)
+        text_emb = text_encoder(ids.view(-1, 1), self.model.text)
 
-        text_idx: list[int] = []
-        text_ids: list[int] = []
-        coord_idx: list[int] = []
-        coord_vals: list[float] = []
-        size_idx: list[int] = []
-        size_vals: list[tuple[float, float]] = []
+        coord_emb = encode_coordinate(coord_values, self.region).unsqueeze(1)
+        size_emb = encode_size(size_values, self.region).unsqueeze(1)
 
-        for i, token in enumerate(tokens):
-            if isinstance(token, TextToken):
-                text_idx.append(i)
-                text_ids.append(token.token_id)
-            elif isinstance(token, CoordToken):
-                coord_idx.append(i)
-                coord_vals.append(token.pos)
-            elif isinstance(token, SizeToken):
-                size_idx.append(i)
-                size_vals.append((token.width, token.height))
-            else:  # pragma: no cover - defensive
-                raise TypeError(f"Unsupported token type: {type(token)!r}")
+        coord_id = self.config.tokenizer.coord_id
+        size_id = self.config.tokenizer.size_id
+        coord_mask = (ids == coord_id).view(-1, 1, 1)
+        size_mask = (ids == size_id).view(-1, 1, 1)
 
-        if text_idx:
-            ids = torch.tensor(text_ids, device=self.device, dtype=torch.long).view(
-                len(text_idx), 1
-            )
-            embeds = text_encoder(ids, self.model.text)
-            out[text_idx, :, :] = embeds
-
-        if coord_idx:
-            coords = torch.tensor(
-                coord_vals,
-                device=self.device,
-                dtype=self.region.coord_features.dtype,
-            ).view(len(coord_idx), 1)
-            embeds = encode_coordinate(coords, self.region)
-            out[coord_idx, 0, :] = embeds
-
-        if size_idx:
-            sizes = torch.tensor(
-                size_vals,
-                device=self.device,
-                dtype=self.region.size_features.dtype,
-            )
-            embeds = encode_size(sizes, self.region)
-            out[size_idx, 0, :] = embeds
-
+        out = torch.where(coord_mask, coord_emb, text_emb)
+        out = torch.where(size_mask, size_emb, out)
         return out
 
     def render_token(self, token_id: int, hidden: Tensor) -> Token:
@@ -807,10 +806,6 @@ class MoondreamRuntime:
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
 
-    def decode(self, state: SequenceState, token_id: Tensor | Token) -> None:
-        self.decode_batch([state], token_id)
-        state.advance()
-
     def decode_batch(
         self,
         states: Sequence[SequenceState],
@@ -828,7 +823,8 @@ class MoondreamRuntime:
         lora_slot_ids = self._lora_slot_ids.copy_to_gpu(batch_size)
 
         tokens_tensor: Optional[Tensor] = None
-        token_seq: Optional[Sequence[Token]] = None
+        coord_values: Optional[Tensor] = None
+        size_values: Optional[Tensor] = None
 
         if isinstance(token_inputs, Tensor):
             tokens_tensor = token_inputs
@@ -844,12 +840,43 @@ class MoondreamRuntime:
             host_tokens = self._tokens.cpu[:batch_size]
             host_tokens.copy_(tokens_tensor)
             tokens_tensor = self._tokens.copy_to_gpu(batch_size)
+            coord_values = self._coord_values.gpu[:batch_size]
+            size_values = self._size_values.gpu[:batch_size]
+            coord_values.zero_()
+            size_values.zero_()
         else:
             token_seq = list(token_inputs)
             if len(token_seq) != len(states):
                 raise ValueError(
                     "token list and states must have matching batch dimensions"
                 )
+            host_tokens = self._tokens.cpu[:batch_size]
+            host_coords = self._coord_values.cpu[:batch_size]
+            host_sizes = self._size_values.cpu[:batch_size]
+            host_coords.zero_()
+            host_sizes.zero_()
+
+            coord_id = self.config.tokenizer.coord_id
+            size_id = self.config.tokenizer.size_id
+            for i, token in enumerate(token_seq):
+                if isinstance(token, TextToken):
+                    host_tokens[i] = token.token_id
+                elif isinstance(token, CoordToken):
+                    host_tokens[i] = coord_id
+                    host_coords[i, 0] = token.pos
+                elif isinstance(token, SizeToken):
+                    host_tokens[i] = size_id
+                    host_sizes[i, 0] = token.width
+                    host_sizes[i, 1] = token.height
+                else:  # pragma: no cover - defensive
+                    raise TypeError(f"Unsupported token type: {type(token)!r}")
+
+            tokens_tensor = self._tokens.copy_to_gpu(batch_size)
+            coord_values = self._coord_values.copy_to_gpu(batch_size)
+            size_values = self._size_values.copy_to_gpu(batch_size)
+
+        if tokens_tensor is None or coord_values is None or size_values is None:
+            raise RuntimeError("Decode token buffers are not initialized")
 
         batch_size = batch_idx.shape[0]
         result: RuntimeDecodeResult
@@ -873,16 +900,22 @@ class MoondreamRuntime:
                     f"No CUDA graph captured for batch size {graph_batch_size}"
                 )
             result = self._decode_with_graph(
-                batch_idx, tokens_tensor, input_pos, lora_slot_ids, graph_batch_size
-            )
-        else:
-            token_arg: Tensor | Sequence[Token]
-            token_arg = tokens_tensor if tokens_tensor is not None else token_seq  # type: ignore[assignment]
-            result = self._decode_step(
                 batch_idx,
-                token_arg,
+                tokens_tensor,
+                coord_values,
+                size_values,
                 input_pos,
                 lora_slot_ids,
+                graph_batch_size,
+            )
+        else:
+            result = self._decode_step(
+                batch_idx,
+                tokens_tensor,
+                input_pos,
+                lora_slot_ids,
+                coord_values=coord_values,
+                size_values=size_values,
                 input_pos_cpu=self._input_pos.cpu[:batch_size],
             )
 
@@ -1022,10 +1055,12 @@ class MoondreamRuntime:
     def _decode_step(
         self,
         batch_idx: Tensor,
-        token_inputs: Tensor | Sequence[Token],
+        token_ids: Tensor,
         input_pos: Tensor,
         lora_slot_ids: Tensor,
         *,
+        coord_values: Optional[Tensor] = None,
+        size_values: Optional[Tensor] = None,
         use_graph: bool = False,
         full_batch_size: Optional[int] = None,
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
@@ -1034,10 +1069,10 @@ class MoondreamRuntime:
     ) -> RuntimeDecodeResult:
         self._batch_binding.tensor = batch_idx
 
-        if isinstance(token_inputs, Tensor):
-            embeds = text_encoder(token_inputs.view(-1, 1), self.model.text)
+        if coord_values is not None and size_values is not None:
+            embeds = self._embed_packed_token_batch(token_ids, coord_values, size_values)
         else:
-            embeds = self._embed_token_batch(token_inputs)
+            embeds = text_encoder(token_ids.view(-1, 1), self.model.text)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
         slot_mapping = self.page_table.build_slot_mapping(
             batch_idx=batch_idx.view(-1, 1), positions=position_ids
@@ -1159,6 +1194,8 @@ class MoondreamRuntime:
         self,
         batch_idx: Tensor,
         tokens: Tensor,
+        coord_values: Tensor,
+        size_values: Tensor,
         input_pos: Tensor,
         lora_slot_ids: Tensor,
         graph_batch_size: int,
@@ -1174,6 +1211,8 @@ class MoondreamRuntime:
         batch_size = batch_idx.shape[0]
         self._clear_graph_inputs(graph_batch_size)
         workspace.token_buffer[:batch_size, 0].copy_(tokens)
+        workspace.coord_values_buffer[:batch_size].copy_(coord_values)
+        workspace.size_values_buffer[:batch_size].copy_(size_values)
         workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
         workspace.position_buffer[:batch_size].copy_(input_pos)
         workspace.lora_slot_ids_buffer[:batch_size].copy_(lora_slot_ids)
@@ -1242,6 +1281,16 @@ class MoondreamRuntime:
         token_buffer = torch.zeros(
             (max_effective_batch, 1), device=self.device, dtype=torch.long
         )
+        coord_values_buffer = torch.zeros(
+            (max_effective_batch, 1),
+            device=self.device,
+            dtype=self.region.coord_features.dtype,
+        )
+        size_values_buffer = torch.zeros(
+            (max_effective_batch, 2),
+            device=self.device,
+            dtype=self.region.size_features.dtype,
+        )
         batch_idx_buffer = torch.zeros(
             (max_effective_batch,), device=self.device, dtype=torch.long
         )
@@ -1263,6 +1312,8 @@ class MoondreamRuntime:
         )
         self._graph_workspace = _GraphWorkspace(
             token_buffer=token_buffer,
+            coord_values_buffer=coord_values_buffer,
+            size_values_buffer=size_values_buffer,
             batch_idx_buffer=batch_idx_buffer,
             position_buffer=position_buffer,
             output_buffer=output_buffer,
@@ -1292,7 +1343,10 @@ class MoondreamRuntime:
             # so it provides valid memory access patterns without requiring allocation.
             workspace.batch_idx_buffer.zero_()
             workspace.token_buffer.zero_()
+            workspace.coord_values_buffer.zero_()
+            workspace.size_values_buffer.zero_()
             workspace.position_buffer.zero_()
+            workspace.lora_slot_ids_buffer.zero_()
 
             try:
 
@@ -1312,6 +1366,8 @@ class MoondreamRuntime:
                             workspace.position_buffer[:bs],
                             workspace.lora_slot_ids_buffer[:bs],
                             use_graph=True,
+                            coord_values=workspace.coord_values_buffer[:bs],
+                            size_values=workspace.size_values_buffer[:bs],
                             full_batch_size=bs,
                             flashinfer_metadata=metadata,
                             skip_plan=False,
@@ -1328,6 +1384,8 @@ class MoondreamRuntime:
                                 workspace.position_buffer[:bs],
                                 workspace.lora_slot_ids_buffer[:bs],
                                 use_graph=True,
+                                coord_values=workspace.coord_values_buffer[:bs],
+                                size_values=workspace.size_values_buffer[:bs],
                                 full_batch_size=bs,
                                 flashinfer_metadata=metadata,
                                 skip_plan=True,
@@ -1355,6 +1413,8 @@ class MoondreamRuntime:
         if limit <= 0:
             limit = workspace.token_buffer.shape[0]
         workspace.token_buffer[:limit].zero_()
+        workspace.coord_values_buffer[:limit].zero_()
+        workspace.size_values_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
         workspace.lora_slot_ids_buffer[:limit].zero_()
