@@ -201,9 +201,22 @@ class GenerationScheduler:
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
         self._pinned_token_buffer = torch.empty(
-            runtime.max_batch_size, dtype=torch.long, device="cpu"
-        ).pin_memory()
-        self._pinned_token_np = self._pinned_token_buffer.numpy()
+            runtime.max_batch_size, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        coord_dtype = runtime.region.coord_features.dtype
+        size_dtype = runtime.region.size_features.dtype
+        self._pinned_coord_buffer = torch.empty(
+            (runtime.max_batch_size, 1),
+            dtype=coord_dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._pinned_size_buffer = torch.empty(
+            (runtime.max_batch_size, 2),
+            dtype=size_dtype,
+            device="cpu",
+            pin_memory=True,
+        )
         self._sample_buffer = _SampleBuffer(runtime.max_batch_size, runtime.device)
         self._flashinfer_rng = torch.Generator(device=runtime.device)
         self._flashinfer_rng.manual_seed(torch.seed())
@@ -416,26 +429,39 @@ class GenerationScheduler:
             self.running.extend(idle)
             return False
 
-        pending_tokens: list[Token] = []
-        all_text = True
-        for seq in active:
+        count = len(active)
+        token_ids = self._pinned_token_buffer[:count]
+        coord_values = self._pinned_coord_buffer[:count]
+        size_values = self._pinned_size_buffer[:count]
+        coord_values.zero_()
+        size_values.zero_()
+
+        coord_id = self.runtime.config.tokenizer.coord_id
+        size_id = self.runtime.config.tokenizer.size_id
+        for i, seq in enumerate(active):
             token = seq.pending_token
             if token is None:
                 raise RuntimeError(
                     "ScheduledSequence has no pending token during decode"
                 )
-            pending_tokens.append(token)
-            if not isinstance(token, TextToken):
-                all_text = False
+            if isinstance(token, TextToken):
+                token_ids[i] = token.token_id
+            elif isinstance(token, CoordToken):
+                token_ids[i] = coord_id
+                coord_values[i, 0] = token.pos
+            elif isinstance(token, SizeToken):
+                token_ids[i] = size_id
+                size_values[i, 0] = token.width
+                size_values[i, 1] = token.height
+            else:  # pragma: no cover - defensive
+                raise TypeError(f"Unsupported token type: {type(token)!r}")
 
-        if all_text:
-            count = len(pending_tokens)
-            self._pinned_token_np[:count] = [token.token_id for token in pending_tokens]
-            token_input = self._pinned_token_buffer[:count]
-        else:
-            token_input = pending_tokens
-
-        logits = self.runtime.decode_batch([seq.state for seq in active], token_input)
+        logits = self.runtime.decode_batch(
+            [seq.state for seq in active],
+            token_ids,
+            coord_values,
+            size_values,
+        )
 
         sampled_tokens = self._sample_batch(logits, [seq.request for seq in active])
         transfer = self._sample_buffer.transfer(sampled_tokens)
