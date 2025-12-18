@@ -822,28 +822,22 @@ class MoondreamRuntime:
         input_pos = self._input_pos.copy_to_gpu(batch_size)
         lora_slot_ids = self._lora_slot_ids.copy_to_gpu(batch_size)
 
-        tokens_tensor: Optional[Tensor] = None
-        coord_values: Optional[Tensor] = None
-        size_values: Optional[Tensor] = None
-
         if isinstance(token_inputs, Tensor):
-            tokens_tensor = token_inputs
-            if tokens_tensor.ndim > 1:
-                tokens_tensor = tokens_tensor.view(-1)
-            if tokens_tensor.shape[0] != len(states):
+            token_ids = token_inputs
+            if token_ids.ndim > 1:
+                token_ids = token_ids.view(-1)
+            if token_ids.shape[0] != len(states):
                 raise ValueError(
                     "token_ids and states must have matching batch dimensions"
                 )
-            if tokens_tensor.device.type != "cpu":
-                tokens_tensor = tokens_tensor.to(device="cpu")
-            tokens_tensor = tokens_tensor.to(dtype=torch.long)
+            if token_ids.device.type != "cpu":
+                token_ids = token_ids.to(device="cpu")
+            token_ids = token_ids.to(dtype=torch.long)
             host_tokens = self._tokens.cpu[:batch_size]
-            host_tokens.copy_(tokens_tensor)
-            tokens_tensor = self._tokens.copy_to_gpu(batch_size)
+            host_tokens.copy_(token_ids)
+            token_ids = self._tokens.copy_to_gpu(batch_size)
             coord_values = self._coord_values.gpu[:batch_size]
             size_values = self._size_values.gpu[:batch_size]
-            coord_values.zero_()
-            size_values.zero_()
         else:
             token_seq = list(token_inputs)
             if len(token_seq) != len(states):
@@ -853,8 +847,6 @@ class MoondreamRuntime:
             host_tokens = self._tokens.cpu[:batch_size]
             host_coords = self._coord_values.cpu[:batch_size]
             host_sizes = self._size_values.cpu[:batch_size]
-            host_coords.zero_()
-            host_sizes.zero_()
 
             coord_id = self.config.tokenizer.coord_id
             size_id = self.config.tokenizer.size_id
@@ -871,20 +863,13 @@ class MoondreamRuntime:
                 else:  # pragma: no cover - defensive
                     raise TypeError(f"Unsupported token type: {type(token)!r}")
 
-            tokens_tensor = self._tokens.copy_to_gpu(batch_size)
+            token_ids = self._tokens.copy_to_gpu(batch_size)
             coord_values = self._coord_values.copy_to_gpu(batch_size)
             size_values = self._size_values.copy_to_gpu(batch_size)
 
-        if tokens_tensor is None or coord_values is None or size_values is None:
-            raise RuntimeError("Decode token buffers are not initialized")
-
         batch_size = batch_idx.shape[0]
         result: RuntimeDecodeResult
-        if (
-            tokens_tensor is not None
-            and self._use_cuda_graphs
-            and batch_size > 0
-        ):
+        if self._use_cuda_graphs and batch_size > 0:
             graph_batch_size = self._select_graph_batch_size(batch_size)
             if graph_batch_size is None:
                 raise RuntimeError(
@@ -901,7 +886,7 @@ class MoondreamRuntime:
                 )
             result = self._decode_with_graph(
                 batch_idx,
-                tokens_tensor,
+                token_ids,
                 coord_values,
                 size_values,
                 input_pos,
@@ -911,7 +896,7 @@ class MoondreamRuntime:
         else:
             result = self._decode_step(
                 batch_idx,
-                tokens_tensor,
+                token_ids,
                 input_pos,
                 lora_slot_ids,
                 coord_values=coord_values,
@@ -1059,8 +1044,8 @@ class MoondreamRuntime:
         input_pos: Tensor,
         lora_slot_ids: Tensor,
         *,
-        coord_values: Optional[Tensor] = None,
-        size_values: Optional[Tensor] = None,
+        coord_values: Tensor,
+        size_values: Tensor,
         use_graph: bool = False,
         full_batch_size: Optional[int] = None,
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
@@ -1069,10 +1054,7 @@ class MoondreamRuntime:
     ) -> RuntimeDecodeResult:
         self._batch_binding.tensor = batch_idx
 
-        if coord_values is not None and size_values is not None:
-            embeds = self._embed_packed_token_batch(token_ids, coord_values, size_values)
-        else:
-            embeds = text_encoder(token_ids.view(-1, 1), self.model.text)
+        embeds = self._embed_packed_token_batch(token_ids, coord_values, size_values)
         position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
         slot_mapping = self.page_table.build_slot_mapping(
             batch_idx=batch_idx.view(-1, 1), positions=position_ids
@@ -1413,8 +1395,6 @@ class MoondreamRuntime:
         if limit <= 0:
             limit = workspace.token_buffer.shape[0]
         workspace.token_buffer[:limit].zero_()
-        workspace.coord_values_buffer[:limit].zero_()
-        workspace.size_values_buffer[:limit].zero_()
         workspace.batch_idx_buffer[:limit].zero_()
         workspace.position_buffer[:limit].zero_()
         workspace.lora_slot_ids_buffer[:limit].zero_()

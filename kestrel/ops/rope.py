@@ -211,15 +211,36 @@ def precompute_freqs_cis(
     *,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
+    """Precompute RoPE cos/sin cache in vLLM format.
+
+    Args:
+        dim: Rotary dimension (must be even). The cache will have shape
+            ``[end, dim]`` where the first ``dim//2`` columns are ``cos`` and
+            the last ``dim//2`` columns are ``sin``.
+        end: Maximum sequence length (number of positions).
+        theta: RoPE base.
+        dtype: Output dtype.
+        device: Output device.
+    """
     if device is not None:
         device = torch.device(device)
 
-    freq_indices = torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)]
-    freqs = 1.0 / (theta ** (freq_indices / dim))
-    t = torch.arange(end, dtype=dtype, device=device).unsqueeze(1)
-    freqs = t * freqs.unsqueeze(0)
-    freqs = torch.exp(1j * freqs)
-    return torch.stack([freqs.real, freqs.imag], dim=-1)
+    if dim % 2 != 0:
+        raise ValueError("dim must be even")
+
+    # Compute in fp32 for stability, then cast to the requested dtype.
+    inv_freq = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+            / float(dim)
+        )
+    )
+    t = torch.arange(end, dtype=torch.float32, device=device).unsqueeze(1)
+    freqs = t * inv_freq.unsqueeze(0)  # [end, dim//2]
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    return torch.cat([cos, sin], dim=-1).to(dtype=dtype)
 
 
 __all__ = ["apply_rotary_emb", "precompute_freqs_cis"]

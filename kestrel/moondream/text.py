@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm import _custom_ops as vllm_ops
+
 from .config import TextConfig
 from .layers import (
     build_dense_mlp,
@@ -22,7 +24,7 @@ from .layers import (
     MLPWeights,
 )
 from .lora_workspace import TextLoRAWorkspace
-from ..ops import apply_rotary_emb, precompute_freqs_cis
+from ..ops import precompute_freqs_cis
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
@@ -39,7 +41,7 @@ def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
 def attn(
     x: torch.Tensor,
     module: nn.Module,
-    freqs_cis: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     kv_cache: Optional[nn.Module],
     attn_mask: Optional[torch.Tensor],
     n_heads: int,
@@ -92,17 +94,20 @@ def attn(
         q.mul_((tok_q + tau_pos).unsqueeze(-1))
         v.mul_((tok_v + tau_pos).unsqueeze(-1))
 
-    cos = freqs_cis[..., 0][position_ids]
-    sin = freqs_cis[..., 1][position_ids]
-    if cos.ndim == 2:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    q, k = apply_rotary_emb(
+    # Use vLLM's in-place rotary embedding kernel (GPT-NeoX style).
+    # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    vllm_ops.rotary_embedding(
+        position_matrix,
         q,
         k,
-        cos.contiguous(),
-        sin.contiguous(),
+        head_dim,
+        cos_sin_cache,
+        True,
     )
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
 
     flash_ctx = None
     metadata = None
@@ -227,7 +232,7 @@ def text_decoder(
         attn_out = attn(
             x_norm,
             block.attn,
-            module.freqs_cis,
+            module.cos_sin_cache,
             block.kv_cache,
             attn_mask,
             config.n_heads,
@@ -348,13 +353,13 @@ def build_text_model(
     )
 
     text.wte = nn.Parameter(torch.empty(config.vocab_size, config.dim, dtype=dtype))
-    text.register_buffer(
-        "freqs_cis",
-        precompute_freqs_cis(
-            config.dim // (2 * config.n_heads), config.max_context, device=device
-        ),
-        persistent=False,
+    cos_sin_cache = precompute_freqs_cis(
+        config.dim // (2 * config.n_heads),
+        config.max_context,
+        dtype=dtype,
+        device=device,
     )
+    text.register_buffer("cos_sin_cache", cos_sin_cache, persistent=False)
 
     for block in text["blocks"]:
         block.kv_cache = None
