@@ -348,6 +348,7 @@ class PageTable:
         batch_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         out_kv_indices: torch.Tensor,
+        total_pages: int | None = None,
     ) -> torch.Tensor:
         if batch_idx.ndim != 1:
             raise ValueError("batch_idx must be 1D for FlashInfer metadata")
@@ -363,7 +364,12 @@ class PageTable:
         if not kv_indptr.is_contiguous():
             kv_indptr = kv_indptr.contiguous()
 
-        total_pages = int(kv_indptr[-1].item())
+        if total_pages is None:
+            total_pages = int(kv_indptr[-1].item())
+        else:
+            total_pages = int(total_pages)
+            if total_pages < 0:
+                raise ValueError("total_pages must be non-negative")
         if total_pages == 0:
             return out_kv_indices[:0]
         if out_kv_indices.shape[0] < total_pages:

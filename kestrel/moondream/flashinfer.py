@@ -156,6 +156,7 @@ class _GraphState:
     kv_indptr_buffer: CpuGpuBuffer
     kv_last_page_len_buffer: CpuGpuBuffer
     pages_filled: int = 0
+    last_planned_kv_indptr: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -240,6 +241,16 @@ class FlashInferDecodeContext:
                 )
             self._active_graph_state = state
 
+            # CUDAGraph decode uses fixed GPU-side buffers. When the page topology
+            # (kv_indptr) is unchanged, we can reuse the existing FlashInfer plan info
+            # and avoid calling plan() again. The per-step buffers (indptr/indices/last_page_len)
+            # are updated by our metadata builder.
+            backend = getattr(state.wrapper, "_backend", None)
+            can_skip_plan = (not state.wrapper.use_tensor_cores) and backend != "trtllm-gen"
+            if can_skip_plan and state.last_planned_kv_indptr is not None:
+                if torch.equal(state.last_planned_kv_indptr, state.kv_indptr_cpu):
+                    return
+
             state.wrapper.plan(
                 metadata.kv_indptr,
                 metadata.kv_indices,
@@ -252,6 +263,10 @@ class FlashInferDecodeContext:
                 q_data_type=self.q_dtype,
                 kv_data_type=self.kv_dtype,
             )
+            if state.last_planned_kv_indptr is None:
+                state.last_planned_kv_indptr = state.kv_indptr_cpu.detach().clone()
+            else:
+                state.last_planned_kv_indptr.copy_(state.kv_indptr_cpu, non_blocking=True)
         else:
             self._active_graph_state = None
             self._decode_wrapper.plan(

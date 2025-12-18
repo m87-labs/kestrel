@@ -878,7 +878,13 @@ class MoondreamRuntime:
         else:
             token_arg: Tensor | Sequence[Token]
             token_arg = tokens_tensor if tokens_tensor is not None else token_seq  # type: ignore[assignment]
-            result = self._decode_step(batch_idx, token_arg, input_pos, lora_slot_ids)
+            result = self._decode_step(
+                batch_idx,
+                token_arg,
+                input_pos,
+                lora_slot_ids,
+                input_pos_cpu=self._input_pos.cpu[:batch_size],
+            )
 
         hidden_last = result.hidden[:, -1, :]
         for state, vec in zip(states, hidden_last):
@@ -893,6 +899,7 @@ class MoondreamRuntime:
         *,
         full_batch_size: Optional[int] = None,
         use_graph: bool = False,
+        input_pos_cpu: Optional[Tensor] = None,
     ) -> FlashInferBatchMetadata:
         if batch_idx.ndim != 1:
             raise ValueError("batch_idx must be 1D")
@@ -906,8 +913,18 @@ class MoondreamRuntime:
         seq_lens_np = buffers.seq_lens_np[:target_batch]
         seq_lens_np.fill(0)
         if batch_size:
-            seq_lens_cpu_tensor = buffers.seq_lens_cpu[:batch_size]
-            seq_lens_cpu_tensor.copy_(input_pos[:batch_size])
+            if input_pos_cpu is not None:
+                if input_pos_cpu.device.type != "cpu":
+                    raise ValueError("input_pos_cpu must be a CPU tensor")
+                copy_len = min(batch_size, int(input_pos_cpu.shape[0]))
+                if copy_len:
+                    buffers.seq_lens_cpu[:copy_len].copy_(
+                        input_pos_cpu[:copy_len].to(dtype=torch.int32),
+                        non_blocking=True,
+                    )
+            else:
+                seq_lens_cpu_tensor = buffers.seq_lens_cpu[:batch_size]
+                seq_lens_cpu_tensor.copy_(input_pos[:batch_size])
             seq_lens_np[:batch_size] += 1
 
         num_pages_np = buffers.num_pages_np[:target_batch]
@@ -957,6 +974,7 @@ class MoondreamRuntime:
                 batch_idx=expanded_batch,
                 kv_indptr=kv_indptr,
                 out_kv_indices=kv_indices,
+                total_pages=total_pages,
             )
 
         pages_filled = total_pages
@@ -1012,6 +1030,7 @@ class MoondreamRuntime:
         full_batch_size: Optional[int] = None,
         flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
         skip_plan: bool = False,
+        input_pos_cpu: Optional[Tensor] = None,
     ) -> RuntimeDecodeResult:
         self._batch_binding.tensor = batch_idx
 
@@ -1031,6 +1050,7 @@ class MoondreamRuntime:
                 input_pos,
                 full_batch_size=full_batch_size,
                 use_graph=use_graph,
+                input_pos_cpu=input_pos_cpu,
             )
 
         if not skip_plan:
@@ -1162,6 +1182,7 @@ class MoondreamRuntime:
             workspace.position_buffer[:graph_batch_size],
             full_batch_size=graph_batch_size,
             use_graph=True,
+            input_pos_cpu=self._input_pos.cpu[:batch_size],
         )
         self._batch_binding.tensor = workspace.batch_idx_buffer[:graph_batch_size]
         self._flashinfer_ctx.plan(
