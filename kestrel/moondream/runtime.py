@@ -45,8 +45,6 @@ from .region import (
     build_region_module,
     encode_coordinate,
     encode_size,
-    decode_coordinate,
-    decode_size,
 )
 from ..seg_refiner import SegmentRefiner
 
@@ -395,8 +393,9 @@ class MoondreamRuntime:
         )
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
-        # Decode token/value inputs are always provided by the scheduler as
-        # pinned CPU tensors; keep only the reusable GPU staging buffers here.
+        # Decode token/value inputs are staged by the scheduler; keep reusable
+        # GPU buffers here to avoid per-step allocations regardless of whether
+        # the scheduler passes CPU or GPU tensors.
         self._tokens = torch.empty(
             (self.max_batch_size,), device=self.device, dtype=torch.long
         )
@@ -585,38 +584,6 @@ class MoondreamRuntime:
         out = torch.where(size_mask, size_emb, out)
         return out
 
-    def render_token(self, token_id: int, hidden: Tensor) -> Token:
-        """Materialise a sampled id into its typed token, decoding coords/sizes."""
-        coord_id = self.config.tokenizer.coord_id
-        size_id = self.config.tokenizer.size_id
-
-        hidden_row = hidden.squeeze(0) if hidden.ndim == 2 else hidden
-        hidden_batch = hidden_row.unsqueeze(0)
-
-        if token_id == coord_id:
-            logits = decode_coordinate(hidden_batch, self.region).squeeze(0)
-            bins = logits.shape[-1]
-            index = torch.argmax(logits).item()
-            denom = max(bins - 1, 1)
-            pos = float(min(max(index / denom, 0.0), 1.0))
-            return CoordToken(pos=pos)
-
-        if token_id == size_id:
-            logits = decode_size(hidden_batch, self.region)
-            width_logits = logits[0]
-            height_logits = logits[1]
-            bins = width_logits.shape[-1]
-            width_bin = torch.argmax(width_logits).item()
-            height_bin = torch.argmax(height_logits).item()
-            scale = float(bins - 1) if bins > 1 else 1.0
-            width = 2.0 ** ((width_bin / scale) * 10.0 - 10.0)
-            height = 2.0 ** ((height_bin / scale) * 10.0 - 10.0)
-            width = float(min(max(width, 0.0), 1.0))
-            height = float(min(max(height, 0.0), 1.0))
-            return SizeToken(width=width, height=height)
-
-        return TextToken(token_id=token_id)
-
     def encode_image(
         self,
         image: Optional[pyvips.Image | np.ndarray],
@@ -797,7 +764,7 @@ class MoondreamRuntime:
         token_ids: Tensor,
         coord_values: Tensor,
         size_values: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         if not states:
             raise ValueError("states must not be empty")
 
@@ -866,7 +833,7 @@ class MoondreamRuntime:
         for state, vec in zip(states, hidden_last):
             state.last_hidden = vec.detach()
 
-        return result.logits
+        return result.logits, hidden_last
 
     def _build_flashinfer_metadata(
         self,

@@ -20,11 +20,11 @@ from kestrel.moondream.runtime import (
 )
 from kestrel.moondream.lora import AdapterProvider
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.utils.buffers import CpuGpuBuffer
 from kestrel.skills import (
     QuerySkill,
     SegmentRequest,
     SkillRegistry,
-    SkillSpec,
     SkillState,
 )
 
@@ -37,7 +37,6 @@ from .types import (
     StreamCallback,
 )
 from .sampling import sample_tokens
-from kestrel.utils.buffers import CpuGpuBuffer
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -138,43 +137,91 @@ def _prompt_with_spatial_tokens(
 
     return out
 
-class _SampleBuffer:
-    """Pinned host buffer for sampled token ids with optional async copy."""
+class _RenderBuffer:
+    """Pinned host buffers for sampled ids + decoded coord/size values."""
 
-    def __init__(self, max_batch: int, device: torch.device) -> None:
-        self._buffer = CpuGpuBuffer(
-            max_batch,
+    def __init__(
+        self,
+        max_batch: int,
+        device: torch.device,
+        *,
+        coord_dtype: torch.dtype,
+        size_dtype: torch.dtype,
+    ) -> None:
+        self._token_ids = torch.empty(
+            (max_batch,),
             dtype=torch.long,
-            device=device,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._coord_values = torch.empty(
+            (max_batch, 1),
+            dtype=coord_dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._size_values = torch.empty(
+            (max_batch, 2),
+            dtype=size_dtype,
+            device="cpu",
             pin_memory=True,
         )
         self._device = device
         self._stream = torch.cuda.Stream(device=device)
         self._event = torch.cuda.Event(enable_timing=False, blocking=False)
 
-    class TransferHandle:
-        def __init__(self, event: torch.cuda.Event, cpu_view: Tensor, count: int) -> None:
+    class _TransferHandle:
+        def __init__(
+            self,
+            event: torch.cuda.Event,
+            token_ids: Tensor,
+            coord_values: Tensor,
+            size_values: Tensor,
+            count: int,
+        ) -> None:
             self._event = event
-            self._cpu_view = cpu_view
+            self._token_ids = token_ids
+            self._coord_values = coord_values
+            self._size_values = size_values
             self._count = count
 
-        def wait(self) -> Tensor:
+        def wait(self) -> tuple[Tensor, Tensor, Tensor]:
             if self._count == 0:
-                return self._cpu_view[:0]
+                empty = self._token_ids[:0]
+                return empty, self._coord_values[:0], self._size_values[:0]
             self._event.synchronize()
-            return self._cpu_view[: self._count]
+            return (
+                self._token_ids[: self._count],
+                self._coord_values[: self._count],
+                self._size_values[: self._count],
+            )
 
-    def transfer(self, tensor: Tensor) -> "_SampleBuffer.TransferHandle":
-        count = int(tensor.shape[0])
+    def transfer(
+        self,
+        token_ids: Tensor,
+        coord_values: Tensor,
+        size_values: Tensor,
+    ) -> "_RenderBuffer._TransferHandle":
+        count = int(token_ids.shape[0])
         if count == 0:
-            return _SampleBuffer.TransferHandle(self._event, self._buffer.cpu, 0)
+            return _RenderBuffer._TransferHandle(
+                self._event,
+                self._token_ids,
+                self._coord_values,
+                self._size_values,
+                0,
+            )
 
         current = torch.cuda.current_stream(device=self._device)
         with torch.cuda.stream(self._stream):
             self._stream.wait_stream(current)
-            self._buffer.cpu[:count].copy_(tensor, non_blocking=True)
+            self._token_ids[:count].copy_(token_ids, non_blocking=True)
+            self._coord_values[:count].copy_(coord_values, non_blocking=True)
+            self._size_values[:count].copy_(size_values, non_blocking=True)
             self._event.record(self._stream)
-        return _SampleBuffer.TransferHandle(self._event, self._buffer.cpu, count)
+        return _RenderBuffer._TransferHandle(
+            self._event, self._token_ids, self._coord_values, self._size_values, count
+        )
 
 
 class GenerationScheduler:
@@ -200,26 +247,98 @@ class GenerationScheduler:
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
-        self._pinned_token_buffer = torch.empty(
-            runtime.max_batch_size, dtype=torch.long, device="cpu", pin_memory=True
-        )
         coord_dtype = runtime.region.coord_features.dtype
         size_dtype = runtime.region.size_features.dtype
-        self._pinned_coord_buffer = torch.empty(
+        self._pending_token_ids = torch.zeros(
+            (runtime.max_batch_size,),
+            dtype=torch.long,
+            device=runtime.device,
+        )
+        self._pending_coord_values = torch.zeros(
             (runtime.max_batch_size, 1),
             dtype=coord_dtype,
-            device="cpu",
-            pin_memory=True,
+            device=runtime.device,
         )
-        self._pinned_size_buffer = torch.empty(
+        self._pending_size_values = torch.zeros(
             (runtime.max_batch_size, 2),
             dtype=size_dtype,
-            device="cpu",
+            device=runtime.device,
+        )
+        self._render_buffer = _RenderBuffer(
+            runtime.max_batch_size,
+            runtime.device,
+            coord_dtype=coord_dtype,
+            size_dtype=size_dtype,
+        )
+        coord_bins = runtime.config.region.coord_out_dim
+        size_bins = runtime.config.region.size_out_dim // 2
+        self._coord_value_lut = torch.linspace(
+            0.0,
+            1.0,
+            coord_bins,
+            device=runtime.device,
+            dtype=torch.float32,
+        ).to(dtype=coord_dtype)
+        size_exponents = torch.linspace(
+            -10.0,
+            0.0,
+            size_bins,
+            device=runtime.device,
+            dtype=torch.float32,
+        )
+        self._size_value_lut = torch.exp2(size_exponents).to(dtype=size_dtype)
+        coord_decoder = runtime.region["coord_decoder"]
+        size_decoder = runtime.region["size_decoder"]
+        self._coord_logits_dim = int(coord_decoder.out_features)
+        self._size_logits_dim = int(size_decoder.out_features)
+        self._spatial_decode_weight = torch.cat(
+            (coord_decoder.weight, size_decoder.weight), dim=0
+        ).contiguous()
+        self._spatial_decode_bias = torch.cat(
+            (coord_decoder.bias, size_decoder.bias), dim=0
+        ).contiguous()
+        # Preallocated staging buffers for gathering the packed decode inputs
+        # from the pending per-sequence slots (avoids per-step allocations).
+        self._decode_token_ids = torch.empty(
+            (runtime.max_batch_size,),
+            dtype=torch.long,
+            device=runtime.device,
+        )
+        self._decode_coord_values = torch.empty(
+            (runtime.max_batch_size, 1),
+            dtype=coord_dtype,
+            device=runtime.device,
+        )
+        self._decode_size_values = torch.empty(
+            (runtime.max_batch_size, 2),
+            dtype=size_dtype,
+            device=runtime.device,
+        )
+        self._sampled_token_ids = torch.empty(
+            (runtime.max_batch_size,),
+            dtype=torch.long,
+            device=runtime.device,
+        )
+        self._coord_bin_ids = torch.empty(
+            (runtime.max_batch_size,),
+            dtype=torch.long,
+            device=runtime.device,
+        )
+        self._size_bin_ids = torch.empty(
+            (runtime.max_batch_size * 2,),
+            dtype=torch.long,
+            device=runtime.device,
+        )
+        self._decode_batch_idx = CpuGpuBuffer(
+            runtime.max_batch_size,
+            dtype=torch.long,
+            device=runtime.device,
             pin_memory=True,
         )
-        self._sample_buffer = _SampleBuffer(runtime.max_batch_size, runtime.device)
         self._flashinfer_rng = torch.Generator(device=runtime.device)
         self._flashinfer_rng.manual_seed(torch.seed())
+        self._spatial_rng = torch.Generator(device=runtime.device)
+        self._spatial_rng.manual_seed(torch.seed())
 
     # ------------------------------------------------------------------
     # Submission
@@ -396,11 +515,32 @@ class GenerationScheduler:
                 continue
 
             first_logits = logits.squeeze(0)
-            sampled = self._sample_batch(first_logits.unsqueeze(0), [seq.request])
-            transfer = self._sample_buffer.transfer(sampled)
-            sampled_host = transfer.wait()
-            token_value = int(sampled_host[0].item())
-            seq.stage_token(self.runtime, token_value)
+            sampled_ids, temps, top_ps = self._sample_batch(
+                first_logits.unsqueeze(0), [seq.request]
+            )
+            hidden_last = seq.state.last_hidden
+            if hidden_last is None:  # pragma: no cover - defensive
+                raise RuntimeError("Missing last_hidden after prefill")
+            coord_out = self._decode_coord_values[:1]
+            size_out = self._decode_size_values[:1]
+            coord_decode, size_decode = self._compute_spatial_values(
+                sampled_ids.view(-1),
+                hidden_last,
+                [seq.request],
+                temperatures=temps,
+                top_ps=top_ps,
+                out_coord=coord_out,
+                out_size=size_out,
+            )
+            batch_idx = seq.state.batch_idx
+            self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
+            self._pending_coord_values[batch_idx].copy_(coord_decode[0])
+            self._pending_size_values[batch_idx].copy_(size_decode[0])
+
+            transfer = self._render_buffer.transfer(sampled_ids, coord_decode, size_decode)
+            token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
+            token = self._render_tokens_from_packed(token_ids_cpu, coord_cpu, size_cpu)[0]
+            seq.stage_token(self.runtime, token)
 
             if self._mark_finished_if_needed(seq):
                 progress = True
@@ -429,52 +569,50 @@ class GenerationScheduler:
             self.running.extend(idle)
             return False
 
-        count = len(active)
-        token_ids = self._pinned_token_buffer[:count]
-        coord_values = self._pinned_coord_buffer[:count]
-        size_values = self._pinned_size_buffer[:count]
-        coord_values.zero_()
-        size_values.zero_()
-
-        coord_id = self.runtime.config.tokenizer.coord_id
-        size_id = self.runtime.config.tokenizer.size_id
+        batch_size = len(active)
+        idx_np = self._decode_batch_idx.np
         for i, seq in enumerate(active):
-            token = seq.pending_token
-            if token is None:
-                raise RuntimeError(
-                    "ScheduledSequence has no pending token during decode"
-                )
-            if isinstance(token, TextToken):
-                token_ids[i] = token.token_id
-            elif isinstance(token, CoordToken):
-                token_ids[i] = coord_id
-                coord_values[i, 0] = token.pos
-            elif isinstance(token, SizeToken):
-                token_ids[i] = size_id
-                size_values[i, 0] = token.width
-                size_values[i, 1] = token.height
-            else:  # pragma: no cover - defensive
-                raise TypeError(f"Unsupported token type: {type(token)!r}")
+            idx_np[i] = seq.state.batch_idx
+        batch_idx = self._decode_batch_idx.copy_to_gpu(batch_size)
+        token_ids = self._decode_token_ids[:batch_size]
+        coord_values = self._decode_coord_values[:batch_size]
+        size_values = self._decode_size_values[:batch_size]
+        torch.index_select(self._pending_token_ids, 0, batch_idx, out=token_ids)
+        torch.index_select(self._pending_coord_values, 0, batch_idx, out=coord_values)
+        torch.index_select(self._pending_size_values, 0, batch_idx, out=size_values)
 
-        logits = self.runtime.decode_batch(
+        logits, hidden_last = self.runtime.decode_batch(
             [seq.state for seq in active],
             token_ids,
             coord_values,
             size_values,
         )
 
-        sampled_tokens = self._sample_batch(logits, [seq.request for seq in active])
-        transfer = self._sample_buffer.transfer(sampled_tokens)
+        requests = [seq.request for seq in active]
+        sampled_ids, temps, top_ps = self._sample_batch(logits, requests)
+        coord_decode, size_decode = self._compute_spatial_values(
+            sampled_ids,
+            hidden_last,
+            requests,
+            temperatures=temps,
+            top_ps=top_ps,
+            out_coord=coord_values,
+            out_size=size_values,
+        )
+        self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
+        self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
+        self._pending_size_values.index_copy_(0, batch_idx, size_decode)
+        transfer = self._render_buffer.transfer(sampled_ids, coord_decode, size_decode)
 
         # Overlap advances/length bookkeeping with the host copy.
         for seq in active:
             seq.state.advance()
 
-        sampled_cpu = transfer.wait()
-        sampled_np = sampled_cpu.numpy().reshape(-1)
+        token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
+        tokens = self._render_tokens_from_packed(token_ids_cpu, coord_cpu, size_cpu)
 
-        for seq, token_value in zip(active, sampled_np):
-            seq.stage_token(self.runtime, int(token_value))
+        for seq, token in zip(active, tokens):
+            seq.stage_token(self.runtime, token)
             if not self._mark_finished_if_needed(seq):
                 idle.append(seq)
 
@@ -483,10 +621,11 @@ class GenerationScheduler:
 
     def _sample_batch(
         self, logits: Tensor, requests: List[GenerationRequest]
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         batch = len(requests)
         if batch == 0:
-            return torch.empty(0, dtype=torch.long, device=logits.device)
+            empty = torch.empty(0, dtype=torch.long, device=logits.device)
+            return empty, None, None
 
         allowed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
@@ -511,16 +650,136 @@ class GenerationScheduler:
                 logits[i] = pruned
 
         if all(req.temperature <= 0.0 for req in requests):
-            return torch.argmax(logits, dim=-1)
+            return torch.argmax(logits, dim=-1), None, None
 
-        temps = torch.empty(batch, dtype=torch.float32)
-        top_ps = torch.empty(batch, dtype=torch.float32)
+        temps_cpu = torch.empty(batch, dtype=torch.float32)
+        top_ps_cpu = torch.empty(batch, dtype=torch.float32)
         for i, req in enumerate(requests):
-            temps[i] = req.temperature
-            top_ps[i] = req.top_p
-        temps = temps.to(device=logits.device)
-        top_ps = top_ps.to(device=logits.device)
-        return sample_tokens(logits, temps, top_ps, generator=self._flashinfer_rng)
+            temps_cpu[i] = req.temperature
+            top_ps_cpu[i] = req.top_p
+        temps = temps_cpu.to(device=logits.device)
+        top_ps = top_ps_cpu.to(device=logits.device)
+        sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._flashinfer_rng)
+        if sampled_raw.dtype == torch.long:
+            return sampled_raw, temps, top_ps
+
+        sampled = self._sampled_token_ids[:batch]
+        sampled.copy_(sampled_raw, non_blocking=True)
+        return sampled, temps, top_ps
+
+    def _compute_spatial_values(
+        self,
+        token_ids: Tensor,
+        hidden_last: Tensor,
+        requests: List[GenerationRequest],
+        *,
+        temperatures: Tensor | None = None,
+        top_ps: Tensor | None = None,
+        out_coord: Tensor,
+        out_size: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Decode coord/size token values from hidden states on GPU."""
+
+        if token_ids.ndim != 1:
+            token_ids = token_ids.view(-1)
+        batch = int(token_ids.shape[0])
+        if batch == 0:
+            device = hidden_last.device
+            coord_decode = torch.empty((0, 1), device=device, dtype=out_coord.dtype)
+            size_decode = torch.empty((0, 2), device=device, dtype=out_size.dtype)
+            return coord_decode, size_decode
+
+        hidden = hidden_last.unsqueeze(0) if hidden_last.ndim == 1 else hidden_last
+
+        do_sample = not all(req.temperature <= 0.0 for req in requests)
+        if do_sample and (temperatures is None or top_ps is None):
+            temps_cpu = torch.tensor(
+                [req.temperature for req in requests],
+                dtype=torch.float32,
+            )
+            top_ps_cpu = torch.tensor(
+                [req.top_p for req in requests],
+                dtype=torch.float32,
+            )
+            temperatures = temps_cpu.to(device=hidden.device)
+            top_ps = top_ps_cpu.to(device=hidden.device)
+
+        spatial_logits = torch.nn.functional.linear(
+            hidden, self._spatial_decode_weight, self._spatial_decode_bias
+        )
+        coord_logits = spatial_logits[:, : self._coord_logits_dim]
+        size_flat = spatial_logits[:, self._coord_logits_dim :]
+        bins_size = int(size_flat.shape[-1] // 2)
+        width_logits = size_flat[:, :bins_size]
+        height_logits = size_flat[:, bins_size:]
+
+        if not do_sample:
+            coord_bins = torch.argmax(coord_logits, dim=-1)
+            width_bins = torch.argmax(width_logits, dim=-1)
+            height_bins = torch.argmax(height_logits, dim=-1)
+        else:
+            if temperatures is None or top_ps is None:  # pragma: no cover - defensive
+                raise RuntimeError("Missing sampling parameters for spatial decode")
+            coord_bins_raw = sample_tokens(
+                coord_logits, temperatures, top_ps, generator=self._spatial_rng
+            )
+            if coord_bins_raw.dtype == torch.long:
+                coord_bins = coord_bins_raw
+            else:
+                coord_bins = self._coord_bin_ids[:batch]
+                coord_bins.copy_(coord_bins_raw, non_blocking=True)
+            logits_2 = torch.cat((width_logits, height_logits), dim=0)
+            bins_2_raw = sample_tokens(
+                logits_2,
+                temperatures.repeat(2),
+                top_ps.repeat(2),
+                generator=self._spatial_rng,
+            )
+            if bins_2_raw.dtype == torch.long:
+                bins_2 = bins_2_raw
+            else:
+                bins_2 = self._size_bin_ids[: 2 * batch]
+                bins_2.copy_(bins_2_raw, non_blocking=True)
+            width_bins = bins_2[:batch]
+            height_bins = bins_2[batch:]
+
+        coord_out = out_coord[:batch].view(-1)
+        size_out = out_size[:batch]
+        torch.index_select(self._coord_value_lut, 0, coord_bins, out=coord_out)
+        torch.index_select(self._size_value_lut, 0, width_bins, out=size_out[:, 0])
+        torch.index_select(self._size_value_lut, 0, height_bins, out=size_out[:, 1])
+        return out_coord[:batch], out_size[:batch]
+
+    def _render_tokens_from_packed(
+        self,
+        token_ids: Tensor,
+        coord_values: Tensor,
+        size_values: Tensor,
+    ) -> list[Token]:
+        """Materialise sampled ids + value tensors into typed tokens on host."""
+
+        ids = token_ids.view(-1).tolist()
+        batch = len(ids)
+        if batch == 0:
+            return []
+
+        coord_id = self.runtime.config.tokenizer.coord_id
+        size_id = self.runtime.config.tokenizer.size_id
+
+        out: list[Token] = []
+        for i, token_id in enumerate(ids):
+            if token_id == coord_id:
+                out.append(CoordToken(pos=float(coord_values[i, 0].item())))
+            elif token_id == size_id:
+                out.append(
+                    SizeToken(
+                        width=float(size_values[i, 0].item()),
+                        height=float(size_values[i, 1].item()),
+                    )
+                )
+            else:
+                out.append(TextToken(token_id=token_id))
+        return out
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token

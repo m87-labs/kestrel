@@ -33,6 +33,20 @@ def decode_size(hidden_state: torch.Tensor, module: nn.ModuleDict) -> torch.Tens
     return module["size_decoder"](hidden_state).view(2, -1)
 
 
+def decode_size_logits(hidden_state: torch.Tensor, module: nn.ModuleDict) -> torch.Tensor:
+    """Return size decoder logits as (batch, 2, bins).
+
+    The size head emits concatenated logits for width and height. Historically
+    this was reshaped as ``(2, bins)`` for a single hidden state; this helper
+    generalises the reshape for batched hidden states.
+    """
+
+    hidden = hidden_state.unsqueeze(0) if hidden_state.ndim == 1 else hidden_state
+    logits = module["size_decoder"](hidden)
+    bins = logits.shape[-1] // 2
+    return logits.view(logits.shape[0], 2, bins)
+
+
 def encode_spatial_refs(
     spatial_refs: Iterable[SpatialRef], module: nn.ModuleDict
 ) -> dict[str, torch.Tensor | None]:
@@ -86,6 +100,7 @@ __all__ = [
     "decode_coordinate",
     "encode_size",
     "decode_size",
+    "decode_size_logits",
     "encode_spatial_refs",
     "build_region_module",
 ]
