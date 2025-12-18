@@ -80,12 +80,9 @@ class ScheduledSequence:
     def stage_token(
         self,
         runtime: MoondreamRuntime,
-        token_id: int,
+        token: Token,
     ) -> None:
         hidden = self.state.last_hidden
-        if hidden is None:
-            raise RuntimeError("SequenceState.last_hidden is not available")
-        token = runtime.render_token(token_id, hidden)
         self.pending_token = token
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
