@@ -82,14 +82,12 @@ class ScheduledSequence:
         runtime: MoondreamRuntime,
         token: Token,
     ) -> None:
-        hidden = self.state.last_hidden
         self.pending_token = token
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
         step = DecodeStep(
             token=token,
             position=self.skill_state.token_count,
-            hidden=hidden,
         )
         self.skill_state.consume_step(runtime, step)
         callback = self.request.stream_callback
