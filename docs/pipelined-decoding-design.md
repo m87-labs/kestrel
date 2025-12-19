@@ -516,6 +516,7 @@ if paused_flag.is_set():
     #    for t+1 depends on grammar state after committing t.
     while step := pipeline.pop_oldest():
         scheduler.complete_step(step)
+        pipeline.on_step_completed()
 
     # 2. Then finalize any pending forward using the updated grammar state
     if pipeline.forward_handle is not None:
@@ -523,6 +524,7 @@ if paused_flag.is_set():
         step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
         pipeline.on_sampling_complete(step)
         scheduler.complete_step(pipeline.pop_oldest())
+        pipeline.on_step_completed()
 
     # 3. Now safe to sync and acknowledge
     with runtime.graph_capture_lock:
@@ -801,6 +803,7 @@ while True:
         # 1) Commit any sampled steps first
         while step := pipeline.pop_oldest():
             scheduler.complete_step(step)
+            pipeline.on_step_completed()
 
         # 2) If there's a pending forward, finalize and commit it
         if pipeline.forward_handle is not None:
@@ -808,6 +811,7 @@ while True:
             step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
             pipeline.on_sampling_complete(step)
             scheduler.complete_step(pipeline.pop_oldest())
+            pipeline.on_step_completed()
 
         # 3) Now prefill is safe
         scheduler.try_run_prefill_sync(next_prefill)
@@ -824,6 +828,7 @@ while True:
             step = pipeline.pop_oldest()
             if step is not None:
                 scheduler.complete_step(step)
+                pipeline.on_step_completed()
             continue
 
         plan = scheduler.schedule_decode_step()
@@ -842,6 +847,7 @@ while True:
             step = pipeline.pop_oldest()
             if step is not None:
                 scheduler.complete_step(step)
+                pipeline.on_step_completed()
 
             mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
             step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
@@ -858,6 +864,7 @@ while True:
     step = pipeline.pop_oldest()
     if step is not None:
         scheduler.complete_step(step)
+        pipeline.on_step_completed()
         continue
 
     # Truly idle: sleep until new work arrives.
@@ -1265,11 +1272,13 @@ while True:
         # Drain before prefill
         while step := pipeline.pop_oldest():
             scheduler.complete_step(step)
+            pipeline.on_step_completed()
         if pipeline.forward_handle is not None:
             mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
             step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
             pipeline.on_sampling_complete(step)
             scheduler.complete_step(pipeline.pop_oldest())
+            pipeline.on_step_completed()
         scheduler.try_run_prefill_sync(next_prefill)
         continue
 
@@ -1287,6 +1296,7 @@ while True:
         step = pipeline.pop_oldest()
         if step is not None:
             scheduler.complete_step(step)
+            pipeline.on_step_completed()
 
         mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
         step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
@@ -1297,6 +1307,7 @@ while True:
     step = pipeline.pop_oldest()
     if step is not None:
         scheduler.complete_step(step)
+        pipeline.on_step_completed()
         continue
 
     wake_event.wait()
@@ -1352,104 +1363,20 @@ Goal: 2-deep queue for all decode batches (constrained and unconstrained) using 
 - Add `seq.finalized` and `seq.inflight_refs` tracking to `ScheduledSequence`.
 - Update `InferenceEngine._scheduler_loop` to use the unified loop (§4.6).
 
-**New module: `pipeline.py` (canonical production state machine)**
+**Implemented: `kestrel/scheduler/pipeline.py`**
 
-The engine loop delegates to `PipelineState` for all state transitions. This makes the state machine the single source of truth and enables comprehensive unit testing without CUDA.
+The `PipelineState` class is now implemented in `kestrel/scheduler/pipeline.py`. The engine loop delegates to this state machine for all pipeline state transitions, making it the single source of truth.
 
-```py
-# kestrel/scheduler/pipeline.py
-"""Pipeline state machine for async decoding. No CUDA dependencies."""
+Key features:
+- **Two-phase completion:** `pop_oldest()` moves step to `completing_step` (slot stays in use), `on_step_completed()` frees the slot after scheduler finishes. This enforces invariant I6.
+- **Defensive assertions:** `on_forward_launched()` verifies slot is free, `on_sampling_complete()` verifies slot_id matches.
+- **FIFO ordering:** Queue uses `appendleft`/`pop` for correct completion order.
 
-class PipelineState:
-    """Manages the 2-deep batch queue, forward handle, and slot allocation.
+See `kestrel/scheduler/pipeline.py` for the full implementation and comprehensive docstrings.
 
-    This is the CANONICAL state machine — the engine loop calls these methods
-    rather than manipulating state directly. This ensures the state machine
-    is testable in isolation and prevents drift between test and production.
-    """
+**Tests: `tests/scheduler/test_pipeline.py`**
 
-    def __init__(self, num_slots: int = 2):
-        assert num_slots == 2, "PipelineState currently supports exactly 2 slots"
-        self.batch_queue: deque[InFlightStep] = deque()
-        self.forward_handle: ForwardHandle | None = None
-        self._num_slots = num_slots
-
-    def free_slot_id(self) -> int | None:
-        """Return ID of a free slot, or None if all in use."""
-        mask = 0
-        for step in self.batch_queue:
-            mask |= 1 << step.slot_id
-        if self.forward_handle is not None:
-            mask |= 1 << self.forward_handle.slot_id
-        if mask == 0 or mask == 2:
-            return 0
-        if mask == 1:
-            return 1
-        return None
-
-    def can_launch_forward(self) -> bool:
-        """True if we can launch a new forward pass (no forward in-flight and slot available)."""
-        return self.forward_handle is None and self.free_slot_id() is not None
-
-    def total_in_flight(self) -> int:
-        """Total steps in-flight (queue + forward handle)."""
-        return len(self.batch_queue) + (1 if self.forward_handle else 0)
-
-    # State transitions (queue/slot bookkeeping only — refcounts owned by scheduler)
-    def on_forward_launched(self, handle: ForwardHandle) -> None:
-        """Record forward launch. Stores the handle returned by scheduler."""
-        assert self.forward_handle is None
-        self.forward_handle = handle
-
-    def on_sampling_complete(self, step: InFlightStep) -> None:
-        """Record sampling completion. Stores the step returned by scheduler."""
-        assert self.forward_handle is not None
-        self.batch_queue.appendleft(step)
-        self.forward_handle = None
-
-    def pop_oldest(self) -> InFlightStep | None:
-        """Pop oldest step for completion (FIFO)."""
-        return self.batch_queue.pop() if self.batch_queue else None
-```
-
-**Unit tests for `pipeline.py` (no CUDA required):**
-
-The `PipelineState` tests verify queue/slot bookkeeping only. Refcount logic is tested separately in scheduler tests.
-
-```py
-def test_slot_selection():
-    state = PipelineState(num_slots=2)
-    assert state.free_slot_id() == 0
-
-    state.on_forward_launched(ForwardHandle(slot_id=0, sequences=[mock_seq()]))
-    assert state.free_slot_id() == 1  # slot 0 in use (forward)
-
-    state.on_sampling_complete(InFlightStep(slot_id=0, sequences=[mock_seq()], transfer=mock_transfer()))
-    assert state.free_slot_id() == 1  # slot 0 in use (queue)
-
-    state.on_forward_launched(ForwardHandle(slot_id=1, sequences=[mock_seq()]))
-    assert state.free_slot_id() is None  # both in use
-
-def test_fifo_completion():
-    state = PipelineState()
-
-    # Launch two steps
-    state.on_forward_launched(ForwardHandle(slot_id=0, sequences=[mock_seq()]))
-    state.on_sampling_complete(InFlightStep(slot_id=0, sequences=[mock_seq()], transfer=mock_transfer()))
-    state.on_forward_launched(ForwardHandle(slot_id=1, sequences=[mock_seq()]))
-    state.on_sampling_complete(InFlightStep(slot_id=1, sequences=[mock_seq()], transfer=mock_transfer()))
-
-    # Oldest is slot 0
-    step_t = state.pop_oldest()
-    assert step_t.slot_id == 0
-
-    # Next oldest is slot 1
-    step_t1 = state.pop_oldest()
-    assert step_t1.slot_id == 1
-
-    # Queue is empty
-    assert state.pop_oldest() is None
-```
+43 unit tests verify queue/slot bookkeeping, two-phase completion, slot assertions, and ping-pong scenarios. No CUDA required — tests use mock sequences and transfers.
 
 **Prefill handling:**
 
