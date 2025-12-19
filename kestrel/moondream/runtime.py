@@ -830,9 +830,6 @@ class MoondreamRuntime:
             )
 
         hidden_last = result.hidden[:, -1, :]
-        for state, vec in zip(states, hidden_last):
-            state.last_hidden = vec.detach()
-
         return result.logits, hidden_last
 
     def _build_flashinfer_metadata(

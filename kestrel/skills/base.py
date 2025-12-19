@@ -41,7 +41,6 @@ class DecodeStep:
     token: "Token"
     position: int
     phase: str = "answer"
-    hidden: Optional[Tensor] = None
 
 
 @dataclass(slots=True)
