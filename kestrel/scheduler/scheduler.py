@@ -2,30 +2,19 @@
 
 
 from collections import deque
-from typing import Deque, List, Optional, Sequence
+from typing import Deque, List, Optional
 
 import time
 import logging
 
-import pyvips
 import torch
 from torch import Tensor
 
 from kestrel.moondream.runtime import (
     MoondreamRuntime,
     TextToken,
-    CoordToken,
-    SizeToken,
-    Token,
 )
 from kestrel.moondream.lora import AdapterProvider
-from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.moondream.region import (
-    SpatialDecodeTables,
-    build_spatial_decode_tables,
-    spatial_bins_to_values,
-    spatial_decode_logits,
-)
 from kestrel.utils.buffers import CpuGpuBuffer
 from kestrel.skills import (
     QuerySkill,
@@ -40,194 +29,14 @@ from .types import (
     RequestMetrics,
     ScheduledSequence,
     SchedulerResult,
-    StreamCallback,
 )
 from .sampling import sample_tokens
+from .transfer import RenderBuffer
+from .tokens import prompt_with_spatial_tokens, render_tokens_from_packed
+from .spatial import compute_spatial_values
 
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _prompt_with_spatial_tokens(
-    prompt_tokens: Tensor,
-    coord_id: int,
-    size_id: int,
-    spatial_refs: Sequence[Sequence[float]],
-) -> list[Token]:
-    """Replace coord/size placeholder ids in ``prompt_tokens`` with typed tokens.
-
-    - 2-value refs are treated as points: ``[x, y]``.
-    - 4-value refs are treated strictly as bounding boxes in
-      ``[x_min, y_min, x_max, y_max]`` format.
-    """
-    if prompt_tokens.ndim != 1:
-        tokens_1d = prompt_tokens.view(-1)
-    else:
-        tokens_1d = prompt_tokens
-    ids = tokens_1d.cpu().tolist()
-
-    # Precompute expected placeholder counts
-    coord_placeholders = sum(1 for t in ids if t == coord_id)
-    size_placeholders = sum(1 for t in ids if t == size_id)
-
-    # Build coord and size lists from spatial refs
-    coord_vals: list[float] = []
-    size_vals: list[tuple[float, float]] = []
-    for ref in spatial_refs:
-        n = len(ref)
-        if n == 2:
-            x, y = float(ref[0]), float(ref[1])
-            x = min(max(x, 0.0), 1.0)
-            y = min(max(y, 0.0), 1.0)
-            coord_vals.extend([x, y])
-        elif n == 4:
-            x_min, y_min, x_max, y_max = map(float, ref)
-            if not (0.0 <= x_min <= x_max <= 1.0 and 0.0 <= y_min <= y_max <= 1.0):
-                raise ValueError(
-                    "bbox spatial_ref must satisfy 0<=x_min<=x_max<=1 and 0<=y_min<=y_max<=1"
-                )
-            x_c = (x_min + x_max) / 2.0
-            y_c = (y_min + y_max) / 2.0
-            width = x_max - x_min
-            height = y_max - y_min
-            coord_vals.extend([x_c, y_c])
-            size_vals.append((width, height))
-        else:
-            raise ValueError(
-                "Each spatial_ref must contain 2 (point) or 4 (bbox) values"
-            )
-
-    expected_coords = 2 * len(spatial_refs)
-    expected_sizes = sum(1 for r in spatial_refs if len(r) == 4)
-    if coord_placeholders != expected_coords or size_placeholders != expected_sizes:
-        raise ValueError(
-            "Mismatch between spatial_refs and placeholder tokens: "
-            f"prompt has {coord_placeholders} coord and {size_placeholders} size placeholders, "
-            f"but refs require {expected_coords} coord and {expected_sizes} size placeholders."
-        )
-
-    # Replace placeholders in order of appearance
-    coord_iter = iter(coord_vals)
-    size_iter = iter(size_vals)
-    out: list[Token] = []
-    for tid in ids:
-        if tid == coord_id:
-            try:
-                pos = next(coord_iter)
-            except StopIteration as exc:
-                raise ValueError("Insufficient coord placeholders for spatial_refs") from exc
-            out.append(CoordToken(pos=float(pos)))
-        elif tid == size_id:
-            try:
-                w, h = next(size_iter)
-            except StopIteration as exc:
-                raise ValueError("Insufficient size placeholders for bbox spatial_refs") from exc
-            # Clamp sizes to [0, 1]
-            w = min(max(float(w), 0.0), 1.0)
-            h = min(max(float(h), 0.0), 1.0)
-            out.append(SizeToken(width=w, height=h))
-        else:
-            out.append(TextToken(token_id=int(tid)))
-
-    # Ensure all refs were consumed
-    try:
-        next(coord_iter)
-        raise ValueError("Unconsumed coord values after placeholder replacement")
-    except StopIteration:
-        pass
-    try:
-        next(size_iter)
-        raise ValueError("Unconsumed size values after placeholder replacement")
-    except StopIteration:
-        pass
-
-    return out
-
-class _RenderBuffer:
-    """Pinned host buffers for sampled ids + decoded coord/size values."""
-
-    def __init__(
-        self,
-        max_batch: int,
-        device: torch.device,
-        *,
-        coord_dtype: torch.dtype,
-        size_dtype: torch.dtype,
-    ) -> None:
-        self._token_ids = torch.empty(
-            (max_batch,),
-            dtype=torch.long,
-            device="cpu",
-            pin_memory=True,
-        )
-        self._coord_values = torch.empty(
-            (max_batch, 1),
-            dtype=coord_dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        self._size_values = torch.empty(
-            (max_batch, 2),
-            dtype=size_dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        self._device = device
-        self._stream = torch.cuda.Stream(device=device)
-        self._event = torch.cuda.Event(enable_timing=False, blocking=False)
-
-    class _TransferHandle:
-        def __init__(
-            self,
-            event: torch.cuda.Event,
-            token_ids: Tensor,
-            coord_values: Tensor,
-            size_values: Tensor,
-            count: int,
-        ) -> None:
-            self._event = event
-            self._token_ids = token_ids
-            self._coord_values = coord_values
-            self._size_values = size_values
-            self._count = count
-
-        def wait(self) -> tuple[Tensor, Tensor, Tensor]:
-            if self._count == 0:
-                empty = self._token_ids[:0]
-                return empty, self._coord_values[:0], self._size_values[:0]
-            self._event.synchronize()
-            return (
-                self._token_ids[: self._count],
-                self._coord_values[: self._count],
-                self._size_values[: self._count],
-            )
-
-    def transfer(
-        self,
-        token_ids: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
-    ) -> "_RenderBuffer._TransferHandle":
-        count = int(token_ids.shape[0])
-        if count == 0:
-            return _RenderBuffer._TransferHandle(
-                self._event,
-                self._token_ids,
-                self._coord_values,
-                self._size_values,
-                0,
-            )
-
-        current = torch.cuda.current_stream(device=self._device)
-        with torch.cuda.stream(self._stream):
-            self._stream.wait_stream(current)
-            self._token_ids[:count].copy_(token_ids, non_blocking=True)
-            self._coord_values[:count].copy_(coord_values, non_blocking=True)
-            self._size_values[:count].copy_(size_values, non_blocking=True)
-            self._event.record(self._stream)
-        return _RenderBuffer._TransferHandle(
-            self._event, self._token_ids, self._coord_values, self._size_values, count
-        )
 
 
 class GenerationScheduler:
@@ -253,6 +62,8 @@ class GenerationScheduler:
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
+        self._coord_id = runtime.config.tokenizer.coord_id
+        self._size_id = runtime.config.tokenizer.size_id
         coord_dtype = runtime.region.coord_features.dtype
         size_dtype = runtime.region.size_features.dtype
         self._pending_token_ids = torch.zeros(
@@ -270,14 +81,11 @@ class GenerationScheduler:
             dtype=size_dtype,
             device=runtime.device,
         )
-        self._render_buffer = _RenderBuffer(
+        self._render_buffer = RenderBuffer(
             runtime.max_batch_size,
             runtime.device,
             coord_dtype=coord_dtype,
             size_dtype=size_dtype,
-        )
-        self._spatial_tables: SpatialDecodeTables = build_spatial_decode_tables(
-            runtime.region
         )
         # Preallocated staging buffers for gathering the packed decode inputs
         # from the pending per-sequence slots (avoids per-step allocations).
@@ -301,26 +109,14 @@ class GenerationScheduler:
             dtype=torch.long,
             device=runtime.device,
         )
-        self._coord_bin_ids = torch.empty(
-            (runtime.max_batch_size,),
-            dtype=torch.long,
-            device=runtime.device,
-        )
-        self._size_bin_ids = torch.empty(
-            (runtime.max_batch_size * 2,),
-            dtype=torch.long,
-            device=runtime.device,
-        )
         self._decode_batch_idx = CpuGpuBuffer(
             runtime.max_batch_size,
             dtype=torch.long,
             device=runtime.device,
             pin_memory=True,
         )
-        self._flashinfer_rng = torch.Generator(device=runtime.device)
-        self._flashinfer_rng.manual_seed(torch.seed())
-        self._spatial_rng = torch.Generator(device=runtime.device)
-        self._spatial_rng.manual_seed(torch.seed())
+        self._sampling_rng = torch.Generator(device=runtime.device)
+        self._sampling_rng.manual_seed(torch.seed())
 
     # ------------------------------------------------------------------
     # Submission
@@ -448,12 +244,10 @@ class GenerationScheduler:
                 prompt_inputs: Tensor | list[Token]
                 ctx = request.request_context
                 if isinstance(ctx, SegmentRequest) and ctx.spatial_refs:
-                    coord_id = self.runtime.config.tokenizer.coord_id
-                    size_id = self.runtime.config.tokenizer.size_id
-                    prompt_inputs = _prompt_with_spatial_tokens(
+                    prompt_inputs = prompt_with_spatial_tokens(
                         request.prompt_tokens,
-                        coord_id,
-                        size_id,
+                        self._coord_id,
+                        self._size_id,
                         ctx.spatial_refs,
                     )
                 else:
@@ -505,14 +299,16 @@ class GenerationScheduler:
                 raise RuntimeError("Missing last_hidden after prefill")
             coord_out = self._decode_coord_values[:1]
             size_out = self._decode_size_values[:1]
-            coord_decode, size_decode = self._compute_spatial_values(
+            coord_decode, size_decode = compute_spatial_values(
                 sampled_ids.view(-1),
                 hidden_last,
                 [seq.request],
+                self.runtime.spatial_tables,
                 temperatures=temps,
                 top_ps=top_ps,
                 out_coord=coord_out,
                 out_size=size_out,
+                rng=self._sampling_rng,
             )
             batch_idx = seq.state.batch_idx
             self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
@@ -521,7 +317,10 @@ class GenerationScheduler:
 
             transfer = self._render_buffer.transfer(sampled_ids, coord_decode, size_decode)
             token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
-            token = self._render_tokens_from_packed(token_ids_cpu, coord_cpu, size_cpu)[0]
+            token = render_tokens_from_packed(
+                token_ids_cpu, coord_cpu, size_cpu,
+                coord_id=self._coord_id, size_id=self._size_id,
+            )[0]
             seq.stage_token(self.runtime, token)
 
             if self._mark_finished_if_needed(seq):
@@ -572,14 +371,16 @@ class GenerationScheduler:
 
         requests = [seq.request for seq in active]
         sampled_ids, temps, top_ps = self._sample_batch(logits, requests)
-        coord_decode, size_decode = self._compute_spatial_values(
+        coord_decode, size_decode = compute_spatial_values(
             sampled_ids,
             hidden_last,
             requests,
+            self.runtime.spatial_tables,
             temperatures=temps,
             top_ps=top_ps,
             out_coord=coord_values,
             out_size=size_values,
+            rng=self._sampling_rng,
         )
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
         self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
@@ -591,7 +392,10 @@ class GenerationScheduler:
             seq.state.advance()
 
         token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
-        tokens = self._render_tokens_from_packed(token_ids_cpu, coord_cpu, size_cpu)
+        tokens = render_tokens_from_packed(
+            token_ids_cpu, coord_cpu, size_cpu,
+            coord_id=self._coord_id, size_id=self._size_id,
+        )
 
         for seq, token in zip(active, tokens):
             seq.stage_token(self.runtime, token)
@@ -641,127 +445,13 @@ class GenerationScheduler:
             top_ps_cpu[i] = req.top_p
         temps = temps_cpu.to(device=logits.device)
         top_ps = top_ps_cpu.to(device=logits.device)
-        sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._flashinfer_rng)
+        sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._sampling_rng)
         if sampled_raw.dtype == torch.long:
             return sampled_raw, temps, top_ps
 
         sampled = self._sampled_token_ids[:batch]
         sampled.copy_(sampled_raw, non_blocking=True)
         return sampled, temps, top_ps
-
-    def _compute_spatial_values(
-        self,
-        token_ids: Tensor,
-        hidden_last: Tensor,
-        requests: List[GenerationRequest],
-        *,
-        temperatures: Tensor | None = None,
-        top_ps: Tensor | None = None,
-        out_coord: Tensor,
-        out_size: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Decode coord/size token values from hidden states on GPU."""
-
-        if token_ids.ndim != 1:
-            token_ids = token_ids.view(-1)
-        batch = int(token_ids.shape[0])
-        if batch == 0:
-            device = hidden_last.device
-            coord_decode = torch.empty((0, 1), device=device, dtype=out_coord.dtype)
-            size_decode = torch.empty((0, 2), device=device, dtype=out_size.dtype)
-            return coord_decode, size_decode
-
-        hidden = hidden_last.unsqueeze(0) if hidden_last.ndim == 1 else hidden_last
-
-        do_sample = not all(req.temperature <= 0.0 for req in requests)
-        if do_sample and (temperatures is None or top_ps is None):
-            temps_cpu = torch.tensor(
-                [req.temperature for req in requests],
-                dtype=torch.float32,
-            )
-            top_ps_cpu = torch.tensor(
-                [req.top_p for req in requests],
-                dtype=torch.float32,
-            )
-            temperatures = temps_cpu.to(device=hidden.device)
-            top_ps = top_ps_cpu.to(device=hidden.device)
-
-        coord_logits, width_logits, height_logits = spatial_decode_logits(
-            hidden, self._spatial_tables
-        )
-
-        if not do_sample:
-            coord_bins = torch.argmax(coord_logits, dim=-1)
-            width_bins = torch.argmax(width_logits, dim=-1)
-            height_bins = torch.argmax(height_logits, dim=-1)
-        else:
-            if temperatures is None or top_ps is None:  # pragma: no cover - defensive
-                raise RuntimeError("Missing sampling parameters for spatial decode")
-            coord_bins_raw = sample_tokens(
-                coord_logits, temperatures, top_ps, generator=self._spatial_rng
-            )
-            if coord_bins_raw.dtype == torch.long:
-                coord_bins = coord_bins_raw
-            else:
-                coord_bins = self._coord_bin_ids[:batch]
-                coord_bins.copy_(coord_bins_raw, non_blocking=True)
-            logits_2 = torch.cat((width_logits, height_logits), dim=0)
-            bins_2_raw = sample_tokens(
-                logits_2,
-                temperatures.repeat(2),
-                top_ps.repeat(2),
-                generator=self._spatial_rng,
-            )
-            if bins_2_raw.dtype == torch.long:
-                bins_2 = bins_2_raw
-            else:
-                bins_2 = self._size_bin_ids[: 2 * batch]
-                bins_2.copy_(bins_2_raw, non_blocking=True)
-            width_bins = bins_2[:batch]
-            height_bins = bins_2[batch:]
-
-        coord_out = out_coord[:batch]
-        size_out = out_size[:batch]
-        spatial_bins_to_values(
-            coord_bins,
-            width_bins,
-            height_bins,
-            self._spatial_tables,
-            out_coord=coord_out,
-            out_size=size_out,
-        )
-        return coord_out, size_out
-
-    def _render_tokens_from_packed(
-        self,
-        token_ids: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
-    ) -> list[Token]:
-        """Materialise sampled ids + value tensors into typed tokens on host."""
-
-        ids = token_ids.view(-1).tolist()
-        batch = len(ids)
-        if batch == 0:
-            return []
-
-        coord_id = self.runtime.config.tokenizer.coord_id
-        size_id = self.runtime.config.tokenizer.size_id
-
-        out: list[Token] = []
-        for i, token_id in enumerate(ids):
-            if token_id == coord_id:
-                out.append(CoordToken(pos=float(coord_values[i, 0].item())))
-            elif token_id == size_id:
-                out.append(
-                    SizeToken(
-                        width=float(size_values[i, 0].item()),
-                        height=float(size_values[i, 1].item()),
-                    )
-                )
-            else:
-                out.append(TextToken(token_id=token_id))
-        return out
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token

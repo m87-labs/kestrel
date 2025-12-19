@@ -43,6 +43,7 @@ from .flashinfer import (
 )
 from .region import (
     build_region_module,
+    build_spatial_decode_tables,
     encode_coordinate,
     encode_size,
 )
@@ -263,6 +264,7 @@ class MoondreamRuntime:
             setup_caches=False,
         ).eval()
         self.region = build_region_module(self.config.region, self.dtype).to(self.device)
+        self.spatial_tables = build_spatial_decode_tables(self.region)
         self.image_prefix_length = self.model.vision.pos_emb.shape[1]
         n_layers = self.config.text.n_layers
         captured_k_scales: list[Optional[float]] = [None] * n_layers
