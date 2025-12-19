@@ -225,12 +225,6 @@ def invoke_fused_moe_kernel(
     )
 
 
-def gelu_and_mul_plus_one(tensor: torch.Tensor) -> torch.Tensor:
-    h, g = tensor.chunk(2, dim=-1)
-    h = F.gelu(h)
-    return h * (g + 1)
-
-
 @triton.jit
 def _gelu_and_mul_kernel(
     inp_ptr,

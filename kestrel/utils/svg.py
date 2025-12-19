@@ -75,26 +75,6 @@ def parse_svg_tokens(tokens: Sequence[str]) -> List[str | List[int]]:
     return result
 
 
-def svg_tokens_to_path(path: Sequence[str | Sequence[int | float | str]]) -> str:
-    """Convert grouped SVG tokens into a canonical path string."""
-
-    parts: List[str] = []
-    pending_space = False
-    for element in path:
-        if isinstance(element, str):
-            if pending_space:
-                parts.append(" ")
-            parts.append(element)
-            pending_space = True
-        else:
-            for idx, value in enumerate(element):
-                if pending_space:
-                    parts.append(" ")
-                parts.append(str(value))
-                pending_space = True
-    return "".join(parts)
-
-
 def _format_number(value: float, decimals: int) -> str:
     """Format a float with up to ``decimals`` decimal places, stripping trailing zeros."""
 
@@ -124,7 +104,7 @@ def scale_svg_path_tokens(
     return scaled_tokens
 
 
-def tokens_to_path_string(tokens: Sequence[str]) -> str:
+def _tokens_to_path_string(tokens: Sequence[str]) -> str:
     """Join a flat list of tokens into a canonical path string."""
 
     if not tokens:
@@ -142,15 +122,13 @@ def svg_path_from_token_ids(
         return "", []
     parsed = parse_svg_tokens(decoded)
     scaled_tokens = scale_svg_path_tokens(parsed)
-    path = tokens_to_path_string(scaled_tokens)
+    path = _tokens_to_path_string(scaled_tokens)
     return path, decoded
 
 
 __all__ = [
     "decode_svg_token_strings",
     "parse_svg_tokens",
-    "svg_tokens_to_path",
     "scale_svg_path_tokens",
-    "tokens_to_path_string",
     "svg_path_from_token_ids",
 ]

@@ -120,7 +120,7 @@ The scheduler owns two FIFO queues:
 
 Even though GPU work itself is asynchronous, the decode loop currently forces a CPU wait **on every step**:
 
-- `transfer.wait()` calls `torch.cuda.Event.synchronize()` inside `_RenderBuffer._TransferHandle.wait()`.
+- `transfer.wait()` calls `torch.cuda.Event.synchronize()` inside `TransferHandle.wait()`.
 - This blocks the scheduler thread, preventing:
   - admission of new requests (even if crops ready),
   - draining scheduler input queue promptly,
@@ -192,15 +192,15 @@ The following invariants are **non-negotiable** throughout the implementation. T
 
 When implementing or reviewing changes, verify these invariants are preserved. Debug assertions for I4 are recommended (see §4.5).
 
-### 4.1 Reuse existing `_RenderBuffer` (vLLM-style deferred output)
+### 4.1 Reuse existing `RenderBuffer` (vLLM-style deferred output)
 
-Kestrel already has `_RenderBuffer` (`kestrel/scheduler/scheduler.py`) which provides:
+Kestrel already has `RenderBuffer` (`kestrel/scheduler/transfer.py`) which provides:
 
 - pinned CPU destination tensors for sampled ids + decoded coord/size values,
 - a copy stream, and a `torch.cuda.Event` recorded after the copy,
-- a `_TransferHandle` that currently blocks via `wait()`.
+- a `TransferHandle` that currently blocks via `wait()`.
 
-To support async completion, `_TransferHandle` needs:
+To support async completion, `TransferHandle` needs:
 
 - `wait()` — blocks until D2H transfer completes (already exists). **Currently returns the CPU tensors directly**, which is fine. No need to change this.
 - `view() -> tuple[torch.Tensor, ...]` — optional accessor if we want to separate "wait for completion" from "get data". Since the current `wait()` already returns tensors, this is only needed if we want `complete_step()` to call `wait()` for synchronization and `view()` later for data access. **For simplicity, keep current behavior: `wait()` returns tensors.**
@@ -215,13 +215,13 @@ Optional (add only if profiling shows benefit):
 **Required implementation:** Use a per-step event:
 
 ```py
-def start_transfer(self, ready_event: torch.cuda.Event, ...) -> _TransferHandle:
+def start_transfer(self, ready_event: torch.cuda.Event, ...) -> TransferHandle:
     """Start D2H transfer, waiting only on ready_event (not all compute work)."""
     with torch.cuda.stream(self._copy_stream):
         self._copy_stream.wait_event(ready_event)  # wait only on this step's sampling
         # ... D2H copies ...
         self._done_event.record()
-    return _TransferHandle(...)
+    return TransferHandle(...)
 ```
 
 Call site records `ready_event` immediately after sampling completes:
@@ -258,7 +258,7 @@ class DecodeMetaBuffers:
 @dataclass
 class DecodeSlot:
     meta: DecodeMetaBuffers                  # per-slot pinned metadata (H2D sources)
-    render: _RenderBuffer                    # pinned host destination for D2H
+    render: RenderBuffer                     # pinned host destination for D2H
     sampled_ids: torch.Tensor                # GPU staging for sampled token IDs
     coord_staging: torch.Tensor              # GPU staging for coord values
     size_staging: torch.Tensor               # GPU staging for size values
@@ -485,7 +485,7 @@ self._copy_stream = torch.cuda.Stream(device=self.device)
 
 self._decode_slots = [
     DecodeSlot(
-        render=_RenderBuffer(..., copy_stream=self._copy_stream),
+        render=RenderBuffer(..., copy_stream=self._copy_stream),
         compute_stream=self._decode_compute_stream,  # SAME stream for both slots
         ...
     )
@@ -495,7 +495,7 @@ self._decode_slots = [
 
 **⚠️ Both slots MUST reference the same `_decode_compute_stream` object (invariant I1).**
 
-Currently `_RenderBuffer` creates its own stream in `__init__`. Change it to accept an optional `copy_stream` parameter, defaulting to creating one if not provided (backwards compatibility).
+Currently `RenderBuffer` creates its own stream in `__init__`. Change it to accept an optional `copy_stream` parameter, defaulting to creating one if not provided (backwards compatibility).
 
 ### 4.5a Engine pause/resume handling
 
@@ -669,7 +669,7 @@ This eliminates `CompletedStepInfo`, `apply_zombies()`, `zombie_seq_ids`, and `r
 Track each scheduled step in an `InFlightStep` record:
   - `sequences: list[ScheduledSequence]`
   - `slot_id: int` (0 or 1, which ping-pong slot this step used)
-  - `transfer: _RenderBuffer._TransferHandle`
+  - `transfer: TransferHandle`
 
 **Row order invariant:** `InFlightStep.sequences[i]` corresponds to row `i` in the render/staging buffers for that step. This mapping is implicit (no separate `row_of_seq` needed) because:
 - Forward and sampling write outputs in batch order
@@ -1235,157 +1235,6 @@ This separation ensures slot safety: we only attempt recovery when we can prove 
 
 ## 5. Implementation Plan (phased)
 
-### Phase 0 — Structural refactoring (prerequisite cleanup)
-
-Goal: Factor the existing `scheduler.py` (~850 lines) into focused modules **before** adding pipelining complexity. This follows the mini-sglang pattern (`ext/mini-sglang/python/minisgl/scheduler/`) where each module has a single responsibility.
-
-**Current structure:**
-
-```
-kestrel/scheduler/
-├── __init__.py
-├── queues.py       # RequestQueue, RunningQueue (good, keep as-is)
-├── sampling.py     # sample_tokens only (57 lines)
-├── types.py        # Core types (good, keep as-is)
-└── scheduler.py    # EVERYTHING ELSE (~850 lines, problem!)
-```
-
-**Proposed structure after Phase 0:**
-
-```
-kestrel/scheduler/
-├── __init__.py
-├── types.py              # Core types (unchanged)
-├── queues.py             # Existing queues (unchanged)
-├── sampling.py           # Existing (unchanged)
-├── transfer.py           # NEW: _RenderBuffer extracted (~90 lines)
-├── spatial.py            # NEW: Spatial value decoding (~100 lines)
-├── tokens.py             # NEW: Token rendering/materialization (~100 lines)
-└── scheduler.py          # Orchestration only (~400 lines)
-```
-
-**Extraction 1: `transfer.py` (~90 lines)**
-
-Extract `_RenderBuffer` and `_TransferHandle` from `scheduler.py`. This module is **required for the pipelined design** — Phase 1+ will extend it with the event-based `start_transfer()` API.
-
-```py
-# kestrel/scheduler/transfer.py
-"""Async D2H transfer management for decode outputs."""
-
-class TransferHandle:
-    """Handle for an in-flight D2H transfer."""
-
-    def __init__(self, event, token_ids, coord_values, size_values, count): ...
-    def wait(self) -> tuple[Tensor, Tensor, Tensor]: ...
-
-
-class RenderBuffer:
-    """Pinned host buffers for D2H transfers."""
-
-    def __init__(self, max_batch, device, *, coord_dtype, size_dtype, copy_stream=None): ...
-
-    # Legacy API (current behavior)
-    def transfer(self, token_ids, coord_values, size_values) -> TransferHandle: ...
-
-    # New API for pipelining (Phase 1+)
-    def start_transfer(self, ready_event, token_ids, coord_values, size_values) -> TransferHandle:
-        """Start D2H transfer, waiting only on ready_event (not wait_stream)."""
-        ...
-```
-
-**Extraction 2: `spatial.py` (~100 lines)**
-
-Extract `_compute_spatial_values` as a standalone function. This is the coord/size bin sampling and value decoding logic.
-
-```py
-# kestrel/scheduler/spatial.py
-"""Spatial token (coord/size) value decoding."""
-
-def compute_spatial_values(
-    token_ids: Tensor,
-    hidden_last: Tensor,
-    requests: list[GenerationRequest],
-    spatial_tables: SpatialDecodeTables,
-    *,
-    temperatures: Tensor | None = None,
-    top_ps: Tensor | None = None,
-    out_coord: Tensor,
-    out_size: Tensor,
-    rng: torch.Generator | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Decode coord/size token values from hidden states on GPU."""
-    ...
-```
-
-**Extraction 3: `tokens.py` (~100 lines)**
-
-Extract token materialization logic. This module is **fully testable without CUDA**.
-
-```py
-# kestrel/scheduler/tokens.py
-"""Token materialization and prompt processing."""
-
-def render_tokens_from_packed(
-    token_ids: Tensor,
-    coord_values: Tensor,
-    size_values: Tensor,
-    *,
-    coord_token_id: int,
-    size_token_id: int,
-) -> list[Token]:
-    """Materialize sampled ids + value tensors into typed tokens on host."""
-    ...
-
-
-def prompt_with_spatial_tokens(
-    prompt_tokens: Tensor,
-    coord_id: int,
-    size_id: int,
-    spatial_refs: Sequence[Sequence[float]],
-) -> list[Token]:
-    """Replace coord/size placeholder ids in prompt with typed tokens."""
-    ...
-```
-
-**Result: Slimmed `scheduler.py` (~400 lines)**
-
-After extractions, `GenerationScheduler` becomes an orchestrator that imports and uses the extracted modules:
-
-```py
-# kestrel/scheduler/scheduler.py
-from .transfer import RenderBuffer, TransferHandle
-from .spatial import compute_spatial_values
-from .tokens import render_tokens_from_packed, prompt_with_spatial_tokens
-
-
-class GenerationScheduler:
-    def __init__(self, runtime, ...):
-        self._render_buffer = RenderBuffer(...)
-        ...
-
-    def _decode_step(self) -> bool:
-        # Uses compute_spatial_values, render_tokens_from_packed
-        ...
-```
-
-**Module testability summary:**
-
-| Module | Lines | CUDA Required | Testable in Isolation |
-|--------|-------|---------------|----------------------|
-| `transfer.py` | ~90 | Yes | Partially (mock events) |
-| `spatial.py` | ~100 | Yes | No (GPU sampling) |
-| `tokens.py` | ~100 | No | **Yes** |
-| `scheduler.py` | ~400 | Yes | Integration tests |
-
-**Acceptance criteria:**
-
-- All existing tests pass (behavior unchanged).
-- `scheduler.py` reduced to ~400 lines.
-- New unit tests for `tokens.py` (no CUDA required).
-- Clean imports: `scheduler.py` imports from extracted modules.
-
----
-
 ### Phase 1 — Conservative pipelining (queue depth ≤ 1)
 
 Goal: Introduce the full Phase 2 infrastructure (PipelineState, ForwardHandle, unified loop) with a conservative constraint: **at most 1 sampled step in queue**. This validates the pipelining mechanism while limiting risk.
@@ -1661,17 +1510,9 @@ Acceptance:
 
 ## 6. Expected code touch points
 
-**Phase 0 (structural refactoring):**
-
-- `kestrel/scheduler/transfer.py`: NEW — `RenderBuffer`, `TransferHandle` extracted from scheduler.
-- `kestrel/scheduler/spatial.py`: NEW — `compute_spatial_values` extracted from scheduler.
-- `kestrel/scheduler/tokens.py`: NEW — `render_tokens_from_packed`, `prompt_with_spatial_tokens` extracted.
-- `kestrel/scheduler/scheduler.py`: Reduced to orchestration (~400 lines after extraction).
-
-**Phase 1+ (pipelining):**
-
 - `kestrel/scheduler/pipeline.py`: NEW — `PipelineState` (canonical production state machine, no CUDA dependencies).
 - `kestrel/scheduler/types.py`: Add `DecodeSlot`, `StepPlan`, `InFlightStep`, `ForwardHandle`; extend `ScheduledSequence` with `finalized`, `inflight_refs`.
+- `kestrel/scheduler/transfer.py`: Extend with event-based `start_transfer()` API.
 - `kestrel/scheduler/scheduler.py`: Scheduler API split (`schedule_decode_step`, `launch_forward_async`, `finalize_sampling`, `complete_step`).
 - `kestrel/moondream/runtime.py`: Two `DecodeSlot` objects, ping-pong FlashInfer contexts.
 - `kestrel/engine.py`: Unified loop in `_scheduler_loop`, delegates to `PipelineState` for state transitions.
@@ -1679,7 +1520,6 @@ Acceptance:
 **Tests:**
 
 - `tests/scheduler/test_pipeline.py`: NEW — Unit tests for state machine (no CUDA).
-- `tests/scheduler/test_tokens.py`: NEW — Unit tests for token rendering (no CUDA).
 - `tests/scheduler/test_transfer.py`: Integration tests for D2H transfers.
 - Existing integration tests: Verify sync/async equivalence.
 
@@ -1702,7 +1542,6 @@ Acceptance:
 - vLLM async copy helpers: `ext/vllm/vllm/v1/worker/gpu/async_utils.py`
 - vLLM execute/sample split: `ext/vllm/vllm/v1/worker/gpu/model_runner.py`
 - vLLM batch queue loop: `ext/vllm/vllm/v1/engine/core.py` (`step_with_batch_queue`)
-- mini-sglang scheduler organization: `ext/mini-sglang/python/minisgl/scheduler/` (inspiration for Phase 0 module factoring)
 - Kestrel engine scheduler loop: `kestrel/engine.py` (`_scheduler_loop`)
 - Kestrel scheduler: `kestrel/scheduler/scheduler.py`
 

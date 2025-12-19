@@ -15,9 +15,6 @@ class ModelPaths:
     weights: Path
     config_json: Optional[Path] = None
     tokenizer: Optional[str | Path] = None
-    reference_weights: Optional[Path] = None
-    reference_config: Optional[Path] = None
-    reference_tokenizer: Optional[str | Path] = None
 
 
 @dataclass
