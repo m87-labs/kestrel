@@ -20,6 +20,12 @@ from kestrel.moondream.runtime import (
 )
 from kestrel.moondream.lora import AdapterProvider
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.moondream.region import (
+    SpatialDecodeTables,
+    build_spatial_decode_tables,
+    spatial_bins_to_values,
+    spatial_decode_logits,
+)
 from kestrel.utils.buffers import CpuGpuBuffer
 from kestrel.skills import (
     QuerySkill,
@@ -270,33 +276,9 @@ class GenerationScheduler:
             coord_dtype=coord_dtype,
             size_dtype=size_dtype,
         )
-        coord_bins = runtime.config.region.coord_out_dim
-        size_bins = runtime.config.region.size_out_dim // 2
-        self._coord_value_lut = torch.linspace(
-            0.0,
-            1.0,
-            coord_bins,
-            device=runtime.device,
-            dtype=torch.float32,
-        ).to(dtype=coord_dtype)
-        size_exponents = torch.linspace(
-            -10.0,
-            0.0,
-            size_bins,
-            device=runtime.device,
-            dtype=torch.float32,
+        self._spatial_tables: SpatialDecodeTables = build_spatial_decode_tables(
+            runtime.region
         )
-        self._size_value_lut = torch.exp2(size_exponents).to(dtype=size_dtype)
-        coord_decoder = runtime.region["coord_decoder"]
-        size_decoder = runtime.region["size_decoder"]
-        self._coord_logits_dim = int(coord_decoder.out_features)
-        self._size_logits_dim = int(size_decoder.out_features)
-        self._spatial_decode_weight = torch.cat(
-            (coord_decoder.weight, size_decoder.weight), dim=0
-        ).contiguous()
-        self._spatial_decode_bias = torch.cat(
-            (coord_decoder.bias, size_decoder.bias), dim=0
-        ).contiguous()
         # Preallocated staging buffers for gathering the packed decode inputs
         # from the pending per-sequence slots (avoids per-step allocations).
         self._decode_token_ids = torch.empty(
@@ -704,14 +686,9 @@ class GenerationScheduler:
             temperatures = temps_cpu.to(device=hidden.device)
             top_ps = top_ps_cpu.to(device=hidden.device)
 
-        spatial_logits = torch.nn.functional.linear(
-            hidden, self._spatial_decode_weight, self._spatial_decode_bias
+        coord_logits, width_logits, height_logits = spatial_decode_logits(
+            hidden, self._spatial_tables
         )
-        coord_logits = spatial_logits[:, : self._coord_logits_dim]
-        size_flat = spatial_logits[:, self._coord_logits_dim :]
-        bins_size = int(size_flat.shape[-1] // 2)
-        width_logits = size_flat[:, :bins_size]
-        height_logits = size_flat[:, bins_size:]
 
         if not do_sample:
             coord_bins = torch.argmax(coord_logits, dim=-1)
@@ -743,12 +720,17 @@ class GenerationScheduler:
             width_bins = bins_2[:batch]
             height_bins = bins_2[batch:]
 
-        coord_out = out_coord[:batch].view(-1)
+        coord_out = out_coord[:batch]
         size_out = out_size[:batch]
-        torch.index_select(self._coord_value_lut, 0, coord_bins, out=coord_out)
-        torch.index_select(self._size_value_lut, 0, width_bins, out=size_out[:, 0])
-        torch.index_select(self._size_value_lut, 0, height_bins, out=size_out[:, 1])
-        return out_coord[:batch], out_size[:batch]
+        spatial_bins_to_values(
+            coord_bins,
+            width_bins,
+            height_bins,
+            self._spatial_tables,
+            out_coord=coord_out,
+            out_size=size_out,
+        )
+        return coord_out, size_out
 
     def _render_tokens_from_packed(
         self,

@@ -1,15 +1,24 @@
 """Region encoding and decoding utilities for spatial skills."""
 
 
+from dataclasses import dataclass
 import math
-from typing import Iterable, List, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 
 from .config import RegionConfig
 
-SpatialRef = Union[Tuple[float, float], Tuple[float, float, float, float]]
+
+@dataclass(frozen=True)
+class SpatialDecodeTables:
+    coord_value_lut: Tensor
+    size_value_lut: Tensor
+    coord_logits_dim: int
+    weight: Tensor
+    bias: Tensor
 
 
 def fourier_features(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -21,59 +30,72 @@ def encode_coordinate(coord: torch.Tensor, module: nn.ModuleDict) -> torch.Tenso
     return module["coord_encoder"](fourier_features(coord, module.coord_features))
 
 
-def decode_coordinate(hidden_state: torch.Tensor, module: nn.ModuleDict) -> torch.Tensor:
-    return module["coord_decoder"](hidden_state)
-
-
 def encode_size(size: torch.Tensor, module: nn.ModuleDict) -> torch.Tensor:
     return module["size_encoder"](fourier_features(size, module.size_features))
 
 
-def decode_size(hidden_state: torch.Tensor, module: nn.ModuleDict) -> torch.Tensor:
-    return module["size_decoder"](hidden_state).view(2, -1)
+def build_spatial_decode_tables(
+    module: nn.ModuleDict,
+) -> SpatialDecodeTables:
+    coord_decoder = module["coord_decoder"]
+    size_decoder = module["size_decoder"]
+
+    weight = torch.cat((coord_decoder.weight, size_decoder.weight), dim=0).contiguous()
+    bias = torch.cat((coord_decoder.bias, size_decoder.bias), dim=0).contiguous()
+
+    coord_bins = int(coord_decoder.out_features)
+    device = module.coord_features.device
+    coord_dtype = module.coord_features.dtype
+    coord_value_lut = torch.linspace(
+        0.0, 1.0, coord_bins, device=device, dtype=torch.float32
+    ).to(dtype=coord_dtype)
+
+    size_bins = int(size_decoder.out_features // 2)
+    size_device = module.size_features.device
+    size_dtype = module.size_features.dtype
+    size_exponents = torch.linspace(
+        -10.0, 0.0, size_bins, device=size_device, dtype=torch.float32
+    )
+    size_value_lut = torch.exp2(size_exponents).to(dtype=size_dtype)
+
+    return SpatialDecodeTables(
+        coord_value_lut=coord_value_lut,
+        size_value_lut=size_value_lut,
+        coord_logits_dim=coord_bins,
+        weight=weight,
+        bias=bias,
+    )
 
 
-def decode_size_logits(hidden_state: torch.Tensor, module: nn.ModuleDict) -> torch.Tensor:
-    """Return size decoder logits as (batch, 2, bins).
-
-    The size head emits concatenated logits for width and height. Historically
-    this was reshaped as ``(2, bins)`` for a single hidden state; this helper
-    generalises the reshape for batched hidden states.
-    """
-
+def spatial_decode_logits(
+    hidden_state: Tensor,
+    tables: SpatialDecodeTables,
+) -> tuple[Tensor, Tensor, Tensor]:
     hidden = hidden_state.unsqueeze(0) if hidden_state.ndim == 1 else hidden_state
-    logits = module["size_decoder"](hidden)
-    bins = logits.shape[-1] // 2
-    return logits.view(logits.shape[0], 2, bins)
+    logits = F.linear(hidden, tables.weight, tables.bias)
+
+    coord_logits = logits[:, : tables.coord_logits_dim]
+    size_flat = logits[:, tables.coord_logits_dim :]
+    bins = int(size_flat.shape[-1] // 2)
+    width_logits = size_flat[:, :bins]
+    height_logits = size_flat[:, bins:]
+    return coord_logits, width_logits, height_logits
 
 
-def encode_spatial_refs(
-    spatial_refs: Iterable[SpatialRef], module: nn.ModuleDict
-) -> dict[str, torch.Tensor | None]:
-    coords: List[float] = []
-    sizes: List[Tuple[float, float]] = []
-    for ref in spatial_refs:
-        if len(ref) == 2:
-            coords.extend(ref)
-        else:
-            x_min, y_min, x_max, y_max = ref
-            x_c = (x_min + x_max) / 2
-            y_c = (y_min + y_max) / 2
-            width = x_max - x_min
-            height = y_max - y_min
-            coords.extend([x_c, y_c])
-            sizes.append((width, height))
-
-    coord_tensor = torch.tensor(coords, device=module.coord_features.device, dtype=module.coord_features.dtype).view(-1, 1)
-    coord_enc = encode_coordinate(coord_tensor, module)
-
-    if sizes:
-        size_tensor = torch.tensor(sizes, device=module.size_features.device, dtype=module.size_features.dtype)
-        size_enc = encode_size(size_tensor, module)
-    else:
-        size_enc = None
-
-    return {"coords": coord_enc, "sizes": size_enc}
+def spatial_bins_to_values(
+    coord_bins: Tensor,
+    width_bins: Tensor,
+    height_bins: Tensor,
+    tables: SpatialDecodeTables,
+    *,
+    out_coord: Tensor,
+    out_size: Tensor,
+) -> tuple[Tensor, Tensor]:
+    coord_out = out_coord.view(-1)
+    torch.index_select(tables.coord_value_lut, 0, coord_bins, out=coord_out)
+    torch.index_select(tables.size_value_lut, 0, width_bins, out=out_size[:, 0])
+    torch.index_select(tables.size_value_lut, 0, height_bins, out=out_size[:, 1])
+    return out_coord, out_size
 
 
 def build_region_module(config: RegionConfig, dtype: torch.dtype) -> nn.ModuleDict:
@@ -94,13 +116,12 @@ def build_region_module(config: RegionConfig, dtype: torch.dtype) -> nn.ModuleDi
 
 
 __all__ = [
-    "SpatialRef",
+    "SpatialDecodeTables",
     "fourier_features",
     "encode_coordinate",
-    "decode_coordinate",
     "encode_size",
-    "decode_size",
-    "decode_size_logits",
-    "encode_spatial_refs",
+    "build_spatial_decode_tables",
+    "spatial_decode_logits",
+    "spatial_bins_to_values",
     "build_region_module",
 ]
