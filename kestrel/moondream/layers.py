@@ -14,6 +14,7 @@ from typing import Literal
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
+from ..ops import topk_fwd
 from ..fused_moe.lora_kernels import apply_moe_lora
 
 # Re-export LoRA for convenience
@@ -192,8 +193,7 @@ def moe_mlp(
     fused_mlp = mlp_module["mlp"]
 
     router_logits = router(x_flat)
-    topk_logits, topk_idxs = torch.topk(router_logits, experts_per_token, dim=-1)
-    topk_weights = F.softmax(topk_logits, dim=-1, dtype=torch.float32).to(x.dtype)
+    topk_weights, topk_idxs = topk_fwd(router_logits, experts_per_token, softmax=True)
 
     # Expand slot IDs for all tokens if we have a sequence length > 1
     expanded_slot_ids = None

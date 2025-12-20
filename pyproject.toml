@@ -20,6 +20,8 @@ dependencies = [
     "vllm==0.11.0",
     "pypotrace==0.3",
     "resvg>=0.1.2",
+    "nvidia-cutlass-dsl==4.3.3",
+    "apache-tvm-ffi>=0.1.5,<0.2",
 ]
 
 [tool.setuptools.packages.find]
