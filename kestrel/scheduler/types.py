@@ -12,6 +12,7 @@ from torch import Tensor
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
+from kestrel.scheduler.transfer import TransferHandle
 
 
 @dataclass
@@ -76,6 +77,10 @@ class ScheduledSequence:
     prefill_started_at: Optional[float] = None
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
+    # Pipelining state: finalized means EOS/length cap reached, inflight_refs
+    # counts how many in-flight steps reference this sequence.
+    finalized: bool = False
+    inflight_refs: int = 0
 
     def stage_token(
         self,
@@ -151,3 +156,16 @@ class RequestMetrics:
     prefill_time_ms: float
     ttft_ms: float
     decode_time_ms: float
+
+
+@dataclass
+class StepPlan:
+    """Decode step plan returned by schedule_decode_step.
+
+    This is a pure selection of which sequences to include in the next decode
+    step. It does not mutate any state - the scheduler remains a stateless
+    selector. Actual state changes (inflight_refs increment, GPU dispatch)
+    happen when the plan is executed via launch_forward_async.
+    """
+
+    sequences: List["ScheduledSequence"]

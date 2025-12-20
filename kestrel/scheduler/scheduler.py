@@ -29,7 +29,9 @@ from .types import (
     RequestMetrics,
     ScheduledSequence,
     SchedulerResult,
+    StepPlan,
 )
+from .pipeline import ForwardHandle, InFlightStep, PipelineState
 from .sampling import sample_tokens
 from .transfer import RenderBuffer
 from .tokens import prompt_with_spatial_tokens, render_tokens_from_packed
@@ -86,6 +88,7 @@ class GenerationScheduler:
             runtime.device,
             coord_dtype=coord_dtype,
             size_dtype=size_dtype,
+            copy_stream=runtime.copy_stream,
         )
         # Preallocated staging buffers for gathering the packed decode inputs
         # from the pending per-sequence slots (avoids per-step allocations).
@@ -117,6 +120,7 @@ class GenerationScheduler:
         )
         self._sampling_rng = torch.Generator(device=runtime.device)
         self._sampling_rng.manual_seed(torch.seed())
+        self._pipeline = PipelineState()
 
     # ------------------------------------------------------------------
     # Submission
@@ -137,21 +141,74 @@ class GenerationScheduler:
     # Execution
 
     def has_pending_work(self) -> bool:
-        """Return ``True`` if there is anything left to prefill or decode."""
-
-        return len(self.waiting) > 0 or len(self.running) > 0
+        """Return ``True`` if there is anything left to prefill, decode, or complete."""
+        return (
+            len(self.waiting) > 0
+            or len(self.running) > 0
+            or not self._pipeline.is_empty()
+        )
 
     def advance(self) -> bool:
-        """Attempt to make progress by running prefill/decode once.
+        """Attempt to make progress using the pipelined decode loop.
 
         Returns ``True`` if any state changed (e.g. tokens decoded, new
         sequences admitted). Callers can keep invoking ``advance`` while it
         returns ``True`` to drain ready work before sleeping.
-        """
 
+        Phase 1 ordering (design doc §5):
+        1. Launch forward (if none in-flight) - forward doesn't need mask
+        2. Commit previous step (updates skill state via consume_step)
+        3. Finalize sampling (compute mask with updated skill state)
+
+        This is "commit-before-finalize" which ensures constrained decoding
+        sees the correct skill state. Forward t+1 runs on GPU while CPU
+        commits step t, achieving overlap.
+        """
         progressed = False
-        progressed |= self._try_prefill()
-        progressed |= self._decode_step()
+        pipeline = self._pipeline
+
+        has_forward = pipeline.has_forward_in_flight()
+        has_queued = pipeline.queue_depth() > 0
+
+        # Only enter stream context if there's GPU work to do
+        if has_forward or has_queued or len(self.running) > 0:
+            with torch.cuda.stream(self.runtime.decode_compute_stream):
+                # 1. Launch forward if none in-flight (forward doesn't need mask)
+                if not has_forward and pipeline.can_launch_forward():
+                    plan = self.schedule_decode_step()
+                    if plan is not None:
+                        slot_id = pipeline.free_slot_id()
+                        handle = self._launch_forward_on_stream(plan, slot_id)
+                        pipeline.on_forward_launched(handle)
+                        has_forward = True  # Update for step 3
+                        progressed = True
+
+                # 2. Commit previous step (updates skill state for mask computation)
+                # GPU runs forward in parallel while CPU blocks on D2H.
+                oldest = pipeline.pop_oldest()
+                if oldest is not None:
+                    self.complete_step(oldest)
+                    pipeline.on_step_completed()
+                    progressed = True
+
+                # 3. Finalize sampling (now skill state is updated for mask)
+                if has_forward:
+                    handle = pipeline.forward_handle
+                    step = self._finalize_sampling_on_stream(handle)
+                    pipeline.on_sampling_complete(step)
+                    progressed = True
+
+        # 4. Prefill - requires empty pipeline to avoid KV ordering issues
+        # Per design doc §4.5: only drain if prefill is actually admissible.
+        # Draining when prefill can't proceed (batch full, KV exhausted) would
+        # collapse overlap under backlog for no benefit.
+        if len(self.waiting) > 0:
+            prefill_admissible = self._is_prefill_admissible()
+            if prefill_admissible and not pipeline.is_empty():
+                self._drain_pipeline()
+                progressed = True
+            if prefill_admissible or pipeline.is_empty():
+                progressed |= self._try_prefill()
 
         if not progressed:
             stalled = self.waiting.peek()
@@ -163,6 +220,35 @@ class GenerationScheduler:
                     f"{stalled.request_id} (needs {stalled.target_length} tokens)."
                 )
         return progressed
+
+    def _drain_pipeline(self) -> None:
+        """Drain the pipeline before prefill - complete all in-flight work.
+
+        Respects Phase 1 commit-before-finalize ordering: complete all queued
+        steps before finalizing any in-flight forward. This ensures grammar
+        state is updated before computing masks for constrained decoding.
+        """
+        pipeline = self._pipeline
+
+        # 1. Complete all queued steps first (commit-before-finalize)
+        while True:
+            step = pipeline.pop_oldest()
+            if step is None:
+                break
+            self.complete_step(step)
+            pipeline.on_step_completed()
+
+        # 2. Finalize any in-flight forward (now safe after all commits)
+        if pipeline.has_forward_in_flight():
+            handle = pipeline.forward_handle
+            step = self.finalize_sampling(handle)
+            pipeline.on_sampling_complete(step)
+
+            # 3. Complete the final step
+            step = pipeline.pop_oldest()
+            if step is not None:
+                self.complete_step(step)
+                pipeline.on_step_completed()
 
     def pop_completed(self) -> List[SchedulerResult]:
         """Retrieve all completed results accumulated so far."""
@@ -217,9 +303,34 @@ class GenerationScheduler:
         )
         self._completed.append(result)
 
+    def _is_prefill_admissible(self) -> bool:
+        """Check if the next pending prefill can be admitted.
+
+        Returns True if:
+        - There's a waiting request
+        - Batch has room (accounting for zombies via active_sequences)
+        - KV cache can reserve space for the request
+
+        This is used to gate pipeline draining per design doc §4.5:
+        only drain when prefill would actually proceed.
+        """
+        request = self.waiting.peek()
+        if request is None:
+            return False
+        # Use active_sequences count to account for zombies (finalized but
+        # inflight_refs > 0). These still hold batch slots until released.
+        num_allocated = len(self.runtime.active_sequences)
+        if num_allocated >= self.runtime.max_batch_size:
+            return False
+        if not self.runtime.can_reserve(request.target_length):
+            return False
+        return True
+
     def _try_prefill(self) -> bool:
         progress = False
-        while len(self.waiting) and len(self.running) < self.runtime.max_batch_size:
+        # Use active_sequences count to account for zombies (finalized but
+        # inflight_refs > 0). These still hold batch slots until released.
+        while len(self.waiting) and len(self.runtime.active_sequences) < self.runtime.max_batch_size:
             request = self.waiting.peek()
             if request is None:
                 break
@@ -292,7 +403,7 @@ class GenerationScheduler:
 
             first_logits = logits.squeeze(0)
             sampled_ids, temps, top_ps = self._sample_batch(
-                first_logits.unsqueeze(0), [seq.request]
+                first_logits.unsqueeze(0), [seq], self._sampled_token_ids
             )
             hidden_last = seq.state.last_hidden
             if hidden_last is None:  # pragma: no cover - defensive
@@ -315,7 +426,12 @@ class GenerationScheduler:
             self._pending_coord_values[batch_idx].copy_(coord_decode[0])
             self._pending_size_values[batch_idx].copy_(size_decode[0])
 
-            transfer = self._render_buffer.transfer(sampled_ids, coord_decode, size_decode)
+            # Record event for D2H transfer synchronization
+            prefill_done_event = torch.cuda.Event()
+            prefill_done_event.record()
+            transfer = self._render_buffer.transfer(
+                sampled_ids, coord_decode, size_decode, ready_event=prefill_done_event
+            )
             token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
             token = render_tokens_from_packed(
                 token_ids_cpu, coord_cpu, size_cpu,
@@ -331,92 +447,304 @@ class GenerationScheduler:
             progress = True
         return progress
 
-    def _decode_step(self) -> bool:
-        if not len(self.running):
+    # ──────────────────────────────────────────────────────────────────────────
+    # Split decode API (Phase 1 pipelining)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _can_dispatch(self, seq: ScheduledSequence) -> bool:
+        """Check if a sequence can be included in the next decode step.
+
+        A sequence is dispatchable if:
+        - Not already finalized (EOS/length cap reached)
+        - Has fewer than 2 in-flight references (pipelining limit)
+        - Won't exceed its length budget if dispatched
+
+        This is a pure predicate - it does not mutate any state.
+        """
+        if seq.finalized:
             return False
+        if seq.inflight_refs >= 2:
+            return False
+        # Absolute max length (includes prompt)
+        if seq.state.length >= seq.state.max_length:
+            return False
+        # Max new tokens budget - account for in-flight steps
+        if seq.request.max_new_tokens is not None:
+            committed = seq.skill_state.token_count
+            if committed + seq.inflight_refs >= seq.request.max_new_tokens:
+                return False
+        return True
+
+    def schedule_decode_step(self) -> Optional[StepPlan]:
+        """Select sequences for the next decode step.
+
+        This is a pure selector that examines the running queue and returns a
+        StepPlan containing sequences ready for decoding, or None if no work.
+
+        Per design doc §4.7: This method does NOT finalize sequences based on
+        GPU-progress (seq.state.length). Finalization happens in complete_step()
+        after the token is committed, using committed counts. The _can_dispatch()
+        predicate uses budgeted counts to exclude sequences that would exceed
+        their limits if dispatched.
+        """
+        if not len(self.running):
+            return None
 
         active: list[ScheduledSequence] = []
-        idle: list[ScheduledSequence] = []
-        for seq in self.running.take_all():
-            if seq.state.at_capacity():
-                self._finalize_sequence(seq, "length")
+        for seq in self.running:
+            if not seq.needs_decode():
                 continue
-            if seq.needs_decode():
-                active.append(seq)
-            else:
-                idle.append(seq)
+            if not self._can_dispatch(seq):
+                continue
+            active.append(seq)
 
         if not active:
-            self.running.extend(idle)
-            return False
+            return None
 
-        batch_size = len(active)
-        idx_np = self._decode_batch_idx.np
-        for i, seq in enumerate(active):
-            idx_np[i] = seq.state.batch_idx
-        batch_idx = self._decode_batch_idx.copy_to_gpu(batch_size)
-        token_ids = self._decode_token_ids[:batch_size]
-        coord_values = self._decode_coord_values[:batch_size]
-        size_values = self._decode_size_values[:batch_size]
-        torch.index_select(self._pending_token_ids, 0, batch_idx, out=token_ids)
-        torch.index_select(self._pending_coord_values, 0, batch_idx, out=coord_values)
-        torch.index_select(self._pending_size_values, 0, batch_idx, out=size_values)
+        return StepPlan(sequences=active)
 
-        logits, hidden_last = self.runtime.decode_batch(
-            [seq.state for seq in active],
-            token_ids,
-            coord_values,
-            size_values,
+    def launch_forward_async(
+        self, plan: StepPlan, slot_id: int
+    ) -> ForwardHandle:
+        """Launch the forward pass for a decode step (with stream context).
+
+        Wrapper that enters the compute stream context before calling
+        _launch_forward_on_stream. Use this when calling from outside advance().
+        """
+        with torch.cuda.stream(self.runtime.decode_compute_stream):
+            return self._launch_forward_on_stream(plan, slot_id)
+
+    def _launch_forward_on_stream(
+        self, plan: StepPlan, slot_id: int
+    ) -> ForwardHandle:
+        """Launch the forward pass for a decode step.
+
+        IMPORTANT: Caller must already be on the compute stream.
+
+        This increments inflight_refs for each sequence (committing them to this
+        step), gathers inputs, and runs the model forward pass. The forward
+        outputs (logits, hidden_last) are stored in the DecodeSlot's buffers
+        for later retrieval by finalize_sampling.
+
+        Returns a ForwardHandle that can be passed to finalize_sampling.
+        """
+        sequences = plan.sequences
+        batch_size = len(sequences)
+        slot = self.runtime.decode_slots[slot_id]
+
+        # Commit sequences to this step (rollback if forward fails)
+        for seq in sequences:
+            seq.inflight_refs += 1
+
+        try:
+            # Prepare all CPU metadata buffers
+            idx_np = slot.meta.batch_idx.np
+            pos_np = slot.meta.input_pos.np
+            lora_np = slot.meta.lora_slot_ids.np
+            for i, seq in enumerate(sequences):
+                idx_np[i] = seq.state.batch_idx
+                pos_np[i] = seq.state.length
+                lora_np[i] = seq.state.lora_slot
+
+            # H2D copies for all metadata
+            batch_idx = slot.meta.batch_idx.copy_to_gpu(batch_size)
+            slot.meta.input_pos.copy_to_gpu(batch_size)
+            slot.meta.lora_slot_ids.copy_to_gpu(batch_size)
+
+            # Gather decode inputs from _pending_* into slot staging buffers
+            token_ids = slot.decode_token_ids[:batch_size]
+            coord_values = slot.decode_coord_values[:batch_size]
+            size_values = slot.decode_size_values[:batch_size]
+            torch.index_select(self._pending_token_ids, 0, batch_idx, out=token_ids)
+            torch.index_select(self._pending_coord_values, 0, batch_idx, out=coord_values)
+            torch.index_select(self._pending_size_values, 0, batch_idx, out=size_values)
+
+            # Run forward pass - writes to slot.logits and slot.hidden_last
+            self.runtime.decode_with_slot(slot, batch_size)
+        except Exception:
+            # Rollback inflight_refs on failure
+            for seq in sequences:
+                seq.inflight_refs -= 1
+            raise
+
+        # Advance sequence states (KV length) immediately after forward dispatch.
+        # Per design doc §4.5: length tracks GPU progress, not CPU commit.
+        for seq in sequences:
+            seq.state.advance()
+
+        return ForwardHandle(
+            slot_id=slot_id,
+            sequences=sequences,
         )
 
-        requests = [seq.request for seq in active]
-        sampled_ids, temps, top_ps = self._sample_batch(logits, requests)
+    def finalize_sampling(
+        self, handle: ForwardHandle, mask: Optional[Tensor] = None
+    ) -> InFlightStep:
+        """Finalize sampling for a forward pass (with stream context).
+
+        Wrapper that enters the compute stream context before calling
+        _finalize_sampling_on_stream. Use this when calling from outside advance().
+        """
+        slot = self.runtime.decode_slots[handle.slot_id]
+        with torch.cuda.stream(slot.compute_stream):
+            return self._finalize_sampling_on_stream(handle, mask)
+
+    def _finalize_sampling_on_stream(
+        self, handle: ForwardHandle, mask: Optional[Tensor] = None
+    ) -> InFlightStep:
+        """Finalize sampling for a forward pass and start D2H transfer.
+
+        IMPORTANT: Caller must already be on the compute stream.
+
+        Takes the forward outputs from the DecodeSlot's buffers, applies optional
+        token mask, samples tokens, computes spatial values, writes to pending
+        buffers, and kicks off async D2H via the slot's RenderBuffer.
+
+        The mask parameter is for future constrained decoding support. Currently
+        masking is computed inline from skill_state.allowed_token_ids.
+
+        Returns an InFlightStep that can be passed to complete_step.
+        """
+        sequences = handle.sequences
+        batch_size = len(sequences)
+        slot = self.runtime.decode_slots[handle.slot_id]
+
+        # Read forward outputs from slot's buffers
+        logits = slot.logits[:batch_size]
+        hidden_last = slot.hidden_last[:batch_size]
+
+        # Reuse batch indices already copied in launch_forward_async
+        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
+
+        # Sample tokens directly into per-slot staging buffer for D2H.
+        # This prevents race with next step's sampling writing to shared buffer.
+        sampled_ids, temps, top_ps = self._sample_batch(
+            logits, sequences, slot.sampled_ids
+        )
+
+        # Compute spatial values into slot's staging buffers
+        coord_staging = slot.coord_staging[:batch_size]
+        size_staging = slot.size_staging[:batch_size]
         coord_decode, size_decode = compute_spatial_values(
             sampled_ids,
             hidden_last,
-            requests,
+            [seq.request for seq in sequences],
             self.runtime.spatial_tables,
             temperatures=temps,
             top_ps=top_ps,
-            out_coord=coord_values,
-            out_size=size_values,
+            out_coord=coord_staging,
+            out_size=size_staging,
             rng=self._sampling_rng,
         )
+
+        # Record event after staging buffers are ready (before pending writes).
+        # D2H copies from staging buffers, not pending buffers, so we can
+        # overlap the pending writes with the D2H transfer.
+        slot.step_done_event.record()
+
+        # Write to shared pending buffers for next step's input gathering.
+        # These run in parallel with D2H since they're after the event record.
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
         self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
         self._pending_size_values.index_copy_(0, batch_idx, size_decode)
-        transfer = self._render_buffer.transfer(sampled_ids, coord_decode, size_decode)
 
-        # Overlap advances/length bookkeeping with the host copy.
-        for seq in active:
-            seq.state.advance()
+        # Start async D2H transfer from per-slot staging buffers.
+        # Pass the step_done_event so copy stream waits only on staging writes.
+        transfer = slot.render.transfer(
+            slot.sampled_ids[:batch_size],
+            coord_staging,
+            size_staging,
+            ready_event=slot.step_done_event,
+        )
 
-        token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
+        return InFlightStep(
+            slot_id=handle.slot_id,
+            sequences=sequences,
+            transfer=transfer,
+        )
+
+    def complete_step(self, step: InFlightStep) -> None:
+        """Complete a decode step: wait for D2H, commit tokens, handle termination.
+
+        Blocks until the D2H transfer completes, then materializes tokens and
+        commits them to each sequence (calls consume_step, emits streaming).
+        Checks for EOS termination and updates finalized state.
+
+        Sequences that become finalized AND have no remaining in-flight refs
+        are released immediately. Zombies (finalized with refs > 0) are skipped
+        at commit time and released when their last step completes.
+        """
+        # Wait for D2H transfer
+        token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+
+        # Render typed tokens from packed tensors
         tokens = render_tokens_from_packed(
             token_ids_cpu, coord_cpu, size_cpu,
             coord_id=self._coord_id, size_id=self._size_id,
         )
 
-        for seq, token in zip(active, tokens):
-            seq.stage_token(self.runtime, token)
-            if not self._mark_finished_if_needed(seq):
-                idle.append(seq)
+        # Commit each sequence
+        for seq, token in zip(step.sequences, tokens):
+            seq.inflight_refs -= 1
 
-        self.running.extend(idle)
-        return True
+            # Skip zombies (already finalized in a previous step)
+            if seq.finalized:
+                if seq.inflight_refs == 0:
+                    self._release_sequence(seq)
+                continue
+
+            # Stage token (calls consume_step, emits streaming)
+            seq.stage_token(self.runtime, token)
+
+            # Check for termination
+            if self._mark_finished_if_needed(seq):
+                seq.finalized = True
+                # Remove from running queue
+                self.running.remove(seq)
+                if seq.inflight_refs == 0:
+                    self._release_sequence(seq)
+
+    def _release_sequence(self, seq: ScheduledSequence) -> None:
+        """Release resources for a finalized sequence with no in-flight refs.
+
+        Called when a zombie's last in-flight reference completes. The sequence
+        was finalized earlier (in _mark_finished_if_needed or schedule_decode_step)
+        but resource release was deferred because inflight_refs > 0.
+        """
+        if seq.state.batch_idx in self.runtime.active_sequences:
+            self.runtime.release_sequence(seq.state)
 
     def _sample_batch(
-        self, logits: Tensor, requests: List[GenerationRequest]
+        self, logits: Tensor, sequences: List[ScheduledSequence], out: Tensor,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
-        batch = len(requests)
+        """Sample tokens from logits into the provided output buffer.
+
+        Args:
+            logits: Logits tensor of shape [batch, vocab_size].
+            sequences: List of scheduled sequences (for temperature/top_p and
+                finalized state). Finalized sequences are treated as unconstrained
+                to avoid querying skill state after termination.
+            out: Pre-allocated output buffer for sampled token IDs. Must be
+                shape [batch] or larger, dtype long.
+
+        Returns:
+            Tuple of (sampled_ids, temps, top_ps). sampled_ids is a view of
+            out[:batch].
+        """
+        batch = len(sequences)
         if batch == 0:
-            empty = torch.empty(0, dtype=torch.long, device=logits.device)
-            return empty, None, None
+            return out[:0], None, None
 
         allowed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
-        for req in requests:
-            state = req.skill_state
+        for seq in sequences:
+            # Skip constraint queries for finalized sequences (zombies).
+            # Per design doc §4.6: treat finalized as unconstrained to avoid
+            # use-after-finalization bugs.
+            if seq.finalized:
+                allowed_tokens.append(None)
+                continue
+            state = seq.request.skill_state
             if state is None:
                 allowed_tokens.append(None)
                 continue
@@ -435,23 +763,20 @@ class GenerationScheduler:
                 pruned[idx] = row[idx]
                 logits[i] = pruned
 
-        if all(req.temperature <= 0.0 for req in requests):
-            return torch.argmax(logits, dim=-1), None, None
+        if all(seq.request.temperature <= 0.0 for seq in sequences):
+            torch.argmax(logits, dim=-1, out=out[:batch])
+            return out[:batch], None, None
 
         temps_cpu = torch.empty(batch, dtype=torch.float32)
         top_ps_cpu = torch.empty(batch, dtype=torch.float32)
-        for i, req in enumerate(requests):
-            temps_cpu[i] = req.temperature
-            top_ps_cpu[i] = req.top_p
+        for i, seq in enumerate(sequences):
+            temps_cpu[i] = seq.request.temperature
+            top_ps_cpu[i] = seq.request.top_p
         temps = temps_cpu.to(device=logits.device)
         top_ps = top_ps_cpu.to(device=logits.device)
         sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._sampling_rng)
-        if sampled_raw.dtype == torch.long:
-            return sampled_raw, temps, top_ps
-
-        sampled = self._sampled_token_ids[:batch]
-        sampled.copy_(sampled_raw, non_blocking=True)
-        return sampled, temps, top_ps
+        out[:batch].copy_(sampled_raw)
+        return out[:batch], temps, top_ps
 
     def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
         last_token = seq.last_token
@@ -472,15 +797,29 @@ class GenerationScheduler:
         return True
 
     def _finalize_sequence(self, seq: ScheduledSequence, reason: str) -> None:
+        """Mark a sequence as finished and prepare its result.
+
+        This marks both `finished` (for result building) and `finalized` (for
+        pipelining). Resources are NOT released here if inflight_refs > 0;
+        release happens in complete_step() when the last in-flight reference
+        completes. This prevents releasing KV cache pages while a zombie step
+        is still reading them.
+        """
         if seq.finished:
             return
         seq.finished = True
+        seq.finalized = True
         seq.finish_reason = reason
         seq.completed_at = time.perf_counter()
         if seq.first_token_time is None:
             seq.first_token_time = seq.completed_at
-        if seq.state.batch_idx in self.runtime.active_sequences:
-            self.runtime.release_sequence(seq.state)
+
+        # Only release immediately if no in-flight steps reference this sequence.
+        # Otherwise, release is deferred to complete_step() when inflight_refs hits 0.
+        if seq.inflight_refs == 0:
+            if seq.state.batch_idx in self.runtime.active_sequences:
+                self.runtime.release_sequence(seq.state)
+
         self._completed.append(self._build_result(seq))
 
     def _resolve_temperature(self, temperature: Optional[float]) -> float:

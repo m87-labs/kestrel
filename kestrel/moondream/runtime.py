@@ -48,7 +48,7 @@ from .region import (
     encode_size,
 )
 from ..seg_refiner import SegmentRefiner
-
+from .decode_slot import DecodeSlot, create_decode_slot
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -113,18 +113,6 @@ class SequenceState:
 
     def remaining_new_tokens(self) -> int:
         return max(self.max_length - self.length, 0)
-
-
-@dataclass
-class _GraphWorkspace:
-    token_buffer: Tensor
-    coord_values_buffer: Tensor
-    size_values_buffer: Tensor
-    batch_idx_buffer: Tensor
-    position_buffer: Tensor
-    output_buffer: Tensor
-    hidden_buffer: Tensor
-    lora_slot_ids_buffer: Tensor
 
 
 @dataclass
@@ -357,15 +345,13 @@ class MoondreamRuntime:
             and self.device.type == "cuda"
         )
 
-        self._flashinfer_ctx = FlashInferDecodeContext(
-            device=self.device,
-            q_dtype=self.dtype,
-            kv_dtype=self.kv_cache_dtype,
-            page_size=self.page_size,
-            max_batch_size=self.max_batch_size,
-            max_seq_len=self.max_seq_length,
-            use_cuda_graphs=self._use_cuda_graphs,
-        )
+        # Shared streams for pipelined decoding. All decode forwards serialize on
+        # the compute stream (preserves KV ordering and _pending_* dependencies).
+        # D2H copies share the copy stream for simpler ordering guarantees.
+        self._decode_compute_stream = torch.cuda.Stream(device=self.device)
+        self._copy_stream = torch.cuda.Stream(device=self.device)
+
+        # Prefill uses a separate FlashInfer context (not pipelined).
         # Force fa2 backend: fa3 lacks mixed-precision attention (see flashinfer#2038).
         self._flashinfer_prefill_ctx = FlashInferPrefillContext(
             device=self.device,
@@ -376,43 +362,12 @@ class MoondreamRuntime:
         self._active_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None
         self._active_prefill_batch_idx: Optional[Tensor] = None
 
-        self._graph_workspace: _GraphWorkspace | None = None
-        self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
         self._graph_pool: object | None = None
-        self._batch_idx = CpuGpuBuffer(
-            self.max_batch_size,
-            dtype=torch.int64,
-            device=self.device,
-            pin_memory=True,
-        )
         self._batch_binding: _BatchBinding = _BatchBinding()
-        self._input_pos = CpuGpuBuffer(
-            self.max_batch_size,
-            dtype=torch.int32,
-            device=self.device,
-            pin_memory=True,
-        )
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
-        # Decode token/value inputs are staged by the scheduler; keep reusable
-        # GPU buffers here to avoid per-step allocations regardless of whether
-        # the scheduler passes CPU or GPU tensors.
-        self._tokens = torch.empty(
-            (self.max_batch_size,), device=self.device, dtype=torch.long
-        )
-        self._coord_values = torch.empty(
-            (self.max_batch_size, 1), device=self.device, dtype=coord_dtype
-        )
-        self._size_values = torch.empty(
-            (self.max_batch_size, 2), device=self.device, dtype=size_dtype
-        )
-        self._lora_slot_ids = CpuGpuBuffer(
-            self.max_batch_size,
-            dtype=torch.int32,
-            device=self.device,
-            pin_memory=True,
-        )
         self._prefill_batch_idx = CpuGpuBuffer(
             1,
             dtype=torch.int64,
@@ -471,6 +426,31 @@ class MoondreamRuntime:
             )
             self._slot_manager = AdapterSlotManager(max_slots)
 
+        # Create two ping-pong decode slots for pipelined decoding.
+        # Each slot has its own FlashInfer context, staging buffers, and
+        # RenderBuffer, but they share the decode compute stream and copy stream.
+        vocab_size = self.model.text.lm_head.weight.shape[0]
+        hidden_dim = self.model.text.lm_head.weight.shape[1]
+        self._decode_slots: list[DecodeSlot] = [
+            create_decode_slot(
+                slot_id=slot_id,
+                device=self.device,
+                dtype=self.dtype,
+                kv_dtype=self.kv_cache_dtype,
+                max_batch_size=self.max_batch_size,
+                max_seq_len=self.max_seq_length,
+                page_size=self.page_size,
+                vocab_size=vocab_size,
+                hidden_dim=hidden_dim,
+                coord_dtype=coord_dtype,
+                size_dtype=size_dtype,
+                compute_stream=self._decode_compute_stream,
+                copy_stream=self._copy_stream,
+                use_cuda_graphs=self._use_cuda_graphs,
+            )
+            for slot_id in range(2)
+        ]
+
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
 
@@ -481,6 +461,21 @@ class MoondreamRuntime:
         """Return True if a request of ``total_length`` tokens can be admitted."""
 
         return self.page_table.can_reserve(total_length)
+
+    @property
+    def copy_stream(self) -> torch.cuda.Stream:
+        """Shared copy stream for D2H transfers."""
+        return self._copy_stream
+
+    @property
+    def decode_compute_stream(self) -> torch.cuda.Stream:
+        """Shared decode compute stream for all decode forwards."""
+        return self._decode_compute_stream
+
+    @property
+    def decode_slots(self) -> list[DecodeSlot]:
+        """Two ping-pong decode slots for pipelined decoding."""
+        return self._decode_slots
 
     # ------------------------------------------------------------------
     # Prompt helpers
@@ -760,83 +755,23 @@ class MoondreamRuntime:
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
 
-    def decode_batch(
-        self,
-        states: Sequence[SequenceState],
-        token_ids: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        if not states:
-            raise ValueError("states must not be empty")
+    def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
+        """Run batched decode forward pass using per-slot resources.
 
-        batch_size = len(states)
-        self._batch_idx.np[:batch_size] = [state.batch_idx for state in states]
-        self._input_pos.np[:batch_size] = [state.length for state in states]
-        self._lora_slot_ids.np[:batch_size] = [state.lora_slot for state in states]
-        batch_idx = self._batch_idx.copy_to_gpu(batch_size)
-        input_pos = self._input_pos.copy_to_gpu(batch_size)
-        lora_slot_ids = self._lora_slot_ids.copy_to_gpu(batch_size)
+        IMPORTANT: Caller must ensure:
+        - Already on slot.compute_stream (via `with torch.cuda.stream()`)
+        - Inputs staged in slot buffers (decode_token_ids, decode_coord_values, etc.)
+        - Metadata copied to GPU (batch_idx, input_pos, lora_slot_ids)
 
-        token_ids = token_ids.view(-1)
-        coord_values = coord_values.view(-1, 1)
-        size_values = size_values.view(-1, 2)
-
-        token_ids_buffer = self._tokens[:batch_size]
-        coord_values_buffer = self._coord_values[:batch_size]
-        size_values_buffer = self._size_values[:batch_size]
-
-        token_ids_buffer.copy_(token_ids[:batch_size], non_blocking=True)
-        coord_values_buffer.copy_(coord_values[:batch_size], non_blocking=True)
-        size_values_buffer.copy_(size_values[:batch_size], non_blocking=True)
-
-        token_ids = token_ids_buffer
-        coord_values = coord_values_buffer
-        size_values = size_values_buffer
-
-        batch_size = batch_idx.shape[0]
-        result: RuntimeDecodeResult
-        if self._use_cuda_graphs and batch_size > 0:
-            graph_batch_size = self._select_graph_batch_size(batch_size)
-            if graph_batch_size is None:
-                raise RuntimeError(
-                    f"Requested batch size {batch_size} exceeds captured graph capacity "
-                    f"{self._graph_batch_sizes[-1] if self._graph_batch_sizes else 0}"
-                )
-            if not self._cuda_graphs:
-                raise RuntimeError(
-                    "CUDA graphs requested but none were captured; initialization likely failed."
-                )
-            if graph_batch_size not in self._cuda_graphs:
-                raise RuntimeError(
-                    f"No CUDA graph captured for batch size {graph_batch_size}"
-                )
-            result = self._decode_with_graph(
-                batch_idx,
-                token_ids,
-                coord_values,
-                size_values,
-                input_pos,
-                lora_slot_ids,
-                graph_batch_size,
-            )
-        else:
-            result = self._decode_step(
-                batch_idx,
-                token_ids,
-                input_pos,
-                lora_slot_ids,
-                coord_values=coord_values,
-                size_values=size_values,
-                input_pos_cpu=self._input_pos.cpu[:batch_size],
-            )
-
-        hidden_last = result.hidden[:, -1, :]
-        return result.logits, hidden_last
+        This method runs the forward pass and writes results to slot.logits
+        and slot.hidden_last.
+        """
+        self._decode_with_slot(slot, batch_size)
 
     def _build_flashinfer_metadata(
         self,
         batch_idx: Tensor,
+        flashinfer_ctx: "FlashInferDecodeContext",
         *,
         use_graph: bool = False,
         input_pos_cpu: Tensor,
@@ -845,7 +780,7 @@ class MoondreamRuntime:
             raise ValueError("batch_idx must be 1D")
 
         batch_size = batch_idx.shape[0]
-        buffers = self._flashinfer_ctx.acquire_plan_buffers(batch_size, use_graph=use_graph)
+        buffers = flashinfer_ctx.acquire_plan_buffers(batch_size, use_graph=use_graph)
 
         buffers.seq_lens_cpu[:batch_size].copy_(input_pos_cpu)
         seq_lens_np = buffers.seq_lens_np[:batch_size]
@@ -930,61 +865,129 @@ class MoondreamRuntime:
             kv_last_page_len=kv_last_page_len,
         )
 
-    def _decode_step(
-        self,
-        batch_idx: Tensor,
-        token_ids: Tensor,
-        input_pos: Tensor,
-        lora_slot_ids: Tensor,
-        *,
-        coord_values: Tensor,
-        size_values: Tensor,
-        use_graph: bool = False,
-        flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
-        skip_plan: bool = False,
-        input_pos_cpu: Tensor,
-    ) -> RuntimeDecodeResult:
-        self._batch_binding.tensor = batch_idx
+    def _decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
+        """Unified decode using slot buffers. Writes results to slot.logits/hidden_last.
 
-        embeds = self._embed_packed_token_batch(token_ids, coord_values, size_values)
-        position_ids = input_pos.to(dtype=torch.long).view(-1, 1)
-        slot_mapping = self.page_table.build_slot_mapping(
-            batch_idx=batch_idx.view(-1, 1), positions=position_ids
+        This method provides identical preparation for both graph and non-graph paths:
+        1. Clear padding region (for graph batch size alignment)
+        2. Build FlashInfer metadata from slot buffers
+        3. Plan FlashInfer context
+        4. Execute: either graph.replay() or eager forward
+
+        The only difference between paths is step 4. This ensures debugging with
+        graphs disabled produces identical behavior to the graph path.
+
+        Args:
+            slot: DecodeSlot with inputs already staged in its buffers.
+            batch_size: Actual number of sequences (before padding).
+        """
+        ctx = slot.flashinfer_ctx
+        use_graph = self._use_cuda_graphs and slot.cuda_graphs is not None
+
+        # Determine padded batch size for graph alignment
+        if use_graph:
+            graph_batch_size = self._select_graph_batch_size(batch_size)
+            if graph_batch_size is None:
+                raise RuntimeError(
+                    f"Batch size {batch_size} exceeds max graph capacity "
+                    f"{self._graph_batch_sizes[-1] if self._graph_batch_sizes else 0}"
+                )
+            if graph_batch_size not in slot.cuda_graphs:
+                raise RuntimeError(
+                    f"No CUDA graph captured for batch size {graph_batch_size}"
+                )
+        else:
+            graph_batch_size = batch_size
+
+        # Clear padding region for deterministic graph behavior
+        if graph_batch_size > batch_size:
+            slot.decode_token_ids[batch_size:graph_batch_size].zero_()
+            slot.decode_coord_values[batch_size:graph_batch_size].zero_()
+            slot.decode_size_values[batch_size:graph_batch_size].zero_()
+            slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
+            slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
+            slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
+
+        # Build FlashInfer metadata (identical for both paths)
+        pos_cpu = slot.meta.input_pos.cpu[:graph_batch_size]
+        pos_cpu[batch_size:graph_batch_size].fill_(-1)
+        metadata = self._build_flashinfer_metadata(
+            slot.meta.batch_idx.gpu[:graph_batch_size],
+            ctx,
+            use_graph=use_graph,
+            input_pos_cpu=pos_cpu,
         )
 
-        metadata = flashinfer_metadata
-        if metadata is None:
-            metadata = self._build_flashinfer_metadata(
-                batch_idx,
-                use_graph=use_graph,
-                input_pos_cpu=input_pos_cpu,
-            )
+        # Set batch binding and plan (identical for both paths)
+        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:graph_batch_size]
+        ctx.plan(
+            metadata,
+            num_q_heads=self.config.text.n_heads,
+            num_kv_heads=self.config.text.n_kv_heads,
+            head_dim=self.head_dim,
+            use_graph=use_graph,
+        )
 
-        if not skip_plan:
-            self._flashinfer_ctx.plan(
-                metadata,
-                num_q_heads=self.config.text.n_heads,
-                num_kv_heads=self.config.text.n_kv_heads,
-                head_dim=self.head_dim,
-                use_graph=use_graph,
-            )
+        # Execute (only difference between paths)
+        if use_graph:
+            slot.cuda_graphs[graph_batch_size].replay()
+        else:
+            self._run_decode_forward(slot, graph_batch_size, metadata)
+
+        # Restore batch binding to actual batch size
+        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:batch_size]
+
+    def _run_decode_forward(
+        self,
+        slot: DecodeSlot,
+        batch_size: int,
+        metadata: FlashInferBatchMetadata,
+        flashinfer_use_graph: bool = False,
+    ) -> None:
+        """Run decode forward pass and write results to slot output buffers.
+
+        This is the core forward computation, used by:
+        - _decode_with_slot (runtime non-graph path, flashinfer_use_graph=False)
+        - Graph capture (flashinfer_use_graph=True to use FlashInfer graph state)
+
+        Args:
+            slot: DecodeSlot with inputs in its buffers.
+            batch_size: Batch size (may be padded for graph capture).
+            metadata: Pre-built FlashInfer metadata.
+            flashinfer_use_graph: Whether to use FlashInfer's graph state.
+        """
+        ctx = slot.flashinfer_ctx
+
+        embeds = self._embed_packed_token_batch(
+            slot.decode_token_ids[:batch_size],
+            slot.decode_coord_values[:batch_size],
+            slot.decode_size_values[:batch_size],
+        )
+        position_ids = slot.meta.input_pos.gpu[:batch_size].to(torch.long).view(-1, 1)
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=slot.meta.batch_idx.gpu[:batch_size].view(-1, 1),
+            positions=position_ids,
+        )
         hidden = text_decoder(
             embeds,
             self.model.text,
             attn_mask=None,
             position_ids=position_ids,
             config=self.config.text,
-            flashinfer_ctx=self._flashinfer_ctx,
+            flashinfer_ctx=ctx,
             flashinfer_metadata=metadata,
             use_flashinfer=True,
-            use_graph=use_graph,
+            use_graph=flashinfer_use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
             lora_workspace=self._lora_workspace,
-            lora_slot_ids=lora_slot_ids,
+            lora_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
         )
         logits = lm_head(hidden, self.model.text)
-        return RuntimeDecodeResult(logits=logits, hidden=hidden)
+
+        # Write to slot output buffers (stable addresses for graph capture)
+        slot.logits[:batch_size].copy_(logits)
+        slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
 
     def acquire_adapter_slot(self, adapter_id: str, adapter: LoRA) -> int:
         """Acquire a slot for an adapter, loading weights if necessary.
@@ -1062,55 +1065,6 @@ class MoondreamRuntime:
 
         self._slot_manager.release(slot)
 
-    def _decode_with_graph(
-        self,
-        batch_idx: Tensor,
-        tokens: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
-        input_pos: Tensor,
-        lora_slot_ids: Tensor,
-        graph_batch_size: int,
-    ) -> RuntimeDecodeResult:
-        workspace = self._graph_workspace
-        if workspace is None:
-            raise RuntimeError("CUDA graph workspace is not initialized")
-        if graph_batch_size not in self._cuda_graphs:
-            raise RuntimeError(
-                f"No CUDA graph captured for batch size {graph_batch_size}"
-            )
-
-        batch_size = batch_idx.shape[0]
-        self._clear_graph_inputs(graph_batch_size)
-        workspace.token_buffer[:batch_size, 0].copy_(tokens)
-        workspace.coord_values_buffer[:batch_size].copy_(coord_values)
-        workspace.size_values_buffer[:batch_size].copy_(size_values)
-        workspace.batch_idx_buffer[:batch_size].copy_(batch_idx)
-        workspace.position_buffer[:batch_size].copy_(input_pos)
-        workspace.lora_slot_ids_buffer[:batch_size].copy_(lora_slot_ids)
-        pos_cpu = self._input_pos.cpu[:graph_batch_size]
-        pos_cpu[batch_size:graph_batch_size].fill_(-1)
-        metadata = self._build_flashinfer_metadata(
-            workspace.batch_idx_buffer[:graph_batch_size],
-            use_graph=True,
-            input_pos_cpu=pos_cpu,
-        )
-        self._batch_binding.tensor = workspace.batch_idx_buffer[:graph_batch_size]
-        self._flashinfer_ctx.plan(
-            metadata,
-            num_q_heads=self.config.text.n_heads,
-            num_kv_heads=self.config.text.n_kv_heads,
-            head_dim=self.head_dim,
-            use_graph=True,
-        )
-
-        graph = self._cuda_graphs[graph_batch_size]
-        graph.replay()
-        self._batch_binding.tensor = batch_idx
-        logits = workspace.output_buffer[:batch_size]
-        hidden = workspace.hidden_buffer[:batch_size].unsqueeze(1)
-        return RuntimeDecodeResult(logits=logits, hidden=hidden)
-
     def rebuild_cuda_graphs(self) -> None:
         """Reset and recapture CUDA graphs used for decode.
 
@@ -1129,70 +1083,33 @@ class MoondreamRuntime:
             if torch.cuda.is_available() and self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
 
-            ctx = self._flashinfer_ctx
-            ctx._graph_states.clear()
-            ctx._active_graph_state = None
-            self._cuda_graphs.clear()
-            self._graph_workspace = None
+            # Clear per-slot graph state
+            for slot in self._decode_slots:
+                ctx = slot.flashinfer_ctx
+                ctx._graph_states.clear()
+                ctx._active_graph_state = None
+                slot.cuda_graphs = None
+
             self._graph_batch_sizes = []
             self._graph_pool = None
 
             self._ensure_cuda_graphs_ready()
 
     def _ensure_cuda_graphs_ready(self) -> None:
-        if not self._use_cuda_graphs or self._cuda_graphs:
+        """Capture CUDA graphs for all slots using slot buffers directly."""
+        if not self._use_cuda_graphs:
             return
-        self._initialize_graph_workspace()
-        self._capture_decode_graphs()
+        # Check if graphs already captured (first slot has graphs)
+        if self._decode_slots and self._decode_slots[0].cuda_graphs is not None:
+            return
 
-    def _initialize_graph_workspace(self) -> None:
-        if self._graph_workspace is not None:
-            return
+        # Initialize graph batch sizes once
         max_effective_batch = max(1, self.max_batch_size - 1)
-        vocab = self.model.text.lm_head.weight.shape[0]
-        token_buffer = torch.zeros(
-            (max_effective_batch, 1), device=self.device, dtype=torch.long
-        )
-        coord_values_buffer = torch.zeros(
-            (max_effective_batch, 1),
-            device=self.device,
-            dtype=self.region.coord_features.dtype,
-        )
-        size_values_buffer = torch.zeros(
-            (max_effective_batch, 2),
-            device=self.device,
-            dtype=self.region.size_features.dtype,
-        )
-        batch_idx_buffer = torch.zeros(
-            (max_effective_batch,), device=self.device, dtype=torch.long
-        )
-        position_buffer = torch.zeros(
-            (max_effective_batch,), device=self.device, dtype=torch.int32
-        )
-        output_buffer = torch.zeros(
-            (max_effective_batch, vocab),
-            device=self.device,
-            dtype=self.model.text.lm_head.weight.dtype,
-        )
-        hidden_buffer = torch.zeros(
-            (max_effective_batch, self.model.text.lm_head.weight.shape[1]),
-            device=self.device,
-            dtype=self.model.text.lm_head.weight.dtype,
-        )
-        lora_slot_ids_buffer = torch.zeros(
-            (max_effective_batch,), device=self.device, dtype=torch.int32
-        )
-        self._graph_workspace = _GraphWorkspace(
-            token_buffer=token_buffer,
-            coord_values_buffer=coord_values_buffer,
-            size_values_buffer=size_values_buffer,
-            batch_idx_buffer=batch_idx_buffer,
-            position_buffer=position_buffer,
-            output_buffer=output_buffer,
-            hidden_buffer=hidden_buffer,
-            lora_slot_ids_buffer=lora_slot_ids_buffer,
-        )
         self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
+
+        # Capture graphs for each slot using its own buffers
+        for slot in self._decode_slots:
+            slot.cuda_graphs = self._capture_decode_graphs_for_slot(slot)
 
     def _make_graph_batch_sizes(self, max_batch: int) -> list[int]:
         seeds = [size for size in (1, 2, 4, 8) if size <= max_batch]
@@ -1200,94 +1117,87 @@ class MoondreamRuntime:
         sizes = sorted({*seeds, *ramps, max_batch})
         return sizes
 
-    def _capture_decode_graphs(self) -> None:
-        with self.graph_capture_lock:
-            workspace = self._graph_workspace
-            if workspace is None:
-                raise RuntimeError("CUDA graph workspace must be initialized before capture")
-            max_batch = workspace.token_buffer.shape[0]
-            if max_batch == 0:
-                return
+    def _capture_decode_graphs_for_slot(
+        self,
+        slot: DecodeSlot,
+    ) -> dict[int, torch.cuda.CUDAGraph]:
+        """Capture CUDA graphs for a decode slot using its own buffers.
 
-            capture_pos_cpu = torch.zeros((max_batch,), dtype=torch.int32, device="cpu")
+        Graphs are captured using the slot's staging buffers (decode_token_ids,
+        meta.batch_idx.gpu, etc.) and output buffers (logits, hidden_last).
+        This ensures graph replay reads from and writes to the same addresses
+        that the non-graph path uses, making behavior identical.
+        """
+        cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+
+        with self.graph_capture_lock:
+            max_batch = slot.decode_token_ids.shape[0]
+            if max_batch == 0:
+                return cuda_graphs
+
             device = self.device
-            # Use batch index 0 for all entries during graph capture.
-            # Row 0 in the page table is pre-initialized and reserved for bookkeeping,
-            # so it provides valid memory access patterns without requiring allocation.
-            workspace.batch_idx_buffer.zero_()
-            workspace.token_buffer.zero_()
-            workspace.coord_values_buffer.zero_()
-            workspace.size_values_buffer.zero_()
-            workspace.position_buffer.zero_()
-            workspace.lora_slot_ids_buffer.zero_()
+            ctx = slot.flashinfer_ctx
+
+            # Zero all slot buffers for capture.
+            # Use batch index 0 for all entries - row 0 in the page table is
+            # pre-initialized and provides valid memory access patterns.
+            slot.decode_token_ids.zero_()
+            slot.decode_coord_values.zero_()
+            slot.decode_size_values.zero_()
+            slot.meta.batch_idx.gpu.zero_()
+            slot.meta.input_pos.gpu.zero_()
+            slot.meta.input_pos.cpu.zero_()
+            slot.meta.lora_slot_ids.gpu.zero_()
 
             try:
-
                 torch.cuda.synchronize(device=device)
                 for bs in reversed(self._graph_batch_sizes):
                     graph = torch.cuda.CUDAGraph()
                     with torch.inference_mode():
+                        # Build metadata from slot buffers
                         metadata = self._build_flashinfer_metadata(
-                            workspace.batch_idx_buffer[:bs],
+                            slot.meta.batch_idx.gpu[:bs],
+                            ctx,
                             use_graph=True,
-                            input_pos_cpu=capture_pos_cpu[:bs],
+                            input_pos_cpu=slot.meta.input_pos.cpu[:bs],
                         )
-                        warmup = self._decode_step(
-                            workspace.batch_idx_buffer[:bs],
-                            workspace.token_buffer[:bs, 0],
-                            workspace.position_buffer[:bs],
-                            workspace.lora_slot_ids_buffer[:bs],
-                            use_graph=True,
-                            coord_values=workspace.coord_values_buffer[:bs],
-                            size_values=workspace.size_values_buffer[:bs],
-                            flashinfer_metadata=metadata,
-                            skip_plan=False,
-                            input_pos_cpu=capture_pos_cpu[:bs],
-                        )
-                        workspace.output_buffer[:bs].copy_(warmup.logits)
-                        workspace.hidden_buffer[:bs].copy_(warmup.hidden[:, 0, :])
 
+                        # Set batch binding and plan
+                        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:bs]
+                        ctx.plan(
+                            metadata,
+                            num_q_heads=self.config.text.n_heads,
+                            num_kv_heads=self.config.text.n_kv_heads,
+                            head_dim=self.head_dim,
+                            use_graph=True,
+                        )
+
+                        # Warmup run (not captured, but uses FlashInfer graph state)
+                        self._run_decode_forward(slot, bs, metadata, flashinfer_use_graph=True)
                         torch.cuda.synchronize(device=device)
 
+                        # Capture the graph
                         with torch.cuda.graph(graph, self._graph_pool):
-                            out = self._decode_step(
-                                workspace.batch_idx_buffer[:bs],
-                                workspace.token_buffer[:bs, 0],
-                                workspace.position_buffer[:bs],
-                                workspace.lora_slot_ids_buffer[:bs],
-                                use_graph=True,
-                                coord_values=workspace.coord_values_buffer[:bs],
-                                size_values=workspace.size_values_buffer[:bs],
-                                flashinfer_metadata=metadata,
-                                skip_plan=True,
-                                input_pos_cpu=capture_pos_cpu[:bs],
-                            )
-                            workspace.output_buffer[:bs].copy_(out.logits)
-                            workspace.hidden_buffer[:bs].copy_(out.hidden[:, 0, :])
+                            self._run_decode_forward(slot, bs, metadata, flashinfer_use_graph=True)
 
                     if self._graph_pool is None:
                         self._graph_pool = graph.pool()
-                    self._cuda_graphs[bs] = graph
+                    cuda_graphs[bs] = graph
                     torch.cuda.synchronize(device=device)
             finally:
-                self._clear_graph_inputs(0)
+                # Clear slot buffers after capture
+                slot.decode_token_ids.zero_()
+                slot.meta.batch_idx.gpu.zero_()
+                slot.meta.input_pos.gpu.zero_()
+                slot.meta.lora_slot_ids.gpu.zero_()
+
+        return cuda_graphs
 
     def _select_graph_batch_size(self, batch_size: int) -> int | None:
         for size in self._graph_batch_sizes:
             if size >= batch_size:
                 return size
         return None
-
-    def _clear_graph_inputs(self, limit: int) -> None:
-        workspace = self._graph_workspace
-        if workspace is None:
-            return
-        if limit <= 0:
-            limit = workspace.token_buffer.shape[0]
-        workspace.token_buffer[:limit].zero_()
-        workspace.batch_idx_buffer[:limit].zero_()
-        workspace.position_buffer[:limit].zero_()
-        workspace.lora_slot_ids_buffer[:limit].zero_()
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]

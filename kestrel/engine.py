@@ -1056,6 +1056,14 @@ class InferenceEngine:
                 while True:
                     # If paused, wait until resumed or shutdown completes.
                     if paused_flag.is_set():
+                        # Drain pipeline before pause - complete all in-flight work.
+                        # Required per design doc §4.5a: callers may mutate runtime
+                        # state while paused (e.g. rebuild CUDA graphs).
+                        scheduler._drain_pipeline()
+                        # Deliver any results from drained steps before pausing.
+                        drained_results = scheduler.pop_completed()
+                        if drained_results:
+                            deliver_results(drained_results)
                         with runtime.graph_capture_lock:
                             torch.cuda.synchronize(runtime.device)
                         paused_event.set()
