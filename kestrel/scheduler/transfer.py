@@ -44,6 +44,7 @@ class RenderBuffer:
         *,
         coord_dtype: torch.dtype,
         size_dtype: torch.dtype,
+        copy_stream: torch.cuda.Stream,
     ) -> None:
         self._token_ids = torch.empty(
             (max_batch,),
@@ -64,7 +65,7 @@ class RenderBuffer:
             pin_memory=True,
         )
         self._device = device
-        self._stream = torch.cuda.Stream(device=device)
+        self._stream = copy_stream
         self._event = torch.cuda.Event(enable_timing=False, blocking=False)
 
     def transfer(
@@ -72,8 +73,20 @@ class RenderBuffer:
         token_ids: Tensor,
         coord_values: Tensor,
         size_values: Tensor,
+        *,
+        ready_event: torch.cuda.Event,
     ) -> TransferHandle:
-        """Start a D2H transfer and return a handle to wait on completion."""
+        """Start a D2H transfer and return a handle to wait on completion.
+
+        Args:
+            token_ids: GPU tensor of sampled token IDs (from per-slot staging buffer).
+            coord_values: GPU tensor of coord values (from per-slot staging buffer).
+            size_values: GPU tensor of size values (from per-slot staging buffer).
+            ready_event: Event recorded on compute stream after all GPU writes complete.
+                The copy stream will wait on this event before starting D2H copies.
+                This ensures correct ordering without capturing dependencies on
+                later compute stream work (which would happen with wait_stream).
+        """
         count = int(token_ids.shape[0])
         if count == 0:
             return TransferHandle(
@@ -84,9 +97,11 @@ class RenderBuffer:
                 0,
             )
 
-        current = torch.cuda.current_stream(device=self._device)
         with torch.cuda.stream(self._stream):
-            self._stream.wait_stream(current)
+            # Wait on the specific step's completion event (not wait_stream).
+            # This anchors the dependency to exactly this step's GPU writes,
+            # independent of any later work enqueued on the compute stream.
+            self._stream.wait_event(ready_event)
             self._token_ids[:count].copy_(token_ids, non_blocking=True)
             self._coord_values[:count].copy_(coord_values, non_blocking=True)
             self._size_values[:count].copy_(size_values, non_blocking=True)

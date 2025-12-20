@@ -39,6 +39,10 @@ class FIFOQueue(Generic[T]):
         self._items.clear()
         return items
 
+    def remove(self, item: T) -> None:
+        """Remove an item from the queue. Raises ValueError if not found."""
+        self._items.remove(item)
+
 
 RequestQueue = FIFOQueue
 RunningQueue = FIFOQueue
