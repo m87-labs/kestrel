@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Literal
 
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+from ..fused_moe.routing import moe_align_block_size
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
 from ..ops import topk_fwd
