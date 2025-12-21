@@ -7,17 +7,14 @@ from torch import nn
 from torch.compiler import disable as torch_compiler_disable
 from vllm import _custom_ops as ops
 
-from .kernels import (
-    dtype_to_triton,
-    fused_gelu_and_mul,
-    invoke_fused_moe_kernel,
-)
+from .kernels import dtype_to_triton, invoke_fused_moe_kernel
 from .lora_kernels import apply_moe_lora
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
+from kestrel.ops.activation import gelu_residual_cuda
 
 
 class _ResizableBuffer:
@@ -391,7 +388,11 @@ class FusedMoEModule(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        fused_gelu_and_mul(activation_in, activation_out)
+        if activation_in.dtype != torch.bfloat16:
+            raise ValueError(
+                f"gelu_residual_cuda only supports bfloat16, got {activation_in.dtype}"
+            )
+        gelu_residual_cuda(activation_out, activation_in)
 
         down_in = activation_out
         down_out = self._workspaces.down.get(
