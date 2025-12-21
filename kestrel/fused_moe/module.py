@@ -11,7 +11,7 @@ from .kernels import dtype_to_triton, invoke_fused_moe_kernel
 from .lora_kernels import apply_moe_lora
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+from .routing import moe_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.ops.activation import gelu_residual_cuda
