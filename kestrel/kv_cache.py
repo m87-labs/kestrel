@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 
-from vllm import _custom_ops as vllm_ops
+from kestrel.ops.kv_cache_write import reshape_and_cache_flash_cuda
 
 from kestrel.utils import CpuGpuBuffer
 
@@ -95,7 +95,7 @@ class PagedKVCache(torch.nn.Module):
             key_cache = key_cache.view(torch.uint8)
             value_cache = value_cache.view(torch.uint8)
 
-        vllm_ops.reshape_and_cache_flash(
+        reshape_and_cache_flash_cuda(
             k_view,
             v_view,
             key_cache,
