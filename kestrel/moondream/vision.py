@@ -14,6 +14,7 @@ from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from
 from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
 from kestrel.ops.fused_linear_residual import fused_linear_bias_residual_into
+from kestrel.ops.layernorm_cuda import layernorm_bias_into
 
 
 def prepare_crops(
@@ -57,8 +58,24 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
     x = module.patch_emb(x)
     x = x + module.pos_emb
     early = None
+    use_fast_ln = x.is_cuda and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
+    x_norm_buf: torch.Tensor | None = torch.empty(x.shape, device=x.device, dtype=x.dtype) if use_fast_ln else None
+
+    def _layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
+        if x_norm_buf is None:
+            return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, float(ln.eps))
+        layernorm_bias_into(
+            x=x,
+            weight=ln.weight,
+            bias=ln.bias,
+            out=x_norm_buf,
+            eps=float(ln.eps),
+            fallback_to_torch=True,
+        )
+        return x_norm_buf
+
     for i, block in enumerate(module.blocks):
-        x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
+        x_norm = _layer_norm(x, block.ln1)
         attn_out = _vision_attn(x_norm, block.attn, config.enc_n_heads)
         b_proj = block.attn["proj"].bias
         if (
@@ -79,7 +96,7 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
             )
         else:
             x = x + block.attn["proj"](attn_out)
-        x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
+        x_norm = _layer_norm(x, block.ln2)
         b1 = block.mlp["fc1"].bias
         b2 = block.mlp["fc2"].bias
         if (
@@ -105,7 +122,7 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
             x = x + _vision_mlp(x_norm, block.mlp)
         if early_layer is not None and i == early_layer:
             early = x
-    x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
+    x = _layer_norm(x, module.post_ln)
     if early_layer is not None:
         return x, early
     return x
