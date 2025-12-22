@@ -10,8 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm import _custom_ops as vllm_ops
-
 from .config import TextConfig
 from .layers import (
     build_dense_mlp,
@@ -25,6 +23,7 @@ from .layers import (
 )
 from .lora_workspace import TextLoRAWorkspace
 from ..ops import precompute_freqs_cis
+from ..ops.rotary_embedding import rotary_embedding_cuda
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
@@ -94,18 +93,11 @@ def attn(
         q.mul_((tok_q + tau_pos).unsqueeze(-1))
         v.mul_((tok_v + tau_pos).unsqueeze(-1))
 
-    # Use vLLM's in-place rotary embedding kernel (GPT-NeoX style).
+    # Apply in-place rotary embedding (GPT-NeoX style).
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
     q = q.transpose(1, 2).contiguous()
     k = k.transpose(1, 2).contiguous()
-    vllm_ops.rotary_embedding(
-        position_matrix,
-        q,
-        k,
-        head_dim,
-        cos_sin_cache,
-        True,
-    )
+    rotary_embedding_cuda(position_matrix, q, k, head_dim, cos_sin_cache)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
 
@@ -356,7 +348,7 @@ def build_text_model(
     cos_sin_cache = precompute_freqs_cis(
         config.dim // (2 * config.n_heads),
         config.max_context,
-        dtype=dtype,
+        dtype=torch.float32,
         device=device,
     )
     text.register_buffer("cos_sin_cache", cos_sin_cache, persistent=False)
