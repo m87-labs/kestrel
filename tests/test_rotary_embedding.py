@@ -3,8 +3,7 @@
 import pytest
 import torch
 
-from kestrel.ops.rope import precompute_freqs_cis
-from kestrel.ops.rotary_embedding import rotary_embedding_cuda
+from kestrel.ops.rotary_embedding import precompute_freqs_cis, rotary_embedding_cuda
 
 
 @pytest.fixture
