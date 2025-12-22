@@ -13,8 +13,8 @@ from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_c
 from .routing import moe_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
-from kestrel.ops.activation import gelu_residual_cuda
-from kestrel.ops.moe_sum import moe_sum_cuda
+from kestrel_kernels.activation import gelu_residual_cuda
+from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 
 
 class _ResizableBuffer:

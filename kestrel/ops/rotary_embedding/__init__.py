@@ -1,6 +1,6 @@
 import torch
 
-from ..jit import cpp_jit
+from kestrel_kernels.rotary_embedding import rotary_embedding as rotary_embedding_cuda
 
 
 def precompute_freqs_cis(
@@ -41,16 +41,6 @@ def precompute_freqs_cis(
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
     return torch.cat([cos, sin], dim=-1).to(dtype=dtype)
-
-
-@cpp_jit(function_name="rotary_embedding")
-def rotary_embedding_cuda(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-) -> None: ...
 
 
 __all__ = ["precompute_freqs_cis", "rotary_embedding_cuda"]

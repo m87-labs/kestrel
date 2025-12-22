@@ -2,17 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ..jit import cpp_jit
-
-
-@cpp_jit()
-def fused_linear_bias_residual_cuda(
-    out: torch.Tensor,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    b: torch.Tensor,
-    residual: torch.Tensor,
-) -> None: ...
+from kestrel_kernels.fused_linear_residual import fused_linear_bias_residual_cuda
 
 
 def fused_linear_bias_residual_into(
@@ -68,4 +58,3 @@ __all__ = [
     "fused_linear_bias_residual_cuda",
     "fused_linear_bias_residual_into",
 ]
-

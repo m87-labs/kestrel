@@ -5,26 +5,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from ..jit import cpp_jit
-
-
-@cpp_jit()
-def layernorm_bias_cuda(
-    out: torch.Tensor,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float,
-) -> None: ...
-
-@cpp_jit()
-def layernorm_bias_reload_cuda(
-    out: torch.Tensor,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float,
-) -> None: ...
+from kestrel_kernels.layernorm_cuda import layernorm_bias_cuda, layernorm_bias_reload_cuda
 
 
 def layernorm_bias_into(

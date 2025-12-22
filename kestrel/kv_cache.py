@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 
-from kestrel.ops.kv_cache_write import reshape_and_cache_flash_cuda
+from kestrel_kernels.kv_cache_write import reshape_and_cache_flash as reshape_and_cache_flash_cuda
 
 from kestrel.utils import CpuGpuBuffer
 
