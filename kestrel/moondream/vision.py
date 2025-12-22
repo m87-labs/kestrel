@@ -13,6 +13,7 @@ from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
+from kestrel.ops.fused_linear_residual import fused_linear_bias_residual_into
 
 
 def prepare_crops(
@@ -58,7 +59,26 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
     early = None
     for i, block in enumerate(module.blocks):
         x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
-        x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
+        attn_out = _vision_attn(x_norm, block.attn, config.enc_n_heads)
+        b_proj = block.attn["proj"].bias
+        if (
+            x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.dtype == torch.bfloat16
+            and attn_out.dtype == x.dtype
+            and x.is_contiguous()
+            and attn_out.is_contiguous()
+            and b_proj is not None
+        ):
+            fused_linear_bias_residual_into(
+                x=attn_out,
+                w=block.attn["proj"].weight,
+                b=b_proj,
+                residual=x,
+                out=x,
+            )
+        else:
+            x = x + block.attn["proj"](attn_out)
         x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
         b1 = block.mlp["fc1"].bias
         b2 = block.mlp["fc2"].bias
@@ -101,7 +121,7 @@ def _vision_attn(x: torch.Tensor, attn: nn.ModuleDict, n_heads: int) -> torch.Te
     v = v.view(x.size(0), -1, n_heads, head_dim).transpose(1, 2)
     out = F.scaled_dot_product_attention(q, k, v)
     out = out.transpose(1, 2).contiguous().view(x.size(0), -1, dim)
-    return attn["proj"](out)
+    return out
 
 
 def _vision_mlp(x: torch.Tensor, mlp: nn.ModuleDict) -> torch.Tensor:
