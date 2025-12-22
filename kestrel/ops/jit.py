@@ -29,7 +29,6 @@ def _get_cpp_function(
     ops_dir = os.path.dirname(__file__)
     extra_include_paths = [
         ops_dir,
-        os.path.join(ops_dir, "sonicmoe"),
     ]
 
     module = _ALL_COMPILED_MODULES.get(module_name, None)

@@ -2,20 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ..jit import cpp_jit
-
-
-@cpp_jit()
-def fused_mlp_gelu_bias_residual_cuda(
-    out: torch.Tensor,
-    hidden: torch.Tensor,
-    x: torch.Tensor,
-    w1: torch.Tensor,
-    b1: torch.Tensor,
-    w2: torch.Tensor,
-    b2: torch.Tensor,
-    residual: torch.Tensor,
-) -> None: ...
+from kestrel_kernels.fused_mlp import fused_mlp_gelu_bias_residual_cuda
 
 
 class _ResizableBuffer:
@@ -111,4 +98,3 @@ __all__ = [
     "fused_mlp_gelu_bias_residual_cuda",
     "fused_mlp_gelu_bias_residual_into",
 ]
-

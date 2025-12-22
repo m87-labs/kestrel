@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from kestrel.ops.moe_align import moe_align_block_size_cuda
+from kestrel_kernels.moe_align import moe_align_block_size as moe_align_block_size_cuda
 
 
 def _round_up(x: int, multiple: int) -> int:

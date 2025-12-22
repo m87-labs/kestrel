@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from kestrel.ops.activation import gelu_residual_cuda
+from kestrel_kernels.activation import gelu_residual_cuda
 
 
 @pytest.fixture

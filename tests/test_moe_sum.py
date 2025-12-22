@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from kestrel.ops.moe_sum import moe_sum_cuda
+from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 
 
 @pytest.fixture

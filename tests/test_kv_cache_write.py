@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from kestrel.ops.kv_cache_write import reshape_and_cache_flash_cuda
+from kestrel_kernels.kv_cache_write import reshape_and_cache_flash as reshape_and_cache_flash_cuda
 
 
 @pytest.fixture
@@ -144,4 +144,3 @@ def test_reshape_and_cache_flash_fp8_matches_reference(device: torch.device) -> 
         atol=0,
         rtol=0,
     )
-
