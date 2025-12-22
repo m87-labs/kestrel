@@ -12,6 +12,7 @@ import numpy as np
 from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
+from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
 
 
 def prepare_crops(
@@ -59,7 +60,29 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
         x_norm = F.layer_norm(x, block.ln1.normalized_shape, block.ln1.weight, block.ln1.bias)
         x = x + _vision_attn(x_norm, block.attn, config.enc_n_heads)
         x_norm = F.layer_norm(x, block.ln2.normalized_shape, block.ln2.weight, block.ln2.bias)
-        x = x + _vision_mlp(x_norm, block.mlp)
+        b1 = block.mlp["fc1"].bias
+        b2 = block.mlp["fc2"].bias
+        if (
+            x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.dtype == torch.bfloat16
+            and x_norm.dtype == x.dtype
+            and x.is_contiguous()
+            and x_norm.is_contiguous()
+            and b1 is not None
+            and b2 is not None
+        ):
+            fused_mlp_gelu_bias_residual_into(
+                x=x_norm,
+                w1=block.mlp["fc1"].weight,
+                b1=b1,
+                w2=block.mlp["fc2"].weight,
+                b2=b2,
+                residual=x,
+                out=x,
+            )
+        else:
+            x = x + _vision_mlp(x_norm, block.mlp)
         if early_layer is not None and i == early_layer:
             early = x
     x = F.layer_norm(x, module.post_ln.normalized_shape, module.post_ln.weight, module.post_ln.bias)
