@@ -48,6 +48,39 @@ __device__ __forceinline__ void apply_rotary_neox_fp32(
   vec[y_index] = __float2bfloat16_rn(out_y);
 }
 
+// Vectorized version processing two consecutive rotary offsets (rot0, rot0+1).
+// Assumes rot0 is even.
+__device__ __forceinline__ void apply_rotary_neox_fp32_pair(
+    __nv_bfloat16* __restrict__ vec, const int rot0, const int embed_dim,
+    const float cos0, const float sin0, const float cos1, const float sin1) {
+  const int x_index = rot0;
+  const int y_index = embed_dim + rot0;
+
+  const auto* __restrict__ x_ptr =
+      reinterpret_cast<const __nv_bfloat162*>(vec + x_index);
+  const auto* __restrict__ y_ptr =
+      reinterpret_cast<const __nv_bfloat162*>(vec + y_index);
+
+  const float2 x2 = __bfloat1622float2(*x_ptr);  // {x0, x1}
+  const float2 y2 = __bfloat1622float2(*y_ptr);  // {y0, y1}
+
+  const float out_x0 =
+      __fsub_rn(__fmul_rn(x2.x, cos0), __fmul_rn(y2.x, sin0));
+  const float out_x1 =
+      __fsub_rn(__fmul_rn(x2.y, cos1), __fmul_rn(y2.y, sin1));
+  const float out_y0 =
+      __fadd_rn(__fmul_rn(y2.x, cos0), __fmul_rn(x2.x, sin0));
+  const float out_y1 =
+      __fadd_rn(__fmul_rn(y2.y, cos1), __fmul_rn(x2.y, sin1));
+
+  auto* __restrict__ out_x_ptr =
+      reinterpret_cast<__nv_bfloat162*>(vec + x_index);
+  auto* __restrict__ out_y_ptr =
+      reinterpret_cast<__nv_bfloat162*>(vec + y_index);
+  *out_x_ptr = __floats2bfloat162_rn(out_x0, out_x1);
+  *out_y_ptr = __floats2bfloat162_rn(out_y0, out_y1);
+}
+
 __global__ void rotary_embedding_neox_fp32_kernel(
     const int64_t* __restrict__ positions, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, const float* __restrict__ cos_sin_cache,
@@ -59,9 +92,14 @@ __global__ void rotary_embedding_neox_fp32_kernel(
   const int embed_dim = rot_dim / 2;
   const int embed_dim2 = embed_dim / 2;
 
+  extern __shared__ float sh_cache[];
   const float* __restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
-  const float* __restrict__ cos_ptr = cache_ptr;
-  const float* __restrict__ sin_ptr = cache_ptr + embed_dim;
+  for (int i = threadIdx.x; i < rot_dim; i += blockDim.x) {
+    sh_cache[i] = KESTREL_LDG(&cache_ptr[i]);
+  }
+  __syncthreads();
+  const float* __restrict__ cos_ptr = sh_cache;
+  const float* __restrict__ sin_ptr = sh_cache + embed_dim;
 
   const int query_hidden_size = num_heads * head_size;
   const int key_hidden_size = num_kv_heads * head_size;
@@ -75,23 +113,22 @@ __global__ void rotary_embedding_neox_fp32_kernel(
     const int head_idx = i / embed_dim2;
     const int offset2 = i - head_idx * embed_dim2;
     const int rot0 = offset2 * 2;
-    const int rot1 = rot0 + 1;
 
     // Shared for q/k.
-    const float cos0 = KESTREL_LDG(&cos_ptr[rot0]);
-    const float sin0 = KESTREL_LDG(&sin_ptr[rot0]);
-    const float cos1 = KESTREL_LDG(&cos_ptr[rot1]);
-    const float sin1 = KESTREL_LDG(&sin_ptr[rot1]);
+    const float cos0 = cos_ptr[rot0];
+    const float sin0 = sin_ptr[rot0];
+    const float cos1 = cos_ptr[rot0 + 1];
+    const float sin1 = sin_ptr[rot0 + 1];
 
     if (head_idx < num_heads) {
       __nv_bfloat16* __restrict__ q_head = q_token + head_idx * head_size;
-      apply_rotary_neox_fp32(q_head, rot0, embed_dim, cos0, sin0);
-      apply_rotary_neox_fp32(q_head, rot1, embed_dim, cos1, sin1);
+      apply_rotary_neox_fp32_pair(q_head, rot0, embed_dim, cos0, sin0, cos1,
+                                  sin1);
     }
     if (head_idx < num_kv_heads) {
       __nv_bfloat16* __restrict__ k_head = k_token + head_idx * head_size;
-      apply_rotary_neox_fp32(k_head, rot0, embed_dim, cos0, sin0);
-      apply_rotary_neox_fp32(k_head, rot1, embed_dim, cos1, sin1);
+      apply_rotary_neox_fp32_pair(k_head, rot0, embed_dim, cos0, sin0, cos1,
+                                  sin1);
     }
   }
 }
@@ -105,16 +142,21 @@ __global__ void rotary_embedding_neox_fp32_split_heads_kernel(
     const int num_heads,
     const int num_kv_heads, const int head_size, const int rot_dim,
     const int heads_per_block) {
-  const int token_idx = blockIdx.x;
+    const int token_idx = blockIdx.x;
   const int head_group = blockIdx.y;
   const int64_t pos = positions[token_idx];
 
   const int embed_dim = rot_dim / 2;
   const int embed_dim2 = embed_dim / 2;
 
+  extern __shared__ float sh_cache[];
   const float* __restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
-  const float* __restrict__ cos_ptr = cache_ptr;
-  const float* __restrict__ sin_ptr = cache_ptr + embed_dim;
+  for (int i = threadIdx.x; i < rot_dim; i += blockDim.x) {
+    sh_cache[i] = KESTREL_LDG(&cache_ptr[i]);
+  }
+  __syncthreads();
+  const float* __restrict__ cos_ptr = sh_cache;
+  const float* __restrict__ sin_ptr = sh_cache + embed_dim;
 
   const int query_hidden_size = num_heads * head_size;
   const int key_hidden_size = num_kv_heads * head_size;
@@ -136,61 +178,21 @@ __global__ void rotary_embedding_neox_fp32_split_heads_kernel(
     const int head_idx = i / embed_dim2;
     const int offset2 = i - head_idx * embed_dim2;
     const int rot0 = offset2 * 2;
-    const int rot1 = rot0 + 1;
 
-    const float cos0 = KESTREL_LDG(&cos_ptr[rot0]);
-    const float sin0 = KESTREL_LDG(&sin_ptr[rot0]);
-    const float cos1 = KESTREL_LDG(&cos_ptr[rot1]);
-    const float sin1 = KESTREL_LDG(&sin_ptr[rot1]);
-
-    if (head_idx < num_heads) {
-      __nv_bfloat16* __restrict__ q_head = q_token + head_idx * head_size;
-      apply_rotary_neox_fp32(q_head, rot0, embed_dim, cos0, sin0);
-      apply_rotary_neox_fp32(q_head, rot1, embed_dim, cos1, sin1);
-    }
-    if (head_idx < num_kv_heads) {
-      __nv_bfloat16* __restrict__ k_head = k_token + head_idx * head_size;
-      apply_rotary_neox_fp32(k_head, rot0, embed_dim, cos0, sin0);
-      apply_rotary_neox_fp32(k_head, rot1, embed_dim, cos1, sin1);
-    }
-  }
-}
-
-__global__ void rotary_embedding_neox_fp32_one_offset_kernel(
-    const int64_t* __restrict__ positions, __nv_bfloat16* __restrict__ query,
-    __nv_bfloat16* __restrict__ key, const float* __restrict__ cos_sin_cache,
-    const int num_heads,
-    const int num_kv_heads, const int head_size, const int rot_dim) {
-  const int token_idx = blockIdx.x;
-  const int64_t pos = positions[token_idx];
-
-  const int embed_dim = rot_dim / 2;
-
-  const float* __restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
-  const float* __restrict__ cos_ptr = cache_ptr;
-  const float* __restrict__ sin_ptr = cache_ptr + embed_dim;
-
-  const int query_hidden_size = num_heads * head_size;
-  const int key_hidden_size = num_kv_heads * head_size;
-  __nv_bfloat16* __restrict__ q_token = query + token_idx * query_hidden_size;
-  __nv_bfloat16* __restrict__ k_token = key + token_idx * key_hidden_size;
-
-  const int max_heads = num_heads > num_kv_heads ? num_heads : num_kv_heads;
-  const int max_n = max_heads * embed_dim;
-
-  for (int i = threadIdx.x; i < max_n; i += blockDim.x) {
-    const int head_idx = i / embed_dim;
-    const int rot_offset = i - head_idx * embed_dim;
-    const float cos = KESTREL_LDG(&cos_ptr[rot_offset]);
-    const float sin = KESTREL_LDG(&sin_ptr[rot_offset]);
+    const float cos0 = cos_ptr[rot0];
+    const float sin0 = sin_ptr[rot0];
+    const float cos1 = cos_ptr[rot0 + 1];
+    const float sin1 = sin_ptr[rot0 + 1];
 
     if (head_idx < num_heads) {
       __nv_bfloat16* __restrict__ q_head = q_token + head_idx * head_size;
-      apply_rotary_neox_fp32(q_head, rot_offset, embed_dim, cos, sin);
+      apply_rotary_neox_fp32_pair(q_head, rot0, embed_dim, cos0, sin0, cos1,
+                                  sin1);
     }
     if (head_idx < num_kv_heads) {
       __nv_bfloat16* __restrict__ k_head = k_token + head_idx * head_size;
-      apply_rotary_neox_fp32(k_head, rot_offset, embed_dim, cos, sin);
+      apply_rotary_neox_fp32_pair(k_head, rot0, embed_dim, cos0, sin0, cos1,
+                                  sin1);
     }
   }
 }
@@ -266,15 +268,13 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
   const int embed_dim2 = embed_dim / 2;
   const int max_heads = num_heads > num_kv_heads ? num_heads : num_kv_heads;
   const int work_pair = max_heads * embed_dim2;
-  const int work_one_offset = max_heads * embed_dim;
 
   // Heuristic: our 2-offset-per-thread kernel tends to win for very small token
   // counts (decode), and for very large token counts (high batching). The
-  // 1-offset-per-thread kernel is better for mid-size prefill.
-  const bool use_one_offset_kernel =
-      (num_tokens > 128) && (num_tokens <= 4096);
+  // 2-offset-per-thread kernel is also better for prefill sizes after
+  // vectorization + shared cos/sin caching.
   const bool maybe_use_split_heads_kernel =
-      (!use_one_offset_kernel) && (num_tokens <= 64) && (max_heads > 1);
+      (num_tokens <= 64) && (max_heads > 1);
 
   const c10::cuda::CUDAGuard device_guard(query.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -296,28 +296,22 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
       maybe_use_split_heads_kernel && (split > 1);
 
   int threads = 32;
-  int work = use_one_offset_kernel ? work_one_offset : work_pair;
+  int work = work_pair;
   if (use_split_heads_kernel) {
     work = heads_per_block * embed_dim2;
   }
   while (threads < work) {
     threads <<= 1;
   }
-  threads = std::min(threads, use_one_offset_kernel ? 512 : 256);
+  threads = std::min(threads, 256);
 
   dim3 grid(static_cast<unsigned int>(num_tokens));
-  if (use_one_offset_kernel) {
-    rotary_embedding_neox_fp32_one_offset_kernel<<<grid, threads, 0, stream>>>(
-        positions.data_ptr<int64_t>(),
-        reinterpret_cast<__nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
-        cos_sin_cache.data_ptr<float>(),
-        num_heads, num_kv_heads, static_cast<int>(head_size), rot_dim);
-  } else if (use_split_heads_kernel) {
+  const int shared_bytes = rot_dim * static_cast<int>(sizeof(float));
+  if (use_split_heads_kernel) {
     dim3 split_grid(static_cast<unsigned int>(num_tokens),
                     static_cast<unsigned int>(split));
-    rotary_embedding_neox_fp32_split_heads_kernel<<<split_grid, threads, 0,
-                                                   stream>>>(
+    rotary_embedding_neox_fp32_split_heads_kernel<<<split_grid, threads,
+                                                   shared_bytes, stream>>>(
         positions.data_ptr<int64_t>(),
         reinterpret_cast<__nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
@@ -325,7 +319,7 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
         num_heads, num_kv_heads, static_cast<int>(head_size), rot_dim,
         heads_per_block);
   } else {
-    rotary_embedding_neox_fp32_kernel<<<grid, threads, 0, stream>>>(
+    rotary_embedding_neox_fp32_kernel<<<grid, threads, shared_bytes, stream>>>(
         positions.data_ptr<int64_t>(),
         reinterpret_cast<__nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
