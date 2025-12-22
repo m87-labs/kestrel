@@ -5,7 +5,6 @@ from math import prod
 import torch
 from torch import nn
 from torch.compiler import disable as torch_compiler_disable
-from vllm import _custom_ops as ops
 
 from .kernels import dtype_to_triton, invoke_fused_moe_kernel
 from .lora_kernels import apply_moe_lora
@@ -15,6 +14,7 @@ from .routing import moe_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.ops.activation import gelu_residual_cuda
+from kestrel.ops.moe_sum import moe_sum_cuda
 
 
 class _ResizableBuffer:
@@ -439,7 +439,7 @@ class FusedMoEModule(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        ops.moe_sum(down_out, fused)
+        moe_sum_cuda(down_out, fused)
         return fused
 
     def _select_block_size(self, assignments: int) -> int:
