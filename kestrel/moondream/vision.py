@@ -15,6 +15,7 @@ from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
 from kestrel.ops.fused_linear_residual import fused_linear_bias_residual_into
 from kestrel.ops.layernorm_cuda import layernorm_bias_into
+from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
 
 
 def prepare_crops(
@@ -53,7 +54,13 @@ def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     return x
 
 
-def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig, *, early_layer: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+def vision_encoder(
+    crops: torch.Tensor,
+    module: nn.Module,
+    config: VisionConfig,
+    *,
+    early_layer: int | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     x = create_patches(crops, config.enc_patch_size)
     x = module.patch_emb(x)
     x = x + module.pos_emb
@@ -128,17 +135,20 @@ def vision_encoder(crops: torch.Tensor, module: nn.Module, config: VisionConfig,
     return x
 
 
-def _vision_attn(x: torch.Tensor, attn: nn.ModuleDict, n_heads: int) -> torch.Tensor:
+def _vision_attn(
+    x: torch.Tensor,
+    attn: nn.ModuleDict,
+    n_heads: int,
+) -> torch.Tensor:
     qkv = attn["qkv"](x)
     dim = x.shape[-1]
     head_dim = dim // n_heads
     q, k, v = qkv.chunk(3, dim=-1)
-    q = q.view(x.size(0), -1, n_heads, head_dim).transpose(1, 2)
-    k = k.view(x.size(0), -1, n_heads, head_dim).transpose(1, 2)
-    v = v.view(x.size(0), -1, n_heads, head_dim).transpose(1, 2)
-    out = F.scaled_dot_product_attention(q, k, v)
-    out = out.transpose(1, 2).contiguous().view(x.size(0), -1, dim)
-    return out
+    q = q.view(x.size(0), -1, n_heads, head_dim)
+    k = k.view(x.size(0), -1, n_heads, head_dim)
+    v = v.view(x.size(0), -1, n_heads, head_dim)
+    out, _ = _flash_attn_fwd(q, k, v, causal=False)
+    return out.reshape(x.size(0), -1, dim)
 
 
 def _vision_mlp(x: torch.Tensor, mlp: nn.ModuleDict) -> torch.Tensor:

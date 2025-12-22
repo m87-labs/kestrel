@@ -15,6 +15,7 @@ description = "CUDA kernel library for Kestrel"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "nvidia-cutlass-dsl==4.3.3",
   "torch==2.8.0",
 ]
 
