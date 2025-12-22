@@ -50,8 +50,8 @@ def _rotary_reference_neox_fp32(
     "bsz,seqlen",
     [
         (2, 17),  # triggers split-head 2-offset-per-thread kernel (num_tokens <= 64)
-        (2, 50),  # triggers 2-offset-per-thread kernel (65 <= num_tokens <= 128)
-        (2, 65),  # triggers 1-offset-per-thread kernel (num_tokens > 128)
+        (2, 50),  # triggers 2-offset-per-thread kernel (num_tokens > 64)
+        (2, 65),  # triggers 2-offset-per-thread kernel (num_tokens > 64)
     ],
 )
 def test_rotary_embedding_matches_reference(
