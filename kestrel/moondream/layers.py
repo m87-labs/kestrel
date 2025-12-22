@@ -53,6 +53,109 @@ class MLPWeights:
     act: Literal["gelu_approx"] = "gelu_approx"
 
 
+@dataclass(frozen=True)
+class _DenseLoRARouting:
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    config: dict[str, int]
+
+
+def _get_dense_lora_expert_map(num_experts: int, device: torch.device) -> torch.Tensor:
+    cache = getattr(_get_dense_lora_expert_map, "_cache", {})
+    key = (device.type, device.index, num_experts)
+    expert_map = cache.get(key)
+    if expert_map is None:
+        expert_map = torch.arange(num_experts, dtype=torch.int32, device=device)
+        expert_map[0] = -1  # slot 0 -> ignored
+        cache[key] = expert_map
+        setattr(_get_dense_lora_expert_map, "_cache", cache)
+    return expert_map
+
+
+def _get_dummy_topk_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a device/dtype-matched dummy tensor for topk_weights.
+
+    Dense LoRA uses mul_routed_weight=False, so the LoRA kernel never reads
+    topk_weights. Avoid allocating a [num_tokens, 1] tensor of ones per call.
+    """
+    cache = getattr(_get_dummy_topk_weights, "_cache", {})
+    key = (device.type, device.index, dtype)
+    weights = cache.get(key)
+    if weights is None:
+        weights = torch.empty((0,), dtype=dtype, device=device)
+        cache[key] = weights
+        setattr(_get_dummy_topk_weights, "_cache", cache)
+    return weights
+
+
+def _prepare_dense_lora_routing(
+    lora_slot_ids: torch.Tensor,
+    *,
+    max_slots: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> _DenseLoRARouting:
+    # Shape as [num_tokens, 1] for top_k=1 routing.
+    topk_ids = lora_slot_ids.view(-1, 1).to(torch.int32).contiguous()
+
+    # Route tokens by slot ID (treating slots as experts).
+    block_size_m = 16
+    # Filter out slot 0 tokens at routing time (no LoRA) to avoid wasted compute.
+    # This mirrors the sentinel filtering used for MoE LoRA (see fused_moe.module).
+    #
+    # We use the expert_map "ignore invalid experts" mode so we don't need to
+    # materialize a per-token sentinel topk_ids tensor.
+    expert_map = _get_dense_lora_expert_map(max_slots, device)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids,
+        block_size_m,
+        max_slots,
+        expert_map=expert_map,
+        ignore_invalid_experts=True,
+    )
+
+    return _DenseLoRARouting(
+        topk_ids=topk_ids,
+        topk_weights=_get_dummy_topk_weights(device, dtype),
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        config={"BLOCK_SIZE_M": block_size_m},
+    )
+
+
+def _apply_dense_lora_with_routing(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    routing: _DenseLoRARouting,
+) -> None:
+    num_tokens = x.shape[0]
+
+    # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora.
+    out_dim = output.shape[-1]
+    output_3d = output.view(num_tokens, 1, out_dim)
+
+    apply_moe_lora(
+        x=x,
+        topk_ids=routing.topk_ids,
+        topk_weights=routing.topk_weights,
+        output=output_3d,
+        lora_a=lora_a,
+        lora_b=lora_b,
+        sorted_token_ids=routing.sorted_token_ids,
+        expert_ids=routing.expert_ids,
+        num_tokens_post_padded=routing.num_tokens_post_padded,
+        top_k=1,
+        config=routing.config,
+        mul_routed_weight=False,
+    )
+
+
 def apply_dense_lora(
     x: torch.Tensor,
     output: torch.Tensor,
@@ -76,38 +179,14 @@ def apply_dense_lora(
         lora_b: LoRA B weights, shape [max_slots, out_dim, rank].
         lora_slot_ids: Per-token slot indices, shape [num_tokens].
     """
-    num_tokens = x.shape[0]
     max_slots = lora_a.shape[0]
-
-    # Shape as [num_tokens, 1] for top_k=1 routing
-    topk_ids = lora_slot_ids.view(-1, 1).to(torch.int32)
-    topk_weights = torch.ones(num_tokens, 1, dtype=x.dtype, device=x.device)
-
-    # Route tokens by slot ID (treating slots as experts)
-    block_size_m = 16
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, max_slots
+    routing = _prepare_dense_lora_routing(
+        lora_slot_ids,
+        max_slots=max_slots,
+        device=x.device,
+        dtype=x.dtype,
     )
-
-    # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora
-    out_dim = output.shape[-1]
-    output_3d = output.view(num_tokens, 1, out_dim)
-
-    config = {"BLOCK_SIZE_M": block_size_m}
-    apply_moe_lora(
-        x=x,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        output=output_3d,
-        lora_a=lora_a,
-        lora_b=lora_b,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-        top_k=1,
-        config=config,
-        mul_routed_weight=False,
-    )
+    _apply_dense_lora_with_routing(x, output, lora_a, lora_b, routing)
 
 
 def mlp(
@@ -128,15 +207,25 @@ def mlp(
     B, T, C = x.shape
     use_lora = lora_workspace is not None and lora_slot_ids is not None
 
+    routing = None
+    if use_lora:
+        # Expand slot IDs for all tokens in each sequence and prepare routing once.
+        slot_ids_expanded = lora_slot_ids.repeat_interleave(T)
+        routing = _prepare_dense_lora_routing(
+            slot_ids_expanded,
+            max_slots=lora_workspace.up_a.shape[0],
+            device=x.device,
+            dtype=x.dtype,
+        )
+
     h = linear(x, w.fc1)
     if use_lora:
         # Flatten for LoRA kernel: [batch * seq_len, dim]
         x_flat = x.view(-1, C)
         h_flat = h.view(-1, h.shape[-1])
-        # Expand slot IDs for all tokens in each sequence
-        slot_ids_expanded = lora_slot_ids.repeat_interleave(T)
-        apply_dense_lora(
-            x_flat, h_flat, lora_workspace.up_a, lora_workspace.up_b, slot_ids_expanded
+        assert routing is not None
+        _apply_dense_lora_with_routing(
+            x_flat, h_flat, lora_workspace.up_a, lora_workspace.up_b, routing
         )
 
     h = gelu_approx(h)
@@ -144,8 +233,9 @@ def mlp(
     if use_lora:
         h_flat = h.view(-1, h.shape[-1])
         out_flat = out.view(-1, out.shape[-1])
-        apply_dense_lora(
-            h_flat, out_flat, lora_workspace.down_a, lora_workspace.down_b, slot_ids_expanded
+        assert routing is not None
+        _apply_dense_lora_with_routing(
+            h_flat, out_flat, lora_workspace.down_a, lora_workspace.down_b, routing
         )
 
     return out
