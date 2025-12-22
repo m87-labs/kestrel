@@ -199,3 +199,31 @@ def test_moe_align_block_size_rejects_bad_dtype(device):
     topk_ids = torch.zeros((4, 2), device=device, dtype=torch.float16)
     with pytest.raises(ValueError, match="topk_ids must be int32"):
         moe_align_block_size(topk_ids, 16, 64)
+
+
+def test_moe_align_block_size_small_batch_matches_torch(device):
+    torch.manual_seed(0)
+    num_tokens = 4
+    topk = 8
+    num_experts = 64
+    block_size = 16
+
+    topk_ids = _make_topk_ids(num_tokens, topk, num_experts, device)
+
+    actual_sorted, actual_expert_ids, actual_num_tokens = moe_align_block_size(
+        topk_ids, block_size, num_experts
+    )
+    golden_sorted, golden_expert_ids, golden_num_tokens = torch_moe_align_block_size(
+        topk_ids, block_size, num_experts
+    )
+
+    torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
+    torch.testing.assert_close(actual_expert_ids, golden_expert_ids, atol=0, rtol=0)
+    _verify_expert_level_sorting(
+        actual_sorted,
+        golden_sorted,
+        actual_expert_ids,
+        block_size,
+        actual_num_tokens.item(),
+        num_tokens * topk,
+    )
