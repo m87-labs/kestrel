@@ -14,7 +14,7 @@ from typing import Literal
 from ..fused_moe.routing import moe_align_block_size
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
-from ..ops import topk_fwd
+from kestrel_kernels.topk import topk_fwd
 from ..fused_moe.lora_kernels import apply_moe_lora
 
 # Re-export LoRA for convenience
