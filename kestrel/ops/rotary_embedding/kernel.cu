@@ -24,7 +24,8 @@ static_assert(sizeof(at::BFloat16) == sizeof(__nv_bfloat16),
 // - GPT-NeoX rotary embedding only.
 // - bf16 only.
 // - positions: contiguous int64, shape [B, S].
-// - query/key: contiguous bf16, shape [B, S, heads, head_size].
+// - query/key: bf16, shape [B, S, heads, head_size] with contiguous head dim
+//   (stride(-1) == 1, stride(-2) == head_size). B/S strides may be larger.
 // - cos_sin_cache: contiguous fp32, shape [max_pos, rot_dim] with vLLM layout
 //   (cos first, sin second; both length rot_dim/2).
 // - rot_dim % 4 == 0 (so the 2-offset-per-thread kernel covers rot offsets in pairs).
@@ -85,9 +86,14 @@ __global__ void rotary_embedding_neox_fp32_kernel(
     const int64_t* __restrict__ positions, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, const float* __restrict__ cos_sin_cache,
     const int num_heads,
-    const int num_kv_heads, const int head_size, const int rot_dim) {
+    const int num_kv_heads, const int head_size, const int rot_dim,
+    const int64_t query_stride_b, const int64_t query_stride_s,
+    const int64_t key_stride_b, const int64_t key_stride_s,
+    const int64_t seq_len) {
   const int token_idx = blockIdx.x;
   const int64_t pos = positions[token_idx];
+  const int64_t batch_idx = token_idx / seq_len;
+  const int64_t seq_idx = token_idx - batch_idx * seq_len;
 
   const int embed_dim = rot_dim / 2;
   const int embed_dim2 = embed_dim / 2;
@@ -101,10 +107,10 @@ __global__ void rotary_embedding_neox_fp32_kernel(
   const float* __restrict__ cos_ptr = sh_cache;
   const float* __restrict__ sin_ptr = sh_cache + embed_dim;
 
-  const int query_hidden_size = num_heads * head_size;
-  const int key_hidden_size = num_kv_heads * head_size;
-  __nv_bfloat16* __restrict__ q_token = query + token_idx * query_hidden_size;
-  __nv_bfloat16* __restrict__ k_token = key + token_idx * key_hidden_size;
+  __nv_bfloat16* __restrict__ q_token =
+      query + batch_idx * query_stride_b + seq_idx * query_stride_s;
+  __nv_bfloat16* __restrict__ k_token =
+      key + batch_idx * key_stride_b + seq_idx * key_stride_s;
 
   const int max_heads = num_heads > num_kv_heads ? num_heads : num_kv_heads;
   const int max_n2 = max_heads * embed_dim2;
@@ -141,10 +147,14 @@ __global__ void rotary_embedding_neox_fp32_split_heads_kernel(
     __nv_bfloat16* __restrict__ key, const float* __restrict__ cos_sin_cache,
     const int num_heads,
     const int num_kv_heads, const int head_size, const int rot_dim,
-    const int heads_per_block) {
+    const int heads_per_block, const int64_t query_stride_b,
+    const int64_t query_stride_s, const int64_t key_stride_b,
+    const int64_t key_stride_s, const int64_t seq_len) {
     const int token_idx = blockIdx.x;
   const int head_group = blockIdx.y;
   const int64_t pos = positions[token_idx];
+  const int64_t batch_idx = token_idx / seq_len;
+  const int64_t seq_idx = token_idx - batch_idx * seq_len;
 
   const int embed_dim = rot_dim / 2;
   const int embed_dim2 = embed_dim / 2;
@@ -158,10 +168,10 @@ __global__ void rotary_embedding_neox_fp32_split_heads_kernel(
   const float* __restrict__ cos_ptr = sh_cache;
   const float* __restrict__ sin_ptr = sh_cache + embed_dim;
 
-  const int query_hidden_size = num_heads * head_size;
-  const int key_hidden_size = num_kv_heads * head_size;
-  __nv_bfloat16* __restrict__ q_token = query + token_idx * query_hidden_size;
-  __nv_bfloat16* __restrict__ k_token = key + token_idx * key_hidden_size;
+  __nv_bfloat16* __restrict__ q_token =
+      query + batch_idx * query_stride_b + seq_idx * query_stride_s;
+  __nv_bfloat16* __restrict__ k_token =
+      key + batch_idx * key_stride_b + seq_idx * key_stride_s;
 
   const int max_heads = num_heads > num_kv_heads ? num_heads : num_kv_heads;
   const int head_start = head_group * heads_per_block;
@@ -214,8 +224,6 @@ static void check_inputs(const torch::Tensor& positions,
               "cos_sin_cache and query must be on the same device");
 
   TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
-  TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
-  TORCH_CHECK(key.is_contiguous(), "key must be contiguous");
   TORCH_CHECK(cos_sin_cache.is_contiguous(), "cos_sin_cache must be contiguous");
 
   TORCH_CHECK(positions.scalar_type() == at::ScalarType::Long,
@@ -245,6 +253,22 @@ static void check_inputs(const torch::Tensor& positions,
               "query head_size must match head_size argument");
   TORCH_CHECK(key.size(-1) == head_size,
               "key head_size must match head_size argument");
+  TORCH_CHECK(query.stride(-1) == 1,
+              "query last dimension must be contiguous");
+  TORCH_CHECK(key.stride(-1) == 1,
+              "key last dimension must be contiguous");
+  TORCH_CHECK(query.stride(-2) == head_size,
+              "query head dimension must be contiguous");
+  TORCH_CHECK(key.stride(-2) == head_size,
+              "key head dimension must be contiguous");
+  TORCH_CHECK(query.stride(0) >= query.size(1) * query.size(2) * head_size,
+              "query stride(0) must be >= S*H*D");
+  TORCH_CHECK(query.stride(1) >= query.size(2) * head_size,
+              "query stride(1) must be >= H*D");
+  TORCH_CHECK(key.stride(0) >= key.size(1) * key.size(2) * head_size,
+              "key stride(0) must be >= S*H*D");
+  TORCH_CHECK(key.stride(1) >= key.size(2) * head_size,
+              "key stride(1) must be >= H*D");
 
   const int rot_dim = static_cast<int>(cos_sin_cache.size(1));
   TORCH_CHECK((rot_dim % 4) == 0, "rot_dim must be divisible by 4");
@@ -263,6 +287,11 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
   const int num_heads = static_cast<int>(query.size(2));
   const int num_kv_heads = static_cast<int>(key.size(2));
   const int rot_dim = static_cast<int>(cos_sin_cache.size(1));
+  const int64_t seq_len = positions.size(1);
+  const int64_t query_stride_b = query.stride(0);
+  const int64_t query_stride_s = query.stride(1);
+  const int64_t key_stride_b = key.stride(0);
+  const int64_t key_stride_s = key.stride(1);
 
   const int embed_dim = rot_dim / 2;
   const int embed_dim2 = embed_dim / 2;
@@ -317,14 +346,16 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
         reinterpret_cast<__nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
         cos_sin_cache.data_ptr<float>(),
         num_heads, num_kv_heads, static_cast<int>(head_size), rot_dim,
-        heads_per_block);
+        heads_per_block, query_stride_b, query_stride_s, key_stride_b,
+        key_stride_s, seq_len);
   } else {
     rotary_embedding_neox_fp32_kernel<<<grid, threads, shared_bytes, stream>>>(
         positions.data_ptr<int64_t>(),
         reinterpret_cast<__nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
         cos_sin_cache.data_ptr<float>(),
-        num_heads, num_kv_heads, static_cast<int>(head_size), rot_dim);
+        num_heads, num_kv_heads, static_cast<int>(head_size), rot_dim,
+        query_stride_b, query_stride_s, key_stride_b, key_stride_s, seq_len);
   }
 }
 

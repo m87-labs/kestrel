@@ -279,8 +279,6 @@ static void check_inputs(const torch::Tensor& key, const torch::Tensor& value,
   TORCH_CHECK(v_scale.device() == key.device(),
               "v_scale and key must be on the same device");
 
-  TORCH_CHECK(key.is_contiguous(), "key must be contiguous");
-  TORCH_CHECK(value.is_contiguous(), "value must be contiguous");
   TORCH_CHECK(slot_mapping.is_contiguous(), "slot_mapping must be contiguous");
 
   TORCH_CHECK(key.dim() == 3, "key must have shape [T, H, D]");
@@ -303,6 +301,17 @@ static void check_inputs(const torch::Tensor& key, const torch::Tensor& value,
   TORCH_CHECK(value_cache.size(3) == key.size(2),
               "value_cache D must match key D");
 
+  TORCH_CHECK(key.stride(2) == 1, "key last dimension must be contiguous");
+  TORCH_CHECK(value.stride(2) == 1, "value last dimension must be contiguous");
+  TORCH_CHECK(key.stride(1) == key.size(2),
+              "key head dimension must be contiguous");
+  TORCH_CHECK(value.stride(1) == value.size(2),
+              "value head dimension must be contiguous");
+  TORCH_CHECK(key.stride(0) >= key.size(1) * key.size(2),
+              "key stride(0) must be >= H*D");
+  TORCH_CHECK(value.stride(0) >= value.size(1) * value.size(2),
+              "value stride(0) must be >= H*D");
+
   TORCH_CHECK(key.scalar_type() == at::ScalarType::Half ||
                   key.scalar_type() == at::ScalarType::BFloat16,
               "key must be float16 or bfloat16");
@@ -318,6 +327,11 @@ static void check_inputs(const torch::Tensor& key, const torch::Tensor& value,
 
   const bool is_fp8 =
       (kv_cache_dtype == "fp8") || (kv_cache_dtype == "fp8_e4m3");
+  const int64_t head_stride = key_cache.stride(2);
+  if (!is_fp8 && head_stride != key.size(2)) {
+    TORCH_CHECK(static_cast<int64_t>(key.size(1)) * key.size(2) >= 32,
+                "HND kv_cache layout requires num_heads * head_size >= 32");
+  }
   if (is_fp8) {
     TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Byte,
                 "fp8 kv-cache requires key_cache uint8 view");
