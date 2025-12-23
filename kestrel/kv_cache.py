@@ -70,12 +70,8 @@ class PagedKVCache(torch.nn.Module):
         if batch_idx.ndim != 1 and batch_idx.ndim != 2:
             raise ValueError("batch_idx must be 1D or 2D")
 
-        k_view = (
-            k_val.permute(0, 2, 1, 3).contiguous().view(-1, k_val.shape[1], k_val.shape[3])
-        )
-        v_view = (
-            v_val.permute(0, 2, 1, 3).contiguous().view(-1, v_val.shape[1], v_val.shape[3])
-        )
+        k_view = k_val.view(-1, k_val.shape[2], k_val.shape[3])
+        v_view = v_val.view(-1, v_val.shape[2], v_val.shape[3])
 
         if slot_mapping.shape != input_pos.shape:
             raise ValueError("slot_mapping must match input_pos shape")
