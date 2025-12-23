@@ -27,10 +27,14 @@ from ..ops.rotary_embedding import rotary_embedding_cuda
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
-    FlashInferPrefillBatchMetadata,
-    FlashInferPrefillContext,
-    run_flashinfer_prefill,
 )
+from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
+from kestrel_kernels.flash_attn.cute.mask_definitions import cute_prefix_lm_mask_730
+
+
+# Avoid expensive runtime hashing in kestrel-kernels' compile key generation.
+# TODO: This should become dynamic once prefix length is no longer fixed.
+cute_prefix_lm_mask_730.__cute_hash__ = "kestrel_kernels.flash_attn.cute.mask_definitions.cute_prefix_lm_mask_730"
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -49,12 +53,10 @@ def attn(
     flashinfer_state: Optional[
         tuple[FlashInferDecodeContext, FlashInferBatchMetadata, bool]
     ] = None,
-    flashinfer_prefill_state: Optional[
-        tuple[FlashInferPrefillContext, FlashInferPrefillBatchMetadata]
-    ] = None,
     mode: Literal["prefill", "decode"] = "decode",
     *,
     slot_mapping: torch.Tensor,
+    use_prefix_attn: bool = False,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -72,34 +74,26 @@ def attn(
     kv_dim = n_kv_heads * head_dim
     q, k, v = qkv_out.split([q_dim, kv_dim, kv_dim], dim=-1)
 
-    q = q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
-    k = k.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-    v = v.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    q = q.view(bsz, q_len, n_heads, head_dim)
+    k = k.view(bsz, q_len, n_kv_heads, head_dim)
+    v = v.view(bsz, q_len, n_kv_heads, head_dim)
 
     if hasattr(module, "tau") and module.tau is not None:
         tok_feat = F.gelu(qkv_out)
-        tok_q = torch.tanh(torch.matmul(tok_feat, module.tau["wq"].t())).permute(
-            0, 2, 1
-        )
-        tok_v = torch.tanh(torch.matmul(tok_feat, module.tau["wv"].t())).permute(
-            0, 2, 1
-        )
+        tok_q = torch.tanh(torch.matmul(tok_feat, module.tau["wq"].t()))
+        tok_v = torch.tanh(torch.matmul(tok_feat, module.tau["wv"].t()))
 
         pos = position_matrix.to(q.dtype) + 1
-        pos_log = pos.log().unsqueeze(1)  # (B,1,S)
-        alpha = module.tau["alpha"].view(1, -1, 1)
-        tau_pos = 1 + (torch.sigmoid(alpha * pos_log) - 0.5)  # (B,H,S)
+        pos_log = pos.log().unsqueeze(-1)  # (B,S,1)
+        alpha = module.tau["alpha"].view(1, 1, -1)
+        tau_pos = 1 + (torch.sigmoid(alpha * pos_log) - 0.5)  # (B,S,H)
 
         q.mul_((tok_q + tau_pos).unsqueeze(-1))
         v.mul_((tok_v + tau_pos).unsqueeze(-1))
 
-    # Apply in-place rotary embedding (GPT-NeoX style).
+    # Apply in-place rotary embedding (GPT-NeoX style) on bshd tensors.
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
     rotary_embedding_cuda(position_matrix, q, k, head_dim, cos_sin_cache)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
 
     flash_ctx = None
     metadata = None
@@ -112,25 +106,14 @@ def attn(
                 f"Unexpected flashinfer_state tuple length {len(flashinfer_state)}"
             )
 
-    prefill_ctx = None
-    prefill_metadata = None
-    if flashinfer_prefill_state is not None:
-        if len(flashinfer_prefill_state) != 2:
-            raise ValueError(
-                "flashinfer_prefill_state must contain a context and metadata tuple"
-            )
-        prefill_ctx, prefill_metadata = flashinfer_prefill_state
-
     if kv_cache is not None:
-        kv_result = kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
-    else:
-        kv_result = (k, v)
+        kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
 
     if flash_ctx is not None:
         if kv_cache is None:
             raise RuntimeError("FlashInfer decode requires a KV cache")
-        torch._assert(q.shape[2] == 1, "FlashInfer decode expects q_len == 1")
-        q_heads = q.view(bsz, n_heads, head_dim)
+        torch._assert(q.shape[1] == 1, "FlashInfer decode expects q_len == 1")
+        q_heads = q[:, 0]
         k_cache = kv_cache.cache.k_cache  # type: ignore[attr-defined]
         v_cache = kv_cache.cache.v_cache  # type: ignore[attr-defined]
         k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
@@ -142,42 +125,36 @@ def attn(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-        out = attn_heads.unsqueeze(2)
-    elif prefill_ctx is not None:
-        if kv_cache is None:
-            raise RuntimeError("FlashInfer prefill requires a KV cache")
-        if prefill_metadata is None:
-            raise RuntimeError("FlashInfer prefill requires metadata")
-        q_heads = q.transpose(1, 2).reshape(-1, n_heads, head_dim).contiguous()
-        paged_cache = kv_cache.cache  # type: ignore[attr-defined]
-        k_scale = getattr(paged_cache, "k_scale", None)
-        v_scale = getattr(paged_cache, "v_scale", None)
-        out_buf = torch.empty_like(q_heads)
-        attn_heads = run_flashinfer_prefill(
-            prefill_ctx,
-            q_heads,
-            (paged_cache.k_cache, paged_cache.v_cache),
-            k_scale=k_scale,
-            v_scale=v_scale,
-            out=out_buf,
-        )
-        out = (
-            attn_heads.view(bsz, q_len, n_heads, head_dim)
-            .transpose(1, 2)
-            .contiguous()
+        out = attn_heads.unsqueeze(1)
+    elif mode == "prefill":
+        if not x.is_cuda:
+            raise RuntimeError("FA3 prefill requires CUDA tensors")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(f"Unsupported dtype for FA3 prefill: {q.dtype}")
+        mask_mod = None
+        causal = True
+        pack_gqa = None
+        if use_prefix_attn:
+            # TODO: Make this dynamic (per-request prefix length) when we support
+            # non-fixed image prefixes. For now, hardcode Moondream's BOS+image
+            # prefix length (730 = 1 + 27*27).
+            causal = False
+            mask_mod = cute_prefix_lm_mask_730
+            pack_gqa = False
+        out, _ = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=causal,
+            pack_gqa=pack_gqa,
+            mask_mod=mask_mod,
         )
     else:
-        k_attn, v_attn = kv_result
-        out = F.scaled_dot_product_attention(
-            q,
-            k_attn,
-            v_attn,
-            attn_mask=attn_mask,
-            enable_gqa=n_heads != n_kv_heads,
-            is_causal=(mode == "prefill") and attn_mask is None,
+        raise RuntimeError(
+            "SDPA fallback removed; FlashInfer decode is required for non-prefill"
         )
 
-    out = out.transpose(1, 2).reshape(bsz, q_len, d_model)
+    out = out.view(bsz, q_len, d_model)
     return module.proj(out)
 
 
@@ -189,13 +166,11 @@ def text_decoder(
     config: TextConfig,
     *,
     slot_mapping: torch.Tensor,
+    use_prefix_attn: bool = False,
     flashinfer_ctx: Optional[FlashInferDecodeContext] = None,
     flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
     use_flashinfer: bool = False,
     use_graph: bool = False,
-    flashinfer_prefill_ctx: Optional[FlashInferPrefillContext] = None,
-    flashinfer_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None,
-    use_flashinfer_prefill: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
@@ -212,15 +187,6 @@ def text_decoder(
         ):
             flash_state = (flashinfer_ctx, flashinfer_metadata, use_graph)
 
-        prefill_state = None
-        if (
-            mode == "prefill"
-            and use_flashinfer_prefill
-            and flashinfer_prefill_ctx is not None
-            and flashinfer_prefill_metadata is not None
-        ):
-            prefill_state = (flashinfer_prefill_ctx, flashinfer_prefill_metadata)
-
         attn_out = attn(
             x_norm,
             block.attn,
@@ -231,9 +197,9 @@ def text_decoder(
             config.n_kv_heads,
             position_ids,
             flashinfer_state=flash_state,
-            flashinfer_prefill_state=prefill_state,
             mode=mode,
             slot_mapping=slot_mapping,
+            use_prefix_attn=use_prefix_attn,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:

@@ -38,8 +38,6 @@ from .image_crops import OverlapCropOutput
 from .flashinfer import (
     FlashInferBatchMetadata,
     FlashInferDecodeContext,
-    FlashInferPrefillBatchMetadata,
-    FlashInferPrefillContext,
 )
 from .region import (
     build_region_module,
@@ -156,8 +154,8 @@ class _LayerPagedCache(torch.nn.Module):
         *,
         slot_mapping: Tensor,
     ):
-        if k_val.shape[2] != v_val.shape[2]:
-            raise ValueError("k_val and v_val must share the sequence dimension")
+        if k_val.shape != v_val.shape:
+            raise ValueError("k_val and v_val must match shape")
 
         input_pos = torch.atleast_2d(pos_ids).to(
             dtype=torch.int32, device=k_val.device
@@ -168,9 +166,9 @@ class _LayerPagedCache(torch.nn.Module):
             )
 
         seq_len = input_pos.shape[1]
-        if k_val.shape[2] != seq_len:
+        if k_val.shape[1] != seq_len:
             raise ValueError(
-                f"KV sequence length {k_val.shape[2]} does not match position tensor {input_pos.shape}"
+                f"KV sequence length {k_val.shape[1]} does not match position tensor {input_pos.shape}"
             )
 
         batch_idx = self._batch_binding.tensor
@@ -351,15 +349,6 @@ class MoondreamRuntime:
         self._decode_compute_stream = torch.cuda.Stream(device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
 
-        # Prefill uses a separate FlashInfer context (not pipelined).
-        # Force fa2 backend: fa3 lacks mixed-precision attention (see flashinfer#2038).
-        self._flashinfer_prefill_ctx = FlashInferPrefillContext(
-            device=self.device,
-            q_dtype=self.dtype,
-            kv_dtype=self.kv_cache_dtype,
-            page_size=self.page_size,
-        )
-        self._active_prefill_metadata: Optional[FlashInferPrefillBatchMetadata] = None
         self._active_prefill_batch_idx: Optional[Tensor] = None
 
         # CUDA graph batch sizes for decode (same for all slots).
@@ -371,13 +360,6 @@ class MoondreamRuntime:
         self._prefill_batch_idx = CpuGpuBuffer(
             1,
             dtype=torch.int64,
-            device=self.device,
-            pin_memory=True,
-            with_numpy=False,
-        )
-        self._prefill_query_lens = CpuGpuBuffer(
-            1,
-            dtype=torch.int32,
             device=self.device,
             pin_memory=True,
             with_numpy=False,
@@ -655,36 +637,16 @@ class MoondreamRuntime:
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        self._prefill_query_lens.cpu[0] = prompt_len
-        query_lens = self._prefill_query_lens.copy_to_gpu()
-        prefill_metadata = self._build_flashinfer_prefill_metadata(
-            batch_tensor, query_lens
-        )
-        custom_mask = None
-        if image_length:
-            mask_matrix = torch.tril(
-                torch.ones(
-                    (prompt_len, prompt_len),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-            )
-            prefix_len = image_length + 1
-            mask_matrix[:prefix_len, :prefix_len] = True
-            custom_mask = mask_matrix.flatten()
-        self._flashinfer_prefill_ctx.plan(
-            prefill_metadata,
-            num_q_heads=self.config.text.n_heads,
-            num_kv_heads=self.config.text.n_kv_heads,
-            head_dim=self.head_dim,
-            custom_mask=custom_mask,
-        )
-        self._active_prefill_metadata = prefill_metadata
         self._active_prefill_batch_idx = batch_tensor
         try:
-            hidden, logits = self._prefill(inputs_embeds, attention_mask, position_ids, lora_slot)
+            hidden, logits = self._prefill(
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                lora_slot,
+                use_prefix_attn=bool(image_length),
+            )
         finally:
-            self._active_prefill_metadata = None
             self._active_prefill_batch_idx = None
         state = SequenceState(
             batch_idx=batch_idx,
@@ -713,8 +675,16 @@ class MoondreamRuntime:
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
         lora_slot: int = 0,
+        *,
+        use_prefix_attn: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        hidden, logits = self._prefill_fn(inputs_embeds, attn_mask, position_ids, lora_slot)
+        hidden, logits = self._prefill_fn(
+            inputs_embeds,
+            attn_mask,
+            position_ids,
+            lora_slot,
+            use_prefix_attn=use_prefix_attn,
+        )
         return hidden, logits
 
     def _prefill_impl(
@@ -723,9 +693,9 @@ class MoondreamRuntime:
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
         lora_slot: int = 0,
+        *,
+        use_prefix_attn: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        prefill_metadata = self._active_prefill_metadata
-        use_flashinfer_prefill = prefill_metadata is not None
         batch_idx = self._active_prefill_batch_idx
         if batch_idx is None:
             raise RuntimeError("Prefill batch index missing during warmup")
@@ -744,11 +714,7 @@ class MoondreamRuntime:
             self.config.text,
             slot_mapping=slot_mapping,
             mode="prefill",
-            flashinfer_prefill_ctx=(
-                self._flashinfer_prefill_ctx if use_flashinfer_prefill else None
-            ),
-            flashinfer_prefill_metadata=prefill_metadata,
-            use_flashinfer_prefill=use_flashinfer_prefill,
+            use_prefix_attn=use_prefix_attn,
             lora_workspace=self._lora_workspace,
             lora_slot_ids=lora_slot_ids,
         )
@@ -833,36 +799,6 @@ class MoondreamRuntime:
             kv_indices=kv_indices,
             kv_last_page_len=kv_last_page_len,
             graph_state=buffers.graph_state if use_graph else None,
-        )
-
-    def _build_flashinfer_prefill_metadata(
-        self,
-        batch_idx: Tensor,
-        query_lens: Tensor,
-    ) -> FlashInferPrefillBatchMetadata:
-        if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be 1D for FlashInfer prefill metadata")
-        if query_lens.ndim != 1:
-            raise ValueError("query_lens must be 1D for FlashInfer prefill metadata")
-
-        seq_lens = query_lens.to(dtype=torch.int32, device=self.device)
-        kv_indptr, kv_indices, kv_last_page_len = (
-            self.page_table.build_flashinfer_kv_metadata(batch_idx, seq_lens)
-        )
-        qo_indptr = torch.zeros(
-            batch_idx.shape[0] + 1, dtype=torch.int32, device=self.device
-        )
-        if query_lens.numel():
-            qo_indptr[1:] = torch.cumsum(
-                query_lens.to(dtype=torch.int32, device=self.device), dim=0
-            )
-
-        return FlashInferPrefillBatchMetadata(
-            batch_size=batch_idx.shape[0],
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_last_page_len=kv_last_page_len,
         )
 
     def _decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
