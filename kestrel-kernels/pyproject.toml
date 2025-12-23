@@ -23,3 +23,4 @@ dependencies = [
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
 wheel.packages = ["python/kestrel_kernels"]
+cmake.args = ["-DCMAKE_CUDA_ARCHITECTURES=90a"]

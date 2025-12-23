@@ -12,6 +12,9 @@ find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
+# Clear PyTorch's auto-detected CUDA architecture flags - we set our own
+set(CMAKE_CUDA_FLAGS "")
+
 # C++/CUDA extensions that use `torch/extension.h` (pybind11) must link against
 # libtorch_python to resolve ATen/Tensor type casters at runtime.
 execute_process(
