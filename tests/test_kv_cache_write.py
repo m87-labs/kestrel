@@ -80,6 +80,57 @@ def test_reshape_and_cache_flash_bf16_matches_reference(device: torch.device) ->
     torch.testing.assert_close(value_cache, ref_v, atol=0, rtol=0)
 
 
+def test_reshape_and_cache_flash_bf16_accepts_strided_tokens(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(0)
+
+    num_tokens = 9
+    num_heads = 4
+    head_size = 8
+    block_size = 4
+    num_blocks = 4
+
+    key_base = torch.randn(
+        (num_tokens * 2, num_heads, head_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    value_base = torch.randn_like(key_base)
+    key = key_base[::2]
+    value = value_base[::2]
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    slot_mapping = torch.tensor(
+        [0, 1, 2, 3, 4, -1, 6, 7, 8], device=device, dtype=torch.int64
+    )
+
+    key_cache = torch.zeros(
+        (num_blocks, num_heads, block_size, head_size), device=device, dtype=torch.bfloat16
+    )
+    value_cache = torch.zeros_like(key_cache)
+    key_cache_arg = key_cache.permute(0, 2, 1, 3)
+    value_cache_arg = value_cache.permute(0, 2, 1, 3)
+
+    reshape_and_cache_flash_cuda(
+        key,
+        value,
+        key_cache_arg,
+        value_cache_arg,
+        slot_mapping,
+        "auto",
+        torch.tensor(1.0, device=device, dtype=torch.float32),
+        torch.tensor(1.0, device=device, dtype=torch.float32),
+    )
+
+    ref_k, ref_v = _write_reference(
+        key, value, key_cache, value_cache, slot_mapping, block_size=block_size
+    )
+    torch.testing.assert_close(key_cache, ref_k, atol=0, rtol=0)
+    torch.testing.assert_close(value_cache, ref_v, atol=0, rtol=0)
+
+
 def test_reshape_and_cache_flash_fp8_matches_reference(device: torch.device) -> None:
     torch.manual_seed(0)
 

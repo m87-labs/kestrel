@@ -82,6 +82,43 @@ def test_rotary_embedding_matches_reference(
     torch.testing.assert_close(k, k_fp32, atol=0, rtol=0)
 
 
+def test_rotary_embedding_accepts_strided_bshd(device: torch.device) -> None:
+    torch.manual_seed(0)
+
+    bsz = 2
+    seqlen = 7
+    num_heads = 4
+    head_size = 64
+    rot_dim = 32
+    max_pos = 128
+
+    positions = torch.randint(0, max_pos, (bsz, seqlen), device=device, dtype=torch.int64)
+    q_base = torch.randn(
+        (bsz * 2, seqlen * 2, num_heads, head_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_base = torch.randn_like(q_base)
+    q = q_base[::2, ::2]
+    k = k_base[::2, ::2]
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+
+    cos_sin_cache_fp32 = precompute_freqs_cis(
+        rot_dim, max_pos, dtype=torch.float32, device=device
+    )
+
+    q_in = q.clone()
+    k_in = k.clone()
+    rotary_embedding_cuda(positions, q, k, head_size, cos_sin_cache_fp32)
+
+    q_ref, k_ref = _rotary_reference_neox_fp32(
+        positions, q_in, k_in, cos_sin_cache_fp32
+    )
+    torch.testing.assert_close(q, q_ref, atol=0, rtol=0)
+    torch.testing.assert_close(k, k_ref, atol=0, rtol=0)
+
+
 def test_rotary_embedding_rejects_non_contiguous_query(device: torch.device) -> None:
     positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
     q_full = torch.zeros((1, 1, 1, 16), device=device, dtype=torch.bfloat16)
@@ -89,7 +126,7 @@ def test_rotary_embedding_rejects_non_contiguous_query(device: torch.device) -> 
     assert not q.is_contiguous()
     k = torch.zeros((1, 1, 1, 8), device=device, dtype=torch.bfloat16)
     cos_sin_cache = precompute_freqs_cis(8, 1, dtype=torch.float32, device=device)
-    with pytest.raises(RuntimeError, match="query must be contiguous"):
+    with pytest.raises(RuntimeError, match="query last dimension must be contiguous"):
         rotary_embedding_cuda(positions, q, k, 8, cos_sin_cache)
 
 
