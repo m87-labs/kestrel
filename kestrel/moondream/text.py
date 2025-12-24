@@ -30,6 +30,7 @@ from .flashinfer import (
 )
 from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
 from kestrel_kernels.flash_attn.cute.mask_definitions import cute_prefix_lm_mask_730
+from kestrel_kernels.tau_tail_ops import tau_tail_apply_into
 
 
 # Avoid expensive runtime hashing in kestrel-kernels' compile key generation.
@@ -100,25 +101,22 @@ def attn(
 
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
+    if hasattr(module, "tau") and module.tau is not None:
+        tau_wqwv = module.tau["wqwv"]
+        tok_qv_lin = F.linear(F.gelu(qkv_out), tau_wqwv)
+        # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
+        tau_tail_apply_into(
+            qkv_out=qkv_out,
+            tok_qv_lin=tok_qv_lin,
+            tau_pos_table=module._tau_pos_table,  # type: ignore[attr-defined]
+            position_ids=position_matrix,
+        )
+
     q, k, v = qkv_out.split([q_dim, kv_dim, kv_dim], dim=-1)
 
     q = q.view(bsz, q_len, n_heads, head_dim)
     k = k.view(bsz, q_len, n_kv_heads, head_dim)
     v = v.view(bsz, q_len, n_kv_heads, head_dim)
-
-    if hasattr(module, "tau") and module.tau is not None:
-        tok_feat = F.gelu(qkv_out)
-        tau_wqwv = module.tau["wqwv"]
-        tok_qv = F.linear(tok_feat, tau_wqwv)
-        tok_qv.tanh_()
-        tok_q, tok_v = tok_qv.split(n_heads, dim=-1)
-
-        # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
-        tau_pos_table = module._tau_pos_table  # type: ignore[attr-defined]
-        tau_pos = tau_pos_table[position_matrix]  # (B,S,H)
-
-        q.mul_((tok_q + tau_pos).unsqueeze(-1))
-        v.mul_((tok_v + tau_pos).unsqueeze(-1))
 
     # Apply in-place rotary embedding (GPT-NeoX style) on bshd tensors.
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
