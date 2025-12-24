@@ -14,7 +14,7 @@
 # Features not supported yet:
 # - split (i.e. FlashDecoding)
 # - tuned block sizes
-# - paged KV
+# - paged KV for page_size != n_block_size (currently expects 128 on SM90)
 # - append KV to existing KV cache
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
@@ -428,8 +428,12 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
         if compute_capability == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
+            if page_table is not None:
+                assert page_size == n_block_size, (
+                    "paged KV on SM90 currently requires page_size == n_block_size "
+                    f"(got page_size={page_size}, n_block_size={n_block_size})"
+                )
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,

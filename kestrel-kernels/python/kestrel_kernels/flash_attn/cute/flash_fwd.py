@@ -1468,7 +1468,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
             1,  # num_splits
-            cute.size(mK.shape[0]),
+            cute.size(mK.shape[0])
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
             mQ.shape[1],
             mV.shape[1],
             total_q=cute.size(mQ.shape[0])
@@ -1523,6 +1525,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -1570,6 +1573,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -1673,7 +1677,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
+            seqlen_k_static=mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -1695,6 +1701,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mQ,
                 mK,
                 mV,
+                mPageTable,
                 sQ,
                 sK,
                 sV,
@@ -1754,6 +1761,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mPageTable: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1784,10 +1792,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 )
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                if const_expr(mPageTable is None):
+                    mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                else:
+                    # Paged KV: mK/mV layouts are (page_size, d, h_k, num_pages) after transpose.
+                    # We use page_table to map logical n_block -> physical page index, and load
+                    # full pages (page_size == tile_n) via TMA.
+                    mK_cur = mK[None, None, head_idx_kv, None]
+                    mV_cur = mV[None, None, head_idx_kv, None]
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(
@@ -1809,6 +1826,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     # if cute.arch.thread_idx()[0] == 0:
                     #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
                     # First iteration: load both Q & K with the same mbarrier
+                    # Keep types stable across dynamic control flow (Cute-DSL disallows None->Int32).
+                    src_idx_k = Int32(0)
+                    src_idx_v = Int32(0)
                     n_block = n_block_max - 1
                     pipeline_k.producer_acquire(
                         kv_producer_state,
@@ -1818,18 +1838,36 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
                     if const_expr(self.use_tma_Q):
                         load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
-                    load_K(src_idx=n_block, producer_state=kv_producer_state)
+                    src_idx_k = (
+                        n_block if const_expr(mPageTable is None) else mPageTable[batch_idx, n_block]
+                    )
+                    load_K(src_idx=src_idx_k, producer_state=kv_producer_state)
 
                     if const_expr(not self.intra_wg_overlap):
                         pipeline_v.producer_acquire(kv_producer_state)
-                        load_V(src_idx=n_block, producer_state=kv_producer_state)
+                        src_idx_v = (
+                            n_block
+                            if const_expr(mPageTable is None)
+                            else mPageTable[batch_idx, n_block]
+                        )
+                        load_V(src_idx=src_idx_v, producer_state=kv_producer_state)
                         kv_producer_state.advance()
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - i - 1
                             pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(src_idx=n_block, producer_state=kv_producer_state)
+                            src_idx_k = (
+                                n_block
+                                if const_expr(mPageTable is None)
+                                else mPageTable[batch_idx, n_block]
+                            )
+                            load_K(src_idx=src_idx_k, producer_state=kv_producer_state)
                             pipeline_v.producer_acquire(kv_producer_state)
-                            load_V(src_idx=n_block, producer_state=kv_producer_state)
+                            src_idx_v = (
+                                n_block
+                                if const_expr(mPageTable is None)
+                                else mPageTable[batch_idx, n_block]
+                            )
+                            load_V(src_idx=src_idx_v, producer_state=kv_producer_state)
                             kv_producer_state.advance()
                     else:
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
@@ -1838,12 +1876,27 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             kv_producer_state_prev = kv_producer_state.clone()
                             kv_producer_state.advance()
                             pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(src_idx=n_block, producer_state=kv_producer_state)
+                            src_idx_k = (
+                                n_block
+                                if const_expr(mPageTable is None)
+                                else mPageTable[batch_idx, n_block]
+                            )
+                            load_K(src_idx=src_idx_k, producer_state=kv_producer_state)
                             pipeline_v.producer_acquire(kv_producer_state_prev)
-                            load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
+                            src_idx_v = (
+                                n_block_prev
+                                if const_expr(mPageTable is None)
+                                else mPageTable[batch_idx, n_block_prev]
+                            )
+                            load_V(src_idx=src_idx_v, producer_state=kv_producer_state_prev)
                         n_block = n_block_min
                         pipeline_v.producer_acquire(kv_producer_state)
-                        load_V(src_idx=n_block, producer_state=kv_producer_state)
+                        src_idx_v = (
+                            n_block
+                            if const_expr(mPageTable is None)
+                            else mPageTable[batch_idx, n_block]
+                        )
+                        load_V(src_idx=src_idx_v, producer_state=kv_producer_state)
                         kv_producer_state.advance()
                 else:
                     kv_producer_state = produce_block_sparse_loads(
