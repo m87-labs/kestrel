@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from ..ops import precompute_freqs_cis
+from .text import build_tau_pos_tables
 
 @contextmanager
 def safetensors_open(path: str):
@@ -48,9 +49,6 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
                 f"{prefix}.mixer.Wqkv.bias": block["attn"]["qkv"].bias,
                 f"{prefix}.mixer.out_proj.weight": block["attn"]["proj"].weight,
                 f"{prefix}.mixer.out_proj.bias": block["attn"]["proj"].bias,
-                f"{prefix}.tau_wq": block["attn"]["tau"]["wq"],
-                f"{prefix}.tau_wv": block["attn"]["tau"]["wv"],
-                f"{prefix}.tau_alpha": block["attn"]["tau"]["alpha"],
             }
         )
         if is_moe:
@@ -74,6 +72,19 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
 
     for key, tensor in weight_map.items():
         tensor.data.copy_(get_tensor(key))
+
+    # Tau weights (q/v scaling). Kestrel stores these fused as a single wqwv matrix
+    # for performance, but older checkpoints store tau_wq and tau_wv separately.
+    for i, block in enumerate(text["blocks"]):
+        prefix = f"text_model.transformer.h.{i}"
+        try:
+            tau_wqwv = get_tensor(f"{prefix}.tau_wqwv")
+        except KeyError:
+            tau_wq = get_tensor(f"{prefix}.tau_wq")
+            tau_wv = get_tensor(f"{prefix}.tau_wv")
+            tau_wqwv = torch.cat([tau_wq, tau_wv], dim=0)
+        block["attn"]["tau"]["wqwv"].data.copy_(tau_wqwv)
+        block["attn"]["tau"]["alpha"].data.copy_(get_tensor(f"{prefix}.tau_alpha"))
 
     for param in text.parameters():
         param.data = param.data.contiguous()
@@ -168,6 +179,20 @@ def _refresh_rotary_tables(model: nn.Module) -> None:
     cache.data.copy_(cos_sin_cache)
 
 
+def _refresh_tau_pos_tables(model: nn.Module) -> None:
+    if not hasattr(model, "text") or not hasattr(model, "config"):
+        return
+    text_cfg = model.config.text
+    target_param = next(model.text.parameters())
+    build_tau_pos_tables(
+        model.text,
+        text_cfg.n_heads,
+        text_cfg.max_context,
+        dtype=target_param.dtype,
+        device=target_param.device,
+    )
+
+
 def load_text_weights(
     path: str,
     model: nn.Module,
@@ -232,6 +257,7 @@ def load_moondream_weights(
             _assign_region_weights(getter, region, convert=convert)
 
     _refresh_rotary_tables(model)
+    _refresh_tau_pos_tables(model)
 
 
 __all__ = ["load_moondream_weights", "load_text_weights"]

@@ -41,6 +41,34 @@ def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
     return F.embedding(input_ids, module.wte)
 
 
+def build_tau_pos_tables(
+    text_module: nn.Module,
+    n_heads: int,
+    max_context: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> None:
+    """Build tau position tables for all attention blocks.
+
+    Call this after loading/tying weights to precompute the position-dependent
+    scaling factors. This avoids small elementwise kernels on the forward path
+    and enables CUDA graph compatibility.
+    """
+    pos = torch.arange(max_context, device=device, dtype=torch.float32) + 1
+    pos_log = pos.log().unsqueeze(-1)  # (P, 1)
+
+    for block in text_module["blocks"]:
+        attn_module = block["attn"]
+        tau = getattr(attn_module, "tau", None)
+        if tau is None:
+            continue
+        alpha = tau["alpha"]
+        alpha_fp32 = alpha.to(dtype=torch.float32, device=device).view(1, -1)
+        tau_pos_table = (torch.sigmoid(alpha_fp32 * pos_log) + 0.5).to(dtype=dtype)
+        attn_module._tau_pos_table = tau_pos_table  # type: ignore[attr-defined]
+
+
 def attn(
     x: torch.Tensor,
     module: nn.Module,
@@ -80,13 +108,14 @@ def attn(
 
     if hasattr(module, "tau") and module.tau is not None:
         tok_feat = F.gelu(qkv_out)
-        tok_q = torch.tanh(torch.matmul(tok_feat, module.tau["wq"].t()))
-        tok_v = torch.tanh(torch.matmul(tok_feat, module.tau["wv"].t()))
+        tau_wqwv = module.tau["wqwv"]
+        tok_qv = F.linear(tok_feat, tau_wqwv)
+        tok_qv.tanh_()
+        tok_q, tok_v = tok_qv.split(n_heads, dim=-1)
 
-        pos = position_matrix.to(q.dtype) + 1
-        pos_log = pos.log().unsqueeze(-1)  # (B,S,1)
-        alpha = module.tau["alpha"].view(1, 1, -1)
-        tau_pos = 1 + (torch.sigmoid(alpha * pos_log) - 0.5)  # (B,S,H)
+        # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
+        tau_pos_table = module._tau_pos_table  # type: ignore[attr-defined]
+        tau_pos = tau_pos_table[position_matrix]  # (B,S,H)
 
         q.mul_((tok_q + tau_pos).unsqueeze(-1))
         v.mul_((tok_v + tau_pos).unsqueeze(-1))
@@ -267,18 +296,15 @@ def build_text_model(
                                 {
                                     "qkv": nn.Linear(config.dim, qkv_dim, dtype=dtype),
                                     "proj": nn.Linear(
-                                        config.dim, config.dim, dtype=dtype
+                                    config.dim, config.dim, dtype=dtype
                                     ),
                                     "tau": nn.ParameterDict(
                                         {
-                                            "wq": nn.Parameter(
+                                            "wqwv": nn.Parameter(
                                                 torch.empty(
-                                                    config.n_heads, qkv_dim, dtype=dtype
-                                                )
-                                            ),
-                                            "wv": nn.Parameter(
-                                                torch.empty(
-                                                    config.n_heads, qkv_dim, dtype=dtype
+                                                    config.n_heads * 2,
+                                                    qkv_dim,
+                                                    dtype=dtype,
                                                 )
                                             ),
                                             "alpha": nn.Parameter(
@@ -331,4 +357,5 @@ __all__ = [
     "lm_head",
     "attn",
     "build_text_model",
+    "build_tau_pos_tables",
 ]
