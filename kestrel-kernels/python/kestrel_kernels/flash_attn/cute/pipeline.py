@@ -10,6 +10,7 @@ from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate
 from cutlass.pipeline import PipelineAsync, PipelineState, Agent, CooperativeGroup
 from cutlass.pipeline import PipelineUserType, PipelineOp
+from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 
@@ -256,6 +257,66 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
                 self.is_signalling_thread,
                 lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
             )
+
+
+@dataclass(frozen=True)
+class PipelineCpAsync(PipelineCpAsyncOg):
+    """
+    PipelineCpAsync is used for cp.async producers and AsyncThread consumers.
+
+    For our FA3 warp-specialized kernels, we set the consumer CooperativeGroup size to the
+    number of warp-groups, so only 1 thread per warp-group should signal the empty barrier.
+    """
+
+    @staticmethod
+    def create(
+        *,
+        num_stages: int,
+        producer_group: CooperativeGroup,
+        consumer_group: CooperativeGroup,
+        barrier_storage: cute.Pointer = None,
+        producer_mask: Optional[cutlass.Int32] = None,
+        consumer_mask: Optional[cutlass.Int32] = None,
+        init_wait: cutlass.Constexpr[bool] = True,
+    ):
+        if not isinstance(barrier_storage, cute.Pointer):
+            raise ValueError(
+                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
+            )
+
+        producer_type = PipelineOp.AsyncLoad
+        consumer_type = PipelineOp.AsyncThread
+
+        producer = (producer_type, producer_group)
+        consumer = (consumer_type, consumer_group)
+
+        sync_object_full = PipelineAsync._make_sync_object(
+            barrier_storage.align(min_align=8), num_stages, producer
+        )
+        sync_object_empty = PipelineAsync._make_sync_object(
+            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        )
+
+        if const_expr(init_wait):
+            pipeline_init_wait()
+
+        return PipelineCpAsync(
+            sync_object_full,
+            sync_object_empty,
+            num_stages,
+            producer_mask,
+            consumer_mask,
+        )
+
+    def consumer_release(self, state: PipelineState):
+        # Only 1 thread per warp-group signals the empty buffer (no clusters).
+        if self.consumer_mask is None:
+            if_generate(
+                cute.arch.thread_idx()[0] % 128 == 0,
+                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+            )
+        else:
+            self.sync_object_empty.arrive(state.index, self.consumer_mask)
 
 
 @dataclass(frozen=True)

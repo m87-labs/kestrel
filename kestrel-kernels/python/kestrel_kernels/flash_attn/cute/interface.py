@@ -130,6 +130,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    paged_kv_non_tma: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -353,6 +354,19 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    inferred_paged_kv_non_tma = paged_kv_non_tma
+    if inferred_paged_kv_non_tma is None:
+        if compute_capability == 9:
+            # Upstream FA3 prefers a non-TMA (cp.async) path for small seqlen_q (decode).
+            inferred_paged_kv_non_tma = (
+                page_table is not None
+                and seqlen_q is not None
+                and seqlen_q * qhead_per_kvhead <= m_block_size
+            )
+        else:
+            # SM100: currently uses a non-TMA path when page_size != 128.
+            inferred_paged_kv_non_tma = page_size not in [None, 128]
+
     compile_key = (
         dtype,
         head_dim,
@@ -378,7 +392,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
-        page_size not in [None, 128],  # paged KV non-TMA
+        inferred_paged_kv_non_tma,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -454,6 +468,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
+                paged_kv_non_tma=inferred_paged_kv_non_tma,
             )
         elif compute_capability == 10:
             fa_fwd = FlashAttentionForwardSm100(
@@ -474,7 +489,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=inferred_paged_kv_non_tma,
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
             )
