@@ -164,7 +164,8 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t block_stride, const int64_t page_stride,
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
-    const int block_size, const int heads_per_block, const float* k_scale_ptr,
+    const int block_size, const int heads_per_block, const int head_chunk_size,
+    const int threads_per_head, const float* k_scale_ptr,
     const float* v_scale_ptr) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -181,6 +182,12 @@ __global__ void reshape_and_cache_flash_kernel(
   if (local_heads <= 0) {
     return;
   }
+  const int head_chunk_idx = static_cast<int>(blockIdx.z);
+  const int head_chunk_start = head_chunk_idx * head_chunk_size;
+  if (head_chunk_start >= head_size) {
+    return;
+  }
+  const int head_chunk_len = min(head_chunk_size, head_size - head_chunk_start);
 
   const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
   const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
@@ -208,19 +215,25 @@ __global__ void reshape_and_cache_flash_kernel(
     } else {
       // HND backing storage; heads are strided, but each head segment is
       // contiguous.
-      const int lane = threadIdx.x & 31;
-      const int warp_id = threadIdx.x >> 5;
-      const int warps_per_block = blockDim.x >> 5;
+      const bool use_half_warp = (threads_per_head == 16);
+      const int lane = use_half_warp ? (threadIdx.x & 15) : (threadIdx.x & 31);
+      const int warp_id = use_half_warp ? (threadIdx.x >> 4) : (threadIdx.x >> 5);
+      const int warps_per_block =
+          use_half_warp ? (blockDim.x >> 4) : (blockDim.x >> 5);
       for (int head = head_start + warp_id; head < head_end;
            head += warps_per_block) {
-        const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
-        const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+        const scalar_t* __restrict__ k_src_h =
+            key_src + head * head_size + head_chunk_start;
+        const scalar_t* __restrict__ v_src_h =
+            value_src + head * head_size + head_chunk_start;
         cache_t* __restrict__ k_dst_h =
-            key_dst + static_cast<int64_t>(head) * head_stride;
+            key_dst + static_cast<int64_t>(head) * head_stride + head_chunk_start;
         cache_t* __restrict__ v_dst_h =
-            value_dst + static_cast<int64_t>(head) * head_stride;
-        vectorize_best_effort(k_src_h, k_dst_h, head_size, lane, 32, k_op);
-        vectorize_best_effort(v_src_h, v_dst_h, head_size, lane, 32, v_op);
+            value_dst + static_cast<int64_t>(head) * head_stride + head_chunk_start;
+        vectorize_best_effort(k_src_h, k_dst_h, head_chunk_len, lane,
+                              threads_per_head, k_op);
+        vectorize_best_effort(v_src_h, v_dst_h, head_chunk_len, lane,
+                              threads_per_head, v_op);
       }
     }
   } else {
@@ -233,19 +246,25 @@ __global__ void reshape_and_cache_flash_kernel(
       vectorize_best_effort(value_src + head_offset, value_dst + head_offset,
                             n_elems, threadIdx.x, blockDim.x, op);
     } else {
-      const int lane = threadIdx.x & 31;
-      const int warp_id = threadIdx.x >> 5;
-      const int warps_per_block = blockDim.x >> 5;
+      const bool use_half_warp = (threads_per_head == 16);
+      const int lane = use_half_warp ? (threadIdx.x & 15) : (threadIdx.x & 31);
+      const int warp_id = use_half_warp ? (threadIdx.x >> 4) : (threadIdx.x >> 5);
+      const int warps_per_block =
+          use_half_warp ? (blockDim.x >> 4) : (blockDim.x >> 5);
       for (int head = head_start + warp_id; head < head_end;
            head += warps_per_block) {
-        const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
-        const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+        const scalar_t* __restrict__ k_src_h =
+            key_src + head * head_size + head_chunk_start;
+        const scalar_t* __restrict__ v_src_h =
+            value_src + head * head_size + head_chunk_start;
         cache_t* __restrict__ k_dst_h =
-            key_dst + static_cast<int64_t>(head) * head_stride;
+            key_dst + static_cast<int64_t>(head) * head_stride + head_chunk_start;
         cache_t* __restrict__ v_dst_h =
-            value_dst + static_cast<int64_t>(head) * head_stride;
-        vectorize_best_effort(k_src_h, k_dst_h, head_size, lane, 32, op);
-        vectorize_best_effort(v_src_h, v_dst_h, head_size, lane, 32, op);
+            value_dst + static_cast<int64_t>(head) * head_stride + head_chunk_start;
+        vectorize_best_effort(k_src_h, k_dst_h, head_chunk_len, lane,
+                              threads_per_head, op);
+        vectorize_best_effort(v_src_h, v_dst_h, head_chunk_len, lane,
+                              threads_per_head, op);
       }
     }
   }
@@ -381,24 +400,45 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
       (kv_cache_dtype == "fp8") || (kv_cache_dtype == "fp8_e4m3");
   int head_blocks = 1;
   int heads_per_block = num_heads;
+  int sm_count = 0;
+  int threads_per_head = 32;
   if (is_fp8) {
-    // For small T (decode), split heads across more blocks to increase
-    // parallelism. This is especially important for head_size=64 HND caches
-    // where the baseline launch has num_tokens blocks (often < #SM).
     const auto* props = at::cuda::getDeviceProperties(key.device().index());
-    const int sm_count = props ? props->multiProcessorCount : 0;
+    sm_count = props ? props->multiProcessorCount : 0;
+    int min_head_blocks = 1;
     if (sm_count > 0 && num_heads > 1) {
+      // For small T (decode), split heads across more blocks to increase
+      // parallelism. This is especially important for head_size=64 HND caches
+      // where the baseline launch has num_tokens blocks (often < #SM).
       const int target_blocks = sm_count;
-      head_blocks =
+      min_head_blocks =
           std::min(num_heads, std::max(1, (target_blocks + num_tokens - 1) /
                                               std::max(1, num_tokens)));
-      heads_per_block = (num_heads + head_blocks - 1) / head_blocks;
+    }
+    head_blocks = min_head_blocks;
+    heads_per_block = (num_heads + head_blocks - 1) / head_blocks;
+    if (head_stride != head_size && head_size >= 64) {
+      threads_per_head = 16;
     }
   }
 
-  dim3 grid(num_tokens, head_blocks);
-  const int fp8_block_threads =
-      std::min(512, std::max(32, heads_per_block * 32));
+  int head_chunks = 1;
+  int head_chunk_size = head_size;
+  if (is_fp8 && head_stride != head_size && sm_count > 0) {
+    const int total_blocks = num_tokens * head_blocks;
+    if (total_blocks < sm_count) {
+      const int min_chunk = (total_blocks * 2 < sm_count) ? 16 : 32;
+      const int max_chunks = (head_size + min_chunk - 1) / min_chunk;
+      const int desired_chunks = (sm_count + total_blocks - 1) / total_blocks;
+      head_chunks = std::min(max_chunks, std::max(1, desired_chunks));
+      head_chunk_size = (head_size + head_chunks - 1) / head_chunks;
+    }
+  }
+
+  dim3 grid(num_tokens, head_blocks, head_chunks);
+  int fp8_block_threads = std::max(32, heads_per_block * threads_per_head);
+  fp8_block_threads = ((fp8_block_threads + 31) / 32) * 32;
+  fp8_block_threads = std::min(512, fp8_block_threads);
   dim3 block(is_fp8 ? fp8_block_threads : std::min(num_heads * head_size, 512));
 
   if (key.scalar_type() == at::ScalarType::BFloat16) {
@@ -413,7 +453,8 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
               reinterpret_cast<uint8_t*>(value_cache.data_ptr<uint8_t>()),
               slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,
               head_stride, key_stride, value_stride, num_heads, head_size,
-              block_size, heads_per_block, k_scale.data_ptr<float>(),
+              block_size, heads_per_block, head_chunk_size, threads_per_head,
+              k_scale.data_ptr<float>(),
               v_scale.data_ptr<float>());
     } else {
       reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, false>
@@ -428,7 +469,8 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                   value_cache.data_ptr<at::BFloat16>()),
               slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,
               head_stride, key_stride, value_stride, num_heads, head_size,
-              block_size, heads_per_block, k_scale.data_ptr<float>(),
+              block_size, heads_per_block, head_chunk_size, threads_per_head,
+              k_scale.data_ptr<float>(),
               v_scale.data_ptr<float>());
     }
   } else if (key.scalar_type() == at::ScalarType::Half) {
@@ -441,7 +483,9 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
           reinterpret_cast<uint8_t*>(value_cache.data_ptr<uint8_t>()),
           slot_mapping.data_ptr<int64_t>(), block_stride, page_stride, head_stride,
           key_stride, value_stride, num_heads, head_size, block_size,
-          heads_per_block, k_scale.data_ptr<float>(), v_scale.data_ptr<float>());
+          heads_per_block, head_chunk_size, threads_per_head,
+          k_scale.data_ptr<float>(),
+          v_scale.data_ptr<float>());
     } else {
       reshape_and_cache_flash_kernel<__half, __half, false><<<grid, block, 0,
                                                             stream>>>(
@@ -451,7 +495,9 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
           reinterpret_cast<__half*>(value_cache.data_ptr<at::Half>()),
           slot_mapping.data_ptr<int64_t>(), block_stride, page_stride, head_stride,
           key_stride, value_stride, num_heads, head_size, block_size,
-          heads_per_block, k_scale.data_ptr<float>(), v_scale.data_ptr<float>());
+          heads_per_block, head_chunk_size, threads_per_head,
+          k_scale.data_ptr<float>(),
+          v_scale.data_ptr<float>());
     }
   } else {
     TORCH_CHECK(false, "Unsupported key dtype: ", key.scalar_type());
