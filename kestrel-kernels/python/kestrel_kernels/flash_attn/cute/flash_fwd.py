@@ -34,7 +34,6 @@ from kestrel_kernels.flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from kestrel_kernels.flash_attn.cute.paged_kv import fill_swizzled
 from kestrel_kernels.flash_attn.cute import pipeline
 from kestrel_kernels.flash_attn.cute.pack_gqa import PackGQA
 from kestrel_kernels.flash_attn.cute.named_barrier import NamedBarrierFwd
@@ -1965,19 +1964,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     pipeline_k.producer_commit(kv_producer_state)
 
                     pipeline_v.producer_acquire(kv_producer_state)
+                    # Use cp.async zfill instead of manually clearing smem for invalid rows.
+                    pred_false = cute.make_fragment_like(tVsV[None, 0, 0, 0], Boolean)
+                    pred_false.fill(False)
                     for m in cutlass.range_constexpr(cute.size(tVsV, mode=[1])):
                         should_load_row = tPrShouldLoad[m]
+                        v_gmem_ptr = cute.make_ptr(
+                            mV.element_type,
+                            tPrVPtr[m],
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        mV_paged_row = cute.make_tensor(v_gmem_ptr, (self.tile_hdimv,))
+                        mV_paged_row_copy = cute.tiled_divide(mV_paged_row, (async_copy_elems,))
                         if should_load_row:
-                            v_gmem_ptr = cute.make_ptr(
-                                mV.element_type,
-                                tPrVPtr[m],
-                                cute.AddressSpace.gmem,
-                                assumed_align=16,
-                            )
-                            mV_paged_row = cute.make_tensor(v_gmem_ptr, (self.tile_hdimv,))
-                            mV_paged_row_copy = cute.tiled_divide(
-                                mV_paged_row, (async_copy_elems,)
-                            )
                             for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
                                 ki = tVcV[0, 0, k][1] // async_copy_elems
                                 cute.copy(
@@ -1987,7 +1987,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 )
                         else:
                             for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
-                                fill_swizzled(tVsV[None, m, k, stage_idx], 0)
+                                ki = tVcV[0, 0, k][1] // async_copy_elems
+                                cute.copy(
+                                    atom_async_copy,
+                                    mV_paged_row_copy[None, ki],
+                                    tVsV[None, m, k, stage_idx],
+                                    pred=pred_false,
+                                )
                     pipeline_v.producer_commit(kv_producer_state)
                     kv_producer_state.advance()
                     stage_idx = (
