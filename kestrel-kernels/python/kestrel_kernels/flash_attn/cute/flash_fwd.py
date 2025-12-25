@@ -34,6 +34,7 @@ from kestrel_kernels.flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
+from kestrel_kernels.flash_attn.cute.paged_kv import fill_swizzled
 from kestrel_kernels.flash_attn.cute import pipeline
 from kestrel_kernels.flash_attn.cute.pack_gqa import PackGQA
 from kestrel_kernels.flash_attn.cute.named_barrier import NamedBarrierFwd
@@ -1818,26 +1819,37 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Paged KV non-TMA path: use cp.async loads (PipelineCpAsync) instead of TMA.
             # Use all producer warps (128 threads) for K/V loads.
             tidx, _, _ = cute.arch.thread_idx()
+            # Setup page table divmod once outside the tile loop.
+            page_size = mK.shape[0]
+            page_size_divmod = FastDivmodDivisor(page_size)
+
+            # Use the same 128-bit cp.async atom as the regular KV loads.
+            universal_copy_bits = 128
+            async_copy_elems = universal_copy_bits // mK.element_type.width
+            atom_async_copy = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                mK.element_type,
+                num_bits_per_copy=universal_copy_bits,
+            )
+
             gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
             tKsK = gmem_thr_copy_K.partition_D(sK)
             cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
             tKcK = gmem_thr_copy_K.partition_S(cK)
-            t0KcK = gmem_tiled_copy_K.get_slice(0).partition_S(cK)
             tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
 
             gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
             tVsV = gmem_thr_copy_V.partition_D(sV)
             if const_expr(self.same_hdim_kv):
                 tVcV = tKcK
-                t0VcV = t0KcK
                 tVpV = tKpK
             else:
                 cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
                 tVcV = gmem_thr_copy_V.partition_S(cV)
-                t0VcV = gmem_tiled_copy_V.get_slice(0).partition_S(cV)
                 tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
 
-            block0 = Int32(0)
+            stage_idx = kv_producer_state.index if const_expr(self.num_stages > 1) else Int32(0)
+            m_block0 = Int32(0)
             while work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
@@ -1849,61 +1861,58 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     # Not yet implemented for this path.
                     assert False
 
-                # Slice by head once; per-page selection is done via pointer arithmetic (non-affine
+                # Slice by head once; per-row selection uses pointer arithmetic (non-affine
                 # page_idx -> pointer), which keeps cp.async sources as memrefs (not coord_tensors).
                 mK_head = mK[None, None, head_idx_kv, None]
                 mV_head = mV[None, None, head_idx_kv, None]
-                k_page_layout = cute.make_layout(
-                    (mK_head.shape[0], mK_head.shape[1]),
-                    stride=(mK_head.stride[0], mK_head.stride[1]),
-                )
-                v_page_layout = cute.make_layout(
-                    (mV_head.shape[0], mV_head.shape[1]),
-                    stride=(mV_head.stride[0], mV_head.stride[1]),
-                )
 
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                 for i in cutlass.range(n_block_max - n_block_min, unroll=1):
                     n_block = n_block_max - 1 - i
                     pipeline_k.producer_acquire(kv_producer_state)
-                    page_idx = mPageTable[batch_idx, n_block]
-                    k_page_ptr = mK_head.iterator + page_idx * mK_head.stride[2]
-                    v_page_ptr = mV_head.iterator + page_idx * mV_head.stride[2]
-                    mK_page = cute.make_tensor(k_page_ptr, k_page_layout)
-                    mV_page = cute.make_tensor(v_page_ptr, v_page_layout)
-                    gK = cute.local_tile(mK_page, (self.tile_n, self.tile_hdim), (None, 0))
-                    gV = cute.local_tile(mV_page, (self.tile_n, self.tile_hdimv), (None, 0))
-                    tKgK = gmem_thr_copy_K.partition_S(gK)
-                    tVgV = gmem_thr_copy_V.partition_S(gV)
-                    self.load_K(
-                        gmem_tiled_copy_K,
-                        tKgK,
-                        tKsK,
-                        tKcK,
-                        t0KcK,
-                        tKpK,
-                        block=block0,
-                        smem_pipe_write=kv_producer_state.index,
-                        seqlen=seqlen.seqlen_k,
-                        need_predicates=False,
-                    )
+                    seqlenk_row_limit = seqlen.seqlen_k - n_block * self.tile_n if n_block >= 0 else 0
+                    for m in cutlass.range(cute.size(tKsK, mode=[1]), unroll=1):
+                        row = tKcK[0, m, 0][0]
+                        should_load_row = row < seqlenk_row_limit
+                        token_idx = n_block * self.tile_n + row
+                        page_idx, page_offset = divmod(token_idx, page_size_divmod)
+                        page = mPageTable[batch_idx, page_idx] if should_load_row else 0
+                        mK_paged_row = mK_head[page_offset, None, page]
+                        mK_paged_row_copy = cute.tiled_divide(mK_paged_row, (async_copy_elems,))
+                        for k in cutlass.range(cute.size(tKsK, mode=[2]), unroll=1):
+                            if should_load_row:
+                                ki = tKcK[0, 0, k][1] // async_copy_elems
+                                cute.copy(
+                                    atom_async_copy,
+                                    mK_paged_row_copy[None, ki],
+                                    tKsK[None, m, k, stage_idx],
+                                )
                     pipeline_k.producer_commit(kv_producer_state)
 
                     pipeline_v.producer_acquire(kv_producer_state)
-                    self.load_V(
-                        gmem_tiled_copy_V,
-                        tVgV,
-                        tVsV,
-                        tVcV,
-                        t0VcV,
-                        tVpV,
-                        block=block0,
-                        smem_pipe_write=kv_producer_state.index,
-                        seqlen=seqlen.seqlen_k,
-                        need_predicates=False,
-                    )
+                    for m in cutlass.range(cute.size(tVsV, mode=[1]), unroll=1):
+                        row = tVcV[0, m, 0][0]
+                        should_load_row = row < seqlenk_row_limit
+                        token_idx = n_block * self.tile_n + row
+                        page_idx, page_offset = divmod(token_idx, page_size_divmod)
+                        page = mPageTable[batch_idx, page_idx] if should_load_row else 0
+                        mV_paged_row = mV_head[page_offset, None, page]
+                        mV_paged_row_copy = cute.tiled_divide(mV_paged_row, (async_copy_elems,))
+                        for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
+                            ki = tVcV[0, 0, k][1] // async_copy_elems
+                            if should_load_row:
+                                cute.copy(
+                                    atom_async_copy,
+                                    mV_paged_row_copy[None, ki],
+                                    tVsV[None, m, k, stage_idx],
+                                )
+                            else:
+                                fill_swizzled(tVsV[None, m, k, stage_idx], 0)
                     pipeline_v.producer_commit(kv_producer_state)
                     kv_producer_state.advance()
+                    stage_idx = (
+                        kv_producer_state.index if const_expr(self.num_stages > 1) else stage_idx
+                    )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()

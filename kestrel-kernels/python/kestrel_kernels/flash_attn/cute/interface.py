@@ -14,7 +14,6 @@
 # Features not supported yet:
 # - split (i.e. FlashDecoding)
 # - tuned block sizes
-# - paged KV for page_size != n_block_size (currently expects 128 on SM90)
 # - append KV to existing KV cache
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
@@ -357,12 +356,9 @@ def _flash_attn_fwd(
     inferred_paged_kv_non_tma = paged_kv_non_tma
     if inferred_paged_kv_non_tma is None:
         if compute_capability == 9:
-            # Upstream FA3 prefers a non-TMA (cp.async) path for small seqlen_q (decode).
-            inferred_paged_kv_non_tma = (
-                page_table is not None
-                and seqlen_q is not None
-                and seqlen_q * qhead_per_kvhead <= m_block_size
-            )
+            # For SM90, use the non-TMA (cp.async) path for all paged KV to
+            # support arbitrary page sizes.
+            inferred_paged_kv_non_tma = page_table is not None
         else:
             # SM100: currently uses a non-TMA path when page_size != 128.
             inferred_paged_kv_non_tma = page_size not in [None, 128]
@@ -443,9 +439,9 @@ def _flash_attn_fwd(
 
         if compute_capability == 9:
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
-            if page_table is not None:
+            if page_table is not None and not inferred_paged_kv_non_tma:
                 assert page_size == n_block_size, (
-                    "paged KV on SM90 currently requires page_size == n_block_size "
+                    "paged KV TMA path on SM90 requires page_size == n_block_size "
                     f"(got page_size={page_size}, n_block_size={n_block_size})"
                 )
             # fa_fwd = FlashAttentionForwardSm80(
