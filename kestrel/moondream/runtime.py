@@ -776,11 +776,12 @@ class MoondreamRuntime:
         # - page_table rows: [B, num_pages]
         # - seqused_k: [B] (KV length including the current token after update)
         batch_idx = slot.meta.batch_idx.gpu[:graph_batch_size]
-        slot.fa3_page_table[:graph_batch_size].copy_(
-            self.page_table.page_table.index_select(0, batch_idx.to(torch.long))
+        self.page_table.populate_fa3_decode_metadata(
+            batch_idx=batch_idx,
+            input_pos=slot.meta.input_pos.gpu[:graph_batch_size],
+            out_page_table=slot.fa3_page_table[:graph_batch_size],
+            out_seqused_k=slot.fa3_seqused_k[:graph_batch_size],
         )
-        slot.fa3_seqused_k[:graph_batch_size].copy_(slot.meta.input_pos.gpu[:graph_batch_size])
-        slot.fa3_seqused_k[:graph_batch_size].add_(1)
 
         # Set batch binding (identical for both paths)
         self._batch_binding.tensor = slot.meta.batch_idx.gpu[:graph_batch_size]
@@ -1006,13 +1007,12 @@ class MoondreamRuntime:
                         with torch.inference_mode():
                             # Build FA3 per-step metadata buffers
                             batch_idx = slot.meta.batch_idx.gpu[:bs]
-                            slot.fa3_page_table[:bs].copy_(
-                                self.page_table.page_table.index_select(
-                                    0, batch_idx.to(torch.long)
-                                )
+                            self.page_table.populate_fa3_decode_metadata(
+                                batch_idx=batch_idx,
+                                input_pos=slot.meta.input_pos.gpu[:bs],
+                                out_page_table=slot.fa3_page_table[:bs],
+                                out_seqused_k=slot.fa3_seqused_k[:bs],
                             )
-                            slot.fa3_seqused_k[:bs].copy_(slot.meta.input_pos.gpu[:bs])
-                            slot.fa3_seqused_k[:bs].add_(1)
 
                             # Set batch binding
                             self._batch_binding.tensor = slot.meta.batch_idx.gpu[:bs]

@@ -314,6 +314,78 @@ class PageTable:
 
         return kv_indptr, kv_indices.to(torch.int32), kv_last_page_len
 
+    def populate_fa3_decode_metadata(
+        self,
+        *,
+        batch_idx: torch.Tensor,
+        input_pos: torch.Tensor,
+        out_page_table: torch.Tensor,
+        out_seqused_k: torch.Tensor,
+    ) -> None:
+        """Populate FA3 paged-KV metadata buffers using a fused Triton kernel."""
+        if batch_idx.ndim != 1:
+            raise ValueError("batch_idx must be 1D for FA3 metadata")
+        if input_pos.ndim != 1:
+            raise ValueError("input_pos must be 1D for FA3 metadata")
+        if batch_idx.shape[0] != input_pos.shape[0]:
+            raise ValueError("batch_idx and input_pos must have the same length")
+        if out_page_table.ndim != 2:
+            raise ValueError("out_page_table must be 2D")
+        if out_seqused_k.ndim != 1:
+            raise ValueError("out_seqused_k must be 1D")
+
+        batch_size = batch_idx.shape[0]
+        if out_page_table.shape[0] < batch_size:
+            raise ValueError("out_page_table has insufficient batch capacity")
+        if out_page_table.shape[1] < self.n_pages:
+            raise ValueError("out_page_table has insufficient page capacity")
+        if out_seqused_k.shape[0] < batch_size:
+            raise ValueError("out_seqused_k has insufficient batch capacity")
+
+        if out_page_table.dtype != torch.int32:
+            raise ValueError("out_page_table must be int32")
+        if out_seqused_k.dtype != torch.int32:
+            raise ValueError("out_seqused_k must be int32")
+        if input_pos.dtype != torch.int32:
+            raise ValueError("input_pos must be int32")
+        if self.page_table.dtype != torch.int32:
+            raise ValueError("page_table must be int32")
+        if out_page_table.stride(-1) != 1:
+            raise ValueError("out_page_table must be contiguous in the last dimension")
+
+        device = self.page_table.device
+        if not (batch_idx.is_cuda and input_pos.is_cuda):
+            raise ValueError("batch_idx and input_pos must be CUDA tensors")
+        if not (out_page_table.is_cuda and out_seqused_k.is_cuda):
+            raise ValueError("out_page_table and out_seqused_k must be CUDA tensors")
+
+        batch_idx = batch_idx.to(device=device)
+        input_pos = input_pos.to(device=device)
+        if not batch_idx.is_contiguous():
+            batch_idx = batch_idx.contiguous()
+        if not input_pos.is_contiguous():
+            input_pos = input_pos.contiguous()
+
+        if batch_size == 0:
+            return
+
+        BLOCK_PAGES = 128
+        grid = (batch_size, triton.cdiv(self.n_pages, BLOCK_PAGES))
+        _build_fa3_decode_metadata_kernel[grid](
+            self.page_table,
+            self.page_table.stride(0),
+            batch_idx,
+            input_pos,
+            out_page_table,
+            out_page_table.stride(0),
+            out_seqused_k,
+            self.n_pages,
+            batch_size,
+            BLOCK_PAGES=BLOCK_PAGES,
+            PAGE_SIZE=self.page_size,
+            num_warps=4,
+        )
+
     def build_slot_mapping(
         self, batch_idx: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
@@ -419,3 +491,44 @@ def _copy_page_indices_kernel(
             block_ids,
             mask=mask,
         )
+
+
+@triton.jit
+def _build_fa3_decode_metadata_kernel(
+    page_table_ptr,
+    page_table_stride,
+    batch_idx_ptr,
+    input_pos_ptr,
+    out_page_table_ptr,
+    out_page_table_stride,
+    out_seqused_k_ptr,
+    n_pages,
+    batch_size,
+    BLOCK_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    batch_mask = batch_id < batch_size
+    batch_idx = tl.load(batch_idx_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
+    seqlen = tl.load(input_pos_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
+    seqlen = seqlen + 1
+    num_pages = (seqlen + (PAGE_SIZE - 1)) // PAGE_SIZE
+    n_pages_i64 = tl.full((), n_pages, dtype=tl.int64)
+    num_pages = tl.where(num_pages < n_pages_i64, num_pages, n_pages_i64)
+
+    page_stride = tl.full((), page_table_stride, dtype=tl.int64)
+    out_stride = tl.full((), out_page_table_stride, dtype=tl.int64)
+
+    offs = tile_id * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
+    offs = offs.to(tl.int64)
+    mask = offs < num_pages
+
+    in_ptr = page_table_ptr + batch_idx * page_stride + offs
+    out_ptr = out_page_table_ptr + batch_id * out_stride + offs
+    values = tl.load(in_ptr, mask=mask & batch_mask, other=0)
+    tl.store(out_ptr, values, mask=mask & batch_mask)
+
+    write_seq = (tile_id == 0) & batch_mask
+    tl.store(out_seqused_k_ptr + batch_id, seqlen, mask=write_seq)
