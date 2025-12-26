@@ -454,7 +454,7 @@ class FlashAttentionDecodeSm90:
 
             # Compute QK on current stage.
             cute.arch.cp_async_wait_group(self.num_stages_smem * 2 - 1)
-            cute.arch.barrier()
+            cute.arch.sync_warp()
             m_prev = m
             for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                 token_in_stage = tz * self.tile_tokens_per_tz + t
@@ -485,7 +485,7 @@ class FlashAttentionDecodeSm90:
                 for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                     s[t] = utils.exp2f(s[t] - m)
                     d += s[t]
-            cute.arch.barrier()
+            cute.arch.sync_warp()
 
             # Prefetch next K tile (overwrites current stage).
             if prefetch_iter < num_iters:
@@ -520,7 +520,7 @@ class FlashAttentionDecodeSm90:
 
             # Update output using V for current stage.
             cute.arch.cp_async_wait_group(self.num_stages_smem * 2 - 1)
-            cute.arch.barrier()
+            cute.arch.sync_warp()
             if qo_head_active:
                 for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                     token_in_stage = tz * self.tile_tokens_per_tz + t
@@ -531,7 +531,7 @@ class FlashAttentionDecodeSm90:
                             o[i] += wt * Float32(
                                 sV[stage_idx, token_in_stage, tx * self.vec_size + i]
                             )
-            cute.arch.barrier()
+            cute.arch.sync_warp()
 
             # Prefetch next V tile.
             if prefetch_iter < num_iters:
