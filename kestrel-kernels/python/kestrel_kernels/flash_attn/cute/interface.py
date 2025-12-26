@@ -41,6 +41,7 @@ from kestrel_kernels.flash_attn.cute.flash_fwd import (
     FlashAttentionForwardSm80,
     FlashAttentionForwardSm90,
 )
+from kestrel_kernels.flash_attn.cute.flash_decode_sm90 import FlashAttentionDecodeSm90
 from kestrel_kernels.flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from kestrel_kernels.flash_attn.cute.flash_bwd_preprocess import (
     FlashAttentionBackwardPreprocess,
@@ -263,6 +264,12 @@ def _flash_attn_fwd(
 
     use_block_sparsity = block_sparse_tensors is not None
 
+    # Common sentinel: -1 means "no limit". Treat as None to avoid negative window math.
+    if window_size_left is not None and window_size_left < 0:
+        window_size_left = None
+    if window_size_right is not None and window_size_right < 0:
+        window_size_right = None
+
     if mask_mod is None:
         if causal:
             window_size_right = 0
@@ -363,6 +370,25 @@ def _flash_attn_fwd(
             # SM100: currently uses a non-TMA path when page_size != 128.
             inferred_paged_kv_non_tma = page_size not in [None, 128]
 
+    use_sm90_decode_fastpath = (
+        compute_capability == 9
+        and page_table is not None
+        and page_size == 1
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is not None
+        and seqlen_q == 1
+        and head_dim_v == head_dim
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and learnable_sink is None
+        and not is_split_kv
+        and head_dim in (64, 128)
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -389,6 +415,7 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         inferred_paged_kv_non_tma,
+        use_sm90_decode_fastpath,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -444,28 +471,37 @@ def _flash_attn_fwd(
                     "paged KV TMA path on SM90 requires page_size == n_block_size "
                     f"(got page_size={page_size}, n_block_size={n_block_size})"
                 )
-            # fa_fwd = FlashAttentionForwardSm80(
-            fa_fwd = FlashAttentionForwardSm90(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                pack_gqa=pack_gqa,
-                tile_m=m_block_size,
-                tile_n=n_block_size,
-                # num_stages=1,
-                num_stages=2,
-                num_threads=num_threads,
-                Q_in_regs=False,
-                intra_wg_overlap=True,
-                mma_pv_is_rs=True,
-                mask_mod=mask_mod,
-                score_mod=score_mod,
-                has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=inferred_paged_kv_non_tma,
-            )
+            if use_sm90_decode_fastpath:
+                fa_fwd = FlashAttentionDecodeSm90(
+                    dtype,
+                    head_dim,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                )
+            else:
+                # fa_fwd = FlashAttentionForwardSm80(
+                fa_fwd = FlashAttentionForwardSm90(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    pack_gqa=pack_gqa,
+                    tile_m=m_block_size,
+                    tile_n=n_block_size,
+                    # num_stages=1,
+                    num_stages=2,
+                    num_threads=num_threads,
+                    Q_in_regs=False,
+                    intra_wg_overlap=True,
+                    mma_pv_is_rs=True,
+                    mask_mod=mask_mod,
+                    score_mod=score_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    paged_kv_non_tma=inferred_paged_kv_non_tma,
+                )
         elif compute_capability == 10:
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
@@ -548,6 +584,8 @@ def _flash_attn_fwd(
         normalized_block_sparse_tensors,
         aux_tensors,
     )
+    # Expose last dispatch choice for tests.
+    _flash_attn_fwd._debug_last_impl = "sm90_decode" if use_sm90_decode_fastpath else "fwd"
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

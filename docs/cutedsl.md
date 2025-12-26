@@ -196,6 +196,33 @@ Limitations of Dynamic Control Flow
             n = 10.0
 
 
+Debugging Deadlocked Kernels
+============================
+
+Hangs that show **zero GPU and CPU utilization** are often true deadlocks
+(e.g., a warp stall on a sync or a bad collective). Common CuTe DSL pitfalls:
+
+* **Warp-level ops inside divergent branches**: `utils.warp_reduce` (or any
+  shuffle-based primitive) must be executed by *all* lanes in the warp. If you
+  introduce padded "inactive" lanes (e.g., via `bdy` padding) and guard the
+  entire reduction with `if qo_head_active`, you can deadlock. Fix by making all
+  lanes participate and contribute zero for inactive lanes.
+* **Warp straddling across `threadIdx.z`**: if `blockDim.x * blockDim.y` is not
+  a multiple of 32 and `blockDim.z > 1`, warps can span multiple `tz` planes.
+  That pattern has been observed to hang CuTe DSL kernels. Ensure
+  `blockDim.x * blockDim.y % 32 == 0` (pad `bdy` accordingly) or force `bdz = 1`.
+* **Misaligned or invalid `cp.async` addresses**: incorrect page-table indices
+  or alignment assumptions can yield a hard stall instead of a clean fault.
+
+Quick checks:
+
+* Temporarily set `CUDA_LAUNCH_BLOCKING=1` and run a minimal test to turn some
+  hangs into errors.
+* Reduce the kernel geometry (smaller tiles, `bdz = 1`) to bisect the issue.
+* If the kernel only hangs with padded lanes, audit every warp collective and
+  ensure it executes uniformly across the warp.
+
+
 .. _limitations:
 
 Limitations
