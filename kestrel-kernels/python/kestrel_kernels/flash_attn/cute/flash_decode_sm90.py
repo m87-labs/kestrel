@@ -68,8 +68,10 @@ class FlashAttentionDecodeSm90:
 
         self.num_stages_smem = num_stages_smem
         self.tile_size_per_bdx = tile_size_per_bdx
-        # Use `threadIdx.y` to represent query heads within a KV head group. For small GQA/MHA,
-        # pad `bdy` so that:
+        # Use `threadIdx.y` to represent query heads within a KV head group.
+        # For MHA (qhead_per_kvhead == 1), keep bdy=1 and rely on bdz to fill the block.
+        # This matches FlashInfer's geometry and reduces per-thread state.
+        # For GQA/MQA, we pad `bdy` so that:
         # 1) `blockDim.x * blockDim.y >= 32` (at least one warp in the xy plane), and
         # 2) `blockDim.x * blockDim.y` is a multiple of 32 (warps don't straddle tz planes
         #    when we use `bdz > 1`).
@@ -79,15 +81,20 @@ class FlashAttentionDecodeSm90:
         bdy_nominal = min(qhead_per_kvhead, max_qheads_per_block)
         bdy_min = (cute.arch.WARP_SIZE + self.bdx - 1) // self.bdx
         warp_multiple = cute.arch.WARP_SIZE // math.gcd(cute.arch.WARP_SIZE, self.bdx)
-        bdy = max(bdy_nominal, bdy_min)
-        # Round up to a multiple so that threads_xy is warp-aligned.
-        bdy = ((bdy + warp_multiple - 1) // warp_multiple) * warp_multiple
-        if bdy > max_qheads_per_block:
-            # Try to round down within the user's cap.
-            bdy = (max_qheads_per_block // warp_multiple) * warp_multiple
-            if bdy < bdy_min:
-                # Last-resort: allow padding beyond max_qheads_per_block.
-                bdy = bdy_min
+        if qhead_per_kvhead == 1:
+            bdy = 1
+            allow_warp_straddle = True
+        else:
+            bdy = max(bdy_nominal, bdy_min)
+            # Round up to a multiple so that threads_xy is warp-aligned.
+            bdy = ((bdy + warp_multiple - 1) // warp_multiple) * warp_multiple
+            if bdy > max_qheads_per_block:
+                # Try to round down within the user's cap.
+                bdy = (max_qheads_per_block // warp_multiple) * warp_multiple
+                if bdy < bdy_min:
+                    # Last-resort: allow padding beyond max_qheads_per_block.
+                    bdy = bdy_min
+            allow_warp_straddle = False
         self.bdy = bdy
         self.group_count = (qhead_per_kvhead + self.bdy - 1) // self.bdy
         threads_xy = self.bdx * self.bdy
@@ -98,8 +105,8 @@ class FlashAttentionDecodeSm90:
         # Match FlashInfer-style launch geometry: use threadIdx.z (bdz) to reach a reasonable
         # threads-per-block even for MHA (qhead_per_kvhead == 1).
         self.bdz = max(1, min(max_bdz, target_threads_per_block // threads_xy))
-        # Safety: if warps would straddle tz planes, force bdz=1 to avoid hangs.
-        if threads_xy % cute.arch.WARP_SIZE != 0:
+        # Safety: if warps would straddle tz planes, force bdz=1 unless explicitly allowed.
+        if threads_xy % cute.arch.WARP_SIZE != 0 and not allow_warp_straddle:
             self.bdz = 1
 
         # Tokens per iteration tile:
@@ -594,7 +601,7 @@ class FlashAttentionDecodeSm90:
                 oz = cute.make_rmem_tensor((self.vec_size,), Float32)
                 for z in cutlass.range_constexpr(self.bdz):
                     dz = sD[z, ty]
-                    if dz != Float32(0.0):
+                    if dz > Float32(0.0):
                         mz = sM[z, ty]
                         for i in cutlass.range_constexpr(self.vec_size):
                             oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
