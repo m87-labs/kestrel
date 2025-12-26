@@ -118,8 +118,6 @@ class FlashAttentionDecodeSm90:
     def _shared_storage_cls(self):
         cosize_kv_stage = self.num_stages_smem * self.tile_tokens * self.head_dim
         cosize_offsets = self.bdx * self.tile_tokens
-        cosize_omerge = self.bdz * self.bdy * self.head_dim
-        cosize_md = self.bdz * self.bdy
 
         sK_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
@@ -130,20 +128,12 @@ class FlashAttentionDecodeSm90:
         sOffsets_struct = cute.struct.Align[
             cute.struct.MemRange[cutlass.Int64, cosize_offsets], 16
         ]
-        sOMerge_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, cosize_omerge], 16
-        ]
-        sM_struct = cute.struct.Align[cute.struct.MemRange[Float32, cosize_md], 16]
-        sD_struct = cute.struct.Align[cute.struct.MemRange[Float32, cosize_md], 16]
 
         @cute.struct
         class SharedStorageDecode:
             sK: sK_struct
             sV: sV_struct
             sOffsets: sOffsets_struct
-            sOMerge: sOMerge_struct
-            sM: sM_struct
-            sD: sD_struct
 
         return SharedStorageDecode
 
@@ -309,9 +299,6 @@ class FlashAttentionDecodeSm90:
         sV = storage.sV.get_tensor(sK_layout)
         sOffsets_token_major = storage.sOffsets.get_tensor(sOffsets_token_major_layout)
         sOffsets = cute.make_tensor(sOffsets_token_major.iterator, sOffsets_slice_major_layout)
-        sOMerge = storage.sOMerge.get_tensor(sOMerge_layout)
-        sM = storage.sM.get_tensor(sMD_layout)
-        sD = storage.sD.get_tensor(sMD_layout)
 
         # Copy atoms.
         copy_bits = self.vec_size * self.dtype.width
@@ -333,6 +320,8 @@ class FlashAttentionDecodeSm90:
         # Pre-allocate a constant false predicate for zfill.
         pred_false = cute.make_rmem_tensor((self.vec_size,), cutlass.Boolean)
         pred_false.fill(False)
+        # Reuse offsets between K/V prefetch loops.
+        offset_bytes_vec = cute.make_rmem_tensor((self.tile_size_per_bdx,), cutlass.Int64)
 
         # Load q into registers for active heads.
         q_vec = cute.make_rmem_tensor((self.vec_size,), Float32)
@@ -384,6 +373,7 @@ class FlashAttentionDecodeSm90:
                 token_off = iter_i * self.tile_tokens + token_in_iter
                 valid = token_off < chunk_size
                 offset_bytes = sOffsets[slice_idx, token_in_iter]
+                offset_bytes_vec[j] = offset_bytes
                 gmem_ptr = cute.make_ptr(
                     self.dtype,
                     mK_base_i64 + offset_bytes + feature_bytes,
@@ -411,7 +401,7 @@ class FlashAttentionDecodeSm90:
                 token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                 token_off = iter_i * self.tile_tokens + token_in_iter
                 valid = token_off < chunk_size
-                offset_bytes = sOffsets[slice_idx, token_in_iter]
+                offset_bytes = offset_bytes_vec[j]
                 gmem_ptr = cute.make_ptr(
                     self.dtype,
                     mV_base_i64 + offset_bytes + feature_bytes,
@@ -439,7 +429,7 @@ class FlashAttentionDecodeSm90:
         stage_idx = Int32(0)
         s = cute.make_rmem_tensor((self.tile_tokens_per_tz,), Float32)
 
-        for iter_idx in cutlass.range(num_iters, unroll=1):
+        for iter_idx in cutlass.range(num_iters, unroll=2):
             prefetch_iter = iter_idx + self.num_stages_smem
             # Update offset ring buffer at bdx boundaries for the prefetch iteration.
             if prefetch_iter % self.bdx == 0:
@@ -502,6 +492,7 @@ class FlashAttentionDecodeSm90:
                     token_off = prefetch_iter * self.tile_tokens + token_in_iter
                     valid = token_off < chunk_size
                     offset_bytes = sOffsets[slice_idx, token_in_iter]
+                    offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
                         self.dtype,
                         mK_base_i64 + offset_bytes + feature_bytes,
@@ -547,7 +538,7 @@ class FlashAttentionDecodeSm90:
                     token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                     token_off = prefetch_iter * self.tile_tokens + token_in_iter
                     valid = token_off < chunk_size
-                    offset_bytes = sOffsets[slice_idx, token_in_iter]
+                    offset_bytes = offset_bytes_vec[j]
                     gmem_ptr = cute.make_ptr(
                         self.dtype,
                         mV_base_i64 + offset_bytes + feature_bytes,
@@ -579,6 +570,35 @@ class FlashAttentionDecodeSm90:
 
         # Merge (m, d, o) across threadIdx.z when bdz > 1 (FlashInfer-style).
         if const_expr(self.bdz > 1):
+            # Reuse the K/V shared-memory region for merge scratch instead of reserving a
+            # dedicated float buffer for the entire kernel (FlashInfer-style).
+            #
+            # All cp.async traffic is complete and all threads are synced at this point,
+            # so it is safe to overwrite sK/sV.
+            cosize_omerge = self.bdz * self.bdy * self.head_dim
+            cosize_md = self.bdz * self.bdy
+            sOMerge_ptr = cute.make_ptr(
+                Float32,
+                sK_base_i64,
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            sOMerge = cute.make_tensor(sOMerge_ptr, sOMerge_layout)
+            sM_ptr = cute.make_ptr(
+                Float32,
+                sK_base_i64 + cutlass.Int64(cosize_omerge * 4),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            sM = cute.make_tensor(sM_ptr, sMD_layout)
+            sD_ptr = cute.make_ptr(
+                Float32,
+                sK_base_i64 + cutlass.Int64((cosize_omerge + cosize_md) * 4),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            sD = cute.make_tensor(sD_ptr, sMD_layout)
+
             if qo_head_active:
                 for i in cutlass.range_constexpr(self.vec_size):
                     sOMerge[tz, ty, tx * self.vec_size + i] = o[i]
