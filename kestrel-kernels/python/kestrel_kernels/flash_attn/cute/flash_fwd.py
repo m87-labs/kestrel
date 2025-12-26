@@ -1878,31 +1878,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mV_head = mV[None, None, head_idx_kv, None]
 
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-                for i in cutlass.range(n_block_max - n_block_min, unroll=1):
-                    n_block = n_block_max - 1 - i
-                    seqlenk_row_limit = seqlen.seqlen_k - n_block * self.tile_n if n_block >= 0 else 0
+                assert cute.size(tKsK, mode=[1]) == cute.size(
+                    tVsV, mode=[1]
+                ), "K and V row counts must match for paged KV non-TMA"
+                mask_and_clamp_row = (cute.arch.WARP_SIZE - threads_per_row_K) << 8 | (
+                    cute.arch.WARP_SIZE - 1
+                )
+                # Use cp.async zfill instead of manually clearing smem for invalid rows.
+                pred_false = cute.make_fragment_like(tVsV[None, 0, 0, 0], Boolean)
+                pred_false.fill(False)
 
-                    assert cute.size(tKsK, mode=[1]) == cute.size(
-                        tVsV, mode=[1]
-                    ), "K and V row counts must match for paged KV non-TMA"
-                    tPrKPtr = cute.make_rmem_tensor(
-                        (cute.size(tKsK, mode=[1]),), cutlass.Int64
+                if const_expr(self.intra_wg_overlap):
+                    # Match the KV overlap schedule used by the TMA path: keep K one stage ahead of V.
+                    tPrVPtr0 = cute.make_rmem_tensor((cute.size(tKsK, mode=[1]),), cutlass.Int64)
+                    tPrVPtr1 = cute.make_rmem_tensor((cute.size(tKsK, mode=[1]),), cutlass.Int64)
+                    tPrVPtr_prev = tPrVPtr0
+                    tPrVPtr_next = tPrVPtr1
+
+                    # First iteration: compute ptrs, stash V ptrs, and load only K for the first block.
+                    n_block = n_block_max - 1
+                    seqlenk_row_limit = (
+                        seqlen.seqlen_k - n_block * self.tile_n if n_block >= 0 else 0
                     )
-                    tPrVPtr = cute.make_rmem_tensor(
-                        (cute.size(tKsK, mode=[1]),), cutlass.Int64
-                    )
-                    tPrShouldLoad = cute.make_rmem_tensor(
-                        (cute.size(tKsK, mode=[1]),), cutlass.Boolean
-                    )
-                    mask_and_clamp_row = (cute.arch.WARP_SIZE - threads_per_row_K) << 8 | (
-                        cute.arch.WARP_SIZE - 1
-                    )
+                    pipeline_k.producer_acquire(kv_producer_state)
                     for m in cutlass.range_constexpr(cute.size(tKsK, mode=[1])):
                         owner_lane = m % threads_per_row_K
                         row = tKcK[0, m, 0][0]
                         row = utils.shuffle_sync(row, owner_lane, width=threads_per_row_K)
                         should_load_row = row < seqlenk_row_limit
-
                         k_ptr_i64 = cutlass.Int64(0)
                         v_ptr_i64 = cutlass.Int64(0)
                         if lane_in_row_K == owner_lane:
@@ -1936,17 +1939,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             v_ptr_words[1], owner_lane, mask_and_clamp=mask_and_clamp_row
                         )
 
-                        tPrKPtr[m] = k_ptr_pack[0]
-                        tPrVPtr[m] = v_ptr_pack[0]
-                        tPrShouldLoad[m] = should_load_row
+                        tPrVPtr_prev[m] = v_ptr_pack[0]
 
-                    pipeline_k.producer_acquire(kv_producer_state)
-                    for m in cutlass.range_constexpr(cute.size(tKsK, mode=[1])):
-                        should_load_row = tPrShouldLoad[m]
                         if should_load_row:
                             k_gmem_ptr = cute.make_ptr(
                                 mK.element_type,
-                                tPrKPtr[m],
+                                k_ptr_pack[0],
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
@@ -1963,20 +1961,136 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 )
                     pipeline_k.producer_commit(kv_producer_state)
 
+                    # Remaining iterations: overlap K(next block) with V(prev block).
+                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                        kv_producer_state_prev = kv_producer_state.clone()
+                        stage_idx_prev = stage_idx
+                        kv_producer_state.advance()
+                        stage_idx = (
+                            kv_producer_state.index
+                            if const_expr(self.num_stages > 1)
+                            else stage_idx
+                        )
+
+                        n_block_prev = n_block_max - i - 1
+                        n_block = n_block_prev - 1
+                        seqlenk_row_limit = (
+                            seqlen.seqlen_k - n_block * self.tile_n if n_block >= 0 else 0
+                        )
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        for m in cutlass.range_constexpr(cute.size(tKsK, mode=[1])):
+                            owner_lane = m % threads_per_row_K
+                            row = tKcK[0, m, 0][0]
+                            row = utils.shuffle_sync(row, owner_lane, width=threads_per_row_K)
+                            should_load_row = row < seqlenk_row_limit
+                            k_ptr_i64 = cutlass.Int64(0)
+                            v_ptr_i64 = cutlass.Int64(0)
+                            if lane_in_row_K == owner_lane:
+                                if should_load_row:
+                                    token_idx = n_block * self.tile_n + row
+                                    page_idx, page_offset = divmod(token_idx, page_size_divmod)
+                                    page = mPageTable[batch_idx, page_idx]
+                                    k_ptr_i64 = utils.elem_pointer_i64(
+                                        mK_head, (page_offset, 0, page)
+                                    ).toint()
+                                    v_ptr_i64 = utils.elem_pointer_i64(
+                                        mV_head, (page_offset, 0, page)
+                                    ).toint()
+                            # Broadcast the 64-bit pointers within the row-group (2x shfl.b32).
+                            k_ptr_words = cute.make_rmem_tensor(2, Int32)
+                            k_ptr_pack = cute.recast_tensor(k_ptr_words, cutlass.Int64)
+                            k_ptr_pack[0] = k_ptr_i64
+                            k_ptr_words[0] = cute.arch.shuffle_sync(
+                                k_ptr_words[0], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            k_ptr_words[1] = cute.arch.shuffle_sync(
+                                k_ptr_words[1], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            v_ptr_words = cute.make_rmem_tensor(2, Int32)
+                            v_ptr_pack = cute.recast_tensor(v_ptr_words, cutlass.Int64)
+                            v_ptr_pack[0] = v_ptr_i64
+                            v_ptr_words[0] = cute.arch.shuffle_sync(
+                                v_ptr_words[0], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            v_ptr_words[1] = cute.arch.shuffle_sync(
+                                v_ptr_words[1], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+
+                            tPrVPtr_next[m] = v_ptr_pack[0]
+
+                            if should_load_row:
+                                k_gmem_ptr = cute.make_ptr(
+                                    mK.element_type,
+                                    k_ptr_pack[0],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                )
+                                mK_paged_row = cute.make_tensor(k_gmem_ptr, (self.tile_hdim,))
+                                mK_paged_row_copy = cute.tiled_divide(
+                                    mK_paged_row, (async_copy_elems,)
+                                )
+                                for k in cutlass.range(cute.size(tKsK, mode=[2]), unroll=1):
+                                    ki = tKcK[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mK_paged_row_copy[None, ki],
+                                        tKsK[None, m, k, stage_idx],
+                                    )
+                        pipeline_k.producer_commit(kv_producer_state)
+
+                        pipeline_v.producer_acquire(kv_producer_state_prev)
+                        for m in cutlass.range_constexpr(cute.size(tVsV, mode=[1])):
+                            v_ptr_i64 = tPrVPtr_prev[m]
+                            should_load_row = v_ptr_i64 != cutlass.Int64(0)
+                            v_gmem_ptr = cute.make_ptr(
+                                mV.element_type,
+                                v_ptr_i64,
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            mV_paged_row = cute.make_tensor(v_gmem_ptr, (self.tile_hdimv,))
+                            mV_paged_row_copy = cute.tiled_divide(
+                                mV_paged_row, (async_copy_elems,)
+                            )
+                            if should_load_row:
+                                for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
+                                    ki = tVcV[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mV_paged_row_copy[None, ki],
+                                        tVsV[None, m, k, stage_idx_prev],
+                                    )
+                            else:
+                                for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
+                                    ki = tVcV[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mV_paged_row_copy[None, ki],
+                                        tVsV[None, m, k, stage_idx_prev],
+                                        pred=pred_false,
+                                    )
+                        pipeline_v.producer_commit(kv_producer_state_prev)
+
+                        # Rotate the per-block V pointer buffers.
+                        tPrVPtr_tmp = tPrVPtr_prev
+                        tPrVPtr_prev = tPrVPtr_next
+                        tPrVPtr_next = tPrVPtr_tmp
+
+                    # Final step: load V for the last block and advance the producer state.
                     pipeline_v.producer_acquire(kv_producer_state)
-                    # Use cp.async zfill instead of manually clearing smem for invalid rows.
-                    pred_false = cute.make_fragment_like(tVsV[None, 0, 0, 0], Boolean)
-                    pred_false.fill(False)
                     for m in cutlass.range_constexpr(cute.size(tVsV, mode=[1])):
-                        should_load_row = tPrShouldLoad[m]
+                        v_ptr_i64 = tPrVPtr_prev[m]
+                        should_load_row = v_ptr_i64 != cutlass.Int64(0)
                         v_gmem_ptr = cute.make_ptr(
                             mV.element_type,
-                            tPrVPtr[m],
+                            v_ptr_i64,
                             cute.AddressSpace.gmem,
                             assumed_align=16,
                         )
                         mV_paged_row = cute.make_tensor(v_gmem_ptr, (self.tile_hdimv,))
-                        mV_paged_row_copy = cute.tiled_divide(mV_paged_row, (async_copy_elems,))
+                        mV_paged_row_copy = cute.tiled_divide(
+                            mV_paged_row, (async_copy_elems,)
+                        )
                         if should_load_row:
                             for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
                                 ki = tVcV[0, 0, k][1] // async_copy_elems
@@ -1999,6 +2113,125 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     stage_idx = (
                         kv_producer_state.index if const_expr(self.num_stages > 1) else stage_idx
                     )
+
+                else:
+                    # No overlap: load K and V serially for each block.
+                    for i in cutlass.range(n_block_max - n_block_min, unroll=1):
+                        n_block = n_block_max - 1 - i
+                        seqlenk_row_limit = (
+                            seqlen.seqlen_k - n_block * self.tile_n if n_block >= 0 else 0
+                        )
+
+                        tPrKPtr = cute.make_rmem_tensor(
+                            (cute.size(tKsK, mode=[1]),), cutlass.Int64
+                        )
+                        tPrVPtr = cute.make_rmem_tensor(
+                            (cute.size(tKsK, mode=[1]),), cutlass.Int64
+                        )
+                        tPrShouldLoad = cute.make_rmem_tensor(
+                            (cute.size(tKsK, mode=[1]),), cutlass.Boolean
+                        )
+                        for m in cutlass.range_constexpr(cute.size(tKsK, mode=[1])):
+                            owner_lane = m % threads_per_row_K
+                            row = tKcK[0, m, 0][0]
+                            row = utils.shuffle_sync(row, owner_lane, width=threads_per_row_K)
+                            should_load_row = row < seqlenk_row_limit
+
+                            k_ptr_i64 = cutlass.Int64(0)
+                            v_ptr_i64 = cutlass.Int64(0)
+                            if lane_in_row_K == owner_lane:
+                                if should_load_row:
+                                    token_idx = n_block * self.tile_n + row
+                                    page_idx, page_offset = divmod(token_idx, page_size_divmod)
+                                    page = mPageTable[batch_idx, page_idx]
+                                    k_ptr_i64 = utils.elem_pointer_i64(
+                                        mK_head, (page_offset, 0, page)
+                                    ).toint()
+                                    v_ptr_i64 = utils.elem_pointer_i64(
+                                        mV_head, (page_offset, 0, page)
+                                    ).toint()
+                            # Broadcast the 64-bit pointers within the row-group (2x shfl.b32).
+                            k_ptr_words = cute.make_rmem_tensor(2, Int32)
+                            k_ptr_pack = cute.recast_tensor(k_ptr_words, cutlass.Int64)
+                            k_ptr_pack[0] = k_ptr_i64
+                            k_ptr_words[0] = cute.arch.shuffle_sync(
+                                k_ptr_words[0], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            k_ptr_words[1] = cute.arch.shuffle_sync(
+                                k_ptr_words[1], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            v_ptr_words = cute.make_rmem_tensor(2, Int32)
+                            v_ptr_pack = cute.recast_tensor(v_ptr_words, cutlass.Int64)
+                            v_ptr_pack[0] = v_ptr_i64
+                            v_ptr_words[0] = cute.arch.shuffle_sync(
+                                v_ptr_words[0], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+                            v_ptr_words[1] = cute.arch.shuffle_sync(
+                                v_ptr_words[1], owner_lane, mask_and_clamp=mask_and_clamp_row
+                            )
+
+                            tPrKPtr[m] = k_ptr_pack[0]
+                            tPrVPtr[m] = v_ptr_pack[0]
+                            tPrShouldLoad[m] = should_load_row
+
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        for m in cutlass.range_constexpr(cute.size(tKsK, mode=[1])):
+                            should_load_row = tPrShouldLoad[m]
+                            if should_load_row:
+                                k_gmem_ptr = cute.make_ptr(
+                                    mK.element_type,
+                                    tPrKPtr[m],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                )
+                                mK_paged_row = cute.make_tensor(k_gmem_ptr, (self.tile_hdim,))
+                                mK_paged_row_copy = cute.tiled_divide(
+                                    mK_paged_row, (async_copy_elems,)
+                                )
+                                for k in cutlass.range(cute.size(tKsK, mode=[2]), unroll=1):
+                                    ki = tKcK[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mK_paged_row_copy[None, ki],
+                                        tKsK[None, m, k, stage_idx],
+                                    )
+                        pipeline_k.producer_commit(kv_producer_state)
+
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        for m in cutlass.range_constexpr(cute.size(tVsV, mode=[1])):
+                            should_load_row = tPrShouldLoad[m]
+                            v_gmem_ptr = cute.make_ptr(
+                                mV.element_type,
+                                tPrVPtr[m],
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            mV_paged_row = cute.make_tensor(v_gmem_ptr, (self.tile_hdimv,))
+                            mV_paged_row_copy = cute.tiled_divide(
+                                mV_paged_row, (async_copy_elems,)
+                            )
+                            if should_load_row:
+                                for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
+                                    ki = tVcV[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mV_paged_row_copy[None, ki],
+                                        tVsV[None, m, k, stage_idx],
+                                    )
+                            else:
+                                for k in cutlass.range(cute.size(tVsV, mode=[2]), unroll=1):
+                                    ki = tVcV[0, 0, k][1] // async_copy_elems
+                                    cute.copy(
+                                        atom_async_copy,
+                                        mV_paged_row_copy[None, ki],
+                                        tVsV[None, m, k, stage_idx],
+                                        pred=pred_false,
+                                    )
+                        pipeline_v.producer_commit(kv_producer_state)
+                        kv_producer_state.advance()
+                        stage_idx = (
+                            kv_producer_state.index if const_expr(self.num_stages > 1) else stage_idx
+                        )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
