@@ -132,7 +132,7 @@ class PageTable:
         self._page_table_buffer = CpuGpuBuffer(
             max_batch_size,
             self.n_pages,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=torch.device(device),
             pin_memory=True,
         )
@@ -226,9 +226,7 @@ class PageTable:
 
         # find empty physical pages
         allocated_pages_list = self.free_pages[-num_pages_to_allocate:]
-        allocated_pages_cpu = torch.as_tensor(
-            allocated_pages_list, dtype=torch.int64
-        )
+        allocated_pages_cpu = torch.as_tensor(allocated_pages_list, dtype=torch.int32)
         # update page table on host first, then sync the touched slice once
         self._page_table_cpu_tensor[
             batch_idx_int, start_page_idx:end_page_idx
@@ -236,8 +234,8 @@ class PageTable:
         self._sync_page_table_row(batch_idx_int, start_page_idx, end_page_idx)
 
         # update metadata
-        allocated_pages = allocated_pages_cpu.to(device=self.device)
-        self.physical_to_logical[batch_idx, allocated_pages] = torch.arange(
+        allocated_pages_idx = allocated_pages_cpu.to(device=self.device, dtype=torch.long)
+        self.physical_to_logical[batch_idx, allocated_pages_idx] = torch.arange(
             start_page_idx,
             end_page_idx,
             device=self.device,

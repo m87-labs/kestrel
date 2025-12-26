@@ -1,8 +1,8 @@
 """Per-slot resources for pipelined decoding.
 
 Each DecodeSlot bundles the GPU resources needed for one decode step:
-- FlashInfer context with its own workspace and plan buffers
 - Pinned host buffers for H2D metadata copies (batch_idx, input_pos, lora_slot_ids)
+- Per-slot FA3 paged-KV metadata buffers (page_table, seqused_k)
 - GPU staging buffers for sampled outputs
 - Forward output buffers (logits, hidden_last) for delayed sampling
 - RenderBuffer for D2H copies
@@ -26,8 +26,6 @@ import torch
 from torch import Tensor
 
 from kestrel.utils import CpuGpuBuffer
-
-from .flashinfer import FlashInferDecodeContext
 
 
 @dataclass
@@ -65,10 +63,12 @@ class DecodeSlot:
         slot_id: The slot index (0 or 1).
         meta: Per-slot pinned host buffers for H2D metadata copies.
         render: Per-slot RenderBuffer for D2H output copies.
-        flashinfer_ctx: Per-slot FlashInfer decode context with workspace.
         compute_stream: Reference to the shared decode compute stream.
             All decode forwards across both slots serialize on this stream
             to preserve sequential token dependencies (invariant I1).
+
+        fa3_page_table: Per-slot page table rows for FA3 paged decode.
+        fa3_seqused_k: Per-slot per-sequence KV lengths for FA3 paged decode.
 
         # GPU staging buffers for sampled outputs (per-slot to avoid clobbering)
         sampled_ids: GPU buffer for sampled token IDs.
@@ -93,8 +93,10 @@ class DecodeSlot:
     slot_id: int
     meta: DecodeMetaBuffers
     render: object  # RenderBuffer (import deferred to avoid circular import)
-    flashinfer_ctx: FlashInferDecodeContext
     compute_stream: torch.cuda.Stream
+
+    fa3_page_table: Tensor
+    fa3_seqused_k: Tensor
 
     # GPU staging for sampled outputs
     sampled_ids: Tensor
@@ -122,7 +124,6 @@ def create_decode_slot(
     *,
     device: torch.device,
     dtype: torch.dtype,
-    kv_dtype: torch.dtype,
     max_batch_size: int,
     max_seq_len: int,
     page_size: int,
@@ -132,7 +133,6 @@ def create_decode_slot(
     size_dtype: torch.dtype,
     compute_stream: torch.cuda.Stream,
     copy_stream: torch.cuda.Stream,
-    use_cuda_graphs: bool,
 ) -> DecodeSlot:
     """Create a DecodeSlot with all per-slot resources allocated.
 
@@ -190,15 +190,16 @@ def create_decode_slot(
         copy_stream=copy_stream,
     )
 
-    # Per-slot FlashInfer context
-    flashinfer_ctx = FlashInferDecodeContext(
+    n_pages = max_seq_len // page_size
+    fa3_page_table = torch.empty(
+        (max_batch_size, n_pages),
+        dtype=torch.int32,
         device=device,
-        q_dtype=dtype,
-        kv_dtype=kv_dtype,
-        page_size=page_size,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
-        use_cuda_graphs=use_cuda_graphs,
+    )
+    fa3_seqused_k = torch.empty(
+        (max_batch_size,),
+        dtype=torch.int32,
+        device=device,
     )
 
     # GPU staging for sampled outputs
@@ -254,8 +255,9 @@ def create_decode_slot(
         slot_id=slot_id,
         meta=meta,
         render=render,
-        flashinfer_ctx=flashinfer_ctx,
         compute_stream=compute_stream,
+        fa3_page_table=fa3_page_table,
+        fa3_seqused_k=fa3_seqused_k,
         sampled_ids=sampled_ids,
         coord_staging=coord_staging,
         size_staging=size_staging,
