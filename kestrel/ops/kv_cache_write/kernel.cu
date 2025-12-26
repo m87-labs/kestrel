@@ -154,6 +154,86 @@ __device__ inline void vectorize_best_effort(const InT* in, OutT* out, int len,
   }
 }
 
+template <int VEC_SIZE, typename InT, typename OutT, typename ScalarOpA,
+          typename ScalarOpB>
+__device__ inline bool vectorize_with_alignment_pair(
+    const InT* in_a, const InT* in_b, OutT* out_a, OutT* out_b, int len,
+    int tid, int stride, ScalarOpA op_a, ScalarOpB op_b) {
+  static_assert(VEC_SIZE > 0 && (VEC_SIZE & (VEC_SIZE - 1)) == 0,
+                "VEC_SIZE must be a positive power-of-two");
+  constexpr int WIDTH = VEC_SIZE * sizeof(InT);
+  const uintptr_t addr_a = reinterpret_cast<uintptr_t>(in_a);
+  const uintptr_t addr_b = reinterpret_cast<uintptr_t>(in_b);
+  if (((addr_a & (WIDTH - 1)) != 0) || ((addr_b & (WIDTH - 1)) != 0) ||
+      ((len & (VEC_SIZE - 1)) != 0)) {
+    return false;
+  }
+  const int num_vec = len / VEC_SIZE;
+  using vin_t = vec_n_t<InT, VEC_SIZE>;
+  using vout_t = vec_n_t<OutT, VEC_SIZE>;
+  const auto* v_in_a = reinterpret_cast<const vin_t*>(in_a);
+  const auto* v_in_b = reinterpret_cast<const vin_t*>(in_b);
+  auto* v_out_a = reinterpret_cast<vout_t*>(out_a);
+  auto* v_out_b = reinterpret_cast<vout_t*>(out_b);
+  for (int i = tid; i < num_vec; i += stride) {
+    const vin_t src_a = v_in_a[i];
+    const vin_t src_b = v_in_b[i];
+    vout_t dst_a;
+    vout_t dst_b;
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      op_a(dst_a.val[j], src_a.val[j]);
+      op_b(dst_b.val[j], src_b.val[j]);
+    }
+    v_out_a[i] = dst_a;
+    v_out_b[i] = dst_b;
+  }
+  return true;
+}
+
+template <typename InT, typename OutT, typename ScalarOpA, typename ScalarOpB>
+__device__ inline bool vectorize_best_effort_pair(
+    const InT* in_a, const InT* in_b, OutT* out_a, OutT* out_b, int len,
+    int tid, int stride, ScalarOpA op_a, ScalarOpB op_b) {
+  if constexpr (sizeof(InT) == 2) {
+    const int ratio = len / stride;
+    if (ratio >= 8 &&
+        vectorize_with_alignment_pair<8>(in_a, in_b, out_a, out_b, len, tid,
+                                         stride, op_a, op_b)) {
+      return true;
+    }
+    if (ratio >= 4 &&
+        vectorize_with_alignment_pair<4>(in_a, in_b, out_a, out_b, len, tid,
+                                         stride, op_a, op_b)) {
+      return true;
+    }
+    if (ratio >= 2 &&
+        vectorize_with_alignment_pair<2>(in_a, in_b, out_a, out_b, len, tid,
+                                         stride, op_a, op_b)) {
+      return true;
+    }
+    return vectorize_with_alignment_pair<1>(in_a, in_b, out_a, out_b, len, tid,
+                                            stride, op_a, op_b);
+  } else if constexpr (sizeof(InT) == 4) {
+    const int ratio = len / stride;
+    if (ratio >= 4 &&
+        vectorize_with_alignment_pair<4>(in_a, in_b, out_a, out_b, len, tid,
+                                         stride, op_a, op_b)) {
+      return true;
+    }
+    if (ratio >= 2 &&
+        vectorize_with_alignment_pair<2>(in_a, in_b, out_a, out_b, len, tid,
+                                         stride, op_a, op_b)) {
+      return true;
+    }
+    return vectorize_with_alignment_pair<1>(in_a, in_b, out_a, out_b, len, tid,
+                                            stride, op_a, op_b);
+  } else {
+    return vectorize_with_alignment_pair<1>(in_a, in_b, out_a, out_b, len, tid,
+                                            stride, op_a, op_b);
+  }
+}
+
 template <typename scalar_t, typename cache_t, bool kFp8>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
@@ -208,10 +288,19 @@ __global__ void reshape_and_cache_flash_kernel(
       // NHD: [num_blocks, block_size, num_heads, head_size]
       const int n_elems = local_heads * head_size;
       const int64_t head_offset = static_cast<int64_t>(head_start) * head_size;
-      vectorize_best_effort(key_src + head_offset, key_dst + head_offset,
-                            n_elems, threadIdx.x, blockDim.x, k_op);
-      vectorize_best_effort(value_src + head_offset, value_dst + head_offset,
-                            n_elems, threadIdx.x, blockDim.x, v_op);
+      const scalar_t* __restrict__ k_src = key_src + head_offset;
+      const scalar_t* __restrict__ v_src = value_src + head_offset;
+      cache_t* __restrict__ k_dst = key_dst + head_offset;
+      cache_t* __restrict__ v_dst = value_dst + head_offset;
+      const bool fused = vectorize_best_effort_pair(
+          k_src, v_src, k_dst, v_dst, n_elems, threadIdx.x, blockDim.x, k_op,
+          v_op);
+      if (!fused) {
+        vectorize_best_effort(k_src, k_dst, n_elems, threadIdx.x, blockDim.x,
+                              k_op);
+        vectorize_best_effort(v_src, v_dst, n_elems, threadIdx.x, blockDim.x,
+                              v_op);
+      }
     } else {
       // HND backing storage; heads are strided, but each head segment is
       // contiguous.
@@ -241,10 +330,18 @@ __global__ void reshape_and_cache_flash_kernel(
     if (is_contiguous_heads) {
       const int n_elems = local_heads * head_size;
       const int64_t head_offset = static_cast<int64_t>(head_start) * head_size;
-      vectorize_best_effort(key_src + head_offset, key_dst + head_offset,
-                            n_elems, threadIdx.x, blockDim.x, op);
-      vectorize_best_effort(value_src + head_offset, value_dst + head_offset,
-                            n_elems, threadIdx.x, blockDim.x, op);
+      const scalar_t* __restrict__ k_src = key_src + head_offset;
+      const scalar_t* __restrict__ v_src = value_src + head_offset;
+      cache_t* __restrict__ k_dst = key_dst + head_offset;
+      cache_t* __restrict__ v_dst = value_dst + head_offset;
+      const bool fused = vectorize_best_effort_pair(
+          k_src, v_src, k_dst, v_dst, n_elems, threadIdx.x, blockDim.x, op, op);
+      if (!fused) {
+        vectorize_best_effort(k_src, k_dst, n_elems, threadIdx.x, blockDim.x,
+                              op);
+        vectorize_best_effort(v_src, v_dst, n_elems, threadIdx.x, blockDim.x,
+                              op);
+      }
     } else {
       const bool use_half_warp = (threads_per_head == 16);
       const int lane = use_half_warp ? (threadIdx.x & 15) : (threadIdx.x & 31);
@@ -398,15 +495,19 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
 
   const bool is_fp8 =
       (kv_cache_dtype == "fp8") || (kv_cache_dtype == "fp8_e4m3");
+  const auto* props = at::cuda::getDeviceProperties(key.device().index());
+  const int sm_count = props ? props->multiProcessorCount : 0;
+
+  int threads_per_head = 32;
+  if (head_stride != head_size && head_size >= 64) {
+    threads_per_head = 16;
+  }
+
   int head_blocks = 1;
   int heads_per_block = num_heads;
-  int sm_count = 0;
-  int threads_per_head = 32;
-  if (is_fp8) {
-    const auto* props = at::cuda::getDeviceProperties(key.device().index());
-    sm_count = props ? props->multiProcessorCount : 0;
+  if (sm_count > 0 && num_heads > 1) {
     int min_head_blocks = 1;
-    if (sm_count > 0 && num_heads > 1) {
+    if (is_fp8 || num_tokens < (sm_count / 4)) {
       // For small T (decode), split heads across more blocks to increase
       // parallelism. This is especially important for head_size=64 HND caches
       // where the baseline launch has num_tokens blocks (often < #SM).
@@ -415,16 +516,23 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
           std::min(num_heads, std::max(1, (target_blocks + num_tokens - 1) /
                                               std::max(1, num_tokens)));
     }
-    head_blocks = min_head_blocks;
-    heads_per_block = (num_heads + head_blocks - 1) / head_blocks;
-    if (head_stride != head_size && head_size >= 64) {
-      threads_per_head = 16;
+
+    int hnd_head_blocks = 1;
+    if (!is_fp8 && head_stride != head_size) {
+      const int target_block_threads = 256;
+      const int target_heads_per_block =
+          std::max(1, target_block_threads / threads_per_head);
+      hnd_head_blocks =
+          (num_heads + target_heads_per_block - 1) / target_heads_per_block;
     }
+
+    head_blocks = std::max(min_head_blocks, hnd_head_blocks);
+    heads_per_block = (num_heads + head_blocks - 1) / head_blocks;
   }
 
   int head_chunks = 1;
   int head_chunk_size = head_size;
-  if (is_fp8 && head_stride != head_size && sm_count > 0) {
+  if (head_stride != head_size && sm_count > 0) {
     const int total_blocks = num_tokens * head_blocks;
     if (total_blocks < sm_count) {
       const int min_chunk = (total_blocks * 2 < sm_count) ? 16 : 32;
@@ -439,7 +547,17 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
   int fp8_block_threads = std::max(32, heads_per_block * threads_per_head);
   fp8_block_threads = ((fp8_block_threads + 31) / 32) * 32;
   fp8_block_threads = std::min(512, fp8_block_threads);
-  dim3 block(is_fp8 ? fp8_block_threads : std::min(num_heads * head_size, 512));
+  int bf16_block_threads = 0;
+  if (head_stride == head_size) {
+    bf16_block_threads = std::min(heads_per_block * head_size, 512);
+    if (block_size == 1 && num_tokens >= 256) {
+      bf16_block_threads = std::min(bf16_block_threads, 256);
+    }
+  } else {
+    bf16_block_threads = std::min(heads_per_block * threads_per_head, 512);
+  }
+  bf16_block_threads = std::max(32, ((bf16_block_threads + 31) / 32) * 32);
+  dim3 block(is_fp8 ? fp8_block_threads : bf16_block_threads);
 
   if (key.scalar_type() == at::ScalarType::BFloat16) {
     if (is_fp8) {
