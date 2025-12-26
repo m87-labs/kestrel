@@ -35,10 +35,6 @@ from .vision import encode_image
 from .lora import LoRA
 from .lora_workspace import AdapterSlotManager, TextLoRAWorkspace
 from .image_crops import OverlapCropOutput
-from .flashinfer import (
-    FlashInferBatchMetadata,
-    FlashInferDecodeContext,
-)
 from .region import (
     build_region_module,
     build_spatial_decode_tables,
@@ -300,13 +296,16 @@ class MoondreamRuntime:
                 stacklevel=2,
             )
 
-        if (
-            self._kv_layer_k_scales is not None
-            and self._kv_layer_v_scales is not None
-        ):
-            self.kv_cache_dtype = torch.float8_e4m3fn
-        else:
-            self.kv_cache_dtype = self.dtype
+        # TEMPORARY: force KV cache to bf16 for debugging/validation.
+        # Restore the fp8/auto selection logic below after the investigation.
+        # if (
+        #     self._kv_layer_k_scales is not None
+        #     and self._kv_layer_v_scales is not None
+        # ):
+        #     self.kv_cache_dtype = torch.float8_e4m3fn
+        # else:
+        #     self.kv_cache_dtype = self.dtype
+        self.kv_cache_dtype = torch.bfloat16  # TEMPORARY override
 
         tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
@@ -409,8 +408,8 @@ class MoondreamRuntime:
             self._slot_manager = AdapterSlotManager(max_slots)
 
         # Create two ping-pong decode slots for pipelined decoding.
-        # Each slot has its own FlashInfer context, staging buffers, and
-        # RenderBuffer, but they share the decode compute stream and copy stream.
+        # Each slot has its own staging buffers, FA3 paged-KV metadata buffers,
+        # and RenderBuffer, but they share the decode compute stream and copy stream.
         vocab_size = self.model.text.lm_head.weight.shape[0]
         hidden_dim = self.model.text.lm_head.weight.shape[1]
         self._decode_slots: list[DecodeSlot] = [
@@ -418,7 +417,6 @@ class MoondreamRuntime:
                 slot_id=slot_id,
                 device=self.device,
                 dtype=self.dtype,
-                kv_dtype=self.kv_cache_dtype,
                 max_batch_size=self.max_batch_size,
                 max_seq_len=self.max_seq_length,
                 page_size=self.page_size,
@@ -428,7 +426,6 @@ class MoondreamRuntime:
                 size_dtype=size_dtype,
                 compute_stream=self._decode_compute_stream,
                 copy_stream=self._copy_stream,
-                use_cuda_graphs=self._use_cuda_graphs,
             )
             for slot_id in range(2)
         ]
@@ -734,90 +731,21 @@ class MoondreamRuntime:
         """
         self._decode_with_slot(slot, batch_size)
 
-    def _build_flashinfer_metadata(
-        self,
-        batch_idx: Tensor,
-        flashinfer_ctx: "FlashInferDecodeContext",
-        *,
-        use_graph: bool = False,
-        input_pos_cpu: Tensor,
-    ) -> FlashInferBatchMetadata:
-        if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be 1D")
-
-        batch_size = batch_idx.shape[0]
-        buffers = flashinfer_ctx.acquire_plan_buffers(batch_size, use_graph=use_graph)
-
-        buffers.seq_lens_cpu[:batch_size].copy_(input_pos_cpu)
-        seq_lens_np = buffers.seq_lens_np[:batch_size]
-        seq_lens_np += 1
-
-        num_pages_np = buffers.num_pages_np[:batch_size]
-        np.add(seq_lens_np, self.page_size - 1, out=num_pages_np)
-        np.floor_divide(num_pages_np, self.page_size, out=num_pages_np)
-
-        kv_indptr_np = buffers.kv_indptr_np[: batch_size + 1]
-        kv_indptr_np[0] = 0
-        kv_indptr_np[1:] = np.cumsum(num_pages_np, dtype=np.int32)
-
-        kv_last_page_len_np = buffers.kv_last_page_len_np[:batch_size]
-        np.subtract(seq_lens_np, 1, out=kv_last_page_len_np)
-        np.mod(kv_last_page_len_np, self.page_size, out=kv_last_page_len_np)
-        kv_last_page_len_np += 1
-        kv_last_page_len_np[num_pages_np == 0] = 0
-
-        kv_indptr = buffers._kv_indptr.copy_to_gpu(batch_size + 1)
-        kv_last_page_len = buffers._kv_last_page_len.copy_to_gpu(batch_size)
-
-        if buffers.graph_state is not None:
-            batch_buf = buffers.batch_indices[:batch_size]
-            batch_buf.copy_(batch_idx)
-            expanded_batch = batch_buf
-        else:
-            expanded_batch = batch_idx
-
-        total_pages = int(buffers.kv_indptr_cpu[batch_size].item())
-        if total_pages > buffers.page_capacity:
-            raise RuntimeError(
-                f"FlashInfer plan buffer overflow: need {total_pages} pages but capacity is {buffers.page_capacity}"
-            )
-
-        kv_indices = buffers.kv_indices[:total_pages]
-        self.page_table.populate_flashinfer_kv_indices(
-            batch_idx=expanded_batch,
-            kv_indptr=kv_indptr,
-            out_kv_indices=kv_indices,
-            total_pages=total_pages,
-        )
-
-        buffers.pages_filled = total_pages
-        if buffers.graph_state is not None:
-            buffers.graph_state.pages_filled = total_pages
-        return FlashInferBatchMetadata(
-            batch_size=batch_size,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_last_page_len=kv_last_page_len,
-            graph_state=buffers.graph_state if use_graph else None,
-        )
-
     def _decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         """Unified decode using slot buffers. Writes results to slot.logits/hidden_last.
 
         This method provides identical preparation for both graph and non-graph paths:
         1. Clear padding region (for graph batch size alignment)
-        2. Build FlashInfer metadata from slot buffers
-        3. Plan FlashInfer context
-        4. Execute: either graph.replay() or eager forward
+        2. Build FA3 paged-KV metadata buffers
+        3. Execute: either graph.replay() or eager forward
 
-        The only difference between paths is step 4. This ensures debugging with
+        The only difference between paths is step 3. This ensures debugging with
         graphs disabled produces identical behavior to the graph path.
 
         Args:
             slot: DecodeSlot with inputs already staged in its buffers.
             batch_size: Actual number of sequences (before padding).
         """
-        ctx = slot.flashinfer_ctx
         use_graph = self._use_cuda_graphs and slot.cuda_graphs is not None
 
         # Determine padded batch size for graph alignment
@@ -844,31 +772,24 @@ class MoondreamRuntime:
             slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
             slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
 
-        # Build FlashInfer metadata (identical for both paths)
-        pos_cpu = slot.meta.input_pos.cpu[:graph_batch_size]
-        pos_cpu[batch_size:graph_batch_size].fill_(-1)
-        metadata = self._build_flashinfer_metadata(
-            slot.meta.batch_idx.gpu[:graph_batch_size],
-            ctx,
-            use_graph=use_graph,
-            input_pos_cpu=pos_cpu,
+        # Build FA3 per-step metadata buffers (identical for both paths)
+        # - page_table rows: [B, num_pages]
+        # - seqused_k: [B] (KV length including the current token after update)
+        batch_idx = slot.meta.batch_idx.gpu[:graph_batch_size]
+        slot.fa3_page_table[:graph_batch_size].copy_(
+            self.page_table.page_table.index_select(0, batch_idx.to(torch.long))
         )
+        slot.fa3_seqused_k[:graph_batch_size].copy_(slot.meta.input_pos.gpu[:graph_batch_size])
+        slot.fa3_seqused_k[:graph_batch_size].add_(1)
 
-        # Set batch binding and plan (identical for both paths)
+        # Set batch binding (identical for both paths)
         self._batch_binding.tensor = slot.meta.batch_idx.gpu[:graph_batch_size]
-        ctx.plan(
-            metadata,
-            num_q_heads=self.config.text.n_heads,
-            num_kv_heads=self.config.text.n_kv_heads,
-            head_dim=self.head_dim,
-            use_graph=use_graph,
-        )
 
         # Execute (only difference between paths)
         if use_graph:
             slot.cuda_graphs[graph_batch_size].replay()
         else:
-            self._run_decode_forward(slot, graph_batch_size, metadata)
+            self._run_decode_forward(slot, graph_batch_size)
 
         # Restore batch binding to actual batch size
         self._batch_binding.tensor = slot.meta.batch_idx.gpu[:batch_size]
@@ -877,23 +798,16 @@ class MoondreamRuntime:
         self,
         slot: DecodeSlot,
         batch_size: int,
-        metadata: FlashInferBatchMetadata,
-        flashinfer_use_graph: bool = False,
     ) -> None:
         """Run decode forward pass and write results to slot output buffers.
 
-        This is the core forward computation, used by:
-        - _decode_with_slot (runtime non-graph path, flashinfer_use_graph=False)
-        - Graph capture (flashinfer_use_graph=True to use FlashInfer graph state)
+        This is the core forward computation, used by both eager decode and
+        CUDA graph replay.
 
         Args:
             slot: DecodeSlot with inputs in its buffers.
             batch_size: Batch size (may be padded for graph capture).
-            metadata: Pre-built FlashInfer metadata.
-            flashinfer_use_graph: Whether to use FlashInfer's graph state.
         """
-        ctx = slot.flashinfer_ctx
-
         embeds = self._embed_packed_token_batch(
             slot.decode_token_ids[:batch_size],
             slot.decode_coord_values[:batch_size],
@@ -910,12 +824,10 @@ class MoondreamRuntime:
             attn_mask=None,
             position_ids=position_ids,
             config=self.config.text,
-            flashinfer_ctx=ctx,
-            flashinfer_metadata=metadata,
-            use_flashinfer=True,
-            use_graph=flashinfer_use_graph,
             mode="decode",
             slot_mapping=slot_mapping,
+            page_table=slot.fa3_page_table[:batch_size],
+            fa3_seqused_k=slot.fa3_seqused_k[:batch_size],
             lora_workspace=self._lora_workspace,
             lora_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
         )
@@ -1021,9 +933,6 @@ class MoondreamRuntime:
 
             # Clear per-slot graph state
             for slot in self._decode_slots:
-                ctx = slot.flashinfer_ctx
-                ctx._graph_states.clear()
-                ctx._active_graph_state = None
                 slot.cuda_graphs = None
 
             self._graph_batch_sizes = []
@@ -1072,60 +981,62 @@ class MoondreamRuntime:
                 return cuda_graphs
 
             device = self.device
-            ctx = slot.flashinfer_ctx
 
-            # Zero all slot buffers for capture.
-            # Use batch index 0 for all entries - row 0 in the page table is
-            # pre-initialized and provides valid memory access patterns.
-            slot.decode_token_ids.zero_()
-            slot.decode_coord_values.zero_()
-            slot.decode_size_values.zero_()
-            slot.meta.batch_idx.gpu.zero_()
-            slot.meta.input_pos.gpu.zero_()
-            slot.meta.input_pos.cpu.zero_()
-            slot.meta.lora_slot_ids.gpu.zero_()
-
-            try:
-                torch.cuda.synchronize(device=device)
-                for bs in reversed(self._graph_batch_sizes):
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.inference_mode():
-                        # Build metadata from slot buffers
-                        metadata = self._build_flashinfer_metadata(
-                            slot.meta.batch_idx.gpu[:bs],
-                            ctx,
-                            use_graph=True,
-                            input_pos_cpu=slot.meta.input_pos.cpu[:bs],
-                        )
-
-                        # Set batch binding and plan
-                        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:bs]
-                        ctx.plan(
-                            metadata,
-                            num_q_heads=self.config.text.n_heads,
-                            num_kv_heads=self.config.text.n_kv_heads,
-                            head_dim=self.head_dim,
-                            use_graph=True,
-                        )
-
-                        # Warmup run (not captured, but uses FlashInfer graph state)
-                        self._run_decode_forward(slot, bs, metadata, flashinfer_use_graph=True)
-                        torch.cuda.synchronize(device=device)
-
-                        # Capture the graph
-                        with torch.cuda.graph(graph, self._graph_pool):
-                            self._run_decode_forward(slot, bs, metadata, flashinfer_use_graph=True)
-
-                    if self._graph_pool is None:
-                        self._graph_pool = graph.pool()
-                    cuda_graphs[bs] = graph
-                    torch.cuda.synchronize(device=device)
-            finally:
-                # Clear slot buffers after capture
+            # Graph capture must happen on the same stream we use for decode replay.
+            # Otherwise, replayed kernels may read stale metadata (page tables / seqused_k)
+            # written on a different stream, producing incorrect results.
+            with torch.cuda.stream(slot.compute_stream):
+                # Zero all slot buffers for capture.
+                # Use batch index 0 for all entries - row 0 in the page table is
+                # pre-initialized and provides valid memory access patterns.
                 slot.decode_token_ids.zero_()
+                slot.decode_coord_values.zero_()
+                slot.decode_size_values.zero_()
                 slot.meta.batch_idx.gpu.zero_()
                 slot.meta.input_pos.gpu.zero_()
+                slot.meta.input_pos.cpu.zero_()
                 slot.meta.lora_slot_ids.gpu.zero_()
+                slot.fa3_page_table.zero_()
+                slot.fa3_seqused_k.zero_()
+
+                try:
+                    torch.cuda.synchronize(device=device)
+                    for bs in reversed(self._graph_batch_sizes):
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.inference_mode():
+                            # Build FA3 per-step metadata buffers
+                            batch_idx = slot.meta.batch_idx.gpu[:bs]
+                            slot.fa3_page_table[:bs].copy_(
+                                self.page_table.page_table.index_select(
+                                    0, batch_idx.to(torch.long)
+                                )
+                            )
+                            slot.fa3_seqused_k[:bs].copy_(slot.meta.input_pos.gpu[:bs])
+                            slot.fa3_seqused_k[:bs].add_(1)
+
+                            # Set batch binding
+                            self._batch_binding.tensor = slot.meta.batch_idx.gpu[:bs]
+
+                            # Warmup run (not captured)
+                            self._run_decode_forward(slot, bs)
+                            torch.cuda.synchronize(device=device)
+
+                            # Capture the graph
+                            with torch.cuda.graph(graph, self._graph_pool):
+                                self._run_decode_forward(slot, bs)
+
+                        if self._graph_pool is None:
+                            self._graph_pool = graph.pool()
+                        cuda_graphs[bs] = graph
+                        torch.cuda.synchronize(device=device)
+                finally:
+                    # Clear slot buffers after capture
+                    slot.decode_token_ids.zero_()
+                    slot.meta.batch_idx.gpu.zero_()
+                    slot.meta.input_pos.gpu.zero_()
+                    slot.meta.lora_slot_ids.gpu.zero_()
+                    slot.fa3_page_table.zero_()
+                    slot.fa3_seqused_k.zero_()
 
         return cuda_graphs
 

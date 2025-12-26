@@ -24,10 +24,6 @@ from .layers import (
 from .lora_workspace import TextLoRAWorkspace
 from ..ops import precompute_freqs_cis
 from ..ops.rotary_embedding import rotary_embedding_cuda
-from .flashinfer import (
-    FlashInferBatchMetadata,
-    FlashInferDecodeContext,
-)
 from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
 from kestrel_kernels.flash_attn.cute.mask_definitions import cute_prefix_lm_mask_730
 from kestrel_kernels.tau_tail_ops import tau_tail_apply_into
@@ -79,13 +75,12 @@ def attn(
     n_heads: int,
     n_kv_heads: int,
     position_ids: torch.Tensor,
-    flashinfer_state: Optional[
-        tuple[FlashInferDecodeContext, FlashInferBatchMetadata, bool]
-    ] = None,
     mode: Literal["prefill", "decode"] = "decode",
     *,
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
+    page_table: torch.Tensor | None = None,
+    fa3_seqused_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -122,38 +117,10 @@ def attn(
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
     rotary_embedding_cuda(position_matrix, q, k, head_dim, cos_sin_cache)
 
-    flash_ctx = None
-    metadata = None
-    use_graph = False
-    if flashinfer_state is not None:
-        if len(flashinfer_state) == 3:
-            flash_ctx, metadata, use_graph = flashinfer_state  # type: ignore[misc]
-        else:
-            raise ValueError(
-                f"Unexpected flashinfer_state tuple length {len(flashinfer_state)}"
-            )
-
     if kv_cache is not None:
         kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
 
-    if flash_ctx is not None:
-        if kv_cache is None:
-            raise RuntimeError("FlashInfer decode requires a KV cache")
-        torch._assert(q.shape[1] == 1, "FlashInfer decode expects q_len == 1")
-        q_heads = q[:, 0]
-        k_cache = kv_cache.cache.k_cache  # type: ignore[attr-defined]
-        v_cache = kv_cache.cache.v_cache  # type: ignore[attr-defined]
-        k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
-        v_scale = getattr(kv_cache.cache, "v_scale", None)  # type: ignore[attr-defined]
-        attn_heads = flash_ctx.run(
-            q_heads,
-            (k_cache, v_cache),
-            use_graph=use_graph,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        out = attn_heads.unsqueeze(1)
-    elif mode == "prefill":
+    if mode == "prefill":
         if not x.is_cuda:
             raise RuntimeError("FA3 prefill requires CUDA tensors")
         if q.dtype not in (torch.float16, torch.bfloat16):
@@ -177,8 +144,30 @@ def attn(
             mask_mod=mask_mod,
         )
     else:
-        raise RuntimeError(
-            "SDPA fallback removed; FlashInfer decode is required for non-prefill"
+        if kv_cache is None:
+            raise RuntimeError("FA3 paged decode requires a KV cache")
+        if page_table is None or fa3_seqused_k is None:
+            raise RuntimeError("FA3 paged decode requires page_table and fa3_seqused_k")
+        torch._assert(q.shape[1] == 1, "FA3 paged decode expects q_len == 1")
+
+        k_cache_hnd = kv_cache.cache.k_cache  # type: ignore[attr-defined]
+        v_cache_hnd = kv_cache.cache.v_cache  # type: ignore[attr-defined]
+        k_cache = k_cache_hnd.permute(0, 2, 1, 3)
+        v_cache = v_cache_hnd.permute(0, 2, 1, 3)
+
+        k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
+        v_scale = getattr(kv_cache.cache, "v_scale", None)  # type: ignore[attr-defined]
+        out, _ = _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=fa3_seqused_k,
+            paged_kv_non_tma=None,
+            causal=True,
+            # TEMPORARY: force bf16 kv scale
+#            k_scale=k_scale,
+#            v_scale=v_scale,
         )
 
     out = out.view(bsz, q_len, d_model)
@@ -194,25 +183,15 @@ def text_decoder(
     *,
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
-    flashinfer_ctx: Optional[FlashInferDecodeContext] = None,
-    flashinfer_metadata: Optional[FlashInferBatchMetadata] = None,
-    use_flashinfer: bool = False,
-    use_graph: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
+    page_table: torch.Tensor | None = None,
+    fa3_seqused_k: torch.Tensor | None = None,
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
-
-        flash_state = None
-        if (
-            use_flashinfer
-            and flashinfer_ctx is not None
-            and flashinfer_metadata is not None
-        ):
-            flash_state = (flashinfer_ctx, flashinfer_metadata, use_graph)
 
         attn_out = attn(
             x_norm,
@@ -223,10 +202,11 @@ def text_decoder(
             config.n_heads,
             config.n_kv_heads,
             position_ids,
-            flashinfer_state=flash_state,
             mode=mode,
             slot_mapping=slot_mapping,
             use_prefix_attn=use_prefix_attn,
+            page_table=page_table,
+            fa3_seqused_k=fa3_seqused_k,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:

@@ -25,7 +25,7 @@ class RuntimeConfig:
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     max_batch_size: int = 4
-    page_size: int = 128
+    page_size: int = 1
     max_seq_length: int = 32768
     enable_cuda_graphs: bool = True
 
