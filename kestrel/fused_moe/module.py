@@ -2,11 +2,12 @@
 from dataclasses import dataclass
 from math import prod
 
+import os
 import torch
 from torch import nn
 from torch.compiler import disable as torch_compiler_disable
 
-from .kernels import dtype_to_triton, invoke_fused_moe_kernel
+from .kernels import dtype_to_triton, invoke_fused_moe_kernel as invoke_fused_moe_kernel_triton
 from .lora_kernels import apply_moe_lora
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
@@ -214,6 +215,7 @@ class FusedMoEConfig:
     num_warps: int = 4
     num_stages: int = 2
     allow_tf32: bool = True
+    backend: str = "triton"  # "triton" | "cute" | "auto"
 
     def as_triton(self, *, block_size_m: int | None = None) -> dict[str, int]:
         config = {
@@ -316,7 +318,7 @@ class FusedMoEModule(nn.Module):
 
         compute_type = dtype_to_triton(hidden_states.dtype)
 
-        invoke_fused_moe_kernel(
+        self._invoke_fused_moe_kernel(
             hidden_states,
             self.up_experts.weight,
             up_out,
@@ -326,10 +328,8 @@ class FusedMoEModule(nn.Module):
             num_tokens_post_padded=num_tokens_post_padded,
             mul_routed_weight=False,
             top_k=self.top_k,
-            config=triton_config,
+            triton_config=triton_config,
             compute_type=compute_type,
-            bias=None,
-            allow_tf32=self.config.allow_tf32,
         )
 
         # For LoRA, run separate routing with super-expert IDs.
@@ -400,7 +400,7 @@ class FusedMoEModule(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        invoke_fused_moe_kernel(
+        self._invoke_fused_moe_kernel(
             down_in,
             self.down_experts.weight,
             down_out,
@@ -410,10 +410,8 @@ class FusedMoEModule(nn.Module):
             num_tokens_post_padded=num_tokens_post_padded,
             mul_routed_weight=True,
             top_k=1,
-            config=triton_config,
+            triton_config=triton_config,
             compute_type=compute_type,
-            bias=None,
-            allow_tf32=self.config.allow_tf32,
         )
 
         if lora_workspace is not None and lora_slot_ids is not None:
@@ -441,6 +439,108 @@ class FusedMoEModule(nn.Module):
         )
         moe_sum_cuda(down_out, fused)
         return fused
+
+    def _invoke_fused_moe_kernel(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        *,
+        topk_weights: torch.Tensor | None,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        mul_routed_weight: bool,
+        top_k: int,
+        triton_config: dict[str, int],
+        compute_type,
+    ) -> None:
+        # Prefer explicit config flag, but allow quick env-var override.
+        backend = os.getenv("KESTREL_FUSED_MOE_BACKEND", self.config.backend).lower()
+        use_cute = backend in ("cute", "auto")
+
+        if use_cute:
+            try:
+                from kestrel.ops.fused_moe_cute import (
+                    FusedMoeCuTeConfig,
+                    invoke_fused_moe_kernel_cute,
+                )
+
+                # Current CuTe kernel is tuned for the small-M decode regime where the routing
+                # block size is 16. For other block sizes we fall back to Triton.
+                block_m = triton_config["BLOCK_SIZE_M"]
+                if block_m == 16:
+                    # Allow CuTe-specific tuning for the decode regime.
+                    # We keep correctness identical to Triton but may pick different tiles.
+                    num_tokens = int(C.shape[0])
+                    if num_tokens <= 8:
+                        # Tiny decode batches (B~4, T~1) are extremely padding-heavy; we
+                        # use CuTe-specific tiles tuned for H100 decode.
+                        #
+                        # NOTE: Up-proj and down-proj have different sweet spots:
+                        # - Up: smaller BK helps shared memory footprint; 1 stage is enough.
+                        # - Down: larger BK reduces K tiles and is faster even at 1 CTA/SM.
+                        if mul_routed_weight:
+                            cute_cfg = FusedMoeCuTeConfig(
+                                block_m=16,
+                                block_n=64,
+                                block_k=256,
+                                num_warps=4,
+                                num_stages=3,
+                            )
+                        else:
+                            cute_cfg = FusedMoeCuTeConfig(
+                                block_m=16,
+                                block_n=128,
+                                block_k=128,
+                                num_warps=2,
+                                num_stages=1,
+                            )
+                    else:
+                        # For down-proj (mul_routed_weight) we keep the Triton tiling but use
+                        # fewer stages to reduce shared-memory pressure.
+                        num_stages = int(triton_config["NUM_STAGES"])
+                        if mul_routed_weight:
+                            num_stages = min(2, num_stages)
+                        cute_cfg = FusedMoeCuTeConfig(
+                            block_m=block_m,
+                            block_n=int(triton_config["BLOCK_SIZE_N"]),
+                            block_k=int(triton_config["BLOCK_SIZE_K"]),
+                            num_warps=int(triton_config["NUM_WARPS"]),
+                            num_stages=num_stages,
+                        )
+                    invoke_fused_moe_kernel_cute(
+                        A,
+                        B,
+                        C,
+                        topk_weights=topk_weights,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=expert_ids,
+                        num_tokens_post_padded=num_tokens_post_padded,
+                        mul_routed_weight=mul_routed_weight,
+                        top_k=top_k,
+                        config=cute_cfg,
+                    )
+                    return
+            except Exception:
+                # Fall back to Triton if CuTe is unavailable (or config unsupported).
+                pass
+
+        invoke_fused_moe_kernel_triton(
+            A,
+            B,
+            C,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            config=triton_config,
+            compute_type=compute_type,
+            bias=None,
+            allow_tf32=self.config.allow_tf32,
+        )
 
     def _select_block_size(self, assignments: int) -> int:
         block_m = self.config.block_size_m
