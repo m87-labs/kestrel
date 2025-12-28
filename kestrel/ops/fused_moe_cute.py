@@ -195,6 +195,12 @@ class _FusedMoeMatmulCuTe:
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sMeta_elems], 16]
+        sArowBase_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
+        ]
+        sCrowBase_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
+        ]
 
         @cute.struct
         class SharedStorage:
@@ -204,6 +210,8 @@ class _FusedMoeMatmulCuTe:
             sAid: sAid_struct
             sTok: sTok_struct
             sW: sW_struct
+            sArowBase: sArowBase_struct
+            sCrowBase: sCrowBase_struct
 
         return SharedStorage
 
@@ -301,6 +309,13 @@ class _FusedMoeMatmulCuTe:
         sAid = storage.sAid.get_tensor(s_meta_layout)
         sTok = storage.sTok.get_tensor(s_meta_layout)
         sW = storage.sW.get_tensor(s_meta_layout)
+        sArowBase = storage.sArowBase.get_tensor(s_meta_layout)
+        sCrowBase = storage.sCrowBase.get_tensor(s_meta_layout)
+        # Precompute per-row base pointers in bytes to avoid repeated 64-bit multiplies
+        # in the hot inner loops.
+        element_bytes = cutlass.Int64(self.dtype.width // 8)
+        stride_am_elems = cutlass.Int64(mA.stride[0])
+        stride_cm_elems = cutlass.Int64(mC.stride[0])
         if tx < Int32(block_m):
             idx = row_start + tx
             aid = Int32(num_valid_tokens)  # padded sentinel
@@ -311,6 +326,13 @@ class _FusedMoeMatmulCuTe:
             if aid < num_valid_tokens:
                 tok = aid // Int32(self.top_k)
             sTok[tx] = tok
+            arow_base = cutlass.Int64(0)
+            crow_base = cutlass.Int64(0)
+            if aid < num_valid_tokens:
+                arow_base = cutlass.Int64(tok) * stride_am_elems * element_bytes
+                crow_base = cutlass.Int64(aid) * stride_cm_elems * element_bytes
+            sArowBase[tx] = arow_base
+            sCrowBase[tx] = crow_base
             if const_expr(self.mul_routed_weight):
                 w = self.dtype(0.0)
                 if aid < num_valid_tokens:
@@ -360,8 +382,6 @@ class _FusedMoeMatmulCuTe:
             element_bytes = cutlass.Int64(self.dtype.width // 8)
             align_bytes = vec_size * int(self.dtype.width // 8)
             mC_base_i64 = mC.iterator.toint()
-            stride_cm_elems = cutlass.Int64(mC.stride[0])
-            stride_cn_elems = cutlass.Int64(mC.stride[1])
 
             zero_vec = cute.make_rmem_tensor((vec_size,), self.dtype)
             zero_vec.fill(self.dtype(0.0))
@@ -374,10 +394,7 @@ class _FusedMoeMatmulCuTe:
                 aid_c = sAid[r_c]
                 col0 = n_start + n0
                 if (aid_c < num_valid_tokens) and (col0 < N):
-                    g_off_elems_c = cutlass.Int64(aid_c) * stride_cm_elems + cutlass.Int64(
-                        col0
-                    ) * stride_cn_elems
-                    g_off_bytes_c = g_off_elems_c * element_bytes
+                    g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
                     g_ptr_c = cute.make_ptr(
                         self.dtype,
                         mC_base_i64 + g_off_bytes_c,
@@ -415,11 +432,6 @@ class _FusedMoeMatmulCuTe:
             sA_base_i64 = sA.iterator.toint()
             sB_base_i64 = sB.iterator.toint()
             sC_base_i64 = sC.iterator.toint()
-
-            stride_am_elems = cutlass.Int64(mA.stride[0])
-            stride_ak_elems = cutlass.Int64(mA.stride[1])
-            stride_cm_elems = cutlass.Int64(mC.stride[0])
-            stride_cn_elems = cutlass.Int64(mC.stride[1])
 
             block_vec_k = block_k // vec_size
             total_vec_a = block_m * block_vec_k
@@ -459,13 +471,10 @@ class _FusedMoeMatmulCuTe:
 
                     aid_a = sAid[r_a]
                     valid_row_a = aid_a < num_valid_tokens
-                    token_id_a = sTok[r_a]
+                    arow_base = sArowBase[r_a]
 
                     valid_a = tile_in_range and valid_row_a and (kg_a < K)
-                    g_off_elems_a = cutlass.Int64(token_id_a) * stride_am_elems + cutlass.Int64(
-                        kg_a
-                    ) * stride_ak_elems
-                    g_off_bytes_a = g_off_elems_a * element_bytes
+                    g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
                     g_ptr_a = cute.make_ptr(
                         self.dtype,
                         mA_base_i64 + g_off_bytes_a,
@@ -617,13 +626,10 @@ class _FusedMoeMatmulCuTe:
 
                         aid_a2 = sAid[r_a2]
                         valid_row_a2 = aid_a2 < num_valid_tokens
-                        token_id_a2 = sTok[r_a2]
+                        arow_base2 = sArowBase[r_a2]
 
                         valid_a2 = valid_row_a2 and (kg_a2 < K)
-                        g_off_elems_a2 = cutlass.Int64(token_id_a2) * stride_am_elems + cutlass.Int64(
-                            kg_a2
-                        ) * stride_ak_elems
-                        g_off_bytes_a2 = g_off_elems_a2 * element_bytes
+                        g_off_bytes_a2 = arow_base2 + cutlass.Int64(kg_a2) * element_bytes
                         g_ptr_a2 = cute.make_ptr(
                             self.dtype,
                             mA_base_i64 + g_off_bytes_a2,
@@ -810,10 +816,7 @@ class _FusedMoeMatmulCuTe:
                     )
                     src_c = cute.make_tensor(s_ptr_c, (vec_size,))
 
-                    g_off_elems_c = cutlass.Int64(aid_c) * stride_cm_elems + cutlass.Int64(
-                        col0
-                    ) * stride_cn_elems
-                    g_off_bytes_c = g_off_elems_c * element_bytes
+                    g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
                     g_ptr_c = cute.make_ptr(
                         self.dtype,
                         mC_base_i64 + g_off_bytes_c,
@@ -875,6 +878,12 @@ class _FusedMoeMatmulCuTeDecodeWarp:
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sMeta_elems], 16]
+        sArowBase_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
+        ]
+        sCrowBase_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
+        ]
 
         @cute.struct
         class SharedStorageDecodeWarp:
@@ -884,6 +893,8 @@ class _FusedMoeMatmulCuTeDecodeWarp:
             sAid: sAid_struct
             sTok: sTok_struct
             sW: sW_struct
+            sArowBase: sArowBase_struct
+            sCrowBase: sCrowBase_struct
 
         return SharedStorageDecodeWarp
 
@@ -996,6 +1007,13 @@ class _FusedMoeMatmulCuTeDecodeWarp:
         sAid = storage.sAid.get_tensor(s_meta_layout)
         sTok = storage.sTok.get_tensor(s_meta_layout)
         sW = storage.sW.get_tensor(s_meta_layout)
+        sArowBase = storage.sArowBase.get_tensor(s_meta_layout)
+        sCrowBase = storage.sCrowBase.get_tensor(s_meta_layout)
+        # Precompute per-row base pointers in bytes to avoid repeated 64-bit multiplies
+        # in the hot inner loops.
+        element_bytes = cutlass.Int64(self.dtype.width // 8)
+        stride_am_elems = cutlass.Int64(mA.stride[0])
+        stride_cm_elems = cutlass.Int64(mC.stride[0])
         if tx < Int32(block_m):
             idx = row_start + tx
             aid = Int32(num_valid_tokens)  # padded sentinel
@@ -1006,6 +1024,13 @@ class _FusedMoeMatmulCuTeDecodeWarp:
             if aid < num_valid_tokens:
                 tok = aid // Int32(self.top_k)
             sTok[tx] = tok
+            arow_base = cutlass.Int64(0)
+            crow_base = cutlass.Int64(0)
+            if aid < num_valid_tokens:
+                arow_base = cutlass.Int64(tok) * stride_am_elems * element_bytes
+                crow_base = cutlass.Int64(aid) * stride_cm_elems * element_bytes
+            sArowBase[tx] = arow_base
+            sCrowBase[tx] = crow_base
             if const_expr(self.mul_routed_weight):
                 w = self.dtype(0.0)
                 if aid < num_valid_tokens:
@@ -1037,8 +1062,6 @@ class _FusedMoeMatmulCuTeDecodeWarp:
             element_bytes = cutlass.Int64(self.dtype.width // 8)
             align_bytes = vec_size * int(self.dtype.width // 8)
             mC_base_i64 = mC.iterator.toint()
-            stride_cm_elems = cutlass.Int64(mC.stride[0])
-            stride_cn_elems = cutlass.Int64(mC.stride[1])
 
             zero_vec = cute.make_rmem_tensor((vec_size,), self.dtype)
             zero_vec.fill(self.dtype(0.0))
@@ -1051,10 +1074,7 @@ class _FusedMoeMatmulCuTeDecodeWarp:
                 aid_c = sAid[r_c]
                 col0 = n_start + n0
                 if (aid_c < num_valid_tokens) and (col0 < N):
-                    g_off_elems_c = cutlass.Int64(aid_c) * stride_cm_elems + cutlass.Int64(
-                        col0
-                    ) * stride_cn_elems
-                    g_off_bytes_c = g_off_elems_c * element_bytes
+                    g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
                     g_ptr_c = cute.make_ptr(
                         self.dtype,
                         mC_base_i64 + g_off_bytes_c,
@@ -1089,11 +1109,6 @@ class _FusedMoeMatmulCuTeDecodeWarp:
             sA_base_i64 = sA.iterator.toint()
             sB_base_i64 = sB.iterator.toint()
             sC_base_i64 = sC.iterator.toint()
-
-            stride_am_elems = cutlass.Int64(mA.stride[0])
-            stride_ak_elems = cutlass.Int64(mA.stride[1])
-            stride_cm_elems = cutlass.Int64(mC.stride[0])
-            stride_cn_elems = cutlass.Int64(mC.stride[1])
 
             block_vec_k = block_k // vec_size
             total_vec_a = block_m * block_vec_k
@@ -1132,13 +1147,10 @@ class _FusedMoeMatmulCuTeDecodeWarp:
 
                     aid_a = sAid[r_a]
                     valid_row_a = aid_a < num_valid_tokens
-                    token_id_a = sTok[r_a]
+                    arow_base = sArowBase[r_a]
 
                     valid_a = tile_in_range and valid_row_a and (kg_a < K)
-                    g_off_elems_a = cutlass.Int64(token_id_a) * stride_am_elems + cutlass.Int64(
-                        kg_a
-                    ) * stride_ak_elems
-                    g_off_bytes_a = g_off_elems_a * element_bytes
+                    g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
                     g_ptr_a = cute.make_ptr(
                         self.dtype,
                         mA_base_i64 + g_off_bytes_a,
@@ -1295,13 +1307,10 @@ class _FusedMoeMatmulCuTeDecodeWarp:
 
                         aid_a2 = sAid[r_a2]
                         valid_row_a2 = aid_a2 < num_valid_tokens
-                        token_id_a2 = sTok[r_a2]
+                        arow_base2 = sArowBase[r_a2]
 
                         valid_a2 = valid_row_a2 and (kg_a2 < K)
-                        g_off_elems_a2 = cutlass.Int64(token_id_a2) * stride_am_elems + cutlass.Int64(
-                            kg_a2
-                        ) * stride_ak_elems
-                        g_off_bytes_a2 = g_off_elems_a2 * element_bytes
+                        g_off_bytes_a2 = arow_base2 + cutlass.Int64(kg_a2) * element_bytes
                         g_ptr_a2 = cute.make_ptr(
                             self.dtype,
                             mA_base_i64 + g_off_bytes_a2,
@@ -1492,10 +1501,7 @@ class _FusedMoeMatmulCuTeDecodeWarp:
                         )
                         src_c = cute.make_tensor(s_ptr_c, (vec_size,))
 
-                        g_off_elems_c = cutlass.Int64(aid_c) * stride_cm_elems + cutlass.Int64(
-                            col0
-                        ) * stride_cn_elems
-                        g_off_bytes_c = g_off_elems_c * element_bytes
+                        g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
                         g_ptr_c = cute.make_ptr(
                             self.dtype,
                             mC_base_i64 + g_off_bytes_c,
