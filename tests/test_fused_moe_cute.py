@@ -59,12 +59,16 @@ class TestFusedMoECuTe:
             config=FusedMoEConfig(backend="cute"),
         )
 
+        from kestrel.ops import fused_moe_cute as fused_moe_cute_mod
+
+        # Ensure we exercise the CuTe path for *both* moe_up and moe_down (avoid silent fallback).
+        fused_moe_cute_mod._COMPILE_CACHE.clear()
+
         out_triton = moe_triton(hidden_states, topk_weights, topk_ids)
         out_cute = moe_cute(hidden_states, topk_weights, topk_ids)
 
-        # Ensure the CuTe kernel actually compiled/launched.
-        from kestrel.ops import fused_moe_cute as fused_moe_cute_mod
-
-        assert fused_moe_cute_mod._COMPILE_CACHE, "CuTe fused MoE kernel did not compile/launch"
+        keys = list(fused_moe_cute_mod._COMPILE_CACHE.keys())
+        assert any((not k[3]) and (k[4] == top_k) for k in keys), "CuTe moe_up did not compile/launch"
+        assert any(k[3] and (k[4] == 1) for k in keys), "CuTe moe_down did not compile/launch"
 
         torch.testing.assert_close(out_cute, out_triton, rtol=2e-2, atol=2e-2)
