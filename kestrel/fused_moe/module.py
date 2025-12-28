@@ -486,7 +486,9 @@ class FusedMoEModule(nn.Module):
                                 block_n=64,
                                 block_k=256,
                                 num_warps=4,
-                                num_stages=3,
+                                # For tiny decode, keeping stages low avoids exploding SMEM
+                                # (and preserves occupancy) while still benefiting from larger BK.
+                                num_stages=1,
                             )
                         else:
                             cute_cfg = FusedMoeCuTeConfig(
