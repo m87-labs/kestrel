@@ -70,7 +70,7 @@ class FlashAttentionDecodeSm90:
         self.tile_size_per_bdx = tile_size_per_bdx
         # Use `threadIdx.y` to represent query heads within a KV head group.
         # For MHA (qhead_per_kvhead == 1), keep bdy=1 and rely on bdz to fill the block.
-        # This matches FlashInfer's geometry and reduces per-thread state.
+        # This matches FlashInfer's geometry and avoids introducing inactive ty lanes.
         # For GQA/MQA, we pad `bdy` so that:
         # 1) `blockDim.x * blockDim.y >= 32` (at least one warp in the xy plane), and
         # 2) `blockDim.x * blockDim.y` is a multiple of 32 (warps don't straddle tz planes
@@ -117,7 +117,9 @@ class FlashAttentionDecodeSm90:
 
     def _shared_storage_cls(self):
         cosize_kv_stage = self.num_stages_smem * self.tile_tokens * self.head_dim
-        cosize_offsets = self.bdx * self.tile_tokens
+        # Pad the fast offset ring-buffer by 1 element per row to avoid pathological
+        # shared-memory bank conflicts from the (token_in_iter, tx) store pattern.
+        cosize_offsets = self.tile_tokens * (self.bdx + 1)
 
         sK_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
@@ -192,13 +194,9 @@ class FlashAttentionDecodeSm90:
             stride=(self.tile_tokens * self.head_dim, self.head_dim, 1),
         )
 
-        # Offsets are accessed as [slice][token_in_iter] (slice-major), but filled in token-major
-        # order for coalesced writes.
+        # Offsets are filled in token-major order for coalesced writes.
         sOffsets_token_major_layout = cute.make_layout(
-            (self.tile_tokens, self.bdx), stride=(self.bdx, 1)
-        )
-        sOffsets_slice_major_layout = cute.make_layout(
-            (self.bdx, self.tile_tokens), stride=(self.tile_tokens, 1)
+            (self.tile_tokens, self.bdx + 1), stride=(self.bdx + 1, 1)
         )
         sOMerge_layout = cute.make_layout(
             (self.bdz, self.bdy, self.head_dim),
@@ -219,7 +217,6 @@ class FlashAttentionDecodeSm90:
             window_size_right,
             sK_layout,
             sOffsets_token_major_layout,
-            sOffsets_slice_major_layout,
             sOMerge_layout,
             sMD_layout,
             SharedStorage,
@@ -245,7 +242,6 @@ class FlashAttentionDecodeSm90:
         window_size_right: Optional[Int32],
         sK_layout: cute.Layout,
         sOffsets_token_major_layout: cute.Layout,
-        sOffsets_slice_major_layout: cute.Layout,
         sOMerge_layout: cute.Layout,
         sMD_layout: cute.Layout,
         SharedStorage: cutlass.Constexpr,
@@ -298,7 +294,8 @@ class FlashAttentionDecodeSm90:
         sK = storage.sK.get_tensor(sK_layout)
         sV = storage.sV.get_tensor(sK_layout)
         sOffsets_token_major = storage.sOffsets.get_tensor(sOffsets_token_major_layout)
-        sOffsets = cute.make_tensor(sOffsets_token_major.iterator, sOffsets_slice_major_layout)
+        bdx = const_expr(self.bdx)
+        assert bdx in (8, 16), "Offset swizzle assumes bdx is a power-of-two (8 or 16)"
 
         # Copy atoms.
         copy_bits = self.vec_size * self.dtype.width
@@ -372,7 +369,14 @@ class FlashAttentionDecodeSm90:
                 token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                 token_off = iter_i * self.tile_tokens + token_in_iter
                 valid = token_off < chunk_size
-                offset_bytes = sOffsets[slice_idx, token_in_iter]
+                linear = slice_idx * self.tile_tokens + token_in_iter
+                if const_expr(bdx == 8):
+                    row = linear >> 3
+                    col = linear & 7
+                else:
+                    row = linear >> 4
+                    col = linear & 15
+                offset_bytes = sOffsets_token_major[row, col]
                 offset_bytes_vec[j] = offset_bytes
                 gmem_ptr = cute.make_ptr(
                     self.dtype,
@@ -491,7 +495,14 @@ class FlashAttentionDecodeSm90:
                     token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                     token_off = prefetch_iter * self.tile_tokens + token_in_iter
                     valid = token_off < chunk_size
-                    offset_bytes = sOffsets[slice_idx, token_in_iter]
+                    linear = slice_idx * self.tile_tokens + token_in_iter
+                    if const_expr(bdx == 8):
+                        row = linear >> 3
+                        col = linear & 7
+                    else:
+                        row = linear >> 4
+                        col = linear & 15
+                    offset_bytes = sOffsets_token_major[row, col]
                     offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
                         self.dtype,
@@ -599,49 +610,149 @@ class FlashAttentionDecodeSm90:
             )
             sD = cute.make_tensor(sD_ptr, sMD_layout)
 
-            if qo_head_active:
-                for i in cutlass.range_constexpr(self.vec_size):
-                    sOMerge[tz, ty, tx * self.vec_size + i] = o[i]
-                if tx == 0:
-                    sM[tz, ty] = m
-                    sD[tz, ty] = d
-            else:
-                for i in cutlass.range_constexpr(self.vec_size):
-                    sOMerge[tz, ty, tx * self.vec_size + i] = Float32(0.0)
-                if tx == 0:
-                    sM[tz, ty] = -Float32.inf
-                    sD[tz, ty] = Float32(0.0)
-            cute.arch.barrier()
+            if const_expr(self.bdy == 1):
+                # In MHA geometry (bdy==1, bdx<32), warps straddle tz lanes. Instead of
+                # writing all bdz slices to shared memory and having tz==0 merge 16 slices,
+                # first merge tz within each warp via shuffles, then store one slice per warp.
+                #
+                # This reduces:
+                # - Shared-memory store bank conflicts in the fp32 merge scratch.
+                # - Shared-memory traffic + work in the final tz==0 merge loop.
+                if qo_head_active:
+                    o_other = cute.make_rmem_tensor((self.vec_size,), Float32)
+                    if const_expr(self.bdx == 8):
+                        # Reduce over tz_in_warp in {0,1,2,3} using xor offsets 8 and 16.
+                        for offset in (8, 16):
+                            m2 = cute.arch.shuffle_sync_bfly(m, offset=offset)
+                            d2 = cute.arch.shuffle_sync_bfly(d, offset=offset)
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=offset)
+                            if d == Float32(0.0):
+                                m = m2
+                                d = d2
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o[i] = o_other[i]
+                            elif d2 != Float32(0.0):
+                                m_new = utils.fmax(m, m2)
+                                scale_self = utils.exp2f(m - m_new)
+                                scale_other = utils.exp2f(m2 - m_new)
+                                d = d * scale_self + d2 * scale_other
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o[i] = o[i] * scale_self + o_other[i] * scale_other
+                                m = m_new
 
-            if tz == 0 and qo_head_active:
-                m_merge = -Float32.inf
-                d_merge = Float32(0.0)
-                o_merge = cute.make_rmem_tensor((self.vec_size,), Float32)
-                o_merge.fill(0.0)
-                oz = cute.make_rmem_tensor((self.vec_size,), Float32)
-                for z in cutlass.range_constexpr(self.bdz):
-                    dz = sD[z, ty]
-                    if dz > Float32(0.0):
-                        mz = sM[z, ty]
+                        # One writer per warp: tz % 4 == 0 stores to warp_id = tz // 4.
+                        if (tz & Int32(3)) == Int32(0):
+                            warp_id = tz >> Int32(2)
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
+                            if tx == 0:
+                                sM[warp_id, ty] = m
+                                sD[warp_id, ty] = d
+                    else:
+                        # bdx == 16: reduce over tz_in_warp in {0,1} using xor offset 16.
+                        m2 = cute.arch.shuffle_sync_bfly(m, offset=16)
+                        d2 = cute.arch.shuffle_sync_bfly(d, offset=16)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
-                        if d_merge == Float32(0.0):
-                            m_merge = mz
-                            d_merge = dz
+                            o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=16)
+                        if d == Float32(0.0):
+                            m = m2
+                            d = d2
                             for i in cutlass.range_constexpr(self.vec_size):
-                                o_merge[i] = oz[i]
-                        else:
-                            m_new = utils.fmax(m_merge, mz)
-                            scale_old = utils.exp2f(m_merge - m_new)
-                            scale_z = utils.exp2f(mz - m_new)
-                            d_merge = d_merge * scale_old + dz * scale_z
+                                o[i] = o_other[i]
+                        elif d2 != Float32(0.0):
+                            m_new = utils.fmax(m, m2)
+                            scale_self = utils.exp2f(m - m_new)
+                            scale_other = utils.exp2f(m2 - m_new)
+                            d = d * scale_self + d2 * scale_other
                             for i in cutlass.range_constexpr(self.vec_size):
-                                o_merge[i] = o_merge[i] * scale_old + oz[i] * scale_z
-                            m_merge = m_new
-                m = m_merge
-                d = d_merge
-                for i in cutlass.range_constexpr(self.vec_size):
-                    o[i] = o_merge[i]
+                                o[i] = o[i] * scale_self + o_other[i] * scale_other
+                            m = m_new
+
+                        # One writer per warp: tz % 2 == 0 stores to warp_id = tz // 2.
+                        if (tz & Int32(1)) == Int32(0):
+                            warp_id = tz >> Int32(1)
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
+                            if tx == 0:
+                                sM[warp_id, ty] = m
+                                sD[warp_id, ty] = d
+
+                cute.arch.barrier()
+
+                if tz == 0 and qo_head_active:
+                    # Merge across warp partials (always 4 for the supported bdx/bdz pairs).
+                    if const_expr(self.bdx == 8):
+                        num_partials = self.bdz // 4
+                    else:
+                        num_partials = self.bdz // 2
+                    m_merge = -Float32.inf
+                    d_merge = Float32(0.0)
+                    o_merge = cute.make_rmem_tensor((self.vec_size,), Float32)
+                    o_merge.fill(0.0)
+                    oz = cute.make_rmem_tensor((self.vec_size,), Float32)
+                    for z in cutlass.range_constexpr(num_partials):
+                        dz = sD[z, ty]
+                        if dz > Float32(0.0):
+                            mz = sM[z, ty]
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
+                            if d_merge == Float32(0.0):
+                                m_merge = mz
+                                d_merge = dz
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o_merge[i] = oz[i]
+                            else:
+                                m_new = utils.fmax(m_merge, mz)
+                                scale_old = utils.exp2f(m_merge - m_new)
+                                scale_z = utils.exp2f(mz - m_new)
+                                d_merge = d_merge * scale_old + dz * scale_z
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o_merge[i] = o_merge[i] * scale_old + oz[i] * scale_z
+                                m_merge = m_new
+                    m = m_merge
+                    d = d_merge
+                    for i in cutlass.range_constexpr(self.vec_size):
+                        o[i] = o_merge[i]
+            else:
+                # Generic merge path (no warp-level tz reduction).
+                if qo_head_active:
+                    for i in cutlass.range_constexpr(self.vec_size):
+                        sOMerge[tz, ty, tx * self.vec_size + i] = o[i]
+                    if tx == 0:
+                        sM[tz, ty] = m
+                        sD[tz, ty] = d
+                cute.arch.barrier()
+
+                if tz == 0 and qo_head_active:
+                    m_merge = -Float32.inf
+                    d_merge = Float32(0.0)
+                    o_merge = cute.make_rmem_tensor((self.vec_size,), Float32)
+                    o_merge.fill(0.0)
+                    oz = cute.make_rmem_tensor((self.vec_size,), Float32)
+                    for z in cutlass.range_constexpr(self.bdz):
+                        dz = sD[z, ty]
+                        if dz > Float32(0.0):
+                            mz = sM[z, ty]
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
+                            if d_merge == Float32(0.0):
+                                m_merge = mz
+                                d_merge = dz
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o_merge[i] = oz[i]
+                            else:
+                                m_new = utils.fmax(m_merge, mz)
+                                scale_old = utils.exp2f(m_merge - m_new)
+                                scale_z = utils.exp2f(mz - m_new)
+                                d_merge = d_merge * scale_old + dz * scale_z
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    o_merge[i] = o_merge[i] * scale_old + oz[i] * scale_z
+                                m_merge = m_new
+                    m = m_merge
+                    d = d_merge
+                    for i in cutlass.range_constexpr(self.vec_size):
+                        o[i] = o_merge[i]
 
         # Write out (only tz == 0 writes).
         if tz == 0 and qo_head_active:

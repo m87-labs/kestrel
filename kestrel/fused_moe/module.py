@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 from math import prod
 
-import os
 import torch
 from torch import nn
 from torch.compiler import disable as torch_compiler_disable
@@ -215,7 +214,7 @@ class FusedMoEConfig:
     num_warps: int = 4
     num_stages: int = 2
     allow_tf32: bool = True
-    backend: str = "triton"  # "triton" | "cute" | "auto"
+    backend: str = "auto"  # "auto" | "cute" | "triton"
 
     def as_triton(self, *, block_size_m: int | None = None) -> dict[str, int]:
         config = {
@@ -455,15 +454,15 @@ class FusedMoEModule(nn.Module):
         triton_config: dict[str, int],
         compute_type,
     ) -> None:
-        # Prefer explicit config flag, but allow quick env-var override.
-        backend = os.getenv("KESTREL_FUSED_MOE_BACKEND", self.config.backend).lower()
+        backend = self.config.backend.lower()
         use_cute = backend in ("cute", "auto")
 
         if use_cute:
             try:
                 from kestrel.ops.fused_moe_cute import (
                     FusedMoeCuTeConfig,
-                    invoke_fused_moe_kernel_cute,
+                    invoke_fused_moe_kernel_cute_down_decode,
+                    invoke_fused_moe_kernel_cute_up_decode,
                 )
 
                 # Current CuTe kernel is tuned for the small-M decode regime where the routing
@@ -511,18 +510,33 @@ class FusedMoEModule(nn.Module):
                             num_warps=int(triton_config["NUM_WARPS"]),
                             num_stages=num_stages,
                         )
-                    invoke_fused_moe_kernel_cute(
-                        A,
-                        B,
-                        C,
-                        topk_weights=topk_weights,
-                        sorted_token_ids=sorted_token_ids,
-                        expert_ids=expert_ids,
-                        num_tokens_post_padded=num_tokens_post_padded,
-                        mul_routed_weight=mul_routed_weight,
-                        top_k=top_k,
-                        config=cute_cfg,
-                    )
+                    if mul_routed_weight:
+                        if int(top_k) != 1:
+                            raise ValueError("CuTe moe_down expects top_k=1")
+                        if topk_weights is None:
+                            raise ValueError("topk_weights is required when mul_routed_weight=True")
+                        invoke_fused_moe_kernel_cute_down_decode(
+                            A,
+                            B,
+                            C,
+                            topk_weights=topk_weights,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                            config=cute_cfg,
+                        )
+                    else:
+                        if int(top_k) != 8:
+                            raise ValueError("CuTe moe_up expects top_k=8")
+                        invoke_fused_moe_kernel_cute_up_decode(
+                            A,
+                            B,
+                            C,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                            config=cute_cfg,
+                        )
                     return
             except Exception:
                 # Fall back to Triton if CuTe is unavailable (or config unsupported).
