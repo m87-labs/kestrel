@@ -194,7 +194,9 @@ class _FusedMoeMatmulCuTe:
         sC_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sC_elems], 16]
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
-        sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sMeta_elems], 16]
+        # Store routing weights as fp32 in shared memory so the epilogue doesn't need
+        # per-element dtype->fp32 conversion.
+        sW_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
         sArowBase_struct = cute.struct.Align[
             cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
         ]
@@ -334,10 +336,10 @@ class _FusedMoeMatmulCuTe:
             sArowBase[tx] = arow_base
             sCrowBase[tx] = crow_base
             if const_expr(self.mul_routed_weight):
-                w = self.dtype(0.0)
+                w32 = Float32(0.0)
                 if aid < num_valid_tokens:
-                    w = mTopkWeights[aid]
-                sW[tx] = w
+                    w32 = Float32(mTopkWeights[aid])
+                sW[tx] = w32
         cute.arch.barrier()
 
         # Flash-attn-style swizzled SMEM layout to reduce bank conflicts on ldmatrix loads.
@@ -779,9 +781,9 @@ class _FusedMoeMatmulCuTe:
                 tRC = fa_utils.make_acc_tensor_mn_view(rC)
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                     m = Int32(tC_coords[mi, 0][0])
-                    w = sW[m]
+                    w32 = sW[m]
                     for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * Float32(w))
+                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * w32)
             else:
                 rC.store(acc.load().to(self.dtype))
             smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
@@ -877,7 +879,9 @@ class _FusedMoeMatmulCuTeDecodeWarp:
         sC_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sC_elems], 16]
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
-        sW_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sMeta_elems], 16]
+        # Store routing weights as fp32 in shared memory so the epilogue doesn't need
+        # per-element dtype->fp32 conversion.
+        sW_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
         sArowBase_struct = cute.struct.Align[
             cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
         ]
@@ -1032,10 +1036,10 @@ class _FusedMoeMatmulCuTeDecodeWarp:
             sArowBase[tx] = arow_base
             sCrowBase[tx] = crow_base
             if const_expr(self.mul_routed_weight):
-                w = self.dtype(0.0)
+                w32 = Float32(0.0)
                 if aid < num_valid_tokens:
-                    w = mTopkWeights[aid]
-                sW[tx] = w
+                    w32 = Float32(mTopkWeights[aid])
+                sW[tx] = w32
         cute.arch.barrier()
 
         # MMA
@@ -1462,9 +1466,9 @@ class _FusedMoeMatmulCuTeDecodeWarp:
                 tRC = fa_utils.make_acc_tensor_mn_view(rC)
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                     m = Int32(tC_coords[mi, 0][0])
-                    w = sW[m]
+                    w32 = sW[m]
                     for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * Float32(w))
+                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * w32)
             else:
                 rC.store(acc.load().to(self.dtype))
             smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
