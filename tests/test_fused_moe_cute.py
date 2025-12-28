@@ -68,7 +68,7 @@ class TestFusedMoECuTe:
         out_cute = moe_cute(hidden_states, topk_weights, topk_ids)
 
         keys = list(fused_moe_cute_mod._COMPILE_CACHE.keys())
-        assert any((not k[3]) and (k[4] == top_k) for k in keys), "CuTe moe_up did not compile/launch"
-        assert any(k[3] and (k[4] == 1) for k in keys), "CuTe moe_down did not compile/launch"
+        assert any(k[0] == "up" for k in keys), "CuTe moe_up did not compile/launch"
+        assert any(k[0] == "down" for k in keys), "CuTe moe_down did not compile/launch"
 
         torch.testing.assert_close(out_cute, out_triton, rtol=2e-2, atol=2e-2)
