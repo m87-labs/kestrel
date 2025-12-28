@@ -326,8 +326,12 @@ class _FusedMoeMatmulCuTe:
         sB_tile_layout = cute.tile_to_shape(sB_layout_atom, (block_n, block_k), (0, 1))
         sB_elems = num_stages * block_n * block_k
         sB = storage.sB.get_tensor(cute.make_layout((sB_elems,), stride=(1,)))
-        sC_layout = cute.make_layout((block_m, block_n), stride=(block_n, 1))
-        sC = storage.sC.get_tensor(sC_layout)
+        # Flash-attn-style swizzled SMEM layout for C. This makes `stmatrix` stores conflict-free
+        # and preserves 128-bit vector contiguity for the subsequent SMEM->GMEM scatter stores.
+        sC_layout_atom = ampere_helpers.get_smem_layout_atom(self.dtype, block_n)
+        sC_layout = cute.tile_to_shape(sC_layout_atom, (block_m, block_n), (0, 1))
+        sC_linear = storage.sC.get_tensor(cute.make_layout((block_m * block_n,), stride=(1,)))
+        sC = cute.make_tensor(sC_linear.iterator, sC_layout)
 
         # Thread MMA setup.
         thr_mma = tiled_mma.get_slice(tx)
@@ -756,8 +760,11 @@ class _FusedMoeMatmulCuTe:
 
                 stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-            # Epilogue: apply routed weights in fp32 (if needed), then rmem -> smem,
-            # then vectorized smem -> gmem scatter.
+            # Epilogue: apply routed weights (if needed), then store the fp32 accumulator to shared
+            # in fp16/bf16, then scatter to gmem.
+            #
+            # NOTE: `retile` expects a Tensor (not TensorSSA), so we materialize a fragment for the
+            # rmem -> smem store path.
             rC = cute.make_fragment_like(acc, self.dtype)
             if const_expr(self.mul_routed_weight):
                 cC = cute.make_identity_tensor((block_m, block_n))
@@ -765,17 +772,16 @@ class _FusedMoeMatmulCuTe:
                 tAcc = fa_utils.make_acc_tensor_mn_view(acc)
                 tRC = fa_utils.make_acc_tensor_mn_view(rC)
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                    m = Int32(tC_coords[mi, 0][0])
+                    w = sW[m]
                     for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                        m = Int32(tC_coords[mi, ni][0])
-                        w = sW[m]
                         tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * Float32(w))
             else:
                 rC.store(acc.load().to(self.dtype))
-
             smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
             smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
-            tCrC = smem_thr_store.retile(rC)
             tCsC = smem_thr_store.partition_D(sC)
+            tCrC = smem_thr_store.retile(rC)
             cute.copy(smem_store_atom, tCrC, tCsC)
             cute.arch.barrier()
 
@@ -794,7 +800,7 @@ class _FusedMoeMatmulCuTe:
                 aid_c = sAid[r_c]
                 col0 = n_start + n0
                 if (aid_c < num_valid_tokens) and (col0 < N):
-                    s_linear_c = Int32(r_c) * Int32(block_n) + n0
+                    s_linear_c = Int32(sC_layout((Int32(r_c), n0)))
                     s_off_bytes_c = cutlass.Int64(s_linear_c) * element_bytes
                     s_ptr_c = cute.make_ptr(
                         self.dtype,
@@ -979,8 +985,12 @@ class _FusedMoeMatmulCuTeDecodeWarp:
         sB_elems = num_stages * block_n * block_k
         sA = storage.sA.get_tensor(cute.make_layout((sA_elems,), stride=(1,)))
         sB = storage.sB.get_tensor(cute.make_layout((sB_elems,), stride=(1,)))
-        sC_layout = cute.make_layout((block_m, block_n), stride=(block_n, 1))
-        sC = storage.sC.get_tensor(sC_layout)
+        # Flash-attn-style swizzled SMEM layout for C. This makes `stmatrix` stores conflict-free
+        # and preserves 128-bit vector contiguity for the subsequent SMEM->GMEM scatter stores.
+        sC_layout_atom = ampere_helpers.get_smem_layout_atom(self.dtype, block_n)
+        sC_layout = cute.tile_to_shape(sC_layout_atom, (block_m, block_n), (0, 1))
+        sC_linear = storage.sC.get_tensor(cute.make_layout((block_m * block_n,), stride=(1,)))
+        sC = cute.make_tensor(sC_linear.iterator, sC_layout)
         # Assignment metadata: one CTA load into SMEM, then reuse everywhere.
         s_meta_layout = cute.make_layout((block_m,), stride=(1,))
         sAid = storage.sAid.get_tensor(s_meta_layout)
@@ -1430,7 +1440,11 @@ class _FusedMoeMatmulCuTeDecodeWarp:
 
                 stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-            # Epilogue.
+            # Epilogue: apply routed weights (if needed), then store the fp32 accumulator to shared
+            # in fp16/bf16, then scatter to gmem.
+            #
+            # NOTE: `retile` expects a Tensor (not TensorSSA), so we materialize a fragment for the
+            # rmem -> smem store path.
             rC = cute.make_fragment_like(acc, self.dtype)
             if const_expr(self.mul_routed_weight):
                 cC = cute.make_identity_tensor((block_m, block_n))
@@ -1438,16 +1452,16 @@ class _FusedMoeMatmulCuTeDecodeWarp:
                 tAcc = fa_utils.make_acc_tensor_mn_view(acc)
                 tRC = fa_utils.make_acc_tensor_mn_view(rC)
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                    m = Int32(tC_coords[mi, 0][0])
+                    w = sW[m]
                     for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                        m = Int32(tC_coords[mi, ni][0])
-                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * Float32(sW[m]))
+                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * Float32(w))
             else:
                 rC.store(acc.load().to(self.dtype))
-
             smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
             smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
-            tCrC = smem_thr_store.retile(rC)
             tCsC = smem_thr_store.partition_D(sC)
+            tCrC = smem_thr_store.retile(rC)
             cute.copy(smem_store_atom, tCrC, tCsC)
             cute.arch.sync_warp()
 
@@ -1468,7 +1482,7 @@ class _FusedMoeMatmulCuTeDecodeWarp:
                     aid_c = sAid[r_c]
                     col0 = n_start + n_base_c + n0
                     if (aid_c < num_valid_tokens) and (col0 < N):
-                        s_linear_c = Int32(r_c) * Int32(block_n) + n_base_c + n0
+                        s_linear_c = Int32(sC_layout((Int32(r_c), n_base_c + n0)))
                         s_off_bytes_c = cutlass.Int64(s_linear_c) * element_bytes
                         s_ptr_c = cute.make_ptr(
                             self.dtype,
