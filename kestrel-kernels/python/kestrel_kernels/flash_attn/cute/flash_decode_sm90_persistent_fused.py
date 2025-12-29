@@ -254,6 +254,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         SharedStorage: cutlass.Constexpr,
     ):
         tx, ty, tz = cute.arch.thread_idx()
+        is_cta_leader = (tx == 0) and (ty == 0) and (tz == 0)
         task0 = Int32(cute.arch.block_idx()[0])
         grid_stride = Int32(cute.arch.grid_dim()[0])
 
@@ -269,6 +270,12 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
         bdx = const_expr(self.bdx)
         assert bdx in (8, 16)
+        offsets_row_shift = 3 if bdx == 8 else 4
+        offsets_col_mask = bdx - 1
+        tz_merge_offsets = (8, 16) if bdx == 8 else (16,)
+        tz_merge_div = 4 if bdx == 8 else 2
+        tz_merge_mask = tz_merge_div - 1
+        tz_merge_shift = 2 if bdx == 8 else 1
 
         # Shared memory.
         smem = cutlass.utils.SmemAllocator()
@@ -309,11 +316,13 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         offset_bytes_vec = cute.make_rmem_tensor((self.tile_size_per_bdx,), cutlass.Int64)
 
         LOG2_E = math.log2(math.e)
-        scale_log2 = softmax_scale * Float32(LOG2_E)
+        LOG2_E_F32 = Float32(LOG2_E)
+        scale_log2 = softmax_scale * LOG2_E_F32
         split_tokens = Int32(self.split_tokens)
+        num_stages_smem_i32 = Int32(self.num_stages_smem)
+        cp_async_wait_n = Int32(self.num_stages_smem - 1)
 
-        task = task0
-        while task < total_tasks:
+        for task in cutlass.range(task0, total_tasks, grid_stride):
             batch_idx, rem1 = divmod(task, tasks_per_batch_div)
             block_y, split_idx = divmod(rem1, num_splits_div)
 
@@ -369,9 +378,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
             if active_split:
                 base = chunk_size_total // active_splits
                 rem = chunk_size_total - base * active_splits
-                split_start = (
-                    chunk_start + split_idx * base + cutlass.min(split_idx, rem)
-                )
+                split_start = chunk_start + split_idx * base + cutlass.min(split_idx, rem)
                 split_end = split_start + base + (Int32(1) if split_idx < rem else Int32(0))
 
             chunk_size = split_end - split_start
@@ -420,14 +427,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         token_off = iter_i * Int32(self.tile_tokens) + token_in_iter
                         valid = token_off < chunk_size
                         linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
-                        if const_expr(bdx == 8):
-                            row = linear >> 3
-                            col = linear & 7
-                        else:
-                            row = linear >> 4
-                            col = linear & 15
-                        offset16 = sOffsets_token_major[row, col]
-                        offset_bytes = cutlass.Int64(offset16) << offset_shift
+                        row = linear >> offsets_row_shift
+                        col = linear & offsets_col_mask
+                        offset16_i32 = sOffsets_token_major[row, col]
+                        offset16_u32 = cutlass.Uint32(offset16_i32)
+                        offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                         offset_bytes_vec[j] = offset_bytes
                         gmem_ptr = cute.make_ptr(
                             self.dtype,
@@ -449,11 +453,10 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             assumed_align=align_bytes,
                         )
                         dst = cute.make_tensor(smem_ptr, (self.vec_size,))
-                        if valid:
-                            cute.copy(atom_async_copy, src, dst)
-                        else:
-                            cute.copy(atom_async_copy, src, dst, pred=pred_false)
-                    cute.arch.cp_async_commit_group()
+                    if valid:
+                        cute.copy(atom_async_copy, src, dst)
+                    else:
+                        cute.copy(atom_async_copy, src, dst, pred=pred_false)
                     # V
                     for j in cutlass.range_constexpr(self.tile_size_per_bdx):
                         token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
@@ -485,13 +488,17 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         else:
                             cute.copy(atom_async_copy, src, dst, pred=pred_false)
                     cute.arch.cp_async_commit_group()
-                    stage_idx = stage_idx + 1 if stage_idx + 1 < Int32(self.num_stages_smem) else Int32(0)
+                    stage_idx = (
+                        stage_idx + 1
+                        if stage_idx + 1 < num_stages_smem_i32
+                        else Int32(0)
+                    )
 
             stage_idx = Int32(0)
             s = cute.make_rmem_tensor((self.tile_tokens_per_tz,), Float32)
 
             for iter_idx in cutlass.range(num_iters, unroll=2):
-                prefetch_iter = iter_idx + Int32(self.num_stages_smem)
+                prefetch_iter = iter_idx + num_stages_smem_i32
                 if prefetch_iter % Int32(self.bdx) == 0:
                     if prefetch_iter * Int32(self.tile_tokens) < chunk_size:
                         for j in cutlass.range_constexpr(self.tile_size_per_bdx):
@@ -510,8 +517,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                                 sOffsets_token_major[token_in_iter, tx] = 0
                         cute.arch.barrier()
 
-                cute.arch.cp_async_wait_group(Int32(self.num_stages_smem * 2 - 1))
-                cute.arch.sync_warp()
+                cute.arch.cp_async_wait_group(cp_async_wait_n)
+                cute.arch.barrier()
                 m_prev = m
                 for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                     token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
@@ -533,13 +540,16 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         s[t] = Float32(0.0)
 
                 if qo_head_active:
-                    o_scale = utils.exp2f(m_prev - m)
-                    d *= o_scale
-                    for i in cutlass.range_constexpr(self.vec_size):
-                        o[i] *= o_scale
-                    for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
-                        s[t] = utils.exp2f(s[t] - m)
-                        d += s[t]
+                    # If a tz plane has no valid tokens, keep (m=-inf, d=0) and avoid
+                    # exp2f(-inf - -inf) which can yield NaNs and poison the merge.
+                    if m != -Float32.inf:
+                        o_scale = utils.exp2f(m_prev - m)
+                        d *= o_scale
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            o[i] *= o_scale
+                        for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
+                            s[t] = utils.exp2f(s[t] - m)
+                            d += s[t]
                 cute.arch.sync_warp()
 
                 if prefetch_iter < num_iters:
@@ -549,14 +559,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         token_off = prefetch_iter * Int32(self.tile_tokens) + token_in_iter
                         valid = token_off < chunk_size
                         linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
-                        if const_expr(bdx == 8):
-                            row = linear >> 3
-                            col = linear & 7
-                        else:
-                            row = linear >> 4
-                            col = linear & 15
-                        offset16 = sOffsets_token_major[row, col]
-                        offset_bytes = cutlass.Int64(offset16) << offset_shift
+                        row = linear >> offsets_row_shift
+                        col = linear & offsets_col_mask
+                        offset16_i32 = sOffsets_token_major[row, col]
+                        offset16_u32 = cutlass.Uint32(offset16_i32)
+                        offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                         offset_bytes_vec[j] = offset_bytes
                         gmem_ptr = cute.make_ptr(
                             self.dtype,
@@ -582,10 +589,9 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             cute.copy(atom_async_copy, src, dst)
                         else:
                             cute.copy(atom_async_copy, src, dst, pred=pred_false)
-                cute.arch.cp_async_commit_group()
 
-                cute.arch.cp_async_wait_group(Int32(self.num_stages_smem * 2 - 1))
-                cute.arch.sync_warp()
+                cute.arch.cp_async_wait_group(cp_async_wait_n)
+                cute.arch.barrier()
                 if qo_head_active:
                     for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                         token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
@@ -629,7 +635,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         else:
                             cute.copy(atom_async_copy, src, dst, pred=pred_false)
                 cute.arch.cp_async_commit_group()
-                stage_idx = stage_idx + 1 if stage_idx + 1 < Int32(self.num_stages_smem) else Int32(0)
+                stage_idx = (
+                    stage_idx + 1
+                    if stage_idx + 1 < num_stages_smem_i32
+                    else Int32(0)
+                )
 
             if active_split:
                 cute.arch.cp_async_wait_group(0)
@@ -665,38 +675,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     if const_expr(self.bdy == 1):
                         if qo_head_active:
                             o_other = cute.make_rmem_tensor((self.vec_size,), Float32)
-                            if const_expr(bdx == 8):
-                                for offset in (8, 16):
-                                    m2 = cute.arch.shuffle_sync_bfly(m, offset=offset)
-                                    d2 = cute.arch.shuffle_sync_bfly(d, offset=offset)
-                                    for i in cutlass.range_constexpr(self.vec_size):
-                                        o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=offset)
-                                    if d == Float32(0.0):
-                                        m = m2
-                                        d = d2
-                                        for i in cutlass.range_constexpr(self.vec_size):
-                                            o[i] = o_other[i]
-                                    elif d2 != Float32(0.0):
-                                        m_new = utils.fmax(m, m2)
-                                        scale_self = utils.exp2f(m - m_new)
-                                        scale_other = utils.exp2f(m2 - m_new)
-                                        d = d * scale_self + d2 * scale_other
-                                        for i in cutlass.range_constexpr(self.vec_size):
-                                            o[i] = o[i] * scale_self + o_other[i] * scale_other
-                                        m = m_new
-
-                                if (tz & Int32(3)) == Int32(0):
-                                    warp_id = tz >> Int32(2)
-                                    for i in cutlass.range_constexpr(self.vec_size):
-                                        sOMerge[warp_id, ty, tx * Int32(self.vec_size) + i] = o[i]
-                                    if tx == 0:
-                                        sM[warp_id, ty] = m
-                                        sD[warp_id, ty] = d
-                            else:
-                                m2 = cute.arch.shuffle_sync_bfly(m, offset=16)
-                                d2 = cute.arch.shuffle_sync_bfly(d, offset=16)
+                            for offset in tz_merge_offsets:
+                                m2 = cute.arch.shuffle_sync_bfly(m, offset=offset)
+                                d2 = cute.arch.shuffle_sync_bfly(d, offset=offset)
                                 for i in cutlass.range_constexpr(self.vec_size):
-                                    o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=16)
+                                    o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=offset)
                                 if d == Float32(0.0):
                                     m = m2
                                     d = d2
@@ -711,21 +694,18 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                                         o[i] = o[i] * scale_self + o_other[i] * scale_other
                                     m = m_new
 
-                                if (tz & Int32(1)) == Int32(0):
-                                    warp_id = tz >> Int32(1)
-                                    for i in cutlass.range_constexpr(self.vec_size):
-                                        sOMerge[warp_id, ty, tx * Int32(self.vec_size) + i] = o[i]
-                                    if tx == 0:
-                                        sM[warp_id, ty] = m
-                                        sD[warp_id, ty] = d
+                            if (tz & Int32(tz_merge_mask)) == Int32(0):
+                                warp_id = tz >> Int32(tz_merge_shift)
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    sOMerge[warp_id, ty, tx * Int32(self.vec_size) + i] = o[i]
+                                if tx == 0:
+                                    sM[warp_id, ty] = m
+                                    sD[warp_id, ty] = d
 
                         cute.arch.barrier()
 
                         if tz == 0 and qo_head_active:
-                            if const_expr(bdx == 8):
-                                num_partials = self.bdz // 4
-                            else:
-                                num_partials = self.bdz // 2
+                            num_partials = self.bdz // tz_merge_div
                             m_merge = -Float32.inf
                             d_merge = Float32(0.0)
                             o_merge = cute.make_rmem_tensor((self.vec_size,), Float32)
@@ -816,86 +796,244 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     if tx == 0:
                         mLSE_partial[split_idx, batch_idx, qo_head_idx, 0] = -Float32.inf
 
-            if active_split:
-                # Ensure partial writes are visible before we publish split completion.
-                cute.arch.sync_threads()
+            if self.bdx * self.bdy <= cute.arch.WARP_SIZE:
+                # Warp-scoped epilogue:
+                # When (bdx * bdy) <= 32, partial writes, atomic publish, and combine all live in a
+                # single warp. Avoid CTA-wide sync_threads() barriers which stall unrelated warps.
+                is_last = Int32(0)
+                if active_split:
+                    if is_cta_leader:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        old = utils.atomic_add_release_i32(Int32(1), ctr_ptr)
+                        is_last = Int32(1) if old == (active_splits - 1) else Int32(0)
+                    # Broadcast from lane 0 in each warp.
+                    is_last = utils.shuffle_sync(is_last, 0)
 
-                # One counter increment per (batch, head_group, split).
-                if tx == 0 and ty == 0 and tz == 0:
-                    ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
-                    old = utils.atomic_add_acq_rel_i32(Int32(1), ctr_ptr)
-                    sIsLast[0] = Int32(1) if old == (active_splits - 1) else Int32(0)
-                cute.arch.sync_threads()
+                if active_split and is_last != Int32(0):
+                    # Acquire to ensure we see all split partial writes for this group.
+                    if tz == 0 and qo_head_active:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        _ = utils.ld_acquire_i32(ctr_ptr)
 
-            if active_split and sIsLast[0] != Int32(0):
-                # Acquire to ensure we see all split partial writes for this group.
-                if tz == 0 and qo_head_active:
-                    ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
-                    _ = utils.ld_acquire_i32(ctr_ptr)
-                cute.arch.sync_threads()
+                        # Combine: only tz == 0 writes final outputs.
+                        if const_expr(self.num_splits == 2):
+                            has_s1 = active_splits > Int32(1)
+                            lse0 = mLSE_partial[0, batch_idx, qo_head_idx, 0]
+                            lse1 = -Float32.inf
+                            if has_s1:
+                                lse1 = mLSE_partial[1, batch_idx, qo_head_idx, 0]
 
-                # Combine: only tz == 0 writes final outputs.
-                if tz == 0 and qo_head_active:
-                    # Compute lse_max and denom (unnormalized weights).
-                    lse_max = -Float32.inf
-                    for s_idx in cutlass.range_constexpr(self.num_splits):
-                        lse_s = -Float32.inf
-                        if Int32(s_idx) < active_splits:
-                            lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
-                        lse_max = utils.fmax(lse_max, lse_s)
+                            lse_max = utils.fmax(lse0, lse1)
+                            lse_max_cur = (
+                                Float32(0.0) if lse_max == -Float32.inf else lse_max
+                            )
 
-                    lse_max_cur = Float32(0.0) if lse_max == -Float32.inf else lse_max
-                    denom = Float32(0.0)
-                    acc = cute.make_rmem_tensor((self.vec_size,), Float32)
-                    acc.fill(0.0)
-                    for s_idx in cutlass.range_constexpr(self.num_splits):
-                        if Int32(s_idx) < active_splits:
-                            lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
-                            wi = utils.exp2f((lse_s - lse_max_cur) * Float32(LOG2_E))
-                            denom += wi
+                            w0 = utils.exp2f((lse0 - lse_max_cur) * LOG2_E_F32)
+                            denom = w0
+
+                            acc = cute.make_rmem_tensor((self.vec_size,), Float32)
                             for i in cutlass.range_constexpr(self.vec_size):
-                                idx = Int32(self.bdx) * i + tx
-                                acc[i] += wi * mO_partial[
-                                    s_idx,
+                                acc[i] = w0 * mO_partial[
+                                    0,
                                     batch_idx,
                                     0,
                                     qo_head_idx,
-                                    idx,
+                                    Int32(self.bdx) * i + tx,
                                 ]
-                    inv_denom = (
-                        Float32(0.0)
-                        if (denom == Float32(0.0) or denom != denom)
-                        else Float32(1.0) / denom
-                    )
 
-                    for i in cutlass.range_constexpr(self.vec_size):
-                        acc[i] *= inv_denom
+                            if has_s1:
+                                w1 = utils.exp2f((lse1 - lse_max_cur) * LOG2_E_F32)
+                                denom += w1
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    acc[i] += w1 * mO_partial[
+                                        1,
+                                        batch_idx,
+                                        0,
+                                        qo_head_idx,
+                                        Int32(self.bdx) * i + tx,
+                                    ]
+                        else:
+                            lse_max = -Float32.inf
+                            for s_idx in cutlass.range_constexpr(self.num_splits):
+                                lse_s = -Float32.inf
+                                if Int32(s_idx) < active_splits:
+                                    lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
+                                lse_max = utils.fmax(lse_max, lse_s)
 
-                    o_out = cute.make_rmem_tensor((self.vec_size,), self.dtype)
-                    for i in cutlass.range_constexpr(self.vec_size):
-                        o_out[i] = acc[i].to(self.dtype)
-                    o_ptr_i64 = utils.elem_pointer_i64(
-                        mO, (0, tx * Int32(self.vec_size), qo_head_idx, batch_idx)
-                    ).toint()
-                    o_ptr = cute.make_ptr(
-                        self.dtype,
-                        o_ptr_i64,
-                        cute.AddressSpace.gmem,
-                        assumed_align=align_bytes,
-                    )
-                    o_dst = cute.make_tensor(o_ptr, (self.vec_size,))
-                    cute.copy(atom_universal_copy, o_out, o_dst)
-                    if const_expr(mLSE is not None):
-                        if tx == 0:
-                            mLSE[0, qo_head_idx, batch_idx] = utils.logf(denom) + lse_max
+                            lse_max_cur = (
+                                Float32(0.0) if lse_max == -Float32.inf else lse_max
+                            )
+                            denom = Float32(0.0)
+                            acc = cute.make_rmem_tensor((self.vec_size,), Float32)
+                            acc.fill(0.0)
+                            for s_idx in cutlass.range_constexpr(self.num_splits):
+                                if Int32(s_idx) < active_splits:
+                                    lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
+                                    wi = utils.exp2f((lse_s - lse_max_cur) * LOG2_E_F32)
+                                    denom += wi
+                                    for i in cutlass.range_constexpr(self.vec_size):
+                                        idx = Int32(self.bdx) * i + tx
+                                        acc[i] += wi * mO_partial[
+                                            s_idx,
+                                            batch_idx,
+                                            0,
+                                            qo_head_idx,
+                                            idx,
+                                        ]
+                        inv_denom = (
+                            Float32(0.0)
+                            if (denom == Float32(0.0) or denom != denom)
+                            else Float32(1.0) / denom
+                        )
 
-                cute.arch.sync_threads()
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            acc[i] *= inv_denom
 
-                # Reset counter for this group so the buffer can be reused on next replay.
-                if tx == 0 and ty == 0 and tz == 0:
-                    ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
-                    utils.atomic_exch_i32(Int32(0), ctr_ptr)
-                    sIsLast[0] = Int32(0)
-                cute.arch.sync_threads()
+                        o_out = cute.make_rmem_tensor((self.vec_size,), self.dtype)
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            o_out[i] = acc[i].to(self.dtype)
+                        o_ptr_i64 = utils.elem_pointer_i64(
+                            mO, (0, tx * Int32(self.vec_size), qo_head_idx, batch_idx)
+                        ).toint()
+                        o_ptr = cute.make_ptr(
+                            self.dtype,
+                            o_ptr_i64,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        o_dst = cute.make_tensor(o_ptr, (self.vec_size,))
+                        cute.copy(atom_universal_copy, o_out, o_dst)
+                        if const_expr(mLSE is not None):
+                            if tx == 0:
+                                mLSE[0, qo_head_idx, batch_idx] = utils.logf(denom) + lse_max
 
-            task = task + grid_stride
+                    # Reset counter for this group so the buffer can be reused on next replay.
+                    if is_cta_leader:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        utils.atomic_exch_i32(Int32(0), ctr_ptr)
+            else:
+                if active_split:
+                    # Ensure partial writes are visible before we publish split completion.
+                    cute.arch.sync_threads()
+
+                    # One counter increment per (batch, head_group, split).
+                    if is_cta_leader:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        # Publication ordering note:
+                        # Partial outputs are written by multiple warps in this CTA.
+                        # Using only a release atomic here was insufficient for correctness (we observed
+                        # mismatches in head_dim=128, qhead_per_kvhead=4, return_lse=True).
+                        # Use acq_rel as a stronger publish barrier before the last-split consumer reads.
+                        old = utils.atomic_add_acq_rel_i32(Int32(1), ctr_ptr)
+                        sIsLast[0] = Int32(1) if old == (active_splits - 1) else Int32(0)
+                    cute.arch.sync_threads()
+
+                if active_split and sIsLast[0] != Int32(0):
+                    # Acquire to ensure we see all split partial writes for this group.
+                    if tz == 0 and qo_head_active:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        _ = utils.ld_acquire_i32(ctr_ptr)
+                    cute.arch.sync_threads()
+
+                    # Combine: only tz == 0 writes final outputs.
+                    if tz == 0 and qo_head_active:
+                        # Compute lse_max and denom (unnormalized weights).
+                        if const_expr(self.num_splits == 2):
+                            has_s1 = active_splits > Int32(1)
+                            lse0 = mLSE_partial[0, batch_idx, qo_head_idx, 0]
+                            lse1 = -Float32.inf
+                            if has_s1:
+                                lse1 = mLSE_partial[1, batch_idx, qo_head_idx, 0]
+
+                            lse_max = utils.fmax(lse0, lse1)
+                            lse_max_cur = (
+                                Float32(0.0) if lse_max == -Float32.inf else lse_max
+                            )
+
+                            w0 = utils.exp2f((lse0 - lse_max_cur) * LOG2_E_F32)
+                            denom = w0
+
+                            acc = cute.make_rmem_tensor((self.vec_size,), Float32)
+                            for i in cutlass.range_constexpr(self.vec_size):
+                                acc[i] = w0 * mO_partial[
+                                    0,
+                                    batch_idx,
+                                    0,
+                                    qo_head_idx,
+                                    Int32(self.bdx) * i + tx,
+                                ]
+
+                            if has_s1:
+                                w1 = utils.exp2f((lse1 - lse_max_cur) * LOG2_E_F32)
+                                denom += w1
+                                for i in cutlass.range_constexpr(self.vec_size):
+                                    acc[i] += w1 * mO_partial[
+                                        1,
+                                        batch_idx,
+                                        0,
+                                        qo_head_idx,
+                                        Int32(self.bdx) * i + tx,
+                                    ]
+                        else:
+                            lse_max = -Float32.inf
+                            for s_idx in cutlass.range_constexpr(self.num_splits):
+                                lse_s = -Float32.inf
+                                if Int32(s_idx) < active_splits:
+                                    lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
+                                lse_max = utils.fmax(lse_max, lse_s)
+
+                            lse_max_cur = (
+                                Float32(0.0) if lse_max == -Float32.inf else lse_max
+                            )
+                            denom = Float32(0.0)
+                            acc = cute.make_rmem_tensor((self.vec_size,), Float32)
+                            acc.fill(0.0)
+                            for s_idx in cutlass.range_constexpr(self.num_splits):
+                                if Int32(s_idx) < active_splits:
+                                    lse_s = mLSE_partial[s_idx, batch_idx, qo_head_idx, 0]
+                                    wi = utils.exp2f((lse_s - lse_max_cur) * LOG2_E_F32)
+                                    denom += wi
+                                    for i in cutlass.range_constexpr(self.vec_size):
+                                        idx = Int32(self.bdx) * i + tx
+                                        acc[i] += wi * mO_partial[
+                                            s_idx,
+                                            batch_idx,
+                                            0,
+                                            qo_head_idx,
+                                            idx,
+                                        ]
+                        inv_denom = (
+                            Float32(0.0)
+                            if (denom == Float32(0.0) or denom != denom)
+                            else Float32(1.0) / denom
+                        )
+
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            acc[i] *= inv_denom
+
+                        o_out = cute.make_rmem_tensor((self.vec_size,), self.dtype)
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            o_out[i] = acc[i].to(self.dtype)
+                        o_ptr_i64 = utils.elem_pointer_i64(
+                            mO, (0, tx * Int32(self.vec_size), qo_head_idx, batch_idx)
+                        ).toint()
+                        o_ptr = cute.make_ptr(
+                            self.dtype,
+                            o_ptr_i64,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        o_dst = cute.make_tensor(o_ptr, (self.vec_size,))
+                        cute.copy(atom_universal_copy, o_out, o_dst)
+                        if const_expr(mLSE is not None):
+                            if tx == 0:
+                                mLSE[0, qo_head_idx, batch_idx] = utils.logf(denom) + lse_max
+
+                    cute.arch.sync_threads()
+
+                    # Reset counter for this group so the buffer can be reused on next replay.
+                    if is_cta_leader:
+                        ctr_ptr = utils.elem_pointer(mSplitCounters, (batch_idx, block_y))
+                        utils.atomic_exch_i32(Int32(0), ctr_ptr)
+                        sIsLast[0] = Int32(0)
+                    cute.arch.sync_threads()

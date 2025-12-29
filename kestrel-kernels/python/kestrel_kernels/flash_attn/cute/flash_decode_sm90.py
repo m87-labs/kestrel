@@ -382,8 +382,9 @@ class FlashAttentionDecodeSm90:
                 else:
                     row = linear >> 4
                     col = linear & 15
-                offset16 = sOffsets_token_major[row, col]
-                offset_bytes = cutlass.Int64(offset16) << offset_shift
+                offset16_i32 = sOffsets_token_major[row, col]
+                offset16_u32 = cutlass.Uint32(offset16_i32)
+                offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                 offset_bytes_vec[j] = offset_bytes
                 gmem_ptr = cute.make_ptr(
                     self.dtype,
@@ -406,7 +407,6 @@ class FlashAttentionDecodeSm90:
                     cute.copy(atom_async_copy, src, dst)
                 else:
                     cute.copy(atom_async_copy, src, dst, pred=pred_false)
-            cute.arch.cp_async_commit_group()
             # V
             for j in cutlass.range_constexpr(self.tile_size_per_bdx):
                 token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
@@ -462,8 +462,8 @@ class FlashAttentionDecodeSm90:
                     cute.arch.barrier()
 
             # Compute QK on current stage.
-            cute.arch.cp_async_wait_group(self.num_stages_smem * 2 - 1)
-            cute.arch.sync_warp()
+            cute.arch.cp_async_wait_group(self.num_stages_smem - 1)
+            cute.arch.barrier()
             m_prev = m
             for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                 token_in_stage = tz * self.tile_tokens_per_tz + t
@@ -487,13 +487,20 @@ class FlashAttentionDecodeSm90:
 
             if qo_head_active:
                 # Update running softmax stats and rescale output accumulator.
-                o_scale = utils.exp2f(m_prev - m)
-                d *= o_scale
-                for i in cutlass.range_constexpr(self.vec_size):
-                    o[i] *= o_scale
-                for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
-                    s[t] = utils.exp2f(s[t] - m)
-                    d += s[t]
+                #
+                # When this tz lane has no valid tokens in the current tile, we can have
+                # m_prev == m == -inf, which would otherwise produce NaNs in (m_prev - m).
+                if m == -Float32.inf:
+                    for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
+                        s[t] = Float32(0.0)
+                else:
+                    o_scale = utils.exp2f(m_prev - m)
+                    d *= o_scale
+                    for i in cutlass.range_constexpr(self.vec_size):
+                        o[i] *= o_scale
+                    for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
+                        s[t] = utils.exp2f(s[t] - m)
+                        d += s[t]
             cute.arch.sync_warp()
 
             # Prefetch next K tile (overwrites current stage).
@@ -510,8 +517,9 @@ class FlashAttentionDecodeSm90:
                     else:
                         row = linear >> 4
                         col = linear & 15
-                    offset16 = sOffsets_token_major[row, col]
-                    offset_bytes = cutlass.Int64(offset16) << offset_shift
+                    offset16_i32 = sOffsets_token_major[row, col]
+                    offset16_u32 = cutlass.Uint32(offset16_i32)
+                    offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                     offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
                         self.dtype,
@@ -534,11 +542,10 @@ class FlashAttentionDecodeSm90:
                         cute.copy(atom_async_copy, src, dst)
                     else:
                         cute.copy(atom_async_copy, src, dst, pred=pred_false)
-            cute.arch.cp_async_commit_group()
 
             # Update output using V for current stage.
-            cute.arch.cp_async_wait_group(self.num_stages_smem * 2 - 1)
-            cute.arch.sync_warp()
+            cute.arch.cp_async_wait_group(self.num_stages_smem - 1)
+            cute.arch.barrier()
             if qo_head_active:
                 for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                     token_in_stage = tz * self.tile_tokens_per_tz + t

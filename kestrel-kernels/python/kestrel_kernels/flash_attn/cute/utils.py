@@ -451,24 +451,27 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 
 
 @dsl_user_op
-def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return cutlass.Int32(
-        nvvm.atomicrmw(
-            res=T.i32(),
-            op=nvvm.AtomicOpKind.ADD,
-            ptr=gmem_ptr.llvm_ptr,
-            a=Int32(a).ir_value(),
-        )
-    )
-
-
-@dsl_user_op
 def atomic_add_acq_rel_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     old = llvm.inline_asm(
         T.i32(),
         [gmem_ptr_i64, Int32(a).ir_value(loc=loc, ip=ip)],
         "atom.global.add.acq_rel.gpu.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Int32(old)
+
+
+@dsl_user_op
+def atomic_add_release_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    old = llvm.inline_asm(
+        T.i32(),
+        [gmem_ptr_i64, Int32(a).ir_value(loc=loc, ip=ip)],
+        "atom.global.add.release.gpu.s32 $0, [$1], $2;",
         "=r,l,r",
         has_side_effects=True,
         is_align_stack=False,
