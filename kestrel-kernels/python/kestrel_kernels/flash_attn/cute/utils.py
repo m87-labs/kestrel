@@ -10,7 +10,7 @@ from functools import partial
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -448,6 +448,65 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     nvvm.atomicrmw(
         res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
     )
+
+
+@dsl_user_op
+def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    return cutlass.Int32(
+        nvvm.atomicrmw(
+            res=T.i32(),
+            op=nvvm.AtomicOpKind.ADD,
+            ptr=gmem_ptr.llvm_ptr,
+            a=Int32(a).ir_value(),
+        )
+    )
+
+
+@dsl_user_op
+def atomic_add_acq_rel_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    old = llvm.inline_asm(
+        T.i32(),
+        [gmem_ptr_i64, Int32(a).ir_value(loc=loc, ip=ip)],
+        "atom.global.add.acq_rel.gpu.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Int32(old)
+
+
+@dsl_user_op
+def ld_acquire_i32(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    val = llvm.inline_asm(
+        T.i32(),
+        [gmem_ptr_i64],
+        "ld.global.acquire.gpu.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Int32(val)
+
+
+@dsl_user_op
+def atomic_exch_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    return cutlass.Int32(
+        nvvm.atomicrmw(
+            res=T.i32(),
+            op=nvvm.AtomicOpKind.EXCH,
+            ptr=gmem_ptr.llvm_ptr,
+            a=Int32(a).ir_value(),
+        )
+    )
+
+
+@dsl_user_op
+def fence_sc_gpu(*, loc=None, ip=None) -> None:
+    nvvm.fence_sc_gpu()
 
 
 @dsl_user_op

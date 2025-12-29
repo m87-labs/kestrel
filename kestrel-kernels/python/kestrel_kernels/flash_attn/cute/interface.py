@@ -12,7 +12,7 @@
 # - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
 
 # Features not supported yet:
-# - split (i.e. FlashDecoding)
+# - general SplitKV (except the SM90 page_size==1 decode fused path)
 # - tuned block sizes
 # - append KV to existing KV cache
 # - FP8
@@ -42,6 +42,9 @@ from kestrel_kernels.flash_attn.cute.flash_fwd import (
     FlashAttentionForwardSm90,
 )
 from kestrel_kernels.flash_attn.cute.flash_decode_sm90 import FlashAttentionDecodeSm90
+from kestrel_kernels.flash_attn.cute.flash_decode_sm90_persistent_fused import (
+    FlashAttentionDecodeSm90PersistentSplitFused,
+)
 from kestrel_kernels.flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from kestrel_kernels.flash_attn.cute.flash_bwd_preprocess import (
     FlashAttentionBackwardPreprocess,
@@ -97,6 +100,54 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+
+_sm90_decode_persistent_split_fused_counter_cache: dict[
+    tuple[int, int, int, int], torch.Tensor
+] = {}
+
+
+def _get_sm90_decode_persistent_split_fused_counters(
+    *,
+    device: torch.device,
+    batch_size: int,
+    num_kv_heads: int,
+    group_count: int,
+) -> torch.Tensor:
+    """Get a reusable int32 counter buffer for the fused persistent split path.
+
+    Important: we intentionally do *not* zero the buffer here to avoid capturing a memset
+    into CUDA graphs. The fused kernel resets counters to 0 after each replay.
+    """
+    if device.type != "cuda":
+        raise ValueError(f"Expected CUDA device; got {device!r}")
+    if device.index is None:
+        dev_index = int(torch.cuda.current_device())
+        device = torch.device("cuda", dev_index)
+    else:
+        dev_index = int(device.index)
+
+    batch_size = int(batch_size)
+    num_kv_heads = int(num_kv_heads)
+    group_count = int(group_count)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive (got {batch_size})")
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive (got {num_kv_heads})")
+    if group_count <= 0:
+        raise ValueError(f"group_count must be positive (got {group_count})")
+
+    shape = (batch_size, num_kv_heads * group_count)
+    key = (dev_index, batch_size, num_kv_heads, group_count)
+    buf = _sm90_decode_persistent_split_fused_counter_cache.get(key)
+    if (
+        buf is None
+        or buf.device != device
+        or buf.dtype != torch.int32
+        or tuple(buf.shape) != shape
+    ):
+        buf = torch.zeros(shape, device=device, dtype=torch.int32)
+        _sm90_decode_persistent_split_fused_counter_cache[key] = buf
+    return buf
 
 
 def _flash_attn_fwd(
@@ -316,6 +367,122 @@ def _flash_attn_fwd(
             128,
         )
 
+    # Optional: SM90 decode-only persistent split path (page_size==1).
+    #
+    # Default behavior: enable only during CUDA graph capture (decode is graph-replayed in
+    # production) and only for small batches where the baseline grid under-fills the GPU.
+    sm90_persist_oversub = 4
+    sm90_persistent_split_enabled = (
+        torch.cuda.is_current_stream_capturing()
+        and (not requires_grad)
+        and compute_capability == 9
+        and batch_size <= 4
+        and page_table is not None
+        and page_size == 1
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is not None
+        and seqlen_q == 1
+        and head_dim_v == head_dim
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and learnable_sink is None
+        and head_dim in (64, 128)
+    )
+    if sm90_persistent_split_enabled:
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        # Baseline SM90 decode launches one CTA per (batch, kv_head_group).
+        tmp_kernel = FlashAttentionDecodeSm90PersistentSplitFused(
+            dtype=dtype,
+            head_dim=head_dim,
+            qhead_per_kvhead=qhead_per_kvhead,
+            num_splits=2,
+            is_causal=causal,
+            is_local=local,
+            split_tokens=1,
+            persist_oversub=sm90_persist_oversub,
+        )
+        head_groups = num_head_kv * tmp_kernel.group_count
+        baseline_blocks = batch_size * head_groups
+        # Heuristic: use split-KV when the baseline grid is too small to fill the GPU.
+        #
+        # For this kernel on H100 we tend to be limited to ~4 CTAs/SM (register + smem),
+        # so target at least one full "wave" of work:
+        #
+        #   target_tasks ~= sm_count * persist_oversub
+        target_tasks = int(sm_count) * int(sm90_persist_oversub)
+        desired_splits = (target_tasks + baseline_blocks - 1) // max(1, baseline_blocks)
+        if desired_splits <= 1:
+            sm90_persistent_split_enabled = False
+            # Avoid accidentally selecting the unsupported generic SplitKV path on SM90.
+            num_splits = 1
+        else:
+            # Compile with a small fixed max_splits (for graph capture), and let the kernel compute
+            # active splits from seqused_k at runtime. This makes CUDA graph replay adapt to the
+            # *actual* KV work (instead of being tied to the page_table capacity used during capture).
+            if head_dim == 64 and int(qhead_per_kvhead) == 1:
+                # MHA decode: baseline is already 1 CTA per head, so splitting too much can be
+                # net-negative (extra partial traffic + counter coordination).
+                #
+                # Target ~1 CTA/SM worth of split work for the common B<=4 decode graphs.
+                sm90_max_splits = (int(sm_count) + baseline_blocks - 1) // max(1, baseline_blocks)
+                sm90_max_splits = max(2, min(int(sm90_max_splits), 4))
+            else:
+                sm90_max_splits = max(2, min(int(desired_splits), 6))
+
+            # Split-token heuristic:
+            # - Target ~740-1000 decode context lengths (Moondream-ish) and keep split sizes aligned.
+            if head_dim == 64 and int(qhead_per_kvhead) == 1:
+                # Keep the active split count modest for typical decode lengths.
+                sm90_split_tokens = 256 if sm90_max_splits >= 3 else 64
+            else:
+                sm90_split_tokens = 192 if head_dim == 128 else 64
+
+            out_partial = torch.empty(
+                sm90_max_splits,
+                *q_batch_seqlen_shape,
+                num_head,
+                head_dim_v,
+                dtype=torch.float32,
+                device=device,
+            )
+            lse_partial = torch.empty(
+                sm90_max_splits, *lse_shape, dtype=torch.float32, device=device
+            )
+            # Counter is per (batch, head_group). Use the fused kernel's group_count.
+            split_counters = _get_sm90_decode_persistent_split_fused_counters(
+                device=device,
+                batch_size=batch_size,
+                num_kv_heads=num_head_kv,
+                group_count=tmp_kernel.group_count,
+            )
+            _flash_attn_sm90_decode_persistent_split_fused(
+                q,
+                k,
+                v,
+                out,
+                lse,
+                page_table=page_table,
+                seqused_k=seqused_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                local=local,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                qhead_per_kvhead=qhead_per_kvhead,
+                num_splits=sm90_max_splits,
+                split_tokens=sm90_split_tokens,
+                persist_oversub=sm90_persist_oversub,
+                out_partial=out_partial,
+                lse_partial=lse_partial,
+                split_counters=split_counters,
+            )
+            _flash_attn_fwd._debug_last_impl = "sm90_decode_persistent_split_fused"
+            return out, lse
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
@@ -411,6 +578,7 @@ def _flash_attn_fwd(
         m_block_size,
         n_block_size,
         num_threads,
+        num_splits,
         is_split_kv,
         pack_gqa,
         compute_capability,
@@ -465,7 +633,8 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
         if compute_capability == 9:
-            assert not is_split_kv, "SplitKV not supported on SM 9.0"
+            if is_split_kv:
+                raise NotImplementedError("SplitKV is not supported on SM90.")
             if page_table is not None and not inferred_paged_kv_non_tma:
                 assert page_size == n_block_size, (
                     "paged KV TMA path on SM90 requires page_size == n_block_size "
@@ -587,11 +756,13 @@ def _flash_attn_fwd(
     # Expose last dispatch choice for tests.
     _flash_attn_fwd._debug_last_impl = "sm90_decode" if use_sm90_decode_fastpath else "fwd"
     if is_split_kv:
+        lse_partial_bsh = lse_partial.transpose(-1, -2)
+        lse_bsh = lse.transpose(-1, -2) if lse is not None else None
         _flash_attn_fwd_combine(
             out_partial,
-            lse_partial.transpose(-1, -2),
+            lse_partial_bsh,
             out,
-            lse.transpose(-1, -2) if lse is not None else None,
+            lse_bsh,
             cu_seqlens_q,
             seqused_q,
         )
@@ -1466,6 +1637,121 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
     )
+
+
+def _flash_attn_sm90_decode_persistent_split_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    *,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    local: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    qhead_per_kvhead: int,
+    num_splits: int,
+    split_tokens: int,
+    persist_oversub: int,
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    split_counters: torch.Tensor,
+) -> None:
+    """SM90 decode-only persistent split with in-kernel combine (page_size==1, seqlen_q==1)."""
+    assert q.is_cuda and k.is_cuda and v.is_cuda and out.is_cuda, "tensors must be on CUDA device"
+    assert page_table.is_cuda and seqused_k.is_cuda, "page_table/seqused_k must be on CUDA device"
+    assert q.shape[1] == 1 and out.shape[1] == 1, "fused decode requires seqlen_q == 1"
+    assert q.dtype == out.dtype, "q/out dtype mismatch"
+    assert out_partial.dtype == torch.float32 and lse_partial.dtype == torch.float32, "partials must be fp32"
+    assert split_counters.dtype == torch.int32, "split_counters must be int32"
+    if lse is not None:
+        assert lse.is_cuda and lse.dtype == torch.float32, "lse must be fp32 CUDA tensor"
+
+    dtype = torch2cute_dtype_map[q.dtype]
+    head_dim = q.shape[-1]
+    assert head_dim in (64, 128), "fused persistent split is only tuned for head_dim 64/128"
+
+    compile_key = (
+        dtype,
+        head_dim,
+        int(qhead_per_kvhead),
+        bool(causal),
+        bool(local),
+        int(num_splits),
+        int(split_tokens),
+        int(persist_oversub),
+        window_size_left is not None,
+        window_size_right is not None,
+        lse is None,
+    )
+    if compile_key not in _flash_attn_sm90_decode_persistent_split_fused.compile_cache:
+        q_tensor = to_cute_tensor(q)
+        k_tensor = to_cute_tensor(k)
+        v_tensor = to_cute_tensor(v)
+        out_tensor = to_cute_tensor(out)
+        lse_tensor = (
+            to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+        )
+        page_table_tensor = to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
+        seqused_k_tensor = to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0)
+        out_partial_tensor = to_cute_tensor(out_partial, leading_dim=4)
+        lse_partial_tensor = to_cute_tensor(lse_partial, assumed_align=4)
+        split_counters_tensor = to_cute_tensor(split_counters, assumed_align=4, leading_dim=1)
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
+            dtype=dtype,
+            head_dim=head_dim,
+            qhead_per_kvhead=int(qhead_per_kvhead),
+            num_splits=int(num_splits),
+            is_causal=bool(causal),
+            is_local=bool(local),
+            split_tokens=int(split_tokens),
+            persist_oversub=int(persist_oversub),
+        )
+        _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = cute.compile(
+            fa_fused,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            out_tensor,
+            lse_tensor,
+            seqused_k_tensor,
+            page_table_tensor,
+            out_partial_tensor,
+            lse_partial_tensor,
+            split_counters_tensor,
+            softmax_scale,
+            window_size_left,
+            window_size_right,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key](
+        q,
+        k,
+        v,
+        out,
+        lse,
+        seqused_k,
+        page_table,
+        out_partial,
+        lse_partial,
+        split_counters,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        current_stream,
+    )
+
+
+_flash_attn_sm90_decode_persistent_split_fused.compile_cache = {}
 
 
 def _flash_attn_fwd_combine(

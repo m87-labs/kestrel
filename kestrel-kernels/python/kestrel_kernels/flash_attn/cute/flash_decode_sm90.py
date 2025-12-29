@@ -117,9 +117,13 @@ class FlashAttentionDecodeSm90:
 
     def _shared_storage_cls(self):
         cosize_kv_stage = self.num_stages_smem * self.tile_tokens * self.head_dim
-        # Pad the fast offset ring-buffer by 1 element per row to avoid pathological
-        # shared-memory bank conflicts from the (token_in_iter, tx) store pattern.
-        cosize_offsets = self.tile_tokens * (self.bdx + 1)
+        # Store offsets as 32-bit units (bytes / 16) to reduce shared-memory traffic and
+        # eliminate 64-bit bank conflicts in the (token_in_iter, tx) store pattern.
+        #
+        # Padding is chosen so that rows separated by `tile_size_per_bdx` (4) map to disjoint
+        # shared-memory bank sets for the supported bdx in {8, 16}.
+        offset_cols = self.bdx + self.bdx // 4
+        cosize_offsets = self.tile_tokens * offset_cols
 
         sK_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
@@ -127,9 +131,7 @@ class FlashAttentionDecodeSm90:
         sV_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
         ]
-        sOffsets_struct = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Int64, cosize_offsets], 16
-        ]
+        sOffsets_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int32, cosize_offsets], 16]
 
         @cute.struct
         class SharedStorageDecode:
@@ -195,8 +197,9 @@ class FlashAttentionDecodeSm90:
         )
 
         # Offsets are filled in token-major order for coalesced writes.
+        offset_cols = self.bdx + self.bdx // 4
         sOffsets_token_major_layout = cute.make_layout(
-            (self.tile_tokens, self.bdx + 1), stride=(self.bdx + 1, 1)
+            (self.tile_tokens, offset_cols), stride=(offset_cols, 1)
         )
         sOMerge_layout = cute.make_layout(
             (self.bdz, self.bdy, self.head_dim),
@@ -307,6 +310,8 @@ class FlashAttentionDecodeSm90:
 
         element_bytes = cutlass.Int64(self.dtype.width // 8)
         feature_bytes = cutlass.Int64(tx) * cutlass.Int64(self.vec_size) * element_bytes
+        # Offsets are stored in units of 16 bytes, matching the alignment requirement for cp.async.
+        offset_shift = Int32(4)
 
         # Compute K/V byte strides for page + head.
         stride_page_elems = cutlass.Int64(mK.stride[3])
@@ -350,7 +355,8 @@ class FlashAttentionDecodeSm90:
                 offset_elems = cutlass.Int64(page) * stride_page_elems + cutlass.Int64(
                     kv_head_idx
                 ) * stride_head_elems
-                sOffsets_token_major[token_in_iter, tx] = offset_elems * element_bytes
+                offset_bytes = offset_elems * element_bytes
+                sOffsets_token_major[token_in_iter, tx] = Int32(offset_bytes >> offset_shift)
             else:
                 sOffsets_token_major[token_in_iter, tx] = 0
         cute.arch.barrier()
@@ -376,7 +382,8 @@ class FlashAttentionDecodeSm90:
                 else:
                     row = linear >> 4
                     col = linear & 15
-                offset_bytes = sOffsets_token_major[row, col]
+                offset16 = sOffsets_token_major[row, col]
+                offset_bytes = cutlass.Int64(offset16) << offset_shift
                 offset_bytes_vec[j] = offset_bytes
                 gmem_ptr = cute.make_ptr(
                     self.dtype,
@@ -448,7 +455,8 @@ class FlashAttentionDecodeSm90:
                             offset_elems = cutlass.Int64(page) * stride_page_elems + cutlass.Int64(
                                 kv_head_idx
                             ) * stride_head_elems
-                            sOffsets_token_major[token_in_iter, tx] = offset_elems * element_bytes
+                            offset_bytes = offset_elems * element_bytes
+                            sOffsets_token_major[token_in_iter, tx] = Int32(offset_bytes >> offset_shift)
                         else:
                             sOffsets_token_major[token_in_iter, tx] = 0
                     cute.arch.barrier()
@@ -502,7 +510,8 @@ class FlashAttentionDecodeSm90:
                     else:
                         row = linear >> 4
                         col = linear & 15
-                    offset_bytes = sOffsets_token_major[row, col]
+                    offset16 = sOffsets_token_major[row, col]
+                    offset_bytes = cutlass.Int64(offset16) << offset_shift
                     offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
                         self.dtype,
