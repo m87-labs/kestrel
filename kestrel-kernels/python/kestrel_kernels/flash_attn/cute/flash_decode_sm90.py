@@ -300,6 +300,14 @@ class FlashAttentionDecodeSm90:
         bdx = const_expr(self.bdx)
         assert bdx in (8, 16), "Offset swizzle assumes bdx is a power-of-two (8 or 16)"
 
+        # Compile-time constants for bdx-specific logic.
+        offsets_row_shift = 3 if bdx == 8 else 4
+        offsets_col_mask = bdx - 1
+        tz_merge_offsets = (8, 16) if bdx == 8 else (16,)
+        tz_merge_div = 4 if bdx == 8 else 2
+        tz_merge_mask = tz_merge_div - 1
+        tz_merge_shift = 2 if bdx == 8 else 1
+
         # Copy atoms.
         copy_bits = self.vec_size * self.dtype.width
         atom_async_copy = cute.make_copy_atom(
@@ -376,12 +384,8 @@ class FlashAttentionDecodeSm90:
                 token_off = iter_i * self.tile_tokens + token_in_iter
                 valid = token_off < chunk_size
                 linear = slice_idx * self.tile_tokens + token_in_iter
-                if const_expr(bdx == 8):
-                    row = linear >> 3
-                    col = linear & 7
-                else:
-                    row = linear >> 4
-                    col = linear & 15
+                row = linear >> offsets_row_shift
+                col = linear & offsets_col_mask
                 offset16_i32 = sOffsets_token_major[row, col]
                 offset16_u32 = cutlass.Uint32(offset16_i32)
                 offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
@@ -511,12 +515,8 @@ class FlashAttentionDecodeSm90:
                     token_off = prefetch_iter * self.tile_tokens + token_in_iter
                     valid = token_off < chunk_size
                     linear = slice_idx * self.tile_tokens + token_in_iter
-                    if const_expr(bdx == 8):
-                        row = linear >> 3
-                        col = linear & 7
-                    else:
-                        row = linear >> 4
-                        col = linear & 15
+                    row = linear >> offsets_row_shift
+                    col = linear & offsets_col_mask
                     offset16_i32 = sOffsets_token_major[row, col]
                     offset16_u32 = cutlass.Uint32(offset16_i32)
                     offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
@@ -636,41 +636,11 @@ class FlashAttentionDecodeSm90:
                 # - Shared-memory traffic + work in the final tz==0 merge loop.
                 if qo_head_active:
                     o_other = cute.make_rmem_tensor((self.vec_size,), Float32)
-                    if const_expr(self.bdx == 8):
-                        # Reduce over tz_in_warp in {0,1,2,3} using xor offsets 8 and 16.
-                        for offset in (8, 16):
-                            m2 = cute.arch.shuffle_sync_bfly(m, offset=offset)
-                            d2 = cute.arch.shuffle_sync_bfly(d, offset=offset)
-                            for i in cutlass.range_constexpr(self.vec_size):
-                                o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=offset)
-                            if d == Float32(0.0):
-                                m = m2
-                                d = d2
-                                for i in cutlass.range_constexpr(self.vec_size):
-                                    o[i] = o_other[i]
-                            elif d2 != Float32(0.0):
-                                m_new = utils.fmax(m, m2)
-                                scale_self = utils.exp2f(m - m_new)
-                                scale_other = utils.exp2f(m2 - m_new)
-                                d = d * scale_self + d2 * scale_other
-                                for i in cutlass.range_constexpr(self.vec_size):
-                                    o[i] = o[i] * scale_self + o_other[i] * scale_other
-                                m = m_new
-
-                        # One writer per warp: tz % 4 == 0 stores to warp_id = tz // 4.
-                        if (tz & Int32(3)) == Int32(0):
-                            warp_id = tz >> Int32(2)
-                            for i in cutlass.range_constexpr(self.vec_size):
-                                sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
-                            if tx == 0:
-                                sM[warp_id, ty] = m
-                                sD[warp_id, ty] = d
-                    else:
-                        # bdx == 16: reduce over tz_in_warp in {0,1} using xor offset 16.
-                        m2 = cute.arch.shuffle_sync_bfly(m, offset=16)
-                        d2 = cute.arch.shuffle_sync_bfly(d, offset=16)
+                    for offset in tz_merge_offsets:
+                        m2 = cute.arch.shuffle_sync_bfly(m, offset=offset)
+                        d2 = cute.arch.shuffle_sync_bfly(d, offset=offset)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=16)
+                            o_other[i] = cute.arch.shuffle_sync_bfly(o[i], offset=offset)
                         if d == Float32(0.0):
                             m = m2
                             d = d2
@@ -685,23 +655,20 @@ class FlashAttentionDecodeSm90:
                                 o[i] = o[i] * scale_self + o_other[i] * scale_other
                             m = m_new
 
-                        # One writer per warp: tz % 2 == 0 stores to warp_id = tz // 2.
-                        if (tz & Int32(1)) == Int32(0):
-                            warp_id = tz >> Int32(1)
-                            for i in cutlass.range_constexpr(self.vec_size):
-                                sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
-                            if tx == 0:
-                                sM[warp_id, ty] = m
-                                sD[warp_id, ty] = d
+                    # One writer per warp: tz % tz_merge_div == 0 stores to warp_id = tz // tz_merge_div.
+                    if (tz & Int32(tz_merge_mask)) == Int32(0):
+                        warp_id = tz >> Int32(tz_merge_shift)
+                        for i in cutlass.range_constexpr(self.vec_size):
+                            sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
+                        if tx == 0:
+                            sM[warp_id, ty] = m
+                            sD[warp_id, ty] = d
 
                 cute.arch.barrier()
 
                 if tz == 0 and qo_head_active:
                     # Merge across warp partials (always 4 for the supported bdx/bdz pairs).
-                    if const_expr(self.bdx == 8):
-                        num_partials = self.bdz // 4
-                    else:
-                        num_partials = self.bdz // 2
+                    num_partials = self.bdz // tz_merge_div
                     m_merge = -Float32.inf
                     d_merge = Float32(0.0)
                     o_merge = cute.make_rmem_tensor((self.vec_size,), Float32)
