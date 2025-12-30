@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "kestrel-kernels" / "python"))
 
 
 @pytest.fixture
@@ -34,6 +40,35 @@ def _alloc_outputs(
     max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
     expert_ids = torch.empty((max_num_m_blocks,), device=topk_ids.device, dtype=torch.int32)
     num_tokens_post_pad = torch.empty((1,), device=topk_ids.device, dtype=torch.int32)
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def _alloc_outputs_lora(
+    *,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    max_loras: int,
+    pad_sorted_ids: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_num_tokens_padded = int(topk_ids.numel()) + int(num_experts) * (int(block_size) - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = _round_up(max_num_tokens_padded, block_size)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = min(int(topk_ids.numel()) * int(block_size), max_num_tokens_padded)
+
+    sorted_token_ids = torch.empty(
+        (max_loras, max_num_tokens_padded),
+        device=topk_ids.device,
+        dtype=torch.int32,
+    )
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    expert_ids = torch.empty(
+        (max_loras, max_num_m_blocks),
+        device=topk_ids.device,
+        dtype=torch.int32,
+    )
+    num_tokens_post_pad = torch.empty((max_loras,), device=topk_ids.device, dtype=torch.int32)
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
@@ -105,6 +140,38 @@ def torch_moe_align_block_size(
 
     total_padded_tokens = expert_padded_counts.sum()
     num_tokens_post_pad = torch.tensor([total_padded_tokens], dtype=torch.int32, device=topk_ids.device)
+
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def torch_moe_lora_align_block_size(
+    topk_ids: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    max_loras: int,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sorted_token_ids, expert_ids, num_tokens_post_pad = _alloc_outputs_lora(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        block_size=block_size,
+        max_loras=max_loras,
+    )
+
+    sentinel = num_experts
+    for lora_id in range(max_loras):
+        mask = token_lora_mapping == lora_id
+        if not mask.any():
+            num_tokens_post_pad[lora_id] = 0
+            continue
+        masked_topk_ids = torch.where(mask[:, None], topk_ids, sentinel)
+        sorted_ref, expert_ref, post_ref = torch_moe_align_block_size(
+            masked_topk_ids, block_size, num_experts, expert_map=expert_map
+        )
+        sorted_token_ids[lora_id].copy_(sorted_ref)
+        expert_ids[lora_id].copy_(expert_ref)
+        num_tokens_post_pad[lora_id] = post_ref[0]
 
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
@@ -218,3 +285,121 @@ def test_moe_align_block_size_cute_matches_cuda_with_expert_map(device):
         num_tokens_post_pad=int(post_ref.item()),
         total_tokens=num_tokens * topk,
     )
+
+
+def test_moe_lora_align_block_size_single_lora(device):
+    torch.manual_seed(0)
+    num_tokens = 128
+    topk = 8
+    num_experts = 64
+    block_size = 16
+    max_loras = 4
+
+    topk_ids = _make_topk_ids(num_tokens, topk, num_experts, device)
+    token_lora_mapping = torch.zeros((num_tokens,), device=device, dtype=torch.int32)
+
+    from kestrel_kernels.moe_align_cute import (
+        moe_lora_align_block_size as moe_lora_align_block_size_cute,
+    )
+
+    sorted_cute, expert_cute, post_cute = _alloc_outputs_lora(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        block_size=block_size,
+        max_loras=max_loras,
+    )
+    expert_map_empty = torch.empty((0,), device=device, dtype=torch.int32)
+    lora_ids = torch.tensor([0], device=device, dtype=torch.int32)
+
+    moe_lora_align_block_size_cute(
+        topk_ids,
+        token_lora_mapping,
+        num_experts,
+        block_size,
+        sorted_cute,
+        expert_cute,
+        post_cute,
+        lora_ids=lora_ids,
+        expert_map=expert_map_empty,
+    )
+
+    sorted_ref, expert_ref, post_ref = torch_moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        block_size,
+        num_experts,
+        max_loras,
+    )
+
+    torch.testing.assert_close(post_cute[0], post_ref[0], atol=0, rtol=0)
+    torch.testing.assert_close(expert_cute[0], expert_ref[0], atol=0, rtol=0)
+    _verify_same_expert_buckets(
+        sorted_a=sorted_cute[0],
+        sorted_b=sorted_ref[0],
+        expert_ids=expert_ref[0],
+        block_size=block_size,
+        num_tokens_post_pad=int(post_ref[0].item()),
+        total_tokens=num_tokens * topk,
+    )
+
+
+def test_moe_lora_align_block_size_multi_lora(device):
+    torch.manual_seed(0)
+    num_tokens = 32
+    topk = 8
+    num_experts = 16
+    block_size = 16
+    max_loras = 3
+
+    topk_ids = _make_topk_ids(num_tokens, topk, num_experts, device)
+    token_lora_mapping = torch.tensor(
+        [0, 1, 2, -1] * (num_tokens // 4),
+        device=device,
+        dtype=torch.int32,
+    )
+
+    from kestrel_kernels.moe_align_cute import (
+        moe_lora_align_block_size as moe_lora_align_block_size_cute,
+    )
+
+    sorted_cute, expert_cute, post_cute = _alloc_outputs_lora(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        block_size=block_size,
+        max_loras=max_loras,
+    )
+    expert_map_empty = torch.empty((0,), device=device, dtype=torch.int32)
+    lora_ids = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
+
+    moe_lora_align_block_size_cute(
+        topk_ids,
+        token_lora_mapping,
+        num_experts,
+        block_size,
+        sorted_cute,
+        expert_cute,
+        post_cute,
+        lora_ids=lora_ids,
+        expert_map=expert_map_empty,
+    )
+
+    sorted_ref, expert_ref, post_ref = torch_moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        block_size,
+        num_experts,
+        max_loras,
+    )
+
+    for lora_id in range(max_loras):
+        torch.testing.assert_close(post_cute[lora_id], post_ref[lora_id], atol=0, rtol=0)
+        torch.testing.assert_close(expert_cute[lora_id], expert_ref[lora_id], atol=0, rtol=0)
+        if post_ref[lora_id] > 0:
+            _verify_same_expert_buckets(
+                sorted_a=sorted_cute[lora_id],
+                sorted_b=sorted_ref[lora_id],
+                expert_ids=expert_ref[lora_id],
+                block_size=block_size,
+                num_tokens_post_pad=int(post_ref[lora_id].item()),
+                total_tokens=num_tokens * topk,
+            )
