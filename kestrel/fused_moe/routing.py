@@ -1,13 +1,10 @@
-"""Routing helpers for fused MoE kernels.
-
-CUDA implementation mirrors vLLM's moe_align_block_size semantics.
-"""
+"""Routing helpers for fused MoE kernels."""
 
 from __future__ import annotations
 
 import torch
 
-from kestrel_kernels.moe_align import moe_align_block_size as moe_align_block_size_cuda
+from kestrel_kernels.moe_align_cute import moe_align_block_size as moe_align_block_size_cute
 
 
 def _round_up(x: int, multiple: int) -> int:
@@ -73,7 +70,7 @@ def moe_align_block_size(
     else:
         expert_map_arg = expert_map
 
-    moe_align_block_size_cuda(
+    moe_align_block_size_cute(
         topk_ids,
         num_experts,
         block_size,
