@@ -1,0 +1,528 @@
+"""CuTe DSL implementation of `moe_align_block_size`."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple
+
+import torch
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Int64, const_expr
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def atomic_add_i32(a: int | Int32, ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    # `nvvm.atomicrmw` returns the old value (like CUDA's atomicAdd).
+    return Int32(
+        nvvm.atomicrmw(
+            res=T.i32(),
+            op=nvvm.AtomicOpKind.ADD,
+            ptr=ptr.llvm_ptr,
+            a=Int32(a).ir_value(loc=loc, ip=ip),
+        )
+    )
+
+
+@dataclass(frozen=True)
+class MoeAlignCuTeConfig:
+    # Small path (single-CTA) tuned for decode-like TK.
+    small_threads: int = 256
+    # Large path (2 kernels): use a large block for the align kernel because the
+    # grid is only 2 CTAs (one for counts/offsets, one for sentinel fill).
+    large_align_threads: int = 1024
+    large_scatter_threads: int = 256
+
+
+class _MoeAlignBlockSizeCuTe:
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        block_size: int,
+        has_expert_map: bool,
+        config: MoeAlignCuTeConfig,
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.block_size = int(block_size)
+        self.has_expert_map = bool(has_expert_map)
+        self.config = config
+
+    @cute.jit
+    def __call__(
+        self,
+        topk_ids: cute.Tensor,  # [T, K] integral
+        sorted_token_ids: cute.Tensor,  # [max_num_tokens_padded] int32
+        expert_ids: cute.Tensor,  # [max_num_m_blocks] int32
+        num_tokens_post_pad: cute.Tensor,  # [1] int32
+        expert_map: cute.Tensor,  # [num_experts] int32
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(topk_ids, sorted_token_ids, expert_ids, num_tokens_post_pad, expert_map).launch(
+            grid=[1, 1, 1],
+            block=[self.config.small_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        topk_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        expert_ids: cute.Tensor,
+        num_tokens_post_pad: cute.Tensor,
+        expert_map: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+
+        # Flatten topk_ids to 1D [TK] so we can avoid div/mod in the hot loops.
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+        topk_flat = cute.make_tensor(
+            topk_ids.iterator,
+            cute.make_layout((numel_i32,), stride=(1,)),
+        )
+
+        # Shared-memory bookkeeping (E <= 64 in Kestrel's typical MoE shapes).
+        @cute.struct
+        class SharedStorage:
+            counts: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+            offsets: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts + 1], 16]
+            counters: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage, 16)
+        counts = storage.counts.get_tensor(cute.make_layout((self.num_experts,)))
+        offsets = storage.offsets.get_tensor(cute.make_layout((self.num_experts + 1,)))
+        counters = storage.counters.get_tensor(cute.make_layout((self.num_experts,)))
+
+        # Zero counts.
+        if tidx < self.num_experts:
+            counts[tidx] = Int32(0)
+        cute.arch.sync_threads()
+
+        # Count tokens per (mapped) expert.
+        for i in range(tidx, numel_i32, self.config.small_threads):
+            expert_id = Int32(topk_flat[i])
+            if expert_id < self.num_experts:
+                if const_expr(self.has_expert_map):
+                    mapped = expert_map[expert_id]
+                    if mapped != -1:
+                        atomic_add_i32(1, elem_pointer(counts, mapped))
+                else:
+                    atomic_add_i32(1, elem_pointer(counts, expert_id))
+        cute.arch.sync_threads()
+
+        # Prefix sum over padded expert counts.
+        if tidx == 0:
+            offsets[0] = Int32(0)
+            running = Int32(0)
+            for e in cutlass.range(self.num_experts, unroll_full=True):
+                c = counts[e]
+                padded = ((c + (self.block_size - 1)) // self.block_size) * self.block_size
+                running += padded
+                offsets[e + 1] = running
+            num_tokens_post_pad[0] = running
+        cute.arch.sync_threads()
+
+        total_padded_tokens = offsets[self.num_experts]
+        total_blocks = total_padded_tokens // self.block_size
+
+        # Initialize sorted_token_ids with sentinel values in the consumed region.
+        for idx in range(tidx, total_padded_tokens, self.config.small_threads):
+            sorted_token_ids[idx] = numel_i32
+
+        # Write expert_ids per M-block.
+        if tidx < self.num_experts:
+            start = offsets[tidx]
+            end = offsets[tidx + 1]
+            for j in range(start, end, self.block_size):
+                expert_ids[j // self.block_size] = tidx
+
+        # Fill remaining expert_ids with inactive expert id (=0), matching the CUDA kernel.
+        max_blocks = Int32(expert_ids.shape[0])
+        for b in range(total_blocks + tidx, max_blocks, self.config.small_threads):
+            expert_ids[b] = Int32(0)
+
+        # Scatter token indices into the padded expert-major layout.
+        if tidx < self.num_experts:
+            counters[tidx] = Int32(0)
+        cute.arch.sync_threads()
+
+        for i in range(tidx, numel_i32, self.config.small_threads):
+            expert_id = Int32(topk_flat[i])
+            if expert_id < self.num_experts:
+                if const_expr(self.has_expert_map):
+                    mapped = expert_map[expert_id]
+                    if mapped != -1:
+                        pos = atomic_add_i32(1, elem_pointer(counters, mapped))
+                        sorted_token_ids[offsets[mapped] + pos] = Int32(i)
+                else:
+                    pos = atomic_add_i32(1, elem_pointer(counters, expert_id))
+                    sorted_token_ids[offsets[expert_id] + pos] = Int32(i)
+
+
+class _MoeAlignBlockSizeCuTeLarge:
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        block_size: int,
+        has_expert_map: bool,
+        config: MoeAlignCuTeConfig,
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.block_size = int(block_size)
+        self.has_expert_map = bool(has_expert_map)
+        self.config = config
+
+    @cute.jit
+    def __call__(
+        self,
+        topk_ids: cute.Tensor,  # [T, K] integral
+        sorted_token_ids: cute.Tensor,  # [max_num_tokens_padded] int32
+        expert_ids: cute.Tensor,  # [max_num_m_blocks] int32
+        num_tokens_post_pad: cute.Tensor,  # [1] int32
+        expert_map: cute.Tensor,  # [num_experts] int32
+        cumsum_buffer: cute.Tensor,  # [num_experts] int32
+        stream: cuda.CUstream,
+    ) -> None:
+        # Kernel 1: compute offsets/expert_ids, initialize cumsum_buffer, and fill sorted_token_ids with sentinels.
+        self.align_kernel(
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map,
+            cumsum_buffer,
+        ).launch(
+            grid=[2, 1, 1],
+            block=[self.config.large_align_threads, 1, 1],
+            stream=stream,
+        )
+        # Kernel 2: scatter token indices into the padded expert-major layout.
+        num_blocks = Int32(cute.ceil_div(cute.size(topk_ids.shape), self.config.large_scatter_threads))
+        if num_blocks > 0:
+            self.scatter_kernel(topk_ids, sorted_token_ids, expert_map, cumsum_buffer).launch(
+                grid=[num_blocks, Int32(1), Int32(1)],
+                block=[self.config.large_scatter_threads, 1, 1],
+                stream=stream,
+            )
+
+    @cute.kernel
+    def align_kernel(
+        self,
+        topk_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        expert_ids: cute.Tensor,
+        num_tokens_post_pad: cute.Tensor,
+        expert_map: cute.Tensor,
+        cumsum_buffer: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+
+        # Block 1: fill sorted_token_ids with sentinel values.
+        if bidx == 1:
+            max_sorted = Int32(sorted_token_ids.shape[0])
+            for idx in range(tidx, max_sorted, self.config.large_align_threads):
+                sorted_token_ids[idx] = numel_i32
+        else:
+            # Block 0: compute expert counts and padded offsets.
+            topk_flat = cute.make_tensor(
+                topk_ids.iterator,
+                cute.make_layout((numel_i32,), stride=(1,)),
+            )
+
+            @cute.struct
+            class SharedStorage:
+                counts: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+                offsets: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts + 1], 16]
+
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage, 16)
+            counts = storage.counts.get_tensor(cute.make_layout((self.num_experts,)))
+            offsets = storage.offsets.get_tensor(cute.make_layout((self.num_experts + 1,)))
+
+            if tidx < self.num_experts:
+                counts[tidx] = Int32(0)
+            cute.arch.sync_threads()
+
+            for i in range(tidx, numel_i32, self.config.large_align_threads):
+                expert_id = Int32(topk_flat[i])
+                if expert_id < self.num_experts:
+                    if const_expr(self.has_expert_map):
+                        mapped = expert_map[expert_id]
+                        if mapped != -1:
+                            atomic_add_i32(1, elem_pointer(counts, mapped))
+                    else:
+                        atomic_add_i32(1, elem_pointer(counts, expert_id))
+            cute.arch.sync_threads()
+
+            if tidx == 0:
+                offsets[0] = Int32(0)
+                running = Int32(0)
+                for e in cutlass.range(self.num_experts, unroll_full=True):
+                    c = counts[e]
+                    padded = ((c + (self.block_size - 1)) // self.block_size) * self.block_size
+                    running += padded
+                    offsets[e + 1] = running
+                num_tokens_post_pad[0] = running
+            cute.arch.sync_threads()
+
+            # Initialize cumsum_buffer with base offsets (used as atomic counters in the scatter kernel).
+            if tidx < self.num_experts:
+                cumsum_buffer[tidx] = offsets[tidx]
+
+            total_padded_tokens = offsets[self.num_experts]
+            total_blocks = total_padded_tokens // self.block_size
+
+            if tidx < self.num_experts:
+                start = offsets[tidx]
+                end = offsets[tidx + 1]
+                for j in range(start, end, self.block_size):
+                    expert_ids[j // self.block_size] = tidx
+
+            max_blocks = Int32(expert_ids.shape[0])
+            for b in range(total_blocks + tidx, max_blocks, self.config.large_align_threads):
+                expert_ids[b] = Int32(0)
+
+    @cute.kernel
+    def scatter_kernel(
+        self,
+        topk_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        expert_map: cute.Tensor,
+        cumsum_buffer: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_stride = Int32(cute.arch.grid_dim()[0])
+
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+        topk_flat = cute.make_tensor(
+            topk_ids.iterator,
+            cute.make_layout((numel_i32,), stride=(1,)),
+        )
+
+        tid = Int32(bidx) * self.config.large_scatter_threads + tidx
+        stride = Int32(self.config.large_scatter_threads) * grid_stride
+        for i in range(tid, numel_i32, stride):
+            expert_id = Int32(topk_flat[i])
+            if expert_id < self.num_experts:
+                if const_expr(self.has_expert_map):
+                    mapped = expert_map[expert_id]
+                    if mapped != -1:
+                        rank = atomic_add_i32(1, elem_pointer(cumsum_buffer, mapped))
+                        sorted_token_ids[rank] = Int32(i)
+                else:
+                    rank = atomic_add_i32(1, elem_pointer(cumsum_buffer, expert_id))
+                    sorted_token_ids[rank] = Int32(i)
+
+
+_COMPILE_CACHE_SMALL: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
+_COMPILE_CACHE_LARGE: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
+_CUMSUM_BUFFER_CACHE: Dict[Tuple[int, int, int], torch.Tensor] = {}
+_DUMMY_EXPERT_MAP_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: torch.Tensor,
+) -> None:
+    """CuTe DSL moe_align_block_size (CUDA-only)."""
+    if topk_ids.device.type != "cuda":
+        raise ValueError("topk_ids must be a CUDA tensor")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must have shape [num_tokens, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must be int32 or int64")
+    if sorted_token_ids.dtype != torch.int32 or sorted_token_ids.ndim != 1 or not sorted_token_ids.is_contiguous():
+        raise ValueError("sorted_token_ids must be a contiguous int32 1D tensor")
+    if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1 or not expert_ids.is_contiguous():
+        raise ValueError("expert_ids must be a contiguous int32 1D tensor")
+    if (
+        num_tokens_post_pad.dtype != torch.int32
+        or num_tokens_post_pad.ndim != 1
+        or num_tokens_post_pad.numel() != 1
+        or not num_tokens_post_pad.is_contiguous()
+    ):
+        raise ValueError("num_tokens_post_pad must be a contiguous int32 tensor with shape (1,)")
+    if expert_map.dtype != torch.int32 or expert_map.ndim != 1 or not expert_map.is_contiguous():
+        raise ValueError("expert_map must be a contiguous int32 1D tensor")
+    if expert_map.numel() not in (0, int(num_experts)):
+        raise ValueError("expert_map must be empty or shape [num_experts]")
+
+    topk = int(topk_ids.shape[1])
+    has_expert_map = bool(expert_map.numel() > 0)
+    topk_dtype = Int32 if topk_ids.dtype == torch.int32 else Int64
+    numel = int(topk_ids.numel())
+    cfg = MoeAlignCuTeConfig()
+    # Match the CUDA extension fast path: a single-CTA shared-memory histogram +
+    # scatter is best for decode-like TK and small E.
+    small_batch_expert_mode = (int(num_experts) <= 64) and (numel < 1024)
+
+    key = (topk_dtype, topk, int(num_experts), int(block_size), has_expert_map, cfg)
+    dev_idx = int(topk_ids.device.index or 0)
+    if has_expert_map:
+        expert_map_arg = expert_map
+    else:
+        dummy_key = (dev_idx, int(num_experts))
+        expert_map_arg = _DUMMY_EXPERT_MAP_CACHE.get(dummy_key)
+        if expert_map_arg is None:
+            expert_map_arg = torch.zeros(
+                (int(num_experts),), device=topk_ids.device, dtype=torch.int32
+            )
+            _DUMMY_EXPERT_MAP_CACHE[dummy_key] = expert_map_arg
+
+    if small_batch_expert_mode:
+        if key not in _COMPILE_CACHE_SMALL:
+            t_sym = cute.sym_int()
+            topk_ids_fake = cute.runtime.make_fake_tensor(
+                topk_dtype,
+                (t_sym, topk),
+                stride=(topk, 1),
+                assumed_align=topk_dtype.width // 8,
+            )
+            sorted_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            expert_ids_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            post_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (1,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            expert_map_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (int(num_experts),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            op = _MoeAlignBlockSizeCuTe(
+                num_experts=int(num_experts),
+                block_size=int(block_size),
+                has_expert_map=has_expert_map,
+                config=cfg,
+            )
+            _COMPILE_CACHE_SMALL[key] = cute.compile(
+                op,
+                topk_ids_fake,
+                sorted_fake,
+                expert_ids_fake,
+                post_fake,
+                expert_map_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+
+        _COMPILE_CACHE_SMALL[key](
+            topk_ids, sorted_token_ids, expert_ids, num_tokens_post_pad, expert_map_arg
+        )
+        return
+
+    # Large path: global cumsum buffer + multi-CTA scatter (matches CUDA kernel structure).
+    if key not in _COMPILE_CACHE_LARGE:
+        t_sym = cute.sym_int()
+        topk_ids_fake = cute.runtime.make_fake_tensor(
+            topk_dtype,
+            (t_sym, topk),
+            stride=(topk, 1),
+            assumed_align=topk_dtype.width // 8,
+        )
+        sorted_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        expert_ids_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        post_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (1,),
+            stride=(1,),
+            assumed_align=4,
+        )
+        cumsum_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (int(num_experts),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        expert_map_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (int(num_experts),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        op = _MoeAlignBlockSizeCuTeLarge(
+            num_experts=int(num_experts),
+            block_size=int(block_size),
+            has_expert_map=has_expert_map,
+            config=cfg,
+        )
+        _COMPILE_CACHE_LARGE[key] = cute.compile(
+            op,
+            topk_ids_fake,
+            sorted_fake,
+            expert_ids_fake,
+            post_fake,
+            expert_map_fake,
+            cumsum_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    # Reuse a per-stream scratch buffer to avoid per-call allocations on the hot path.
+    # NOTE: The align kernel overwrites the buffer with base offsets each call, so it
+    # is safe to reuse as long as calls on the same stream are sequential.
+    stream_id = int(torch.cuda.current_stream(topk_ids.device).cuda_stream)
+    buf_key = (dev_idx, stream_id, int(num_experts))
+    cumsum_buffer = _CUMSUM_BUFFER_CACHE.get(buf_key)
+    if cumsum_buffer is None:
+        cumsum_buffer = torch.empty((int(num_experts),), device=topk_ids.device, dtype=torch.int32)
+        _CUMSUM_BUFFER_CACHE[buf_key] = cumsum_buffer
+    _COMPILE_CACHE_LARGE[key](
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map_arg,
+        cumsum_buffer,
+    )
+
+
+__all__ = ["MoeAlignCuTeConfig", "moe_align_block_size"]

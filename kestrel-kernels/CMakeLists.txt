@@ -89,7 +89,6 @@ add_kestrel_kernel(fused_linear_residual "${KESTREL_OPS_DIR}/fused_linear_residu
 add_kestrel_kernel(fused_mlp "${KESTREL_OPS_DIR}/fused_mlp/kernel.cu")
 add_kestrel_kernel(kv_cache_write "${KESTREL_OPS_DIR}/kv_cache_write/kernel.cu")
 add_kestrel_kernel(layernorm_cuda "${KESTREL_OPS_DIR}/layernorm_cuda/kernel.cu")
-add_kestrel_kernel(moe_align "${KESTREL_OPS_DIR}/moe_align/kernel.cu")
 add_kestrel_kernel(moe_sum "${KESTREL_OPS_DIR}/moe_sum/kernel.cu")
 add_kestrel_kernel(rotary_embedding "${KESTREL_OPS_DIR}/rotary_embedding/kernel.cu")
 add_kestrel_kernel(fp8_quant "${CMAKE_CURRENT_LIST_DIR}/csrc/fp8_quant/kernel.cu")
