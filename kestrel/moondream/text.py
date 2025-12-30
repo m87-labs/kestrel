@@ -165,9 +165,8 @@ def attn(
             seqused_k=fa3_seqused_k,
             paged_kv_non_tma=None,
             causal=True,
-            # TEMPORARY: force bf16 kv scale
-#            k_scale=k_scale,
-#            v_scale=v_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     out = out.view(bsz, q_len, d_model)
