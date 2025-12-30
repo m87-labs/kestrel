@@ -551,10 +551,8 @@ class FusedMoEModule(nn.Module):
                     FusedMoeCuTeConfig,
                     invoke_fused_moe_kernel_cute_down_decode,
                     invoke_fused_moe_kernel_cute_down_decode_fp8,
-                    invoke_fused_moe_kernel_cute_down_decode_fp8w,
                     invoke_fused_moe_kernel_cute_up_decode,
                     invoke_fused_moe_kernel_cute_up_decode_fp8,
-                    invoke_fused_moe_kernel_cute_up_decode_fp8w,
                 )
 
                 block_m = triton_config["BLOCK_SIZE_M"]
@@ -605,72 +603,6 @@ class FusedMoEModule(nn.Module):
                             invoke_fused_moe_kernel_cute_up_decode_fp8(
                                 a_bits,
                                 a_scale,
-                                B,
-                                B_scale,
-                                C,
-                                sorted_token_ids=sorted_token_ids,
-                                expert_ids=expert_ids,
-                                num_tokens_post_padded=num_tokens_post_padded,
-                                config=cute_cfg,
-                            )
-                        return
-
-                    # Legacy fallback: FP8 weights only (BF16 activations).
-                    if block_m == 16:
-                        num_tokens = int(C.shape[0])
-                        if num_tokens <= 8:
-                            if mul_routed_weight:
-                                cute_cfg = FusedMoeCuTeConfig(
-                                    block_m=16,
-                                    block_n=64,
-                                    block_k=256,
-                                    num_warps=4,
-                                    num_stages=1,
-                                )
-                            else:
-                                cute_cfg = FusedMoeCuTeConfig(
-                                    block_m=16,
-                                    block_n=128,
-                                    block_k=128,
-                                    num_warps=2,
-                                    num_stages=1,
-                                )
-                        else:
-                            num_stages = int(triton_config["NUM_STAGES"])
-                            if mul_routed_weight:
-                                num_stages = min(2, num_stages)
-                            cute_cfg = FusedMoeCuTeConfig(
-                                block_m=block_m,
-                                block_n=int(triton_config["BLOCK_SIZE_N"]),
-                                block_k=int(triton_config["BLOCK_SIZE_K"]),
-                                num_warps=int(triton_config["NUM_WARPS"]),
-                                num_stages=num_stages,
-                            )
-                        if mul_routed_weight:
-                            if int(top_k) != 1:
-                                raise ValueError("CuTe fp8w moe_down expects top_k=1")
-                            if topk_weights is None:
-                                raise ValueError("topk_weights is required when mul_routed_weight=True")
-                            if B_scale is None:
-                                raise ValueError("B_scale is required for FP8-weight moe_down")
-                            invoke_fused_moe_kernel_cute_down_decode_fp8w(
-                                A,
-                                B,
-                                B_scale,
-                                C,
-                                topk_weights=topk_weights,
-                                sorted_token_ids=sorted_token_ids,
-                                expert_ids=expert_ids,
-                                num_tokens_post_padded=num_tokens_post_padded,
-                                config=cute_cfg,
-                            )
-                        else:
-                            if int(top_k) != 8:
-                                raise ValueError("CuTe fp8w moe_up expects top_k=8")
-                            if B_scale is None:
-                                raise ValueError("B_scale is required for FP8-weight moe_up")
-                            invoke_fused_moe_kernel_cute_up_decode_fp8w(
-                                A,
                                 B,
                                 B_scale,
                                 C,
