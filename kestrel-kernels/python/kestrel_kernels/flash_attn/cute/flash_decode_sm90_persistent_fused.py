@@ -302,6 +302,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         feature_bytes = cutlass.Int64(tx) * cutlass.Int64(self.vec_size) * element_bytes
         offset_shift = Int32(4)  # offsets in units of 16 bytes (cp.async alignment)
 
+        tile_tokens_i32 = Int32(self.tile_tokens)
+
         stride_page_elems = cutlass.Int64(mK.stride[3])
         stride_head_elems = cutlass.Int64(mK.stride[2])
         mK_base_i64 = mK.iterator.toint()
@@ -311,8 +313,24 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         sV_base_i64 = sV.iterator.toint()
         align_bytes = self.vec_size * (self.dtype.width // 8)
 
-        pred_false = cute.make_rmem_tensor((self.vec_size,), cutlass.Boolean)
-        pred_false.fill(False)
+        smem_feature_elems = tx * Int32(self.vec_size)
+        stage_stride_elems = Int32(self.tile_tokens * self.head_dim)
+        sKV_stage_layout = cute.make_layout(
+            (self.tile_tokens, self.head_dim),
+            stride=(self.head_dim, 1),
+        )
+
+        # For full tiles, issue unpredicated cp.async loads.
+        #
+        # For partial tiles (tail), use a single predicated cp.async copy to avoid
+        # generating dual LDGSTS instructions from control-flow `if/else` around
+        # `cute.copy`, and to skip out-of-range loads.
+        #
+        # Make the predicate a broadcasted (stride-0) vector to match the expected
+        # pred shape for vectorized copies without needing per-element fills.
+        pred_in_layout = cute.make_layout((self.vec_size,), stride=(0,))
+        pred_in = cute.make_rmem_tensor(pred_in_layout, cutlass.Boolean)
+        pred_in[0] = False
         offset_bytes_vec = cute.make_rmem_tensor((self.tile_size_per_bdx,), cutlass.Int64)
 
         LOG2_E = math.log2(math.e)
@@ -421,72 +439,121 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                 for iter_prefetch in cutlass.range_constexpr(self.num_stages_smem):
                     iter_i = Int32(iter_prefetch)
                     slice_idx = iter_i % Int32(self.bdx)
+                    stage_off_bytes = (
+                        cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_elems) * element_bytes
+                    )
+                    sK_stage_i64 = sK_base_i64 + stage_off_bytes
+                    sV_stage_i64 = sV_base_i64 + stage_off_bytes
+                    iter_base = iter_i * tile_tokens_i32
+                    full_tile = (iter_base + tile_tokens_i32) <= chunk_size
                     # K
-                    for j in cutlass.range_constexpr(self.tile_size_per_bdx):
-                        token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
-                        token_off = iter_i * Int32(self.tile_tokens) + token_in_iter
-                        valid = token_off < chunk_size
-                        linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
-                        row = linear >> offsets_row_shift
-                        col = linear & offsets_col_mask
-                        offset16_i32 = sOffsets_token_major[row, col]
-                        offset16_u32 = cutlass.Uint32(offset16_i32)
-                        offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
-                        offset_bytes_vec[j] = offset_bytes
-                        gmem_ptr = cute.make_ptr(
-                            self.dtype,
-                            mK_base_i64 + offset_bytes + feature_bytes,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+                    if full_tile:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
+                            row = linear >> offsets_row_shift
+                            col = linear & offsets_col_mask
+                            offset16_i32 = sOffsets_token_major[row, col]
+                            offset16_u32 = cutlass.Uint32(offset16_i32)
+                            offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
+                            offset_bytes_vec[j] = offset_bytes
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mK_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
 
-                        smem_row = (
-                            (stage_idx * Int32(self.tile_tokens) + token_in_iter) * Int32(self.head_dim)
-                            + tx * Int32(self.vec_size)
-                        )
-                        smem_byte_off = cutlass.Int64(smem_row) * element_bytes
-                        smem_ptr = cute.make_ptr(
-                            self.dtype,
-                            sK_base_i64 + smem_byte_off,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst = cute.make_tensor(smem_ptr, (self.vec_size,))
-                    if valid:
-                        cute.copy(atom_async_copy, src, dst)
-                    else:
-                        cute.copy(atom_async_copy, src, dst, pred=pred_false)
-                    # V
-                    for j in cutlass.range_constexpr(self.tile_size_per_bdx):
-                        token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
-                        token_off = iter_i * Int32(self.tile_tokens) + token_in_iter
-                        valid = token_off < chunk_size
-                        offset_bytes = offset_bytes_vec[j]
-                        gmem_ptr = cute.make_ptr(
-                            self.dtype,
-                            mV_base_i64 + offset_bytes + feature_bytes,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src = cute.make_tensor(gmem_ptr, (self.vec_size,))
-
-                        smem_row = (
-                            (stage_idx * Int32(self.tile_tokens) + token_in_iter) * Int32(self.head_dim)
-                            + tx * Int32(self.vec_size)
-                        )
-                        smem_byte_off = cutlass.Int64(smem_row) * element_bytes
-                        smem_ptr = cute.make_ptr(
-                            self.dtype,
-                            sV_base_i64 + smem_byte_off,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst = cute.make_tensor(smem_ptr, (self.vec_size,))
-                        if valid:
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sK_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
                             cute.copy(atom_async_copy, src, dst)
-                        else:
-                            cute.copy(atom_async_copy, src, dst, pred=pred_false)
+                    else:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            token_off = iter_base + token_in_iter
+                            valid = token_off < chunk_size
+                            linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
+                            row = linear >> offsets_row_shift
+                            col = linear & offsets_col_mask
+                            offset16_i32 = sOffsets_token_major[row, col]
+                            offset16_u32 = cutlass.Uint32(offset16_i32)
+                            offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
+                            offset_bytes_vec[j] = offset_bytes
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mK_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sK_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
+                            pred_in[0] = valid
+                            cute.copy(atom_async_copy, src, dst, pred=pred_in)
+                    # V
+                    if full_tile:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            offset_bytes = offset_bytes_vec[j]
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mV_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sV_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
+                            cute.copy(atom_async_copy, src, dst)
+                    else:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            token_off = iter_base + token_in_iter
+                            valid = token_off < chunk_size
+                            offset_bytes = offset_bytes_vec[j]
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mV_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sV_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
+                            pred_in[0] = valid
+                            cute.copy(atom_async_copy, src, dst, pred=pred_in)
                     cute.arch.cp_async_commit_group()
                     stage_idx = (
                         stage_idx + 1
@@ -499,6 +566,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
             for iter_idx in cutlass.range(num_iters, unroll=2):
                 prefetch_iter = iter_idx + num_stages_smem_i32
+                stage_off_bytes = (
+                    cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_elems) * element_bytes
+                )
+                sK_stage_i64 = sK_base_i64 + stage_off_bytes
+                sV_stage_i64 = sV_base_i64 + stage_off_bytes
                 if prefetch_iter % Int32(self.bdx) == 0:
                     if prefetch_iter * Int32(self.tile_tokens) < chunk_size:
                         for j in cutlass.range_constexpr(self.tile_size_per_bdx):
@@ -519,6 +591,13 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
                 cute.arch.cp_async_wait_group(cp_async_wait_n)
                 cute.arch.barrier()
+                sK_stage_ptr = cute.make_ptr(
+                    self.dtype,
+                    sK_stage_i64,
+                    cute.AddressSpace.smem,
+                    assumed_align=align_bytes,
+                )
+                sK_stage = cute.make_tensor(sK_stage_ptr, sKV_stage_layout)
                 m_prev = m
                 for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                     token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
@@ -527,7 +606,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     if token_off < chunk_size and qo_head_active:
                         for i in cutlass.range_constexpr(self.vec_size):
                             dot += q_vec[i] * Float32(
-                                sK[stage_idx, token_in_stage, tx * Int32(self.vec_size) + i]
+                                sK_stage[token_in_stage, tx * Int32(self.vec_size) + i]
                             )
                     dot = utils.warp_reduce(dot, operator.add, width=self.bdx)
                     if qo_head_active:
@@ -554,44 +633,77 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
                 if prefetch_iter < num_iters:
                     slice_idx = prefetch_iter % Int32(self.bdx)
-                    for j in cutlass.range_constexpr(self.tile_size_per_bdx):
-                        token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
-                        token_off = prefetch_iter * Int32(self.tile_tokens) + token_in_iter
-                        valid = token_off < chunk_size
-                        linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
-                        row = linear >> offsets_row_shift
-                        col = linear & offsets_col_mask
-                        offset16_i32 = sOffsets_token_major[row, col]
-                        offset16_u32 = cutlass.Uint32(offset16_i32)
-                        offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
-                        offset_bytes_vec[j] = offset_bytes
-                        gmem_ptr = cute.make_ptr(
-                            self.dtype,
-                            mK_base_i64 + offset_bytes + feature_bytes,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+                    prefetch_base = prefetch_iter * tile_tokens_i32
+                    full_tile = (prefetch_base + tile_tokens_i32) <= chunk_size
+                    if full_tile:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
+                            row = linear >> offsets_row_shift
+                            col = linear & offsets_col_mask
+                            offset16_i32 = sOffsets_token_major[row, col]
+                            offset16_u32 = cutlass.Uint32(offset16_i32)
+                            offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
+                            offset_bytes_vec[j] = offset_bytes
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mK_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
 
-                        smem_row = (
-                            (stage_idx * Int32(self.tile_tokens) + token_in_iter) * Int32(self.head_dim)
-                            + tx * Int32(self.vec_size)
-                        )
-                        smem_byte_off = cutlass.Int64(smem_row) * element_bytes
-                        smem_ptr = cute.make_ptr(
-                            self.dtype,
-                            sK_base_i64 + smem_byte_off,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst = cute.make_tensor(smem_ptr, (self.vec_size,))
-                        if valid:
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sK_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
                             cute.copy(atom_async_copy, src, dst)
-                        else:
-                            cute.copy(atom_async_copy, src, dst, pred=pred_false)
+                    else:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            token_off = prefetch_base + token_in_iter
+                            valid = token_off < chunk_size
+                            linear = slice_idx * Int32(self.tile_tokens) + token_in_iter
+                            row = linear >> offsets_row_shift
+                            col = linear & offsets_col_mask
+                            offset16_i32 = sOffsets_token_major[row, col]
+                            offset16_u32 = cutlass.Uint32(offset16_i32)
+                            offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
+                            offset_bytes_vec[j] = offset_bytes
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mK_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sK_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
+                            pred_in[0] = valid
+                            cute.copy(atom_async_copy, src, dst, pred=pred_in)
 
                 cute.arch.cp_async_wait_group(cp_async_wait_n)
                 cute.arch.barrier()
+                sV_stage_ptr = cute.make_ptr(
+                    self.dtype,
+                    sV_stage_i64,
+                    cute.AddressSpace.smem,
+                    assumed_align=align_bytes,
+                )
+                sV_stage = cute.make_tensor(sV_stage_ptr, sKV_stage_layout)
                 if qo_head_active:
                     for t in cutlass.range_constexpr(self.tile_tokens_per_tz):
                         token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
@@ -600,40 +712,60 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             wt = s[t]
                             for i in cutlass.range_constexpr(self.vec_size):
                                 o[i] += wt * Float32(
-                                    sV[stage_idx, token_in_stage, tx * Int32(self.vec_size) + i]
+                                    sV_stage[token_in_stage, tx * Int32(self.vec_size) + i]
                                 )
                 cute.arch.sync_warp()
 
                 if prefetch_iter < num_iters:
-                    for j in cutlass.range_constexpr(self.tile_size_per_bdx):
-                        token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
-                        token_off = prefetch_iter * Int32(self.tile_tokens) + token_in_iter
-                        valid = token_off < chunk_size
-                        offset_bytes = offset_bytes_vec[j]
-                        gmem_ptr = cute.make_ptr(
-                            self.dtype,
-                            mV_base_i64 + offset_bytes + feature_bytes,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+                    prefetch_base = prefetch_iter * tile_tokens_i32
+                    full_tile = (prefetch_base + tile_tokens_i32) <= chunk_size
+                    if full_tile:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            offset_bytes = offset_bytes_vec[j]
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mV_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
 
-                        smem_row = (
-                            (stage_idx * Int32(self.tile_tokens) + token_in_iter) * Int32(self.head_dim)
-                            + tx * Int32(self.vec_size)
-                        )
-                        smem_byte_off = cutlass.Int64(smem_row) * element_bytes
-                        smem_ptr = cute.make_ptr(
-                            self.dtype,
-                            sV_base_i64 + smem_byte_off,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst = cute.make_tensor(smem_ptr, (self.vec_size,))
-                        if valid:
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sV_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
                             cute.copy(atom_async_copy, src, dst)
-                        else:
-                            cute.copy(atom_async_copy, src, dst, pred=pred_false)
+                    else:
+                        for j in cutlass.range_constexpr(self.tile_size_per_bdx):
+                            token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
+                            token_off = prefetch_base + token_in_iter
+                            valid = token_off < chunk_size
+                            offset_bytes = offset_bytes_vec[j]
+                            gmem_ptr = cute.make_ptr(
+                                self.dtype,
+                                mV_base_i64 + offset_bytes + feature_bytes,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            src = cute.make_tensor(gmem_ptr, (self.vec_size,))
+
+                            smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
+                            smem_byte_off = cutlass.Int64(smem_row) * element_bytes
+                            smem_ptr = cute.make_ptr(
+                                self.dtype,
+                                sV_stage_i64 + smem_byte_off,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            dst = cute.make_tensor(smem_ptr, (self.vec_size,))
+                            pred_in[0] = valid
+                            cute.copy(atom_async_copy, src, dst, pred=pred_in)
                 cute.arch.cp_async_commit_group()
                 stage_idx = (
                     stage_idx + 1

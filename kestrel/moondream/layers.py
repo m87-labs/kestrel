@@ -16,6 +16,7 @@ from ..fused_moe.routing import moe_align_block_size
 from ..fused_moe import ExpertWeights, FusedMoEModule
 from kestrel_kernels.topk import topk_fwd
 from ..fused_moe.lora_kernels import apply_moe_lora
+from ..ops.layernorm_cuda import layernorm_bias
 
 # Re-export LoRA for convenience
 from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
@@ -33,6 +34,11 @@ class LayerNormWeights:
 
 
 def layer_norm(x: torch.Tensor, w: LayerNormWeights) -> torch.Tensor:
+    if x.is_cuda and x.dtype == torch.bfloat16:
+        try:
+            return layernorm_bias(x, w.weight, w.bias)
+        except Exception:
+            pass
     return F.layer_norm(x, w.bias.shape, w.weight, w.bias)
 
 
