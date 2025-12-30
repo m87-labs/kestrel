@@ -259,61 +259,6 @@ class PageTable:
         self.free_pages.extend(reversed(allocated_pages_cpu))
         self.page_table_cpu[batch_idx] = []
 
-    def build_flashinfer_kv_metadata(
-        self,
-        batch_idx: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Construct per-request metadata tensors for FlashInfer paged decoding."""
-
-        if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be 1D for FlashInfer metadata")
-        if seq_lens.ndim != 1:
-            raise ValueError("seq_lens must be 1D for FlashInfer metadata")
-        if batch_idx.shape[0] != seq_lens.shape[0]:
-            raise ValueError(
-                "batch_idx and seq_lens must have matching leading dimensions"
-            )
-
-        device = self.page_table.device
-        batch_size = batch_idx.shape[0]
-        if batch_size == 0:
-            empty = torch.zeros(0, dtype=torch.int32, device=device)
-            return (
-                torch.zeros(1, dtype=torch.int32, device=device),
-                empty,
-                empty,
-            )
-
-        seq_lens = seq_lens.to(device=device, dtype=torch.int32)
-        num_pages = torch.div(
-            seq_lens + (self.page_size - 1),
-            self.page_size,
-            rounding_mode="floor",
-        )
-        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-        if num_pages.numel() > 0:
-            kv_indptr[1:] = torch.cumsum(num_pages, dim=0)
-
-        total_pages = int(kv_indptr[-1].item())
-        if total_pages == 0:
-            kv_indices = torch.zeros(0, dtype=torch.int32, device=device)
-        else:
-            max_pages = int(num_pages.max().item())
-            page_rows = self.page_table[batch_idx.to(torch.long), :max_pages]
-            page_rows = page_rows.to(torch.int32)
-            arange_pages = torch.arange(max_pages, device=device, dtype=torch.int32)
-            mask = arange_pages.unsqueeze(0) < num_pages.unsqueeze(1)
-            kv_indices = torch.masked_select(page_rows, mask)
-
-        kv_last_page_len = torch.where(
-            num_pages > 0,
-            ((seq_lens - 1) % self.page_size) + 1,
-            torch.zeros_like(seq_lens),
-        )
-
-        return kv_indptr, kv_indices.to(torch.int32), kv_last_page_len
-
     def populate_fa3_decode_metadata(
         self,
         *,
@@ -408,46 +353,6 @@ class PageTable:
         slots = physical_block_idx * page_size + offset_flat
         return slots.to(dtype=torch.int64).view_as(positions)
 
-    def populate_flashinfer_kv_indices(
-        self,
-        *,
-        batch_idx: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        out_kv_indices: torch.Tensor,
-        total_pages: int,
-    ) -> torch.Tensor:
-        if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be 1D for FlashInfer metadata")
-        if kv_indptr.ndim != 1:
-            raise ValueError("kv_indptr must be 1D")
-        if kv_indptr.shape[0] != batch_idx.shape[0] + 1:
-            raise ValueError("kv_indptr must have length batch_size + 1")
-
-        batch_idx = batch_idx.to(device=self.page_table.device, dtype=torch.long)
-        if not batch_idx.is_contiguous():
-            batch_idx = batch_idx.contiguous()
-        kv_indptr = kv_indptr.to(device=self.page_table.device, dtype=torch.int32)
-        if not kv_indptr.is_contiguous():
-            kv_indptr = kv_indptr.contiguous()
-
-        total_pages = int(total_pages)
-        if total_pages <= 0:
-            return out_kv_indices[:0]
-        if out_kv_indices.shape[0] < total_pages:
-            raise ValueError("out_kv_indices capacity is insufficient")
-
-        page_table_stride = self.page_table.stride(0)
-        grid = (batch_idx.shape[0],)
-        _copy_page_indices_kernel[grid](
-            out_kv_indices[:total_pages],
-            self.page_table,
-            batch_idx,
-            kv_indptr,
-            page_table_stride,
-            BLOCK_SIZE=128,
-        )
-        return out_kv_indices[:total_pages]
-
     def _sync_page_table_row(
         self, batch_idx: int, start: int = 0, end: Optional[int] = None
     ) -> None:
@@ -461,36 +366,6 @@ class PageTable:
 
     def _sync_full_page_table(self) -> None:
         self._page_table_buffer.copy_to_gpu()
-
-
-@triton.jit
-def _copy_page_indices_kernel(
-    out_kv_indices,
-    page_table,
-    batch_indices,
-    kv_indptr,
-    page_table_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_id = tl.program_id(0)
-    start = tl.load(kv_indptr + req_id)
-    end = tl.load(kv_indptr + req_id + 1)
-    num_pages = end - start
-
-    batch_id = tl.load(batch_indices + req_id, mask=True, other=0).to(tl.int64)
-    stride = tl.full((), page_table_stride, dtype=tl.int64)
-    row_ptr = page_table + batch_id * stride
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    for base in tl.range(0, num_pages, BLOCK_SIZE):
-        mask = base + offsets < num_pages
-        block_ids = tl.load(row_ptr + base + offsets, mask=mask, other=0)
-        block_ids = block_ids.to(tl.int32)
-        tl.store(
-            out_kv_indices + start + base + offsets,
-            block_ids,
-            mask=mask,
-        )
 
 
 @triton.jit

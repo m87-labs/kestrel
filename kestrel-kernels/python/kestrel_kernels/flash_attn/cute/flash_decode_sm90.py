@@ -20,7 +20,8 @@ class FlashAttentionDecodeSm90:
     """SM90 decode-only kernel for paged KV, optimized for page_size == 1.
 
     Supported (initial scope):
-    - BF16 / FP16
+    - BF16 / FP16 Q/O
+    - BF16 / FP16 / FP8 (E4M3FN) KV cache
     - seqlen_q == 1 (decode)
     - paged KV (page_table != None) with page_size == 1
     - MHA / GQA / MQA (qhead_per_kvhead arbitrary), by grouping q heads per KV head
@@ -41,30 +42,42 @@ class FlashAttentionDecodeSm90:
         head_dim: int,
         qhead_per_kvhead: int,
         *,
+        dtype_kv: Optional[type[cutlass.Numeric]] = None,
         is_causal: bool,
         is_local: bool,
         max_qheads_per_block: int = 8,
         target_threads_per_block: int = 128,
-        max_bdz: int = 16,
+        max_bdz: int = 32,
         num_stages_smem: int = 2,
         tile_size_per_bdx: int = 4,
     ):
         self.dtype = dtype
+        self.dtype_kv = dtype if dtype_kv is None else dtype_kv
         self.head_dim = head_dim
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_causal = is_causal
         self.is_local = is_local
 
-        # CuTe DSL's non-bulk cp.async atom currently supports 128-bit copies. For BF16/FP16
-        # (16-bit elements), this implies vec_size == 8.
+        # CuTe DSL's non-bulk cp.async atom currently supports 128-bit copies.
+        # Choose vec_size so that vec_size * sizeof(dtype_kv) == 16 bytes:
+        # - BF16/FP16 KV: vec_size=8
+        # - FP8 KV: vec_size=16
         if head_dim not in (64, 128):
             raise ValueError(
                 f"FlashAttentionDecodeSm90 only supports head_dim 64 or 128 for now (got {head_dim})"
             )
-        self.vec_size = 8
+        kv_bytes = int(self.dtype_kv.width // 8)
+        if kv_bytes == 2:
+            self.vec_size = 8
+        elif kv_bytes == 1:
+            self.vec_size = 16
+        else:
+            raise ValueError(
+                f"Unsupported KV dtype width for SM90 decode fastpath: {self.dtype_kv.width} bits"
+            )
         assert head_dim % self.vec_size == 0
         self.bdx = head_dim // self.vec_size
-        assert self.bdx in (8, 16)
+        assert self.bdx in (4, 8, 16)
 
         self.num_stages_smem = num_stages_smem
         self.tile_size_per_bdx = tile_size_per_bdx
@@ -121,16 +134,12 @@ class FlashAttentionDecodeSm90:
         # eliminate 64-bit bank conflicts in the (token_in_iter, tx) store pattern.
         #
         # Padding is chosen so that rows separated by `tile_size_per_bdx` (4) map to disjoint
-        # shared-memory bank sets for the supported bdx in {8, 16}.
+        # shared-memory bank sets for the supported bdx in {4, 8, 16}.
         offset_cols = self.bdx + self.bdx // 4
         cosize_offsets = self.tile_tokens * offset_cols
 
-        sK_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
-        ]
-        sV_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, cosize_kv_stage], 16
-        ]
+        sK_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_kv, cosize_kv_stage], 16]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_kv, cosize_kv_stage], 16]
         sOffsets_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int32, cosize_offsets], 16]
 
         @cute.struct
@@ -150,6 +159,8 @@ class FlashAttentionDecodeSm90:
         mO: cute.Tensor,  # (b, s_q, h, d)
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
+        k_scale: Float32,
+        v_scale: Float32,
         stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -216,6 +227,8 @@ class FlashAttentionDecodeSm90:
             mSeqUsedK,
             mPageTable,
             softmax_scale,
+            k_scale,
+            v_scale,
             window_size_left,
             window_size_right,
             sK_layout,
@@ -241,6 +254,8 @@ class FlashAttentionDecodeSm90:
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: cute.Tensor,
         softmax_scale: Float32,
+        k_scale: Float32,
+        v_scale: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         sK_layout: cute.Layout,
@@ -298,25 +313,25 @@ class FlashAttentionDecodeSm90:
         sV = storage.sV.get_tensor(sK_layout)
         sOffsets_token_major = storage.sOffsets.get_tensor(sOffsets_token_major_layout)
         bdx = const_expr(self.bdx)
-        assert bdx in (8, 16), "Offset swizzle assumes bdx is a power-of-two (8 or 16)"
+        assert bdx in (4, 8, 16), "Offset swizzle assumes bdx is a power-of-two (4, 8, or 16)"
 
         # Compile-time constants for bdx-specific logic.
-        offsets_row_shift = 3 if bdx == 8 else 4
+        offsets_row_shift = bdx.bit_length() - 1
         offsets_col_mask = bdx - 1
-        tz_merge_offsets = (8, 16) if bdx == 8 else (16,)
-        tz_merge_div = 4 if bdx == 8 else 2
+        tz_merge_div = cute.arch.WARP_SIZE // bdx
+        tz_merge_offsets = tuple(bdx << i for i in range(tz_merge_div.bit_length() - 1))
         tz_merge_mask = tz_merge_div - 1
-        tz_merge_shift = 2 if bdx == 8 else 1
+        tz_merge_shift = tz_merge_div.bit_length() - 1
 
         # Copy atoms.
-        copy_bits = self.vec_size * self.dtype.width
+        copy_bits = self.vec_size * self.dtype_kv.width
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
+            self.dtype_kv,
             num_bits_per_copy=copy_bits,
         )
 
-        element_bytes = cutlass.Int64(self.dtype.width // 8)
+        element_bytes = cutlass.Int64(self.dtype_kv.width // 8)
         feature_bytes = cutlass.Int64(tx) * cutlass.Int64(self.vec_size) * element_bytes
         # Offsets are stored in units of 16 bytes, matching the alignment requirement for cp.async.
         offset_shift = Int32(4)
@@ -349,10 +364,11 @@ class FlashAttentionDecodeSm90:
         if qo_head_active:
             for i in cutlass.range_constexpr(self.vec_size):
                 q_vec[i] = Float32(mQ[0, tx * self.vec_size + i, qo_head_idx, batch_idx])
+        q_vec_ssa = q_vec.load()
 
         # Softmax state (log2 domain).
         LOG2_E = math.log2(math.e)
-        scale_log2 = softmax_scale * Float32(LOG2_E)
+        scale_log2 = softmax_scale * Float32(LOG2_E) * k_scale
         m = -Float32.inf
         d = Float32(0.0)
         o = cute.make_rmem_tensor((self.vec_size,), Float32)
@@ -381,13 +397,13 @@ class FlashAttentionDecodeSm90:
 
         sK_base_i64 = sK.iterator.toint()
         sV_base_i64 = sV.iterator.toint()
-        align_bytes = self.vec_size * (self.dtype.width // 8)
+        align_bytes = self.vec_size * (self.dtype_kv.width // 8)
 
         smem_feature_elems = tx * Int32(self.vec_size)
         stage_stride_elems = Int32(self.tile_tokens * self.head_dim)
         sKV_stage_layout = cute.make_layout(
-            (self.tile_tokens, self.head_dim),
-            stride=(self.head_dim, 1),
+            (self.tile_tokens, self.bdx, self.vec_size),
+            stride=(self.head_dim, self.vec_size, 1),
         )
 
         # Preload K/V for the first num_stages iterations.
@@ -414,7 +430,7 @@ class FlashAttentionDecodeSm90:
                     offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                     offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         mK_base_i64 + offset_bytes + feature_bytes,
                         cute.AddressSpace.gmem,
                         assumed_align=align_bytes,
@@ -424,7 +440,7 @@ class FlashAttentionDecodeSm90:
                     smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                     smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                     smem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         sK_stage_i64 + smem_byte_off,
                         cute.AddressSpace.smem,
                         assumed_align=align_bytes,
@@ -444,7 +460,7 @@ class FlashAttentionDecodeSm90:
                     offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                     offset_bytes_vec[j] = offset_bytes
                     gmem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         mK_base_i64 + offset_bytes + feature_bytes,
                         cute.AddressSpace.gmem,
                         assumed_align=align_bytes,
@@ -454,7 +470,7 @@ class FlashAttentionDecodeSm90:
                     smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                     smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                     smem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         sK_stage_i64 + smem_byte_off,
                         cute.AddressSpace.smem,
                         assumed_align=align_bytes,
@@ -468,7 +484,7 @@ class FlashAttentionDecodeSm90:
                     token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                     offset_bytes = offset_bytes_vec[j]
                     gmem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         mV_base_i64 + offset_bytes + feature_bytes,
                         cute.AddressSpace.gmem,
                         assumed_align=align_bytes,
@@ -478,7 +494,7 @@ class FlashAttentionDecodeSm90:
                     smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                     smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                     smem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         sV_stage_i64 + smem_byte_off,
                         cute.AddressSpace.smem,
                         assumed_align=align_bytes,
@@ -492,7 +508,7 @@ class FlashAttentionDecodeSm90:
                     valid = token_off < chunk_size
                     offset_bytes = offset_bytes_vec[j]
                     gmem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         mV_base_i64 + offset_bytes + feature_bytes,
                         cute.AddressSpace.gmem,
                         assumed_align=align_bytes,
@@ -502,7 +518,7 @@ class FlashAttentionDecodeSm90:
                     smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                     smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                     smem_ptr = cute.make_ptr(
-                        self.dtype,
+                        self.dtype_kv,
                         sV_stage_i64 + smem_byte_off,
                         cute.AddressSpace.smem,
                         assumed_align=align_bytes,
@@ -546,7 +562,7 @@ class FlashAttentionDecodeSm90:
             cute.arch.cp_async_wait_group(self.num_stages_smem - 1)
             cute.arch.barrier()
             sK_stage_ptr = cute.make_ptr(
-                self.dtype,
+                self.dtype_kv,
                 sK_stage_i64,
                 cute.AddressSpace.smem,
                 assumed_align=align_bytes,
@@ -558,10 +574,12 @@ class FlashAttentionDecodeSm90:
                 token_off = iter_idx * self.tile_tokens + token_in_stage
                 dot = Float32(0.0)
                 if token_off < chunk_size and qo_head_active:
-                    for i in cutlass.range_constexpr(self.vec_size):
-                        dot += q_vec[i] * Float32(
-                            sK_stage[token_in_stage, tx * self.vec_size + i]
+                    k_vec_f32 = sK_stage[token_in_stage, tx, None].load().to(Float32)
+                    dot = Float32(
+                        (k_vec_f32 * q_vec_ssa).reduce(
+                            cute.ReductionOp.ADD, 0.0, reduction_profile=0
                         )
+                    )
                 # IMPORTANT: all lanes in the warp must execute the shuffle-based reduction.
                 dot = utils.warp_reduce(dot, operator.add, width=self.bdx)
                 if qo_head_active:
@@ -607,7 +625,7 @@ class FlashAttentionDecodeSm90:
                         offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                         offset_bytes_vec[j] = offset_bytes
                         gmem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             mK_base_i64 + offset_bytes + feature_bytes,
                             cute.AddressSpace.gmem,
                             assumed_align=align_bytes,
@@ -617,7 +635,7 @@ class FlashAttentionDecodeSm90:
                         smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                         smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                         smem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             sK_stage_i64 + smem_byte_off,
                             cute.AddressSpace.smem,
                             assumed_align=align_bytes,
@@ -637,7 +655,7 @@ class FlashAttentionDecodeSm90:
                         offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                         offset_bytes_vec[j] = offset_bytes
                         gmem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             mK_base_i64 + offset_bytes + feature_bytes,
                             cute.AddressSpace.gmem,
                             assumed_align=align_bytes,
@@ -647,7 +665,7 @@ class FlashAttentionDecodeSm90:
                         smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                         smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                         smem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             sK_stage_i64 + smem_byte_off,
                             cute.AddressSpace.smem,
                             assumed_align=align_bytes,
@@ -660,7 +678,7 @@ class FlashAttentionDecodeSm90:
             cute.arch.cp_async_wait_group(self.num_stages_smem - 1)
             cute.arch.barrier()
             sV_stage_ptr = cute.make_ptr(
-                self.dtype,
+                self.dtype_kv,
                 sV_stage_i64,
                 cute.AddressSpace.smem,
                 assumed_align=align_bytes,
@@ -671,11 +689,10 @@ class FlashAttentionDecodeSm90:
                     token_in_stage = tz * self.tile_tokens_per_tz + t
                     token_off = iter_idx * self.tile_tokens + token_in_stage
                     if token_off < chunk_size:
-                        wt = s[t]
+                        wt = s[t] * v_scale
+                        v_vec_f32 = sV_stage[token_in_stage, tx, None].load().to(Float32)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            o[i] += wt * Float32(
-                                sV_stage[token_in_stage, tx * self.vec_size + i]
-                            )
+                            o[i] += wt * v_vec_f32[i]
             cute.arch.sync_warp()
 
             # Prefetch next V tile.
@@ -688,7 +705,7 @@ class FlashAttentionDecodeSm90:
                         token_in_iter = (tz * self.bdy + ty) * self.tile_size_per_bdx + j
                         offset_bytes = offset_bytes_vec[j]
                         gmem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             mV_base_i64 + offset_bytes + feature_bytes,
                             cute.AddressSpace.gmem,
                             assumed_align=align_bytes,
@@ -698,7 +715,7 @@ class FlashAttentionDecodeSm90:
                         smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                         smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                         smem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             sV_stage_i64 + smem_byte_off,
                             cute.AddressSpace.smem,
                             assumed_align=align_bytes,
@@ -712,7 +729,7 @@ class FlashAttentionDecodeSm90:
                         valid = token_off < chunk_size
                         offset_bytes = offset_bytes_vec[j]
                         gmem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             mV_base_i64 + offset_bytes + feature_bytes,
                             cute.AddressSpace.gmem,
                             assumed_align=align_bytes,
@@ -722,7 +739,7 @@ class FlashAttentionDecodeSm90:
                         smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                         smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                         smem_ptr = cute.make_ptr(
-                            self.dtype,
+                            self.dtype_kv,
                             sV_stage_i64 + smem_byte_off,
                             cute.AddressSpace.smem,
                             assumed_align=align_bytes,

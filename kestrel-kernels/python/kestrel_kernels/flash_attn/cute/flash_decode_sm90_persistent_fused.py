@@ -43,17 +43,19 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         qhead_per_kvhead: int,
         num_splits: int,
         *,
+        dtype_kv: Optional[type[cutlass.Numeric]] = None,
         is_causal: bool,
         is_local: bool,
         split_tokens: int,
         persist_oversub: int = 1,
         max_qheads_per_block: int = 8,
         target_threads_per_block: int = 128,
-        max_bdz: int = 16,
+        max_bdz: int = 32,
         num_stages_smem: int = 2,
         tile_size_per_bdx: int = 4,
     ):
         self.dtype = dtype
+        self.dtype_kv = dtype if dtype_kv is None else dtype_kv
         self.head_dim = int(head_dim)
         self.qhead_per_kvhead = int(qhead_per_kvhead)
         self.is_causal = is_causal
@@ -72,10 +74,18 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                 "FlashAttentionDecodeSm90PersistentSplitFused only supports head_dim 64 or 128 "
                 f"(got {head_dim})"
             )
-        self.vec_size = 8
+        kv_bytes = int(self.dtype_kv.width // 8)
+        if kv_bytes == 2:
+            self.vec_size = 8
+        elif kv_bytes == 1:
+            self.vec_size = 16
+        else:
+            raise ValueError(
+                f"Unsupported KV dtype width for SM90 decode fastpath: {self.dtype_kv.width} bits"
+            )
         assert self.head_dim % self.vec_size == 0
         self.bdx = self.head_dim // self.vec_size
-        assert self.bdx in (8, 16)
+        assert self.bdx in (4, 8, 16)
 
         self.num_stages_smem = int(num_stages_smem)
         self.tile_size_per_bdx = int(tile_size_per_bdx)
@@ -113,8 +123,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         offset_cols = self.bdx + self.bdx // 4
         cosize_offsets = self.tile_tokens * offset_cols
 
-        sK_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_kv_stage], 16]
-        sV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_kv_stage], 16]
+        sK_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_kv, cosize_kv_stage], 16]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_kv, cosize_kv_stage], 16]
         sOffsets_struct = cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, cosize_offsets], 16
         ]
@@ -145,6 +155,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         mLSE_partial: cute.Tensor,  # (num_splits, b, h, s_q) float32
         mSplitCounters: cute.Tensor,  # (b, num_kv_heads * group_count) int32
         softmax_scale: Float32,
+        k_scale: Float32,
+        v_scale: Float32,
         window_size_left: Int32 | int | None,
         window_size_right: Int32 | int | None,
         stream: cuda.CUstream,
@@ -215,6 +227,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
             mLSE_partial,
             mSplitCounters,
             softmax_scale,
+            k_scale,
+            v_scale,
             window_size_left,
             window_size_right,
             sK_layout,
@@ -244,6 +258,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         mLSE_partial: cute.Tensor,
         mSplitCounters: cute.Tensor,
         softmax_scale: Float32,
+        k_scale: Float32,
+        v_scale: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         sK_layout: cute.Layout,
@@ -269,13 +285,13 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         group_count_div = FastDivmodDivisor(Int32(self.group_count))
 
         bdx = const_expr(self.bdx)
-        assert bdx in (8, 16)
-        offsets_row_shift = 3 if bdx == 8 else 4
+        assert bdx in (4, 8, 16)
+        offsets_row_shift = bdx.bit_length() - 1
         offsets_col_mask = bdx - 1
-        tz_merge_offsets = (8, 16) if bdx == 8 else (16,)
-        tz_merge_div = 4 if bdx == 8 else 2
+        tz_merge_div = cute.arch.WARP_SIZE // bdx
+        tz_merge_offsets = tuple(bdx << i for i in range(tz_merge_div.bit_length() - 1))
         tz_merge_mask = tz_merge_div - 1
-        tz_merge_shift = 2 if bdx == 8 else 1
+        tz_merge_shift = tz_merge_div.bit_length() - 1
 
         # Shared memory.
         smem = cutlass.utils.SmemAllocator()
@@ -286,19 +302,14 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
         sIsLast = storage.sIsLast.get_tensor(sIsLast_layout)
 
         # Copy atoms.
-        copy_bits = self.vec_size * self.dtype.width
+        copy_bits_kv = self.vec_size * self.dtype_kv.width
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
-            num_bits_per_copy=copy_bits,
-        )
-        atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
-            num_bits_per_copy=copy_bits,
+            self.dtype_kv,
+            num_bits_per_copy=copy_bits_kv,
         )
 
-        element_bytes = cutlass.Int64(self.dtype.width // 8)
+        element_bytes = cutlass.Int64(self.dtype_kv.width // 8)
         feature_bytes = cutlass.Int64(tx) * cutlass.Int64(self.vec_size) * element_bytes
         offset_shift = Int32(4)  # offsets in units of 16 bytes (cp.async alignment)
 
@@ -311,13 +322,13 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
         sK_base_i64 = sK.iterator.toint()
         sV_base_i64 = sV.iterator.toint()
-        align_bytes = self.vec_size * (self.dtype.width // 8)
+        align_bytes = self.vec_size * (self.dtype_kv.width // 8)
 
         smem_feature_elems = tx * Int32(self.vec_size)
         stage_stride_elems = Int32(self.tile_tokens * self.head_dim)
         sKV_stage_layout = cute.make_layout(
-            (self.tile_tokens, self.head_dim),
-            stride=(self.head_dim, 1),
+            (self.tile_tokens, self.bdx, self.vec_size),
+            stride=(self.head_dim, self.vec_size, 1),
         )
 
         # For full tiles, issue unpredicated cp.async loads.
@@ -335,7 +346,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
         LOG2_E = math.log2(math.e)
         LOG2_E_F32 = Float32(LOG2_E)
-        scale_log2 = softmax_scale * LOG2_E_F32
+        scale_log2 = softmax_scale * LOG2_E_F32 * k_scale
         split_tokens = Int32(self.split_tokens)
         num_stages_smem_i32 = Int32(self.num_stages_smem)
         cp_async_wait_n = Int32(self.num_stages_smem - 1)
@@ -409,6 +420,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     q_vec[i] = Float32(mQ[0, tx * Int32(self.vec_size) + i, qo_head_idx, batch_idx])
             else:
                 q_vec.fill(0.0)
+            q_vec_ssa = q_vec.load()
 
             # Softmax accumulators.
             m = -Float32.inf
@@ -458,7 +470,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                             offset_bytes_vec[j] = offset_bytes
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mK_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -468,7 +480,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sK_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -488,7 +500,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                             offset_bytes_vec[j] = offset_bytes
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mK_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -498,7 +510,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sK_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -512,7 +524,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
                             offset_bytes = offset_bytes_vec[j]
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mV_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -522,7 +534,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sV_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -536,7 +548,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             valid = token_off < chunk_size
                             offset_bytes = offset_bytes_vec[j]
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mV_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -546,7 +558,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sV_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -592,7 +604,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                 cute.arch.cp_async_wait_group(cp_async_wait_n)
                 cute.arch.barrier()
                 sK_stage_ptr = cute.make_ptr(
-                    self.dtype,
+                    self.dtype_kv,
                     sK_stage_i64,
                     cute.AddressSpace.smem,
                     assumed_align=align_bytes,
@@ -604,10 +616,12 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     token_off = iter_idx * Int32(self.tile_tokens) + token_in_stage
                     dot = Float32(0.0)
                     if token_off < chunk_size and qo_head_active:
-                        for i in cutlass.range_constexpr(self.vec_size):
-                            dot += q_vec[i] * Float32(
-                                sK_stage[token_in_stage, tx * Int32(self.vec_size) + i]
+                        k_vec_f32 = sK_stage[token_in_stage, tx, None].load().to(Float32)
+                        dot = Float32(
+                            (k_vec_f32 * q_vec_ssa).reduce(
+                                cute.ReductionOp.ADD, 0.0, reduction_profile=0
                             )
+                        )
                     dot = utils.warp_reduce(dot, operator.add, width=self.bdx)
                     if qo_head_active:
                         if token_off < chunk_size:
@@ -646,7 +660,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                             offset_bytes_vec[j] = offset_bytes
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mK_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -656,7 +670,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sK_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -676,7 +690,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             offset_bytes = cutlass.Int64(offset16_u32) << offset_shift
                             offset_bytes_vec[j] = offset_bytes
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mK_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -686,7 +700,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sK_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -698,7 +712,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                 cute.arch.cp_async_wait_group(cp_async_wait_n)
                 cute.arch.barrier()
                 sV_stage_ptr = cute.make_ptr(
-                    self.dtype,
+                    self.dtype_kv,
                     sV_stage_i64,
                     cute.AddressSpace.smem,
                     assumed_align=align_bytes,
@@ -709,11 +723,10 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
                         token_off = iter_idx * Int32(self.tile_tokens) + token_in_stage
                         if token_off < chunk_size:
-                            wt = s[t]
+                            wt = s[t] * v_scale
+                            v_vec_f32 = sV_stage[token_in_stage, tx, None].load().to(Float32)
                             for i in cutlass.range_constexpr(self.vec_size):
-                                o[i] += wt * Float32(
-                                    sV_stage[token_in_stage, tx * Int32(self.vec_size) + i]
-                                )
+                                o[i] += wt * v_vec_f32[i]
                 cute.arch.sync_warp()
 
                 if prefetch_iter < num_iters:
@@ -724,7 +737,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             token_in_iter = (tz * Int32(self.bdy) + ty) * Int32(self.tile_size_per_bdx) + j
                             offset_bytes = offset_bytes_vec[j]
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mV_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -734,7 +747,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sV_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -748,7 +761,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             valid = token_off < chunk_size
                             offset_bytes = offset_bytes_vec[j]
                             gmem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 mV_base_i64 + offset_bytes + feature_bytes,
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes,
@@ -758,7 +771,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             smem_row = token_in_iter * Int32(self.head_dim) + smem_feature_elems
                             smem_byte_off = cutlass.Int64(smem_row) * element_bytes
                             smem_ptr = cute.make_ptr(
-                                self.dtype,
+                                self.dtype_kv,
                                 sV_stage_i64 + smem_byte_off,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
@@ -1020,21 +1033,10 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
                         for i in cutlass.range_constexpr(self.vec_size):
                             acc[i] *= inv_denom
-
-                        o_out = cute.make_rmem_tensor((self.vec_size,), self.dtype)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            o_out[i] = acc[i].to(self.dtype)
-                        o_ptr_i64 = utils.elem_pointer_i64(
-                            mO, (0, tx * Int32(self.vec_size), qo_head_idx, batch_idx)
-                        ).toint()
-                        o_ptr = cute.make_ptr(
-                            self.dtype,
-                            o_ptr_i64,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        o_dst = cute.make_tensor(o_ptr, (self.vec_size,))
-                        cute.copy(atom_universal_copy, o_out, o_dst)
+                            mO[0, tx * Int32(self.vec_size) + i, qo_head_idx, batch_idx] = acc[
+                                i
+                            ].to(self.dtype)
                         if const_expr(mLSE is not None):
                             if tx == 0:
                                 mLSE[0, qo_head_idx, batch_idx] = utils.logf(denom) + lse_max
@@ -1142,21 +1144,10 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
                         for i in cutlass.range_constexpr(self.vec_size):
                             acc[i] *= inv_denom
-
-                        o_out = cute.make_rmem_tensor((self.vec_size,), self.dtype)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            o_out[i] = acc[i].to(self.dtype)
-                        o_ptr_i64 = utils.elem_pointer_i64(
-                            mO, (0, tx * Int32(self.vec_size), qo_head_idx, batch_idx)
-                        ).toint()
-                        o_ptr = cute.make_ptr(
-                            self.dtype,
-                            o_ptr_i64,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        o_dst = cute.make_tensor(o_ptr, (self.vec_size,))
-                        cute.copy(atom_universal_copy, o_out, o_dst)
+                            mO[0, tx * Int32(self.vec_size) + i, qo_head_idx, batch_idx] = acc[
+                                i
+                            ].to(self.dtype)
                         if const_expr(mLSE is not None):
                             if tx == 0:
                                 mLSE[0, qo_head_idx, batch_idx] = utils.logf(denom) + lse_max

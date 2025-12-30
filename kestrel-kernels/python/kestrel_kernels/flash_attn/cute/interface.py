@@ -182,6 +182,8 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     paged_kv_non_tma: Optional[bool] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -196,6 +198,12 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    if isinstance(k_scale, torch.Tensor):
+        k_scale = float(k_scale.item())
+    if isinstance(v_scale, torch.Tensor):
+        v_scale = float(v_scale.item())
+    k_scale_val = 1.0 if k_scale is None else float(k_scale)
+    v_scale_val = 1.0 if v_scale is None else float(v_scale)
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -241,8 +249,19 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    assert q.dtype in [torch.float16, torch.bfloat16], "q must be float16 or bfloat16"
+    kv_is_fp8 = (k.dtype == torch.float8_e4m3fn) or (v.dtype == torch.float8_e4m3fn)
+    if kv_is_fp8:
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"FP8 KV cache requires k and v both be float8_e4m3fn (got k={k.dtype}, v={v.dtype})"
+            )
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 KV cache requires k_scale and v_scale")
+        if k_scale_val <= 0.0 or v_scale_val <= 0.0:
+            raise ValueError("k_scale and v_scale must be positive for FP8 KV cache")
+    else:
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -305,6 +324,7 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     dtype = torch2cute_dtype_map[q.dtype]
+    dtype_kv = cutlass.Float8E4M3FN if kv_is_fp8 else dtype
     compute_capability = (
         _get_device_capability()
         if _compute_capability is None
@@ -397,6 +417,7 @@ def _flash_attn_fwd(
         # Baseline SM90 decode launches one CTA per (batch, kv_head_group).
         tmp_kernel = FlashAttentionDecodeSm90PersistentSplitFused(
             dtype=dtype,
+            dtype_kv=dtype_kv,
             head_dim=head_dim,
             qhead_per_kvhead=qhead_per_kvhead,
             num_splits=2,
@@ -468,6 +489,8 @@ def _flash_attn_fwd(
                 page_table=page_table,
                 seqused_k=seqused_k,
                 softmax_scale=softmax_scale,
+                k_scale=k_scale_val,
+                v_scale=v_scale_val,
                 causal=causal,
                 local=local,
                 window_size_left=window_size_left,
@@ -555,9 +578,15 @@ def _flash_attn_fwd(
         and not is_split_kv
         and head_dim in (64, 128)
     )
+    if kv_is_fp8 and not use_sm90_decode_fastpath:
+        raise NotImplementedError(
+            "FP8 KV cache is currently supported only for the SM90 decode fastpath "
+            "(paged KV with page_size==1, seqlen_q==1)."
+        )
 
     compile_key = (
         dtype,
+        dtype_kv,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -603,8 +632,14 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
+        k_for_cute = k
+        v_for_cute = v
+        if kv_is_fp8 and use_sm90_decode_fastpath:
+            k_for_cute = k.view(torch.uint8)
+            v_for_cute = v.view(torch.uint8)
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            to_cute_tensor(t)
+            for t in (q, k_for_cute, v_for_cute, out if not is_split_kv else out_partial)
         ]
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
@@ -641,12 +676,15 @@ def _flash_attn_fwd(
                     f"(got page_size={page_size}, n_block_size={n_block_size})"
                 )
             if use_sm90_decode_fastpath:
+                tile_size_per_bdx = 2 if kv_is_fp8 and qhead_per_kvhead == 1 else 4
                 fa_fwd = FlashAttentionDecodeSm90(
                     dtype,
                     head_dim,
                     qhead_per_kvhead,
+                    dtype_kv=dtype_kv,
                     is_causal=causal,
                     is_local=local,
+                    tile_size_per_bdx=tile_size_per_bdx,
                 )
             else:
                 # fa_fwd = FlashAttentionForwardSm80(
@@ -699,27 +737,53 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            window_size_left,
-            window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-            options="--enable-tvm-ffi",
-        )
+        if use_sm90_decode_fastpath:
+            compiled = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                k_scale_val,
+                v_scale_val,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            compiled = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
+        _flash_attn_fwd.compile_cache[compile_key] = compiled
 
     # Expand block sparse tensors to match actual head count (may be broadcast from 1)
     normalized_block_sparse_tensors = None
@@ -734,25 +798,53 @@ def _flash_attn_fwd(
             expected_index_shape=expected_index_shape,
         )
 
-    _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        out if not is_split_kv else out_partial,
-        lse_partial if is_split_kv else lse,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        normalized_block_sparse_tensors,
-        aux_tensors,
-    )
+    k_for_call = k
+    v_for_call = v
+    if kv_is_fp8 and use_sm90_decode_fastpath:
+        k_for_call = k.view(torch.uint8)
+        v_for_call = v.view(torch.uint8)
+    if use_sm90_decode_fastpath:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q,
+            k_for_call,
+            v_for_call,
+            out if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            k_scale_val,
+            v_scale_val,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            normalized_block_sparse_tensors,
+            aux_tensors,
+        )
+    else:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q,
+            k_for_call,
+            v_for_call,
+            out if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            normalized_block_sparse_tensors,
+            aux_tensors,
+        )
     # Expose last dispatch choice for tests.
     _flash_attn_fwd._debug_last_impl = "sm90_decode" if use_sm90_decode_fastpath else "fwd"
     if is_split_kv:
@@ -1649,6 +1741,8 @@ def _flash_attn_sm90_decode_persistent_split_fused(
     page_table: torch.Tensor,
     seqused_k: torch.Tensor,
     softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
     causal: bool,
     local: bool,
     window_size_left: Optional[int],
@@ -1672,11 +1766,23 @@ def _flash_attn_sm90_decode_persistent_split_fused(
         assert lse.is_cuda and lse.dtype == torch.float32, "lse must be fp32 CUDA tensor"
 
     dtype = torch2cute_dtype_map[q.dtype]
+    kv_is_fp8 = (k.dtype == torch.float8_e4m3fn) or (v.dtype == torch.float8_e4m3fn)
+    if kv_is_fp8:
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"FP8 KV cache requires k and v both be float8_e4m3fn (got k={k.dtype}, v={v.dtype})"
+            )
+        if k_scale <= 0.0 or v_scale <= 0.0:
+            raise ValueError("k_scale and v_scale must be positive for FP8 KV cache")
+    else:
+        assert q.dtype == k.dtype == v.dtype, "q/k/v dtype mismatch"
+    dtype_kv = cutlass.Float8E4M3FN if kv_is_fp8 else dtype
     head_dim = q.shape[-1]
     assert head_dim in (64, 128), "fused persistent split is only tuned for head_dim 64/128"
 
     compile_key = (
         dtype,
+        dtype_kv,
         head_dim,
         int(qhead_per_kvhead),
         bool(causal),
@@ -1690,8 +1796,10 @@ def _flash_attn_sm90_decode_persistent_split_fused(
     )
     if compile_key not in _flash_attn_sm90_decode_persistent_split_fused.compile_cache:
         q_tensor = to_cute_tensor(q)
-        k_tensor = to_cute_tensor(k)
-        v_tensor = to_cute_tensor(v)
+        k_for_cute = k.view(torch.uint8) if kv_is_fp8 else k
+        v_for_cute = v.view(torch.uint8) if kv_is_fp8 else v
+        k_tensor = to_cute_tensor(k_for_cute)
+        v_tensor = to_cute_tensor(v_for_cute)
         out_tensor = to_cute_tensor(out)
         lse_tensor = (
             to_cute_tensor(lse, assumed_align=4) if lse is not None else None
@@ -1705,6 +1813,7 @@ def _flash_attn_sm90_decode_persistent_split_fused(
 
         fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
             dtype=dtype,
+            dtype_kv=dtype_kv,
             head_dim=head_dim,
             qhead_per_kvhead=int(qhead_per_kvhead),
             num_splits=int(num_splits),
@@ -1712,6 +1821,7 @@ def _flash_attn_sm90_decode_persistent_split_fused(
             is_local=bool(local),
             split_tokens=int(split_tokens),
             persist_oversub=int(persist_oversub),
+            tile_size_per_bdx=2 if kv_is_fp8 and int(qhead_per_kvhead) == 1 else 4,
         )
         _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = cute.compile(
             fa_fused,
@@ -1726,6 +1836,8 @@ def _flash_attn_sm90_decode_persistent_split_fused(
             lse_partial_tensor,
             split_counters_tensor,
             softmax_scale,
+            k_scale,
+            v_scale,
             window_size_left,
             window_size_right,
             current_stream,
@@ -1733,10 +1845,12 @@ def _flash_attn_sm90_decode_persistent_split_fused(
         )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    k_for_call = k.view(torch.uint8) if kv_is_fp8 else k
+    v_for_call = v.view(torch.uint8) if kv_is_fp8 else v
     _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key](
         q,
-        k,
-        v,
+        k_for_call,
+        v_for_call,
         out,
         lse,
         seqused_k,
@@ -1745,6 +1859,8 @@ def _flash_attn_sm90_decode_persistent_split_fused(
         lse_partial,
         split_counters,
         softmax_scale,
+        k_scale,
+        v_scale,
         window_size_left,
         window_size_right,
         current_stream,

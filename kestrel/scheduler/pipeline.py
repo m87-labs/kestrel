@@ -143,8 +143,8 @@ class ForwardHandle(Generic[Seq]):
     3. Consumed by scheduler.finalize_sampling(handle, mask) -> InFlightStep
     4. Cleared via pipeline.on_sampling_complete(step)
 
-    The slot_id indicates which ping-pong slot's resources (FlashInfer context,
-    staging buffers, CUDA graphs) are being used for this forward pass.
+    The slot_id indicates which ping-pong slot's resources (staging buffers,
+    CUDA graphs, etc.) are being used for this forward pass.
     """
 
     slot_id: int
@@ -183,7 +183,7 @@ class PipelineState(Generic[Seq, Transfer]):
     Slot Management
     ---------------
     Two ping-pong slots (0 and 1) alternate each step. Each slot owns:
-    - FlashInfer decode context + workspace
+    - Per-slot decode workspace
     - Staging buffers for sampled outputs (GPU)
     - Pinned host buffers for D2H copies
     - CUDA graph workspace + captures (if enabled)

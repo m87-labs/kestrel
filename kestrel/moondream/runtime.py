@@ -296,16 +296,25 @@ class MoondreamRuntime:
                 stacklevel=2,
             )
 
-        # TEMPORARY: force KV cache to bf16 for debugging/validation.
-        # Restore the fp8/auto selection logic below after the investigation.
-        # if (
-        #     self._kv_layer_k_scales is not None
-        #     and self._kv_layer_v_scales is not None
-        # ):
-        #     self.kv_cache_dtype = torch.float8_e4m3fn
-        # else:
-        #     self.kv_cache_dtype = self.dtype
-        self.kv_cache_dtype = torch.bfloat16  # TEMPORARY override
+        if (
+            self._kv_layer_k_scales is not None
+            and self._kv_layer_v_scales is not None
+            and self.page_size == 1
+            and hasattr(torch, "float8_e4m3fn")
+        ):
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        else:
+            if (
+                self._kv_layer_k_scales is not None
+                and self._kv_layer_v_scales is not None
+                and self.page_size != 1
+            ):
+                warnings.warn(
+                    "KV scales found in checkpoint but FP8 KV cache currently requires page_size==1; "
+                    "falling back to standard KV cache.",
+                    stacklevel=2,
+                )
+            self.kv_cache_dtype = self.dtype
 
         tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
