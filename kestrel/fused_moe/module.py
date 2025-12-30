@@ -6,7 +6,11 @@ import torch
 from torch import nn
 from torch.compiler import disable as torch_compiler_disable
 
-from .kernels import dtype_to_triton, invoke_fused_moe_kernel as invoke_fused_moe_kernel_triton
+from .kernels import (
+    dtype_to_triton,
+    invoke_fused_moe_kernel as invoke_fused_moe_kernel_triton,
+    invoke_fused_moe_kernel_fp8_w8a8 as invoke_fused_moe_kernel_triton_fp8,
+)
 from .lora_kernels import apply_moe_lora
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
@@ -203,6 +207,8 @@ class _MoEWorkspaces:
         self.down = _ResizableBuffer()
         self.output = _ResizableBuffer()
         self.activation = _ResizableBuffer()
+        self.fp8_bits = _ResizableBuffer()
+        self.fp8_scale = _ResizableBuffer()
 
 
 @dataclass
@@ -278,16 +284,32 @@ class FusedMoEModule(nn.Module):
             raise ValueError("Fused MoE backend requires fp16/bf16/fp32 inputs")
         if self.up_experts.weight.device != hidden_states.device:
             raise ValueError("Expert weights must be on the same device as inputs")
-        if self.up_experts.weight.dtype != hidden_states.dtype:
-            raise ValueError("Expert weights must match hidden state dtype")
         if self.down_experts.weight.device != hidden_states.device:
             raise ValueError("Output expert weights must be on the input device")
-        if self.down_experts.weight.dtype != hidden_states.dtype:
-            raise ValueError("Output expert weights must match hidden state dtype")
         if topk_weights.dtype != hidden_states.dtype:
             raise ValueError("Top-k weights must match hidden state dtype")
         if topk_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("topk_ids must be an integer tensor")
+
+        up_is_fp8w = self.up_experts.weight.dtype == torch.uint8
+        down_is_fp8w = self.down_experts.weight.dtype == torch.uint8
+        if up_is_fp8w != down_is_fp8w:
+            raise ValueError("Up and down expert weights must use the same dtype scheme")
+
+        if up_is_fp8w:
+            if hidden_states.dtype != torch.bfloat16:
+                raise ValueError("FP8-weight MoE currently requires bfloat16 hidden states")
+            if not hasattr(self.up_experts, "scale") or not hasattr(self.down_experts, "scale"):
+                raise ValueError("FP8-weight experts must define a `scale` tensor")
+            if self.up_experts.scale.device != hidden_states.device:
+                raise ValueError("Up expert scales must be on the same device as inputs")
+            if self.down_experts.scale.device != hidden_states.device:
+                raise ValueError("Down expert scales must be on the same device as inputs")
+        else:
+            if self.up_experts.weight.dtype != hidden_states.dtype:
+                raise ValueError("Expert weights must match hidden state dtype")
+            if self.down_experts.weight.dtype != hidden_states.dtype:
+                raise ValueError("Output expert weights must match hidden state dtype")
 
         hidden_states = hidden_states.contiguous()
         topk_weights = topk_weights.contiguous()
@@ -303,6 +325,10 @@ class FusedMoEModule(nn.Module):
             assignments=assignments,
             dtype=hidden_states.dtype,
         )
+        if up_is_fp8w:
+            # SM90 FP8 WGMMA path prefers block_m=64 routing.
+            triton_config = triton_config.copy()
+            triton_config["BLOCK_SIZE_M"] = 64
         block_size_m = triton_config["BLOCK_SIZE_M"]
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -320,6 +346,7 @@ class FusedMoEModule(nn.Module):
         self._invoke_fused_moe_kernel(
             hidden_states,
             self.up_experts.weight,
+            getattr(self.up_experts, "scale", None),
             up_out,
             topk_weights=None,
             sorted_token_ids=sorted_token_ids,
@@ -402,6 +429,7 @@ class FusedMoEModule(nn.Module):
         self._invoke_fused_moe_kernel(
             down_in,
             self.down_experts.weight,
+            getattr(self.down_experts, "scale", None),
             down_out,
             topk_weights=topk_weights.view(-1),
             sorted_token_ids=sorted_token_ids,
@@ -439,10 +467,37 @@ class FusedMoEModule(nn.Module):
         moe_sum_cuda(down_out, fused)
         return fused
 
+    def _quantize_fp8_e4m3fn_rowwise(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Row-wise FP8(E4M3FN) quantization returning (uint8 bitview, fp32 scale)."""
+        if x.dtype != torch.bfloat16:
+            raise ValueError(f"FP8 activation quantization expects bf16 (got {x.dtype})")
+        if x.ndim != 2:
+            raise ValueError("Expected 2D activation matrix")
+
+        # Use a custom CUDA kernel to keep this path CUDA-graph-capturable and avoid
+        # per-call allocations.
+        from kestrel_kernels.fp8_quant import fp8_e4m3fn_rowwise_quant_cuda
+
+        out_bits = self._workspaces.fp8_bits.get(
+            (int(x.shape[0]), int(x.shape[1])),
+            device=x.device,
+            dtype=torch.uint8,
+        )
+        out_scale = self._workspaces.fp8_scale.get(
+            (int(x.shape[0]),),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        fp8_e4m3fn_rowwise_quant_cuda(out_bits, out_scale, x)
+        return out_bits, out_scale
+
     def _invoke_fused_moe_kernel(
         self,
         A: torch.Tensor,
         B: torch.Tensor,
+        B_scale: torch.Tensor | None,
         C: torch.Tensor,
         *,
         topk_weights: torch.Tensor | None,
@@ -456,37 +511,186 @@ class FusedMoEModule(nn.Module):
     ) -> None:
         backend = self.config.backend.lower()
         use_cute = backend in ("cute", "auto")
+        b_is_fp8w = B.dtype == torch.uint8
+
+        if b_is_fp8w and backend in ("triton", "auto"):
+            # Triton FP8 W8A8 path (SGLang-style): quantize activations per row
+            # and do FP8 dot with per-output-channel weight scales.
+            if B_scale is None:
+                raise ValueError("B_scale is required for FP8-weight MoE")
+
+            triton_fp8_config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "NUM_WARPS": 4,
+                "NUM_STAGES": 4,
+            }
+            a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
+            invoke_fused_moe_kernel_triton_fp8(
+                a_bits.view(torch.float8_e4m3fn),
+                a_scale,
+                B.view(torch.float8_e4m3fn),
+                B_scale,
+                C,
+                topk_weights=topk_weights,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=mul_routed_weight,
+                top_k=top_k,
+                config=triton_fp8_config,
+                compute_type=compute_type,
+            )
+            return
 
         if use_cute:
             try:
                 from kestrel.ops.fused_moe_cute import (
                     FusedMoeCuTeConfig,
                     invoke_fused_moe_kernel_cute_down_decode,
+                    invoke_fused_moe_kernel_cute_down_decode_fp8,
+                    invoke_fused_moe_kernel_cute_down_decode_fp8w,
                     invoke_fused_moe_kernel_cute_up_decode,
+                    invoke_fused_moe_kernel_cute_up_decode_fp8,
+                    invoke_fused_moe_kernel_cute_up_decode_fp8w,
                 )
 
-                # Current CuTe kernel is tuned for the small-M decode regime where the routing
-                # block size is 16. For other block sizes we fall back to Triton.
                 block_m = triton_config["BLOCK_SIZE_M"]
+                if b_is_fp8w:
+                    # Prefer W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
+                    if block_m == 64:
+                        if B_scale is None:
+                            raise ValueError("B_scale is required for FP8-weight MoE")
+
+                        num_tokens = int(C.shape[0])
+                        # Match Triton's fp8 W8A8 tiling, but keep a smaller N tile
+                        # for the single-token case where occupancy is otherwise poor.
+                        block_n = 64 if (not mul_routed_weight) and (num_tokens == 1) else 128
+
+                        # Prefer deeper pipelining for small decode batches to better hide
+                        # DRAM latency; fall back to fewer stages for larger batches where
+                        # occupancy becomes the limiting factor.
+                        num_stages = 4 if num_tokens <= 16 else 2
+
+                        cute_cfg = FusedMoeCuTeConfig(
+                            block_m=64,
+                            block_n=block_n,
+                            block_k=128,
+                            num_warps=4,
+                            num_stages=num_stages,
+                        )
+                        a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
+                        if mul_routed_weight:
+                            if int(top_k) != 1:
+                                raise ValueError("CuTe fp8 moe_down expects top_k=1")
+                            if topk_weights is None:
+                                raise ValueError("topk_weights is required when mul_routed_weight=True")
+                            invoke_fused_moe_kernel_cute_down_decode_fp8(
+                                a_bits,
+                                a_scale,
+                                B,
+                                B_scale,
+                                C,
+                                topk_weights=topk_weights,
+                                sorted_token_ids=sorted_token_ids,
+                                expert_ids=expert_ids,
+                                num_tokens_post_padded=num_tokens_post_padded,
+                                config=cute_cfg,
+                            )
+                        else:
+                            if int(top_k) != 8:
+                                raise ValueError("CuTe fp8 moe_up expects top_k=8")
+                            invoke_fused_moe_kernel_cute_up_decode_fp8(
+                                a_bits,
+                                a_scale,
+                                B,
+                                B_scale,
+                                C,
+                                sorted_token_ids=sorted_token_ids,
+                                expert_ids=expert_ids,
+                                num_tokens_post_padded=num_tokens_post_padded,
+                                config=cute_cfg,
+                            )
+                        return
+
+                    # Legacy fallback: FP8 weights only (BF16 activations).
+                    if block_m == 16:
+                        num_tokens = int(C.shape[0])
+                        if num_tokens <= 8:
+                            if mul_routed_weight:
+                                cute_cfg = FusedMoeCuTeConfig(
+                                    block_m=16,
+                                    block_n=64,
+                                    block_k=256,
+                                    num_warps=4,
+                                    num_stages=1,
+                                )
+                            else:
+                                cute_cfg = FusedMoeCuTeConfig(
+                                    block_m=16,
+                                    block_n=128,
+                                    block_k=128,
+                                    num_warps=2,
+                                    num_stages=1,
+                                )
+                        else:
+                            num_stages = int(triton_config["NUM_STAGES"])
+                            if mul_routed_weight:
+                                num_stages = min(2, num_stages)
+                            cute_cfg = FusedMoeCuTeConfig(
+                                block_m=block_m,
+                                block_n=int(triton_config["BLOCK_SIZE_N"]),
+                                block_k=int(triton_config["BLOCK_SIZE_K"]),
+                                num_warps=int(triton_config["NUM_WARPS"]),
+                                num_stages=num_stages,
+                            )
+                        if mul_routed_weight:
+                            if int(top_k) != 1:
+                                raise ValueError("CuTe fp8w moe_down expects top_k=1")
+                            if topk_weights is None:
+                                raise ValueError("topk_weights is required when mul_routed_weight=True")
+                            if B_scale is None:
+                                raise ValueError("B_scale is required for FP8-weight moe_down")
+                            invoke_fused_moe_kernel_cute_down_decode_fp8w(
+                                A,
+                                B,
+                                B_scale,
+                                C,
+                                topk_weights=topk_weights,
+                                sorted_token_ids=sorted_token_ids,
+                                expert_ids=expert_ids,
+                                num_tokens_post_padded=num_tokens_post_padded,
+                                config=cute_cfg,
+                            )
+                        else:
+                            if int(top_k) != 8:
+                                raise ValueError("CuTe fp8w moe_up expects top_k=8")
+                            if B_scale is None:
+                                raise ValueError("B_scale is required for FP8-weight moe_up")
+                            invoke_fused_moe_kernel_cute_up_decode_fp8w(
+                                A,
+                                B,
+                                B_scale,
+                                C,
+                                sorted_token_ids=sorted_token_ids,
+                                expert_ids=expert_ids,
+                                num_tokens_post_padded=num_tokens_post_padded,
+                                config=cute_cfg,
+                            )
+                        return
+
+                # Unquantized BF16 CuTe path: tuned for decode with routing block_m=16.
                 if block_m == 16:
-                    # Allow CuTe-specific tuning for the decode regime.
-                    # We keep correctness identical to Triton but may pick different tiles.
                     num_tokens = int(C.shape[0])
                     if num_tokens <= 8:
-                        # Tiny decode batches (B~4, T~1) are extremely padding-heavy; we
-                        # use CuTe-specific tiles tuned for H100 decode.
-                        #
-                        # NOTE: Up-proj and down-proj have different sweet spots:
-                        # - Up: smaller BK helps shared memory footprint; 1 stage is enough.
-                        # - Down: larger BK reduces K tiles and is faster even at 1 CTA/SM.
                         if mul_routed_weight:
                             cute_cfg = FusedMoeCuTeConfig(
                                 block_m=16,
                                 block_n=64,
                                 block_k=256,
                                 num_warps=4,
-                                # For tiny decode, keeping stages low avoids exploding SMEM
-                                # (and preserves occupancy) while still benefiting from larger BK.
                                 num_stages=1,
                             )
                         else:
@@ -498,8 +702,6 @@ class FusedMoEModule(nn.Module):
                                 num_stages=1,
                             )
                     else:
-                        # For down-proj (mul_routed_weight) we keep the Triton tiling but use
-                        # fewer stages to reduce shared-memory pressure.
                         num_stages = int(triton_config["NUM_STAGES"])
                         if mul_routed_weight:
                             num_stages = min(2, num_stages)
@@ -540,7 +742,15 @@ class FusedMoEModule(nn.Module):
                     return
             except Exception:
                 # Fall back to Triton if CuTe is unavailable (or config unsupported).
-                pass
+                if backend == "cute":
+                    raise
+
+        if b_is_fp8w:
+            # Safe-but-slower fallback: dequantize weights to match the Triton kernel.
+            if B_scale is None:
+                raise ValueError("B_scale is required for FP8-weight MoE")
+            B_dequant = B.view(torch.float8_e4m3fn).to(A.dtype) * B_scale.to(A.dtype).unsqueeze(-1)
+            B = B_dequant
 
         invoke_fused_moe_kernel_triton(
             A,
