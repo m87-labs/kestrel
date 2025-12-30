@@ -330,10 +330,389 @@ class _MoeAlignBlockSizeCuTeLarge:
                     sorted_token_ids[rank] = Int32(i)
 
 
+class _MoeAlignBlockSizeCuTeLora:
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        block_size: int,
+        top_k: int,
+        has_expert_map: bool,
+        config: MoeAlignCuTeConfig,
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.block_size = int(block_size)
+        self.top_k = int(top_k)
+        self.has_expert_map = bool(has_expert_map)
+        self.config = config
+
+    @cute.jit
+    def __call__(
+        self,
+        topk_ids: cute.Tensor,  # [T, K] integral
+        token_lora_mapping: cute.Tensor,  # [T] int32 (lora id per token)
+        lora_ids: cute.Tensor,  # [num_loras] int32 (values in [0, max_loras) or -1)
+        sorted_token_ids: cute.Tensor,  # [max_loras * max_num_tokens_padded] int32
+        expert_ids: cute.Tensor,  # [max_loras * max_num_m_blocks] int32
+        num_tokens_post_pad: cute.Tensor,  # [max_loras] int32
+        sorted_stride: cute.Tensor,  # [1] int32
+        expert_stride: cute.Tensor,  # [1] int32
+        expert_map: cute.Tensor,  # [num_experts] int32
+        stream: cuda.CUstream,
+    ) -> None:
+        num_loras = Int32(lora_ids.shape[0])
+        self.kernel(
+            topk_ids,
+            token_lora_mapping,
+            lora_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            sorted_stride,
+            expert_stride,
+            expert_map,
+        ).launch(
+            grid=[num_loras, 1, 1],
+            block=[self.config.small_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        topk_ids: cute.Tensor,
+        token_lora_mapping: cute.Tensor,
+        lora_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        expert_ids: cute.Tensor,
+        num_tokens_post_pad: cute.Tensor,
+        sorted_stride: cute.Tensor,
+        expert_stride: cute.Tensor,
+        expert_map: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+        top_k = Int32(self.top_k)
+        lora_id_val = Int32(lora_ids[bidx])
+        max_loras = Int32(num_tokens_post_pad.shape[0])
+
+        if lora_id_val >= 0 and lora_id_val < max_loras:
+            max_tokens_padded = Int32(sorted_stride[0])
+            max_blocks = Int32(expert_stride[0])
+            row_offset = lora_id_val * max_tokens_padded
+            block_offset = lora_id_val * max_blocks
+
+            sorted_row = cute.make_tensor(
+                sorted_token_ids.iterator + row_offset,
+                cute.make_layout((max_tokens_padded,), stride=(1,)),
+            )
+            expert_row = cute.make_tensor(
+                expert_ids.iterator + block_offset,
+                cute.make_layout((max_blocks,), stride=(1,)),
+            )
+
+            topk_flat = cute.make_tensor(
+                topk_ids.iterator,
+                cute.make_layout((numel_i32,), stride=(1,)),
+            )
+
+            @cute.struct
+            class SharedStorage:
+                counts: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+                offsets: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts + 1], 16]
+                counters: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage, 16)
+            counts = storage.counts.get_tensor(cute.make_layout((self.num_experts,)))
+            offsets = storage.offsets.get_tensor(cute.make_layout((self.num_experts + 1,)))
+            counters = storage.counters.get_tensor(cute.make_layout((self.num_experts,)))
+
+            if tidx < self.num_experts:
+                counts[tidx] = Int32(0)
+            cute.arch.sync_threads()
+
+            for i in range(tidx, numel_i32, self.config.small_threads):
+                token_idx = i // top_k
+                if token_lora_mapping[token_idx] == lora_id_val:
+                    expert_id = Int32(topk_flat[i])
+                    if expert_id < self.num_experts:
+                        if const_expr(self.has_expert_map):
+                            mapped = expert_map[expert_id]
+                            if mapped != -1:
+                                atomic_add_i32(1, elem_pointer(counts, mapped))
+                        else:
+                            atomic_add_i32(1, elem_pointer(counts, expert_id))
+            cute.arch.sync_threads()
+
+            if tidx == 0:
+                offsets[0] = Int32(0)
+                running = Int32(0)
+                for e in cutlass.range(self.num_experts, unroll_full=True):
+                    c = counts[e]
+                    padded = ((c + (self.block_size - 1)) // self.block_size) * self.block_size
+                    running += padded
+                    offsets[e + 1] = running
+                num_tokens_post_pad[lora_id_val] = running
+            cute.arch.sync_threads()
+
+            total_padded_tokens = offsets[self.num_experts]
+            total_blocks = total_padded_tokens // self.block_size
+
+            for idx in range(tidx, total_padded_tokens, self.config.small_threads):
+                sorted_row[idx] = numel_i32
+
+            if tidx < self.num_experts:
+                start = offsets[tidx]
+                end = offsets[tidx + 1]
+                for j in range(start, end, self.block_size):
+                    expert_row[j // self.block_size] = tidx
+
+            for b in range(total_blocks + tidx, max_blocks, self.config.small_threads):
+                expert_row[b] = Int32(0)
+
+            if tidx < self.num_experts:
+                counters[tidx] = Int32(0)
+            cute.arch.sync_threads()
+
+            for i in range(tidx, numel_i32, self.config.small_threads):
+                token_idx = i // top_k
+                if token_lora_mapping[token_idx] == lora_id_val:
+                    expert_id = Int32(topk_flat[i])
+                    if expert_id < self.num_experts:
+                        if const_expr(self.has_expert_map):
+                            mapped = expert_map[expert_id]
+                            if mapped != -1:
+                                pos = atomic_add_i32(1, elem_pointer(counters, mapped))
+                                sorted_row[offsets[mapped] + pos] = Int32(i)
+                        else:
+                            pos = atomic_add_i32(1, elem_pointer(counters, expert_id))
+                            sorted_row[offsets[expert_id] + pos] = Int32(i)
+
+
+class _MoeAlignBlockSizeCuTeLargeLora:
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        block_size: int,
+        top_k: int,
+        has_expert_map: bool,
+        config: MoeAlignCuTeConfig,
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.block_size = int(block_size)
+        self.top_k = int(top_k)
+        self.has_expert_map = bool(has_expert_map)
+        self.config = config
+
+    @cute.jit
+    def __call__(
+        self,
+        topk_ids: cute.Tensor,  # [T, K] integral
+        token_lora_mapping: cute.Tensor,  # [T] int32
+        lora_ids: cute.Tensor,  # [num_loras] int32
+        sorted_token_ids: cute.Tensor,  # [max_loras * max_num_tokens_padded] int32
+        expert_ids: cute.Tensor,  # [max_loras * max_num_m_blocks] int32
+        num_tokens_post_pad: cute.Tensor,  # [max_loras] int32
+        sorted_stride: cute.Tensor,  # [1] int32
+        expert_stride: cute.Tensor,  # [1] int32
+        expert_map: cute.Tensor,  # [num_experts] int32
+        cumsum_buffer: cute.Tensor,  # [num_experts] int32
+        stream: cuda.CUstream,
+    ) -> None:
+        num_loras = Int32(lora_ids.shape[0])
+        self.align_kernel(
+            topk_ids,
+            token_lora_mapping,
+            lora_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            sorted_stride,
+            expert_stride,
+            expert_map,
+            cumsum_buffer,
+        ).launch(
+            grid=[num_loras * 2, 1, 1],
+            block=[self.config.large_align_threads, 1, 1],
+            stream=stream,
+        )
+        num_blocks = Int32(cute.ceil_div(cute.size(topk_ids.shape), self.config.large_scatter_threads))
+        if num_blocks > 0:
+            self.scatter_kernel(
+                topk_ids,
+                token_lora_mapping,
+                lora_ids,
+                sorted_token_ids,
+                sorted_stride,
+                expert_map,
+                cumsum_buffer,
+            ).launch(
+                grid=[num_loras, num_blocks, Int32(1)],
+                block=[self.config.large_scatter_threads, 1, 1],
+                stream=stream,
+            )
+
+    @cute.kernel
+    def align_kernel(
+        self,
+        topk_ids: cute.Tensor,
+        token_lora_mapping: cute.Tensor,
+        lora_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        expert_ids: cute.Tensor,
+        num_tokens_post_pad: cute.Tensor,
+        sorted_stride: cute.Tensor,
+        expert_stride: cute.Tensor,
+        expert_map: cute.Tensor,
+        cumsum_buffer: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+        top_k = Int32(self.top_k)
+        lora_idx = Int32(bidx) // Int32(2)
+        phase = Int32(bidx) % Int32(2)
+        lora_id_val = Int32(lora_ids[lora_idx])
+        max_loras = Int32(num_tokens_post_pad.shape[0])
+
+        if lora_id_val >= 0 and lora_id_val < max_loras:
+            max_tokens_padded = Int32(sorted_stride[0])
+            max_blocks = Int32(expert_stride[0])
+            row_offset = lora_id_val * max_tokens_padded
+            block_offset = lora_id_val * max_blocks
+
+            sorted_row = cute.make_tensor(
+                sorted_token_ids.iterator + row_offset,
+                cute.make_layout((max_tokens_padded,), stride=(1,)),
+            )
+            expert_row = cute.make_tensor(
+                expert_ids.iterator + block_offset,
+                cute.make_layout((max_blocks,), stride=(1,)),
+            )
+
+            if phase == Int32(1):
+                for idx in range(tidx, max_tokens_padded, self.config.large_align_threads):
+                    sorted_row[idx] = numel_i32
+            else:
+                topk_flat = cute.make_tensor(
+                    topk_ids.iterator,
+                    cute.make_layout((numel_i32,), stride=(1,)),
+                )
+
+                @cute.struct
+                class SharedStorage:
+                    counts: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts], 16]
+                    offsets: cute.struct.Align[cute.struct.MemRange[Int32, self.num_experts + 1], 16]
+
+                smem = cutlass.utils.SmemAllocator()
+                storage = smem.allocate(SharedStorage, 16)
+                counts = storage.counts.get_tensor(cute.make_layout((self.num_experts,)))
+                offsets = storage.offsets.get_tensor(cute.make_layout((self.num_experts + 1,)))
+
+                if tidx < self.num_experts:
+                    counts[tidx] = Int32(0)
+                cute.arch.sync_threads()
+
+                for i in range(tidx, numel_i32, self.config.large_align_threads):
+                    token_idx = i // top_k
+                    if token_lora_mapping[token_idx] == lora_id_val:
+                        expert_id = Int32(topk_flat[i])
+                        if expert_id < self.num_experts:
+                            if const_expr(self.has_expert_map):
+                                mapped = expert_map[expert_id]
+                                if mapped != -1:
+                                    atomic_add_i32(1, elem_pointer(counts, mapped))
+                            else:
+                                atomic_add_i32(1, elem_pointer(counts, expert_id))
+                cute.arch.sync_threads()
+
+                if tidx == 0:
+                    offsets[0] = Int32(0)
+                    running = Int32(0)
+                    for e in cutlass.range(self.num_experts, unroll_full=True):
+                        c = counts[e]
+                        padded = ((c + (self.block_size - 1)) // self.block_size) * self.block_size
+                        running += padded
+                        offsets[e + 1] = running
+                    num_tokens_post_pad[lora_id_val] = running
+                cute.arch.sync_threads()
+
+                if tidx < self.num_experts:
+                    cumsum_buffer[tidx] = offsets[tidx]
+
+                total_padded_tokens = offsets[self.num_experts]
+                total_blocks = total_padded_tokens // self.block_size
+
+                if tidx < self.num_experts:
+                    start = offsets[tidx]
+                    end = offsets[tidx + 1]
+                    for j in range(start, end, self.block_size):
+                        expert_row[j // self.block_size] = tidx
+
+                for b in range(total_blocks + tidx, max_blocks, self.config.large_align_threads):
+                    expert_row[b] = Int32(0)
+
+    @cute.kernel
+    def scatter_kernel(
+        self,
+        topk_ids: cute.Tensor,
+        token_lora_mapping: cute.Tensor,
+        lora_ids: cute.Tensor,
+        sorted_token_ids: cute.Tensor,
+        sorted_stride: cute.Tensor,
+        expert_map: cute.Tensor,
+        cumsum_buffer: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx_x, bidx_y, _ = cute.arch.block_idx()
+        grid_stride = Int32(cute.arch.grid_dim()[1])
+
+        numel_i32 = Int32(cute.size(topk_ids.shape))
+        top_k = Int32(self.top_k)
+        lora_id_val = Int32(lora_ids[bidx_x])
+        max_tokens_padded = Int32(sorted_stride[0])
+        total_len = Int32(sorted_token_ids.shape[0])
+        max_loras = total_len // max_tokens_padded
+        topk_flat = cute.make_tensor(
+            topk_ids.iterator,
+            cute.make_layout((numel_i32,), stride=(1,)),
+        )
+
+        tid = Int32(bidx_y) * self.config.large_scatter_threads + tidx
+        stride = Int32(self.config.large_scatter_threads) * grid_stride
+        if lora_id_val >= 0 and lora_id_val < max_loras:
+            row_offset = lora_id_val * max_tokens_padded
+            sorted_row = cute.make_tensor(
+                sorted_token_ids.iterator + row_offset,
+                cute.make_layout((max_tokens_padded,), stride=(1,)),
+            )
+            for i in range(tid, numel_i32, stride):
+                token_idx = i // top_k
+                if token_lora_mapping[token_idx] == lora_id_val:
+                    expert_id = Int32(topk_flat[i])
+                    if expert_id < self.num_experts:
+                        if const_expr(self.has_expert_map):
+                            mapped = expert_map[expert_id]
+                            if mapped != -1:
+                                rank = atomic_add_i32(1, elem_pointer(cumsum_buffer, mapped))
+                                sorted_row[rank] = Int32(i)
+                        else:
+                            rank = atomic_add_i32(1, elem_pointer(cumsum_buffer, expert_id))
+                            sorted_row[rank] = Int32(i)
+
+
 _COMPILE_CACHE_SMALL: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
 _COMPILE_CACHE_LARGE: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
+_COMPILE_CACHE_LORA_SMALL: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
+_COMPILE_CACHE_LORA_LARGE: Dict[Tuple[Any, int, int, int, bool, MoeAlignCuTeConfig], Any] = {}
 _CUMSUM_BUFFER_CACHE: Dict[Tuple[int, int, int], torch.Tensor] = {}
 _DUMMY_EXPERT_MAP_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
+_LORA_STRIDE_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def moe_align_block_size(
@@ -525,4 +904,311 @@ def moe_align_block_size(
     )
 
 
-__all__ = ["MoeAlignCuTeConfig", "moe_align_block_size"]
+def moe_lora_align_block_size(
+    topk_ids: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    lora_ids: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    """CuTe DSL moe_lora_align_block_size (CUDA-only).
+
+    token_lora_mapping uses -1 for no-LoRA and [0, max_loras) for active LoRAs.
+    """
+    if topk_ids.device.type != "cuda":
+        raise ValueError("topk_ids must be a CUDA tensor")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must have shape [num_tokens, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must be int32 or int64")
+    if token_lora_mapping.device != topk_ids.device:
+        raise ValueError("token_lora_mapping must be on the same device as topk_ids")
+    if token_lora_mapping.dtype != torch.int32:
+        raise ValueError("token_lora_mapping must be int32")
+    if token_lora_mapping.ndim != 1 or token_lora_mapping.shape[0] != topk_ids.shape[0]:
+        raise ValueError("token_lora_mapping must have shape [num_tokens]")
+    if not token_lora_mapping.is_contiguous():
+        raise ValueError("token_lora_mapping must be contiguous")
+    if sorted_token_ids.dtype != torch.int32 or sorted_token_ids.ndim != 2:
+        raise ValueError("sorted_token_ids must be a contiguous int32 2D tensor")
+    if expert_ids.dtype != torch.int32 or expert_ids.ndim != 2:
+        raise ValueError("expert_ids must be a contiguous int32 2D tensor")
+    if num_tokens_post_pad.dtype != torch.int32 or num_tokens_post_pad.ndim != 1:
+        raise ValueError("num_tokens_post_pad must be a contiguous int32 1D tensor")
+    if not sorted_token_ids.is_contiguous():
+        raise ValueError("sorted_token_ids must be contiguous")
+    if not expert_ids.is_contiguous():
+        raise ValueError("expert_ids must be contiguous")
+    if not num_tokens_post_pad.is_contiguous():
+        raise ValueError("num_tokens_post_pad must be contiguous")
+
+    max_loras = int(sorted_token_ids.shape[0])
+    if expert_ids.shape[0] != max_loras or num_tokens_post_pad.shape[0] != max_loras:
+        raise ValueError("expert_ids and num_tokens_post_pad must have leading dim == max_loras")
+
+    if expert_map is None or expert_map.numel() == 0:
+        expert_map_arg = torch.empty((0,), dtype=torch.int32, device=topk_ids.device)
+    else:
+        if expert_map.device != topk_ids.device:
+            raise ValueError("expert_map must be on the same device as topk_ids")
+        if expert_map.dtype != torch.int32:
+            raise ValueError("expert_map must be int32")
+        if expert_map.ndim != 1 or expert_map.numel() != int(num_experts):
+            raise ValueError("expert_map must be shape [num_experts]")
+        if not expert_map.is_contiguous():
+            raise ValueError("expert_map must be contiguous")
+        expert_map_arg = expert_map
+
+    topk = int(topk_ids.shape[1])
+    topk_dtype = Int32 if topk_ids.dtype == torch.int32 else Int64
+    numel = int(topk_ids.numel())
+    cfg = MoeAlignCuTeConfig()
+    has_expert_map = bool(expert_map_arg.numel() > 0)
+    small_batch_expert_mode = (int(num_experts) <= 64) and (numel < 1024)
+
+    if not isinstance(lora_ids, torch.Tensor):
+        raise ValueError("lora_ids must be a CUDA int32 tensor for graph compatibility")
+    if lora_ids.device != topk_ids.device:
+        raise ValueError("lora_ids must be on the same device as topk_ids")
+    if lora_ids.dtype != torch.int32:
+        raise ValueError("lora_ids must be int32")
+    if lora_ids.ndim != 1 or not lora_ids.is_contiguous():
+        raise ValueError("lora_ids must be a contiguous 1D tensor")
+
+    if lora_ids.numel() == 0:
+        num_tokens_post_pad.zero_()
+        return
+
+    num_tokens_post_pad.zero_()
+
+    key = (topk_dtype, topk, int(num_experts), int(block_size), has_expert_map, cfg)
+    dev_idx = int(topk_ids.device.index or 0)
+    if not has_expert_map:
+        dummy_key = (dev_idx, int(num_experts))
+        dummy_map = _DUMMY_EXPERT_MAP_CACHE.get(dummy_key)
+        if dummy_map is None:
+            dummy_map = torch.zeros((int(num_experts),), device=topk_ids.device, dtype=torch.int32)
+            _DUMMY_EXPERT_MAP_CACHE[dummy_key] = dummy_map
+        expert_map_arg = dummy_map
+    max_tokens_padded = int(sorted_token_ids.shape[1])
+    max_blocks = int(expert_ids.shape[1])
+    stride_key = (dev_idx, max_tokens_padded, max_blocks)
+    stride_tensors = _LORA_STRIDE_CACHE.get(stride_key)
+    if stride_tensors is None:
+        sorted_stride = torch.tensor([max_tokens_padded], device=topk_ids.device, dtype=torch.int32)
+        expert_stride = torch.tensor([max_blocks], device=topk_ids.device, dtype=torch.int32)
+        stride_tensors = (sorted_stride, expert_stride)
+        _LORA_STRIDE_CACHE[stride_key] = stride_tensors
+    else:
+        sorted_stride, expert_stride = stride_tensors
+
+    sorted_flat = sorted_token_ids.view(-1)
+    expert_flat = expert_ids.view(-1)
+
+    if small_batch_expert_mode:
+        if key not in _COMPILE_CACHE_LORA_SMALL:
+            t_sym = cute.sym_int()
+            topk_ids_fake = cute.runtime.make_fake_tensor(
+                topk_dtype,
+                (t_sym, topk),
+                stride=(topk, 1),
+                assumed_align=topk_dtype.width // 8,
+            )
+            token_lora_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (t_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            lora_ids_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            sorted_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            expert_ids_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            post_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            sorted_stride_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (1,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            expert_stride_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (1,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            expert_map_fake = cute.runtime.make_fake_tensor(
+                Int32,
+                (int(num_experts),),
+                stride=(1,),
+                assumed_align=4,
+            )
+            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            op = _MoeAlignBlockSizeCuTeLora(
+                num_experts=int(num_experts),
+                block_size=int(block_size),
+                top_k=topk,
+                has_expert_map=has_expert_map,
+                config=cfg,
+            )
+            _COMPILE_CACHE_LORA_SMALL[key] = cute.compile(
+                op,
+                topk_ids_fake,
+                token_lora_fake,
+                lora_ids_fake,
+                sorted_fake,
+                expert_ids_fake,
+                post_fake,
+                sorted_stride_fake,
+                expert_stride_fake,
+                expert_map_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+
+        _COMPILE_CACHE_LORA_SMALL[key](
+            topk_ids,
+            token_lora_mapping,
+            lora_ids,
+            sorted_flat,
+            expert_flat,
+            num_tokens_post_pad,
+            sorted_stride,
+            expert_stride,
+            expert_map_arg,
+        )
+        return
+
+    if key not in _COMPILE_CACHE_LORA_LARGE:
+        t_sym = cute.sym_int()
+        topk_ids_fake = cute.runtime.make_fake_tensor(
+            topk_dtype,
+            (t_sym, topk),
+            stride=(topk, 1),
+            assumed_align=topk_dtype.width // 8,
+        )
+        token_lora_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (t_sym,),
+            stride=(1,),
+            assumed_align=4,
+        )
+        lora_ids_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        sorted_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        expert_ids_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        post_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (cute.sym_int(),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        sorted_stride_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (1,),
+            stride=(1,),
+            assumed_align=4,
+        )
+        expert_stride_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (1,),
+            stride=(1,),
+            assumed_align=4,
+        )
+        cumsum_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (int(num_experts),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        expert_map_fake = cute.runtime.make_fake_tensor(
+            Int32,
+            (int(num_experts),),
+            stride=(1,),
+            assumed_align=4,
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        op = _MoeAlignBlockSizeCuTeLargeLora(
+            num_experts=int(num_experts),
+            block_size=int(block_size),
+            top_k=topk,
+            has_expert_map=has_expert_map,
+            config=cfg,
+        )
+        _COMPILE_CACHE_LORA_LARGE[key] = cute.compile(
+            op,
+            topk_ids_fake,
+            token_lora_fake,
+            lora_ids_fake,
+            sorted_fake,
+            expert_ids_fake,
+            post_fake,
+            sorted_stride_fake,
+            expert_stride_fake,
+            expert_map_fake,
+            cumsum_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    stream_id = int(torch.cuda.current_stream(topk_ids.device).cuda_stream)
+    buf_key = (dev_idx, stream_id, int(num_experts))
+    cumsum_buffer = _CUMSUM_BUFFER_CACHE.get(buf_key)
+    if cumsum_buffer is None:
+        cumsum_buffer = torch.empty((int(num_experts),), device=topk_ids.device, dtype=torch.int32)
+        _CUMSUM_BUFFER_CACHE[buf_key] = cumsum_buffer
+
+    _COMPILE_CACHE_LORA_LARGE[key](
+        topk_ids,
+        token_lora_mapping,
+        lora_ids,
+        sorted_flat,
+        expert_flat,
+        num_tokens_post_pad,
+        sorted_stride,
+        expert_stride,
+        expert_map_arg,
+        cumsum_buffer,
+    )
+
+
+__all__ = ["MoeAlignCuTeConfig", "moe_align_block_size", "moe_lora_align_block_size"]
