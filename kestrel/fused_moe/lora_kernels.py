@@ -182,13 +182,10 @@ def _batched_moe_lora_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    # Read-modify-write for expand (IS_PRIMARY=False), direct store for shrink
-    if IS_PRIMARY:
-        tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
-    else:
-        c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
-        c_new = (c_prev + accumulator).to(c_ptr.dtype.element_ty)
-        tl.store(c_ptrs, c_new, mask=c_mask)
+    # Direct store is safe for expand: sorted_token_ids is a per-LoRA permutation of
+    # flattened [token, top_k] indices and this kernel does not split-K, so no cross-block
+    # accumulation occurs.
+    tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 
 @triton.jit
@@ -358,7 +355,6 @@ def apply_moe_lora_batched(
     block_size_m = config["BLOCK_SIZE_M"]
     block_size_out = config.get("BLOCK_SIZE_N", 64)
     block_size_hidden = config.get("BLOCK_SIZE_K", 64)
-    block_size_rank = max(16, triton.next_power_of_2(rank))
     num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
     num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
 
@@ -370,52 +366,8 @@ def apply_moe_lora_batched(
     num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
     num_n_blocks = triton.cdiv(out_dim, block_size_out)
 
-    # Heuristic: use fused for small token counts (keeps intermediate in registers)
-    use_fused = num_valid_tokens <= 256
-
     # Reshape output for kernel access: [M, top_k, out_dim] -> [M * top_k, out_dim]
     output_flat = output.view(num_valid_tokens, out_dim)
-
-    if use_fused:
-        grid = (num_m_blocks, num_n_blocks, max_loras)
-        _batched_fused_moe_lora_kernel[grid](
-            x,
-            lora_a,
-            lora_b,
-            output_flat,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            hidden_dim,
-            rank,
-            out_dim,
-            EM,
-            num_valid_tokens,
-            num_experts,
-            max_tokens_padded,
-            x.stride(0),
-            x.stride(1),
-            lora_a.stride(0),
-            lora_a.stride(1),
-            lora_a.stride(2),
-            lora_b.stride(0),
-            lora_b.stride(1),
-            lora_b.stride(2),
-            output_flat.stride(0),
-            output_flat.stride(1),
-            sorted_token_ids.stride(0),
-            expert_ids.stride(0),
-            top_k=top_k,
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            BLOCK_SIZE_M=block_size_m,
-            BLOCK_SIZE_RANK=block_size_rank,
-            BLOCK_SIZE_HIDDEN=block_size_hidden,
-            BLOCK_SIZE_OUT=block_size_out,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        return
 
     # Split shrink+expand with PDL for larger token counts using unified kernel
     intermediate = _BATCHED_INTERMEDIATE_BUFFER.get(
@@ -466,7 +418,7 @@ def apply_moe_lora_batched(
 
     expand_grid = (num_m_blocks, num_n_blocks, max_loras)
 
-    # Expand: intermediate @ lora_b.T -> output (with read-modify-write)
+    # Expand: intermediate @ lora_b.T -> output (direct store)
     # lora_b shape: [E, out_dim, rank] -> N=out_dim, K=rank
     _batched_moe_lora_kernel[expand_grid](
         intermediate,  # a_ptr: input
@@ -554,7 +506,6 @@ def apply_moe_lora_single(
     block_size_m = config["BLOCK_SIZE_M"]
     block_size_out = config.get("BLOCK_SIZE_N", 64)
     block_size_hidden = config.get("BLOCK_SIZE_K", 64)
-    block_size_rank = max(16, triton.next_power_of_2(rank))
     num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
     num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
 
@@ -574,50 +525,6 @@ def apply_moe_lora_single(
     max_tokens_padded = EM
     num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
     num_n_blocks = triton.cdiv(out_dim, block_size_out)
-
-    # Heuristic: use fused for small token counts (keeps intermediate in registers)
-    use_fused = num_valid_tokens <= 256
-
-    if use_fused:
-        grid = (num_m_blocks, num_n_blocks, 1)  # Z=1 for single LoRA
-        _batched_fused_moe_lora_kernel[grid](
-            x,
-            lora_a,
-            lora_b,
-            output_flat,
-            topk_weights,
-            sorted_token_ids_2d,
-            expert_ids_2d,
-            num_tokens_post_padded_1d,
-            hidden_dim,
-            rank,
-            out_dim,
-            EM,
-            num_valid_tokens,
-            num_experts,
-            max_tokens_padded,
-            x.stride(0),
-            x.stride(1),
-            lora_a.stride(0),
-            lora_a.stride(1),
-            lora_a.stride(2),
-            lora_b.stride(0),
-            lora_b.stride(1),
-            lora_b.stride(2),
-            output_flat.stride(0),
-            output_flat.stride(1),
-            sorted_token_ids_2d.stride(0),
-            expert_ids_2d.stride(0),
-            top_k=top_k,
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            BLOCK_SIZE_M=block_size_m,
-            BLOCK_SIZE_RANK=block_size_rank,
-            BLOCK_SIZE_HIDDEN=block_size_hidden,
-            BLOCK_SIZE_OUT=block_size_out,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        return
 
     # Split shrink+expand with PDL for larger token counts
     intermediate = _SINGLE_INTERMEDIATE_BUFFER.get(
