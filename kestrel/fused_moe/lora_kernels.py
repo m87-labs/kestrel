@@ -32,40 +32,202 @@ class _ResizableBuffer:
         return self._tensor[:numel].view(*shape)
 
 
-_INTERMEDIATE_BUFFER = _ResizableBuffer()
+# =============================================================================
+# Batched MoE LoRA Kernels
+# =============================================================================
+#
+# These kernels use a 3D grid where axis=2 iterates over LoRA adapters.
+# This approach uses moe_lora_align_block_size which produces per-LoRA routing:
+#   sorted_token_ids: [max_loras, EM]
+#   expert_ids: [max_loras, num_blocks]
+#   num_tokens_post_padded: [max_loras]
+#
+# Benefits over super-expert approach:
+#   - No expert-space explosion (avoids max_loras * num_experts routing)
+#   - Cleaner slot-0 handling (filtered at routing time)
+#   - Unified path for dense + MoE LoRA
+
+
+@triton.jit(
+    do_not_specialize=[
+        "EM",
+        "num_valid_tokens",
+        "max_tokens_padded",
+        "stride_tl",
+        "stride_el",
+    ]
+)
+def _batched_moe_lora_kernel(
+    # Input/output pointers
+    a_ptr,  # Input: [num_valid_tokens, K] - x for shrink, intermediate for expand
+    b_ptr,  # Weights: [max_loras * num_experts, N, K] - lora_a or lora_b
+    c_ptr,  # Output: [num_valid_tokens, N] - intermediate for shrink, output for expand
+    topk_weights_ptr,  # [M, top_k]
+    sorted_token_ids_ptr,  # [max_loras, EM]
+    expert_ids_ptr,  # [max_loras, num_blocks]
+    num_tokens_post_padded_ptr,  # [max_loras]
+    # Dimensions
+    N,  # Output dim (rank for shrink, out_dim for expand)
+    K,  # Input dim (hidden for shrink, rank for expand)
+    EM,
+    num_valid_tokens,
+    num_experts,
+    max_tokens_padded,
+    # Strides for a [num_valid_tokens, K]
+    stride_am,
+    stride_ak,
+    # Strides for b [max_loras * num_experts, N, K]
+    stride_be,
+    stride_bn,
+    stride_bk,
+    # Strides for c [num_valid_tokens, N]
+    stride_cm,
+    stride_cn,
+    # Strides for sorted_token_ids [max_loras, EM]
+    stride_tl,
+    # Strides for expert_ids [max_loras, num_blocks]
+    stride_el,
+    # Constexprs
+    top_k: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    IS_PRIMARY: tl.constexpr,  # True for shrink (signal), False for expand (wait)
+):
+    """Unified batched MoE LoRA kernel for both shrink and expand operations.
+
+    Uses IS_PRIMARY to control PDL behavior:
+    - IS_PRIMARY=True (shrink): signals gdc_launch_dependents after pointer setup
+    - IS_PRIMARY=False (expand): waits with gdc_wait before loading input
+    """
+    # Use natural 2D grid indexing (no swizzling overhead)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    lora_idx = tl.program_id(2)
+
+    # Load per-LoRA token count and early exit if inactive
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_idx)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    # Load expert_id for this block
+    expert_id = tl.load(expert_ids_ptr + lora_idx * stride_el + pid_m)
+    if expert_id == -1:
+        return
+
+    # Compute super-expert index: lora_idx is used directly (identity mapping)
+    super_expert_id = lora_idx * num_experts + expert_id
+
+    # Load token indices
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(
+        sorted_token_ids_ptr + lora_idx * stride_tl + offs_m,
+        mask=offs_m < EM,
+        other=0,
+    )
+    token_mask = offs_token < num_valid_tokens
+
+    # Use modulo for N offset to handle cases where BLOCK_SIZE_N > N
+    # This allows all threads to load valid (repeated) data instead of zeros
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Compute pointers with pointer arithmetic for efficient K-loop
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + super_expert_id * stride_be + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk
+
+    # Signal after pointer setup (shrink) - allows expand to start preparing
+    if IS_PRIMARY:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Wait for prior kernel before loading input (expand only)
+    if not IS_PRIMARY:
+        tl.extra.cuda.gdc_wait()
+
+    # Main GEMM loop - load B first (prefetch weights), then A
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        k_remaining = K - k_start
+
+        # Load B block first (prefetch weights while waiting for A data)
+        # No N mask needed due to modulo - all threads access valid data
+        b_block = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < k_remaining,
+            other=0.0,
+        )
+
+        # Load A block
+        a_block = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+
+        accumulator += tl.dot(a_block, b_block)
+
+        # Advance pointers
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Apply routing weight if needed
+    if MUL_ROUTED_WEIGHT:
+        weights = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
+        accumulator = accumulator * weights[:, None]
+
+    # Store output - use non-modulo offset for correct indexing
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    # Read-modify-write for expand (IS_PRIMARY=False), direct store for shrink
+    if IS_PRIMARY:
+        tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
+    else:
+        c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+        c_new = (c_prev + accumulator).to(c_ptr.dtype.element_ty)
+        tl.store(c_ptrs, c_new, mask=c_mask)
 
 
 @triton.jit
-def _fused_moe_lora_kernel(
+def _batched_fused_moe_lora_kernel(
     # Input/output pointers
     x_ptr,  # [M, hidden_dim] or [M * top_k, hidden_dim]
-    lora_a_ptr,  # [num_experts, rank, hidden_dim]
-    lora_b_ptr,  # [num_experts, out_dim, rank]
+    lora_a_ptr,  # [max_loras * num_experts, rank, hidden_dim]
+    lora_b_ptr,  # [max_loras * num_experts, out_dim, rank]
     output_ptr,  # [M, top_k, out_dim]
     topk_weights_ptr,  # [M, top_k]
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    num_tokens_post_padded_ptr,
+    sorted_token_ids_ptr,  # [max_loras, EM]
+    expert_ids_ptr,  # [max_loras, num_blocks]
+    num_tokens_post_padded_ptr,  # [max_loras]
     # Dimensions
     hidden_dim,
     rank,
     out_dim,
     EM,
     num_valid_tokens,
+    num_experts,
+    max_tokens_padded,  # For consistent grid decomposition
     # Strides for x
     stride_xm,
     stride_xk,
-    # Strides for lora_a [num_experts, rank, hidden_dim]
+    # Strides for lora_a [max_loras * num_experts, rank, hidden_dim]
     stride_ae,
     stride_ar,
     stride_ak,
-    # Strides for lora_b [num_experts, out_dim, rank]
+    # Strides for lora_b [max_loras * num_experts, out_dim, rank]
     stride_be,
     stride_bn,
     stride_br,
     # Strides for output [M, top_k, out_dim]
     stride_om,
     stride_on,
+    # Strides for sorted_token_ids [max_loras, EM]
+    stride_tl,
+    # Strides for expert_ids [max_loras, num_blocks]
+    stride_el,
     # Constexprs
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
@@ -74,49 +236,47 @@ def _fused_moe_lora_kernel(
     BLOCK_SIZE_HIDDEN: tl.constexpr,
     BLOCK_SIZE_OUT: tl.constexpr,
 ):
-    """Fused MoE LoRA kernel: computes x @ A.T @ B.T in one kernel.
+    """Batched fused MoE LoRA kernel with natural 2D grid indexing."""
+    # Use natural 2D grid indexing (no swizzling overhead)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    lora_idx = tl.program_id(2)
 
-    This fuses the shrink and expand phases to avoid intermediate buffer
-    allocation and reduce kernel launch overhead.
-    """
-    pid_m = tl.program_id(0)  # Token block
-    pid_n = tl.program_id(1)  # Output block
-
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    # Load per-LoRA token count and early exit if inactive
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_idx)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
 
-    expert_id = tl.load(expert_ids_ptr + pid_m)
+    # Load expert_id for this block
+    expert_id = tl.load(expert_ids_ptr + lora_idx * stride_el + pid_m)
     if expert_id == -1:
         return
 
-    # Load token indices for this block
+    # Compute super-expert index: lora_idx is used directly (identity mapping)
+    super_expert_id = lora_idx * num_experts + expert_id
+
+    # Load token indices
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_token = tl.load(
-        sorted_token_ids_ptr + offs_m,
+        sorted_token_ids_ptr + lora_idx * stride_tl + offs_m,
         mask=offs_m < EM,
         other=0,
     )
     token_mask = offs_token < num_valid_tokens
 
     # Phase 1: Shrink - compute x @ A.T -> [BLOCK_SIZE_M, rank]
-    # Accumulate in float32 for precision. Keep operands in fp16/bf16 to enable
-    # tensor core use in tl.dot (vLLM/Punica style).
     intermediate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_RANK), dtype=tl.float32)
 
     for k_start in range(0, hidden_dim, BLOCK_SIZE_HIDDEN):
         k_offs = k_start + tl.arange(0, BLOCK_SIZE_HIDDEN)
         k_mask = k_offs < hidden_dim
 
-        # Load x block: [BLOCK_SIZE_M, BLOCK_SIZE_HIDDEN]
         x_ptrs = x_ptr + (offs_token[:, None] // top_k) * stride_xm + k_offs[None, :] * stride_xk
         x_block = tl.load(
             x_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0
         )
 
-        # Load A block: [BLOCK_SIZE_HIDDEN, BLOCK_SIZE_RANK] (transposed from [rank, hidden])
-        # A is [num_experts, rank, hidden_dim], we want A[expert].T = [hidden_dim, rank]
-        a_ptrs = lora_a_ptr + expert_id * stride_ae + tl.arange(0, BLOCK_SIZE_RANK)[None, :] * stride_ar + k_offs[:, None] * stride_ak
+        a_ptrs = lora_a_ptr + super_expert_id * stride_ae + tl.arange(0, BLOCK_SIZE_RANK)[None, :] * stride_ar + k_offs[:, None] * stride_ak
         a_block = tl.load(
             a_ptrs,
             mask=k_mask[:, None] & (tl.arange(0, BLOCK_SIZE_RANK)[None, :] < rank),
@@ -126,7 +286,6 @@ def _fused_moe_lora_kernel(
         intermediate += tl.dot(x_block, a_block)
 
     # Phase 2: Expand - compute intermediate @ B.T -> [BLOCK_SIZE_M, BLOCK_SIZE_OUT]
-    # B is [num_experts, out_dim, rank], we want B[expert].T = [rank, out_dim]
     offs_n = pid_n * BLOCK_SIZE_OUT + tl.arange(0, BLOCK_SIZE_OUT)
     n_mask = offs_n < out_dim
 
@@ -136,19 +295,14 @@ def _fused_moe_lora_kernel(
         r_offs = r_start + tl.arange(0, BLOCK_SIZE_RANK)
         r_mask = r_offs < rank
 
-        # Get intermediate slice: [BLOCK_SIZE_M, BLOCK_SIZE_RANK]
         if r_start == 0:
-            # Cast intermediate to enable tensor core usage for the expand GEMM.
             inter_block = intermediate.to(output_ptr.dtype.element_ty)
         else:
-            # For ranks > BLOCK_SIZE_RANK, we'd need to recompute or store
-            # For typical LoRA ranks (8-32), this won't happen with BLOCK_SIZE_RANK=64
             inter_block = tl.zeros(
                 (BLOCK_SIZE_M, BLOCK_SIZE_RANK), dtype=output_ptr.dtype.element_ty
             )
 
-        # Load B block: [BLOCK_SIZE_RANK, BLOCK_SIZE_OUT] (transposed from [out_dim, rank])
-        b_ptrs = lora_b_ptr + expert_id * stride_be + offs_n[None, :] * stride_bn + r_offs[:, None] * stride_br
+        b_ptrs = lora_b_ptr + super_expert_id * stride_be + offs_n[None, :] * stride_bn + r_offs[:, None] * stride_br
         b_block = tl.load(
             b_ptrs, mask=r_mask[:, None] & n_mask[None, :], other=0.0
         )
@@ -160,14 +314,7 @@ def _fused_moe_lora_kernel(
         weights = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         output_acc = output_acc * weights[:, None]
 
-    # Store output (accumulate into existing output).
-    #
-    # NOTE: We use a non-atomic read+add+write here because each element of the
-    # flattened [M * top_k, out_dim] output is written by exactly one program
-    # instance (pid_m selects a disjoint BLOCK_SIZE_M range of sorted assignment
-    # ids; pid_n selects a disjoint BLOCK_SIZE_OUT range of output columns).
-    #
-    # The previous atomic_add implementation scaled poorly at large M.
+    # Read-modify-write to accumulate into output
     out_ptrs = output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on
     out_mask = token_mask[:, None] & n_mask[None, :]
     out_prev = tl.load(out_ptrs, mask=out_mask, other=0.0).to(tl.float32)
@@ -175,198 +322,225 @@ def _fused_moe_lora_kernel(
     tl.store(out_ptrs, out_new, mask=out_mask)
 
 
-@triton.jit
-def _moe_lora_shrink_kernel(
-    # Input pointers
-    x_ptr,  # [M, hidden_dim] or [M * top_k, hidden_dim]
-    lora_a_ptr,  # [num_experts, rank, hidden_dim]
-    intermediate_ptr,  # [num_valid_tokens, rank] (fp32)
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    num_tokens_post_padded_ptr,
-    # Dimensions
-    hidden_dim,
-    rank,
-    EM,
-    num_valid_tokens,
-    # Strides for x
-    stride_xm,
-    stride_xk,
-    # Strides for lora_a [num_experts, rank, hidden_dim]
-    stride_ae,
-    stride_ar,
-    stride_ak,
-    # Strides for intermediate [num_valid_tokens, rank]
-    stride_im,
-    stride_ir,
-    # Constexprs
-    top_k: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_RANK: tl.constexpr,
-    BLOCK_SIZE_HIDDEN: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-
-    expert_id = tl.load(expert_ids_ptr + pid_m)
-    if expert_id == -1:
-        return
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_token = tl.load(
-        sorted_token_ids_ptr + offs_m,
-        mask=offs_m < EM,
-        other=0,
-    )
-    token_mask = offs_token < num_valid_tokens
-
-    # Shrink: x @ A.T -> [BLOCK_SIZE_M, rank]
-    intermediate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_RANK), dtype=tl.float32)
-
-    for k_start in range(0, hidden_dim, BLOCK_SIZE_HIDDEN):
-        k_offs = k_start + tl.arange(0, BLOCK_SIZE_HIDDEN)
-        k_mask = k_offs < hidden_dim
-
-        x_ptrs = x_ptr + (offs_token[:, None] // top_k) * stride_xm + k_offs[None, :] * stride_xk
-        x_block = tl.load(x_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
-
-        a_ptrs = (
-            lora_a_ptr
-            + expert_id * stride_ae
-            + tl.arange(0, BLOCK_SIZE_RANK)[None, :] * stride_ar
-            + k_offs[:, None] * stride_ak
-        )
-        a_block = tl.load(
-            a_ptrs,
-            mask=k_mask[:, None] & (tl.arange(0, BLOCK_SIZE_RANK)[None, :] < rank),
-            other=0.0,
-        )
-        intermediate += tl.dot(x_block, a_block)
-
-    r_offs = tl.arange(0, BLOCK_SIZE_RANK)
-    r_mask = r_offs < rank
-    inter_ptrs = intermediate_ptr + offs_token[:, None] * stride_im + r_offs[None, :] * stride_ir
-    tl.store(inter_ptrs, intermediate, mask=token_mask[:, None] & r_mask[None, :])
-
-    # Signal that this CTA's output is ready for the expand kernel (PDL).
-    tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _moe_lora_expand_kernel(
-    # Input pointers
-    intermediate_ptr,  # [num_valid_tokens, rank] (fp32)
-    lora_b_ptr,  # [num_experts, out_dim, rank]
-    output_ptr,  # [M, top_k, out_dim]
-    topk_weights_ptr,  # [M, top_k]
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    num_tokens_post_padded_ptr,
-    # Dimensions
-    rank,
-    out_dim,
-    EM,
-    num_valid_tokens,
-    # Strides for intermediate [num_valid_tokens, rank]
-    stride_im,
-    stride_ir,
-    # Strides for lora_b [num_experts, out_dim, rank]
-    stride_be,
-    stride_bn,
-    stride_br,
-    # Strides for output [M, top_k, out_dim]
-    stride_om,
-    stride_on,
-    # Constexprs
-    MUL_ROUTED_WEIGHT: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_RANK: tl.constexpr,
-    BLOCK_SIZE_OUT: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-
-    expert_id = tl.load(expert_ids_ptr + pid_m)
-    if expert_id == -1:
-        return
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_token = tl.load(
-        sorted_token_ids_ptr + offs_m,
-        mask=offs_m < EM,
-        other=0,
-    )
-    token_mask = offs_token < num_valid_tokens
-
-    offs_n = pid_n * BLOCK_SIZE_OUT + tl.arange(0, BLOCK_SIZE_OUT)
-    n_mask = offs_n < out_dim
-
-    r_offs = tl.arange(0, BLOCK_SIZE_RANK)
-    r_mask = r_offs < rank
-
-    # Load B weights first (can overlap with shrink kernel via PDL).
-    b_ptrs = lora_b_ptr + expert_id * stride_be + offs_n[None, :] * stride_bn + r_offs[:, None] * stride_br
-    b_block = tl.load(b_ptrs, mask=r_mask[:, None] & n_mask[None, :], other=0.0)
-
-    # Wait for shrink kernel to finish writing intermediate (PDL).
-    tl.extra.cuda.gdc_wait()
-
-    # Load intermediate and cast to enable tensor core usage.
-    inter_ptrs = intermediate_ptr + offs_token[:, None] * stride_im + r_offs[None, :] * stride_ir
-    inter_block = tl.load(
-        inter_ptrs, mask=token_mask[:, None] & r_mask[None, :], other=0.0
-    ).to(output_ptr.dtype.element_ty)
-
-    output_acc = tl.dot(inter_block, b_block)
-
-    if MUL_ROUTED_WEIGHT:
-        weights = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
-        output_acc = output_acc * weights[:, None]
-
-    out_ptrs = output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on
-    out_mask = token_mask[:, None] & n_mask[None, :]
-    out_prev = tl.load(out_ptrs, mask=out_mask, other=0.0).to(tl.float32)
-    out_new = (out_prev + output_acc).to(output_ptr.dtype.element_ty)
-    tl.store(out_ptrs, out_new, mask=out_mask)
+_BATCHED_INTERMEDIATE_BUFFER = _ResizableBuffer()
+_BATCHED_LORA_OUTPUT_BUFFER = _ResizableBuffer()
+_SINGLE_INTERMEDIATE_BUFFER = _ResizableBuffer()
 
 
 @torch.inference_mode()
-def apply_moe_lora(
+def apply_moe_lora_batched(
     x: torch.Tensor,  # [M, hidden_dim] or [M * top_k, hidden_dim]
-    topk_ids: torch.Tensor,  # [M, top_k]
     topk_weights: torch.Tensor,  # [M, top_k]
     output: torch.Tensor,  # [M, top_k, out_dim]
-    lora_a: torch.Tensor,  # [num_experts, rank, hidden_dim]
-    lora_b: torch.Tensor,  # [num_experts, out_dim, rank]
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    lora_a: torch.Tensor,  # [max_loras * num_experts, rank, hidden_dim]
+    lora_b: torch.Tensor,  # [max_loras * num_experts, out_dim, rank]
+    sorted_token_ids: torch.Tensor,  # [max_loras, EM]
+    expert_ids: torch.Tensor,  # [max_loras, num_blocks]
+    num_tokens_post_padded: torch.Tensor,  # [max_loras]
     top_k: int,
+    num_experts: int,
     config: dict[str, int],
     mul_routed_weight: bool = False,
 ) -> None:
-    """Apply MoE LoRA using a fused Triton kernel.
+    """Apply batched MoE LoRA using per-LoRA routing from moe_lora_align_block_size.
 
-    Computes: output += (x @ A.T @ B.T) [* topk_weights]
+    This uses a 3D grid where axis=2 iterates over LoRA adapters. Uses identity
+    mapping where lora_idx == lora_id (no indirection needed).
+    """
+    M = topk_weights.shape[0]
+    max_loras = sorted_token_ids.shape[0]
+    EM = sorted_token_ids.shape[1]
+    rank = lora_a.shape[1]
+    hidden_dim = lora_a.shape[2]
+    out_dim = lora_b.shape[1]
+    num_valid_tokens = M * topk_weights.shape[1]
+
+    block_size_m = config["BLOCK_SIZE_M"]
+    block_size_out = config.get("BLOCK_SIZE_N", 64)
+    block_size_hidden = config.get("BLOCK_SIZE_K", 64)
+    block_size_rank = max(16, triton.next_power_of_2(rank))
+    num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
+    num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
+
+    # Use EM (sorted_token_ids dim 1) as max_tokens_padded - already computed by routing
+    max_tokens_padded = EM
+    if max_tokens_padded == 0:
+        return  # No active LoRAs
+
+    num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
+    num_n_blocks = triton.cdiv(out_dim, block_size_out)
+
+    # Heuristic: use fused for small token counts (keeps intermediate in registers)
+    use_fused = num_valid_tokens <= 256
+
+    # Reshape output for kernel access: [M, top_k, out_dim] -> [M * top_k, out_dim]
+    output_flat = output.view(num_valid_tokens, out_dim)
+
+    if use_fused:
+        grid = (num_m_blocks, num_n_blocks, max_loras)
+        _batched_fused_moe_lora_kernel[grid](
+            x,
+            lora_a,
+            lora_b,
+            output_flat,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            hidden_dim,
+            rank,
+            out_dim,
+            EM,
+            num_valid_tokens,
+            num_experts,
+            max_tokens_padded,
+            x.stride(0),
+            x.stride(1),
+            lora_a.stride(0),
+            lora_a.stride(1),
+            lora_a.stride(2),
+            lora_b.stride(0),
+            lora_b.stride(1),
+            lora_b.stride(2),
+            output_flat.stride(0),
+            output_flat.stride(1),
+            sorted_token_ids.stride(0),
+            expert_ids.stride(0),
+            top_k=top_k,
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_RANK=block_size_rank,
+            BLOCK_SIZE_HIDDEN=block_size_hidden,
+            BLOCK_SIZE_OUT=block_size_out,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return
+
+    # Split shrink+expand with PDL for larger token counts using unified kernel
+    intermediate = _BATCHED_INTERMEDIATE_BUFFER.get(
+        (num_valid_tokens, rank),
+        device=x.device,
+        dtype=output.dtype,  # Use output dtype, not float32
+    )
+
+    # Use 2D grid (M, N) with Z dimension for LoRAs - no linearization overhead
+    num_rank_blocks = triton.cdiv(rank, block_size_out)
+    shrink_grid = (num_m_blocks, num_rank_blocks, max_loras)
+
+    # Shrink: x @ lora_a.T -> intermediate
+    # lora_a shape: [E, rank, hidden] -> N=rank, K=hidden
+    _batched_moe_lora_kernel[shrink_grid](
+        x,  # a_ptr: input
+        lora_a,  # b_ptr: weights [E, N=rank, K=hidden]
+        intermediate,  # c_ptr: output
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        rank,  # N
+        hidden_dim,  # K
+        EM,
+        num_valid_tokens,
+        num_experts,
+        max_tokens_padded,
+        x.stride(0),
+        x.stride(1),
+        lora_a.stride(0),
+        lora_a.stride(1),
+        lora_a.stride(2),
+        intermediate.stride(0),
+        intermediate.stride(1),
+        sorted_token_ids.stride(0),
+        expert_ids.stride(0),
+        top_k=top_k,
+        MUL_ROUTED_WEIGHT=False,  # Never multiply in shrink
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_out,  # For rank dimension
+        BLOCK_SIZE_K=block_size_hidden,
+        IS_PRIMARY=True,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        launch_pdl=True,
+    )
+
+    expand_grid = (num_m_blocks, num_n_blocks, max_loras)
+
+    # Expand: intermediate @ lora_b.T -> output (with read-modify-write)
+    # lora_b shape: [E, out_dim, rank] -> N=out_dim, K=rank
+    _batched_moe_lora_kernel[expand_grid](
+        intermediate,  # a_ptr: input
+        lora_b,  # b_ptr: weights [E, N=out_dim, K=rank]
+        output_flat,  # c_ptr: output (kernel does read-modify-write)
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        out_dim,  # N
+        rank,  # K
+        EM,
+        num_valid_tokens,
+        num_experts,
+        max_tokens_padded,
+        intermediate.stride(0),
+        intermediate.stride(1),
+        lora_b.stride(0),
+        lora_b.stride(1),
+        lora_b.stride(2),
+        output_flat.stride(0),
+        output_flat.stride(1),
+        sorted_token_ids.stride(0),
+        expert_ids.stride(0),
+        top_k=1,  # Intermediate is already per-token*topk
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_out,
+        BLOCK_SIZE_K=block_size_hidden,  # For rank - may need tuning
+        IS_PRIMARY=False,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        launch_pdl=True,
+    )
+
+
+@torch.inference_mode()
+def apply_moe_lora_single(
+    x: torch.Tensor,  # [M, hidden_dim]
+    topk_ids: torch.Tensor,  # [M, top_k]
+    topk_weights: torch.Tensor,  # [M, top_k]
+    output: torch.Tensor,  # [M, top_k, out_dim]
+    lora_a: torch.Tensor,  # [max_loras * num_experts, rank, hidden_dim]
+    lora_b: torch.Tensor,  # [max_loras * num_experts, out_dim, rank]
+    sorted_token_ids: torch.Tensor,  # [EM] - 1D from moe_align_block_size
+    expert_ids: torch.Tensor,  # [num_blocks] - 1D from moe_align_block_size
+    num_tokens_post_padded: torch.Tensor,  # Scalar
+    lora_id: int,  # Which LoRA adapter to use
+    top_k: int,
+    num_experts: int,
+    config: dict[str, int],
+    mul_routed_weight: bool = False,
+) -> None:
+    """Apply single-LoRA MoE using baseline routing (no Z dimension overhead).
+
+    This is optimized for prefill where only one LoRA is active. Uses standard
+    moe_align_block_size routing and reuses the batched kernel with Z=1.
+
+    The expert_ids are offset by lora_id * num_experts so the kernel indexes
+    into the correct slice of the weight tensors.
 
     Args:
-        x: Input activations
+        x: Input activations [M, hidden_dim]
         topk_ids: Expert assignments [M, top_k]
         topk_weights: Router weights [M, top_k]
         output: Output tensor to accumulate into [M, top_k, out_dim]
-        lora_a: LoRA A weights [num_experts, rank, hidden_dim]
-        lora_b: LoRA B weights [num_experts, out_dim, rank]
-        sorted_token_ids: Pre-sorted token indices from moe_align_block_size
-        expert_ids: Expert ID per block from moe_align_block_size
-        num_tokens_post_padded: Padded token count
-        top_k: Number of experts per token (use 1 if x is already per-expert)
+        lora_a: LoRA A weights [max_loras * num_experts, rank, hidden_dim]
+        lora_b: LoRA B weights [max_loras * num_experts, out_dim, rank]
+        sorted_token_ids: Pre-sorted token indices from moe_align_block_size [EM]
+        expert_ids: Expert ID per block from moe_align_block_size [num_blocks]
+        num_tokens_post_padded: Padded token count (scalar)
+        lora_id: Which LoRA adapter (0-indexed)
+        top_k: Number of experts per token
+        num_experts: Number of experts
         config: Triton kernel config
         mul_routed_weight: Whether to multiply by router weights
     """
@@ -380,37 +554,48 @@ def apply_moe_lora(
     block_size_m = config["BLOCK_SIZE_M"]
     block_size_out = config.get("BLOCK_SIZE_N", 64)
     block_size_hidden = config.get("BLOCK_SIZE_K", 64)
-    # For LoRA, rank is typically small (8-64), so we can fit it in one block
     block_size_rank = max(16, triton.next_power_of_2(rank))
     num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
     num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
 
-    # Heuristic:
-    # - For small token counts (decode), a single fused kernel is often faster
-    #   than paying the intermediate buffer traffic + second launch.
-    # - For prefill (large M), the fused kernel is prohibitively expensive
-    #   because it recomputes the shrink GEMM for every output tile.
+    # Offset expert_ids by lora_id * num_experts so the kernel indexes
+    # into the correct slice of weight tensors. When Z=1 and lora_idx=0,
+    # super_expert_id = 0 * num_experts + expert_id = expert_id (already offset).
+    expert_ids_offset = expert_ids + lora_id * num_experts
+
+    # Reshape 1D routing to 2D with shape [1, ...] for batched kernel
+    sorted_token_ids_2d = sorted_token_ids.unsqueeze(0)  # [1, EM]
+    expert_ids_2d = expert_ids_offset.unsqueeze(0)  # [1, num_blocks]
+    num_tokens_post_padded_1d = num_tokens_post_padded.view(1)  # [1]
+
+    # Reshape output for kernel access: [M, top_k, out_dim] -> [M * top_k, out_dim]
+    output_flat = output.view(num_valid_tokens, out_dim)
+
+    max_tokens_padded = EM
+    num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
+    num_n_blocks = triton.cdiv(out_dim, block_size_out)
+
+    # Heuristic: use fused for small token counts (keeps intermediate in registers)
     use_fused = num_valid_tokens <= 256
 
     if use_fused:
-        grid = (
-            triton.cdiv(EM, block_size_m),
-            triton.cdiv(out_dim, block_size_out),
-        )
-        _fused_moe_lora_kernel[grid](
+        grid = (num_m_blocks, num_n_blocks, 1)  # Z=1 for single LoRA
+        _batched_fused_moe_lora_kernel[grid](
             x,
             lora_a,
             lora_b,
-            output,
+            output_flat,
             topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
+            sorted_token_ids_2d,
+            expert_ids_2d,
+            num_tokens_post_padded_1d,
             hidden_dim,
             rank,
             out_dim,
             EM,
             num_valid_tokens,
+            num_experts,
+            max_tokens_padded,
             x.stride(0),
             x.stride(1),
             lora_a.stride(0),
@@ -419,8 +604,10 @@ def apply_moe_lora(
             lora_b.stride(0),
             lora_b.stride(1),
             lora_b.stride(2),
-            output.stride(1),  # stride for M (token*topk dim)
-            output.stride(2),  # stride for N (out_dim)
+            output_flat.stride(0),
+            output_flat.stride(1),
+            sorted_token_ids_2d.stride(0),
+            expert_ids_2d.stride(0),
             top_k=top_k,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             BLOCK_SIZE_M=block_size_m,
@@ -432,31 +619,32 @@ def apply_moe_lora(
         )
         return
 
-    # Split shrink+expand to avoid recomputing the shrink GEMM per output tile.
-    intermediate = _INTERMEDIATE_BUFFER.get(
+    # Split shrink+expand with PDL for larger token counts
+    intermediate = _SINGLE_INTERMEDIATE_BUFFER.get(
         (num_valid_tokens, rank),
         device=x.device,
-        dtype=torch.float32,
+        dtype=output.dtype,
     )
 
-    # Compute both grids upfront so launches are back-to-back (required for PDL).
-    shrink_grid = (triton.cdiv(EM, block_size_m),)
-    expand_grid = (
-        triton.cdiv(EM, block_size_m),
-        triton.cdiv(out_dim, block_size_out),
-    )
+    num_rank_blocks = triton.cdiv(rank, block_size_out)
+    shrink_grid = (num_m_blocks, num_rank_blocks, 1)  # Z=1
+    expand_grid = (num_m_blocks, num_n_blocks, 1)  # Z=1
 
-    _moe_lora_shrink_kernel[shrink_grid](
+    # Shrink: x @ lora_a.T -> intermediate
+    _batched_moe_lora_kernel[shrink_grid](
         x,
         lora_a,
         intermediate,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        hidden_dim,
-        rank,
+        topk_weights,
+        sorted_token_ids_2d,
+        expert_ids_2d,
+        num_tokens_post_padded_1d,
+        rank,  # N
+        hidden_dim,  # K
         EM,
         num_valid_tokens,
+        num_experts,
+        max_tokens_padded,
         x.stride(0),
         x.stride(1),
         lora_a.stride(0),
@@ -464,37 +652,49 @@ def apply_moe_lora(
         lora_a.stride(2),
         intermediate.stride(0),
         intermediate.stride(1),
+        sorted_token_ids_2d.stride(0),
+        expert_ids_2d.stride(0),
         top_k=top_k,
+        MUL_ROUTED_WEIGHT=False,
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_RANK=block_size_rank,
-        BLOCK_SIZE_HIDDEN=block_size_hidden,
+        BLOCK_SIZE_N=block_size_out,
+        BLOCK_SIZE_K=block_size_hidden,
+        IS_PRIMARY=True,
         num_warps=num_warps,
         num_stages=num_stages,
         launch_pdl=True,
     )
-    _moe_lora_expand_kernel[expand_grid](
+
+    # Expand: intermediate @ lora_b.T -> output
+    _batched_moe_lora_kernel[expand_grid](
         intermediate,
         lora_b,
-        output,
+        output_flat,
         topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        rank,
-        out_dim,
+        sorted_token_ids_2d,
+        expert_ids_2d,
+        num_tokens_post_padded_1d,
+        out_dim,  # N
+        rank,  # K
         EM,
         num_valid_tokens,
+        num_experts,
+        max_tokens_padded,
         intermediate.stride(0),
         intermediate.stride(1),
         lora_b.stride(0),
         lora_b.stride(1),
         lora_b.stride(2),
-        output.stride(1),  # stride for M (token*topk dim)
-        output.stride(2),  # stride for N (out_dim)
+        output_flat.stride(0),
+        output_flat.stride(1),
+        sorted_token_ids_2d.stride(0),
+        expert_ids_2d.stride(0),
+        top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_RANK=block_size_rank,
-        BLOCK_SIZE_OUT=block_size_out,
+        BLOCK_SIZE_N=block_size_out,
+        BLOCK_SIZE_K=block_size_hidden,
+        IS_PRIMARY=False,
         num_warps=num_warps,
         num_stages=num_stages,
         launch_pdl=True,

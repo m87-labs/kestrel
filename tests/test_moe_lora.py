@@ -1,11 +1,11 @@
-"""Tests for MoE mixed-slot LoRA comparing against naive implementation."""
+"""Tests for MoE LoRA kernel using moe_lora_align_block_size."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 
-def naive_moe_lora(
+def naive_moe_lora_batched(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -17,12 +17,15 @@ def naive_moe_lora(
 ) -> torch.Tensor:
     """Naive per-token MoE LoRA using F.linear.
 
+    Uses the batched mapping: slot 0 -> no LoRA, slot N (N>0) -> lora_id N-1.
+    Workspace is sized (max_slots-1)*num_experts with no slot 0 weights.
+
     Args:
         x: Input activations [num_tokens, hidden_dim]
         topk_ids: Expert assignments [num_tokens, top_k]
         topk_weights: Router weights [num_tokens, top_k]
-        lora_a: LoRA A weights [max_slots * num_experts, rank, hidden_dim]
-        lora_b: LoRA B weights [max_slots * num_experts, out_dim, rank]
+        lora_a: LoRA A weights [(max_slots-1) * num_experts, rank, hidden_dim]
+        lora_b: LoRA B weights [(max_slots-1) * num_experts, out_dim, rank]
         lora_slot_ids: Per-token slot indices [num_tokens]
         num_experts: Number of experts
         mul_routed_weight: Whether to multiply by router weights
@@ -36,14 +39,16 @@ def naive_moe_lora(
 
     for i in range(num_tokens):
         slot = lora_slot_ids[i].item()
+        if slot == 0:
+            # Slot 0 = no LoRA, output stays zero
+            continue
         for k in range(top_k):
             expert = topk_ids[i, k].item()
-            # Super-expert index: slot * num_experts + expert
-            super_expert = slot * num_experts + expert
+            # Batched mapping: slot N -> (N-1) * num_experts + expert
+            super_expert = (slot - 1) * num_experts + expert
             a = lora_a[super_expert]  # [rank, hidden_dim]
             b = lora_b[super_expert]  # [out_dim, rank]
-            # x[i] @ A.T @ B.T
-            h = F.linear(x[i:i+1], a)  # [1, rank]
+            h = F.linear(x[i : i + 1], a)  # [1, rank]
             delta = F.linear(h, b).squeeze(0)  # [out_dim]
             if mul_routed_weight:
                 delta = delta * topk_weights[i, k]
@@ -65,7 +70,7 @@ def dtype():
 
 
 class TestMoELoRA:
-    """Test MoE mixed-slot LoRA against naive implementation."""
+    """Test MoE LoRA kernel against naive implementation."""
 
     def test_single_slot_single_token(self, device, dtype):
         """Test with a single token using a single slot."""
@@ -76,13 +81,11 @@ class TestMoELoRA:
         out_dim = 128
         top_k = 2
 
-        # Create super-expert shaped tensors
-        num_super_experts = max_slots * num_experts
+        # Workspace sized for (max_slots - 1) * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        # Slot 0 super-experts should be zeros (no LoRA)
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(1, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (1, top_k), dtype=torch.int32, device=device)
@@ -90,26 +93,35 @@ class TestMoELoRA:
         lora_slot_ids = torch.tensor([1], dtype=torch.int32, device=device)
 
         # Expected: naive implementation
-        expected = naive_moe_lora(
+        expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
 
-        # Actual: use apply_moe_lora via super-expert routing
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        # Actual: use batched kernel with moe_lora_align_block_size
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
 
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        combined_topk_ids = topk_ids + expanded_slots * num_experts
+        # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
 
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
         block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
+
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            block_size_m,
+            num_experts,
+            max_loras,
         )
 
         output = torch.zeros(1, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
@@ -118,6 +130,7 @@ class TestMoELoRA:
             expert_ids=expert_ids_lora,
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=False,
         )
@@ -134,32 +147,39 @@ class TestMoELoRA:
         top_k = 2
         num_tokens = 4
 
-        num_super_experts = max_slots * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
         lora_slot_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
 
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
 
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        combined_topk_ids = topk_ids + expanded_slots * num_experts
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
 
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
         block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
+
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            block_size_m,
+            num_experts,
+            max_loras,
         )
 
         output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
@@ -168,11 +188,12 @@ class TestMoELoRA:
             expert_ids=expert_ids_lora,
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=False,
         )
 
-        # Should be all zeros since slot 0 weights are zeros
+        # Should be all zeros since slot 0 is filtered
         torch.testing.assert_close(output, torch.zeros_like(output))
 
     def test_mixed_slots(self, device, dtype):
@@ -185,11 +206,10 @@ class TestMoELoRA:
         top_k = 2
         num_tokens = 8
 
-        num_super_experts = max_slots * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
@@ -197,25 +217,33 @@ class TestMoELoRA:
         # Mix of slot 0 (no LoRA), slot 1, slot 2, slot 3
         lora_slot_ids = torch.tensor([0, 1, 2, 3, 1, 2, 0, 3], dtype=torch.int32, device=device)
 
-        expected = naive_moe_lora(
+        expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
 
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
 
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        combined_topk_ids = topk_ids + expanded_slots * num_experts
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
 
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
         block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
+
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            block_size_m,
+            num_experts,
+            max_loras,
         )
 
         output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
@@ -224,6 +252,7 @@ class TestMoELoRA:
             expert_ids=expert_ids_lora,
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=False,
         )
@@ -240,36 +269,43 @@ class TestMoELoRA:
         top_k = 2
         num_tokens = 4
 
-        num_super_experts = max_slots * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.rand(num_tokens, top_k, dtype=dtype, device=device)
         lora_slot_ids = torch.tensor([1, 2, 1, 2], dtype=torch.int32, device=device)
 
-        expected = naive_moe_lora(
+        expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts, mul_routed_weight=True
         )
 
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
 
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        combined_topk_ids = topk_ids + expanded_slots * num_experts
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
 
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
         block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
+
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            block_size_m,
+            num_experts,
+            max_loras,
         )
 
         output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
@@ -278,6 +314,7 @@ class TestMoELoRA:
             expert_ids=expert_ids_lora,
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=True,
         )
@@ -294,33 +331,31 @@ class TestMoELoRA:
         top_k = 2
         num_tokens = 4
 
-        num_super_experts = max_slots * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
 
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
+
+        block_size_m = 16
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
 
         # Output without LoRA (slot 0 for all)
         slot_ids_no_lora = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        expanded_slots_no = slot_ids_no_lora.unsqueeze(1).expand(-1, top_k)
-        combined_no = topk_ids + expanded_slots_no * num_experts
+        mapping_no = torch.full((num_tokens,), -1, dtype=torch.int32, device=device)
 
-        block_size_m = 16
-        sorted_no, expert_ids_no, num_tokens_no = moe_align_block_size(
-            combined_no, block_size_m, num_super_experts
-        )
+        sorted_no, expert_ids_no, num_tokens_no = moe_lora_align_block_size(
+            topk_ids, mapping_no, block_size_m, num_experts, max_loras        )
 
         output_no_lora = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_no,
             topk_weights=topk_weights,
             output=output_no_lora,
             lora_a=lora_a,
@@ -329,23 +364,21 @@ class TestMoELoRA:
             expert_ids=expert_ids_no,
             num_tokens_post_padded=num_tokens_no,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=False,
         )
 
         # Output with LoRA (slot 1 for all)
         slot_ids_with_lora = torch.ones(num_tokens, dtype=torch.int32, device=device)
-        expanded_slots_with = slot_ids_with_lora.unsqueeze(1).expand(-1, top_k)
-        combined_with = topk_ids + expanded_slots_with * num_experts
+        mapping_with = torch.zeros(num_tokens, dtype=torch.int32, device=device)  # lora_id=0
 
-        sorted_with, expert_ids_with, num_tokens_with = moe_align_block_size(
-            combined_with, block_size_m, num_super_experts
-        )
+        sorted_with, expert_ids_with, num_tokens_with = moe_lora_align_block_size(
+            topk_ids, mapping_with, block_size_m, num_experts, max_loras        )
 
         output_with_lora = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_with,
             topk_weights=topk_weights,
             output=output_with_lora,
             lora_a=lora_a,
@@ -354,6 +387,7 @@ class TestMoELoRA:
             expert_ids=expert_ids_with,
             num_tokens_post_padded=num_tokens_with,
             top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=False,
         )
@@ -377,34 +411,33 @@ class TestMoELoRA:
         out_dim = 128
         top_k = 2
 
-        num_super_experts = max_slots * num_experts
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
         lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
         lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
-        lora_a[:num_experts].zero_()
-        lora_b[:num_experts].zero_()
 
         x = torch.randn(1, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (1, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(1, top_k, dtype=dtype, device=device)
 
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
+
+        block_size_m = 16
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
 
         outputs = []
         for slot in range(1, max_slots):  # Skip slot 0
-            slot_ids = torch.tensor([slot], dtype=torch.int32, device=device)
-            expanded_slots = slot_ids.unsqueeze(1).expand(-1, top_k)
-            combined = topk_ids + expanded_slots * num_experts
+            # lora_id = slot - 1
+            lora_id = slot - 1
+            mapping = torch.tensor([lora_id], dtype=torch.int32, device=device)
 
-            block_size_m = 16
-            sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-                combined, block_size_m, num_super_experts
-            )
+            sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+                topk_ids, mapping, block_size_m, num_experts, max_loras            )
 
             output = torch.zeros(1, top_k, out_dim, dtype=dtype, device=device)
-            apply_moe_lora(
+            apply_moe_lora_batched(
                 x=x,
-                topk_ids=combined,
                 topk_weights=topk_weights,
                 output=output,
                 lora_a=lora_a,
@@ -412,7 +445,8 @@ class TestMoELoRA:
                 sorted_token_ids=sorted_lora,
                 expert_ids=expert_ids_lora,
                 num_tokens_post_padded=num_tokens_lora,
-                top_k=top_k,
+                    top_k=top_k,
+                num_experts=num_experts,
                 config={"BLOCK_SIZE_M": block_size_m},
                 mul_routed_weight=False,
             )
@@ -424,248 +458,54 @@ class TestMoELoRA:
                 assert not torch.allclose(outputs[i], outputs[j]), \
                     f"Slots {i+1} and {j+1} should produce different outputs"
 
-
-def naive_moe_lora_sentinel(
-    x: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    lora_slot_ids: torch.Tensor,
-    num_experts: int,
-    mul_routed_weight: bool = False,
-) -> torch.Tensor:
-    """Naive MoE LoRA with sentinel-based slot 0 filtering.
-
-    Uses the mapping: slot 0 -> no LoRA, slot N (N>0) -> super-expert (N-1)*num_experts + expert.
-    Workspace is sized (max_slots-1)*num_experts with no slot 0 weights.
-    """
-    num_tokens, top_k = topk_ids.shape
-    out_dim = lora_b.shape[1]
-    output = torch.zeros(num_tokens, top_k, out_dim, dtype=x.dtype, device=x.device)
-
-    for i in range(num_tokens):
-        slot = lora_slot_ids[i].item()
-        if slot == 0:
-            # Slot 0 = no LoRA, output stays zero
-            continue
-        for k in range(top_k):
-            expert = topk_ids[i, k].item()
-            # New mapping: slot N -> (N-1) * num_experts + expert
-            super_expert = (slot - 1) * num_experts + expert
-            a = lora_a[super_expert]  # [rank, hidden_dim]
-            b = lora_b[super_expert]  # [out_dim, rank]
-            h = F.linear(x[i : i + 1], a)  # [1, rank]
-            delta = F.linear(h, b).squeeze(0)  # [out_dim]
-            if mul_routed_weight:
-                delta = delta * topk_weights[i, k]
-            output[i, k] = delta
-
-    return output
-
-
-class TestMoELoRASentinel:
-    """Test MoE LoRA with sentinel-based slot 0 filtering.
-
-    This tests the pattern used to avoid the 1024 super-expert limit in
-    moe_align_block_size. By using a sentinel value for slot 0 tokens,
-    they are filtered out by the kernel (expert_id >= num_experts is skipped).
-    This allows the workspace to exclude slot 0, reducing max_super_experts
-    from max_slots * num_experts to (max_slots - 1) * num_experts.
-    """
-
-    def test_sentinel_filters_slot_zero(self, device, dtype):
-        """Test that slot 0 tokens are filtered via sentinel (no workspace slot 0)."""
-        max_slots = 4  # Workspace only has slots 1-3 (indices 0-2 in workspace)
+    def test_prefill_path_uses_split_kernels(self, device, dtype):
+        """Test that larger token counts use split shrink/expand with PDL."""
+        max_slots = 4
         num_experts = 8
         rank = 8
         hidden_dim = 64
         out_dim = 128
         top_k = 2
-        num_tokens = 8
+        # Use more than 256 tokens to trigger split path
+        num_tokens = 512
 
-        # Workspace sized for (max_slots - 1) super-experts - NO slot 0
-        num_super_experts = (max_slots - 1) * num_experts  # 24, not 32
-        lora_a = torch.randn(
-            num_super_experts, rank, hidden_dim, dtype=dtype, device=device
-        ) * 0.1
-        lora_b = torch.randn(
-            num_super_experts, out_dim, rank, dtype=dtype, device=device
-        ) * 0.1
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
 
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-        topk_ids = torch.randint(
-            0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
-        )
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
-        # Mix of slot 0 (no LoRA) and slots 1, 2, 3
-        lora_slot_ids = torch.tensor(
-            [0, 1, 2, 3, 1, 2, 0, 3], dtype=torch.int32, device=device
-        )
+        lora_slot_ids = torch.randint(0, max_slots, (num_tokens,), dtype=torch.int32, device=device)
 
-        # Expected output from naive implementation
-        expected = naive_moe_lora_sentinel(
+        expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
 
-        # Actual: use sentinel-based mapping
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-            moe_align_block_size,
-        )
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
 
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        sentinel = num_super_experts  # Value >= num_super_experts will be filtered
-        combined_topk_ids = torch.where(
-            expanded_slots > 0,
-            topk_ids + (expanded_slots - 1) * num_experts,
-            sentinel,
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
         ).to(torch.int32)
 
+        lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
         block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
-        )
 
-        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
-            x=x,
-            topk_ids=combined_topk_ids,
-            topk_weights=topk_weights,
-            output=output,
-            lora_a=lora_a,
-            lora_b=lora_b,
-            sorted_token_ids=sorted_lora,
-            expert_ids=expert_ids_lora,
-            num_tokens_post_padded=num_tokens_lora,
-            top_k=top_k,
-            config={"BLOCK_SIZE_M": block_size_m},
-            mul_routed_weight=False,
-        )
-
-        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
-
-    def test_sentinel_slot_zero_output_is_zero(self, device, dtype):
-        """Test that slot 0 tokens produce zero output (not processed)."""
-        max_slots = 4
-        num_experts = 8
-        rank = 8
-        hidden_dim = 64
-        out_dim = 128
-        top_k = 2
-        num_tokens = 4
-
-        num_super_experts = (max_slots - 1) * num_experts
-        lora_a = torch.randn(
-            num_super_experts, rank, hidden_dim, dtype=dtype, device=device
-        ) * 0.1
-        lora_b = torch.randn(
-            num_super_experts, out_dim, rank, dtype=dtype, device=device
-        ) * 0.1
-
-        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-        topk_ids = torch.randint(
-            0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
-        )
-        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
-        # All slot 0
-        lora_slot_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-            moe_align_block_size,
-        )
-
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        sentinel = num_super_experts
-        combined_topk_ids = torch.where(
-            expanded_slots > 0,
-            topk_ids + (expanded_slots - 1) * num_experts,
-            sentinel,
-        ).to(torch.int32)
-
-        block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
-        )
-
-        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
-            x=x,
-            topk_ids=combined_topk_ids,
-            topk_weights=topk_weights,
-            output=output,
-            lora_a=lora_a,
-            lora_b=lora_b,
-            sorted_token_ids=sorted_lora,
-            expert_ids=expert_ids_lora,
-            num_tokens_post_padded=num_tokens_lora,
-            top_k=top_k,
-            config={"BLOCK_SIZE_M": block_size_m},
-            mul_routed_weight=False,
-        )
-
-        # All slot 0 -> all outputs should be zero
-        torch.testing.assert_close(output, torch.zeros_like(output))
-
-    def test_sentinel_with_router_weights(self, device, dtype):
-        """Test sentinel filtering with router weight multiplication."""
-        max_slots = 4
-        num_experts = 8
-        rank = 8
-        hidden_dim = 64
-        out_dim = 128
-        top_k = 2
-        num_tokens = 4
-
-        num_super_experts = (max_slots - 1) * num_experts
-        lora_a = torch.randn(
-            num_super_experts, rank, hidden_dim, dtype=dtype, device=device
-        ) * 0.1
-        lora_b = torch.randn(
-            num_super_experts, out_dim, rank, dtype=dtype, device=device
-        ) * 0.1
-
-        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-        topk_ids = torch.randint(
-            0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
-        )
-        topk_weights = torch.rand(num_tokens, top_k, dtype=dtype, device=device)
-        lora_slot_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
-
-        expected = naive_moe_lora_sentinel(
-            x,
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
             topk_ids,
-            topk_weights,
-            lora_a,
-            lora_b,
-            lora_slot_ids,
+            token_lora_mapping,
+            block_size_m,
             num_experts,
-            mul_routed_weight=True,
-        )
-
-        from kestrel.fused_moe.lora_kernels import apply_moe_lora
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-            moe_align_block_size,
-        )
-
-        expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, top_k)
-        sentinel = num_super_experts
-        combined_topk_ids = torch.where(
-            expanded_slots > 0,
-            topk_ids + (expanded_slots - 1) * num_experts,
-            sentinel,
-        ).to(torch.int32)
-
-        block_size_m = 16
-        sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-            combined_topk_ids, block_size_m, num_super_experts
+            max_loras,
         )
 
         output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
-        apply_moe_lora(
+        apply_moe_lora_batched(
             x=x,
-            topk_ids=combined_topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
@@ -674,8 +514,375 @@ class TestMoELoRASentinel:
             expert_ids=expert_ids_lora,
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
+            num_experts=num_experts,
+            config={"BLOCK_SIZE_M": block_size_m},
+            mul_routed_weight=False,
+        )
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestSingleLoRA:
+    """Test single-LoRA path (optimized for prefill)."""
+
+    def test_single_lora_matches_naive(self, device, dtype):
+        """Test apply_moe_lora_single matches naive implementation."""
+        max_slots = 4
+        num_experts = 8
+        rank = 8
+        hidden_dim = 64
+        out_dim = 128
+        top_k = 2
+        num_tokens = 32
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+
+        # All tokens use slot 2 (lora_id = 1)
+        lora_slot = 2
+        lora_id = lora_slot - 1
+        lora_slot_ids = torch.full((num_tokens,), lora_slot, dtype=torch.int32, device=device)
+
+        expected = naive_moe_lora_batched(
+            x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
+        )
+
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_single
+
+        block_size_m = 16
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, num_experts
+        )
+
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_single(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_id=lora_id,
+            top_k=top_k,
+            num_experts=num_experts,
+            config={"BLOCK_SIZE_M": block_size_m},
+            mul_routed_weight=False,
+        )
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_single_lora_matches_batched(self, device, dtype):
+        """Test that single-LoRA path produces same results as batched path."""
+        max_slots = 8
+        num_experts = 8
+        rank = 8
+        hidden_dim = 64
+        out_dim = 128
+        top_k = 2
+        num_tokens = 128
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.rand(num_tokens, top_k, dtype=dtype, device=device)
+
+        # All tokens use slot 3 (lora_id = 2)
+        lora_slot = 3
+        lora_id = lora_slot - 1
+        lora_slot_ids = torch.full((num_tokens,), lora_slot, dtype=torch.int32, device=device)
+
+        from kestrel.fused_moe.routing import moe_align_block_size, moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_single, apply_moe_lora_batched
+
+        block_size_m = 16
+
+        # Single-LoRA path
+        sorted_single, expert_ids_single, num_post_single = moe_align_block_size(
+            topk_ids, block_size_m, num_experts
+        )
+        output_single = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_single(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output_single,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_single,
+            expert_ids=expert_ids_single,
+            num_tokens_post_padded=num_post_single,
+            lora_id=lora_id,
+            top_k=top_k,
+            num_experts=num_experts,
             config={"BLOCK_SIZE_M": block_size_m},
             mul_routed_weight=True,
         )
 
+        # Batched path
+        token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
+        sorted_batch, expert_ids_batch, num_post_batch = moe_lora_align_block_size(
+            topk_ids, token_lora_mapping, block_size_m, num_experts, max_loras
+        )
+        output_batched = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_batched(
+            x=x,
+            topk_weights=topk_weights,
+            output=output_batched,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_batch,
+            expert_ids=expert_ids_batch,
+            num_tokens_post_padded=num_post_batch,
+            top_k=top_k,
+            num_experts=num_experts,
+            config={"BLOCK_SIZE_M": block_size_m},
+            mul_routed_weight=True,
+        )
+
+        torch.testing.assert_close(output_single, output_batched, rtol=1e-2, atol=1e-2)
+
+    def test_single_lora_prefill_split_path(self, device, dtype):
+        """Test single-LoRA with large token count (triggers split shrink/expand)."""
+        max_slots = 4
+        num_experts = 8
+        rank = 8
+        hidden_dim = 64
+        out_dim = 128
+        top_k = 2
+        # Use more than 256 tokens to trigger split path
+        num_tokens = 512
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+
+        lora_slot = 1
+        lora_id = lora_slot - 1
+        lora_slot_ids = torch.full((num_tokens,), lora_slot, dtype=torch.int32, device=device)
+
+        expected = naive_moe_lora_batched(
+            x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
+        )
+
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_single
+
+        block_size_m = 16
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, num_experts
+        )
+
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_single(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_id=lora_id,
+            top_k=top_k,
+            num_experts=num_experts,
+            config={"BLOCK_SIZE_M": block_size_m},
+            mul_routed_weight=False,
+        )
+
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_different_lora_ids_produce_different_outputs(self, device, dtype):
+        """Test that different lora_ids produce different outputs."""
+        max_slots = 4
+        num_experts = 8
+        rank = 8
+        hidden_dim = 64
+        out_dim = 128
+        top_k = 2
+        num_tokens = 16
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_single
+
+        block_size_m = 16
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, num_experts
+        )
+
+        outputs = []
+        for lora_id in range(max_loras):
+            output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+            apply_moe_lora_single(
+                x=x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=output,
+                lora_a=lora_a,
+                lora_b=lora_b,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                lora_id=lora_id,
+                top_k=top_k,
+                num_experts=num_experts,
+                config={"BLOCK_SIZE_M": block_size_m},
+                mul_routed_weight=False,
+            )
+            outputs.append(output.clone())
+
+        # Each lora_id should produce a different output
+        for i in range(len(outputs)):
+            for j in range(i + 1, len(outputs)):
+                assert not torch.allclose(outputs[i], outputs[j]), \
+                    f"lora_id {i} and {j} should produce different outputs"
+
+
+class TestWorkspaceMode:
+    """Test workspace mode switching for prefill/decode."""
+
+    def test_set_prefill_mode(self, device, dtype):
+        """Test that set_prefill_mode sets single_lora_id on all MoE layers."""
+        from kestrel.moondream.config import TextConfig, TextMoeConfig
+        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
+
+        moe_config = TextMoeConfig(
+            num_experts=8,
+            experts_per_token=2,
+            expert_inner_dim=256,
+            start_layer=2,
+        )
+        text_config = TextConfig(
+            dim=512,
+            ff_dim=1024,
+            n_heads=8,
+            n_kv_heads=4,
+            n_layers=4,
+            vocab_size=32000,
+            moe=moe_config,
+        )
+
+        workspace = TextLoRAWorkspace(
+            text_config=text_config,
+            max_slots=4,
+            max_rank=8,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Initially should be None (decode mode)
+        for layer in workspace.moe:
+            assert layer.single_lora_id is None
+
+        # Set prefill mode for slot 2
+        workspace.set_prefill_mode(lora_slot=2)
+
+        # All MoE layers should have single_lora_id = 1 (slot 2 -> lora_id 1)
+        for layer in workspace.moe:
+            assert layer.single_lora_id == 1
+
+    def test_set_decode_mode(self, device, dtype):
+        """Test that set_decode_mode clears single_lora_id."""
+        from kestrel.moondream.config import TextConfig, TextMoeConfig
+        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
+
+        moe_config = TextMoeConfig(
+            num_experts=8,
+            experts_per_token=2,
+            expert_inner_dim=256,
+            start_layer=2,
+        )
+        text_config = TextConfig(
+            dim=512,
+            ff_dim=1024,
+            n_heads=8,
+            n_kv_heads=4,
+            n_layers=4,
+            vocab_size=32000,
+            moe=moe_config,
+        )
+
+        workspace = TextLoRAWorkspace(
+            text_config=text_config,
+            max_slots=4,
+            max_rank=8,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Set prefill mode first
+        workspace.set_prefill_mode(lora_slot=3)
+        for layer in workspace.moe:
+            assert layer.single_lora_id == 2
+
+        # Switch to decode mode
+        workspace.set_decode_mode()
+
+        # All should be None now
+        for layer in workspace.moe:
+            assert layer.single_lora_id is None
+
+    def test_prefill_mode_validates_slot(self, device, dtype):
+        """Test that set_prefill_mode validates the slot."""
+        from kestrel.moondream.config import TextConfig, TextMoeConfig
+        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
+
+        moe_config = TextMoeConfig(
+            num_experts=8,
+            experts_per_token=2,
+            expert_inner_dim=256,
+            start_layer=2,
+        )
+        text_config = TextConfig(
+            dim=512,
+            ff_dim=1024,
+            n_heads=8,
+            n_kv_heads=4,
+            n_layers=4,
+            vocab_size=32000,
+            moe=moe_config,
+        )
+
+        workspace = TextLoRAWorkspace(
+            text_config=text_config,
+            max_slots=4,
+            max_rank=8,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Slot 0 should raise
+        with pytest.raises(ValueError, match="Slot 0 is reserved"):
+            workspace.set_prefill_mode(lora_slot=0)
+
+        # Out of range slot should raise
+        with pytest.raises(ValueError, match="out of range"):
+            workspace.set_prefill_mode(lora_slot=10)

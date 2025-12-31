@@ -716,6 +716,9 @@ class MoondreamRuntime:
         else:
             lora_workspace = self._lora_workspace
             lora_slot_ids = torch.tensor([lora_slot], dtype=torch.int32, device=self.device)
+            # Enable single-LoRA mode for prefill (optimized kernel path)
+            if lora_workspace is not None:
+                lora_workspace.set_prefill_mode(lora_slot)
 
         hidden = text_decoder(
             inputs_embeds,
@@ -729,6 +732,11 @@ class MoondreamRuntime:
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
         )
+
+        # Reset to decode mode after prefill (batched kernel path)
+        if lora_workspace is not None:
+            lora_workspace.set_decode_mode()
+
         logits = lm_head(hidden, self.model.text)
         return hidden, logits
 
