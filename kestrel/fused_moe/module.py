@@ -206,6 +206,8 @@ class _MoEWorkspaces:
         self.down = _ResizableBuffer()
         self.output = _ResizableBuffer()
         self.activation = _ResizableBuffer()
+        self.lora_up = _ResizableBuffer()
+        self.lora_down = _ResizableBuffer()
         self.fp8_bits = _ResizableBuffer()
         self.fp8_scale = _ResizableBuffer()
 
@@ -257,6 +259,82 @@ class FusedMoEModule(nn.Module):
         self.config = config or FusedMoEConfig()
         self._workspaces = _MoEWorkspaces()
         self._tuned_configs: dict[int, dict[str, int] | None] = {}
+        self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
+        self._lora_activation_event = torch.cuda.Event(enable_timing=False)
+        self._lora_up_event = torch.cuda.Event(enable_timing=False)
+        self._lora_down_event = torch.cuda.Event(enable_timing=False)
+
+    def _compute_lora_routing(
+        self,
+        *,
+        topk_ids: torch.Tensor,
+        lora_slot_ids: torch.Tensor,
+        block_size_m: int,
+        lora_workspace: MoELoRALayerWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
+        max_loras = lora_workspace.up_a.shape[0] // self.num_experts
+        return moe_lora_align_block_size(
+            topk_ids.to(torch.int32),
+            token_lora_mapping,
+            block_size_m,
+            self.num_experts,
+            max_loras,
+        )
+
+    def _run_lora_up(
+        self,
+        *,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: torch.Tensor,
+        lora_workspace: MoELoRALayerWorkspace,
+        sorted_lora: torch.Tensor,
+        expert_ids_lora: torch.Tensor,
+        num_tokens_lora: torch.Tensor,
+        block_size_m: int,
+    ) -> None:
+        apply_moe_lora_batched(
+            x=x,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_workspace.up_a,
+            lora_b=lora_workspace.up_b,
+            sorted_token_ids=sorted_lora,
+            expert_ids=expert_ids_lora,
+            num_tokens_post_padded=num_tokens_lora,
+            top_k=self.top_k,
+            num_experts=self.num_experts,
+            block_size_m=block_size_m,
+            mul_routed_weight=False,
+        )
+
+    def _run_lora_down(
+        self,
+        *,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: torch.Tensor,
+        lora_workspace: MoELoRALayerWorkspace,
+        sorted_lora: torch.Tensor,
+        expert_ids_lora: torch.Tensor,
+        num_tokens_lora: torch.Tensor,
+        block_size_m: int,
+    ) -> None:
+        apply_moe_lora_batched(
+            x=x,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_workspace.down_a,
+            lora_b=lora_workspace.down_b,
+            sorted_token_ids=sorted_lora,
+            expert_ids=expert_ids_lora,
+            num_tokens_post_padded=num_tokens_lora,
+            top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
+            num_experts=self.num_experts,
+            block_size_m=block_size_m,
+            mul_routed_weight=True,
+        )
 
     def __call__(
         self,
@@ -342,21 +420,6 @@ class FusedMoEModule(nn.Module):
 
         compute_type = dtype_to_triton(hidden_states.dtype)
 
-        self._invoke_fused_moe_kernel(
-            hidden_states,
-            self.up_experts.weight,
-            getattr(self.up_experts, "scale", None),
-            up_out,
-            topk_weights=None,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-            mul_routed_weight=False,
-            top_k=self.top_k,
-            triton_config=triton_config,
-            compute_type=compute_type,
-        )
-
         # LoRA handling: dispatch based on workspace mode
         #
         # Single-LoRA mode (prefill): Use standard moe_align_block_size routing
@@ -377,11 +440,71 @@ class FusedMoEModule(nn.Module):
             and lora_slot_ids is not None
             and lora_workspace.single_lora_id is None
         )
+        lora_stream = lora_workspace.stream if use_batched_lora else None
+        compute_stream = torch.cuda.current_stream()
+        use_lora_stream = lora_stream is not None and lora_stream != compute_stream
 
         # For batched mode, prepare per-LoRA routing once (reused for up and down)
         sorted_lora = None
         expert_ids_lora = None
         num_tokens_lora = None
+
+        # Launch batched LoRA up before base MoE so it can overlap if we have a
+        # dedicated LoRA stream. Always compute into the LoRA buffer and add
+        # into the base output after the fused kernel runs.
+        lora_up_out = None
+        if use_batched_lora:
+            target_stream = lora_stream if use_lora_stream else compute_stream
+            if use_lora_stream:
+                self._lora_inputs_event.record(compute_stream)
+            with torch.cuda.stream(target_stream):
+                if use_lora_stream:
+                    target_stream.wait_event(self._lora_inputs_event)
+                sorted_lora, expert_ids_lora, num_tokens_lora = self._compute_lora_routing(
+                    topk_ids=topk_ids,
+                    lora_slot_ids=lora_slot_ids,
+                    block_size_m=block_size_m,
+                    lora_workspace=lora_workspace,
+                )
+                lora_up_out = self._workspaces.lora_up.get(
+                    (num_tokens, self.top_k, self.hidden_size * 2),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                lora_up_out.zero_()
+                self._run_lora_up(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    output=lora_up_out,
+                    lora_workspace=lora_workspace,
+                    sorted_lora=sorted_lora,
+                    expert_ids_lora=expert_ids_lora,
+                    num_tokens_lora=num_tokens_lora,
+                    block_size_m=block_size_m,
+                )
+                if use_lora_stream:
+                    self._lora_up_event.record(target_stream)
+
+        self._invoke_fused_moe_kernel(
+            hidden_states,
+            self.up_experts.weight,
+            getattr(self.up_experts, "scale", None),
+            up_out,
+            topk_weights=None,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=self.top_k,
+            triton_config=triton_config,
+            compute_type=compute_type,
+        )
+
+        if use_batched_lora:
+            if use_lora_stream:
+                compute_stream.wait_event(self._lora_up_event)
+            if lora_up_out is not None:
+                up_out.add_(lora_up_out)
 
         if use_single_lora:
             # Single-LoRA path: reuse MoE routing, offset by lora_id
@@ -398,37 +521,7 @@ class FusedMoEModule(nn.Module):
                 lora_id=lora_workspace.single_lora_id,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
-                config=triton_config,
-                mul_routed_weight=False,
-            )
-        elif use_batched_lora:
-            # Batched path: per-LoRA routing for mixed decode batches
-            # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
-            token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
-
-            # max_loras = workspace size / num_experts (slot 0 excluded from workspace)
-            max_loras = lora_workspace.up_a.shape[0] // self.num_experts
-
-            sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
-                topk_ids.to(torch.int32),
-                token_lora_mapping,
-                block_size_m,
-                self.num_experts,
-                max_loras,
-            )
-
-            apply_moe_lora_batched(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                output=up_out,
-                lora_a=lora_workspace.up_a,
-                lora_b=lora_workspace.up_b,
-                sorted_token_ids=sorted_lora,
-                expert_ids=expert_ids_lora,
-                num_tokens_post_padded=num_tokens_lora,
-                top_k=self.top_k,
-                num_experts=self.num_experts,
-                config=triton_config,
+                block_size_m=block_size_m,
                 mul_routed_weight=False,
             )
 
@@ -445,6 +538,33 @@ class FusedMoEModule(nn.Module):
         gelu_residual_cuda(activation_out, activation_in)
 
         down_in = activation_out
+        lora_down_out = None
+        if use_batched_lora:
+            target_stream = lora_stream if use_lora_stream else compute_stream
+            if use_lora_stream:
+                self._lora_activation_event.record(compute_stream)
+            with torch.cuda.stream(target_stream):
+                if use_lora_stream:
+                    target_stream.wait_event(self._lora_activation_event)
+                lora_down_out = self._workspaces.lora_down.get(
+                    (num_tokens, self.top_k, self.input_size),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                lora_down_out.zero_()
+                self._run_lora_down(
+                    x=down_in,
+                    topk_weights=topk_weights,
+                    output=lora_down_out,
+                    lora_workspace=lora_workspace,
+                    sorted_lora=sorted_lora,
+                    expert_ids_lora=expert_ids_lora,
+                    num_tokens_lora=num_tokens_lora,
+                    block_size_m=block_size_m,
+                )
+                if use_lora_stream:
+                    self._lora_down_event.record(target_stream)
+
         down_out = self._workspaces.down.get(
             (num_tokens, self.top_k, self.input_size),
             device=hidden_states.device,
@@ -465,6 +585,12 @@ class FusedMoEModule(nn.Module):
             compute_type=compute_type,
         )
 
+        if use_batched_lora:
+            if use_lora_stream:
+                compute_stream.wait_event(self._lora_down_event)
+            if lora_down_out is not None:
+                down_out.add_(lora_down_out)
+
         if use_single_lora:
             # Single-LoRA path for down projection
             apply_moe_lora_single(
@@ -480,24 +606,7 @@ class FusedMoEModule(nn.Module):
                 lora_id=lora_workspace.single_lora_id,
                 top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
                 num_experts=self.num_experts,
-                config=triton_config,
-                mul_routed_weight=True,
-            )
-        elif use_batched_lora:
-            # Batched path for down projection
-            # Reuse the same per-LoRA routing computed for up projection
-            apply_moe_lora_batched(
-                x=down_in,
-                topk_weights=topk_weights,
-                output=down_out,
-                lora_a=lora_workspace.down_a,
-                lora_b=lora_workspace.down_b,
-                sorted_token_ids=sorted_lora,
-                expert_ids=expert_ids_lora,
-                num_tokens_post_padded=num_tokens_lora,
-                top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
-                num_experts=self.num_experts,
-                config=triton_config,
+                block_size_m=block_size_m,
                 mul_routed_weight=True,
             )
 

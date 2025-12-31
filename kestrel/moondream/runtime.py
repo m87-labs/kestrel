@@ -355,6 +355,7 @@ class MoondreamRuntime:
         # the compute stream (preserves KV ordering and _pending_* dependencies).
         # D2H copies share the copy stream for simpler ordering guarantees.
         self._decode_compute_stream = torch.cuda.Stream(device=self.device)
+        self._decode_lora_stream = torch.cuda.Stream(device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
 
         self._active_prefill_batch_idx: Optional[Tensor] = None
@@ -413,6 +414,7 @@ class MoondreamRuntime:
                 max_rank=max_lora_rank,
                 device=self.device,
                 dtype=self.dtype,
+                lora_stream=self._decode_lora_stream,
             )
             self._slot_manager = AdapterSlotManager(max_slots)
 
