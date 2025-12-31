@@ -12,8 +12,8 @@ from .kernels import (
     invoke_fused_moe_kernel as invoke_fused_moe_kernel_triton,
     invoke_fused_moe_kernel_fp8_w8a8 as invoke_fused_moe_kernel_triton_fp8,
 )
-from .lora_kernels import apply_moe_lora
-from .routing import moe_align_block_size
+from .lora_kernels import apply_moe_lora_batched, apply_moe_lora_single
+from .routing import moe_align_block_size, moe_lora_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel_kernels.activation import gelu_residual_cuda
@@ -357,44 +357,68 @@ class FusedMoEModule(nn.Module):
             compute_type=compute_type,
         )
 
-        # For LoRA, run separate routing with super-expert IDs.
-        # This keeps base MoE compute unchanged while enabling mixed-adapter batches.
-        # Compute routing once here and reuse for both up and down LoRA.
+        # LoRA handling: dispatch based on workspace mode
         #
-        # Super-expert mapping uses sentinel-based slot 0 filtering:
-        # - Slot 0 (no LoRA): Set to sentinel value >= max_super_experts, which
-        #   causes moe_align_block_size to skip these tokens (expert_id >= num_experts
-        #   are ignored in the kernel). These tokens get no LoRA contribution.
-        # - Slot N (N >= 1): Maps to super-expert (N-1)*num_experts + expert_id
+        # Single-LoRA mode (prefill): Use standard moe_align_block_size routing
+        # with apply_moe_lora_single. No Z dimension overhead.
         #
-        # This allows the MoE workspace to exclude slot 0 entirely, reducing
-        # max_super_experts from max_slots*num_experts to (max_slots-1)*num_experts.
-        # With 64 experts, this keeps us under vLLM's 1024 super-expert limit
-        # (floor(1023/64) = 15 usable adapter slots).
+        # Batched mode (decode): Use moe_lora_align_block_size for per-LoRA
+        # routing with apply_moe_lora_batched. Handles mixed LoRA batches.
+        #
+        # The workspace stores weights as [max_loras * num_experts, rank, dim]
+        # where max_loras = max_slots - 1 (slot 0 excluded).
+        use_single_lora = (
+            lora_workspace is not None
+            and lora_slot_ids is not None
+            and lora_workspace.single_lora_id is not None
+        )
+        use_batched_lora = (
+            lora_workspace is not None
+            and lora_slot_ids is not None
+            and lora_workspace.single_lora_id is None
+        )
+
+        # For batched mode, prepare per-LoRA routing once (reused for up and down)
         sorted_lora = None
         expert_ids_lora = None
         num_tokens_lora = None
-        combined_topk_ids = None
-        if lora_workspace is not None and lora_slot_ids is not None:
-            # Expand slot IDs: [M] -> [M, top_k] to match topk_ids shape
-            expanded_slots = lora_slot_ids.unsqueeze(1).expand(-1, self.top_k)
 
-            # Sentinel-based mapping: slot 0 -> sentinel (filtered), slot N -> (N-1)*E + expert
-            max_super_experts = lora_workspace.up_a.shape[0]
-            sentinel = max_super_experts  # Any value >= max_super_experts will be filtered
-            combined_topk_ids = torch.where(
-                expanded_slots > 0,
-                topk_ids + (expanded_slots - 1) * self.num_experts,
-                sentinel,
-            ).to(torch.int32)
+        if use_single_lora:
+            # Single-LoRA path: reuse MoE routing, offset by lora_id
+            apply_moe_lora_single(
+                x=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=up_out,
+                lora_a=lora_workspace.up_a,
+                lora_b=lora_workspace.up_b,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                lora_id=lora_workspace.single_lora_id,
+                top_k=self.top_k,
+                num_experts=self.num_experts,
+                config=triton_config,
+                mul_routed_weight=False,
+            )
+        elif use_batched_lora:
+            # Batched path: per-LoRA routing for mixed decode batches
+            # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
+            token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
 
-            sorted_lora, expert_ids_lora, num_tokens_lora = moe_align_block_size(
-                combined_topk_ids, block_size_m, max_super_experts
+            # max_loras = workspace size / num_experts (slot 0 excluded from workspace)
+            max_loras = lora_workspace.up_a.shape[0] // self.num_experts
+
+            sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+                topk_ids.to(torch.int32),
+                token_lora_mapping,
+                block_size_m,
+                self.num_experts,
+                max_loras,
             )
 
-            apply_moe_lora(
+            apply_moe_lora_batched(
                 x=hidden_states,
-                topk_ids=combined_topk_ids,
                 topk_weights=topk_weights,
                 output=up_out,
                 lora_a=lora_workspace.up_a,
@@ -403,6 +427,7 @@ class FusedMoEModule(nn.Module):
                 expert_ids=expert_ids_lora,
                 num_tokens_post_padded=num_tokens_lora,
                 top_k=self.top_k,
+                num_experts=self.num_experts,
                 config=triton_config,
                 mul_routed_weight=False,
             )
@@ -440,12 +465,29 @@ class FusedMoEModule(nn.Module):
             compute_type=compute_type,
         )
 
-        if lora_workspace is not None and lora_slot_ids is not None:
-            # For down projection, input is already per-expert [M * top_k, dim]
-            # Reuse the same super-expert routing computed for up projection
-            apply_moe_lora(
+        if use_single_lora:
+            # Single-LoRA path for down projection
+            apply_moe_lora_single(
                 x=down_in,
-                topk_ids=combined_topk_ids,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=down_out,
+                lora_a=lora_workspace.down_a,
+                lora_b=lora_workspace.down_b,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                lora_id=lora_workspace.single_lora_id,
+                top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
+                num_experts=self.num_experts,
+                config=triton_config,
+                mul_routed_weight=True,
+            )
+        elif use_batched_lora:
+            # Batched path for down projection
+            # Reuse the same per-LoRA routing computed for up projection
+            apply_moe_lora_batched(
+                x=down_in,
                 topk_weights=topk_weights,
                 output=down_out,
                 lora_a=lora_workspace.down_a,
@@ -454,6 +496,7 @@ class FusedMoEModule(nn.Module):
                 expert_ids=expert_ids_lora,
                 num_tokens_post_padded=num_tokens_lora,
                 top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
+                num_experts=self.num_experts,
                 config=triton_config,
                 mul_routed_weight=True,
             )

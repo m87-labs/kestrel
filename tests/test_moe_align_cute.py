@@ -309,7 +309,6 @@ def test_moe_lora_align_block_size_single_lora(device):
         max_loras=max_loras,
     )
     expert_map_empty = torch.empty((0,), device=device, dtype=torch.int32)
-    lora_ids = torch.tensor([0], device=device, dtype=torch.int32)
 
     moe_lora_align_block_size_cute(
         topk_ids,
@@ -319,7 +318,6 @@ def test_moe_lora_align_block_size_single_lora(device):
         sorted_cute,
         expert_cute,
         post_cute,
-        lora_ids=lora_ids,
         expert_map=expert_map_empty,
     )
 
@@ -369,7 +367,6 @@ def test_moe_lora_align_block_size_multi_lora(device):
         max_loras=max_loras,
     )
     expert_map_empty = torch.empty((0,), device=device, dtype=torch.int32)
-    lora_ids = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
 
     moe_lora_align_block_size_cute(
         topk_ids,
@@ -379,7 +376,6 @@ def test_moe_lora_align_block_size_multi_lora(device):
         sorted_cute,
         expert_cute,
         post_cute,
-        lora_ids=lora_ids,
         expert_map=expert_map_empty,
     )
 

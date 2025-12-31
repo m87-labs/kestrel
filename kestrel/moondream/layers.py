@@ -11,11 +11,11 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Literal
 
-from ..fused_moe.routing import moe_align_block_size
+from ..fused_moe.routing import moe_lora_align_block_size
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
 from kestrel_kernels.topk import topk_fwd
-from ..fused_moe.lora_kernels import apply_moe_lora
+from ..fused_moe.lora_kernels import apply_moe_lora_batched
 from ..ops.layernorm_cuda import layernorm_bias
 
 # Re-export LoRA for convenience
@@ -61,24 +61,13 @@ class MLPWeights:
 
 @dataclass(frozen=True)
 class _DenseLoRARouting:
-    topk_ids: torch.Tensor
+    """Batched routing data for dense LoRA using moe_lora_align_block_size."""
     topk_weights: torch.Tensor
-    sorted_token_ids: torch.Tensor
-    expert_ids: torch.Tensor
-    num_tokens_post_padded: torch.Tensor
+    sorted_token_ids: torch.Tensor  # [max_loras, EM]
+    expert_ids: torch.Tensor  # [max_loras, num_blocks]
+    num_tokens_post_padded: torch.Tensor  # [max_loras]
+    lora_ids: torch.Tensor  # [max_loras]
     config: dict[str, int]
-
-
-def _get_dense_lora_expert_map(num_experts: int, device: torch.device) -> torch.Tensor:
-    cache = getattr(_get_dense_lora_expert_map, "_cache", {})
-    key = (device.type, device.index, num_experts)
-    expert_map = cache.get(key)
-    if expert_map is None:
-        expert_map = torch.arange(num_experts, dtype=torch.int32, device=device)
-        expert_map[0] = -1  # slot 0 -> ignored
-        cache[key] = expert_map
-        setattr(_get_dense_lora_expert_map, "_cache", cache)
-    return expert_map
 
 
 def _get_dummy_topk_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -104,31 +93,46 @@ def _prepare_dense_lora_routing(
     device: torch.device,
     dtype: torch.dtype,
 ) -> _DenseLoRARouting:
-    # Shape as [num_tokens, 1] for top_k=1 routing.
-    topk_ids = lora_slot_ids.view(-1, 1).to(torch.int32).contiguous()
+    """Prepare batched routing for dense LoRA.
 
-    # Route tokens by slot ID (treating slots as experts).
+    Uses moe_lora_align_block_size with num_experts=1 (each slot treated as
+    one expert). Slot 0 (no LoRA) is filtered via token_lora_mapping = -1.
+    """
+    # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
+    token_lora_mapping = torch.where(
+        lora_slot_ids > 0,
+        lora_slot_ids - 1,
+        torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+    ).to(torch.int32)
+
+    # For dense LoRA, treat each slot as a separate "LoRA" with num_experts=1
+    # max_loras = max_slots - 1 (slot 0 excluded from workspace)
+    max_loras = max_slots - 1
     block_size_m = 16
-    # Filter out slot 0 tokens at routing time (no LoRA) to avoid wasted compute.
-    # This mirrors the sentinel filtering used for MoE LoRA (see fused_moe.module).
-    #
-    # We use the expert_map "ignore invalid experts" mode so we don't need to
-    # materialize a per-token sentinel topk_ids tensor.
-    expert_map = _get_dense_lora_expert_map(max_slots, device)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    num_experts = 1  # Dense LoRA: each slot is one "expert"
+
+    # Shape topk_ids as [num_tokens, 1] with all zeros (single expert per "LoRA")
+    num_tokens = lora_slot_ids.shape[0]
+    topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
+
+    # lora_ids maps grid index to lora_id (dense: grid idx = lora_id)
+    lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_lora_align_block_size(
         topk_ids,
+        token_lora_mapping,
         block_size_m,
-        max_slots,
-        expert_map=expert_map,
-        ignore_invalid_experts=True,
+        num_experts,
+        max_loras,
+        lora_ids=lora_ids,
     )
 
     return _DenseLoRARouting(
-        topk_ids=topk_ids,
         topk_weights=_get_dummy_topk_weights(device, dtype),
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
+        lora_ids=lora_ids,
         config={"BLOCK_SIZE_M": block_size_m},
     )
 
@@ -140,23 +144,34 @@ def _apply_dense_lora_with_routing(
     lora_b: torch.Tensor,
     routing: _DenseLoRARouting,
 ) -> None:
+    """Apply dense LoRA using batched kernel.
+
+    Workspace layout: lora_a/lora_b have shape [max_slots, rank, hidden].
+    We slice off slot 0 to get [max_loras, rank, hidden] where max_loras = max_slots - 1.
+    """
     num_tokens = x.shape[0]
 
-    # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora.
+    # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora_batched.
     out_dim = output.shape[-1]
     output_3d = output.view(num_tokens, 1, out_dim)
 
-    apply_moe_lora(
+    # Slice off slot 0 from workspace (slot 0 = no LoRA, always zeros)
+    # This aligns with the lora_id mapping: slot N -> lora_id N-1
+    lora_a_active = lora_a[1:]  # [max_loras, rank, hidden]
+    lora_b_active = lora_b[1:]  # [max_loras, out_dim, rank]
+
+    apply_moe_lora_batched(
         x=x,
-        topk_ids=routing.topk_ids,
         topk_weights=routing.topk_weights,
         output=output_3d,
-        lora_a=lora_a,
-        lora_b=lora_b,
+        lora_a=lora_a_active,
+        lora_b=lora_b_active,
         sorted_token_ids=routing.sorted_token_ids,
         expert_ids=routing.expert_ids,
         num_tokens_post_padded=routing.num_tokens_post_padded,
+        lora_ids=routing.lora_ids,
         top_k=1,
+        num_experts=1,  # Dense LoRA: each slot is one "expert"
         config=routing.config,
         mul_routed_weight=False,
     )
@@ -169,14 +184,13 @@ def apply_dense_lora(
     lora_b: torch.Tensor,
     lora_slot_ids: torch.Tensor,
 ) -> None:
-    """Apply mixed-slot dense LoRA by treating slots as MoE experts.
+    """Apply mixed-slot dense LoRA using the batched kernel.
 
-    This reuses the fused MoE LoRA kernel by treating adapter slots as "experts"
-    with top_k=1. Each token selects exactly one slot (its sequence's adapter),
-    and the kernel computes: output += x @ A.T @ B.T for that slot's weights.
+    Uses moe_lora_align_block_size to route tokens to their LoRA adapters,
+    then applies the batched kernel with num_experts=1.
 
-    Slot 0 is always zeros in the workspace, so tokens with lora_slot_ids=0
-    contribute zero delta (no LoRA applied).
+    Slot 0 tokens are filtered out at routing time (no LoRA applied).
+    Slot N (N >= 1) maps to lora_id N-1 in the workspace.
 
     Args:
         x: Input activations, shape [num_tokens, hidden_dim].

@@ -96,13 +96,13 @@ def moe_lora_align_block_size(
     num_experts: int,
     max_loras: int,
     *,
-    lora_ids: torch.Tensor,
     expert_map: torch.Tensor | None = None,
     pad_sorted_ids: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Align token distribution across experts for each LoRA id.
 
     token_lora_mapping uses -1 for no-LoRA and [0, max_loras) for active LoRAs.
+    Uses dense identity mapping (lora_id == grid block index).
     """
     if not isinstance(topk_ids, torch.Tensor):
         raise TypeError("topk_ids must be a torch.Tensor")
@@ -171,7 +171,6 @@ def moe_lora_align_block_size(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
-        lora_ids=lora_ids,
         expert_map=expert_map,
     )
 
