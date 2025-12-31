@@ -66,8 +66,7 @@ class _DenseLoRARouting:
     sorted_token_ids: torch.Tensor  # [max_loras, EM]
     expert_ids: torch.Tensor  # [max_loras, num_blocks]
     num_tokens_post_padded: torch.Tensor  # [max_loras]
-    lora_ids: torch.Tensor  # [max_loras]
-    config: dict[str, int]
+    block_size_m: int
 
 
 def _get_dummy_topk_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -132,8 +131,7 @@ def _prepare_dense_lora_routing(
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
-        lora_ids=lora_ids,
-        config={"BLOCK_SIZE_M": block_size_m},
+        block_size_m=block_size_m,
     )
 
 
@@ -169,10 +167,9 @@ def _apply_dense_lora_with_routing(
         sorted_token_ids=routing.sorted_token_ids,
         expert_ids=routing.expert_ids,
         num_tokens_post_padded=routing.num_tokens_post_padded,
-        lora_ids=routing.lora_ids,
         top_k=1,
         num_experts=1,  # Dense LoRA: each slot is one "expert"
-        config=routing.config,
+        block_size_m=routing.block_size_m,
         mul_routed_weight=False,
     )
 

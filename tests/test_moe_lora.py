@@ -3,6 +3,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 
 def naive_moe_lora_batched(
@@ -57,10 +58,28 @@ def naive_moe_lora_batched(
     return output
 
 
+class DummyExperts(nn.Module):
+    """Minimal expert container for FusedMoEModule tests."""
+
+    def __init__(
+        self,
+        num_experts: int,
+        in_features: int,
+        out_features: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.randn(num_experts, out_features, in_features, dtype=dtype, device=device)
+            * 0.02,
+            requires_grad=False,
+        )
+
+
 @pytest.fixture
 def device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
     return torch.device("cuda")
 
 
@@ -131,7 +150,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -189,7 +208,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -253,7 +272,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -315,7 +334,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=True,
         )
 
@@ -365,7 +384,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_no,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -388,7 +407,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_with,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -447,7 +466,7 @@ class TestMoELoRA:
                 num_tokens_post_padded=num_tokens_lora,
                     top_k=top_k,
                 num_experts=num_experts,
-                config={"BLOCK_SIZE_M": block_size_m},
+                block_size_m=block_size_m,
                 mul_routed_weight=False,
             )
             outputs.append(output.clone())
@@ -515,7 +534,7 @@ class TestMoELoRA:
             num_tokens_post_padded=num_tokens_lora,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -575,7 +594,7 @@ class TestSingleLoRA:
             lora_id=lora_id,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -628,7 +647,7 @@ class TestSingleLoRA:
             lora_id=lora_id,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=True,
         )
 
@@ -649,7 +668,7 @@ class TestSingleLoRA:
             num_tokens_post_padded=num_post_batch,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=True,
         )
 
@@ -705,7 +724,7 @@ class TestSingleLoRA:
             lora_id=lora_id,
             top_k=top_k,
             num_experts=num_experts,
-            config={"BLOCK_SIZE_M": block_size_m},
+            block_size_m=block_size_m,
             mul_routed_weight=False,
         )
 
@@ -754,7 +773,7 @@ class TestSingleLoRA:
                 lora_id=lora_id,
                 top_k=top_k,
                 num_experts=num_experts,
-                config={"BLOCK_SIZE_M": block_size_m},
+                block_size_m=block_size_m,
                 mul_routed_weight=False,
             )
             outputs.append(output.clone())
@@ -886,3 +905,85 @@ class TestWorkspaceMode:
         # Out of range slot should raise
         with pytest.raises(ValueError, match="out of range"):
             workspace.set_prefill_mode(lora_slot=10)
+
+
+class TestLoRAStream:
+    """Validate batched LoRA path with a dedicated stream."""
+
+    def test_batched_stream_matches_default(self, device, dtype):
+        torch.manual_seed(0)
+
+        from kestrel.fused_moe.module import FusedMoEModule
+        from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
+
+        num_experts = 64
+        top_k = 2
+        d_model = 2048
+        d_expert = 1024
+        rank = 8
+        max_slots = 3
+        max_loras = max_slots - 1
+        num_tokens = 8
+
+        up_experts = DummyExperts(
+            num_experts=num_experts,
+            in_features=d_model,
+            out_features=d_expert * 2,
+            dtype=dtype,
+            device=device,
+        )
+        down_experts = DummyExperts(
+            num_experts=num_experts,
+            in_features=d_expert,
+            out_features=d_model,
+            dtype=dtype,
+            device=device,
+        )
+        moe = FusedMoEModule(
+            up_experts=up_experts,
+            down_experts=down_experts,
+            top_k=top_k,
+            hidden_size=d_expert,
+            input_size=d_model,
+            num_experts=num_experts,
+        )
+
+        hidden_states = torch.randn(num_tokens, d_model, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, dtype=dtype, device=device), dim=-1
+        )
+
+        num_super_experts = max_loras * num_experts
+        lora_workspace = MoELoRALayerWorkspace(
+            up_a=torch.randn(num_super_experts, rank, d_model, dtype=dtype, device=device) * 0.1,
+            up_b=torch.randn(num_super_experts, d_expert * 2, rank, dtype=dtype, device=device) * 0.1,
+            down_a=torch.randn(num_super_experts, rank, d_expert, dtype=dtype, device=device) * 0.1,
+            down_b=torch.randn(num_super_experts, d_model, rank, dtype=dtype, device=device) * 0.1,
+            num_experts=num_experts,
+        )
+
+        lora_slot_ids = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0], dtype=torch.int32, device=device)
+
+        lora_workspace.single_lora_id = None
+        lora_workspace.stream = None
+        out_default = moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            lora_workspace=lora_workspace,
+            lora_slot_ids=lora_slot_ids,
+        )
+        torch.cuda.synchronize()
+
+        lora_workspace.stream = torch.cuda.Stream(device=device)
+        out_stream = moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            lora_workspace=lora_workspace,
+            lora_slot_ids=lora_slot_ids,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(out_stream, out_default, rtol=2e-2, atol=2e-2)

@@ -81,6 +81,7 @@ class MoELoRALayerWorkspace:
     down_b: torch.Tensor
     num_experts: int
     single_lora_id: int | None = None
+    stream: torch.cuda.Stream | None = None
 
 
 class TextLoRAWorkspace:
@@ -105,6 +106,7 @@ class TextLoRAWorkspace:
         max_rank: int,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        lora_stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Allocate workspace tensors.
 
@@ -119,6 +121,7 @@ class TextLoRAWorkspace:
         self.max_rank = max_rank
         self.device = device
         self.dtype = dtype
+        self.lora_stream = lora_stream
 
         moe_cfg = text_config.moe
         self.start_layer = moe_cfg.start_layer if moe_cfg else text_config.n_layers
@@ -175,6 +178,7 @@ class TextLoRAWorkspace:
                         device=device, dtype=dtype
                     ),
                     num_experts=num_experts,
+                    stream=lora_stream,
                 )
                 self.moe.append(workspace)
 

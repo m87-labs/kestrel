@@ -334,8 +334,13 @@ def apply_moe_lora_batched(
     num_tokens_post_padded: torch.Tensor,  # [max_loras]
     top_k: int,
     num_experts: int,
-    config: dict[str, int],
+    block_size_m: int,
+    *,
     mul_routed_weight: bool = False,
+    block_size_out: int = 64,
+    block_size_hidden: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 2,
 ) -> None:
     """Apply batched MoE LoRA using per-LoRA routing from moe_lora_align_block_size.
 
@@ -348,12 +353,6 @@ def apply_moe_lora_batched(
     hidden_dim = lora_a.shape[2]
     out_dim = lora_b.shape[1]
     num_valid_tokens = M * topk_weights.shape[1]
-
-    block_size_m = config["BLOCK_SIZE_M"]
-    block_size_out = config.get("BLOCK_SIZE_N", 64)
-    block_size_hidden = config.get("BLOCK_SIZE_K", 64)
-    num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
-    num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
 
     # Use EM (sorted_token_ids dim 1) as max_tokens_padded - already computed by routing
     max_tokens_padded = EM
@@ -468,8 +467,13 @@ def apply_moe_lora_single(
     lora_id: int,  # Which LoRA adapter to use
     top_k: int,
     num_experts: int,
-    config: dict[str, int],
+    block_size_m: int,
+    *,
     mul_routed_weight: bool = False,
+    block_size_out: int = 64,
+    block_size_hidden: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 2,
 ) -> None:
     """Apply single-LoRA MoE using baseline routing.
 
@@ -492,7 +496,7 @@ def apply_moe_lora_single(
         lora_id: Which LoRA adapter (0-indexed)
         top_k: Number of experts per token
         num_experts: Number of experts
-        config: Triton kernel config
+        block_size_m: Routing block size (must match moe_align_block_size).
         mul_routed_weight: Whether to multiply by router weights
     """
     M = topk_ids.shape[0]
@@ -501,12 +505,6 @@ def apply_moe_lora_single(
     out_dim = lora_b.shape[1]
     EM = sorted_token_ids.shape[0]
     num_valid_tokens = M * topk_ids.shape[1]
-
-    block_size_m = config["BLOCK_SIZE_M"]
-    block_size_out = config.get("BLOCK_SIZE_N", 64)
-    block_size_hidden = config.get("BLOCK_SIZE_K", 64)
-    num_warps = config.get("NUM_WARPS", config.get("num_warps", 4))
-    num_stages = config.get("NUM_STAGES", config.get("num_stages", 2))
 
     # Offset expert_ids by lora_id * num_experts so the kernel indexes
     # into the correct slice of weight tensors. With MAX_LORAS=1, lora_idx=0,
