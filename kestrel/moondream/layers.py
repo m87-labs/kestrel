@@ -283,7 +283,7 @@ def moe_mlp(
     lora_slot_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
-    x_flat = x.reshape(-1, C)
+    x_flat = x.view(-1, C)
 
     router = mlp_module["router"]
     fused_mlp = mlp_module["mlp"]

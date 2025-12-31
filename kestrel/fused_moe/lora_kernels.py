@@ -251,6 +251,9 @@ def _moe_lora_shrink_kernel(
     inter_ptrs = intermediate_ptr + offs_token[:, None] * stride_im + r_offs[None, :] * stride_ir
     tl.store(inter_ptrs, intermediate, mask=token_mask[:, None] & r_mask[None, :])
 
+    # Signal that this CTA's output is ready for the expand kernel (PDL).
+    tl.extra.cuda.gdc_launch_dependents()
+
 
 @triton.jit
 def _moe_lora_expand_kernel(
@@ -308,14 +311,18 @@ def _moe_lora_expand_kernel(
     r_offs = tl.arange(0, BLOCK_SIZE_RANK)
     r_mask = r_offs < rank
 
+    # Load B weights first (can overlap with shrink kernel via PDL).
+    b_ptrs = lora_b_ptr + expert_id * stride_be + offs_n[None, :] * stride_bn + r_offs[:, None] * stride_br
+    b_block = tl.load(b_ptrs, mask=r_mask[:, None] & n_mask[None, :], other=0.0)
+
+    # Wait for shrink kernel to finish writing intermediate (PDL).
+    tl.extra.cuda.gdc_wait()
+
     # Load intermediate and cast to enable tensor core usage.
     inter_ptrs = intermediate_ptr + offs_token[:, None] * stride_im + r_offs[None, :] * stride_ir
     inter_block = tl.load(
         inter_ptrs, mask=token_mask[:, None] & r_mask[None, :], other=0.0
     ).to(output_ptr.dtype.element_ty)
-
-    b_ptrs = lora_b_ptr + expert_id * stride_be + offs_n[None, :] * stride_bn + r_offs[:, None] * stride_br
-    b_block = tl.load(b_ptrs, mask=r_mask[:, None] & n_mask[None, :], other=0.0)
 
     output_acc = tl.dot(inter_block, b_block)
 
@@ -432,7 +439,13 @@ def apply_moe_lora(
         dtype=torch.float32,
     )
 
+    # Compute both grids upfront so launches are back-to-back (required for PDL).
     shrink_grid = (triton.cdiv(EM, block_size_m),)
+    expand_grid = (
+        triton.cdiv(EM, block_size_m),
+        triton.cdiv(out_dim, block_size_out),
+    )
+
     _moe_lora_shrink_kernel[shrink_grid](
         x,
         lora_a,
@@ -457,11 +470,7 @@ def apply_moe_lora(
         BLOCK_SIZE_HIDDEN=block_size_hidden,
         num_warps=num_warps,
         num_stages=num_stages,
-    )
-
-    expand_grid = (
-        triton.cdiv(EM, block_size_m),
-        triton.cdiv(out_dim, block_size_out),
+        launch_pdl=True,
     )
     _moe_lora_expand_kernel[expand_grid](
         intermediate,
@@ -488,4 +497,5 @@ def apply_moe_lora(
         BLOCK_SIZE_OUT=block_size_out,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=True,
     )

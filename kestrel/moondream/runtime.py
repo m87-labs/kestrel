@@ -709,8 +709,13 @@ class MoondreamRuntime:
             batch_idx=batch_idx, positions=position_ids
         )
 
-        # Build single-element slot IDs tensor for prefill (batch_size=1)
-        lora_slot_ids = torch.tensor([lora_slot], dtype=torch.int32, device=self.device)
+        # For no-adapter prefill, skip LoRA entirely to avoid redundant work
+        if lora_slot == 0:
+            lora_workspace = None
+            lora_slot_ids = None
+        else:
+            lora_workspace = self._lora_workspace
+            lora_slot_ids = torch.tensor([lora_slot], dtype=torch.int32, device=self.device)
 
         hidden = text_decoder(
             inputs_embeds,
@@ -721,7 +726,7 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
-            lora_workspace=self._lora_workspace,
+            lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
         )
         logits = lm_head(hidden, self.model.text)

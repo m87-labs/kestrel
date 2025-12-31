@@ -3,7 +3,7 @@ requires = [
   "scikit-build-core>=0.10",
   "cmake>=3.26",
   "ninja",
-  "torch==2.8.0",
+  "torch==2.9.1",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
@@ -16,7 +16,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "nvidia-cutlass-dsl==4.3.3",
-  "torch==2.8.0",
+  "torch==2.9.1",
 ]
 
 [tool.scikit-build]
