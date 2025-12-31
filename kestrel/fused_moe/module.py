@@ -1,6 +1,7 @@
 
 from dataclasses import dataclass
 from math import prod
+from typing import Literal
 
 import torch
 from torch import nn
@@ -12,8 +13,6 @@ from .kernels import (
     invoke_fused_moe_kernel_fp8_w8a8 as invoke_fused_moe_kernel_triton_fp8,
 )
 from .lora_kernels import apply_moe_lora
-from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
-from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from .routing import moe_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
@@ -737,25 +736,19 @@ class FusedMoEModule(nn.Module):
         if num_tokens in self._tuned_configs:
             return self._tuned_configs[num_tokens]
 
-        hardcoded = _HARDCODED_CONFIGS.get(
-            (
-                self.down_experts.weight.shape[0],
-                self.down_experts.weight.shape[2],
-            )
+        key = (
+            self.down_experts.weight.shape[0],
+            self.down_experts.weight.shape[2],
         )
-        if hardcoded:
-            nearest = min(hardcoded.keys(), key=lambda m: abs(m - num_tokens))
-            raw = hardcoded[nearest]
-        else:
-            config_name = FUSED_MOE_UNQUANTIZED_CONFIG.config_name(dtype)
-            raw = try_get_optimal_moe_config(
-                self.up_experts.weight.shape,
-                self.down_experts.weight.shape,
-                self.top_k,
-                config_name,
-                num_tokens,
+        hardcoded = _HARDCODED_CONFIGS.get(key)
+        if not hardcoded:
+            raise ValueError(
+                f"No hardcoded MoE config for expert shape {key}. "
+                "Add an entry to _HARDCODED_CONFIGS."
             )
-        tuned = {k.upper(): int(v) for k, v in raw.items()} if raw is not None else None
+        nearest = min(hardcoded.keys(), key=lambda m: abs(m - num_tokens))
+        raw = hardcoded[nearest]
+        tuned = {k.upper(): int(v) for k, v in raw.items()}
 
         self._tuned_configs[num_tokens] = tuned
         return tuned
