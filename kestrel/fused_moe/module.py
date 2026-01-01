@@ -1,5 +1,5 @@
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import prod
 from typing import Literal
 
@@ -222,6 +222,38 @@ class FusedMoEConfig:
     num_stages: int = 2
     allow_tf32: bool = True
     backend: str = "auto"  # "auto" | "cute" | "triton"
+    lora_decode_shrink: dict[str, int] | None = field(
+        default_factory=lambda: {
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 128,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 3,
+        }
+    )
+    lora_decode_expand: dict[str, int] | None = field(
+        default_factory=lambda: {
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 16,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 2,
+        }
+    )
+    lora_prefill_shrink: dict[str, int] | None = field(
+        default_factory=lambda: {
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 64,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 3,
+        }
+    )
+    lora_prefill_expand: dict[str, int] | None = field(
+        default_factory=lambda: {
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 16,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 3,
+        }
+    )
 
     def as_triton(self, *, block_size_m: int | None = None) -> dict[str, int]:
         config = {
@@ -293,6 +325,8 @@ class FusedMoEModule(nn.Module):
         expert_ids_lora: torch.Tensor,
         num_tokens_lora: torch.Tensor,
         block_size_m: int,
+        shrink_config: dict[str, int] | None,
+        expand_config: dict[str, int] | None,
     ) -> None:
         apply_moe_lora_batched(
             x=x,
@@ -307,6 +341,8 @@ class FusedMoEModule(nn.Module):
             num_experts=self.num_experts,
             block_size_m=block_size_m,
             mul_routed_weight=False,
+            shrink_config=shrink_config,
+            expand_config=expand_config,
         )
 
     def _run_lora_down(
@@ -320,6 +356,8 @@ class FusedMoEModule(nn.Module):
         expert_ids_lora: torch.Tensor,
         num_tokens_lora: torch.Tensor,
         block_size_m: int,
+        shrink_config: dict[str, int] | None,
+        expand_config: dict[str, int] | None,
     ) -> None:
         apply_moe_lora_batched(
             x=x,
@@ -334,6 +372,8 @@ class FusedMoEModule(nn.Module):
             num_experts=self.num_experts,
             block_size_m=block_size_m,
             mul_routed_weight=True,
+            shrink_config=shrink_config,
+            expand_config=expand_config,
         )
 
     def __call__(
@@ -444,6 +484,18 @@ class FusedMoEModule(nn.Module):
         compute_stream = torch.cuda.current_stream()
         use_lora_stream = lora_stream is not None and lora_stream != compute_stream
 
+        is_prefill = use_single_lora
+        lora_shrink_cfg = (
+            self.config.lora_prefill_shrink
+            if is_prefill
+            else self.config.lora_decode_shrink
+        )
+        lora_expand_cfg = (
+            self.config.lora_prefill_expand
+            if is_prefill
+            else self.config.lora_decode_expand
+        )
+
         # For batched mode, prepare per-LoRA routing once (reused for up and down)
         sorted_lora = None
         expert_ids_lora = None
@@ -481,6 +533,8 @@ class FusedMoEModule(nn.Module):
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
                     block_size_m=block_size_m,
+                    shrink_config=lora_shrink_cfg,
+                    expand_config=lora_expand_cfg,
                 )
                 if use_lora_stream:
                     self._lora_up_event.record(target_stream)
@@ -523,6 +577,8 @@ class FusedMoEModule(nn.Module):
                 num_experts=self.num_experts,
                 block_size_m=block_size_m,
                 mul_routed_weight=False,
+                shrink_config=lora_shrink_cfg,
+                expand_config=lora_expand_cfg,
             )
 
         activation_in = up_out.view(num_tokens * self.top_k, -1)
@@ -561,6 +617,8 @@ class FusedMoEModule(nn.Module):
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
                     block_size_m=block_size_m,
+                    shrink_config=lora_shrink_cfg,
+                    expand_config=lora_expand_cfg,
                 )
                 if use_lora_stream:
                     self._lora_down_event.record(target_stream)
@@ -608,6 +666,8 @@ class FusedMoEModule(nn.Module):
                 num_experts=self.num_experts,
                 block_size_m=block_size_m,
                 mul_routed_weight=True,
+                shrink_config=lora_shrink_cfg,
+                expand_config=lora_expand_cfg,
             )
 
         fused = self._workspaces.output.get(
