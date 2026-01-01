@@ -322,6 +322,30 @@ _BATCHED_LORA_OUTPUT_BUFFER = _ResizableBuffer()
 _SINGLE_INTERMEDIATE_BUFFER = _ResizableBuffer()
 
 
+def _get_lora_kernel_params(
+    config: dict[str, int] | None,
+    *,
+    block_size_out: int,
+    block_size_hidden: int,
+    num_warps: int,
+    num_stages: int,
+) -> tuple[int, int, int, int]:
+    if not config:
+        return block_size_out, block_size_hidden, num_warps, num_stages
+
+    def pick(keys: tuple[str, ...], default: int) -> int:
+        for key in keys:
+            if key in config:
+                return int(config[key])
+        return default
+
+    block_size_out = pick(("BLOCK_SIZE_N", "block_size_n"), block_size_out)
+    block_size_hidden = pick(("BLOCK_SIZE_K", "block_size_k"), block_size_hidden)
+    num_warps = pick(("NUM_WARPS", "num_warps"), num_warps)
+    num_stages = pick(("NUM_STAGES", "num_stages"), num_stages)
+    return block_size_out, block_size_hidden, num_warps, num_stages
+
+
 @torch.inference_mode()
 def apply_moe_lora_batched(
     x: torch.Tensor,  # [M, hidden_dim] or [M * top_k, hidden_dim]
@@ -337,6 +361,8 @@ def apply_moe_lora_batched(
     block_size_m: int,
     *,
     mul_routed_weight: bool = False,
+    shrink_config: dict[str, int] | None = None,
+    expand_config: dict[str, int] | None = None,
     block_size_out: int = 64,
     block_size_hidden: int = 64,
     num_warps: int = 4,
@@ -345,6 +371,8 @@ def apply_moe_lora_batched(
     """Apply batched MoE LoRA using per-LoRA routing from moe_lora_align_block_size.
 
     Uses a 2D grid and loops over LoRA adapters inside each CTA (lora_idx == lora_id).
+    Optional shrink_config/expand_config override BLOCK_SIZE_N/K and NUM_WARPS/STAGES
+    separately for the two phases.
     """
     M = topk_weights.shape[0]
     max_loras = sorted_token_ids.shape[0]
@@ -360,7 +388,26 @@ def apply_moe_lora_batched(
         return  # No active LoRAs
 
     num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
-    num_n_blocks = triton.cdiv(out_dim, block_size_out)
+    shrink_block_size_out, shrink_block_size_hidden, shrink_num_warps, shrink_num_stages = (
+        _get_lora_kernel_params(
+            shrink_config,
+            block_size_out=block_size_out,
+            block_size_hidden=block_size_hidden,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    )
+    expand_block_size_out, expand_block_size_hidden, expand_num_warps, expand_num_stages = (
+        _get_lora_kernel_params(
+            expand_config,
+            block_size_out=block_size_out,
+            block_size_hidden=block_size_hidden,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    )
+
+    num_n_blocks = triton.cdiv(out_dim, expand_block_size_out)
 
     # Reshape output for kernel access: [M, top_k, out_dim] -> [M * top_k, out_dim]
     output_flat = output.view(num_valid_tokens, out_dim)
@@ -373,7 +420,7 @@ def apply_moe_lora_batched(
     )
 
     # Use 2D grid (M, N) and loop over LoRAs inside the kernel.
-    num_rank_blocks = triton.cdiv(rank, block_size_out)
+    num_rank_blocks = triton.cdiv(rank, shrink_block_size_out)
     shrink_grid = (num_m_blocks, num_rank_blocks)
 
     # Shrink: x @ lora_a.T -> intermediate
@@ -404,12 +451,12 @@ def apply_moe_lora_batched(
         top_k=top_k,
         MUL_ROUTED_WEIGHT=False,  # Never multiply in shrink
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_out,  # For rank dimension
-        BLOCK_SIZE_K=block_size_hidden,
+        BLOCK_SIZE_N=shrink_block_size_out,  # For rank dimension
+        BLOCK_SIZE_K=shrink_block_size_hidden,
         IS_PRIMARY=True,
         MAX_LORAS=max_loras,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=shrink_num_warps,
+        num_stages=shrink_num_stages,
         launch_pdl=True,
     )
 
@@ -443,12 +490,12 @@ def apply_moe_lora_batched(
         top_k=1,  # Intermediate is already per-token*topk
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_out,
-        BLOCK_SIZE_K=block_size_hidden,  # For rank - may need tuning
+        BLOCK_SIZE_N=expand_block_size_out,
+        BLOCK_SIZE_K=expand_block_size_hidden,  # For rank - may need tuning
         IS_PRIMARY=False,
         MAX_LORAS=max_loras,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=expand_num_warps,
+        num_stages=expand_num_stages,
         launch_pdl=True,
     )
 
@@ -470,6 +517,8 @@ def apply_moe_lora_single(
     block_size_m: int,
     *,
     mul_routed_weight: bool = False,
+    shrink_config: dict[str, int] | None = None,
+    expand_config: dict[str, int] | None = None,
     block_size_out: int = 64,
     block_size_hidden: int = 64,
     num_warps: int = 4,
@@ -497,6 +546,8 @@ def apply_moe_lora_single(
         top_k: Number of experts per token
         num_experts: Number of experts
         block_size_m: Routing block size (must match moe_align_block_size).
+        shrink_config/expand_config: Optional per-phase overrides for BLOCK_SIZE_N/K
+            and NUM_WARPS/STAGES.
         mul_routed_weight: Whether to multiply by router weights
     """
     M = topk_ids.shape[0]
@@ -519,9 +570,28 @@ def apply_moe_lora_single(
     # Reshape output for kernel access: [M, top_k, out_dim] -> [M * top_k, out_dim]
     output_flat = output.view(num_valid_tokens, out_dim)
 
+    shrink_block_size_out, shrink_block_size_hidden, shrink_num_warps, shrink_num_stages = (
+        _get_lora_kernel_params(
+            shrink_config,
+            block_size_out=block_size_out,
+            block_size_hidden=block_size_hidden,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    )
+    expand_block_size_out, expand_block_size_hidden, expand_num_warps, expand_num_stages = (
+        _get_lora_kernel_params(
+            expand_config,
+            block_size_out=block_size_out,
+            block_size_hidden=block_size_hidden,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    )
+
     max_tokens_padded = EM
     num_m_blocks = triton.cdiv(max_tokens_padded, block_size_m)
-    num_n_blocks = triton.cdiv(out_dim, block_size_out)
+    num_n_blocks = triton.cdiv(out_dim, expand_block_size_out)
 
     # Split shrink+expand with PDL for larger token counts
     intermediate = _SINGLE_INTERMEDIATE_BUFFER.get(
@@ -530,7 +600,7 @@ def apply_moe_lora_single(
         dtype=output.dtype,
     )
 
-    num_rank_blocks = triton.cdiv(rank, block_size_out)
+    num_rank_blocks = triton.cdiv(rank, shrink_block_size_out)
     shrink_grid = (num_m_blocks, num_rank_blocks)
     expand_grid = (num_m_blocks, num_n_blocks)
 
@@ -561,12 +631,12 @@ def apply_moe_lora_single(
         top_k=top_k,
         MUL_ROUTED_WEIGHT=False,
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_out,
-        BLOCK_SIZE_K=block_size_hidden,
+        BLOCK_SIZE_N=shrink_block_size_out,
+        BLOCK_SIZE_K=shrink_block_size_hidden,
         IS_PRIMARY=True,
         MAX_LORAS=1,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=shrink_num_warps,
+        num_stages=shrink_num_stages,
         launch_pdl=True,
     )
 
@@ -597,11 +667,11 @@ def apply_moe_lora_single(
         top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_out,
-        BLOCK_SIZE_K=block_size_hidden,
+        BLOCK_SIZE_N=expand_block_size_out,
+        BLOCK_SIZE_K=expand_block_size_hidden,
         IS_PRIMARY=False,
         MAX_LORAS=1,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=expand_num_warps,
+        num_stages=expand_num_stages,
         launch_pdl=True,
     )
