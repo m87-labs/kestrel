@@ -16,7 +16,6 @@ import pyvips
 import torch
 from torch import Tensor
 
-from kestrel.utils import CpuGpuBuffer
 
 from tokenizers import Tokenizer
 
@@ -434,12 +433,8 @@ class MoondreamRuntime:
         self._batch_binding: _BatchBinding = _BatchBinding()
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
-        self._prefill_batch_idx = CpuGpuBuffer(
-            1,
-            dtype=torch.int64,
-            device=self.device,
-            pin_memory=True,
-            with_numpy=False,
+        self._prefill_batch_idx = torch.empty(
+            (1,), dtype=torch.int64, device=self.device
         )
 
         for cache in self.layer_caches:
@@ -948,8 +943,9 @@ class MoondreamRuntime:
 
         # 5. Allocate batch slot
         batch_idx = self.page_table.allocate()
-        self._prefill_batch_idx.cpu[0] = batch_idx
-        batch_tensor = self._prefill_batch_idx.copy_to_gpu()
+        # GPU-only buffer avoids async H2D races on shared pinned host memory.
+        batch_tensor = self._prefill_batch_idx
+        batch_tensor.fill_(batch_idx)
 
         # 6. Cache lookup (maps pages, acquires temp lock)
         cache_result = self._lookup_prefix_cache(
