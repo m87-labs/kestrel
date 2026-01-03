@@ -68,6 +68,7 @@ class EvalConfig:
     cot_samples: int
     temperature: float
     debug: bool
+    enable_prefix_cache: bool
 
 
 def pil_to_pyvips(image: Any) -> pyvips.Image:
@@ -230,6 +231,7 @@ async def create_engine(cfg: EvalConfig) -> InferenceEngine:
         device="cuda",
         dtype=torch.bfloat16,
         max_batch_size=cfg.max_batch_size,
+        enable_prefix_cache=cfg.enable_prefix_cache,
     )
     return await InferenceEngine.create(runtime_cfg)
 
@@ -342,16 +344,20 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     total_decode_ms = 0.0
     request_count = 0
     request_times_ms: List[float] = []  # prefill + decode per request
+    cache_hit_count = 0  # requests with cached_tokens > 0
 
     def record_metrics(metrics: EngineMetrics) -> None:
         nonlocal total_input_tokens, total_output_tokens
         nonlocal total_prefill_ms, total_decode_ms, request_count
+        nonlocal cache_hit_count
         total_input_tokens += metrics.input_tokens
         total_output_tokens += metrics.output_tokens
         total_prefill_ms += metrics.prefill_time_ms
         total_decode_ms += metrics.decode_time_ms
         request_count += 1
         request_times_ms.append(metrics.prefill_time_ms + metrics.decode_time_ms)
+        if metrics.cached_tokens > 0:
+            cache_hit_count += 1
 
     async def evaluate_single(
         row_idx: int,
@@ -537,8 +543,10 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "total_prefill_ms": total_prefill_ms,
             "total_decode_ms": total_decode_ms,
             "request_times_ms": request_times_ms,
+            "cache_hit_count": cache_hit_count,
         },
         "wall_time_s": wall_time_s,
+        "prefix_cache_enabled": cfg.enable_prefix_cache,
     }
 
 
@@ -593,6 +601,11 @@ def parse_args() -> EvalConfig:
         action="store_true",
         help="Print per-question debugging output.",
     )
+    parser.add_argument(
+        "--disable-prefix-caching",
+        action="store_true",
+        help="Disable prefix caching (enabled by default).",
+    )
     args = parser.parse_args()
 
     if args.pot and args.cot:
@@ -609,6 +622,7 @@ def parse_args() -> EvalConfig:
         cot_samples=int(args.cot),
         temperature=float(args.temperature),
         debug=bool(args.debug),
+        enable_prefix_cache=not args.disable_prefix_caching,
     )
     return cfg
 
@@ -638,10 +652,6 @@ def print_results(results: Dict[str, Any]) -> None:
     usage = results.get("token_usage")
     request_count = usage.get("request_count", 0) if usage else 0
 
-    if wall_time_s > 0.0 and request_count > 0:
-        requests_per_second = request_count / wall_time_s
-        print(f"\nRequests per second: {requests_per_second:.2f}")
-
     if usage:
         total_input_tokens = usage.get("total_input_tokens", 0)
         total_output_tokens = usage.get("total_output_tokens", 0)
@@ -666,17 +676,17 @@ def print_results(results: Dict[str, Any]) -> None:
 
         print(f"\nAvg Input Tokens / Request: {avg_input_tokens:.2f}")
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
-        print(
-            f"Effective Prefill Throughput (per request): {effective_prefill:.2f} tok/s"
-        )
-        print(
-            f"Effective Decode Throughput (per request): {effective_decode:.2f} tok/s"
-        )
-        if wall_time_s > 0.0:
-            wall_decode = total_output_tokens / wall_time_s
-            print(
-                f"Overall Decode Throughput (wall clock): {wall_decode:.2f} tok/s"
-            )
+        print(f"Prefill Throughput (per request): {effective_prefill:.2f} tok/s")
+        print(f"Decode Throughput (per request): {effective_decode:.2f} tok/s")
+        if wall_time_s > 0.0 and request_count > 0:
+            requests_per_second = request_count / wall_time_s
+            print(f"Requests per second: {requests_per_second:.2f}")
+
+        # Prefix cache stats (only when enabled)
+        if results.get("prefix_cache_enabled", False) and request_count > 0:
+            cache_hit_count = usage.get("cache_hit_count", 0)
+            hit_rate = cache_hit_count / request_count * 100.0
+            print(f"Prefix cache hit rate: {hit_rate:.1f}%")
 
         # Request latency stats (prefill + decode)
         if request_times_ms:

@@ -76,17 +76,21 @@ Kestrel has four token types, each mapping to KV cache positions:
 | Token Type | Fields | KV Positions | Cache Key (via `cache_key()`) |
 |------------|--------|--------------|-----------------------------|
 | `TextToken` | `token_id: int` | 1 | `(0, token_id)` |
-| `CoordToken` | `pos: float`, `bin: int` | 1 | `(1, bin)` |
-| `SizeToken` | `width: float`, `height: float`, `width_bin: int`, `height_bin: int` | 1 | `(2, width_bin, height_bin)` |
+| `CoordToken` | `pos: float` | 1 | `(1, pos)` |
+| `SizeToken` | `width: float`, `height: float` | 1 | `(2, width, height)` |
 | `ImageToken` | `content_hash: int` (128-bit), `kv_length_: int` | Variable (729 today) | `(3, content_hash, kv_length_)` |
 
-### Coord and Size Token Discretization
+### Coord and Size Token Values
 
 Coord and size values are derived from discrete sampling:
 - **Coord**: 1024 bins, uniformly spaced from 0.0 to 1.0
 - **Width/Height**: 1024 bins each, exponentially spaced from 2^-10 to 1.0
 
-The continuous float values are used for embedding, while the discrete bin indices are used for cache keys. This enables exact matching for caching purposes.
+We use the **float values directly as cache keys** (no bin indices). This keeps
+the token types simple and matches current runtime behavior. Cache hits rely on
+exact float equality, which is stable when values come from the same LUT
+(`coord_value_lut` / `size_value_lut`). For user-provided floats, consider
+snapping to the LUT if higher cache hit rates are desired.
 
 ### Sequence Structure
 
@@ -107,7 +111,7 @@ The cache token sequence mirrors this:
 
 ## Cache Key Design
 
-Instead of separate key types, we reuse the existing token types with a `cache_key()` method that extracts the hashable, discrete portion of each token.
+Instead of separate key types, we reuse the existing token types with a `cache_key()` method that extracts the hashable portion of each token.
 
 ### Token Type Modifications
 
@@ -126,10 +130,9 @@ class TextToken(NamedTuple):
 
 class CoordToken(NamedTuple):
     pos: float      # Continuous value for embedding
-    bin: int        # Discrete bin index (0-1023) for cache key
 
     def cache_key(self) -> tuple:
-        return (1, self.bin)  # Ignores pos - matching on bin only
+        return (1, self.pos)
 
     def kv_length(self) -> int:
         return 1
@@ -138,11 +141,9 @@ class CoordToken(NamedTuple):
 class SizeToken(NamedTuple):
     width: float        # Continuous value for embedding
     height: float       # Continuous value for embedding
-    width_bin: int      # Discrete bin index (0-1023)
-    height_bin: int     # Discrete bin index (0-1023)
 
     def cache_key(self) -> tuple:
-        return (2, self.width_bin, self.height_bin)  # Ignores floats
+        return (2, self.width, self.height)
 
     def kv_length(self) -> int:
         return 1
@@ -1268,6 +1269,13 @@ class PageTable:
         self.capacity[batch_idx] = 0
 ```
 
+**Note on allocation flow**: The runtime can either (a) explicitly call
+`allocate_pages()` + `map_pages()` for the suffix, or (b) call `map_pages()` for
+cached prefix pages (which updates `capacity`) and then call `reserve()` for
+`target_length`. Because `reserve()` computes the delta against `capacity`, path
+(b) allocates *only the suffix* and is functionally equivalent while reusing the
+existing eviction path in `reserve()`.
+
 **Optional defensive clearing**: The GPU-side tensors (`_page_table_cpu_tensor[batch_idx, :]` and `physical_to_logical[batch_idx, :]`) retain stale values after erase. This is safe because inactive batch indices should never be read, but clearing them can help catch bugs in tests:
 
 ```python
@@ -1442,12 +1450,14 @@ class MoondreamRuntime:
             match = MatchResult([], 0, 0, None, cache_tokens)  # Reset match
 
         # Allocate pages for suffix
+        # map_pages() above updates capacity to skip_positions, so reserve() allocates
+        # only the remaining suffix pages to reach target_length.
         target_length = self._compute_target_length(tokens, image, max_new_tokens)
-        suffix_pages_needed = target_length - skip_positions
-
-        if suffix_pages_needed > 0:
-            new_pages = self.page_table.allocate_pages(suffix_pages_needed)
-            self.page_table.map_pages(batch_idx, skip_positions, new_pages)
+        self.page_table.reserve(
+            batch_idx_int=batch_idx,
+            batch_idx=batch_tensor,
+            seq_len=target_length,
+        )
 
         # Run prefill (prompt_len computed earlier)
 
@@ -1556,29 +1566,9 @@ def _release_sequence(self, seq: ScheduledSequence) -> None:
 
 **File**: `kestrel/scheduler/spatial.py`
 
-The `compute_spatial_values` function needs to return bin indices alongside continuous values:
-
-```python
-def compute_spatial_values(...) -> SpatialOutput:
-    # ... existing sampling code ...
-
-    coord_bins = torch.argmax(coord_logits, dim=-1)
-    width_bins = torch.argmax(width_logits, dim=-1)
-    height_bins = torch.argmax(height_logits, dim=-1)
-
-    coord_values = tables.coord_value_lut[coord_bins]
-    width_values = tables.size_value_lut[width_bins]
-    height_values = tables.size_value_lut[height_bins]
-
-    return SpatialOutput(
-        coord_values=coord_values,
-        coord_bins=coord_bins,
-        width_values=width_values,
-        width_bins=width_bins,
-        height_values=height_values,
-        height_bins=height_bins,
-    )
-```
+No cache-specific changes are required. The existing `compute_spatial_values`
+already returns continuous values, which are used directly as cache keys for
+`CoordToken` and `SizeToken`.
 
 ### Engine Modifications
 
@@ -2011,7 +2001,7 @@ class BasePrefixCache(ABC):
 | `kestrel/moondream/text.py` | Add `_append_prefill_attention()` using single-pass append attention |
 | **Modified: Scheduler** | |
 | `kestrel/scheduler/scheduler.py` | Modify `_release_sequence()` to call `prefix_cache.unlock()` and `erase(cached_page_count)` |
-| `kestrel/scheduler/spatial.py` | Return bin indices from `compute_spatial_values()` |
+| `kestrel/scheduler/spatial.py` | No cache-specific changes (values-only decoding is sufficient) |
 | **Modified: Engine** | |
 | `kestrel/engine.py` | Add `image_hash` to `_PendingRequest`. Compute SHA256 hash in `_submit_request()` |
 

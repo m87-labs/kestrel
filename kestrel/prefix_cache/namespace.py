@@ -12,9 +12,11 @@ class CacheNamespace:
     Frozen to be hashable for use as dict keys. Uses slots for memory efficiency.
 
     Attributes:
-        lora_id: LoRA adapter ID, or None for base model.
+        lora_id: LoRA adapter name, or None for base model. Uses the stable
+            adapter identity (not slot index) to avoid cross-adapter cache hits
+            when slots are reused.
         image_hash: 128-bit hash of image content, or None for text-only.
     """
 
-    lora_id: int | None = None
+    lora_id: str | None = None
     image_hash: int | None = None

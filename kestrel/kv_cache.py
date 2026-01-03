@@ -222,16 +222,28 @@ class PageTable:
             seq_len - self.capacity[batch_idx_int], self.page_size
         )
 
-        can_allocate = num_pages_to_allocate <= self.pages_available
+        available = self.pages_available
+        can_allocate = num_pages_to_allocate <= available
+
         if dry_run:
             return can_allocate
 
+        # Evict from prefix cache if needed
+        if not can_allocate and self.prefix_cache is not None:
+            needed = num_pages_to_allocate - available
+            self.prefix_cache.evict(needed)
+            available = self.pages_available
+            can_allocate = num_pages_to_allocate <= available
+
         if not can_allocate:
-            raise RuntimeError(
+            msg = (
                 f"Cannot reserve {num_pages_to_allocate} pages for a sequence of length {seq_len} "
                 f"in batch {batch_idx_int}. Only {self.pages_available} pages available. "
                 f"Current capacity is {self.capacity[batch_idx_int]} tokens."
             )
+            if self.prefix_cache is not None:
+                msg += " All cached prefixes are locked by active sequences."
+            raise RuntimeError(msg)
 
         start_page_idx = self.capacity[batch_idx_int] // self.page_size
         end_page_idx = start_page_idx + num_pages_to_allocate
