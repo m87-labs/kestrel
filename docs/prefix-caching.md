@@ -297,11 +297,16 @@ class RadixPrefixCache:
     Uses all available pages - evicts on demand.
     """
 
-    def __init__(self, page_table: PageTable):
-        assert page_table.page_size == 1, "RadixPrefixCache requires page_size=1"
+    def __init__(self, free_pages_sink=None):
+        """Initialize empty prefix cache.
+
+        Args:
+            free_pages_sink: Optional callback to receive freed pages during eviction.
+                Typically set automatically by PageTable constructor.
+        """
         self._trees: dict[CacheNamespace, TreeNode] = {}
         self._default_namespace = CacheNamespace()  # lora_id=None, image_hash=None
-        self.page_table = page_table
+        self._free_pages_sink = free_pages_sink
         self._total_cached_pages = 0
 
     @property
@@ -714,7 +719,7 @@ Eviction frees pages from unlocked leaf nodes using LRU policy with a min-heap f
 import heapq
 
 class RadixPrefixCache:
-    def __init__(self, page_table: PageTable):
+    def __init__(self, free_pages_sink=None):
         # ... existing init ...
 
         # LRU eviction heap: (last_access_time, counter, node, version)
@@ -775,8 +780,9 @@ class RadixPrefixCache:
                 if victim is None:
                     break
 
-            # Free pages back to pool
-            self.page_table.free_pages_to_pool(victim.physical_pages)
+            # Free pages back to pool via sink callback
+            if self._free_pages_sink is not None:
+                self._free_pages_sink(victim.physical_pages)
             freed += len(victim.physical_pages)
             self._total_cached_pages -= len(victim.physical_pages)
 
@@ -1074,6 +1080,23 @@ This guarantees:
 
 ## Integration Points
 
+### Enable/Disable Toggle (Engine Option)
+
+Prefix caching should be controllable via an engine/runtime option, defaulting to **enabled**:
+
+```python
+# In RuntimeConfig (or engine settings)
+enable_prefix_cache: bool = True
+```
+
+**Behavior when disabled:**
+1. **No cache construction**: `MoondreamRuntime` does not create a `RadixPrefixCache`, and `PageTable` is constructed without `prefix_cache`.
+2. **Full prefill only**: `start_sequence()` always takes the full prefill path (no `match_prefix`, no append prefill, no insert/lock).
+3. **Ownership bookkeeping is zeroed**: `cache_lock_node=None`, `cache_owned_page_count=0`, `reused_page_count=0`.
+4. **Eviction is bypassed**: `PageTable.allocate_pages()` and `can_reserve_with_eviction()` fall back to free-pool checks only (because `prefix_cache` is `None`).
+
+This keeps the scheduler release path unchanged: `erase(batch_idx, cached_page_count=0)` and no cache unlock.
+
 ### PageTable Modifications
 
 **File**: `kestrel/kv_cache.py`
@@ -1105,13 +1128,13 @@ We keep `reserve()` for decode-time extension and add the new methods for prefil
 
 ```python
 class PageTable:
-    def __init__(self, ...):
+    def __init__(self, ..., prefix_cache: RadixPrefixCache | None = None):
         # ... existing init ...
-        self.prefix_cache: RadixPrefixCache | None = None
-
-    def set_prefix_cache(self, cache: RadixPrefixCache) -> None:
-        """Attach prefix cache for on-demand eviction."""
-        self.prefix_cache = cache
+        self.prefix_cache = None
+        if prefix_cache is not None:
+            assert page_size == 1, "Prefix caching requires page_size=1"
+            prefix_cache._free_pages_sink = self.free_pages_to_pool
+            self.prefix_cache = prefix_cache
 
     def allocate_pages(self, count: int) -> list[int]:
         """
@@ -1296,8 +1319,9 @@ slot_mapping = page_table.build_slot_mapping(batch_idx, suffix_positions)
 class MoondreamRuntime:
     def __init__(self, ...):
         # ... existing init ...
-        self.prefix_cache = RadixPrefixCache(self.page_table)
-        self.page_table.set_prefix_cache(self.prefix_cache)
+        self.prefix_cache = RadixPrefixCache()
+        # PageTable wires the cache's eviction sink automatically
+        self.page_table = PageTable(..., prefix_cache=self.prefix_cache)
 
     def start_sequence(
         self,
@@ -1778,12 +1802,18 @@ class CacheNamespace:
 
 
 class RadixPrefixCache:
-    def __init__(self, page_table: PageTable):
-        assert page_table.page_size == 1, "RadixPrefixCache requires page_size=1"
+    def __init__(self, free_pages_sink=None):
+        """Initialize empty prefix cache.
+
+        Args:
+            free_pages_sink: Optional callback to receive freed pages during eviction.
+                Typically set automatically by PageTable constructor.
+        """
         # Separate tree root per namespace
         self._trees: dict[CacheNamespace, TreeNode] = {}
         self._default_namespace = CacheNamespace()  # lora_id=None, image_hash=None
-        self.page_table = page_table
+        self._free_pages_sink = free_pages_sink
+        self._total_cached_pages = 0
 
     def _get_root(self, namespace: CacheNamespace) -> TreeNode:
         if namespace not in self._trees:
@@ -1975,7 +2005,7 @@ class BasePrefixCache(ABC):
 | `kestrel/prefix_cache/namespace.py` | `CacheNamespace` dataclass |
 | `kestrel/prefix_cache/eviction.py` | LRU eviction policy (extensible) |
 | **Modified: KV Cache** | |
-| `kestrel/kv_cache.py` (PageTable) | Add `set_prefix_cache()`, `allocate_pages()`, `map_pages()`, `get_pages()`, `free_pages_to_pool()`, `can_reserve_with_eviction()`. Modify `erase(cached_page_count)` |
+| `kestrel/kv_cache.py` (PageTable) | Add `prefix_cache` constructor arg, `allocate_pages()`, `map_pages()`, `get_pages()`, `free_pages_to_pool()`, `can_reserve_with_eviction()`. Modify `erase(cached_page_count)` |
 | **Modified: Runtime** | |
 | `kestrel/moondream/runtime.py` | Add `cache_tokens`, `cache_lock_node`, `cache_owned_page_count`, `reused_page_count` to `SequenceState`. Modify `start_sequence()` for cache lookup/insert. Add `_append_prefill()` |
 | `kestrel/moondream/text.py` | Add `_append_prefill_attention()` using single-pass append attention |
@@ -2106,7 +2136,7 @@ The prefix caching components (radix tree, page table, append attention) require
 **1. Split correctness**
 ```python
 def test_split_correctness():
-    cache = RadixPrefixCache(page_table)
+    cache = RadixPrefixCache()
     # Insert [A,B,C,D]
     cache.insert([A, B, C, D], pages=[0, 1, 2, 3])
 
@@ -2128,7 +2158,7 @@ def test_split_correctness():
 **2. Image token kv_length accounting**
 ```python
 def test_image_kv_length():
-    cache = RadixPrefixCache(page_table)
+    cache = RadixPrefixCache()
     # Insert [BOS, Image(k=729), t1, t2] with 1+729+1+1=732 pages
     tokens = [TextToken(BOS), ImageToken(hash, 729), TextToken(1), TextToken(2)]
     pages = list(range(732))
@@ -2147,7 +2177,7 @@ def test_image_kv_length():
 **3. Lock ref invariants**
 ```python
 def test_lock_invariants():
-    cache = RadixPrefixCache(page_table)
+    cache = RadixPrefixCache()
     result = cache.insert([A, B, C], pages=[0, 1, 2])
     node = result.node
 
@@ -2169,9 +2199,8 @@ def test_lock_invariants():
 **4. Cache miss full prefill → pages stay cached**
 ```python
 def test_cache_miss_page_ownership():
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     initial_free = page_table.pages_available
 
@@ -2236,7 +2265,7 @@ def test_partial_hit_page_ownership():
 **6. Inserting same sequence twice returns existing node with inserted_pages=0**
 ```python
 def test_insert_idempotency():
-    cache = RadixPrefixCache(page_table)
+    cache = RadixPrefixCache()
 
     # Insert sequence
     result_a = cache.insert(tokens, pages)
@@ -2255,7 +2284,7 @@ def test_insert_idempotency():
 ```python
 def test_lock_transfer_identity():
     """When insert_result.node is temp_lock_node, we must keep exactly one lock."""
-    cache = RadixPrefixCache(page_table)
+    cache = RadixPrefixCache()
 
     # Insert and lock a sequence (simulating first request)
     tokens = [TextToken(1), TextToken(2), TextToken(3)]
@@ -2364,9 +2393,8 @@ def test_multi_batch_shared_pages():
 ```python
 def test_full_prompt_match_page_ownership():
     """Full prompt match maps only reused pages and correctly sets ownership."""
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     tokens = [TextToken(BOS), TextToken(1), TextToken(2), TextToken(3)]
     prompt_len = 4
@@ -2435,9 +2463,8 @@ def test_tiny_hit_text_only():
 
     This validates that even minimal cache hits don't leak pages.
     """
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     total_pages = 99  # Excluding reserved page 0
     initial_free = page_table.pages_available
@@ -2581,9 +2608,8 @@ def test_page_conservation():
     - Pages are leaked (neither free, nor in cache, nor in active batch)
     - Double-free attempts
     """
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     total_pages = 100 - 1  # Page 0 reserved
     initial_free = page_table.pages_available
@@ -2637,9 +2663,8 @@ def test_namespace_pruning():
     persists forever, causing unbounded memory growth in high-cardinality
     image workloads.
     """
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     # Create 10 unique image namespaces
     namespaces = []
@@ -2674,9 +2699,8 @@ def test_match_only_no_root_creation():
     This prevents unbounded _trees growth from match-only queries in workloads
     that query many unique namespaces without inserting.
     """
-    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=100, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     assert len(cache._trees) == 0, "Should start empty"
 
@@ -2712,9 +2736,8 @@ def test_from_page_idx_alignment():
 
     This test catches the bug where token_idx and page_idx drift apart.
     """
-    page_table = PageTable(n_pages=1000, page_size=1, max_batch_size=10)
-    cache = RadixPrefixCache(page_table)
-    page_table.set_prefix_cache(cache)
+    cache = RadixPrefixCache()
+    page_table = PageTable(n_pages=1000, page_size=1, max_batch_size=10, prefix_cache=cache)
 
     # Create a prefix with variable-length token: BOS(1) + Image(729) = 730 pages
     image_kv_length = 729

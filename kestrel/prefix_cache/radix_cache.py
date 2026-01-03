@@ -69,12 +69,19 @@ class RadixPrefixCache(BasePrefixCache):
     token kv_lengths).
     """
 
-    def __init__(self) -> None:
-        """Initialize empty prefix cache."""
+    def __init__(self, free_pages_sink=None) -> None:
+        """Initialize empty prefix cache.
+
+        Args:
+            free_pages_sink: Optional callback to receive freed pages during eviction.
+                Should accept a list[int] of physical page indices.
+                Typically set automatically by PageTable constructor.
+        """
         self._trees: dict[CacheNamespace, TreeNode] = {}
         self._default_namespace = CacheNamespace()
         self._total_cached_pages = 0
         self._eviction_policy = LRUEvictionPolicy(self._collect_unlocked_leaves)
+        self._free_pages_sink = free_pages_sink
 
     @property
     def total_cached_pages(self) -> int:
@@ -320,16 +327,17 @@ class RadixPrefixCache(BasePrefixCache):
         if node.is_leaf() and node.lock_ref == 0 and node.parent is not None:
             self._eviction_policy.add(node)
 
-    def evict(self, needed_pages: int) -> tuple[int, list[int]]:
+    def evict(self, needed_pages: int) -> int:
         """Evict unlocked leaves to free pages using LRU policy.
+
+        Freed pages are sent to the free_pages_sink callback (if configured).
 
         Args:
             needed_pages: Number of pages to free.
 
         Returns:
-            Tuple of (pages_freed_count, list_of_freed_page_indices).
+            Number of pages actually freed.
         """
-        freed_pages: list[int] = []
         freed_count = 0
 
         while freed_count < needed_pages:
@@ -344,9 +352,12 @@ class RadixPrefixCache(BasePrefixCache):
 
             # Evict this node
             node_pages = list(candidate.physical_pages)
-            freed_pages.extend(node_pages)
             freed_count += len(node_pages)
             self._total_cached_pages -= len(node_pages)
+
+            # Send freed pages to sink (e.g., PageTable.free_pages_to_pool)
+            if self._free_pages_sink is not None:
+                self._free_pages_sink(node_pages)
 
             # Remove from tree
             parent = candidate.parent
@@ -366,7 +377,7 @@ class RadixPrefixCache(BasePrefixCache):
                     )
                     del self._trees[parent.namespace]
 
-        return freed_count, freed_pages
+        return freed_count
 
     def evictable_page_count(self) -> int:
         """Return number of pages that can be evicted.
