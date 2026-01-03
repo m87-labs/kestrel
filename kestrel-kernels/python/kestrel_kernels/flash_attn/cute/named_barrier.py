@@ -10,6 +10,10 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    # Per-warp-group FP8 conversion barriers (128 threads each)
+    FP8ConvertWG1 = enum.auto()
+    FP8ConvertWG2 = enum.auto()
+    FP8ConvertWG3 = enum.auto()
 
 
 class NamedBarrierBwd(enum.IntEnum):

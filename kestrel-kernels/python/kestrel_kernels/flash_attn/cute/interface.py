@@ -578,10 +578,21 @@ def _flash_attn_fwd(
         and not is_split_kv
         and head_dim in (64, 128)
     )
-    if kv_is_fp8 and not use_sm90_decode_fastpath:
+    # FP8 KV cache is supported for:
+    # 1. SM90 decode fastpath (paged KV with page_size==1, seqlen_q==1)
+    # 2. SM90 paged prefill with paged_kv_non_tma=True
+    use_sm90_paged_prefill_fp8 = (
+        kv_is_fp8
+        and compute_capability == 9
+        and page_table is not None
+        and inferred_paged_kv_non_tma
+    )
+    intra_wg_overlap = True
+    if kv_is_fp8 and not use_sm90_decode_fastpath and not use_sm90_paged_prefill_fp8:
         raise NotImplementedError(
-            "FP8 KV cache is currently supported only for the SM90 decode fastpath "
-            "(paged KV with page_size==1, seqlen_q==1)."
+            "FP8 KV cache is currently supported only for:\n"
+            "  1. SM90 decode fastpath (paged KV with page_size==1, seqlen_q==1)\n"
+            "  2. SM90 paged prefill with paged_kv_non_tma=True"
         )
 
     compile_key = (
@@ -613,6 +624,7 @@ def _flash_attn_fwd(
         compute_capability,
         inferred_paged_kv_non_tma,
         use_sm90_decode_fastpath,
+        intra_wg_overlap,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -634,7 +646,7 @@ def _flash_attn_fwd(
         )
         k_for_cute = k
         v_for_cute = v
-        if kv_is_fp8 and use_sm90_decode_fastpath:
+        if kv_is_fp8 and (use_sm90_decode_fastpath or use_sm90_paged_prefill_fp8):
             k_for_cute = k.view(torch.uint8)
             v_for_cute = v.view(torch.uint8)
         q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -693,6 +705,7 @@ def _flash_attn_fwd(
                     head_dim,
                     head_dim_v,
                     qhead_per_kvhead,
+                    dtype_kv=dtype_kv if use_sm90_paged_prefill_fp8 else None,
                     is_causal=causal,
                     is_local=local,
                     pack_gqa=pack_gqa,
@@ -702,7 +715,7 @@ def _flash_attn_fwd(
                     num_stages=2,
                     num_threads=num_threads,
                     Q_in_regs=False,
-                    intra_wg_overlap=True,
+                    intra_wg_overlap=intra_wg_overlap,
                     mma_pv_is_rs=True,
                     mask_mod=mask_mod,
                     score_mod=score_mod,
@@ -770,6 +783,8 @@ def _flash_attn_fwd(
                 o_tensor,
                 lse_tensor,
                 softmax_scale,
+                k_scale_val,
+                v_scale_val,
                 current_stream,
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
@@ -800,7 +815,7 @@ def _flash_attn_fwd(
 
     k_for_call = k
     v_for_call = v
-    if kv_is_fp8 and use_sm90_decode_fastpath:
+    if kv_is_fp8 and (use_sm90_decode_fastpath or use_sm90_paged_prefill_fp8):
         k_for_call = k.view(torch.uint8)
         v_for_call = v.view(torch.uint8)
     if use_sm90_decode_fastpath:
@@ -833,6 +848,8 @@ def _flash_attn_fwd(
             out if not is_split_kv else out_partial,
             lse_partial if is_split_kv else lse,
             softmax_scale,
+            k_scale_val,
+            v_scale_val,
             current_stream,
             cu_seqlens_q,
             cu_seqlens_k,

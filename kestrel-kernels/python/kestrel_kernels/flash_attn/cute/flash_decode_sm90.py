@@ -689,7 +689,7 @@ class FlashAttentionDecodeSm90:
                     token_in_stage = tz * self.tile_tokens_per_tz + t
                     token_off = iter_idx * self.tile_tokens + token_in_stage
                     if token_off < chunk_size:
-                        wt = s[t] * v_scale
+                        wt = s[t]
                         v_vec_f32 = sV_stage[token_in_stage, tx, None].load().to(Float32)
                         for i in cutlass.range_constexpr(self.vec_size):
                             o[i] += wt * v_vec_f32[i]
@@ -898,8 +898,9 @@ class FlashAttentionDecodeSm90:
                         o[i] = o_merge[i]
 
         # Write out (only tz == 0 writes).
+        # Apply v_scale here (fused with normalization) instead of per-token in the inner loop.
         if tz == 0 and qo_head_active:
-            inv_d = cute.arch.rcp_approx(d + Float32(1e-20))
+            inv_d = cute.arch.rcp_approx(d + Float32(1e-20)) * v_scale
             for i in cutlass.range_constexpr(self.vec_size):
                 mO[0, tx * self.vec_size + i, qo_head_idx, batch_idx] = (o[i] * inv_d).to(
                     self.dtype

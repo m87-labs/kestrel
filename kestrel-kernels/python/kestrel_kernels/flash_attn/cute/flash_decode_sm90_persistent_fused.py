@@ -723,7 +723,7 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                         token_in_stage = tz * Int32(self.tile_tokens_per_tz) + t
                         token_off = iter_idx * Int32(self.tile_tokens) + token_in_stage
                         if token_off < chunk_size:
-                            wt = s[t] * v_scale
+                            wt = s[t]
                             v_vec_f32 = sV_stage[token_in_stage, tx, None].load().to(Float32)
                             for i in cutlass.range_constexpr(self.vec_size):
                                 o[i] += wt * v_vec_f32[i]
@@ -919,9 +919,10 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                                 o[i] = o_merge[i]
 
             # Write out partials (only tz == 0 writes).
+            # Apply v_scale here (fused with normalization) instead of per-token in the inner loop.
             if active_split and tz == 0 and qo_head_active:
                 if chunk_size > 0:
-                    inv_d = cute.arch.rcp_approx(d + Float32(1e-20))
+                    inv_d = cute.arch.rcp_approx(d + Float32(1e-20)) * v_scale
                     for i in cutlass.range_constexpr(self.vec_size):
                         idx = Int32(self.bdx) * i + tx
                         mO_partial[split_idx, batch_idx, 0, qo_head_idx, idx] = (
