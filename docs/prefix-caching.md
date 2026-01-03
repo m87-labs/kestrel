@@ -1068,51 +1068,6 @@ def merge_attention_states_kernel(
         tl.store(out_ptr + idx, out)
 ```
 
-### FP8 Quantization Consistency
-
-A critical consideration for append prefill is quantization consistency, especially for RL training with logit matching.
-
-#### Current Asymmetry
-
-| Phase | K, V used for attention | K, V written to cache |
-|-------|-------------------------|-----------------------|
-| Prefill | BF16 (from forward) | FP8 (quantized) |
-| Decode | FP8 (from cache) | FP8 (quantized) |
-
-This means the same token at the same position produces **different logits** depending on whether it was computed during prefill (BF16 attention) or decode (FP8 attention).
-
-#### With Append Prefill
-
-The split attention approach naturally handles this:
-
-- **Phase 1**: Cached K, V are FP8 (from cache) ✓
-- **Phase 2**: New K, V should also use FP8 for consistency
-
-#### Solution: FP8 Attention Everywhere
-
-To ensure consistent behavior for RL logit matching, use FP8 K, V for attention in all modes:
-
-| Phase | K, V used for attention | K, V written to cache |
-|-------|-------------------------|-----------------------|
-| Prefill | FP8 | FP8 |
-| Decode | FP8 | FP8 |
-| Append Phase 1 | FP8 (from cache) | N/A |
-| Append Phase 2 | FP8 (quantized) | FP8 |
-
-**Implementation**: Write K, V to cache first, then read back for Phase 2:
-
-```python
-# Write new K, V to cache (quantizes to FP8)
-kv_cache.update(suffix_positions, k, v, slot_mapping=slot_mapping)
-
-# Read back for Phase 2 attention (now FP8, matching cached KV)
-k_fp8, v_fp8 = kv_cache.read_kv_slots(slot_mapping)
-
-out2, lse2 = _flash_attn_fwd(q, k_fp8, v_fp8, causal=True, ...)
-```
-
-This ensures all attention computation sees FP8 K, V regardless of prefill/decode/append mode.
-
 ### Implementation Steps
 
 1. **Implement `merge_attention_states`** - Simple Triton kernel (~50 lines)
@@ -1122,8 +1077,6 @@ This ensures all attention computation sees FP8 K, V regardless of prefill/decod
 3. **Modify `text_decoder` for append mode**:
    - Accept `skip_positions` parameter
    - Run split attention when `skip_positions > 0`
-
-4. **FP8 consistency in Phase 2** - Write to cache before Phase 2 attention
 
 ### Compute Savings
 
@@ -1395,60 +1348,6 @@ slot_mapping = page_table.build_slot_mapping(batch_idx, suffix_positions)
 3. **Capacity tracking**: `capacity[batch_idx]` reflects the total mapped KV positions, including both cached and new pages.
 
 4. **Order preservation**: `page_table_cpu[batch_idx]` stores pages in logical order. With caching, cached pages come first, then newly allocated pages.
-
-### PagedKVCache Modifications
-
-**File**: `kestrel/kv_cache.py`
-
-For FP8 consistency in append prefill, we need to read quantized K, V back from cache:
-
-```python
-class PagedKVCache(torch.nn.Module):
-    # ... existing code ...
-
-    def read_kv_slots(
-        self,
-        slot_mapping: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Read K, V values from cache at specified slots.
-
-        Used for FP8 consistency in append prefill Phase 2:
-        write new K, V to cache (quantizes to FP8), then read back.
-
-        Args:
-            slot_mapping: [num_tokens] flat slot indices
-
-        Returns:
-            k: [num_tokens, n_kv_heads, head_dim] in cache dtype (FP8 or BF16)
-            v: [num_tokens, n_kv_heads, head_dim] in cache dtype
-        """
-        num_tokens = slot_mapping.shape[0]
-        page_size = self.page_table.page_size
-
-        # Decode slot -> (page_idx, offset)
-        page_idx = slot_mapping // page_size
-        offset = slot_mapping % page_size
-
-        # Gather from cache: [n_pages, n_heads, page_size, head_dim]
-        # -> [num_tokens, n_heads, head_dim]
-        k = self.k_cache[page_idx, :, offset, :]  # [num_tokens, n_heads, head_dim]
-        v = self.v_cache[page_idx, :, offset, :]
-
-        return k, v
-```
-
-Usage in append prefill:
-```python
-# Write new K, V to cache (quantizes to FP8 if cache is FP8)
-kv_cache.update(suffix_positions, k, v, slot_mapping=slot_mapping)
-
-# Read back for Phase 2 attention (now FP8, matching cached KV)
-k_fp8, v_fp8 = kv_cache.read_kv_slots(slot_mapping)
-
-# Phase 2 attention uses consistent FP8 K, V
-out2, lse2 = _flash_attn_fwd(q, k_fp8, v_fp8, causal=True, ...)
-```
 
 ### Runtime Modifications
 
@@ -2141,7 +2040,6 @@ class BasePrefixCache(ABC):
 | `kestrel/prefix_cache/eviction.py` | LRU eviction policy (extensible) |
 | **Modified: KV Cache** | |
 | `kestrel/kv_cache.py` (PageTable) | Add `set_prefix_cache()`, `allocate_pages()`, `map_pages()`, `get_pages()`, `free_pages_to_pool()`, `can_reserve_with_eviction()`. Modify `erase(cached_page_count)` |
-| `kestrel/kv_cache.py` (PagedKVCache) | Add `read_kv_slots()` for FP8 write-then-read consistency |
 | **Modified: Runtime** | |
 | `kestrel/moondream/runtime.py` | Add `cache_tokens`, `cache_lock_node`, `cache_owned_page_count`, `reused_page_count` to `SequenceState`. Modify `start_sequence()` for cache lookup/insert. Add `_append_prefill()` |
 | `kestrel/moondream/text.py` | Add `_append_prefill_attention()` with split attention + LSE merge |

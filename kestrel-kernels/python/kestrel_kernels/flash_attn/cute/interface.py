@@ -199,9 +199,9 @@ def _flash_attn_fwd(
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     if isinstance(k_scale, torch.Tensor):
-        k_scale = float(k_scale.item())
+        raise TypeError("k_scale must be a float, not a tensor (tensor.item() causes GPU sync)")
     if isinstance(v_scale, torch.Tensor):
-        v_scale = float(v_scale.item())
+        raise TypeError("v_scale must be a float, not a tensor (tensor.item() causes GPU sync)")
     k_scale_val = 1.0 if k_scale is None else float(k_scale)
     v_scale_val = 1.0 if v_scale is None else float(v_scale)
     num_head, head_dim = q.shape[-2:]
@@ -527,10 +527,6 @@ def _flash_attn_fwd(
     )
 
     if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
         if pack_gqa:
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
@@ -711,7 +707,6 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                     tile_m=m_block_size,
                     tile_n=n_block_size,
-                    # num_stages=1,
                     num_stages=2,
                     num_threads=num_threads,
                     Q_in_regs=False,
