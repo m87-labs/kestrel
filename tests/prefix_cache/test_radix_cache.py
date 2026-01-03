@@ -321,42 +321,46 @@ class TestEviction:
     """Tests for eviction operation."""
 
     def test_evict_frees_unlocked_leaf(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         cache.insert([MockToken(0), MockToken(1)], [0, 1])
 
-        freed_count, freed_pages = cache.evict(2)
+        freed_count = cache.evict(2)
 
         assert freed_count == 2
         assert set(freed_pages) == {0, 1}
         assert cache.total_cached_pages == 0
 
     def test_evict_skips_locked_nodes(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         result = cache.insert([MockToken(0)], [0])
         cache.lock(result.node)
 
-        freed_count, freed_pages = cache.evict(1)
+        freed_count = cache.evict(1)
 
         assert freed_count == 0
         assert freed_pages == []
         assert cache.total_cached_pages == 1
 
     def test_evict_lru_order(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         # Insert old then new
         cache.insert([MockToken(0)], [0])
         time.sleep(0.02)  # Ensure different timestamps
         cache.insert([MockToken(1)], [1])
 
         # Evict one - should be older
-        freed_count, freed_pages = cache.evict(1)
+        freed_count = cache.evict(1)
 
         assert freed_count == 1
         assert freed_pages == [0]
 
     def test_evict_lru_order_after_match(self) -> None:
         """Matching a prefix should update LRU order."""
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         # Insert A (old) then B (newer)
         cache.insert([MockToken(0)], [0])
         time.sleep(0.02)
@@ -367,7 +371,7 @@ class TestEviction:
         cache.match_prefix([MockToken(0)])
 
         # Evict one - should evict B (older access), not A (recently matched)
-        freed_count, freed_pages = cache.evict(1)
+        freed_count = cache.evict(1)
 
         assert freed_count == 1
         assert freed_pages == [1], "Should evict B (page 1), not A (page 0) which was recently matched"
@@ -378,7 +382,8 @@ class TestEviction:
         When an internal node becomes a leaf (after children evicted), it should
         retain the access time from when it was last part of a matched path.
         """
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         # Insert [A] (will become internal node) and [A, B] (leaf)
         cache.insert([MockToken(0)], [0])
         cache.insert([MockToken(0), MockToken(1)], [0, 1])
@@ -392,14 +397,15 @@ class TestEviction:
         cache.match_prefix([MockToken(0), MockToken(1)])
 
         # Evict one - should evict C (older than recently matched [A,B] path)
-        freed1, pages1 = cache.evict(1)
+        freed1 = cache.evict(1)
         assert freed1 == 1
-        assert pages1 == [2], "Should evict C first (older than recently matched [A,B])"
+        assert freed_pages == [2], "Should evict C first (older than recently matched [A,B])"
 
         # Now evict B - A becomes a leaf with access time from the match
-        freed2, pages2 = cache.evict(1)
+        freed_pages.clear()
+        freed2 = cache.evict(1)
         assert freed2 == 1
-        assert pages2 == [1], "Should evict B"
+        assert freed_pages == [1], "Should evict B"
 
         # Insert [D] - this happens BEFORE we match again
         cache.insert([MockToken(3)], [3])
@@ -409,42 +415,46 @@ class TestEviction:
         cache.match_prefix([MockToken(0)])
 
         # Now evict - should evict D (older), not A (just matched)
-        freed3, pages3 = cache.evict(1)
+        freed_pages.clear()
+        freed3 = cache.evict(1)
         assert freed3 == 1
-        assert pages3 == [3], "Should evict D, not A which was just matched"
+        assert freed_pages == [3], "Should evict D, not A which was just matched"
 
     def test_evict_makes_parent_eligible(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         # Insert [A] and [A, B]
         cache.insert([MockToken(0)], [0])
         cache.insert([MockToken(0), MockToken(1)], [0, 1])
 
         # Evict [A, B] leaf
-        freed1, _ = cache.evict(1)
+        freed1 = cache.evict(1)
 
         # Now [A] is a leaf and evictable
-        freed2, _ = cache.evict(1)
+        freed2 = cache.evict(1)
 
         assert freed1 == 1
         assert freed2 == 1
         assert cache.total_cached_pages == 0
 
     def test_evict_partial(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         cache.insert([MockToken(0)], [0])
         cache.insert([MockToken(1)], [1])
 
-        freed_count, freed_pages = cache.evict(1)
+        freed_count = cache.evict(1)
 
         assert freed_count == 1
         assert len(freed_pages) == 1
         assert cache.total_cached_pages == 1
 
     def test_evict_more_than_available(self) -> None:
-        cache = RadixPrefixCache()
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
         cache.insert([MockToken(0)], [0])
 
-        freed_count, freed_pages = cache.evict(10)
+        freed_count = cache.evict(10)
 
         assert freed_count == 1
         assert freed_pages == [0]
