@@ -927,46 +927,32 @@ We surveyed how FlashInfer, SGLang, and vLLM handle this problem:
 | **SGLang** | Split Attention + LSE Merge | `ForwardMode.EXTEND` with two-phase attention |
 | **vLLM** | Split Attention + LSE Merge | `BatchDCPPrefillWrapper` with `merge_attn_states()` |
 
-**Key finding**: SGLang and vLLM both use the same approach - split attention with log-sum-exp merging. This is the industry standard for prefix caching.
+**Key finding**: SGLang and vLLM use split attention with log-sum-exp merging. However, our FA3 kernel's causal mask already handles append attention natively, so we can use a simpler single-pass approach.
 
-Reference: https://arxiv.org/pdf/2501.01005 (Section 2.2 on splitting KV)
+### Solution: Single-Pass Append Attention
 
-### Solution: Split Attention with LSE Merge
+The FA3 causal mask uses the formula `seqlen_k - seqlen_q` to compute the offset between Q and K positions. This **automatically right-aligns Q with K**, which is exactly what append attention needs:
 
-Run two separate attention passes and combine results:
+```
+Example: 150-token cached prefix + 50-token suffix
+├── seqlen_q = 50 (suffix only)
+├── seqlen_k = 200 (full KV cache after writing suffix)
+├── offset = seqlen_k - seqlen_q = 150
+└── Result: Q[0] attends to K[0:151], Q[49] attends to K[0:200] ✓
+```
+
+This means we can run a **single attention pass** instead of two-phase split attention:
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  Phase 1: Cached KV Attention (paged, non-causal)              │
-│  ├── Q: suffix queries [B, suffix_len, H, D]                   │
-│  ├── K, V: from paged cache (positions 0 to skip-1)            │
-│  ├── Masking: NON-CAUSAL (all cached positions valid)          │
-│  └── Output: out1, lse1                                        │
-├────────────────────────────────────────────────────────────────┤
-│  Phase 2: New KV Attention (dense, causal)                     │
-│  ├── Q: suffix queries [B, suffix_len, H, D]                   │
-│  ├── K, V: freshly computed [B, suffix_len, Hkv, D]            │
-│  ├── Masking: CAUSAL (within suffix)                           │
-│  └── Output: out2, lse2                                        │
-├────────────────────────────────────────────────────────────────┤
-│  Merge: Numerically stable combination                         │
-│  ├── max_lse = max(lse1, lse2)                                 │
-│  ├── out = (out1 * exp(lse1 - max_lse) +                       │
-│  │          out2 * exp(lse2 - max_lse)) /                      │
-│  │         (exp(lse1 - max_lse) + exp(lse2 - max_lse))         │
-│  └── Output: merged attention output                           │
+│  1. Write new K, V to paged cache at suffix positions          │
+│  2. Run single causal attention:                               │
+│     ├── Q: suffix tokens [B, suffix_len, H, D]                 │
+│     ├── K, V: full paged cache (positions 0 to total_len-1)    │
+│     ├── seqused_k: total_len (prefix + suffix)                 │
+│     └── causal=True (mask auto-aligns via seqlen_k - seqlen_q) │
 └────────────────────────────────────────────────────────────────┘
 ```
-
-### FA3 Already Supports This
-
-Our FA3 implementation has all the necessary pieces:
-
-1. **Paged prefill with q_len > 1**: ✅ `FlashAttentionForwardSm90` supports `paged_kv_non_tma=True`
-2. **Return LSE**: ✅ `return_lse=True` parameter
-3. **seqused_k**: ✅ Limits attention to first N KV positions
-
-The decode kernel's `seqlen_q == 1` restriction does NOT apply to the general forward kernel.
 
 ### Implementation
 
@@ -978,105 +964,70 @@ def _append_prefill_attention(
     v: Tensor,                    # [1, suffix_len, n_kv_heads, head_dim]
     kv_cache,                     # Paged KV cache
     page_table: Tensor,           # [1, max_pages]
-    skip_positions: int,          # Number of cached KV positions
+    skip_positions: int,          # Number of cached KV positions (prefix length)
     slot_mapping: Tensor,         # For writing new K, V
 ) -> Tensor:
     """
-    Append prefill: suffix Q attends to cached + new KV.
+    Append prefill: suffix Q attends to cached prefix + new suffix KV.
+
+    The causal mask formula (seqlen_k - seqlen_q) automatically right-aligns
+    Q with K, so Q[0] at logical position skip_positions attends correctly.
     """
     suffix_len = q.shape[1]
-    suffix_positions = torch.arange(
-        skip_positions, skip_positions + suffix_len,
-        device=q.device, dtype=torch.int32
-    )
+    total_len = skip_positions + suffix_len
 
     # Write new K, V to paged cache at suffix positions
+    suffix_positions = torch.arange(
+        skip_positions, total_len,
+        device=q.device, dtype=torch.int32
+    )
     kv_cache.update(suffix_positions, k, v, slot_mapping)
 
-    # Phase 1: Suffix Q attending to cached K/V (paged, non-causal)
+    # Single attention pass: suffix Q attends to full KV cache
+    # The causal mask offset (seqlen_k - seqlen_q = skip_positions)
+    # automatically right-aligns Q positions
     k_cache = kv_cache.k_cache.permute(0, 2, 1, 3)  # [pages, page_size, heads, dim]
     v_cache = kv_cache.v_cache.permute(0, 2, 1, 3)
 
-    out1, lse1 = _flash_attn_fwd(
+    out, _ = _flash_attn_fwd(
         q,
         k_cache, v_cache,
         page_table=page_table,
-        seqused_k=torch.tensor([skip_positions], device=q.device, dtype=torch.int32),
-        causal=False,              # Non-causal: all cached positions valid for all Q
-        return_lse=True,
+        seqused_k=torch.tensor([total_len], device=q.device, dtype=torch.int32),
+        causal=True,
         k_scale=kv_cache.k_scale,
         v_scale=kv_cache.v_scale,
     )
-
-    # Phase 2: Suffix Q attending to new K/V (dense, causal)
-    out2, lse2 = _flash_attn_fwd(
-        q,
-        k, v,                      # Dense K, V just computed
-        causal=True,               # Causal within suffix
-        return_lse=True,
-    )
-
-    # Merge using log-sum-exp
-    out = merge_attention_states(out1, lse1, out2, lse2)
     return out
 ```
 
-### Merge Kernel
+### Why This Works
 
-Simple Triton kernel for numerically stable merging:
+The key insight is that FA3's causal mask was designed for cross-attention scenarios where `seqlen_q != seqlen_k`. The offset `seqlen_k - seqlen_q` right-aligns Q with K:
 
-**Layout contract:**
-- `out`, `out1`, `out2`: shape `[batch, q_len, n_heads, head_dim]`, contiguous
-- `lse1`, `lse2`: shape `[batch, n_heads, q_len]`, contiguous
-- Grid: `(batch * q_len * n_heads,)` - one program per (batch, q_pos, head)
-- `pid` mapping: `pid = b * (q_len * n_heads) + q * n_heads + h`
-- Output offset: `pid * head_dim` indexes into flattened `[B*Q*H, D]` view
-- **Requirement**: `head_dim` must be divisible by `BLOCK_SIZE` (typically 64 or 128; Moondream uses head_dim=64)
+| Q local position | Effective global position | Can attend to K positions |
+|------------------|---------------------------|---------------------------|
+| 0 | skip_positions | 0 to skip_positions |
+| i | skip_positions + i | 0 to skip_positions + i |
+| suffix_len - 1 | total_len - 1 | 0 to total_len - 1 |
 
-```python
-@triton.jit
-def merge_attention_states_kernel(
-    out_ptr, out1_ptr, lse1_ptr, out2_ptr, lse2_ptr,
-    seq_len, n_heads, head_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    # Decompose pid -> (batch, q_pos, head) for LSE indexing
-    # LSE layout is [B, H, Q], so lse_idx = b * (n_heads * seq_len) + h * seq_len + q
-    b = pid // (seq_len * n_heads)
-    remainder = pid % (seq_len * n_heads)
-    q = remainder // n_heads
-    h = remainder % n_heads
-    lse_idx = b * (n_heads * seq_len) + h * seq_len + q
+This is exactly the causal masking pattern we need for append attention.
 
-    # Load LSE values
-    lse1 = tl.load(lse1_ptr + lse_idx)
-    lse2 = tl.load(lse2_ptr + lse_idx)
+### Advantages Over Split Attention
 
-    # Numerically stable combination
-    max_lse = tl.maximum(lse1, lse2)
-    exp1 = tl.exp(lse1 - max_lse)
-    exp2 = tl.exp(lse2 - max_lse)
-    scale = 1.0 / (exp1 + exp2)
-
-    # Merge outputs
-    for i in range(0, head_dim, BLOCK_SIZE):
-        idx = pid * head_dim + i + tl.arange(0, BLOCK_SIZE)
-        o1 = tl.load(out1_ptr + idx)
-        o2 = tl.load(out2_ptr + idx)
-        out = (o1 * exp1 + o2 * exp2) * scale
-        tl.store(out_ptr + idx, out)
-```
+| Aspect | Single-Pass | Two-Phase Split |
+|--------|-------------|-----------------|
+| Kernel launches | 1 | 2 + merge |
+| Implementation | No new code | Merge kernel needed |
+| Memory | Single output | Two outputs + merge |
+| Complexity | Uses existing FA3 | Additional synchronization |
 
 ### Implementation Steps
 
-1. **Implement `merge_attention_states`** - Simple Triton kernel (~50 lines)
-
-2. **Add `_append_prefill_attention` to text.py** - Layer-level split attention
-
-3. **Modify `text_decoder` for append mode**:
+1. **Modify `text_decoder` for append mode**:
    - Accept `skip_positions` parameter
-   - Run split attention when `skip_positions > 0`
+   - Write suffix K/V to cache before attention
+   - Call attention with `seqused_k = total_len`
 
 ### Compute Savings
 
@@ -1087,18 +1038,6 @@ For a 730-token cache hit with 20-token suffix:
 | QKV linear | 750 tokens | 20 tokens | 97% |
 | Attention FLOPs | 750 × 750 | 20 × 750 | 97% |
 | MLP | 750 tokens | 20 tokens | 97% |
-
-The merge overhead is O(suffix_len × head_dim) - negligible compared to attention.
-
-### Why Split Attention Works Well
-
-| Aspect | Benefit |
-|--------|---------|
-| Kernel complexity | Minimal - reuses existing FA3 |
-| Memory | No dense copy of cached KV |
-| Compute efficiency | O(suffix × total) instead of O(total²) |
-| Merge overhead | O(suffix × head_dim) - negligible |
-| Production proven | Used by SGLang and vLLM at scale |
 
 ### Full Prompt Match Handling
 
@@ -1943,9 +1882,6 @@ kestrel/
     └── scheduler.py                 # Existing - add cache unlock on release
 
 kestrel-kernels/
-└── python/kestrel_kernels/
-    └── triton/
-        └── merge_attention.py       # New: merge_attention_states kernel
 ```
 
 ### Package Design
@@ -2042,14 +1978,12 @@ class BasePrefixCache(ABC):
 | `kestrel/kv_cache.py` (PageTable) | Add `set_prefix_cache()`, `allocate_pages()`, `map_pages()`, `get_pages()`, `free_pages_to_pool()`, `can_reserve_with_eviction()`. Modify `erase(cached_page_count)` |
 | **Modified: Runtime** | |
 | `kestrel/moondream/runtime.py` | Add `cache_tokens`, `cache_lock_node`, `cache_owned_page_count`, `reused_page_count` to `SequenceState`. Modify `start_sequence()` for cache lookup/insert. Add `_append_prefill()` |
-| `kestrel/moondream/text.py` | Add `_append_prefill_attention()` with split attention + LSE merge |
+| `kestrel/moondream/text.py` | Add `_append_prefill_attention()` using single-pass append attention |
 | **Modified: Scheduler** | |
 | `kestrel/scheduler/scheduler.py` | Modify `_release_sequence()` to call `prefix_cache.unlock()` and `erase(cached_page_count)` |
 | `kestrel/scheduler/spatial.py` | Return bin indices from `compute_spatial_values()` |
 | **Modified: Engine** | |
 | `kestrel/engine.py` | Add `image_hash` to `_PendingRequest`. Compute SHA256 hash in `_submit_request()` |
-| **New: Kernel** | |
-| `kestrel-kernels/.../triton/merge_attention.py` | `merge_attention_states()` Triton kernel for LSE-based output merging |
 
 ---
 
@@ -2064,7 +1998,7 @@ The current implementation assumes zero or one image per request, always at posi
 | **Cache key sequence** | ✅ Ready | Multiple `ImageToken`s in sequence just work |
 | **Radix tree matching** | ✅ Ready | Matches any token sequence |
 | **Page table / allocation** | ✅ Ready | Position-based, not image-aware |
-| **Split attention (append prefill)** | ✅ Ready | Same Phase 1 + Phase 2 + merge architecture |
+| **Append attention** | ✅ Ready | Single-pass with right-aligned causal mask |
 | **Attention masks** | ⚠️ Needs work | Currently hardcoded for single 730-token prefix |
 
 The cache doesn't care how many images there are - it just sees a sequence of cache keys. The complexity is in attention masking.
@@ -2161,7 +2095,7 @@ When adding multi-image support:
 4. **Attention**: Replace `cute_prefix_lm_mask_730` with dynamic mask based on `image_regions`
 5. **Vision encoder**: Process multiple images, interleave embeddings at correct positions
 
-The prefix caching components (radix tree, page table, split attention) require **no changes**.
+The prefix caching components (radix tree, page table, append attention) require **no changes**.
 
 ---
 
