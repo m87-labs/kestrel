@@ -341,6 +341,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     total_prefill_ms = 0.0
     total_decode_ms = 0.0
     request_count = 0
+    request_times_ms: List[float] = []  # prefill + decode per request
 
     def record_metrics(metrics: EngineMetrics) -> None:
         nonlocal total_input_tokens, total_output_tokens
@@ -350,6 +351,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         total_prefill_ms += metrics.prefill_time_ms
         total_decode_ms += metrics.decode_time_ms
         request_count += 1
+        request_times_ms.append(metrics.prefill_time_ms + metrics.decode_time_ms)
 
     async def evaluate_single(
         row_idx: int,
@@ -463,6 +465,25 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
 
         return row_idx, qa_idx, result_entry, is_correct, source == "human"
 
+    # Run a warmup query to exclude startup time from measurements
+    if rows:
+        warmup_image = pil_to_pyvips(rows[0]["image"])
+        warmup_qa = rows[0]["qa"][0]
+        warmup_prompt, warmup_reasoning, warmup_max_tokens, warmup_temp = build_prompt_and_settings(
+            warmup_qa["question"],
+            use_pot=cfg.use_pot,
+            cot_samples=cfg.cot_samples,
+            base_temperature=cfg.temperature,
+        )
+        await query_engine(
+            engine,
+            image=warmup_image,
+            prompt=warmup_prompt,
+            reasoning=warmup_reasoning,
+            max_tokens=warmup_max_tokens,
+            temperature=warmup_temp,
+        )
+
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
     start_time = time.perf_counter()
     for row_idx, row in enumerate(rows):
@@ -515,6 +536,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "total_output_tokens": total_output_tokens,
             "total_prefill_ms": total_prefill_ms,
             "total_decode_ms": total_decode_ms,
+            "request_times_ms": request_times_ms,
         },
         "wall_time_s": wall_time_s,
     }
@@ -591,6 +613,19 @@ def parse_args() -> EvalConfig:
     return cfg
 
 
+def percentile(data: List[float], p: float) -> float:
+    """Compute the p-th percentile (0-100) of a sorted list."""
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    k = (len(sorted_data) - 1) * (p / 100.0)
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_data):
+        return sorted_data[-1]
+    return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
+
+
 def print_results(results: Dict[str, Any]) -> None:
     print("\nChartQA Evaluation Results")
     print(f"Total Accuracy: {results['acc']:.2f}% ({results['correct']} / {results['total']})")
@@ -599,13 +634,20 @@ def print_results(results: Dict[str, Any]) -> None:
         f"({results['human_correct']} / {results['human_total']})"
     )
 
+    wall_time_s = results.get("wall_time_s", 0.0) or 0.0
     usage = results.get("token_usage")
+    request_count = usage.get("request_count", 0) if usage else 0
+
+    if wall_time_s > 0.0 and request_count > 0:
+        requests_per_second = request_count / wall_time_s
+        print(f"\nRequests per second: {requests_per_second:.2f}")
+
     if usage:
-        request_count = usage.get("request_count", 0)
         total_input_tokens = usage.get("total_input_tokens", 0)
         total_output_tokens = usage.get("total_output_tokens", 0)
         total_prefill_ms = usage.get("total_prefill_ms", 0.0)
         total_decode_ms = usage.get("total_decode_ms", 0.0)
+        request_times_ms = usage.get("request_times_ms", [])
 
         avg_input_tokens = (
             total_input_tokens / request_count if request_count else 0.0
@@ -622,9 +664,7 @@ def print_results(results: Dict[str, Any]) -> None:
             total_output_tokens / total_decode_s if total_decode_s > 0 else 0.0
         )
 
-        wall_time_s = results.get("wall_time_s", 0.0) or 0.0
-
-        print(f"Avg Input Tokens / Request: {avg_input_tokens:.2f}")
+        print(f"\nAvg Input Tokens / Request: {avg_input_tokens:.2f}")
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
         print(
             f"Effective Prefill Throughput (per request): {effective_prefill:.2f} tok/s"
@@ -637,6 +677,16 @@ def print_results(results: Dict[str, Any]) -> None:
             print(
                 f"Overall Decode Throughput (wall clock): {wall_decode:.2f} tok/s"
             )
+
+        # Request latency stats (prefill + decode)
+        if request_times_ms:
+            mean_ms = sum(request_times_ms) / len(request_times_ms)
+            p90_ms = percentile(request_times_ms, 90)
+            p99_ms = percentile(request_times_ms, 99)
+            print(f"\nRequest Latency (prefill + decode):")
+            print(f"  Mean: {mean_ms:.2f} ms")
+            print(f"  P90:  {p90_ms:.2f} ms")
+            print(f"  P99:  {p99_ms:.2f} ms")
 
 
 async def async_main() -> None:
