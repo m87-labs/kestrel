@@ -117,8 +117,17 @@ def attn(
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
     rotary_embedding_cuda(position_matrix, q, k, head_dim, cos_sin_cache)
 
-    if kv_cache is not None:
-        kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
+    if kv_cache is None:
+        raise RuntimeError("FA3 attention requires a KV cache")
+    if page_table is None or fa3_seqused_k is None:
+        raise RuntimeError("FA3 attention requires page_table and fa3_seqused_k")
+
+    kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
+
+    k_cache = kv_cache.cache.k_cache.permute(0, 2, 1, 3)
+    v_cache = kv_cache.cache.v_cache.permute(0, 2, 1, 3)
+    k_scale = getattr(kv_cache.cache, "k_scale", None)
+    v_scale = getattr(kv_cache.cache, "v_scale", None)
 
     if mode == "prefill":
         if not x.is_cuda:
@@ -127,43 +136,34 @@ def attn(
             raise RuntimeError(f"Unsupported dtype for FA3 prefill: {q.dtype}")
         mask_mod = None
         causal = True
-        pack_gqa = None
+        pack_gqa = False
         if use_prefix_attn:
             # TODO: Make this dynamic (per-request prefix length) when we support
             # non-fixed image prefixes. For now, hardcode Moondream's BOS+image
             # prefix length (730 = 1 + 27*27).
             causal = False
             mask_mod = cute_prefix_lm_mask_730
-            pack_gqa = False
-        out, _ = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            causal=causal,
-            pack_gqa=pack_gqa,
-            mask_mod=mask_mod,
-        )
-    else:
-        if kv_cache is None:
-            raise RuntimeError("FA3 paged decode requires a KV cache")
-        if page_table is None or fa3_seqused_k is None:
-            raise RuntimeError("FA3 paged decode requires page_table and fa3_seqused_k")
-        torch._assert(q.shape[1] == 1, "FA3 paged decode expects q_len == 1")
-
-        k_cache_hnd = kv_cache.cache.k_cache  # type: ignore[attr-defined]
-        v_cache_hnd = kv_cache.cache.v_cache  # type: ignore[attr-defined]
-        k_cache = k_cache_hnd.permute(0, 2, 1, 3)
-        v_cache = v_cache_hnd.permute(0, 2, 1, 3)
-
-        k_scale = getattr(kv_cache.cache, "k_scale", None)  # type: ignore[attr-defined]
-        v_scale = getattr(kv_cache.cache, "v_scale", None)  # type: ignore[attr-defined]
         out, _ = _flash_attn_fwd(
             q,
             k_cache,
             v_cache,
             page_table=page_table,
             seqused_k=fa3_seqused_k,
-            paged_kv_non_tma=None,
+            paged_kv_non_tma=True,
+            causal=causal,
+            pack_gqa=pack_gqa,
+            mask_mod=mask_mod,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    else:
+        out, _ = _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=fa3_seqused_k,
+            paged_kv_non_tma=True,
             causal=True,
             k_scale=k_scale,
             v_scale=v_scale,

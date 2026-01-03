@@ -711,6 +711,11 @@ class MoondreamRuntime:
             batch_idx=batch_idx, positions=position_ids
         )
 
+        # Build FA3 paged attention metadata for prefill
+        seqlen = position_ids.max().item() + 1
+        fa3_page_table = self.page_table.page_table[batch_idx : batch_idx + 1]
+        fa3_seqused_k = torch.tensor([seqlen], dtype=torch.int32, device=self.device)
+
         # For no-adapter prefill, skip LoRA entirely to avoid redundant work
         if lora_slot == 0:
             lora_workspace = None
@@ -731,6 +736,8 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
+            page_table=fa3_page_table,
+            fa3_seqused_k=fa3_seqused_k,
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
         )
