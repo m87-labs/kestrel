@@ -22,6 +22,14 @@ from tokenizers import Tokenizer
 
 from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import PageTable, PagedKVCache
+from kestrel.prefix_cache import (
+    CacheNamespace,
+    CacheToken,
+    ImageToken,
+    MatchResult,
+    RadixPrefixCache,
+    TreeNode,
+)
 
 from .config import DEFAULT_MOONDREAM_CONFIG, MoondreamConfig
 from .model import MoondreamModel
@@ -53,11 +61,27 @@ class TextToken(NamedTuple):
 
     token_id: int
 
+    def cache_key(self) -> tuple:
+        """Cache key: (0, token_id) - 0 discriminates from other token types."""
+        return (0, self.token_id)
+
+    def kv_length(self) -> int:
+        """Text tokens occupy exactly 1 KV position."""
+        return 1
+
 
 class CoordToken(NamedTuple):
     """Normalized positional token emitted or consumed by the region model."""
 
     pos: float
+
+    def cache_key(self) -> tuple:
+        """Cache key: (1, pos) - 1 discriminates from text tokens."""
+        return (1, self.pos)
+
+    def kv_length(self) -> int:
+        """Coord tokens occupy exactly 1 KV position."""
+        return 1
 
 
 class SizeToken(NamedTuple):
@@ -65,6 +89,14 @@ class SizeToken(NamedTuple):
 
     width: float
     height: float
+
+    def cache_key(self) -> tuple:
+        """Cache key: (2, width, height) - 2 discriminates from coord tokens."""
+        return (2, self.width, self.height)
+
+    def kv_length(self) -> int:
+        """Size tokens occupy exactly 1 KV position."""
+        return 1
 
 
 Token = TextToken | CoordToken | SizeToken
@@ -83,13 +115,32 @@ class SequenceState:
     length: int
     max_length: int
     prompt_length: int | None = None
+    # DEPRECATED: Use image_regions instead. Kept for backward compatibility with
+    # scheduler code. Will be removed once scheduler is migrated to image_regions.
     image_length: int = 0
     last_hidden: Tensor | None = None
     lora_slot: int = 0  # 0 = no LoRA, >0 = slot in TextLoRAWorkspace
 
+    # Prefix cache fields
+    cache_tokens: list[CacheToken] | None = None
+    cache_lock_node: TreeNode | None = None
+    cache_owned_page_count: int = 0  # Pages belonging to cache (not freed on release)
+    reused_page_count: int = 0  # Pages reused from cache hit (for metrics)
+    # List of (start, end) KV positions for bidirectional attention (image regions).
+    # For single-image: [(1, 1+image_kv_length)]. Empty for text-only.
+    # This will replace image_length once multi-image is supported.
+    image_regions: list[tuple[int, int]] | None = None
+
     def __post_init__(self) -> None:
         if self.prompt_length is None:
             self.prompt_length = self.length
+        # Validate consistency between image_length and image_regions
+        if self.image_regions:
+            computed_length = sum(end - start for start, end in self.image_regions)
+            assert self.image_length == computed_length, (
+                f"image_length ({self.image_length}) inconsistent with "
+                f"image_regions ({self.image_regions}, computed={computed_length})"
+            )
 
     def advance(self, tokens: int = 1) -> None:
         self.length += tokens
@@ -107,6 +158,17 @@ class SequenceState:
 
     def remaining_new_tokens(self) -> int:
         return max(self.max_length - self.length, 0)
+
+
+@dataclass
+class _CacheLookupResult:
+    """Result of prefix cache lookup in start_sequence."""
+
+    match: MatchResult | None
+    skip_positions: int
+    temp_lock_node: TreeNode | None
+    can_reuse: bool
+    namespace: CacheNamespace | None
 
 
 @dataclass
@@ -232,11 +294,17 @@ class MoondreamRuntime:
         self.max_batch_size = cfg.max_batch_size
         n_pages = self.max_seq_length // self.page_size
 
+        # Create prefix cache if enabled
+        self.prefix_cache: RadixPrefixCache | None = None
+        if cfg.enable_prefix_cache:
+            self.prefix_cache = RadixPrefixCache()
+
         self.page_table = PageTable(
             n_pages=n_pages,
             page_size=self.page_size,
             max_batch_size=self.max_batch_size,
             device=str(self.device),
+            prefix_cache=self.prefix_cache,
         )
 
         self.model = MoondreamModel(
@@ -450,7 +518,7 @@ class MoondreamRuntime:
     def can_reserve(self, total_length: int) -> bool:
         """Return True if a request of ``total_length`` tokens can be admitted."""
 
-        return self.page_table.can_reserve(total_length)
+        return self.page_table.can_reserve_with_eviction(total_length)
 
     @property
     def copy_stream(self) -> torch.cuda.Stream:
@@ -586,6 +654,242 @@ class MoondreamRuntime:
             overlap=overlap,
         )
 
+    # ------------------------------------------------------------------
+    # start_sequence helpers
+
+    def _normalize_prompt_tokens(
+        self, prompt_tokens: Tensor | Sequence[Token]
+    ) -> list[Token]:
+        """Convert prompt_tokens to a list of Token objects."""
+        if isinstance(prompt_tokens, Tensor):
+            tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
+            if tokens_view.ndim != 2:
+                raise ValueError(
+                    f"prompt_tokens must have shape (1, N); received {tokens_view.shape}"
+                )
+            return [TextToken(int(tid)) for tid in tokens_view[0].tolist()]
+        return list(prompt_tokens)
+
+    def _build_cache_tokens(
+        self,
+        tokens_list: list[Token],
+        image_hash: bytes | None,
+        image_kv_length: int,
+    ) -> list[CacheToken]:
+        """Build cache token sequence: [BOS, ImageToken?, text tokens...]."""
+        cache_tokens: list[CacheToken] = []
+        if tokens_list:
+            cache_tokens.append(tokens_list[0])  # BOS
+        if image_hash is not None:
+            cache_tokens.append(
+                ImageToken(
+                    content_hash=int.from_bytes(image_hash[:16], "big"),
+                    kv_length_=image_kv_length,
+                )
+            )
+        if len(tokens_list) > 1:
+            cache_tokens.extend(tokens_list[1:])
+        return cache_tokens
+
+    def _lookup_prefix_cache(
+        self,
+        cache_tokens: list[CacheToken],
+        adapter_id: str | None,
+        image_hash: bytes | None,
+        image_kv_length: int,
+        prompt_len: int,
+        batch_idx: int,
+    ) -> _CacheLookupResult:
+        """Lookup prefix cache, map cached pages, and acquire temp lock."""
+        if self.prefix_cache is None or not cache_tokens:
+            return _CacheLookupResult(
+                match=None,
+                skip_positions=0,
+                temp_lock_node=None,
+                can_reuse=False,
+                namespace=None,
+            )
+
+        # Build namespace from adapter identity and image hash
+        image_hash_int = (
+            int.from_bytes(image_hash[:16], "big") if image_hash else None
+        )
+        namespace = CacheNamespace(
+            lora_id=adapter_id,
+            image_hash=image_hash_int,
+        )
+        match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
+        can_reuse = match.matched_kv_length > 0
+
+        # Invariant: In image namespace, any hit must include BOS+image.
+        if image_kv_length > 0 and can_reuse:
+            assert match.matched_kv_length >= (1 + image_kv_length), (
+                f"Invariant violated: image namespace hit ({match.matched_kv_length} KV) "
+                f"must include BOS+image ({1 + image_kv_length} KV)"
+            )
+
+        skip_positions = 0
+        temp_lock_node: TreeNode | None = None
+
+        if can_reuse:
+            # Cap skip_positions to ensure at least one suffix KV position
+            skip_positions = min(match.matched_kv_length, prompt_len - 1)
+
+            # Map cached pages
+            cached_pages = match.matched_pages[:skip_positions]
+            self.page_table.map_pages(batch_idx, 0, cached_pages)
+
+            # Lock matched prefix during prefill
+            temp_lock_node = match.last_node
+            self.prefix_cache.lock(temp_lock_node)
+
+        return _CacheLookupResult(
+            match=match,
+            skip_positions=skip_positions,
+            temp_lock_node=temp_lock_node,
+            can_reuse=can_reuse,
+            namespace=namespace,
+        )
+
+    def _prepare_append_prefill_inputs(
+        self,
+        tokens_list: list[Token],
+        skip_positions: int,
+        image_kv_length: int,
+        prompt_len: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Prepare inputs for append prefill (cache hit path)."""
+        # Derive suffix tokens from skip_positions
+        if image_kv_length > 0:
+            # KV layout: [BOS(1)] [Image(image_kv_length)] [Text tokens...]
+            prefix_kv = 1 + image_kv_length
+            text_kv_cached = skip_positions - prefix_kv
+            # tokens_list[0] = BOS, tokens_list[1:] = text after image
+            suffix_tokens = tokens_list[1 + text_kv_cached :]
+        else:
+            suffix_tokens = tokens_list[skip_positions:]
+
+        # Embed suffix tokens
+        if suffix_tokens:
+            inputs_embeds = self._embed_tokens(suffix_tokens)
+        else:
+            # This shouldn't happen due to skip_positions capping
+            inputs_embeds = torch.empty(
+                (1, 0, self.bos_embed.shape[-1]),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+        position_ids = torch.arange(
+            skip_positions, prompt_len, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        # FA3 needs to know total KV length (cached + new)
+        fa3_seqused_k = torch.tensor(
+            [prompt_len], dtype=torch.int32, device=self.device
+        )
+
+        return inputs_embeds, position_ids, fa3_seqused_k
+
+    def _prepare_full_prefill_inputs(
+        self,
+        tokens_list: list[Token],
+        image: Optional[pyvips.Image | np.ndarray],
+        image_crops: Optional[OverlapCropOutput],
+        prompt_len: int,
+    ) -> tuple[Tensor, Tensor, None]:
+        """Prepare inputs for full prefill (cache miss path)."""
+        # Embed prompt tokens
+        if len(tokens_list) > 0:
+            prompt_embed = self._embed_tokens(tokens_list)
+        else:
+            prompt_embed = None
+
+        segments: list[Tensor] = []
+        if prompt_embed is not None and len(tokens_list) > 0:
+            # Add BOS embed (first token)
+            segments.append(prompt_embed[:, :1, :])
+
+        if image is not None or image_crops is not None:
+            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
+            segments.append(image_embed)
+
+        if prompt_embed is not None and len(tokens_list) > 1:
+            # Add remaining tokens after BOS
+            segments.append(prompt_embed[:, 1:, :])
+
+        if not segments:
+            segments = [self.bos_embed]
+
+        inputs_embeds = torch.cat(segments, dim=1)
+        position_ids = torch.arange(
+            prompt_len, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        return inputs_embeds, position_ids, None
+
+    def _finalize_cache_after_prefill(
+        self,
+        cache_tokens: list[CacheToken],
+        cache_result: _CacheLookupResult,
+        prompt_len: int,
+        batch_idx: int,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> tuple[TreeNode | None, int]:
+        """Insert into cache and handle lock transfer after prefill."""
+        if self.prefix_cache is None or not cache_tokens:
+            return None, 0
+
+        full_prompt_cached = (
+            cache_result.can_reuse
+            and cache_result.match is not None
+            and cache_result.match.matched_kv_length >= prompt_len
+        )
+
+        if full_prompt_cached:
+            # Full prompt was cached - don't insert
+            return cache_result.temp_lock_node, cache_result.skip_positions
+
+        # Insert prompt into cache
+        prompt_pages = self.page_table.get_pages(batch_idx, 0, prompt_len)
+        namespace = CacheNamespace(
+            lora_id=adapter_id,
+            image_hash=(
+                int.from_bytes(image_hash[:16], "big") if image_hash else None
+            ),
+        )
+        insert_result = self.prefix_cache.insert(
+            cache_tokens,
+            prompt_pages,
+            namespace=namespace,
+            from_node=cache_result.match.last_node if cache_result.match else None,
+            from_token_idx=(
+                cache_result.match.matched_token_count if cache_result.match else 0
+            ),
+            from_page_idx=cache_result.skip_positions,
+        )
+
+        # Lock transfer
+        temp_lock_node = cache_result.temp_lock_node
+        if temp_lock_node is None:
+            # Miss path
+            self.prefix_cache.lock(insert_result.node)
+            cache_lock_node = insert_result.node
+        elif insert_result.node is temp_lock_node:
+            # Identity case
+            cache_lock_node = temp_lock_node
+        else:
+            # Partial hit path
+            self.prefix_cache.lock(insert_result.node)
+            self.prefix_cache.unlock(temp_lock_node)
+            cache_lock_node = insert_result.node
+
+        cache_owned_page_count = cache_result.skip_positions + insert_result.inserted_pages
+        return cache_lock_node, cache_owned_page_count
+
+    # ------------------------------------------------------------------
+
     def start_sequence(
         self,
         prompt_tokens: Tensor | Sequence[Token],
@@ -594,35 +898,44 @@ class MoondreamRuntime:
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
+        image_hash: bytes | None = None,
+        adapter_id: str | None = None,
     ) -> tuple[SequenceState, Tensor]:
-        if isinstance(prompt_tokens, Tensor):
-            tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
-            if tokens_view.ndim != 2:
+        # 1. Normalize inputs
+        tokens_list = self._normalize_prompt_tokens(prompt_tokens)
+
+        # 2. Validate image/hash consistency
+        if image is None:
+            assert image_hash is None, "image_hash must be None when image is None"
+        else:
+            # Image prompts must have at least one text token after BOS to ensure
+            # correct suffix slicing on cache hit (text_kv_cached >= 0).
+            if len(tokens_list) < 2:
                 raise ValueError(
-                    f"prompt_tokens must have shape (1, N); received {tokens_view.shape}"
+                    "Image prompts must include at least one text token after BOS"
                 )
-            prompt_embed = (
-                text_encoder(tokens_view, self.model.text)
-                if tokens_view.shape[1]
-                else None
+            if self.prefix_cache is not None:
+                assert image_hash is not None, (
+                    "image_hash must be provided when image is not None and prefix cache is enabled"
+                )
+
+        # 3. Compute dimensions
+        image_kv_length = self.image_prefix_length if image is not None else 0
+        prompt_len = len(tokens_list) + image_kv_length
+
+        # Build image_regions for attention masking. Until multi-image support,
+        # this must be either [] (no image) or [(1, 1+image_kv_length)] (single image).
+        if image is not None:
+            image_regions: list[tuple[int, int]] = [(1, 1 + image_kv_length)]
+            # Validate single-image invariant
+            assert len(image_regions) == 1, "Multi-image not yet supported"
+            expected_region = (1, 1 + self.image_prefix_length)
+            assert image_regions[0] == expected_region, (
+                f"Unexpected image region {image_regions[0]}, expected {expected_region}"
             )
         else:
-            prompt_embed = self._embed_tokens(list(prompt_tokens))
-            if prompt_embed.shape[1] == 0:
-                prompt_embed = None
+            image_regions = []
 
-        segments: list[Tensor] = [self.bos_embed]
-        image_length = 0
-        if image is not None or image_crops is not None:
-            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
-            segments.append(image_embed)
-            image_length = image_embed.shape[1]
-        if prompt_embed is not None:
-            segments.append(prompt_embed)
-
-        inputs_embeds = torch.cat(segments, dim=1)
-
-        prompt_len = inputs_embeds.shape[1]
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
         target_length = prompt_len + max_new
         if target_length > self.max_seq_length:
@@ -630,47 +943,99 @@ class MoondreamRuntime:
                 f"Requested length {target_length} exceeds max_seq_length={self.max_seq_length}."
             )
 
+        # 4. Build cache tokens
+        cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
+
+        # 5. Allocate batch slot
         batch_idx = self.page_table.allocate()
         self._prefill_batch_idx.cpu[0] = batch_idx
         batch_tensor = self._prefill_batch_idx.copy_to_gpu()
-        self.page_table.reserve(
-            batch_idx_int=batch_idx,
-            batch_idx=batch_tensor,
-            seq_len=target_length,
+
+        # 6. Cache lookup (maps pages, acquires temp lock)
+        cache_result = self._lookup_prefix_cache(
+            cache_tokens, adapter_id, image_hash, image_kv_length, prompt_len, batch_idx
         )
-        self._batch_binding.tensor = batch_tensor
 
-        attention_mask = None
-        position_ids = torch.arange(
-            prompt_len, dtype=torch.long, device=self.device
-        ).unsqueeze(0)
-
-        self._active_prefill_batch_idx = batch_tensor
+        # Steps 7-10 can fail; ensure we clean up batch slot and cache lock on error.
         try:
-            hidden, logits = self._prefill(
-                inputs_embeds,
-                attention_mask,
-                position_ids,
-                lora_slot,
-                use_prefix_attn=bool(image_length),
+            # 7. Reserve remaining pages for decode. On cache hit, map_pages() in step 6
+            # already set capacity to skip_positions, so reserve() only allocates suffix
+            # pages (target_length - skip_positions), not the full target_length.
+            self.page_table.reserve(
+                batch_idx_int=batch_idx,
+                batch_idx=batch_tensor,
+                seq_len=target_length,
             )
-        finally:
-            self._active_prefill_batch_idx = None
+            self._batch_binding.tensor = batch_tensor
+
+            # 8. Prepare inputs (branch on cache hit)
+            if cache_result.can_reuse:
+                inputs_embeds, position_ids, fa3_seqused_k = self._prepare_append_prefill_inputs(
+                    tokens_list, cache_result.skip_positions, image_kv_length, prompt_len
+                )
+            else:
+                inputs_embeds, position_ids, fa3_seqused_k = self._prepare_full_prefill_inputs(
+                    tokens_list, image, image_crops, prompt_len
+                )
+
+            # 9. Run prefill
+            self._active_prefill_batch_idx = batch_tensor
+            try:
+                hidden, logits = self._prefill(
+                    inputs_embeds,
+                    None,  # attention_mask
+                    position_ids,
+                    lora_slot,
+                    use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
+                    fa3_seqused_k=fa3_seqused_k,
+                )
+            finally:
+                self._active_prefill_batch_idx = None
+
+            # 10. Finalize cache (insert + lock transfer)
+            cache_lock_node, cache_owned_page_count = self._finalize_cache_after_prefill(
+                cache_tokens, cache_result, prompt_len, batch_idx, adapter_id, image_hash
+            )
+        except Exception:
+            # Release temp cache lock if held
+            if (
+                self.prefix_cache is not None
+                and cache_result.temp_lock_node is not None
+            ):
+                self.prefix_cache.unlock(cache_result.temp_lock_node)
+            # Release batch slot (erase frees non-cache pages; 0 = no cache-owned pages yet)
+            self.page_table.erase(batch_idx, 0)
+            raise
+
+        # 11. Create state
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
             max_length=target_length,
             prompt_length=prompt_len,
-            image_length=image_length,
+            image_length=image_kv_length,
             last_hidden=hidden[:, -1, :].squeeze(0).detach(),
             lora_slot=lora_slot,
+            cache_tokens=cache_tokens if self.prefix_cache else None,
+            cache_lock_node=cache_lock_node,
+            cache_owned_page_count=cache_owned_page_count,
+            reused_page_count=cache_result.skip_positions,
+            image_regions=image_regions if image_regions else None,
         )
         self.active_sequences[batch_idx] = state
         return state, logits
 
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)
-        self.page_table.erase(state.batch_idx)
+
+        # Unlock the cached prefix (exactly one unlock per sequence)
+        if self.prefix_cache is not None and state.cache_lock_node is not None:
+            self.prefix_cache.unlock(state.cache_lock_node)
+
+        # Release batch slot
+        # Don't free cache-owned pages - they belong to the prefix cache tree
+        self.page_table.erase(state.batch_idx, state.cache_owned_page_count)
+
         # Release the adapter slot (no-op if lora_slot == 0)
         self.release_adapter_slot(state.lora_slot)
 
@@ -685,6 +1050,7 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool = False,
+        fa3_seqused_k: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         hidden, logits = self._prefill_fn(
             inputs_embeds,
@@ -692,6 +1058,7 @@ class MoondreamRuntime:
             position_ids,
             lora_slot,
             use_prefix_attn=use_prefix_attn,
+            fa3_seqused_k=fa3_seqused_k,
         )
         return hidden, logits
 
@@ -703,6 +1070,7 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool = False,
+        fa3_seqused_k: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         batch_idx = self._active_prefill_batch_idx
         if batch_idx is None:
@@ -712,9 +1080,11 @@ class MoondreamRuntime:
         )
 
         # Build FA3 paged attention metadata for prefill
-        seqlen = position_ids.max().item() + 1
         fa3_page_table = self.page_table.page_table[batch_idx : batch_idx + 1]
-        fa3_seqused_k = torch.tensor([seqlen], dtype=torch.int32, device=self.device)
+        if fa3_seqused_k is None:
+            # Standard prefill: KV length = position_ids.max() + 1
+            seqlen = position_ids.max().item() + 1
+            fa3_seqused_k = torch.tensor([seqlen], dtype=torch.int32, device=self.device)
 
         # For no-adapter prefill, skip LoRA entirely to avoid redundant work
         if lora_slot == 0:

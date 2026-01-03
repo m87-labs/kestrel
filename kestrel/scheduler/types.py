@@ -29,6 +29,7 @@ class GenerationRequest:
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
     image: Optional[pyvips.Image | np.ndarray] = None
+    image_hash: Optional[bytes] = None  # SHA256 hash for prefix caching
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0
     submitted_at: float = 0.0
@@ -156,6 +157,7 @@ class RequestMetrics:
     prefill_time_ms: float
     ttft_ms: float
     decode_time_ms: float
+    cached_tokens: int = 0  # KV positions reused from prefix cache
 
 
 @dataclass

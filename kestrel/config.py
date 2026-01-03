@@ -28,6 +28,7 @@ class RuntimeConfig:
     page_size: int = 1
     max_seq_length: int = 32768
     enable_cuda_graphs: bool = True
+    enable_prefix_cache: bool = True
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

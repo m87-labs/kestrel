@@ -26,6 +26,7 @@ Callers provide raw questions/objects; the engine derives skill-specific context
 
 
 import asyncio
+import hashlib
 import itertools
 import logging
 import math
@@ -93,6 +94,7 @@ class EngineMetrics:
     prefill_time_ms: float
     decode_time_ms: float
     ttft_ms: float
+    cached_tokens: int = 0  # KV positions reused from prefix cache
 
 
 @dataclass(slots=True)
@@ -171,6 +173,7 @@ class _PendingRequest:
     prompt_tokens: torch.Tensor
     prompt_length: int
     image: Optional[pyvips.Image | np.ndarray]
+    image_hash: Optional[bytes]  # SHA256 hash for prefix caching
     max_new_tokens: int
     temperature: float
     top_p: float
@@ -791,12 +794,19 @@ class InferenceEngine:
             )
 
         image_obj: Optional[pyvips.Image | np.ndarray] = None
+        image_hash: Optional[bytes] = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
             if not isinstance(image, (pyvips.Image, np.ndarray)):
                 raise TypeError("image must be a pyvips.Image or np.ndarray")
             image_obj = image
+            # Compute image hash for prefix caching
+            if isinstance(image, pyvips.Image):
+                raw_bytes = image.write_to_buffer(".png")
+            else:
+                raw_bytes = image.tobytes()
+            image_hash = hashlib.sha256(raw_bytes).digest()
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)
         tokens = skill_spec.build_prompt_tokens(self.runtime, request_context)
@@ -808,6 +818,7 @@ class InferenceEngine:
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
             image=image_obj,
+            image_hash=image_hash,
             max_new_tokens=max_new_tokens,
             temperature=self._normalize_temperature(temperature),
             top_p=self._normalize_top_p(top_p),
@@ -1150,6 +1161,7 @@ class InferenceEngine:
             top_p=req.top_p,
             stream_callback=stream_cb,
             image=req.image,
+            image_hash=req.image_hash,
             image_crops=image_crops,
             image_length=image_length,
             submitted_at=req.submitted_at,
@@ -1183,6 +1195,7 @@ class InferenceEngine:
             prefill_time_ms=prefill_time_ms,
             decode_time_ms=decode_time_ms,
             ttft_ms=ttft_ms,
+            cached_tokens=sched_metrics.cached_tokens,
         )
         return EngineResult(
             request_id=result.request_id,

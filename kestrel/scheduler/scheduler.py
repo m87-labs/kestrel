@@ -373,6 +373,8 @@ class GenerationScheduler:
                     image_crops=request.image_crops,
                     max_new_tokens=request.max_new_tokens,
                     lora_slot=request.lora_slot,
+                    image_hash=request.image_hash,
+                    adapter_id=request.adapter,
                 )
             except Exception as exc:
                 # Release slot on failure to prevent leak
@@ -865,6 +867,7 @@ class GenerationScheduler:
             prefill_time_ms=prefill_time_ms,
             ttft_ms=ttft_ms,
             decode_time_ms=decode_time_ms,
+            cached_tokens=seq.state.reused_page_count,
         )
         return SchedulerResult(
             request_id=seq.request.request_id,
