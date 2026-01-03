@@ -12,7 +12,7 @@ def device():
 
 
 class TestFusedMoECuTe:
-    @pytest.mark.parametrize("num_tokens", [4, 32])
+    @pytest.mark.parametrize("num_tokens", [4, 9, 16, 32])
     def test_matches_triton_decode_shapes(self, device, num_tokens: int):
         torch.manual_seed(0)
 
