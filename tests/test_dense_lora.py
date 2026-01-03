@@ -150,8 +150,8 @@ class TestApplyDenseLoRA:
 
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
-    def test_accumulates_into_output(self, device, dtype):
-        """Test that apply_dense_lora accumulates into existing output values."""
+    def test_writes_to_output(self, device, dtype):
+        """Test that apply_dense_lora writes to output buffer (caller adds to base)."""
         max_slots = 4
         rank = 8
         hidden_dim = 64
@@ -166,12 +166,10 @@ class TestApplyDenseLoRA:
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         lora_slot_ids = torch.tensor([1, 2, 1, 2], dtype=torch.int32, device=device)
 
-        # Start with non-zero output
-        initial_output = torch.randn(num_tokens, out_dim, dtype=dtype, device=device)
-        output = initial_output.clone()
+        # Start with zero output - kernel writes delta directly
+        output = torch.zeros(num_tokens, out_dim, dtype=dtype, device=device)
 
-        lora_delta = naive_dense_lora(x, lora_a, lora_b, lora_slot_ids)
-        expected = initial_output + lora_delta
+        expected = naive_dense_lora(x, lora_a, lora_b, lora_slot_ids)
 
         apply_dense_lora(x, output, lora_a, lora_b, lora_slot_ids)
 
@@ -272,3 +270,67 @@ class TestApplyDenseLoRA:
             for j in range(i + 1, len(outputs)):
                 assert not torch.allclose(outputs[i], outputs[j]), \
                     f"Slots {i+1} and {j+1} should produce different outputs"
+
+
+class TestMlpCudaGraph:
+    """Test mlp function with CUDA graph capture."""
+
+    @pytest.mark.skip(reason="LoRA routing allocates tensors during graph capture - needs fix")
+    def test_mlp_with_lora_cudagraph(self, device, dtype):
+        """Test that mlp with LoRA can be captured in a CUDA graph."""
+        from kestrel.moondream.layers import mlp, MLPWeights, LinearWeights
+
+        batch = 2
+        seq_len = 4
+        d_model = 64
+        d_ffn = 128
+        max_slots = 4
+        rank = 8
+
+        # Create MLP weights
+        fc1_weight = torch.randn(d_ffn, d_model, dtype=dtype, device=device)
+        fc1_bias = torch.randn(d_ffn, dtype=dtype, device=device)
+        fc2_weight = torch.randn(d_model, d_ffn, dtype=dtype, device=device)
+        fc2_bias = torch.randn(d_model, dtype=dtype, device=device)
+        mlp_weights = MLPWeights(
+            fc1=LinearWeights(weight=fc1_weight, bias=fc1_bias),
+            fc2=LinearWeights(weight=fc2_weight, bias=fc2_bias),
+        )
+
+        # Create LoRA workspace
+        lora_workspace = DenseLoRALayerWorkspace(
+            up_a=torch.randn(max_slots, rank, d_model, dtype=dtype, device=device) * 0.1,
+            up_b=torch.randn(max_slots, d_ffn, rank, dtype=dtype, device=device) * 0.1,
+            down_a=torch.randn(max_slots, rank, d_ffn, dtype=dtype, device=device) * 0.1,
+            down_b=torch.randn(max_slots, d_model, rank, dtype=dtype, device=device) * 0.1,
+        )
+        # Zero out slot 0 (no LoRA)
+        lora_workspace.up_a[0].zero_()
+        lora_workspace.up_b[0].zero_()
+        lora_workspace.down_a[0].zero_()
+        lora_workspace.down_b[0].zero_()
+
+        # Graph-owned input/output buffers
+        x = torch.randn(batch, seq_len, d_model, dtype=dtype, device=device)
+        lora_slot_ids = torch.tensor([1, 2], dtype=torch.int32, device=device)
+
+        # Warmup
+        for _ in range(3):
+            out = mlp(x, mlp_weights, lora_workspace=lora_workspace, lora_slot_ids=lora_slot_ids)
+        torch.cuda.synchronize()
+
+        # Capture graph
+        g = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            torch.cuda.synchronize()
+            with torch.cuda.graph(g, stream=stream):
+                out_graph = mlp(x, mlp_weights, lora_workspace=lora_workspace, lora_slot_ids=lora_slot_ids)
+
+        # Replay and verify output matches eager
+        x.copy_(torch.randn_like(x))
+        g.replay()
+        torch.cuda.synchronize()
+
+        out_eager = mlp(x, mlp_weights, lora_workspace=lora_workspace, lora_slot_ids=lora_slot_ids)
+        torch.testing.assert_close(out_graph, out_eager, rtol=1e-3, atol=1e-3)

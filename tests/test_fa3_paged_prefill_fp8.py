@@ -87,12 +87,12 @@ def _sdpa_math(
     is_causal: bool,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
     q_4d = q.permute(0, 2, 1, 3).to(torch.float32)
     k_4d = k.permute(0, 2, 1, 3).to(torch.float32)
     v_4d = v.permute(0, 2, 1, 3).to(torch.float32)
-    with torch.backends.cuda.sdp_kernel(
-        enable_flash=False, enable_math=True, enable_mem_efficient=False
-    ):
+    with sdpa_kernel(SDPBackend.MATH):
         out = F.scaled_dot_product_attention(
             q_4d, k_4d, v_4d, attn_mask=attn_mask, is_causal=is_causal
         )
