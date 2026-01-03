@@ -122,6 +122,7 @@ class PageTable:
         page_size: int,
         max_batch_size: int,
         device: str = "cuda",
+        prefix_cache=None,
     ):
         self.n_pages = n_pages
         self.page_size = page_size
@@ -156,6 +157,17 @@ class PageTable:
         self.physical_to_logical = -torch.ones(
             (max_batch_size, n_pages), dtype=torch.int64, device=device
         )
+
+        # Prefix cache for on-demand eviction (optional)
+        self.prefix_cache = None
+        if prefix_cache is not None:
+            assert page_size == 1, (
+                f"Prefix caching requires page_size=1, got {page_size}. "
+                "With page_size>1, partial page reuse would cause leaks or corruption."
+            )
+            # Wire eviction to return pages to our free pool
+            prefix_cache._free_pages_sink = self.free_pages_to_pool
+            self.prefix_cache = prefix_cache
 
     def can_reserve(self, size: int, batch_idx_int: int | None = None) -> bool:
         """check if we can reserve new pages for an existing request or a new request, without gpu operations"""
@@ -246,18 +258,23 @@ class PageTable:
         self.capacity[batch_idx_int] += num_pages_to_allocate * self.page_size
         return True
 
-    def erase(self, batch_idx: int) -> None:
+    def erase(self, batch_idx: int, cached_page_count: int = 0) -> None:
         """
         Removes a single batch from paged attention.
 
         Args:
-            batch_idx (int): batch index to be removed;
+            batch_idx: Batch index to be removed.
+            cached_page_count: Number of leading pages owned by prefix cache.
+                These are NOT returned to free pool (they belong to cache tree).
         """
         # NOTE: the GPU side data will only be reset/overwritten when we allocate it for a new batch
         self.free_batch_idx.append(batch_idx)
         allocated_pages_cpu = self.page_table_cpu[batch_idx]
-        self.free_pages.extend(reversed(allocated_pages_cpu))
+        # Skip cached pages (they belong to the prefix cache tree)
+        pages_to_free = allocated_pages_cpu[cached_page_count:]
+        self.free_pages.extend(reversed(pages_to_free))
         self.page_table_cpu[batch_idx] = []
+        self.capacity[batch_idx] = 0
 
     def populate_fa3_decode_metadata(
         self,
@@ -366,6 +383,156 @@ class PageTable:
 
     def _sync_full_page_table(self) -> None:
         self._page_table_buffer.copy_to_gpu()
+
+    # =========================================================================
+    # Prefix cache integration methods
+    # =========================================================================
+
+    def allocate_pages(self, count: int) -> list[int]:
+        """Allocate physical pages from free pool, evicting from cache if needed.
+
+        Unlike reserve(), this returns unbound physical pages that must be
+        mapped via map_pages(). Used for suffix allocation after cache hit.
+
+        Args:
+            count: Number of pages to allocate.
+
+        Returns:
+            List of physical page indices.
+
+        Raises:
+            RuntimeError: If not enough pages available even after eviction.
+        """
+        available = len(self.free_pages)
+
+        if available < count and self.prefix_cache is not None:
+            needed = count - available
+            # evict() sends freed pages directly to free_pages_to_pool via sink
+            self.prefix_cache.evict(needed)
+            available = len(self.free_pages)
+
+        if available < count:
+            msg = f"Cannot allocate {count} pages: {available} available"
+            if self.prefix_cache is not None:
+                msg += ", all cached prefixes are locked by active sequences"
+            raise RuntimeError(msg)
+
+        return [self.free_pages.pop() for _ in range(count)]
+
+    def map_pages(
+        self,
+        batch_idx: int,
+        logical_start: int,
+        physical_pages: list[int],
+    ) -> None:
+        """Map physical pages into a batch's page table at specified positions.
+
+        Used for:
+        1. Mapping cached pages at logical_start=0
+        2. Mapping newly allocated suffix pages at logical_start=skip_positions
+
+        INVARIANT: map_pages() must be called sequentially - logical_start must
+        equal the current number of mapped pages for this batch. This is because
+        page_table_cpu[batch_idx].extend() assumes non-overlapping, sequential
+        mappings.
+
+        Args:
+            batch_idx: Target batch slot.
+            logical_start: First logical page index (must match current length).
+            physical_pages: Physical page indices to map.
+        """
+        # Enforce sequential, non-overlapping invariant
+        current_len = len(self.page_table_cpu[batch_idx])
+        assert logical_start == current_len, (
+            f"map_pages must be called sequentially: expected logical_start="
+            f"{current_len}, got {logical_start}"
+        )
+
+        if not physical_pages:
+            return
+
+        # Update CPU page table tensor
+        end = logical_start + len(physical_pages)
+        pages_tensor = torch.as_tensor(physical_pages, dtype=torch.int32)
+        self._page_table_cpu_tensor[batch_idx, logical_start:end] = pages_tensor
+
+        # Sync to GPU
+        self._sync_page_table_row(batch_idx, start=logical_start, end=end)
+
+        # Update physical_to_logical mapping
+        pages_gpu = pages_tensor.to(device=self.device, dtype=torch.long)
+        self.physical_to_logical[batch_idx, pages_gpu] = torch.arange(
+            logical_start, end, device=self.device
+        )
+
+        # Update capacity to cover all mapped pages
+        new_capacity = end * self.page_size
+        self.capacity[batch_idx] = max(self.capacity[batch_idx], new_capacity)
+
+        # Track pages for this batch (for erase())
+        self.page_table_cpu[batch_idx].extend(physical_pages)
+
+    def get_pages(self, batch_idx: int, start: int, end: int) -> list[int]:
+        """Get physical page indices for a range of logical pages.
+
+        Used after prefill to get the physical pages for cache insertion.
+
+        Args:
+            batch_idx: Batch slot to query.
+            start: Start logical page index (inclusive).
+            end: End logical page index (exclusive).
+
+        Returns:
+            List of physical page indices.
+        """
+        return [
+            self._page_table_cpu_tensor[batch_idx, i].item()
+            for i in range(start, end)
+        ]
+
+    def free_pages_to_pool(self, pages: tuple[int, ...] | list[int]) -> None:
+        """Return pages to free pool. Called by cache eviction.
+
+        Args:
+            pages: Physical page indices to free.
+        """
+        self.free_pages.extend(reversed(pages))
+
+    def can_reserve_with_eviction(
+        self, size: int, batch_idx_int: int | None = None
+    ) -> bool:
+        """Check if we can reserve pages, considering evictable cache pages.
+
+        Extends existing can_reserve() to account for prefix cache.
+
+        Args:
+            size: Number of KV positions needed.
+            batch_idx_int: Existing batch slot, or None for new request.
+
+        Returns:
+            True if reservation is possible (with eviction if needed).
+        """
+        if batch_idx_int is None:
+            # New request: need batch slot + pages
+            if len(self.free_batch_idx) == 0:
+                return False
+            pages_needed = (size + self.page_size - 1) // self.page_size
+        else:
+            # Existing request: just need pages
+            current = self.capacity[batch_idx_int]
+            if size <= current:
+                return True
+            pages_needed = (size - current + self.page_size - 1) // self.page_size
+
+        available = self.pages_available
+        if available >= pages_needed:
+            return True
+
+        # Check if eviction could free enough
+        if self.prefix_cache is not None:
+            evictable = self.prefix_cache.evictable_page_count()
+            return available + evictable >= pages_needed
+        return False
 
 
 @triton.jit

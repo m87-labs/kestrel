@@ -88,14 +88,16 @@ class BasePrefixCache(ABC):
         ...
 
     @abstractmethod
-    def evict(self, needed_pages: int) -> tuple[int, list[int]]:
+    def evict(self, needed_pages: int) -> int:
         """Evict unlocked leaves to free pages using LRU policy.
+
+        Freed pages are sent to the free_pages_sink callback (if configured).
 
         Args:
             needed_pages: Number of pages to free.
 
         Returns:
-            Tuple of (pages_freed_count, list_of_freed_page_indices).
+            Number of pages actually freed.
         """
         ...
 

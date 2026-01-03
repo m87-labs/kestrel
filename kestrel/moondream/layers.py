@@ -69,22 +69,6 @@ class _DenseLoRARouting:
     block_size_m: int
 
 
-def _get_dummy_topk_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return a device/dtype-matched dummy tensor for topk_weights.
-
-    Dense LoRA uses mul_routed_weight=False, so the LoRA kernel never reads
-    topk_weights. Avoid allocating a [num_tokens, 1] tensor of ones per call.
-    """
-    cache = getattr(_get_dummy_topk_weights, "_cache", {})
-    key = (device.type, device.index, dtype)
-    weights = cache.get(key)
-    if weights is None:
-        weights = torch.empty((0,), dtype=dtype, device=device)
-        cache[key] = weights
-        setattr(_get_dummy_topk_weights, "_cache", cache)
-    return weights
-
-
 def _prepare_dense_lora_routing(
     lora_slot_ids: torch.Tensor,
     *,
@@ -114,20 +98,20 @@ def _prepare_dense_lora_routing(
     num_tokens = lora_slot_ids.shape[0]
     topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
 
-    # lora_ids maps grid index to lora_id (dense: grid idx = lora_id)
-    lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
-
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_lora_align_block_size(
         topk_ids,
         token_lora_mapping,
         block_size_m,
         num_experts,
         max_loras,
-        lora_ids=lora_ids,
     )
 
+    # topk_weights shape [M, top_k] is required by the kernel for shape inference.
+    # Values unused when mul_routed_weight=False but shape must be correct.
+    topk_weights = torch.ones((num_tokens, 1), dtype=dtype, device=device)
+
     return _DenseLoRARouting(
-        topk_weights=_get_dummy_topk_weights(device, dtype),
+        topk_weights=topk_weights,
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
@@ -239,21 +223,25 @@ def mlp(
     if use_lora:
         # Flatten for LoRA kernel: [batch * seq_len, dim]
         x_flat = x.view(-1, C)
-        h_flat = h.view(-1, h.shape[-1])
+        # Use separate buffer for LoRA delta, then add to base output
+        lora_delta = torch.zeros_like(h.view(-1, h.shape[-1]))
         assert routing is not None
         _apply_dense_lora_with_routing(
-            x_flat, h_flat, lora_workspace.up_a, lora_workspace.up_b, routing
+            x_flat, lora_delta, lora_workspace.up_a, lora_workspace.up_b, routing
         )
+        h = h + lora_delta.view_as(h)
 
     h = gelu_approx(h)
     out = linear(h, w.fc2)
     if use_lora:
         h_flat = h.view(-1, h.shape[-1])
-        out_flat = out.view(-1, out.shape[-1])
+        # Use separate buffer for LoRA delta, then add to base output
+        lora_delta = torch.zeros_like(out.view(-1, out.shape[-1]))
         assert routing is not None
         _apply_dense_lora_with_routing(
-            h_flat, out_flat, lora_workspace.down_a, lora_workspace.down_b, routing
+            h_flat, lora_delta, lora_workspace.down_a, lora_workspace.down_b, routing
         )
+        out = out + lora_delta.view_as(out)
 
     return out
 
