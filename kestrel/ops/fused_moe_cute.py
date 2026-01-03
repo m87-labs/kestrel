@@ -801,6 +801,14 @@ class _FusedMoeMatmulCuTe:
             else:
                 rC.store(acc.load().to(self.dtype))
             smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
+            if const_expr(block_n == 32):
+                # When block_n=32, each warp effectively owns 32 / 4 = 8 columns of C.
+                # fa_utils does `stmatrix.x4`, which is a wider store. This leads to
+                # garbage data being written to SMEM. Use a narrower variant instead.
+                smem_store_atom = cute.make_copy_atom(
+                    warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
+                    self.dtype,
+                )
             smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
             tCsC = smem_thr_store.partition_D(sC)
             tCrC = smem_thr_store.retile(rC)
