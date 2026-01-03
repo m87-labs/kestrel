@@ -208,3 +208,158 @@ def test_fa3_paged_prefill_fp8_prefixlm_matches_sdpa(device: torch.device) -> No
     out_ref = _sdpa_math(q, k_ref, v_ref, is_causal=False, attn_mask=attn_mask)
 
     torch.testing.assert_close(out_fa3, out_ref, rtol=6e-2, atol=3e-2)
+
+
+def test_fa3_paged_prefill_append_attention_matches_full_prefill(device: torch.device) -> None:
+    """Verify append attention (suffix-only Q with full KV) produces correct output.
+
+    The causal mask formula uses (seqlen_k - seqlen_q) to right-align Q with K,
+    which naturally handles append attention when:
+    - Q contains only suffix tokens
+    - K/V contains full cache (prefix + suffix)
+    - seqused_k = total_len
+    """
+    torch.manual_seed(0)
+    torch.cuda.set_device(device)
+    torch.set_grad_enabled(False)
+
+    from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
+
+    dtype = torch.bfloat16
+    batch_size = 1
+    num_heads = 4
+    head_dim = 64
+    total_len = 200
+    prefix_len = 150
+    suffix_len = total_len - prefix_len
+    page_size = 1
+
+    q_full = torch.randn((batch_size, total_len, num_heads, head_dim), device=device, dtype=dtype)
+    k_dense = torch.randn_like(q_full)
+    v_dense = torch.randn_like(q_full)
+
+    page_table, k_paged, v_paged = _build_paged_kv(
+        k_dense=k_dense, v_dense=v_dense, page_size=page_size
+    )
+    seqused_k = torch.full((batch_size,), total_len, device=device, dtype=torch.int32)
+
+    # Reference: full prefill, extract suffix output
+    out_full, _ = _flash_attn_fwd(
+        q_full, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+    out_ref = out_full[:, prefix_len:, :, :]  # Suffix portion
+
+    # Test: suffix-only Q with full KV cache
+    # The formula (seqlen_k - seqlen_q) = (200 - 50) = 150 automatically right-aligns Q
+    q_suffix = q_full[:, prefix_len:, :, :]
+    out_append, _ = _flash_attn_fwd(
+        q_suffix, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+
+    torch.testing.assert_close(out_append, out_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_fa3_paged_prefill_append_attention_non_tile_aligned(device: torch.device) -> None:
+    """Verify append attention works when prefix_len is not aligned to tile_m (128)."""
+    torch.manual_seed(0)
+    torch.cuda.set_device(device)
+    torch.set_grad_enabled(False)
+
+    from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
+
+    dtype = torch.bfloat16
+    batch_size = 1
+    num_heads = 4
+    head_dim = 64
+    total_len = 200
+    prefix_len = 137  # Not aligned to tile_m=128
+    suffix_len = total_len - prefix_len
+    page_size = 1
+
+    q_full = torch.randn((batch_size, total_len, num_heads, head_dim), device=device, dtype=dtype)
+    k_dense = torch.randn_like(q_full)
+    v_dense = torch.randn_like(q_full)
+
+    page_table, k_paged, v_paged = _build_paged_kv(
+        k_dense=k_dense, v_dense=v_dense, page_size=page_size
+    )
+    seqused_k = torch.full((batch_size,), total_len, device=device, dtype=torch.int32)
+
+    # Reference: full prefill, extract suffix output
+    out_full, _ = _flash_attn_fwd(
+        q_full, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+    out_ref = out_full[:, prefix_len:, :, :]
+
+    # Test: suffix-only Q
+    q_suffix = q_full[:, prefix_len:, :, :]
+    out_append, _ = _flash_attn_fwd(
+        q_suffix, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+
+    torch.testing.assert_close(out_append, out_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_fa3_paged_prefill_append_attention_single_token(device: torch.device) -> None:
+    """Verify append attention works with a single suffix token (like decode position)."""
+    torch.manual_seed(0)
+    torch.cuda.set_device(device)
+    torch.set_grad_enabled(False)
+
+    from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
+
+    dtype = torch.bfloat16
+    batch_size = 1
+    num_heads = 4
+    head_dim = 64
+    total_len = 150
+    prefix_len = 149  # Single token suffix
+    page_size = 1
+
+    q_full = torch.randn((batch_size, total_len, num_heads, head_dim), device=device, dtype=dtype)
+    k_dense = torch.randn_like(q_full)
+    v_dense = torch.randn_like(q_full)
+
+    page_table, k_paged, v_paged = _build_paged_kv(
+        k_dense=k_dense, v_dense=v_dense, page_size=page_size
+    )
+    seqused_k = torch.full((batch_size,), total_len, device=device, dtype=torch.int32)
+
+    # Reference: full prefill, extract last token output
+    out_full, _ = _flash_attn_fwd(
+        q_full, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+    out_ref = out_full[:, prefix_len:, :, :]
+
+    # Test: single-token Q
+    q_suffix = q_full[:, prefix_len:, :, :]
+    out_append, _ = _flash_attn_fwd(
+        q_suffix, k_paged, v_paged,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        paged_kv_non_tma=True,
+    )
+
+    # Slightly relaxed tolerance for single-token case due to different tile accumulation order
+    torch.testing.assert_close(out_append, out_ref, rtol=1e-2, atol=3e-3)
