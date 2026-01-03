@@ -59,15 +59,15 @@ class TestFusedMoECuTe:
             config=FusedMoEConfig(backend="cute"),
         )
 
-        from kestrel.ops import fused_moe_cute as fused_moe_cute_mod
+        from kestrel_kernels import cute_moe as cute_moe_mod
 
         # Ensure we exercise the CuTe path for *both* moe_up and moe_down (avoid silent fallback).
-        fused_moe_cute_mod._COMPILE_CACHE.clear()
+        cute_moe_mod._COMPILE_CACHE.clear()
 
         out_triton = moe_triton(hidden_states, topk_weights, topk_ids)
         out_cute = moe_cute(hidden_states, topk_weights, topk_ids)
 
-        keys = list(fused_moe_cute_mod._COMPILE_CACHE.keys())
+        keys = list(cute_moe_mod._COMPILE_CACHE.keys())
         assert any(k[0] == "up" for k in keys), "CuTe moe_up did not compile/launch"
         assert any(k[0] == "down" for k in keys), "CuTe moe_down did not compile/launch"
 
@@ -145,9 +145,9 @@ class TestFusedMoECuTe:
             config=FusedMoEConfig(backend="cute"),
         )
 
-        from kestrel.ops import fused_moe_cute as fused_moe_cute_mod
+        from kestrel_kernels import cute_moe as cute_moe_mod
 
-        fused_moe_cute_mod._COMPILE_CACHE_FP8.clear()
+        cute_moe_mod._COMPILE_CACHE_FP8.clear()
 
         # Reference: dequantize both activations and weights, then run Triton MoE.
         block_m = 64
@@ -203,7 +203,7 @@ class TestFusedMoECuTe:
 
         out_fp8 = moe_fp8(hidden_states, topk_weights, topk_ids)
 
-        keys = list(fused_moe_cute_mod._COMPILE_CACHE_FP8.keys())
+        keys = list(cute_moe_mod._COMPILE_CACHE_FP8.keys())
         assert any(k[0] == "up" for k in keys), "CuTe FP8 moe_up did not compile/launch"
         assert any(k[0] == "down" for k in keys), "CuTe FP8 moe_down did not compile/launch"
 

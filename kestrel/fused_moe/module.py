@@ -758,12 +758,12 @@ class FusedMoEModule(nn.Module):
 
         if use_cute:
             try:
-                from kestrel.ops.fused_moe_cute import (
-                    FusedMoeCuTeConfig,
-                    invoke_fused_moe_kernel_cute_down_decode,
-                    invoke_fused_moe_kernel_cute_down_decode_fp8,
-                    invoke_fused_moe_kernel_cute_up_decode,
-                    invoke_fused_moe_kernel_cute_up_decode_fp8,
+                from kestrel_kernels.cute_moe import (
+                    CuteMoeConfig,
+                    invoke_cute_moe_down,
+                    invoke_cute_moe_down_fp8,
+                    invoke_cute_moe_up,
+                    invoke_cute_moe_up_fp8,
                 )
 
                 block_m = triton_config["BLOCK_SIZE_M"]
@@ -783,7 +783,7 @@ class FusedMoEModule(nn.Module):
                         # occupancy becomes the limiting factor.
                         num_stages = 4 if num_tokens <= 16 else 2
 
-                        cute_cfg = FusedMoeCuTeConfig(
+                        cute_cfg = CuteMoeConfig(
                             block_m=64,
                             block_n=block_n,
                             block_k=128,
@@ -796,7 +796,7 @@ class FusedMoEModule(nn.Module):
                                 raise ValueError("CuTe fp8 moe_down expects top_k=1")
                             if topk_weights is None:
                                 raise ValueError("topk_weights is required when mul_routed_weight=True")
-                            invoke_fused_moe_kernel_cute_down_decode_fp8(
+                            invoke_cute_moe_down_fp8(
                                 a_bits,
                                 a_scale,
                                 B,
@@ -811,7 +811,7 @@ class FusedMoEModule(nn.Module):
                         else:
                             if int(top_k) != 8:
                                 raise ValueError("CuTe fp8 moe_up expects top_k=8")
-                            invoke_fused_moe_kernel_cute_up_decode_fp8(
+                            invoke_cute_moe_up_fp8(
                                 a_bits,
                                 a_scale,
                                 B,
@@ -829,7 +829,7 @@ class FusedMoEModule(nn.Module):
                     num_tokens = int(C.shape[0])
                     if num_tokens <= 8:
                         if mul_routed_weight:
-                            cute_cfg = FusedMoeCuTeConfig(
+                            cute_cfg = CuteMoeConfig(
                                 block_m=16,
                                 block_n=64,
                                 block_k=256,
@@ -837,7 +837,7 @@ class FusedMoEModule(nn.Module):
                                 num_stages=1,
                             )
                         else:
-                            cute_cfg = FusedMoeCuTeConfig(
+                            cute_cfg = CuteMoeConfig(
                                 block_m=16,
                                 block_n=128,
                                 block_k=128,
@@ -848,7 +848,7 @@ class FusedMoEModule(nn.Module):
                         num_stages = int(triton_config["NUM_STAGES"])
                         if mul_routed_weight:
                             num_stages = min(2, num_stages)
-                        cute_cfg = FusedMoeCuTeConfig(
+                        cute_cfg = CuteMoeConfig(
                             block_m=block_m,
                             block_n=int(triton_config["BLOCK_SIZE_N"]),
                             block_k=int(triton_config["BLOCK_SIZE_K"]),
@@ -860,7 +860,7 @@ class FusedMoEModule(nn.Module):
                             raise ValueError("CuTe moe_down expects top_k=1")
                         if topk_weights is None:
                             raise ValueError("topk_weights is required when mul_routed_weight=True")
-                        invoke_fused_moe_kernel_cute_down_decode(
+                        invoke_cute_moe_down(
                             A,
                             B,
                             C,
@@ -873,7 +873,7 @@ class FusedMoEModule(nn.Module):
                     else:
                         if int(top_k) != 8:
                             raise ValueError("CuTe moe_up expects top_k=8")
-                        invoke_fused_moe_kernel_cute_up_decode(
+                        invoke_cute_moe_up(
                             A,
                             B,
                             C,
