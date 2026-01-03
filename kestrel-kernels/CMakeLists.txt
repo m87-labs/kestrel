@@ -93,3 +93,21 @@ add_kestrel_kernel(moe_sum "${KESTREL_OPS_DIR}/moe_sum/kernel.cu")
 add_kestrel_kernel(rotary_embedding "${KESTREL_OPS_DIR}/rotary_embedding/kernel.cu")
 add_kestrel_kernel(fp8_quant "${CMAKE_CURRENT_LIST_DIR}/csrc/fp8_quant/kernel.cu")
 add_kestrel_kernel(tau_tail "${CMAKE_CURRENT_LIST_DIR}/csrc/tau_tail/kernel.cu")
+
+# Precompile CuTe DSL kernels (topk)
+set(PRECOMPILE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/scripts/precompile_topk.py")
+set(PRECOMPILED_OUTPUT_DIR "${CMAKE_CURRENT_LIST_DIR}/python/kestrel_kernels/precompiled")
+
+add_custom_target(precompile_cute_kernels ALL
+  COMMAND ${Python_EXECUTABLE} "${PRECOMPILE_SCRIPT}"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+  COMMENT "Precompiling CuTe DSL kernels (topk)"
+  VERBATIM
+)
+
+# Install precompiled kernels
+install(
+  DIRECTORY "${PRECOMPILED_OUTPUT_DIR}/"
+  DESTINATION kestrel_kernels/precompiled
+  FILES_MATCHING PATTERN "*.so" PATTERN "*.py"
+)

@@ -4,6 +4,9 @@ requires = [
   "cmake>=3.26",
   "ninja",
   "torch==2.9.1",
+  "nvidia-cutlass-dsl==4.3.3",
+  "apache-tvm-ffi",
+  "torch-c-dlpack-ext",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
@@ -16,6 +19,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "nvidia-cutlass-dsl==4.3.3",
+  "apache-tvm-ffi",
+  "torch-c-dlpack-ext",
   "torch==2.9.1",
 ]
 

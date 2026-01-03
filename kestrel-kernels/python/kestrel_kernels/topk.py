@@ -2,6 +2,7 @@
 
 import math
 from functools import partial
+from pathlib import Path
 from typing import Optional, Type
 
 import torch
@@ -13,6 +14,11 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm
 
 
+# Precompiled kernel registry
+_precompiled_cache: dict = {}
+_precompiled_dir = Path(__file__).parent / "precompiled"
+
+
 torch2cute_dtype_map = {
     torch.float16: Float16,
     torch.bfloat16: BFloat16,
@@ -20,6 +26,65 @@ torch2cute_dtype_map = {
     torch.int32: Int32,
     torch.int64: Int64,
 }
+
+_cute_dtype_to_name = {
+    BFloat16: "bfloat16",
+    Float16: "float16",
+    Float32: "float32",
+}
+
+# Cache the architecture string
+_cuda_arch: str | None = None
+
+
+def _get_cuda_arch() -> str:
+    """Get the CUDA architecture string (e.g., 'sm90' for Hopper, 'sm100' for Blackwell)."""
+    global _cuda_arch
+    if _cuda_arch is None:
+        major, minor = torch.cuda.get_device_capability()
+        _cuda_arch = f"sm{major}{minor}"
+    return _cuda_arch
+
+
+def _get_precompiled_kernel_path(dtype, N: int, k: int, softmax: bool) -> Path | None:
+    """Get path to precompiled kernel if it exists."""
+    dtype_name = _cute_dtype_to_name.get(dtype)
+    if dtype_name is None:
+        return None
+
+    arch = _get_cuda_arch()
+    softmax_str = "softmax" if softmax else "nosoftmax"
+    filename = f"topk_{dtype_name}_n{N}_k{k}_{softmax_str}_{arch}.so"
+    path = _precompiled_dir / filename
+
+    return path if path.exists() else None
+
+
+def _load_precompiled_kernel(dtype, N: int, k: int, softmax: bool):
+    """Load a precompiled kernel if available, return None otherwise."""
+    compile_key = (dtype, N, k, softmax)
+
+    # Check if already loaded
+    if compile_key in _precompiled_cache:
+        return _precompiled_cache[compile_key]
+
+    # Check if precompiled file exists
+    so_path = _get_precompiled_kernel_path(dtype, N, k, softmax)
+    if so_path is None:
+        return None
+
+    # Load the module
+    mod = cute.runtime.load_module(str(so_path))
+
+    # Get the function by its exported name
+    dtype_name = _cute_dtype_to_name[dtype]
+    arch = _get_cuda_arch()
+    softmax_str = "softmax" if softmax else "nosoftmax"
+    function_name = f"topk_{dtype_name}_n{N}_k{k}_{softmax_str}_{arch}"
+
+    kernel_fn = getattr(mod, function_name)
+    _precompiled_cache[compile_key] = kernel_fn
+    return kernel_fn
 
 
 def make_fake_tensor(dtype, shape, divisibility=1) -> Optional[cute.Tensor]:
@@ -470,20 +535,16 @@ def _topk_fwd(
     dtype = torch2cute_dtype_map[x.dtype]
     compile_key = (dtype, N, k, softmax)
     if compile_key not in _compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        x_cute = make_fake_tensor(dtype, (batch_sym, N), div)
-        values_cute = make_fake_tensor(dtype, (batch_sym, k), div)
-        indices_cute = make_fake_tensor(Int32, (batch_sym, k), div)
-        topk_op = TopK(dtype, N, k, softmax=softmax)
-        _compile_cache[compile_key] = cute.compile(
-            topk_op,
-            x_cute,
-            values_cute,
-            indices_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
+        precompiled = _load_precompiled_kernel(dtype, N, k, softmax)
+        if precompiled is None:
+            dtype_name = _cute_dtype_to_name.get(dtype, dtype.__name__)
+            arch = _get_cuda_arch()
+            raise RuntimeError(
+                f"No precompiled kernel for topk(dtype={dtype_name}, N={N}, k={k}, "
+                f"softmax={softmax}, arch={arch}). "
+                f"Run precompile_topk.py on this architecture to generate it."
+            )
+        _compile_cache[compile_key] = precompiled
     _compile_cache[compile_key](x, values, indices)
 
 
