@@ -8,6 +8,7 @@ This file provides an equivalent kernel using NVIDIA's CuTe DSL.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import torch
@@ -29,6 +30,60 @@ from kestrel_kernels.flash_attn.cute import utils as fa_utils
 _CUTLASS_INITIALIZED = False
 _CUTE_KERNEL_ATTRS_SET: set[str] = set()
 _DEVICE_CACHE_CONFIG_SET = False
+
+# Precompiled kernel registry
+_precompiled_cache: Dict[Tuple[str, "CuteMoeConfig"], Any] = {}
+_precompiled_cache_fp8: Dict[Tuple[str, "CuteMoeConfig"], Any] = {}
+_precompiled_dir = Path(__file__).parent / "precompiled"
+_cuda_arch: str | None = None
+
+
+def _get_cuda_arch() -> str:
+    """Get the CUDA architecture string (e.g., 'sm90' for Hopper, 'sm100' for Blackwell)."""
+    global _cuda_arch
+    if _cuda_arch is None:
+        major, minor = torch.cuda.get_device_capability()
+        _cuda_arch = f"sm{major}{minor}"
+    return _cuda_arch
+
+
+def _get_precompiled_kernel_path(kind: str, config: "CuteMoeConfig") -> Path | None:
+    """Get path to precompiled kernel if it exists."""
+    arch = _get_cuda_arch()
+    filename = (
+        f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
+        f"_w{config.num_warps}_s{config.num_stages}_{arch}.so"
+    )
+    path = _precompiled_dir / filename
+    return path if path.exists() else None
+
+
+def _load_precompiled_kernel(kind: str, config: "CuteMoeConfig"):
+    """Load a precompiled kernel if available, return None otherwise."""
+    compile_key = (kind, config)
+
+    # Check if already loaded
+    if compile_key in _precompiled_cache:
+        return _precompiled_cache[compile_key]
+
+    # Check if precompiled file exists
+    so_path = _get_precompiled_kernel_path(kind, config)
+    if so_path is None:
+        return None
+
+    # Load the module
+    mod = cute.runtime.load_module(str(so_path))
+
+    # Get the function by its exported name
+    arch = _get_cuda_arch()
+    function_name = (
+        f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
+        f"_w{config.num_warps}_s{config.num_stages}_{arch}"
+    )
+
+    kernel_fn = getattr(mod, function_name)
+    _precompiled_cache[compile_key] = kernel_fn
+    return kernel_fn
 
 
 def _ensure_cutlass_initialized() -> None:
@@ -116,7 +171,7 @@ def _maybe_set_device_cache_config() -> None:
 
 
 @dataclass(frozen=True)
-class FusedMoeCuTeConfig:
+class CuteMoeConfig:
     # Tile sizes (tuned for Moondream MoE shapes; adjust via benchmarking).
     block_m: int = 16
     block_n: int = 64
@@ -132,19 +187,19 @@ class FusedMoeCuTeConfig:
 def _to_cute_tensor_1d_i32(t: torch.Tensor) -> cute.Tensor:
     if t.dtype != torch.int32 or t.ndim != 1 or not t.is_contiguous():
         raise ValueError("Expected contiguous int32 1D tensor")
-    return from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    return from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
 
 
 def _to_cute_tensor_1d_contig(t: torch.Tensor, *, assumed_align: int = 16) -> cute.Tensor:
     if t.ndim != 1 or not t.is_contiguous():
         raise ValueError("Expected contiguous 1D tensor")
-    return from_dlpack(t.detach(), assumed_align=assumed_align).mark_layout_dynamic(leading_dim=0)
+    return from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
 
 
 def _to_cute_tensor_scalar_i32(t: torch.Tensor) -> cute.Tensor:
     if t.dtype != torch.int32 or t.ndim != 1 or t.numel() != 1 or not t.is_contiguous():
         raise ValueError("Expected contiguous int32 tensor with shape (1,)")
-    return from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    return from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
 
 
 def _to_cute_tensor_2d_contig(t: torch.Tensor, *, assumed_align: int = 16) -> cute.Tensor:
@@ -153,7 +208,7 @@ def _to_cute_tensor_2d_contig(t: torch.Tensor, *, assumed_align: int = 16) -> cu
     # The MoE kernel relies on 128-bit vectorized accesses (vec_size=8 for BF16/FP16).
     # Add compactness/divisibility hints so the compiler can prove alignment for cp.async.
     return fa_utils.convert_from_dlpack(
-        t.detach(), leading_dim=1, alignment=assumed_align, divisibility=8
+        t.detach(), leading_dim=1, alignment=assumed_align, divisibility=8, enable_tvm_ffi=True
     )
 
 
@@ -163,7 +218,7 @@ def _to_cute_tensor_2d_contig_u8(t: torch.Tensor, *, assumed_align: int = 16) ->
     if t.ndim != 2 or not t.is_contiguous():
         raise ValueError("Expected row-major contiguous 2D uint8 tensor")
     return fa_utils.convert_from_dlpack(
-        t.detach(), leading_dim=1, alignment=assumed_align, divisibility=16
+        t.detach(), leading_dim=1, alignment=assumed_align, divisibility=16, enable_tvm_ffi=True
     )
 
 
@@ -171,7 +226,7 @@ def _to_cute_tensor_3d_last_contig(t: torch.Tensor, *, assumed_align: int = 16) 
     if t.ndim != 3 or t.stride(-1) != 1:
         raise ValueError("Expected 3D tensor contiguous in the last dim")
     return fa_utils.convert_from_dlpack(
-        t.detach(), leading_dim=2, alignment=assumed_align, divisibility=8
+        t.detach(), leading_dim=2, alignment=assumed_align, divisibility=8, enable_tvm_ffi=True
     )
 
 
@@ -181,7 +236,7 @@ def _to_cute_tensor_3d_last_contig_u8(t: torch.Tensor, *, assumed_align: int = 1
     if t.ndim != 3 or t.stride(-1) != 1:
         raise ValueError("Expected 3D uint8 tensor contiguous in the last dim")
     return fa_utils.convert_from_dlpack(
-        t.detach(), leading_dim=2, alignment=assumed_align, divisibility=16
+        t.detach(), leading_dim=2, alignment=assumed_align, divisibility=16, enable_tvm_ffi=True
     )
 
 
@@ -189,7 +244,7 @@ class _FusedMoeMatmulCuTe:
     def __init__(
         self,
         dtype: type[cutlass.Numeric],
-        config: FusedMoeCuTeConfig,
+        config: CuteMoeConfig,
         *,
         mul_routed_weight: bool,
         top_k: int,
@@ -869,7 +924,7 @@ class _FusedMoeMatmulCuTeFp8:
         self,
         dtype: type[cutlass.Numeric],
         fp8_dtype: type[cutlass.Numeric],
-        config: FusedMoeCuTeConfig,
+        config: CuteMoeConfig,
         *,
         mul_routed_weight: bool,
         top_k: int,
@@ -1458,11 +1513,11 @@ _CUTE_TOP_K_UP_DECODE = 8
 # Cache compiled variants keyed by (kind, config). We only support two decode kernels:
 # - up-proj: mul_routed_weight=False, top_k=8
 # - down-proj: mul_routed_weight=True, top_k=1
-_COMPILE_CACHE: Dict[Tuple[str, FusedMoeCuTeConfig], Any] = {}
-_COMPILE_CACHE_FP8: Dict[Tuple[str, FusedMoeCuTeConfig], Any] = {}
+_COMPILE_CACHE: Dict[Tuple[str, CuteMoeConfig], Any] = {}
+_COMPILE_CACHE_FP8: Dict[Tuple[str, CuteMoeConfig], Any] = {}
 
 
-def _invoke_fused_moe_kernel_cute_impl(
+def _invoke_cute_moe_impl(
     kind: str,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1474,7 +1529,7 @@ def _invoke_fused_moe_kernel_cute_impl(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: FusedMoeCuTeConfig,
+    config: CuteMoeConfig,
 ) -> None:
     if A.dtype != torch.bfloat16:
         raise ValueError(f"CuTe fused MoE supports bfloat16 only (got {A.dtype})")
@@ -1520,47 +1575,33 @@ def _invoke_fused_moe_kernel_cute_impl(
     # Flatten output to [M_assignments, N] like the Triton kernel expects.
     C2d = C.view(-1, C.shape[-1])
 
-    dtype = cutlass.BFloat16
     key = (kind, config)
 
-    a_cute = _to_cute_tensor_2d_contig(A)
-    b_cute = _to_cute_tensor_3d_last_contig(B)
-    c_cute = _to_cute_tensor_2d_contig(C2d)
-    sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
-    expert_cute = _to_cute_tensor_1d_i32(expert_ids)
-    post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
-    topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if key not in _COMPILE_CACHE:
-        op = _FusedMoeMatmulCuTe(dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k)
-        compiled = cute.compile(
-            op,
-            a_cute,
-            b_cute,
-            c_cute,
-            topk_w_cute,
-            sorted_cute,
-            expert_cute,
-            post_cute,
-            stream,
-        )
-        _set_compiled_kernel_shared_carveout(compiled)
-        _COMPILE_CACHE[key] = compiled
+        # Try to load precompiled kernel first
+        precompiled = _load_precompiled_kernel(kind, config)
+        if precompiled is not None:
+            _COMPILE_CACHE[key] = precompiled
+        else:
+            arch = _get_cuda_arch()
+            raise RuntimeError(
+                f"No precompiled kernel for cute_moe(kind={kind}, config={config}, arch={arch}). "
+                f"Run precompile_cute_moe.py on this architecture to generate it."
+            )
 
+    # TVM-FFI handles PyTorch tensor conversion automatically
     _COMPILE_CACHE[key](
-        a_cute,
-        b_cute,
-        c_cute,
-        topk_w_cute,
-        sorted_cute,
-        expert_cute,
-        post_cute,
-        stream,
+        A,
+        B,
+        C2d,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
     )
 
 
-def _invoke_fused_moe_kernel_cute_fp8_impl(
+def _invoke_cute_moe_fp8_impl(
     kind: str,
     A_fp8_bits: torch.Tensor,
     A_scale: torch.Tensor,
@@ -1574,7 +1615,7 @@ def _invoke_fused_moe_kernel_cute_fp8_impl(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: FusedMoeCuTeConfig,
+    config: CuteMoeConfig,
 ) -> None:
     if A_fp8_bits.dtype != torch.uint8:
         raise ValueError(f"Expected FP8 activation bits as uint8 (got {A_fp8_bits.dtype})")
@@ -1681,6 +1722,7 @@ def _invoke_fused_moe_kernel_cute_fp8_impl(
             expert_cute,
             post_cute,
             stream,
+            options="--enable-tvm-ffi",
         )
         _set_compiled_kernel_shared_carveout(compiled)
         _COMPILE_CACHE_FP8[key] = compiled
@@ -1699,7 +1741,7 @@ def _invoke_fused_moe_kernel_cute_fp8_impl(
     )
 
 
-def invoke_fused_moe_kernel_cute_up_decode_fp8(
+def invoke_cute_moe_up_fp8(
     A_fp8_bits: torch.Tensor,
     A_scale: torch.Tensor,
     B_fp8_bits: torch.Tensor,
@@ -1709,10 +1751,10 @@ def invoke_fused_moe_kernel_cute_up_decode_fp8(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: FusedMoeCuTeConfig = FusedMoeCuTeConfig(),
+    config: CuteMoeConfig = CuteMoeConfig(),
 ) -> None:
     """Decode-specialized CuTe fused MoE up-projection with FP8 activations+weights (W8A8)."""
-    _invoke_fused_moe_kernel_cute_fp8_impl(
+    _invoke_cute_moe_fp8_impl(
         "up",
         A_fp8_bits,
         A_scale,
@@ -1729,7 +1771,7 @@ def invoke_fused_moe_kernel_cute_up_decode_fp8(
     )
 
 
-def invoke_fused_moe_kernel_cute_down_decode_fp8(
+def invoke_cute_moe_down_fp8(
     A_fp8_bits: torch.Tensor,
     A_scale: torch.Tensor,
     B_fp8_bits: torch.Tensor,
@@ -1740,10 +1782,10 @@ def invoke_fused_moe_kernel_cute_down_decode_fp8(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: FusedMoeCuTeConfig = FusedMoeCuTeConfig(),
+    config: CuteMoeConfig = CuteMoeConfig(),
 ) -> None:
     """Decode-specialized CuTe fused MoE down-projection with FP8 activations+weights (W8A8)."""
-    _invoke_fused_moe_kernel_cute_fp8_impl(
+    _invoke_cute_moe_fp8_impl(
         "down",
         A_fp8_bits,
         A_scale,
@@ -1760,7 +1802,7 @@ def invoke_fused_moe_kernel_cute_down_decode_fp8(
     )
 
 
-def invoke_fused_moe_kernel_cute_up_decode(
+def invoke_cute_moe_up(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -1768,10 +1810,10 @@ def invoke_fused_moe_kernel_cute_up_decode(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: FusedMoeCuTeConfig = FusedMoeCuTeConfig(),
+    config: CuteMoeConfig = CuteMoeConfig(),
 ) -> None:
     """Decode-specialized CuTe fused MoE up-projection (no routed-weight scaling)."""
-    _invoke_fused_moe_kernel_cute_impl(
+    _invoke_cute_moe_impl(
         "up",
         A,
         B,
@@ -1786,7 +1828,7 @@ def invoke_fused_moe_kernel_cute_up_decode(
     )
 
 
-def invoke_fused_moe_kernel_cute_down_decode(
+def invoke_cute_moe_down(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -1795,10 +1837,10 @@ def invoke_fused_moe_kernel_cute_down_decode(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: FusedMoeCuTeConfig = FusedMoeCuTeConfig(),
+    config: CuteMoeConfig = CuteMoeConfig(),
 ) -> None:
     """Decode-specialized CuTe fused MoE down-projection (includes routed-weight scaling)."""
-    _invoke_fused_moe_kernel_cute_impl(
+    _invoke_cute_moe_impl(
         "down",
         A,
         B,
@@ -1813,7 +1855,7 @@ def invoke_fused_moe_kernel_cute_down_decode(
     )
 
 
-def invoke_fused_moe_kernel_cute(
+def invoke_cute_moe(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -1824,7 +1866,7 @@ def invoke_fused_moe_kernel_cute(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: FusedMoeCuTeConfig = FusedMoeCuTeConfig(),
+    config: CuteMoeConfig = CuteMoeConfig(),
 ) -> None:
     """Legacy wrapper for decode-only CuTe fused MoE.
 
@@ -1837,7 +1879,7 @@ def invoke_fused_moe_kernel_cute(
             raise ValueError("CuTe moe_down expects top_k=1")
         if topk_weights is None:
             raise ValueError("topk_weights is required when mul_routed_weight=True")
-        return invoke_fused_moe_kernel_cute_down_decode(
+        return invoke_cute_moe_down(
             A,
             B,
             C,
@@ -1849,7 +1891,7 @@ def invoke_fused_moe_kernel_cute(
         )
     if int(top_k) != _CUTE_TOP_K_UP_DECODE:
         raise ValueError(f"CuTe moe_up expects top_k={_CUTE_TOP_K_UP_DECODE}")
-    return invoke_fused_moe_kernel_cute_up_decode(
+    return invoke_cute_moe_up(
         A,
         B,
         C,
@@ -1861,10 +1903,10 @@ def invoke_fused_moe_kernel_cute(
 
 
 __all__ = [
-    "FusedMoeCuTeConfig",
-    "invoke_fused_moe_kernel_cute_up_decode",
-    "invoke_fused_moe_kernel_cute_down_decode",
-    "invoke_fused_moe_kernel_cute_up_decode_fp8",
-    "invoke_fused_moe_kernel_cute_down_decode_fp8",
-    "invoke_fused_moe_kernel_cute",
+    "CuteMoeConfig",
+    "invoke_cute_moe_up",
+    "invoke_cute_moe_down",
+    "invoke_cute_moe_up_fp8",
+    "invoke_cute_moe_down_fp8",
+    "invoke_cute_moe",
 ]

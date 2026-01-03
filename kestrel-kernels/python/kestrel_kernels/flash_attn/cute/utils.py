@@ -74,9 +74,9 @@ def create_softcap_scoremod(softcap_val):
     return scoremod_premask_fn
 
 
-def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
+def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1, enable_tvm_ffi=False) -> cute.Tensor:
     return (
-        from_dlpack(x, assumed_align=alignment)
+        from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=enable_tvm_ffi)
         .mark_layout_dynamic(leading_dim=leading_dim)
         .mark_compact_shape_dynamic(
             mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
