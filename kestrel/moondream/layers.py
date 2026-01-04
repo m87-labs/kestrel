@@ -81,12 +81,8 @@ def _prepare_dense_lora_routing(
     Uses moe_lora_align_block_size with num_experts=1 (each slot treated as
     one expert). Slot 0 (no LoRA) is filtered via token_lora_mapping = -1.
     """
-    # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
-    token_lora_mapping = torch.where(
-        lora_slot_ids > 0,
-        lora_slot_ids - 1,
-        torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
-    ).to(torch.int32)
+    # slot 0 -> -1 (no LoRA), slot N -> N-1 (lora_id)
+    token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
 
     # For dense LoRA, treat each slot as a separate "LoRA" with num_experts=1
     # max_loras = max_slots - 1 (slot 0 excluded from workspace)

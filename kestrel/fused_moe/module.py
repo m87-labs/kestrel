@@ -18,6 +18,14 @@ from .routing import moe_align_block_size, moe_lora_align_block_size
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel_kernels.activation import gelu_residual_cuda
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
+from kestrel_kernels.cute_moe import (
+    CuteMoeConfig,
+    get_cute_moe_block_m,
+    invoke_cute_moe_down,
+    invoke_cute_moe_down_fp8,
+    invoke_cute_moe_up,
+    invoke_cute_moe_up_fp8,
+)
 
 
 class _ResizableBuffer:
@@ -221,7 +229,7 @@ class FusedMoEConfig:
     num_warps: int = 4
     num_stages: int = 2
     allow_tf32: bool = True
-    backend: str = "auto"  # "auto" | "cute" | "triton"
+    backend: str = "cute"  # "cute" | "triton"
     lora_decode_shrink: dict[str, int] | None = field(
         default_factory=lambda: {
             "BLOCK_SIZE_N": 16,
@@ -442,11 +450,11 @@ class FusedMoEModule(nn.Module):
             assignments=assignments,
             dtype=hidden_states.dtype,
         )
-        if up_is_fp8w:
-            # SM90 FP8 WGMMA path prefers block_m=64 routing.
-            triton_config = triton_config.copy()
-            triton_config["BLOCK_SIZE_M"] = 64
-        block_size_m = triton_config["BLOCK_SIZE_M"]
+        block_size_m = self._get_block_m_for_routing(
+            num_tokens=num_tokens,
+            is_fp8_weights=up_is_fp8w,
+            triton_block_m=triton_config["BLOCK_SIZE_M"],
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, self.num_experts
@@ -721,10 +729,9 @@ class FusedMoEModule(nn.Module):
         compute_type,
     ) -> None:
         backend = self.config.backend.lower()
-        use_cute = backend in ("cute", "auto")
         b_is_fp8w = B.dtype == torch.uint8
 
-        if b_is_fp8w and backend in ("triton", "auto"):
+        if b_is_fp8w and backend == "triton":
             # Triton FP8 W8A8 path (SGLang-style): quantize activations per row
             # and do FP8 dot with per-output-channel weight scales.
             if B_scale is None:
@@ -756,137 +763,92 @@ class FusedMoEModule(nn.Module):
             )
             return
 
-        if use_cute:
-            try:
-                from kestrel_kernels.cute_moe import (
-                    CuteMoeConfig,
-                    invoke_cute_moe_down,
-                    invoke_cute_moe_down_fp8,
-                    invoke_cute_moe_up,
-                    invoke_cute_moe_up_fp8,
+        if backend == "cute":
+            if b_is_fp8w:
+                # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
+                if B_scale is None:
+                    raise ValueError("B_scale is required for FP8-weight MoE")
+
+                num_tokens = int(C.shape[0])
+                # Match Triton's fp8 W8A8 tiling, but keep a smaller N tile
+                # for the single-token case where occupancy is otherwise poor.
+                block_n = 64 if (not mul_routed_weight) and (num_tokens == 1) else 128
+
+                # Prefer deeper pipelining for small decode batches to better hide
+                # DRAM latency; fall back to fewer stages for larger batches where
+                # occupancy becomes the limiting factor.
+                num_stages = 4 if num_tokens <= 16 else 2
+
+                cute_cfg = CuteMoeConfig(
+                    block_m=64,
+                    block_n=block_n,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=num_stages,
                 )
+                a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
+                if mul_routed_weight:
+                    if int(top_k) != 1:
+                        raise ValueError("CuTe fp8 moe_down expects top_k=1")
+                    if topk_weights is None:
+                        raise ValueError("topk_weights is required when mul_routed_weight=True")
+                    invoke_cute_moe_down_fp8(
+                        a_bits,
+                        a_scale,
+                        B,
+                        B_scale,
+                        C,
+                        topk_weights=topk_weights,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=expert_ids,
+                        num_tokens_post_padded=num_tokens_post_padded,
+                        config=cute_cfg,
+                    )
+                else:
+                    if int(top_k) != 8:
+                        raise ValueError("CuTe fp8 moe_up expects top_k=8")
+                    invoke_cute_moe_up_fp8(
+                        a_bits,
+                        a_scale,
+                        B,
+                        B_scale,
+                        C,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=expert_ids,
+                        num_tokens_post_padded=num_tokens_post_padded,
+                        config=cute_cfg,
+                    )
+                return
 
-                block_m = triton_config["BLOCK_SIZE_M"]
-                if b_is_fp8w:
-                    # Prefer W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
-                    if block_m == 64:
-                        if B_scale is None:
-                            raise ValueError("B_scale is required for FP8-weight MoE")
-
-                        num_tokens = int(C.shape[0])
-                        # Match Triton's fp8 W8A8 tiling, but keep a smaller N tile
-                        # for the single-token case where occupancy is otherwise poor.
-                        block_n = 64 if (not mul_routed_weight) and (num_tokens == 1) else 128
-
-                        # Prefer deeper pipelining for small decode batches to better hide
-                        # DRAM latency; fall back to fewer stages for larger batches where
-                        # occupancy becomes the limiting factor.
-                        num_stages = 4 if num_tokens <= 16 else 2
-
-                        cute_cfg = CuteMoeConfig(
-                            block_m=64,
-                            block_n=block_n,
-                            block_k=128,
-                            num_warps=4,
-                            num_stages=num_stages,
-                        )
-                        a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
-                        if mul_routed_weight:
-                            if int(top_k) != 1:
-                                raise ValueError("CuTe fp8 moe_down expects top_k=1")
-                            if topk_weights is None:
-                                raise ValueError("topk_weights is required when mul_routed_weight=True")
-                            invoke_cute_moe_down_fp8(
-                                a_bits,
-                                a_scale,
-                                B,
-                                B_scale,
-                                C,
-                                topk_weights=topk_weights,
-                                sorted_token_ids=sorted_token_ids,
-                                expert_ids=expert_ids,
-                                num_tokens_post_padded=num_tokens_post_padded,
-                                config=cute_cfg,
-                            )
-                        else:
-                            if int(top_k) != 8:
-                                raise ValueError("CuTe fp8 moe_up expects top_k=8")
-                            invoke_cute_moe_up_fp8(
-                                a_bits,
-                                a_scale,
-                                B,
-                                B_scale,
-                                C,
-                                sorted_token_ids=sorted_token_ids,
-                                expert_ids=expert_ids,
-                                num_tokens_post_padded=num_tokens_post_padded,
-                                config=cute_cfg,
-                            )
-                        return
-
-                # Unquantized BF16 CuTe path: tuned for decode with routing block_m=16.
-                if block_m == 16:
-                    num_tokens = int(C.shape[0])
-                    if num_tokens <= 8:
-                        if mul_routed_weight:
-                            cute_cfg = CuteMoeConfig(
-                                block_m=16,
-                                block_n=64,
-                                block_k=256,
-                                num_warps=4,
-                                num_stages=1,
-                            )
-                        else:
-                            cute_cfg = CuteMoeConfig(
-                                block_m=16,
-                                block_n=128,
-                                block_k=128,
-                                num_warps=2,
-                                num_stages=1,
-                            )
-                    else:
-                        num_stages = int(triton_config["NUM_STAGES"])
-                        if mul_routed_weight:
-                            num_stages = min(2, num_stages)
-                        cute_cfg = CuteMoeConfig(
-                            block_m=block_m,
-                            block_n=int(triton_config["BLOCK_SIZE_N"]),
-                            block_k=int(triton_config["BLOCK_SIZE_K"]),
-                            num_warps=int(triton_config["NUM_WARPS"]),
-                            num_stages=num_stages,
-                        )
-                    if mul_routed_weight:
-                        if int(top_k) != 1:
-                            raise ValueError("CuTe moe_down expects top_k=1")
-                        if topk_weights is None:
-                            raise ValueError("topk_weights is required when mul_routed_weight=True")
-                        invoke_cute_moe_down(
-                            A,
-                            B,
-                            C,
-                            topk_weights=topk_weights,
-                            sorted_token_ids=sorted_token_ids,
-                            expert_ids=expert_ids,
-                            num_tokens_post_padded=num_tokens_post_padded,
-                            config=cute_cfg,
-                        )
-                    else:
-                        if int(top_k) != 8:
-                            raise ValueError("CuTe moe_up expects top_k=8")
-                        invoke_cute_moe_up(
-                            A,
-                            B,
-                            C,
-                            sorted_token_ids=sorted_token_ids,
-                            expert_ids=expert_ids,
-                            num_tokens_post_padded=num_tokens_post_padded,
-                            config=cute_cfg,
-                        )
-                    return
-            except Exception:
-                # Fall back to Triton if CuTe is unavailable (or config unsupported).
-                if backend == "cute":
-                    raise
+            # Unquantized BF16 CuTe path: use auto-config selection.
+            if mul_routed_weight:
+                if int(top_k) != 1:
+                    raise ValueError("CuTe moe_down expects top_k=1")
+                if topk_weights is None:
+                    raise ValueError("topk_weights is required when mul_routed_weight=True")
+                invoke_cute_moe_down(
+                    A,
+                    B,
+                    C,
+                    topk_weights=topk_weights,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    # config=None triggers auto-select from JSON configs
+                )
+            else:
+                if int(top_k) != 8:
+                    raise ValueError("CuTe moe_up expects top_k=8")
+                invoke_cute_moe_up(
+                    A,
+                    B,
+                    C,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    # config=None triggers auto-select from JSON configs
+                )
+            return
 
         if b_is_fp8w:
             # Safe-but-slower fallback: dequantize weights to match the Triton kernel.
@@ -964,3 +926,32 @@ class FusedMoEModule(nn.Module):
 
         self._tuned_configs[num_tokens] = tuned
         return tuned
+
+    def _get_block_m_for_routing(
+        self,
+        *,
+        num_tokens: int,
+        is_fp8_weights: bool,
+        triton_block_m: int,
+    ) -> int:
+        """Get block_m for moe_align_block_size based on backend.
+
+        For FP8 weights, both CuTe and Triton use block_m=64.
+        For BF16 weights:
+          - backend="cute": Use CuTe config block_m
+          - backend="triton": Use Triton block_m
+        """
+        if is_fp8_weights:
+            # SM90 FP8 WGMMA path uses block_m=64 for both backends
+            return 64
+
+        backend = self.config.backend.lower()
+        if backend == "cute":
+            return get_cute_moe_block_m(
+                num_tokens,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.hidden_size,
+            )
+        else:
+            return triton_block_m

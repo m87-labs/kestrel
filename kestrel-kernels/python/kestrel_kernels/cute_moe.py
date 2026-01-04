@@ -7,9 +7,12 @@ The reference implementation lives in `kestrel/fused_moe/kernels.py` (Triton).
 This file provides an equivalent kernel using NVIDIA's CuTe DSL.
 """
 
+import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Literal, Tuple
 
 import torch
 import cuda.bindings.driver as cuda
@@ -179,9 +182,174 @@ class CuteMoeConfig:
     num_warps: int = 4
     num_stages: int = 2
 
+    def __post_init__(self) -> None:
+        """Validate config constraints at construction time."""
+        # CRITICAL: block_m must not exceed num_threads!
+        # The kernel's metadata loading loop uses `if tx < block_m` to load per-row
+        # metadata into shared memory. With only num_threads threads, rows beyond
+        # num_threads-1 read uninitialized shared memory -> illegal memory access.
+        if self.block_m > self.num_threads:
+            raise ValueError(
+                f"block_m ({self.block_m}) must not exceed num_threads ({self.num_threads}). "
+                f"With {self.num_warps} warps, max block_m is {self.num_threads}."
+            )
+
+        # block_n must be divisible by 8 * num_warps (MMA layout constraint)
+        # The MMA atom is (16, 8, 16) and warps are tiled (1, num_warps, 1) in N
+        mma_n_coverage = 8 * self.num_warps
+        if self.block_n % mma_n_coverage != 0:
+            raise ValueError(
+                f"block_n ({self.block_n}) must be divisible by 8 * num_warps ({mma_n_coverage})."
+            )
+
+        # block_n=32 with num_warps=8 fails LDSM alignment verification
+        if self.block_n == 32 and self.num_warps == 8:
+            raise ValueError(
+                "block_n=32 with num_warps=8 causes LDSM alignment verification failure."
+            )
+
+        # Shared memory constraint: sA + sB must fit in ~200KB (H100 has 228KB, need room for sC + metadata)
+        # sA = num_stages * block_m * block_k * 2 bytes
+        # sB = num_stages * block_n * block_k * 2 bytes
+        sA_elements = self.num_stages * self.block_m * self.block_k
+        sB_elements = self.num_stages * self.block_n * self.block_k
+        total_elements = sA_elements + sB_elements
+        max_elements = 100000  # ~200KB for BF16, leaving room for sC and metadata
+        if total_elements > max_elements:
+            sA_kb = sA_elements * 2 // 1024
+            sB_kb = sB_elements * 2 // 1024
+            raise ValueError(
+                f"Shared memory exceeded: sA={sA_kb}KB + sB={sB_kb}KB = {sA_kb + sB_kb}KB "
+                f"(stages={self.num_stages}, m={self.block_m}, n={self.block_n}, k={self.block_k}). "
+                f"Max ~200KB."
+            )
+
     @property
     def num_threads(self) -> int:
         return 32 * self.num_warps
+
+
+# Config auto-loading from JSON files
+_CONFIGS_DIR = Path(__file__).parent / "configs"
+
+
+@lru_cache(maxsize=None)
+def _load_cute_moe_configs(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: str,
+    arch: str,
+) -> dict | None:
+    """Load configs for given model shape and hardware. Return None if not found."""
+    filename = f"cute_moe_E{num_experts}_H{hidden_size}_I{intermediate_size}_{dtype}_{arch}.json"
+    config_file = _CONFIGS_DIR / filename
+    if not config_file.exists():
+        return None
+    with open(config_file) as f:
+        return json.load(f)
+
+
+def get_cute_moe_block_m(
+    num_tokens: int,
+    *,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: str = "bf16",
+) -> int:
+    """Get the block_m value for routing alignment.
+
+    Both UP and DOWN kernels share the same block_m for a given token count,
+    so this returns the common value used by moe_align_block_size.
+
+    Args:
+        num_tokens: Number of tokens (batch size)
+        num_experts: Number of experts (E)
+        hidden_size: Hidden/model dimension (H)
+        intermediate_size: Expert intermediate dimension (I)
+        dtype: Data type ("bf16" or "fp8")
+
+    Returns:
+        block_m value for routing alignment.
+
+    Raises:
+        ValueError: If no config file exists for the model shape + GPU arch.
+    """
+    arch = _get_cuda_arch()
+    configs = _load_cute_moe_configs(num_experts, hidden_size, intermediate_size, dtype, arch)
+
+    if configs is None:
+        filename = f"cute_moe_E{num_experts}_H{hidden_size}_I{intermediate_size}_{dtype}_{arch}.json"
+        raise ValueError(
+            f"No CuTe MoE configs for this model shape. "
+            f"Expected file: {_CONFIGS_DIR / filename}"
+        )
+
+    # Use "up" config to get block_m (UP and DOWN have matching block_m)
+    up_configs = configs.get("up", {})
+    if not up_configs:
+        raise ValueError("No 'up' configs in config file")
+
+    # Find nearest token count
+    token_keys = [int(k) for k in up_configs.keys()]
+    nearest = min(token_keys, key=lambda t: abs(t - num_tokens))
+    cfg = up_configs[str(nearest)]
+
+    return cfg["block_m"]
+
+
+def get_cute_moe_config(
+    kind: Literal["up", "down"],
+    num_tokens: int,
+    *,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: str = "bf16",
+) -> CuteMoeConfig:
+    """Get optimal config for given parameters. Raises if not available.
+
+    Args:
+        kind: "up" or "down" kernel type
+        num_tokens: Number of tokens (batch size)
+        num_experts: Number of experts (E)
+        hidden_size: Hidden/model dimension (H)
+        intermediate_size: Expert intermediate dimension (I)
+        dtype: Data type ("bf16" or "fp8")
+
+    Returns:
+        CuteMoeConfig with optimal tile sizes for the given parameters.
+
+    Raises:
+        ValueError: If no config file exists for the model shape + GPU arch.
+    """
+    arch = _get_cuda_arch()
+    configs = _load_cute_moe_configs(num_experts, hidden_size, intermediate_size, dtype, arch)
+
+    if configs is None:
+        filename = f"cute_moe_E{num_experts}_H{hidden_size}_I{intermediate_size}_{dtype}_{arch}.json"
+        raise ValueError(
+            f"No CuTe MoE configs for this model shape. "
+            f"Expected file: {_CONFIGS_DIR / filename}"
+        )
+
+    kind_configs = configs.get(kind, {})
+    if not kind_configs:
+        raise ValueError(f"No '{kind}' configs in config file")
+
+    # Find nearest token count
+    token_keys = [int(k) for k in kind_configs.keys()]
+    nearest = min(token_keys, key=lambda t: abs(t - num_tokens))
+    cfg = kind_configs[str(nearest)]
+
+    return CuteMoeConfig(
+        block_m=cfg["block_m"],
+        block_n=cfg["block_n"],
+        block_k=cfg["block_k"],
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
+    )
 
 
 def _to_cute_tensor_1d_i32(t: torch.Tensor) -> cute.Tensor:
@@ -908,7 +1076,7 @@ class _FusedMoeMatmulCuTe:
 
 
 class _FusedMoeMatmulCuTeFp8:
-    """Decode-specialized routed MoE GEMM with FP8 activations+weights (W8A8) using SM90 WGMMA.
+    """Routed MoE GEMM with FP8 activations+weights (W8A8) using SM90 WGMMA.
 
     Math:
       C = (A_fp8 @ (B_fp8)^T) * A_scale * B_scale   (and optionally * routed_weight)
@@ -1516,6 +1684,9 @@ _CUTE_TOP_K_UP_DECODE = 8
 _COMPILE_CACHE: Dict[Tuple[str, CuteMoeConfig], Any] = {}
 _COMPILE_CACHE_FP8: Dict[Tuple[str, CuteMoeConfig], Any] = {}
 
+# Enable JIT compilation for autotuning (set KESTREL_CUTE_MOE_JIT=1)
+_ENABLE_JIT = os.environ.get("KESTREL_CUTE_MOE_JIT", "0") == "1"
+
 
 def _invoke_cute_moe_impl(
     kind: str,
@@ -1578,16 +1749,48 @@ def _invoke_cute_moe_impl(
     key = (kind, config)
 
     if key not in _COMPILE_CACHE:
-        # Try to load precompiled kernel first
-        precompiled = _load_precompiled_kernel(kind, config)
-        if precompiled is not None:
-            _COMPILE_CACHE[key] = precompiled
-        else:
-            arch = _get_cuda_arch()
-            raise RuntimeError(
-                f"No precompiled kernel for cute_moe(kind={kind}, config={config}, arch={arch}). "
-                f"Run precompile_cute_moe.py on this architecture to generate it."
+        if _ENABLE_JIT:
+            # JIT compile for autotuning
+            from cutlass import BFloat16
+
+            op = _FusedMoeMatmulCuTe(
+                BFloat16, config, mul_routed_weight=mul_routed_weight, top_k=top_k
             )
+            a_cute = _to_cute_tensor_2d_contig(A)
+            b_cute = _to_cute_tensor_3d_last_contig(B)
+            c_cute = _to_cute_tensor_2d_contig(C2d)
+            sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
+            expert_cute = _to_cute_tensor_1d_i32(expert_ids)
+            post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
+            topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
+            # Use env stream so TVM-FFI auto-picks current CUDA stream (matches precompiled)
+            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+            compiled = cute.compile(
+                op,
+                a_cute,
+                b_cute,
+                c_cute,
+                topk_w_cute,
+                sorted_cute,
+                expert_cute,
+                post_cute,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+            _set_compiled_kernel_shared_carveout(compiled)
+            _COMPILE_CACHE[key] = compiled
+        else:
+            # Load precompiled kernel
+            precompiled = _load_precompiled_kernel(kind, config)
+            if precompiled is not None:
+                _COMPILE_CACHE[key] = precompiled
+            else:
+                arch = _get_cuda_arch()
+                raise RuntimeError(
+                    f"No precompiled kernel for cute_moe(kind={kind}, config={config}, arch={arch}). "
+                    f"Run precompile_cute_moe.py on this architecture to generate it."
+                )
 
     # TVM-FFI handles PyTorch tensor conversion automatically
     _COMPILE_CACHE[key](
@@ -1751,9 +1954,26 @@ def invoke_cute_moe_up_fp8(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: CuteMoeConfig = CuteMoeConfig(),
+    config: CuteMoeConfig | None = None,
 ) -> None:
-    """Decode-specialized CuTe fused MoE up-projection with FP8 activations+weights (W8A8)."""
+    """CuTe fused MoE up-projection with FP8 activations+weights (W8A8).
+
+    If config is None, auto-selects optimal config based on tensor shapes and GPU.
+    """
+    if config is None:
+        # Infer model dimensions from tensor shapes
+        # A_fp8_bits: [M, hidden_size], B_fp8_bits: [E, intermediate_size*2, hidden_size]
+        num_tokens = A_fp8_bits.shape[0]
+        hidden_size = A_fp8_bits.shape[1]
+        num_experts = B_fp8_bits.shape[0]
+        intermediate_size = B_fp8_bits.shape[1] // 2
+        config = get_cute_moe_config(
+            "up", num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype="fp8",
+        )
     _invoke_cute_moe_fp8_impl(
         "up",
         A_fp8_bits,
@@ -1782,9 +2002,27 @@ def invoke_cute_moe_down_fp8(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: CuteMoeConfig = CuteMoeConfig(),
+    config: CuteMoeConfig | None = None,
 ) -> None:
-    """Decode-specialized CuTe fused MoE down-projection with FP8 activations+weights (W8A8)."""
+    """CuTe fused MoE down-projection with FP8 activations+weights (W8A8).
+
+    If config is None, auto-selects optimal config based on tensor shapes and GPU.
+    """
+    if config is None:
+        # Infer model dimensions from tensor shapes
+        # A_fp8_bits: [M*top_k, intermediate_size], B_fp8_bits: [E, hidden_size, intermediate_size]
+        # C: [M, top_k, hidden_size]
+        num_tokens = C.shape[0]
+        hidden_size = B_fp8_bits.shape[1]
+        num_experts = B_fp8_bits.shape[0]
+        intermediate_size = B_fp8_bits.shape[2]
+        config = get_cute_moe_config(
+            "down", num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype="fp8",
+        )
     _invoke_cute_moe_fp8_impl(
         "down",
         A_fp8_bits,
@@ -1810,9 +2048,25 @@ def invoke_cute_moe_up(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: CuteMoeConfig = CuteMoeConfig(),
+    config: CuteMoeConfig | None = None,
 ) -> None:
-    """Decode-specialized CuTe fused MoE up-projection (no routed-weight scaling)."""
+    """CuTe fused MoE up-projection (no routed-weight scaling).
+
+    If config is None, auto-selects optimal config based on tensor shapes and GPU.
+    """
+    if config is None:
+        # Infer model dimensions from tensor shapes
+        # A: [M, hidden_size], B: [E, intermediate_size*2, hidden_size]
+        num_tokens = A.shape[0]
+        hidden_size = A.shape[1]
+        num_experts = B.shape[0]
+        intermediate_size = B.shape[1] // 2  # gate+up are fused
+        config = get_cute_moe_config(
+            "up", num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
     _invoke_cute_moe_impl(
         "up",
         A,
@@ -1837,9 +2091,26 @@ def invoke_cute_moe_down(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    config: CuteMoeConfig = CuteMoeConfig(),
+    config: CuteMoeConfig | None = None,
 ) -> None:
-    """Decode-specialized CuTe fused MoE down-projection (includes routed-weight scaling)."""
+    """CuTe fused MoE down-projection (includes routed-weight scaling).
+
+    If config is None, auto-selects optimal config based on tensor shapes and GPU.
+    """
+    if config is None:
+        # Infer model dimensions from tensor shapes
+        # A: [M*top_k, intermediate_size], B: [E, hidden_size, intermediate_size]
+        # C: [M, top_k, hidden_size] - use C to get num_tokens since A is expanded
+        num_tokens = C.shape[0]
+        hidden_size = B.shape[1]
+        num_experts = B.shape[0]
+        intermediate_size = B.shape[2]
+        config = get_cute_moe_config(
+            "down", num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
     _invoke_cute_moe_impl(
         "down",
         A,
@@ -1855,58 +2126,11 @@ def invoke_cute_moe_down(
     )
 
 
-def invoke_cute_moe(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    *,
-    topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    mul_routed_weight: bool,
-    top_k: int,
-    config: CuteMoeConfig = CuteMoeConfig(),
-) -> None:
-    """Legacy wrapper for decode-only CuTe fused MoE.
-
-    Supported combinations:
-      - moe_up: mul_routed_weight=False, top_k=8
-      - moe_down: mul_routed_weight=True, top_k=1
-    """
-    if mul_routed_weight:
-        if int(top_k) != 1:
-            raise ValueError("CuTe moe_down expects top_k=1")
-        if topk_weights is None:
-            raise ValueError("topk_weights is required when mul_routed_weight=True")
-        return invoke_cute_moe_down(
-            A,
-            B,
-            C,
-            topk_weights=topk_weights,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-            config=config,
-        )
-    if int(top_k) != _CUTE_TOP_K_UP_DECODE:
-        raise ValueError(f"CuTe moe_up expects top_k={_CUTE_TOP_K_UP_DECODE}")
-    return invoke_cute_moe_up(
-        A,
-        B,
-        C,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-        config=config,
-    )
-
-
 __all__ = [
     "CuteMoeConfig",
+    "get_cute_moe_config",
     "invoke_cute_moe_up",
     "invoke_cute_moe_down",
     "invoke_cute_moe_up_fp8",
     "invoke_cute_moe_down_fp8",
-    "invoke_cute_moe",
 ]

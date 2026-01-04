@@ -275,7 +275,6 @@ class TestApplyDenseLoRA:
 class TestMlpCudaGraph:
     """Test mlp function with CUDA graph capture."""
 
-    @pytest.mark.skip(reason="LoRA routing allocates tensors during graph capture - needs fix")
     def test_mlp_with_lora_cudagraph(self, device, dtype):
         """Test that mlp with LoRA can be captured in a CUDA graph."""
         from kestrel.moondream.layers import mlp, MLPWeights, LinearWeights

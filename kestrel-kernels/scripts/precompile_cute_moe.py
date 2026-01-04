@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Precompile CuTe MoE kernel variants for AOT deployment."""
+"""Precompile CuTe MoE kernel variants for AOT deployment.
 
+Reads tuned configs from JSON files in kestrel_kernels/configs/ and compiles
+all unique kernel variants needed.
+"""
+
+import json
 import os
 import subprocess
 import sys
@@ -52,55 +57,30 @@ def get_cuda_arch() -> str:
     return f"sm{major}{minor}"
 
 
-def get_cuda_arch_num() -> int:
-    """Get the CUDA architecture as a number (e.g., 90 for Hopper)."""
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor
+def load_variants_from_configs() -> list[MoeVariant]:
+    """Load all unique variants from JSON config files."""
+    configs_dir = Path(__file__).parent.parent / "python" / "kestrel_kernels" / "configs"
+    variants: set[MoeVariant] = set()
 
+    for config_file in configs_dir.glob("cute_moe_*.json"):
+        print(f"Loading configs from: {config_file.name}")
+        with open(config_file) as f:
+            data = json.load(f)
 
-# All variants needed for BF16 decode (1-64 tokens) + prefill (up to 512 tokens)
-#
-# Derived from _HARDCODED_CONFIGS in kestrel/fused_moe/module.py:
-# - For "up": num_stages used as-is
-# - For "down": num_stages capped at min(2, num_stages)
-#
-# Plus special configs for num_tokens <= 8
+        for kind in ("up", "down"):
+            kind_configs = data.get(kind, {})
+            for token_count, cfg in kind_configs.items():
+                variant = MoeVariant(
+                    kind=kind,
+                    block_m=cfg["block_m"],
+                    block_n=cfg["block_n"],
+                    block_k=cfg["block_k"],
+                    num_warps=cfg["num_warps"],
+                    num_stages=cfg["num_stages"],
+                )
+                variants.add(variant)
 
-PRECOMPILE_VARIANTS: list[MoeVariant] = [
-    # Special configs for num_tokens <= 8
-    MoeVariant("up", 16, 128, 128, 2, 1),
-    MoeVariant("down", 16, 64, 256, 4, 1),
-    # Config for tokens=1 (also 32, 48, 64 use same config)
-    MoeVariant("up", 16, 256, 128, 4, 3),
-    MoeVariant("down", 16, 256, 128, 4, 2),
-    # Config for tokens=2
-    MoeVariant("up", 16, 64, 128, 4, 4),
-    MoeVariant("down", 16, 64, 128, 4, 2),
-    # Config for tokens=4
-    MoeVariant("up", 16, 64, 256, 4, 3),
-    MoeVariant("down", 16, 64, 256, 4, 2),
-    # Config for tokens=8
-    MoeVariant("up", 16, 32, 256, 4, 2),
-    MoeVariant("down", 16, 32, 256, 4, 2),
-    # Config for tokens=16
-    MoeVariant("up", 16, 32, 128, 4, 5),
-    MoeVariant("down", 16, 32, 128, 4, 2),
-    # Config for tokens=24
-    MoeVariant("up", 16, 128, 256, 4, 2),
-    MoeVariant("down", 16, 128, 256, 4, 2),
-    # Config for tokens=96
-    MoeVariant("up", 32, 256, 128, 4, 3),
-    MoeVariant("down", 32, 256, 128, 4, 2),
-    # Config for tokens=128
-    MoeVariant("up", 32, 128, 128, 4, 3),
-    MoeVariant("down", 32, 128, 128, 4, 2),
-    # Config for tokens=256
-    MoeVariant("up", 64, 64, 64, 4, 3),
-    MoeVariant("down", 64, 64, 64, 4, 2),
-    # Config for tokens=512
-    MoeVariant("up", 128, 128, 64, 8, 3),
-    MoeVariant("down", 128, 128, 64, 8, 2),
-]
+    return sorted(variants, key=lambda v: (v.kind, v.block_m, v.block_n, v.block_k))
 
 
 def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Path, str | None]:
@@ -136,15 +116,14 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
         # Create fake tensors for compilation
         # These use symbolic dimensions for dynamic shapes
-        # IMPORTANT: Each dimension that can vary independently needs its own symbol
-        M_in_sym = cute.sym_int()  # input num_tokens (A.shape[0])
-        M_out_sym = cute.sym_int()  # output assignments (C.shape[0], may differ for "up" kernel)
-        K_sym = cute.sym_int()  # input dim
-        N_sym = cute.sym_int()  # output dim
-        E_sym = cute.sym_int()  # num_experts
-        EM_sym = cute.sym_int()  # sorted_token_ids length
-        EM_blocks_sym = cute.sym_int()  # expert_ids length (EM / block_m)
-        TW_sym = cute.sym_int()  # topk_weights length (independent, may be 0 for "up")
+        M_in_sym = cute.sym_int()
+        M_out_sym = cute.sym_int()
+        K_sym = cute.sym_int()
+        N_sym = cute.sym_int()
+        E_sym = cute.sym_int()
+        EM_sym = cute.sym_int()
+        EM_blocks_sym = cute.sym_int()
+        TW_sym = cute.sym_int()
 
         # A: (M_in, K) row-major
         a_fake = cute.runtime.make_fake_tensor(
@@ -158,13 +137,13 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
             stride=(cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
-        # C: (M_out, N) row-major - for "up" kernel M_out = num_tokens * top_k
+        # C: (M_out, N) row-major
         c_fake = cute.runtime.make_fake_tensor(
             dtype, (M_out_sym, N_sym),
             stride=(cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
-        # topk_weights: (TW,) - independent dimension, may be 0 for "up" kernels
+        # topk_weights: (TW,)
         topk_w_fake = cute.runtime.make_fake_tensor(
             dtype, (TW_sym,),
             stride=(1,),
@@ -176,7 +155,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
             stride=(1,),
             assumed_align=4,
         )
-        # expert_ids: (EM_blocks,) where EM_blocks = EM / block_m
+        # expert_ids: (EM_blocks,)
         expert_fake = cute.runtime.make_fake_tensor(
             cute.Int32, (EM_blocks_sym,),
             stride=(1,),
@@ -191,7 +170,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-        # Compile using same approach as topk - auto-detect GPU arch
+        # Compile
         compiled = cute.compile(
             op,
             a_fake,
@@ -241,7 +220,14 @@ def main():
     # Detect architecture
     arch = get_cuda_arch()
     print(f"Detected CUDA architecture: {arch}")
-    print(f"Compiling {len(PRECOMPILE_VARIANTS)} kernel variants...")
+
+    # Load variants from config files
+    variants = load_variants_from_configs()
+    print(f"Found {len(variants)} unique kernel variants to compile")
+
+    if not variants:
+        print("No config files found! Add JSON configs to kestrel_kernels/configs/")
+        sys.exit(1)
 
     # Output directory for precompiled kernels
     script_dir = Path(__file__).parent
@@ -253,11 +239,11 @@ def main():
     if not init_file.exists():
         init_file.write_text('"""Precompiled CuTe DSL kernels."""\n')
 
-    # Compile sequentially (like topk) - parallel compilation causes issues with CUDA context
+    # Compile sequentially - parallel compilation causes issues with CUDA context
     failed = []
     succeeded = []
 
-    for variant in PRECOMPILE_VARIANTS:
+    for variant in variants:
         result_variant, so_path, error = compile_variant((variant, arch, output_dir))
         if error:
             failed.append((result_variant, error))
