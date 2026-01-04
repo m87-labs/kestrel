@@ -907,6 +907,98 @@ class TestWorkspaceMode:
             workspace.set_prefill_mode(lora_slot=10)
 
 
+class TestMoELoRACudaGraph:
+    """Test MoE LoRA kernel with CUDA graph capture."""
+
+    def test_moe_lora_cudagraph(self, device, dtype):
+        """Test that MoE LoRA batched kernel can be captured in a CUDA graph."""
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
+
+        max_slots = 4
+        num_experts = 8
+        rank = 8
+        hidden_dim = 64
+        out_dim = 128
+        top_k = 2
+        num_tokens = 8
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        # Graph-owned input buffers
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+        lora_slot_ids = torch.tensor([0, 1, 2, 3, 1, 2, 0, 1], dtype=torch.int32, device=device)
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+
+        block_size_m = 16
+
+        def run_kernel():
+            # Use graph-safe pattern: (lora_slot_ids - 1) instead of torch.where
+            token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
+
+            sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+                topk_ids,
+                token_lora_mapping,
+                block_size_m,
+                num_experts,
+                max_loras,
+            )
+
+            output.zero_()
+            apply_moe_lora_batched(
+                x=x,
+                topk_weights=topk_weights,
+                output=output,
+                lora_a=lora_a,
+                lora_b=lora_b,
+                sorted_token_ids=sorted_lora,
+                expert_ids=expert_ids_lora,
+                num_tokens_post_padded=num_tokens_lora,
+                top_k=top_k,
+                num_experts=num_experts,
+                block_size_m=block_size_m,
+                mul_routed_weight=False,
+            )
+            return output.clone()
+
+        # Warmup
+        for _ in range(3):
+            out_eager = run_kernel()
+        torch.cuda.synchronize()
+
+        # Capture graph
+        g = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            torch.cuda.synchronize()
+            with torch.cuda.graph(g, stream=stream):
+                run_kernel()
+        torch.cuda.synchronize()
+
+        # Replay and compare
+        g.replay()
+        torch.cuda.synchronize()
+        out_graph = output.clone()
+
+        torch.testing.assert_close(out_graph, out_eager, rtol=1e-5, atol=1e-5)
+
+        # Test with different inputs
+        x.copy_(torch.randn_like(x))
+        lora_slot_ids.copy_(torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.int32, device=device))
+
+        out_eager2 = run_kernel()
+        g.replay()
+        torch.cuda.synchronize()
+        out_graph2 = output.clone()
+
+        torch.testing.assert_close(out_graph2, out_eager2, rtol=1e-5, atol=1e-5)
+
+
 class TestLoRAStream:
     """Validate batched LoRA path with a dedicated stream."""
 
