@@ -27,6 +27,7 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from kestrel_kernels.flash_attn.cute import ampere_helpers
+from kestrel_kernels.flash_attn.cute import copy_utils
 from kestrel_kernels.flash_attn.cute import hopper_helpers as sm90_utils
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 
@@ -35,10 +36,27 @@ _CUTE_KERNEL_ATTRS_SET: set[str] = set()
 _DEVICE_CACHE_CONFIG_SET = False
 
 # Precompiled kernel registry
-_precompiled_cache: Dict[Tuple[str, "CuteMoeConfig"], Any] = {}
+_precompiled_cache: Dict[Tuple[str, "CuteMoeConfig", int, int], Any] = {}
 _precompiled_cache_fp8: Dict[Tuple[str, "CuteMoeConfig"], Any] = {}
 _precompiled_dir = Path(__file__).parent / "precompiled"
 _cuda_arch: str | None = None
+
+
+@cute.jit
+def _wgmma_gemm_no_fence(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    wg_wait: cutlass.Constexpr[int] = 0,
+) -> None:
+    mma_atom = cute.make_mma_atom(tiled_mma.op)
+    mma_atom.set(warpgroup.Field.ACCUMULATE, True)
+    for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+        cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+    warpgroup.commit_group()
+    if const_expr(wg_wait >= 0):
+        warpgroup.wait_group(wg_wait)
 
 
 def _get_cuda_arch() -> str:
@@ -50,27 +68,29 @@ def _get_cuda_arch() -> str:
     return _cuda_arch
 
 
-def _get_precompiled_kernel_path(kind: str, config: "CuteMoeConfig") -> Path | None:
+def _get_precompiled_kernel_path(
+    kind: str, config: "CuteMoeConfig", N: int, K: int
+) -> Path | None:
     """Get path to precompiled kernel if it exists."""
     arch = _get_cuda_arch()
     filename = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_w{config.num_warps}_s{config.num_stages}_{arch}.so"
+        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}_{arch}.so"
     )
     path = _precompiled_dir / filename
     return path if path.exists() else None
 
 
-def _load_precompiled_kernel(kind: str, config: "CuteMoeConfig"):
+def _load_precompiled_kernel(kind: str, config: "CuteMoeConfig", N: int, K: int):
     """Load a precompiled kernel if available, return None otherwise."""
-    compile_key = (kind, config)
+    compile_key = (kind, config, N, K)
 
     # Check if already loaded
     if compile_key in _precompiled_cache:
         return _precompiled_cache[compile_key]
 
     # Check if precompiled file exists
-    so_path = _get_precompiled_kernel_path(kind, config)
+    so_path = _get_precompiled_kernel_path(kind, config, N, K)
     if so_path is None:
         return None
 
@@ -81,7 +101,7 @@ def _load_precompiled_kernel(kind: str, config: "CuteMoeConfig"):
     arch = _get_cuda_arch()
     function_name = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_w{config.num_warps}_s{config.num_stages}_{arch}"
+        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}_{arch}"
     )
 
     kernel_fn = getattr(mod, function_name)
@@ -194,8 +214,13 @@ class CuteMoeConfig:
                 f"With {self.num_warps} warps, max block_m is {self.num_threads}."
             )
 
-        # block_n must be divisible by 8 * num_warps (MMA layout constraint)
-        # The MMA atom is (16, 8, 16) and warps are tiled (1, num_warps, 1) in N
+        # block_k must be divisible by 16 (MMA K dimension).
+        if self.block_k % 16 != 0:
+            raise ValueError(
+                f"block_k ({self.block_k}) must be divisible by 16 (MMA K dimension)."
+            )
+
+        # block_n must be divisible by 8 * num_warps (MMA layout constraint).
         mma_n_coverage = 8 * self.num_warps
         if self.block_n % mma_n_coverage != 0:
             raise ValueError(
@@ -208,21 +233,38 @@ class CuteMoeConfig:
                 "block_n=32 with num_warps=8 causes LDSM alignment verification failure."
             )
 
-        # Shared memory constraint: sA + sB must fit in ~200KB (H100 has 228KB, need room for sC + metadata)
-        # sA = num_stages * block_m * block_k * 2 bytes
-        # sB = num_stages * block_n * block_k * 2 bytes
-        sA_elements = self.num_stages * self.block_m * self.block_k
-        sB_elements = self.num_stages * self.block_n * self.block_k
-        total_elements = sA_elements + sB_elements
-        max_elements = 100000  # ~200KB for BF16, leaving room for sC and metadata
-        if total_elements > max_elements:
-            sA_kb = sA_elements * 2 // 1024
-            sB_kb = sB_elements * 2 // 1024
+        # Shared memory constraint: sA + sB + metadata must fit in H100's 228KB.
+        # WGMMA also needs sC for epilogue; non-WGMMA writes directly to GMEM.
+        # Use ~200KB limit to leave room for alignment padding and metadata.
+        sA_bytes = self.num_stages * self.block_m * self.block_k * 2
+        sB_bytes = self.num_stages * self.block_n * self.block_k * 2
+        total_bytes = sA_bytes + sB_bytes
+        max_bytes = 200 * 1024
+        if total_bytes > max_bytes:
             raise ValueError(
-                f"Shared memory exceeded: sA={sA_kb}KB + sB={sB_kb}KB = {sA_kb + sB_kb}KB "
+                f"Shared memory exceeded: sA={sA_bytes // 1024}KB + sB={sB_bytes // 1024}KB "
+                f"= {total_bytes // 1024}KB "
                 f"(stages={self.num_stages}, m={self.block_m}, n={self.block_n}, k={self.block_k}). "
-                f"Max ~200KB."
+                f"Max ~{max_bytes // 1024}KB."
             )
+
+        # WGMMA warpgroup constraint: when block_m >= 128 and meets WGMMA criteria,
+        # the BF16 WGMMA kernel path requires (block_m // 64) warpgroups.
+        # Each warpgroup = 4 warps, so num_warps must be (block_m // 64) * 4.
+        # This ensures the tiled_mma atom_layout_mnk=(block_m // 64, 1, 1) has enough threads.
+        if (
+            self.block_m >= 128
+            and self.block_m % 64 == 0
+            and self.block_k % 16 == 0
+        ):
+            required_warpgroups = self.block_m // 64
+            required_warps = required_warpgroups * 4
+            if self.num_warps != required_warps:
+                raise ValueError(
+                    f"WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
+                    f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}. "
+                    f"Each warpgroup (4 warps/128 threads) handles 64 rows of M."
+                )
 
     @property
     def num_threads(self) -> int:
@@ -416,27 +458,31 @@ class _FusedMoeMatmulCuTe:
         *,
         mul_routed_weight: bool,
         top_k: int,
+        N: int,
+        K: int,
     ) -> None:
         self.dtype = dtype
         self.config = config
         self.mul_routed_weight = mul_routed_weight
         self.top_k = int(top_k)
+        self.N = int(N)
+        self.K = int(K)
 
     def _shared_storage_cls(self):
         sA_elems = self.config.num_stages * self.config.block_m * self.config.block_k
         sB_elems = self.config.num_stages * self.config.block_n * self.config.block_k
-        sC_elems = self.config.block_m * self.config.block_n
         sMeta_elems = self.config.block_m
         # Match flash-attn's practice of aligning swizzled SMEM buffers to large boundaries.
         # This helps the compiler prove alignment for vectorized LDGSTS and reduces any
         # bank-conflict risk for LDSM (ldmatrix) loads.
         sA_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sA_elems], 1024]
         sB_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sB_elems], 1024]
-        sC_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, sC_elems], 16]
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
-        # Store routing weights as fp32 in shared memory so the epilogue doesn't need
-        # per-element dtype->fp32 conversion.
-        sW_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
+        sW_struct = None
+        if self.mul_routed_weight:
+            # Store routing weights as fp32 in shared memory so the epilogue doesn't need
+            # per-element dtype->fp32 conversion.
+            sW_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
         sArowBase_struct = cute.struct.Align[
             cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16
         ]
@@ -448,11 +494,11 @@ class _FusedMoeMatmulCuTe:
         class SharedStorage:
             sA: sA_struct
             sB: sB_struct
-            sC: sC_struct
             sAid: sAid_struct
-            sW: sW_struct
             sArowBase: sArowBase_struct
             sCrowBase: sCrowBase_struct
+            if self.mul_routed_weight:
+                sW: sW_struct
 
         return SharedStorage
 
@@ -481,7 +527,7 @@ class _FusedMoeMatmulCuTe:
         # Launch for the *allocated* routing workspace (sorted ids length) and
         # mask out unused blocks using `mNumTokensPostPadded` inside the kernel.
         grid_m = cute.ceil_div(Int32(mSortedTokenIds.shape[0]), block_m)
-        grid_n = cute.ceil_div(Int32(mB.shape[1]), block_n)
+        grid_n = cute.ceil_div(Int32(self.N), block_n)
         SharedStorage = self._shared_storage_cls()
 
         self.kernel(
@@ -493,6 +539,8 @@ class _FusedMoeMatmulCuTe:
             mSortedTokenIds,
             mExpertIds,
             mNumTokensPostPadded,
+            self.N,
+            self.K,
             SharedStorage,
         ).launch(
             grid=(grid_m, grid_n, 1),
@@ -512,6 +560,8 @@ class _FusedMoeMatmulCuTe:
         mSortedTokenIds: cute.Tensor,
         mExpertIds: cute.Tensor,
         mNumTokensPostPadded: cute.Tensor,
+        N: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
         SharedStorage: cutlass.Constexpr,
     ):
         tx, _, _ = cute.arch.thread_idx()
@@ -530,13 +580,19 @@ class _FusedMoeMatmulCuTe:
         block_active = row_start < num_tokens_post_padded
 
         # NOTE: For this kernel, we assume K and N are static across the op invocation.
-        N = Int32(mB.shape[1])
-        K = Int32(mA.shape[1])
+        N_const = Int32(N)
+        K_const = Int32(K)
 
         # `num_valid_tokens` matches the Triton kernel semantics:
         # - When top_k > 1 (up projection): A is [M, K], valid assignments = M * top_k.
         # - When top_k == 1 (down projection): A is [M_assignments, K], valid assignments = M_assignments.
-        num_valid_tokens = Int32(mA.shape[0]) * Int32(self.top_k)
+        m_count = Int32(mA.shape[0])
+        if const_expr(self.top_k == 1):
+            num_valid_tokens = m_count
+        elif const_expr(self.top_k == 8):
+            num_valid_tokens = m_count << 3
+        else:
+            num_valid_tokens = m_count * Int32(self.top_k)
 
         expert_id = Int32(mExpertIds[pid_m])
 
@@ -548,7 +604,10 @@ class _FusedMoeMatmulCuTe:
         # - Avoid dynamic-indexed register arrays that frequently spill to local memory.
         s_meta_layout = cute.make_layout((block_m,), stride=(1,))
         sAid = storage.sAid.get_tensor(s_meta_layout)
-        sW = storage.sW.get_tensor(s_meta_layout)
+        if const_expr(self.mul_routed_weight):
+            sW = storage.sW.get_tensor(s_meta_layout)
+        else:
+            sW = None
         sArowBase = storage.sArowBase.get_tensor(s_meta_layout)
         sCrowBase = storage.sCrowBase.get_tensor(s_meta_layout)
         # Precompute per-row base pointers in bytes to avoid repeated 64-bit multiplies
@@ -564,7 +623,12 @@ class _FusedMoeMatmulCuTe:
             sAid[tx] = aid
             tok = Int32(0)
             if aid < num_valid_tokens:
-                tok = aid // Int32(self.top_k)
+                if const_expr(self.top_k == 1):
+                    tok = aid
+                elif const_expr(self.top_k == 8):
+                    tok = aid >> 3
+                else:
+                    tok = aid // Int32(self.top_k)
             arow_base = cutlass.Int64(0)
             crow_base = cutlass.Int64(0)
             if aid < num_valid_tokens:
@@ -587,12 +651,6 @@ class _FusedMoeMatmulCuTe:
         sB_tile_layout = cute.tile_to_shape(sB_layout_atom, (block_n, block_k), (0, 1))
         sB_elems = num_stages * block_n * block_k
         sB = storage.sB.get_tensor(cute.make_layout((sB_elems,), stride=(1,)))
-        # Flash-attn-style swizzled SMEM layout for C. This makes `stmatrix` stores conflict-free
-        # and preserves 128-bit vector contiguity for the subsequent SMEM->GMEM scatter stores.
-        sC_layout_atom = ampere_helpers.get_smem_layout_atom(self.dtype, block_n)
-        sC_layout = cute.tile_to_shape(sC_layout_atom, (block_m, block_n), (0, 1))
-        sC_linear = storage.sC.get_tensor(cute.make_layout((block_m * block_n,), stride=(1,)))
-        sC = cute.make_tensor(sC_linear.iterator, sC_layout)
 
         # Thread MMA setup.
         thr_mma = tiled_mma.get_slice(tx)
@@ -632,16 +690,32 @@ class _FusedMoeMatmulCuTe:
                 n0 = Int32(nvec_c * vec_size)
                 aid_c = sAid[r_c]
                 col0 = n_start + n0
-                if (aid_c < num_valid_tokens) and (col0 < N):
-                    g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
-                    g_ptr_c = cute.make_ptr(
-                        self.dtype,
-                        mC_base_i64 + g_off_bytes_c,
-                        cute.AddressSpace.gmem,
-                        assumed_align=align_bytes,
-                    )
-                    dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
-                    cute.copy(gmem_store_atom, zero_vec, dst_c)
+                if const_expr(N % block_n == 0):
+                    if aid_c < num_valid_tokens:
+                        g_off_bytes_c = (
+                            sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
+                        )
+                        g_ptr_c = cute.make_ptr(
+                            self.dtype,
+                            mC_base_i64 + g_off_bytes_c,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
+                        cute.copy(gmem_store_atom, zero_vec, dst_c)
+                else:
+                    if (aid_c < num_valid_tokens) and (col0 < N_const):
+                        g_off_bytes_c = (
+                            sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
+                        )
+                        g_ptr_c = cute.make_ptr(
+                            self.dtype,
+                            mC_base_i64 + g_off_bytes_c,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
+                        cute.copy(gmem_store_atom, zero_vec, dst_c)
         else:
             # Copy atoms (cp.async for gmem->smem).
             vec_size = 8
@@ -670,7 +744,6 @@ class _FusedMoeMatmulCuTe:
             mC_base_i64 = mC.iterator.toint()
             sA_base_i64 = sA.iterator.toint()
             sB_base_i64 = sB.iterator.toint()
-            sC_base_i64 = sC.iterator.toint()
 
             block_vec_k = block_k // vec_size
             total_vec_a = block_m * block_vec_k
@@ -678,8 +751,11 @@ class _FusedMoeMatmulCuTe:
             stage_stride_a = Int32(block_m * block_k)
             stage_stride_b = Int32(block_n * block_k)
 
-            k_tiles = cute.ceil_div(K, block_k)
-            full_n_tile = (n_start + Int32(block_n)) <= N
+            k_tiles = cute.ceil_div(K_const, block_k)
+            if const_expr(N % block_n == 0):
+                full_n_tile = True
+            else:
+                full_n_tile = (n_start + Int32(block_n)) <= N_const
 
             vB_layout = cute.make_layout((1, vec_size))
             tB_shape_dim_1 = sB_layout_atom.outer.shape[1] // vec_size
@@ -687,7 +763,9 @@ class _FusedMoeMatmulCuTe:
                 (num_threads // tB_shape_dim_1, tB_shape_dim_1),
                 order=(1, 0),
             )
-            gmem_tiled_copy_B = cute.make_tiled_copy_tv(atom_async_copy_b, tB_layout, vB_layout)
+            gmem_tiled_copy_B = cute.make_tiled_copy_tv(
+                atom_async_copy_b, tB_layout, vB_layout
+            )
             gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(tx)
 
             cB = cute.make_identity_tensor((block_n, block_k))
@@ -712,7 +790,10 @@ class _FusedMoeMatmulCuTe:
                     valid_row_a = aid_a < num_valid_tokens
                     arow_base = sArowBase[r_a]
 
-                    valid_a = tile_in_range and valid_row_a and (kg_a < K)
+                    if const_expr(K % block_k == 0):
+                        valid_a = tile_in_range and valid_row_a
+                    else:
+                        valid_a = tile_in_range and valid_row_a and (kg_a < K_const)
                     g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
                     g_ptr_a = cute.make_ptr(
                         self.dtype,
@@ -740,7 +821,10 @@ class _FusedMoeMatmulCuTe:
 
                 # B tile: [block_n, block_k] (swizzled SMEM).
                 if tile_in_range:
-                    full_k_tile = (k_start_prefetch + Int32(block_k)) <= K
+                    if const_expr(K % block_k == 0):
+                        full_k_tile = True
+                    else:
+                        full_k_tile = (k_start_prefetch + Int32(block_k)) <= K_const
                     # Use `local_tile` to preserve compactness/divisibility metadata (flash-attn style).
                     gB_tile = cute.local_tile(
                         mB_expert,
@@ -768,14 +852,14 @@ class _FusedMoeMatmulCuTe:
                                 )
                         else:
                             for n in cutlass.range_constexpr(cute.size(tBsB.shape[1])):
-                                if n_start + t0BcB[0, n, 0][0] < N:
+                                if n_start + t0BcB[0, n, 0][0] < N_const:
                                     cute.copy(
                                         gmem_tiled_copy_B,
                                         tBgB[None, n, None],
                                         tBsB[None, n, None],
                                     )
                     else:
-                        tBpB = fa_utils.predicate_k(tBcB, limit=K - k_start_prefetch)
+                        tBpB = fa_utils.predicate_k(tBcB, limit=K_const - k_start_prefetch)
                         if full_n_tile:
                             for n in cutlass.range_constexpr(cute.size(tBsB.shape[1])):
                                 cute.copy(
@@ -786,7 +870,7 @@ class _FusedMoeMatmulCuTe:
                                 )
                         else:
                             for n in cutlass.range_constexpr(cute.size(tBsB.shape[1])):
-                                if n_start + t0BcB[0, n, 0][0] < N:
+                                if n_start + t0BcB[0, n, 0][0] < N_const:
                                     cute.copy(
                                         gmem_tiled_copy_B,
                                         tBgB[None, n, None],
@@ -856,6 +940,10 @@ class _FusedMoeMatmulCuTe:
                 next_tile = tile_idx + Int32(num_stages)
                 if next_tile < k_tiles:
                     k_start_next = next_tile * Int32(block_k)
+                    if const_expr(K % block_k == 0):
+                        full_k_tile_next = True
+                    else:
+                        full_k_tile_next = (k_start_next + Int32(block_k)) <= K_const
 
                     for vec_linear_a2 in range(tx, total_vec_a, num_threads):
                         r_a2 = vec_linear_a2 // block_vec_k
@@ -867,7 +955,10 @@ class _FusedMoeMatmulCuTe:
                         valid_row_a2 = aid_a2 < num_valid_tokens
                         arow_base2 = sArowBase[r_a2]
 
-                        valid_a2 = valid_row_a2 and (kg_a2 < K)
+                        if const_expr(K % block_k == 0):
+                            valid_a2 = valid_row_a2
+                        else:
+                            valid_a2 = valid_row_a2 and (kg_a2 < K_const)
                         g_off_bytes_a2 = arow_base2 + cutlass.Int64(kg_a2) * element_bytes
                         g_ptr_a2 = cute.make_ptr(
                             self.dtype,
@@ -904,7 +995,6 @@ class _FusedMoeMatmulCuTe:
                     sB_stage2 = cute.make_tensor(sB_stage_ptr2, sB_tile_layout)
                     tBsB2 = gmem_thr_copy_B.partition_D(sB_stage2)
 
-                    full_k_tile_next = (k_start_next + Int32(block_k)) <= K
                     gB_tile_next = cute.local_tile(
                         mB_expert,
                         (block_n, block_k),
@@ -921,14 +1011,16 @@ class _FusedMoeMatmulCuTe:
                                 )
                         else:
                             for n in cutlass.range_constexpr(cute.size(tBsB2.shape[1])):
-                                if n_start + t0BcB[0, n, 0][0] < N:
+                                if n_start + t0BcB[0, n, 0][0] < N_const:
                                     cute.copy(
                                         gmem_tiled_copy_B,
                                         tBgB_next[None, n, None],
                                         tBsB2[None, n, None],
                                     )
                     else:
-                        tBpB_next = fa_utils.predicate_k(tBcB, limit=K - k_start_next)
+                        tBpB_next = fa_utils.predicate_k(
+                            tBcB, limit=K_const - k_start_next
+                        )
                         if full_n_tile:
                             for n in cutlass.range_constexpr(cute.size(tBsB2.shape[1])):
                                 cute.copy(
@@ -939,7 +1031,7 @@ class _FusedMoeMatmulCuTe:
                                 )
                         else:
                             for n in cutlass.range_constexpr(cute.size(tBsB2.shape[1])):
-                                if n_start + t0BcB[0, n, 0][0] < N:
+                                if n_start + t0BcB[0, n, 0][0] < N_const:
                                     cute.copy(
                                         gmem_tiled_copy_B,
                                         tBgB_next[None, n, None],
@@ -1005,74 +1097,773 @@ class _FusedMoeMatmulCuTe:
 
                 stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-            # Epilogue: apply routed weights (if needed), then store the fp32 accumulator to shared
-            # in fp16/bf16, then scatter to gmem.
-            #
-            # NOTE: `retile` expects a Tensor (not TensorSSA), so we materialize a fragment for the
-            # rmem -> smem store path.
-            rC = cute.make_fragment_like(acc, self.dtype)
-            if const_expr(self.mul_routed_weight):
-                cC = cute.make_identity_tensor((block_m, block_n))
-                tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
-                tAcc = fa_utils.make_acc_tensor_mn_view(acc)
-                tRC = fa_utils.make_acc_tensor_mn_view(rC)
-                for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
-                    m = Int32(tC_coords[mi, 0][0])
-                    w32 = sW[m]
-                    for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                        tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * w32)
-            else:
-                rC.store(acc.load().to(self.dtype))
-            smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
-            if const_expr(block_n == 32):
-                # When block_n=32, each warp effectively owns 32 / 4 = 8 columns of C.
-                # fa_utils does `stmatrix.x4`, which is a wider store. This leads to
-                # garbage data being written to SMEM. Use a narrower variant instead.
-                smem_store_atom = cute.make_copy_atom(
-                    warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
-                    self.dtype,
-                )
-            smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
-            tCsC = smem_thr_store.partition_D(sC)
-            tCrC = smem_thr_store.retile(rC)
-            cute.copy(smem_store_atom, tCrC, tCsC)
-            cute.arch.barrier()
+            # Epilogue: apply routed weights (if needed), then store directly to gmem.
+            cC = cute.make_identity_tensor((block_m, block_n))
+            tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
+            tAcc = fa_utils.make_acc_tensor_mn_view(acc)
 
             gmem_store_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 self.dtype,
-                num_bits_per_copy=copy_bits,
+                num_bits_per_copy=2 * self.dtype.width,
             )
-            vec_n = block_n // vec_size
-            total_vec_c = block_m * vec_n
+            gmem_store_atom_scalar = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype,
+                num_bits_per_copy=self.dtype.width,
+            )
+            vec_size_out = 2
+            src_vec = cute.make_rmem_tensor((vec_size_out,), self.dtype)
+            src_scalar = cute.make_rmem_tensor((1,), self.dtype)
+            align_bytes_out = vec_size_out * int(self.dtype.width // 8)
+            align_bytes_scalar = int(self.dtype.width // 8)
 
+            if full_n_tile:
+                for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                    m = Int32(tC_coords[mi, 0][0])
+                    aid = sAid[m]
+                    if aid < num_valid_tokens:
+                        row_scale = Float32(1.0)
+                        if const_expr(self.mul_routed_weight):
+                            row_scale = Float32(sW[m])
+                        row_off_bytes = (
+                            cutlass.Int64(aid) * stride_cm_elems * element_bytes
+                        )
+                        n_pairs = cute.size(tAcc.shape[1]) // vec_size_out
+                        for pi in cutlass.range_constexpr(n_pairs):
+                            ni0 = Int32(pi * vec_size_out)
+                            n0 = Int32(tC_coords[mi, ni0][1])
+                            col0 = n_start + n0
+                            src_vec[0] = self.dtype(Float32(tAcc[mi, ni0]) * row_scale)
+                            src_vec[1] = self.dtype(
+                                Float32(tAcc[mi, ni0 + 1]) * row_scale
+                            )
+                            g_off_bytes_vec = (
+                                row_off_bytes + cutlass.Int64(col0) * element_bytes
+                            )
+                            g_ptr_vec = cute.make_ptr(
+                                self.dtype,
+                                mC_base_i64 + g_off_bytes_vec,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes_out,
+                            )
+                            dst_vec = cute.make_tensor(g_ptr_vec, (vec_size_out,))
+                            cute.copy(gmem_store_atom, src_vec, dst_vec)
+            else:
+                for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                    m = Int32(tC_coords[mi, 0][0])
+                    aid = sAid[m]
+                    if aid < num_valid_tokens:
+                        row_scale = Float32(1.0)
+                        if const_expr(self.mul_routed_weight):
+                            row_scale = Float32(sW[m])
+                        row_off_bytes = (
+                            cutlass.Int64(aid) * stride_cm_elems * element_bytes
+                        )
+                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
+                            n = Int32(tC_coords[mi, ni][1])
+                            col = n_start + n
+                            if col < N_const:
+                                src_scalar[0] = self.dtype(
+                                    Float32(tAcc[mi, ni]) * row_scale
+                                )
+                                g_off_bytes_scalar = (
+                                    row_off_bytes + cutlass.Int64(col) * element_bytes
+                                )
+                                g_ptr_scalar = cute.make_ptr(
+                                    self.dtype,
+                                    mC_base_i64 + g_off_bytes_scalar,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=align_bytes_scalar,
+                                )
+                                dst_scalar = cute.make_tensor(g_ptr_scalar, (1,))
+                                cute.copy(gmem_store_atom_scalar, src_scalar, dst_scalar)
+
+
+def _should_use_wgmma_bf16(config: "CuteMoeConfig") -> bool:
+    return (
+        config.block_m >= 128
+        and config.block_m % 64 == 0
+        and config.block_k % 16 == 0
+        and config.num_warps % 4 == 0
+        and config.num_warps == (config.block_m // 64) * 4
+    )
+
+
+class _FusedMoeMatmulCuTeWgmmaBf16:
+    """Routed MoE GEMM with BF16 activations+weights using SM90 WGMMA.
+
+    This is tuned for larger M tiles (block_m >= 64) where warpgroup MMA (WGMMA)
+    tends to outperform warp-level MMA on H100.
+    """
+
+    def __init__(
+        self,
+        dtype: type[cutlass.Numeric],
+        config: CuteMoeConfig,
+        *,
+        mul_routed_weight: bool,
+        top_k: int,
+        N: int,
+        K: int,
+    ) -> None:
+        self.dtype = dtype
+        self.config = config
+        self.mul_routed_weight = mul_routed_weight
+        self.top_k = int(top_k)
+        self.N = int(N)
+        self.K = int(K)
+
+    def _shared_storage_cls(self):
+        block_m = self.config.block_m
+        block_n = self.config.block_n
+        block_k = self.config.block_k
+        num_stages = self.config.num_stages
+
+        # WGMMA requires warpgroup-compatible SMEM layouts.
+        s_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, block_k),
+            self.dtype,
+        )
+        sA_layout = cute.tile_to_shape(
+            s_layout_atom, (block_m, block_k, num_stages), order=(0, 1, 2)
+        )
+        sB_layout = cute.tile_to_shape(
+            s_layout_atom, (block_n, block_k, num_stages), order=(0, 1, 2)
+        )
+
+        sA_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cute.cosize(sA_layout)], 1024
+        ]
+        sB_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cute.cosize(sB_layout)], 1024
+        ]
+        sC_elems = block_m * block_n
+        sC_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, sC_elems], 16
+        ]
+        sMeta_elems = block_m
+        sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
+        sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
+        # Pre-computed row base offsets in bytes for efficient gather.
+        sArowBase_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int64, sMeta_elems], 16]
+        sW_struct = None
+        if self.mul_routed_weight:
+            # Store routing weights as fp32 to avoid per-element bf16->fp32 conversion in the epilogue.
+            sW_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
+
+        @cute.struct
+        class SharedStorage:
+            sA: sA_struct
+            sB: sB_struct
+            sC: sC_struct
+            sAid: sAid_struct
+            sTok: sTok_struct
+            sArowBase: sArowBase_struct
+            if self.mul_routed_weight:
+                sW: sW_struct
+
+        return SharedStorage
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,  # (M_tokens_or_assignments, K)
+        mB: cute.Tensor,  # (E, N, K) row-major in K
+        mC: cute.Tensor,  # (M_assignments, N) row-major in N
+        mTopkWeights: cute.Tensor,  # (M_assignments,) or empty
+        mSortedTokenIds: cute.Tensor,  # (EM,)
+        mExpertIds: cute.Tensor,  # (EM / block_m,)
+        mNumTokensPostPadded: cute.Tensor,  # (1,)
+        stream: cuda.CUstream,
+    ):
+        # SM90 warpgroup MMA (WGMMA).
+        tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
+            self.dtype,
+            self.dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            atom_layout_mnk=(self.config.block_m // 64, 1, 1),
+            tiler_mn=(64, self.config.block_n),
+        )
+
+        block_m = self.config.block_m
+        block_n = self.config.block_n
+        block_k = self.config.block_k
+        grid_m = cute.ceil_div(Int32(mSortedTokenIds.shape[0]), block_m)
+        grid_n = cute.ceil_div(Int32(self.N), block_n)
+        SharedStorage = self._shared_storage_cls()
+
+        self.kernel(
+            tiled_mma,
+            mA,
+            mB,
+            mC,
+            mTopkWeights,
+            mSortedTokenIds,
+            mExpertIds,
+            mNumTokensPostPadded,
+            self.N,
+            self.K,
+            SharedStorage,
+        ).launch(
+            grid=(grid_m, grid_n, 1),
+            block=(self.config.num_threads, 1, 1),
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        mTopkWeights: cute.Tensor,
+        mSortedTokenIds: cute.Tensor,
+        mExpertIds: cute.Tensor,
+        mNumTokensPostPadded: cute.Tensor,
+        N: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        SharedStorage: cutlass.Constexpr,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        pid_m, pid_n, _ = cute.arch.block_idx()
+
+        block_m = self.config.block_m
+        block_n = self.config.block_n
+        block_k = self.config.block_k
+        num_threads = self.config.num_threads
+        num_stages = self.config.num_stages
+
+        n_start = pid_n * block_n
+        row_start = pid_m * block_m
+
+        num_tokens_post_padded = Int32(mNumTokensPostPadded[0])
+        block_active = row_start < num_tokens_post_padded
+        num_threads_per_wg = 128
+
+        N_const = Int32(N)
+        K_const = Int32(K)
+        m_count = Int32(mA.shape[0])
+        if const_expr(self.top_k == 1):
+            num_valid_tokens = m_count
+        elif const_expr(self.top_k == 8):
+            num_valid_tokens = m_count << 3
+        else:
+            num_valid_tokens = m_count * Int32(self.top_k)
+        expert_id = Int32(mExpertIds[pid_m])
+        if const_expr(N % block_n == 0):
+            full_n_tile = True
+        else:
+            full_n_tile = (n_start + Int32(block_n)) <= N_const
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        s_meta_layout = cute.make_layout((block_m,), stride=(1,))
+        sAid = storage.sAid.get_tensor(s_meta_layout)
+        sTok = storage.sTok.get_tensor(s_meta_layout)
+        sArowBase = storage.sArowBase.get_tensor(s_meta_layout)
+        if const_expr(self.mul_routed_weight):
+            sW = storage.sW.get_tensor(s_meta_layout)
+        else:
+            sW = None
+
+        # Shared-memory operand tensors (staged).
+        s_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, block_k),
+            self.dtype,
+        )
+        sA_layout = cute.tile_to_shape(
+            s_layout_atom, (block_m, block_k, num_stages), order=(0, 1, 2)
+        )
+        sB_layout = cute.tile_to_shape(
+            s_layout_atom, (block_n, block_k, num_stages), order=(0, 1, 2)
+        )
+        # WGMMA expects affine layouts; move swizzle to the pointer (recast) via `swizzle=...`.
+        sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner, dtype=self.dtype)
+        sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner, dtype=self.dtype)
+        # Flash-attn-style swizzled SMEM layout for C. This makes `stmatrix` stores conflict-free
+        # and preserves 128-bit vector contiguity for the subsequent SMEM->GMEM scatter stores.
+        sC_layout_atom = ampere_helpers.get_smem_layout_atom(self.dtype, block_n)
+        sC_layout = cute.tile_to_shape(sC_layout_atom, (block_m, block_n), (0, 1))
+        sC_linear = storage.sC.get_tensor(
+            cute.make_layout((block_m * block_n,), stride=(1,))
+        )
+        sC = cute.make_tensor(sC_linear.iterator, sC_layout)
+        element_bytes = cutlass.Int64(self.dtype.width // 8)
+        stride_am_elems = cutlass.Int64(mA.stride[0])
+        stride_cm_elems = cutlass.Int64(mC.stride[0])
+
+        # Load per-row routing metadata once per CTA (unconditional, just guarded by tx < block_m).
+        if tx < Int32(block_m):
+            idx = row_start + tx
+            aid = Int32(num_valid_tokens)  # padded sentinel
+            if idx < num_tokens_post_padded:
+                aid = Int32(mSortedTokenIds[idx])
+            sAid[tx] = aid
+            tok = Int32(0)
+            if aid < num_valid_tokens:
+                if const_expr(self.top_k == 1):
+                    tok = aid
+                elif const_expr(self.top_k == 8):
+                    tok = aid >> 3
+                else:
+                    tok = aid // Int32(self.top_k)
+            sTok[tx] = tok
+
+            # Pre-compute row base offset in bytes for efficient gather.
+            arow_base = cutlass.Int64(0)
+            if aid < num_valid_tokens:
+                arow_base = cutlass.Int64(tok) * stride_am_elems * element_bytes
+            sArowBase[tx] = arow_base
+
+            if const_expr(self.mul_routed_weight):
+                w32 = Float32(0.0)
+                if aid < num_valid_tokens:
+                    w32 = Float32(mTopkWeights[aid])
+                sW[tx] = w32
+
+        cute.arch.barrier()
+
+        # WGMMA accumulator (created unconditionally like warp-level kernel).
+        acc = cute.make_rmem_tensor(
+            tiled_mma.partition_shape_C((block_m, block_n)), Float32
+        )
+        acc.fill(0.0)
+
+        mC_base_i64 = mC.iterator.toint()
+        k_tiles = cute.ceil_div(K_const, block_k)
+
+        # NOTE: Branch is uniform across the CTA, so barriers remain safe.
+        # Pattern from warp-level kernel: each branch has its own complete setup.
+        if (not block_active) or (expert_id == -1):
+            # Inactive block or invalid expert: write zeros to output.
+            # All setup done inside this block (matching warp-level pattern).
+            vec_size_c = 8
+            copy_bits_c = vec_size_c * self.dtype.width
+            gmem_store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype,
+                num_bits_per_copy=copy_bits_c,
+            )
+            element_bytes_c = cutlass.Int64(self.dtype.width // 8)
+            align_bytes_c = vec_size_c * int(self.dtype.width // 8)
+            zero_vec = cute.make_rmem_tensor((vec_size_c,), self.dtype)
+            zero_vec.fill(self.dtype(0.0))
+            vec_n_c = block_n // vec_size_c
+            total_vec_c = block_m * vec_n_c
             for vec_linear_c in range(tx, total_vec_c, num_threads):
-                r_c = vec_linear_c // vec_n
-                nvec_c = vec_linear_c - r_c * vec_n
-                n0 = Int32(nvec_c * vec_size)
+                r_c = vec_linear_c // vec_n_c
+                nvec_c = vec_linear_c - r_c * vec_n_c
+                n0 = Int32(nvec_c * vec_size_c)
                 aid_c = sAid[r_c]
-                col0 = n_start + n0
-                if (aid_c < num_valid_tokens) and (col0 < N):
-                    s_linear_c = Int32(sC_layout((Int32(r_c), n0)))
-                    s_off_bytes_c = cutlass.Int64(s_linear_c) * element_bytes
-                    s_ptr_c = cute.make_ptr(
-                        self.dtype,
-                        sC_base_i64 + s_off_bytes_c,
-                        cute.AddressSpace.smem,
-                        assumed_align=align_bytes,
-                    )
-                    src_c = cute.make_tensor(s_ptr_c, (vec_size,))
+                if aid_c < num_valid_tokens:
+                    col0 = n_start + n0
+                    if const_expr(N % block_n == 0) or (col0 < N_const):
+                        row_off_bytes = cutlass.Int64(aid_c) * stride_cm_elems * element_bytes_c
+                        g_off_bytes_c = row_off_bytes + cutlass.Int64(col0) * element_bytes_c
+                        g_ptr_c = cute.make_ptr(
+                            self.dtype,
+                            mC_base_i64 + g_off_bytes_c,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes_c,
+                        )
+                        dst_c = cute.make_tensor(g_ptr_c, (vec_size_c,))
+                        cute.copy(gmem_store_atom, zero_vec, dst_c)
+        else:
+                # Active block: all copy setup done inside else-block (matching warp-level pattern).
+                vec_size = 8
+                copy_bits = vec_size * self.dtype.width
+                atom_async_copy_a = cute.make_copy_atom(
+                    cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                    self.dtype,
+                    num_bits_per_copy=copy_bits,
+                )
+                pred_false = cute.make_rmem_tensor((vec_size,), Boolean)
+                pred_false.fill(False)
+                element_bytes = cutlass.Int64(self.dtype.width // 8)
+                align_bytes = vec_size * int(self.dtype.width // 8)
+                mA_base_i64 = mA.iterator.toint()
+                sA_base_i64 = sA.iterator.toint()
+                block_vec_k = block_k // vec_size
+                total_vec_a = block_m * block_vec_k
+                stage_stride_a = Int32(block_m * block_k)
+                # 2D tile layout (with swizzle) for computing SMEM offsets within a stage.
+                sA_tile_layout = cute.tile_to_shape(s_layout_atom, (block_m, block_k), (0, 1))
 
-                    g_off_bytes_c = sCrowBase[r_c] + cutlass.Int64(col0) * element_bytes
-                    g_ptr_c = cute.make_ptr(
-                        self.dtype,
-                        mC_base_i64 + g_off_bytes_c,
-                        cute.AddressSpace.gmem,
-                        assumed_align=align_bytes,
-                    )
-                    dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
+                tiled_copy_B = copy_utils.tiled_copy_2d(
+                    self.dtype, block_k, num_threads, is_async=True
+                )
+                thr_copy_B = tiled_copy_B.get_slice(tx)
+                cB = cute.make_identity_tensor((block_n, block_k))
+                tBcB = thr_copy_B.partition_S(cB)
+                t0BcB = thr_copy_B.get_slice(0).partition_S(cB)
 
-                    cute.copy(gmem_store_atom, src_c, dst_c)
+                mB_expert = mB[expert_id, None, None]
+
+                # Prologue: prefetch the first `num_stages` K tiles.
+                for stage_prefetch in cutlass.range_constexpr(num_stages):
+                    tile_idx_prefetch = Int32(stage_prefetch)
+                    k_start_prefetch = tile_idx_prefetch * Int32(block_k)
+                    tile_in_range = tile_idx_prefetch < k_tiles
+
+                    # A tile: explicit gather loop [block_m, block_k].
+                    # Loop runs unconditionally; tile_in_range is folded into valid_a.
+                    for vec_linear_a in range(tx, total_vec_a, num_threads):
+                        r_a = vec_linear_a // block_vec_k
+                        kvec_a = vec_linear_a - r_a * block_vec_k
+                        k_a = Int32(kvec_a * vec_size)
+                        kg_a = k_start_prefetch + k_a
+
+                        aid_a = sAid[r_a]
+                        valid_row_a = aid_a < num_valid_tokens
+                        arow_base = sArowBase[r_a]
+
+                        if const_expr(K % block_k == 0):
+                            valid_a = tile_in_range and valid_row_a
+                        else:
+                            valid_a = tile_in_range and valid_row_a and (kg_a < K_const)
+
+                        g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
+                        g_ptr_a = cute.make_ptr(
+                            self.dtype,
+                            mA_base_i64 + g_off_bytes_a,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        src_a = cute.make_tensor(g_ptr_a, (vec_size,))
+
+                        s_linear_a = Int32(stage_prefetch) * stage_stride_a + Int32(
+                            sA_tile_layout((Int32(r_a), k_a))
+                        )
+                        s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes
+                        s_ptr_a = cute.make_ptr(
+                            self.dtype,
+                            sA_base_i64 + s_off_bytes_a,
+                            cute.AddressSpace.smem,
+                            assumed_align=align_bytes,
+                        )
+                        dst_a = cute.make_tensor(s_ptr_a, (vec_size,))
+
+                        if valid_a:
+                            cute.copy(atom_async_copy_a, src_a, dst_a)
+                        else:
+                            cute.copy(atom_async_copy_a, src_a, dst_a, pred=pred_false)
+
+                    # B tile: only copy when tile is in range.
+                    if tile_in_range:
+                        if const_expr(K % block_k == 0):
+                            full_k_tile = True
+                        else:
+                            full_k_tile = (k_start_prefetch + Int32(block_k)) <= K_const
+
+                        sB_stage = sB[None, None, stage_prefetch]
+                        gB_tile = cute.local_tile(
+                            mB_expert,
+                            (block_n, block_k),
+                            (pid_n, tile_idx_prefetch),
+                        )
+                        tBgB = thr_copy_B.partition_S(gB_tile)
+                        tBsB = thr_copy_B.partition_D(sB_stage)
+                        if full_k_tile:
+                            if full_n_tile:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    cute.copy(
+                                        tiled_copy_B,
+                                        tBgB[None, n, None],
+                                        tBsB[None, n, None],
+                                    )
+                            else:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    if n_start + t0BcB[0, n, 0][0] < N_const:
+                                        cute.copy(
+                                            tiled_copy_B,
+                                            tBgB[None, n, None],
+                                            tBsB[None, n, None],
+                                        )
+                        else:
+                            tBpB = fa_utils.predicate_k(
+                                tBcB, limit=K_const - k_start_prefetch
+                            )
+                            if full_n_tile:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    cute.copy(
+                                        tiled_copy_B,
+                                        tBgB[None, n, None],
+                                        tBsB[None, n, None],
+                                        pred=tBpB[None, n, None],
+                                    )
+                            else:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    if n_start + t0BcB[0, n, 0][0] < N_const:
+                                        cute.copy(
+                                            tiled_copy_B,
+                                            tBgB[None, n, None],
+                                            tBsB[None, n, None],
+                                            pred=tBpB[None, n, None],
+                                        )
+
+                    cute.arch.cp_async_commit_group()
+
+                # WGMMA operand fragments (moved here from before prologue to avoid DSL tracing issues).
+                warp_group_idx = cute.arch.make_warp_uniform(
+                    tx // Int32(num_threads_per_wg)
+                )
+                warp_group_thread_layout = cute.make_layout(
+                    num_threads // num_threads_per_wg,
+                    stride=num_threads_per_wg,
+                )
+                wg_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+                tSrA = tiled_mma.make_fragment_A(wg_mma.partition_A(sA))
+                tSrB = tiled_mma.make_fragment_B(wg_mma.partition_B(sB))
+
+                stage_idx = Int32(0)
+                main_tiles = k_tiles - Int32(num_stages - 1)
+
+                # Precompute loop-invariant values for each element this thread handles.
+                # Each thread processes total_vec_a / num_threads = 4 elements.
+                num_elems_per_thread = total_vec_a // num_threads
+                precomp_k_a = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
+                precomp_aid_a = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
+                precomp_arow_base = cute.make_rmem_tensor((num_elems_per_thread,), cutlass.Int64)
+                precomp_valid_row_a = cute.make_rmem_tensor((num_elems_per_thread,), Boolean)
+                precomp_s_layout_off = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
+
+                for i in range(num_elems_per_thread):
+                    vec_linear_a = tx + Int32(i * num_threads)
+                    r_a = vec_linear_a // Int32(block_vec_k)
+                    kvec_a = vec_linear_a - r_a * Int32(block_vec_k)
+                    k_a = kvec_a * Int32(vec_size)
+                    precomp_k_a[i] = k_a
+                    precomp_aid_a[i] = sAid[r_a]
+                    precomp_arow_base[i] = sArowBase[r_a]
+                    precomp_valid_row_a[i] = precomp_aid_a[i] < num_valid_tokens
+                    precomp_s_layout_off[i] = Int32(sA_tile_layout((r_a, k_a)))
+
+                for tile_idx in cutlass.range(main_tiles, unroll=1):
+                    cute.arch.cp_async_wait_group(num_stages - 1)
+                    # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
+                    cute.arch.barrier()
+
+                    # MMA on the oldest stage in flight.
+                    _wgmma_gemm_no_fence(
+                        tiled_mma,
+                        acc,
+                        tSrA[None, None, None, stage_idx],
+                        tSrB[None, None, None, stage_idx],
+                        wg_wait=0,
+                    )
+                    cute.arch.barrier()
+
+                    next_tile = tile_idx + Int32(num_stages)
+                    k_start_next = next_tile * Int32(block_k)
+                    tile_in_range_next = next_tile < k_tiles
+
+                    # A tile: explicit gather loop [block_m, block_k].
+                    # Loop runs unconditionally; tile_in_range is folded into valid_a.
+                    # Uses precomputed loop-invariant values for efficiency.
+                    for i in range(num_elems_per_thread):
+                        k_a = precomp_k_a[i]
+                        kg_a = k_start_next + k_a
+                        valid_row_a = precomp_valid_row_a[i]
+                        arow_base = precomp_arow_base[i]
+
+                        if const_expr(K % block_k == 0):
+                            valid_a = tile_in_range_next & valid_row_a
+                        else:
+                            valid_a = tile_in_range_next & valid_row_a & (kg_a < K_const)
+
+                        g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
+                        g_ptr_a = cute.make_ptr(
+                            self.dtype,
+                            mA_base_i64 + g_off_bytes_a,
+                            cute.AddressSpace.gmem,
+                            assumed_align=align_bytes,
+                        )
+                        src_a = cute.make_tensor(g_ptr_a, (vec_size,))
+
+                        s_linear_a = stage_idx * stage_stride_a + precomp_s_layout_off[i]
+                        s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes
+                        s_ptr_a = cute.make_ptr(
+                            self.dtype,
+                            sA_base_i64 + s_off_bytes_a,
+                            cute.AddressSpace.smem,
+                            assumed_align=align_bytes,
+                        )
+                        dst_a = cute.make_tensor(s_ptr_a, (vec_size,))
+
+                        if valid_a:
+                            cute.copy(atom_async_copy_a, src_a, dst_a)
+                        else:
+                            cute.copy(atom_async_copy_a, src_a, dst_a, pred=pred_false)
+
+                    # B tile: only copy when tile is in range.
+                    if tile_in_range_next:
+                        if const_expr(K % block_k == 0):
+                            full_k_tile_next = True
+                        else:
+                            full_k_tile_next = (k_start_next + Int32(block_k)) <= K_const
+
+                        sB_stage = sB[None, None, stage_idx]
+                        gB_tile = cute.local_tile(
+                            mB_expert,
+                            (block_n, block_k),
+                            (pid_n, next_tile),
+                        )
+                        tBgB = thr_copy_B.partition_S(gB_tile)
+                        tBsB = thr_copy_B.partition_D(sB_stage)
+                        if full_k_tile_next:
+                            if full_n_tile:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    cute.copy(
+                                        tiled_copy_B,
+                                        tBgB[None, n, None],
+                                        tBsB[None, n, None],
+                                    )
+                            else:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    if n_start + t0BcB[0, n, 0][0] < N_const:
+                                        cute.copy(
+                                            tiled_copy_B,
+                                            tBgB[None, n, None],
+                                            tBsB[None, n, None],
+                                        )
+                        else:
+                            tBpB = fa_utils.predicate_k(
+                                tBcB, limit=K_const - k_start_next
+                            )
+                            if full_n_tile:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    cute.copy(
+                                        tiled_copy_B,
+                                        tBgB[None, n, None],
+                                        tBsB[None, n, None],
+                                        pred=tBpB[None, n, None],
+                                    )
+                            else:
+                                for n in cutlass.range_constexpr(
+                                    cute.size(tBsB.shape[1])
+                                ):
+                                    if n_start + t0BcB[0, n, 0][0] < N_const:
+                                        cute.copy(
+                                            tiled_copy_B,
+                                            tBgB[None, n, None],
+                                            tBsB[None, n, None],
+                                            pred=tBpB[None, n, None],
+                                        )
+
+                    cute.arch.cp_async_commit_group()
+
+                    stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
+
+                # Tail drain.
+                for drain_idx in cutlass.range_constexpr(num_stages - 1):
+                    cute.arch.cp_async_wait_group(num_stages - 2 - drain_idx)
+                    # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
+                    cute.arch.barrier()
+
+                    _wgmma_gemm_no_fence(
+                        tiled_mma,
+                        acc,
+                        tSrA[None, None, None, stage_idx],
+                        tSrB[None, None, None, stage_idx],
+                        wg_wait=0,
+                    )
+                    cute.arch.barrier()
+
+                    stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
+
+                # Epilogue: apply routed weight (if needed), then store to SMEM via stmatrix
+                # and scatter to GMEM. This avoids precomputing all output coords up front.
+                rC = cute.make_fragment_like(acc, self.dtype)
+                thr_mma = tiled_mma.get_slice(tx)
+                if const_expr(self.mul_routed_weight):
+                    cC = cute.make_identity_tensor((block_m, block_n))
+                    tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
+                    tAcc = fa_utils.make_acc_tensor_mn_view(acc)
+                    tRC = fa_utils.make_acc_tensor_mn_view(rC)
+                    for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                        m = Int32(tC_coords[mi, 0][0])
+                        row_scale = Float32(sW[m])
+                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
+                            tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * row_scale)
+                else:
+                    rC.store(acc.load().to(self.dtype))
+
+                smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
+                if const_expr(block_n == 32):
+                    # When block_n=32, each warp effectively owns 32 / 4 = 8 columns of C.
+                    # fa_utils does `stmatrix.x4`, which is a wider store. Use a narrower variant.
+                    smem_store_atom = cute.make_copy_atom(
+                        warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
+                        self.dtype,
+                    )
+                smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
+                tCsC = smem_thr_store.partition_D(sC)
+                tCrC = smem_thr_store.retile(rC)
+                cute.copy(smem_store_atom, tCrC, tCsC)
+                cute.arch.barrier()
+
+                vec_size = 8
+                copy_bits = vec_size * self.dtype.width
+                gmem_store_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    self.dtype,
+                    num_bits_per_copy=copy_bits,
+                )
+                align_bytes = vec_size * int(self.dtype.width // 8)
+                vec_n = block_n // vec_size
+                total_vec_c = block_m * vec_n
+
+                for vec_linear_c in range(tx, total_vec_c, num_threads):
+                    r_c = vec_linear_c // vec_n
+                    nvec_c = vec_linear_c - r_c * vec_n
+                    n0 = Int32(nvec_c * vec_size)
+                    aid_c = sAid[r_c]
+                    if aid_c < num_valid_tokens:
+                        col0 = n_start + n0
+                        if const_expr(N % block_n == 0) or (col0 < N_const):
+                            s_linear_c = Int32(sC_layout((Int32(r_c), n0)))
+                            s_off_bytes_c = cutlass.Int64(s_linear_c) * element_bytes
+                            s_ptr_c = cute.make_ptr(
+                                self.dtype,
+                                sC.iterator.toint() + s_off_bytes_c,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes,
+                            )
+                            src_c = cute.make_tensor(s_ptr_c, (vec_size,))
+
+                            row_off_bytes = (
+                                cutlass.Int64(aid_c) * stride_cm_elems * element_bytes
+                            )
+                            g_off_bytes_c = row_off_bytes + cutlass.Int64(col0) * element_bytes
+                            g_ptr_c = cute.make_ptr(
+                                self.dtype,
+                                mC_base_i64 + g_off_bytes_c,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes,
+                            )
+                            dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
+
+                            cute.copy(gmem_store_atom, src_c, dst_c)
 
 
 class _FusedMoeMatmulCuTeFp8:
@@ -1492,7 +2283,7 @@ class _FusedMoeMatmulCuTeFp8:
                 main_tiles = k_tiles - Int32(num_stages - 1)
                 for tile_idx in cutlass.range(main_tiles, unroll=1):
                     cute.arch.cp_async_wait_group(num_stages - 1)
-                    cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+                    # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
                     cute.arch.barrier()
 
                     # MMA on the oldest stage in flight.
@@ -1589,7 +2380,7 @@ class _FusedMoeMatmulCuTeFp8:
                 # Tail drain.
                 for drain_idx in cutlass.range_constexpr(num_stages - 1):
                     cute.arch.cp_async_wait_group(num_stages - 2 - drain_idx)
-                    cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+                    # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
                     cute.arch.barrier()
 
                     sm90_utils.gemm(
@@ -1681,7 +2472,7 @@ _CUTE_TOP_K_UP_DECODE = 8
 # Cache compiled variants keyed by (kind, config). We only support two decode kernels:
 # - up-proj: mul_routed_weight=False, top_k=8
 # - down-proj: mul_routed_weight=True, top_k=1
-_COMPILE_CACHE: Dict[Tuple[str, CuteMoeConfig], Any] = {}
+_COMPILE_CACHE: Dict[Tuple[str, CuteMoeConfig, int, int], Any] = {}
 _COMPILE_CACHE_FP8: Dict[Tuple[str, CuteMoeConfig], Any] = {}
 
 # Enable JIT compilation for autotuning (set KESTREL_CUTE_MOE_JIT=1)
@@ -1746,15 +2537,27 @@ def _invoke_cute_moe_impl(
     # Flatten output to [M_assignments, N] like the Triton kernel expects.
     C2d = C.view(-1, C.shape[-1])
 
-    key = (kind, config)
+    N_dim = int(B.shape[1])
+    K_dim = int(A.shape[1])
+    key = (kind, config, N_dim, K_dim)
 
     if key not in _COMPILE_CACHE:
         if _ENABLE_JIT:
             # JIT compile for autotuning
             from cutlass import BFloat16
 
-            op = _FusedMoeMatmulCuTe(
-                BFloat16, config, mul_routed_weight=mul_routed_weight, top_k=top_k
+            op_cls = (
+                _FusedMoeMatmulCuTeWgmmaBf16
+                if _should_use_wgmma_bf16(config)
+                else _FusedMoeMatmulCuTe
+            )
+            op = op_cls(
+                BFloat16,
+                config,
+                mul_routed_weight=mul_routed_weight,
+                top_k=top_k,
+                N=N_dim,
+                K=K_dim,
             )
             a_cute = _to_cute_tensor_2d_contig(A)
             b_cute = _to_cute_tensor_3d_last_contig(B)
@@ -1782,13 +2585,14 @@ def _invoke_cute_moe_impl(
             _COMPILE_CACHE[key] = compiled
         else:
             # Load precompiled kernel
-            precompiled = _load_precompiled_kernel(kind, config)
+            precompiled = _load_precompiled_kernel(kind, config, N_dim, K_dim)
             if precompiled is not None:
                 _COMPILE_CACHE[key] = precompiled
             else:
                 arch = _get_cuda_arch()
                 raise RuntimeError(
-                    f"No precompiled kernel for cute_moe(kind={kind}, config={config}, arch={arch}). "
+                    "No precompiled kernel for "
+                    f"cute_moe(kind={kind}, config={config}, N={N_dim}, K={K_dim}, arch={arch}). "
                     f"Run precompile_cute_moe.py on this architecture to generate it."
                 )
 

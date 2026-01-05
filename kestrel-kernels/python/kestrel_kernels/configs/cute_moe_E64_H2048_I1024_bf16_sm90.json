@@ -1,44 +1,296 @@
 {
   "description": "CuTe MoE kernel configs optimized for H100 (SM90)",
-  "generated": "2026-01-04",
+  "generated": "2026-01-05",
   "up": {
-    "1": {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4, "num_stages": 2, "time_us": 35.7},
-    "2": {"block_m": 16, "block_n": 64, "block_k": 256, "num_warps": 4, "num_stages": 2, "time_us": 49.1},
-    "4": {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4, "num_stages": 1, "time_us": 87.4},
-    "8": {"block_m": 16, "block_n": 32, "block_k": 128, "num_warps": 4, "num_stages": 3, "time_us": 125.3},
-    "16": {"block_m": 16, "block_n": 64, "block_k": 256, "num_warps": 4, "num_stages": 2, "time_us": 161.3},
-    "24": {"block_m": 16, "block_n": 32, "block_k": 256, "num_warps": 2, "num_stages": 1, "time_us": 181.0},
-    "32": {"block_m": 16, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 2, "time_us": 185.7},
-    "48": {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4, "num_stages": 1, "time_us": 189.4},
-    "64": {"block_m": 16, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 5, "time_us": 194.2},
-    "96": {"block_m": 32, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 2, "time_us": 192.5},
-    "128": {"block_m": 64, "block_n": 256, "block_k": 128, "num_warps": 8, "num_stages": 2, "time_us": 197.2},
-    "256": {"block_m": 32, "block_n": 256, "block_k": 128, "num_warps": 8, "num_stages": 1, "time_us": 198.9},
-    "512": {"block_m": 64, "block_n": 256, "block_k": 128, "num_warps": 8, "num_stages": 2, "time_us": 218.2},
-    "1024": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 322.3},
-    "1536": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 401.7},
-    "2048": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 494.1},
-    "3072": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 717.6},
-    "4096": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 887.3}
+    "1": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 256,
+      "num_warps": 2,
+      "num_stages": 3,
+      "time_us": 30.1
+    },
+    "2": {
+      "block_m": 16,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 49.7
+    },
+    "4": {
+      "block_m": 16,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 87.3
+    },
+    "8": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 256,
+      "num_warps": 2,
+      "num_stages": 2,
+      "time_us": 123.5
+    },
+    "16": {
+      "block_m": 16,
+      "block_n": 64,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 161.7
+    },
+    "24": {
+      "block_m": 16,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 181.6
+    },
+    "32": {
+      "block_m": 16,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 186.2
+    },
+    "48": {
+      "block_m": 16,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 190.6
+    },
+    "64": {
+      "block_m": 16,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 190.8
+    },
+    "96": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 192.7
+    },
+    "128": {
+      "block_m": 32,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 194.1
+    },
+    "256": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 200.4
+    },
+    "512": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 214.3
+    },
+    "1024": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 283.2
+    },
+    "1536": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 380.8
+    },
+    "2048": {
+      "block_m": 128,
+      "block_n": 128,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 445.3
+    },
+    "3072": {
+      "block_m": 128,
+      "block_n": 128,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 625.9
+    },
+    "4096": {
+      "block_m": 128,
+      "block_n": 128,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 812.9
+    }
   },
   "down": {
-    "1": {"block_m": 16, "block_n": 32, "block_k": 128, "num_warps": 2, "num_stages": 3, "time_us": 16.3},
-    "2": {"block_m": 16, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 3, "time_us": 29.8},
-    "4": {"block_m": 16, "block_n": 32, "block_k": 128, "num_warps": 2, "num_stages": 3, "time_us": 49.3},
-    "8": {"block_m": 16, "block_n": 64, "block_k": 128, "num_warps": 4, "num_stages": 3, "time_us": 68.8},
-    "16": {"block_m": 16, "block_n": 32, "block_k": 128, "num_warps": 2, "num_stages": 1, "time_us": 87.8},
-    "24": {"block_m": 16, "block_n": 128, "block_k": 64, "num_warps": 4, "num_stages": 3, "time_us": 101.5},
-    "32": {"block_m": 16, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 1, "time_us": 99.7},
-    "48": {"block_m": 16, "block_n": 256, "block_k": 128, "num_warps": 8, "num_stages": 1, "time_us": 101.6},
-    "64": {"block_m": 16, "block_n": 32, "block_k": 128, "num_warps": 2, "num_stages": 2, "time_us": 103.4},
-    "96": {"block_m": 32, "block_n": 256, "block_k": 128, "num_warps": 8, "num_stages": 1, "time_us": 104.4},
-    "128": {"block_m": 64, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 1, "time_us": 110.1},
-    "256": {"block_m": 32, "block_n": 128, "block_k": 128, "num_warps": 4, "num_stages": 1, "time_us": 111.9},
-    "512": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 128.4},
-    "1024": {"block_m": 64, "block_n": 128, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 179.9},
-    "1536": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 231.7},
-    "2048": {"block_m": 64, "block_n": 128, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 287.1},
-    "3072": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 416.2},
-    "4096": {"block_m": 64, "block_n": 256, "block_k": 64, "num_warps": 4, "num_stages": 1, "time_us": 511.4}
+    "1": {
+      "block_m": 16,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "time_us": 14.9
+    },
+    "2": {
+      "block_m": 16,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 30.3
+    },
+    "4": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 128,
+      "num_warps": 2,
+      "num_stages": 2,
+      "time_us": 49.5
+    },
+    "8": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 128,
+      "num_warps": 2,
+      "num_stages": 4,
+      "time_us": 67.7
+    },
+    "16": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 256,
+      "num_warps": 2,
+      "num_stages": 3,
+      "time_us": 86.7
+    },
+    "24": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 128,
+      "num_warps": 2,
+      "num_stages": 2,
+      "time_us": 96.3
+    },
+    "32": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 128,
+      "num_warps": 2,
+      "num_stages": 2,
+      "time_us": 100.2
+    },
+    "48": {
+      "block_m": 16,
+      "block_n": 64,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 4,
+      "time_us": 102.4
+    },
+    "64": {
+      "block_m": 16,
+      "block_n": 32,
+      "block_k": 256,
+      "num_warps": 2,
+      "num_stages": 3,
+      "time_us": 102.9
+    },
+    "96": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 1,
+      "time_us": 105.4
+    },
+    "128": {
+      "block_m": 32,
+      "block_n": 64,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 107.8
+    },
+    "256": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 111.7
+    },
+    "512": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 64,
+      "num_warps": 2,
+      "num_stages": 2,
+      "time_us": 131.8
+    },
+    "1024": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 173.6
+    },
+    "1536": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 224.5
+    },
+    "2048": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 318.1
+    },
+    "3072": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 431.4
+    },
+    "4096": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "time_us": 542.0
+    }
   }
 }

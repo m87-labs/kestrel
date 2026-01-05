@@ -7,6 +7,7 @@ all unique kernel variants needed.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ class MoeVariant:
     block_k: int
     num_warps: int
     num_stages: int
+    N: int
+    K: int
 
     @property
     def mul_routed_weight(self) -> bool:
@@ -41,14 +44,21 @@ class MoeVariant:
     def filename(self, arch: str) -> str:
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_w{self.num_warps}_s{self.num_stages}_{arch}.so"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}_{arch}.so"
         )
 
     def function_name(self, arch: str) -> str:
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_w{self.num_warps}_s{self.num_stages}_{arch}"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}_{arch}"
         )
+
+
+def _parse_model_dims(config_name: str) -> tuple[int, int]:
+    match = re.match(r"cute_moe_E\d+_H(\d+)_I(\d+)_", config_name)
+    if not match:
+        raise ValueError(f"Could not parse H/I dims from config name: {config_name}")
+    return int(match.group(1)), int(match.group(2))
 
 
 def get_cuda_arch() -> str:
@@ -64,11 +74,16 @@ def load_variants_from_configs() -> list[MoeVariant]:
 
     for config_file in configs_dir.glob("cute_moe_*.json"):
         print(f"Loading configs from: {config_file.name}")
+        H, I = _parse_model_dims(config_file.name)
         with open(config_file) as f:
             data = json.load(f)
 
         for kind in ("up", "down"):
             kind_configs = data.get(kind, {})
+            if kind == "up":
+                N_dim, K_dim = 2 * I, H
+            else:
+                N_dim, K_dim = H, I
             for token_count, cfg in kind_configs.items():
                 variant = MoeVariant(
                     kind=kind,
@@ -77,10 +92,14 @@ def load_variants_from_configs() -> list[MoeVariant]:
                     block_k=cfg["block_k"],
                     num_warps=cfg["num_warps"],
                     num_stages=cfg["num_stages"],
+                    N=N_dim,
+                    K=K_dim,
                 )
                 variants.add(variant)
 
-    return sorted(variants, key=lambda v: (v.kind, v.block_m, v.block_n, v.block_k))
+    return sorted(
+        variants, key=lambda v: (v.kind, v.N, v.K, v.block_m, v.block_n, v.block_k)
+    )
 
 
 def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Path, str | None]:
@@ -92,11 +111,19 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
     from cutlass import BFloat16
     from cuda.bindings import driver as cuda
 
-    from kestrel_kernels.cute_moe import CuteMoeConfig, _FusedMoeMatmulCuTe
+    from kestrel_kernels.cute_moe import (
+        CuteMoeConfig,
+        _FusedMoeMatmulCuTe,
+        _FusedMoeMatmulCuTeWgmmaBf16,
+        _should_use_wgmma_bf16,
+    )
 
     try:
-        print(f"[{os.getpid()}] Compiling: {variant.kind} m={variant.block_m} n={variant.block_n} "
-              f"k={variant.block_k} w={variant.num_warps} s={variant.num_stages}")
+        print(
+            f"[{os.getpid()}] Compiling: {variant.kind} N={variant.N} K={variant.K} "
+            f"m={variant.block_m} n={variant.block_n} k={variant.block_k} "
+            f"w={variant.num_warps} s={variant.num_stages}"
+        )
 
         config = CuteMoeConfig(
             block_m=variant.block_m,
@@ -108,18 +135,26 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
         # Create the kernel operator
         dtype = BFloat16
-        op = _FusedMoeMatmulCuTe(
-            dtype, config,
+        op_cls = (
+            _FusedMoeMatmulCuTeWgmmaBf16
+            if _should_use_wgmma_bf16(config)
+            else _FusedMoeMatmulCuTe
+        )
+        op = op_cls(
+            dtype,
+            config,
             mul_routed_weight=variant.mul_routed_weight,
             top_k=variant.top_k,
+            N=variant.N,
+            K=variant.K,
         )
 
         # Create fake tensors for compilation
         # These use symbolic dimensions for dynamic shapes
         M_in_sym = cute.sym_int()
         M_out_sym = cute.sym_int()
-        K_sym = cute.sym_int()
-        N_sym = cute.sym_int()
+        K_static = variant.K
+        N_static = variant.N
         E_sym = cute.sym_int()
         EM_sym = cute.sym_int()
         EM_blocks_sym = cute.sym_int()
@@ -127,19 +162,19 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
         # A: (M_in, K) row-major
         a_fake = cute.runtime.make_fake_tensor(
-            dtype, (M_in_sym, K_sym),
+            dtype, (M_in_sym, K_static),
             stride=(cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
         # B: (E, N, K) last-dim contiguous
         b_fake = cute.runtime.make_fake_tensor(
-            dtype, (E_sym, N_sym, K_sym),
+            dtype, (E_sym, N_static, K_static),
             stride=(cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
         # C: (M_out, N) row-major
         c_fake = cute.runtime.make_fake_tensor(
-            dtype, (M_out_sym, N_sym),
+            dtype, (M_out_sym, N_static),
             stride=(cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )

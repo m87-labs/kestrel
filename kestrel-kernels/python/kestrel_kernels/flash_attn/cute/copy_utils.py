@@ -5,7 +5,7 @@ from typing import Optional, Type, Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -104,6 +104,75 @@ def tiled_copy_2d(
     )
     val_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
+@cute.jit
+def gather_m_get_copy_fn(
+    thr_copy_A: cute.core.ThrCopy,
+    mA: cute.Tensor,  # (whatever, K)
+    sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
+    gsAIdx: cute.Tensor,  # (tile_M), either gmem or smem
+    limit_m: Int32,
+    limit_k: Int32,
+) -> Callable:
+    """Gather rows from mA into sA using per-row indices (gsAIdx)."""
+    tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
+    tAsA = thr_copy_A.partition_D(sA)
+    # k-major
+    assert tAsA.shape[2] == 1
+    tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+
+    is_even_m_smem = tile_shape_mk[0] % thr_copy_A.tiler_mn[0].shape == 0
+    if const_expr(not is_even_m_smem):
+        limit_m = min(limit_m, tile_shape_mk[0])
+    elems_per_load = cute.size(tAsA.shape[0][0])
+    cA = cute.make_identity_tensor(tile_shape_mk)
+    tAcA = thr_copy_A.partition_S(cA)
+    t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
+    # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
+    # since we know that tAcA[m][0] = t0AcA[m][0] + tAcA[0][0].
+    # This is so that when we do the comparison, t0AcA is known at compile time.
+    limit_m = limit_m - tAcA[0][0]
+    limit_k = limit_k - tAcA[0][1]
+    # Read and cache indices for A
+    rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+    cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
+    tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+    for m in cutlass.range(rows_per_thread, unroll_full=True):
+        tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
+    m_idx = cute.make_fragment(rows_per_thread, Int32)
+    for m in cutlass.range(rows_per_thread, unroll_full=True):
+        row_idx = tAcA[0, m, 0][0]
+        if tApA_m[m]:
+            m_idx[m] = gsAIdx[row_idx]
+        else:
+            m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
+
+    mA_k = cute.logical_divide(mA, (None, tile_shape_mk[1]))
+
+    def copy_fn(src_idx, dst_idx, pred: bool = False):
+        tApA_k = None
+        if const_expr(pred):
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            for k in cutlass.range(cols_per_thread, unroll_full=True):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
+        mA_cur = mA_k[None, (None, src_idx)]
+        for m in cutlass.range_constexpr(tAcA.shape[1]):
+            # cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,)) would give shape
+            # ((elems_per_load), thread_per_row)
+            # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
+            # So we append 1s to the last dimension and then do tiled_divide, then slice.
+            mA_row = cute.tiled_divide(
+                cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+            )[None, None, 0]
+            if const_expr(is_even_m_smem) or tApA_m[m]:
+                # There's only 1 load per row
+                assert cute.size(tAcA.shape, mode=[2]) == 1
+                ki = tAcA[0, 0, 0][1] // elems_per_load
+                cute.copy(thr_copy_A, mA_row[None, ki], tAsA[(None, m), dst_idx], pred=tApA_k)
+
+    return copy_fn
 
 
 @dsl_user_op

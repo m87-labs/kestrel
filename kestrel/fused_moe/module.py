@@ -229,7 +229,8 @@ class FusedMoEConfig:
     num_warps: int = 4
     num_stages: int = 2
     allow_tf32: bool = True
-    backend: str = "cute"  # "cute" | "triton"
+    backend: str = "auto"  # "auto" | "cute" | "triton"
+    auto_backend_token_threshold: int = 256
     lora_decode_shrink: dict[str, int] | None = field(
         default_factory=lambda: {
             "BLOCK_SIZE_N": 16,
@@ -728,7 +729,7 @@ class FusedMoEModule(nn.Module):
         triton_config: dict[str, int],
         compute_type,
     ) -> None:
-        backend = self.config.backend.lower()
+        backend = self._resolve_backend(num_tokens=int(C.shape[0]))
         b_is_fp8w = B.dtype == torch.uint8
 
         if b_is_fp8w and backend == "triton":
@@ -940,18 +941,25 @@ class FusedMoEModule(nn.Module):
         For BF16 weights:
           - backend="cute": Use CuTe config block_m
           - backend="triton": Use Triton block_m
+          - backend="auto": Use CuTe for smaller batches, Triton otherwise
         """
         if is_fp8_weights:
             # SM90 FP8 WGMMA path uses block_m=64 for both backends
             return 64
 
-        backend = self.config.backend.lower()
+        backend = self._resolve_backend(num_tokens=num_tokens)
         if backend == "cute":
             return get_cute_moe_block_m(
                 num_tokens,
                 num_experts=self.num_experts,
-                hidden_size=self.hidden_size,
+                hidden_size=self.input_size,
                 intermediate_size=self.hidden_size,
             )
         else:
             return triton_block_m
+
+    def _resolve_backend(self, *, num_tokens: int) -> str:
+        backend = self.config.backend.lower()
+        if backend == "auto":
+            return "triton" if num_tokens >= self.config.auto_backend_token_threshold else "cute"
+        return backend
