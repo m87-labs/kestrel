@@ -1476,24 +1476,22 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                         cute.copy(gmem_store_atom, zero_vec, dst_c)
         else:
                 # Active block: all copy setup done inside else-block (matching warp-level pattern).
-                vec_size = 8
-                copy_bits = vec_size * self.dtype.width
-                atom_async_copy_a = cute.make_copy_atom(
-                    cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-                    self.dtype,
-                    num_bits_per_copy=copy_bits,
-                )
-                pred_false = cute.make_rmem_tensor((vec_size,), Boolean)
-                pred_false.fill(False)
                 element_bytes = cutlass.Int64(self.dtype.width // 8)
-                align_bytes = vec_size * int(self.dtype.width // 8)
-                mA_base_i64 = mA.iterator.toint()
-                sA_base_i64 = sA.iterator.toint()
-                block_vec_k = block_k // vec_size
-                total_vec_a = block_m * block_vec_k
-                stage_stride_a = Int32(block_m * block_k)
-                # 2D tile layout (with swizzle) for computing SMEM offsets within a stage.
-                sA_tile_layout = cute.tile_to_shape(s_layout_atom, (block_m, block_k), (0, 1))
+
+                # Use tiled_copy_A with gather to respect swizzled SMEM layout.
+                tiled_copy_A = copy_utils.tiled_copy_2d(
+                    self.dtype, block_k, num_threads, is_async=True
+                )
+                thr_copy_A = tiled_copy_A.get_slice(tx)
+                # Create gather copy function that respects swizzle via partition_D
+                copy_A = copy_utils.gather_m_get_copy_fn(
+                    thr_copy_A,
+                    mA,
+                    sA,
+                    sTok,  # Row indices (token IDs)
+                    num_valid_tokens,
+                    K_const,
+                )
 
                 tiled_copy_B = copy_utils.tiled_copy_2d(
                     self.dtype, block_k, num_threads, is_async=True
@@ -1511,48 +1509,12 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                     k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                     tile_in_range = tile_idx_prefetch < k_tiles
 
-                    # A tile: explicit gather loop [block_m, block_k].
-                    # Loop runs unconditionally; tile_in_range is folded into valid_a.
-                    for vec_linear_a in range(tx, total_vec_a, num_threads):
-                        r_a = vec_linear_a // block_vec_k
-                        kvec_a = vec_linear_a - r_a * block_vec_k
-                        k_a = Int32(kvec_a * vec_size)
-                        kg_a = k_start_prefetch + k_a
-
-                        aid_a = sAid[r_a]
-                        valid_row_a = aid_a < num_valid_tokens
-                        arow_base = sArowBase[r_a]
-
+                    # A tile: use gather copy to respect swizzled SMEM layout.
+                    if tile_in_range:
                         if const_expr(K % block_k == 0):
-                            valid_a = tile_in_range and valid_row_a
+                            copy_A(tile_idx_prefetch, stage_prefetch)
                         else:
-                            valid_a = tile_in_range and valid_row_a and (kg_a < K_const)
-
-                        g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
-                        g_ptr_a = cute.make_ptr(
-                            self.dtype,
-                            mA_base_i64 + g_off_bytes_a,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src_a = cute.make_tensor(g_ptr_a, (vec_size,))
-
-                        s_linear_a = Int32(stage_prefetch) * stage_stride_a + Int32(
-                            sA_tile_layout((Int32(r_a), k_a))
-                        )
-                        s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes
-                        s_ptr_a = cute.make_ptr(
-                            self.dtype,
-                            sA_base_i64 + s_off_bytes_a,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst_a = cute.make_tensor(s_ptr_a, (vec_size,))
-
-                        if valid_a:
-                            cute.copy(atom_async_copy_a, src_a, dst_a)
-                        else:
-                            cute.copy(atom_async_copy_a, src_a, dst_a, pred=pred_false)
+                            copy_A(tile_idx_prefetch, stage_prefetch, pred=True)
 
                     # B tile: only copy when tile is in range.
                     if tile_in_range:
@@ -1632,26 +1594,6 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                 stage_idx = Int32(0)
                 main_tiles = k_tiles - Int32(num_stages - 1)
 
-                # Precompute loop-invariant values for each element this thread handles.
-                # Each thread processes total_vec_a / num_threads = 4 elements.
-                num_elems_per_thread = total_vec_a // num_threads
-                precomp_k_a = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
-                precomp_aid_a = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
-                precomp_arow_base = cute.make_rmem_tensor((num_elems_per_thread,), cutlass.Int64)
-                precomp_valid_row_a = cute.make_rmem_tensor((num_elems_per_thread,), Boolean)
-                precomp_s_layout_off = cute.make_rmem_tensor((num_elems_per_thread,), Int32)
-
-                for i in range(num_elems_per_thread):
-                    vec_linear_a = tx + Int32(i * num_threads)
-                    r_a = vec_linear_a // Int32(block_vec_k)
-                    kvec_a = vec_linear_a - r_a * Int32(block_vec_k)
-                    k_a = kvec_a * Int32(vec_size)
-                    precomp_k_a[i] = k_a
-                    precomp_aid_a[i] = sAid[r_a]
-                    precomp_arow_base[i] = sArowBase[r_a]
-                    precomp_valid_row_a[i] = precomp_aid_a[i] < num_valid_tokens
-                    precomp_s_layout_off[i] = Int32(sA_tile_layout((r_a, k_a)))
-
                 for tile_idx in cutlass.range(main_tiles, unroll=1):
                     cute.arch.cp_async_wait_group(num_stages - 1)
                     # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
@@ -1671,43 +1613,12 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                     k_start_next = next_tile * Int32(block_k)
                     tile_in_range_next = next_tile < k_tiles
 
-                    # A tile: explicit gather loop [block_m, block_k].
-                    # Loop runs unconditionally; tile_in_range is folded into valid_a.
-                    # Uses precomputed loop-invariant values for efficiency.
-                    for i in range(num_elems_per_thread):
-                        k_a = precomp_k_a[i]
-                        kg_a = k_start_next + k_a
-                        valid_row_a = precomp_valid_row_a[i]
-                        arow_base = precomp_arow_base[i]
-
+                    # A tile: use gather copy to respect swizzled SMEM layout.
+                    if tile_in_range_next:
                         if const_expr(K % block_k == 0):
-                            valid_a = tile_in_range_next & valid_row_a
+                            copy_A(next_tile, stage_idx)
                         else:
-                            valid_a = tile_in_range_next & valid_row_a & (kg_a < K_const)
-
-                        g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes
-                        g_ptr_a = cute.make_ptr(
-                            self.dtype,
-                            mA_base_i64 + g_off_bytes_a,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes,
-                        )
-                        src_a = cute.make_tensor(g_ptr_a, (vec_size,))
-
-                        s_linear_a = stage_idx * stage_stride_a + precomp_s_layout_off[i]
-                        s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes
-                        s_ptr_a = cute.make_ptr(
-                            self.dtype,
-                            sA_base_i64 + s_off_bytes_a,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes,
-                        )
-                        dst_a = cute.make_tensor(s_ptr_a, (vec_size,))
-
-                        if valid_a:
-                            cute.copy(atom_async_copy_a, src_a, dst_a)
-                        else:
-                            cute.copy(atom_async_copy_a, src_a, dst_a, pred=pred_false)
+                            copy_A(next_tile, stage_idx, pred=True)
 
                     # B tile: only copy when tile is in range.
                     if tile_in_range_next:
