@@ -313,7 +313,6 @@ class MoondreamRuntime:
             setup_caches=False,
         ).eval()
         self.region = build_region_module(self.config.region, self.dtype).to(self.device)
-        self.spatial_tables = build_spatial_decode_tables(self.region)
         self.image_prefix_length = self.model.vision.pos_emb.shape[1]
         n_layers = self.config.text.n_layers
         captured_k_scales: list[Optional[float]] = [None] * n_layers
@@ -349,6 +348,11 @@ class MoondreamRuntime:
             tensor_hook=_capture_kv_scale,
             region=self.region,
         )
+
+        # Build spatial decode tables after region weight loading; otherwise the
+        # concatenated weights/biases depend on random init/seed rather than the
+        # checkpoint.
+        self.spatial_tables = build_spatial_decode_tables(self.region)
 
         if all(val is not None for val in captured_k_scales) and all(
             val is not None for val in captured_v_scales
