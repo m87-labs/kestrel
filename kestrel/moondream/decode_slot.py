@@ -115,8 +115,14 @@ class DecodeSlot:
     # CUDA graphs (optional) - captured using this slot's buffers
     cuda_graphs: Optional[dict[int, torch.cuda.CUDAGraph]] = None
 
-    # Pre-allocated event for D2H synchronization (avoids per-step allocation)
+    # Pre-allocated events for decode-step synchronization (avoids per-step allocation).
+    #
+    # - step_done_event: recorded once per step when per-slot staging buffers are ready
+    #   for D2H transfer (copy stream waits on this).
+    # - commit_done_event: recorded once per step after writes to shared scheduler
+    #   buffers (e.g. `_pending_*`) complete; used to safely release/reuse batch indices.
     step_done_event: torch.cuda.Event = None  # type: ignore[assignment]
+    commit_done_event: torch.cuda.Event = None  # type: ignore[assignment]
 
 
 def create_decode_slot(
@@ -248,8 +254,9 @@ def create_decode_slot(
         device=device,
     )
 
-    # Pre-allocated event for D2H synchronization
+    # Pre-allocated events for decode-step synchronization
     step_done_event = torch.cuda.Event()
+    commit_done_event = torch.cuda.Event()
 
     return DecodeSlot(
         slot_id=slot_id,
@@ -268,4 +275,5 @@ def create_decode_slot(
         decode_size_values=decode_size_values,
         cuda_graphs=None,  # Captured separately after slot creation
         step_done_event=step_done_event,
+        commit_done_event=commit_done_event,
     )
