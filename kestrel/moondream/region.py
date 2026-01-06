@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .config import RegionConfig
+from .layers import LayerNormWeights, layer_norm
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,8 @@ class SpatialDecodeTables:
     coord_logits_dim: int
     weight: Tensor
     bias: Tensor
+    ln_weight: Tensor
+    ln_bias: Tensor
 
 
 def fourier_features(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -58,12 +61,15 @@ def build_spatial_decode_tables(
     )
     size_value_lut = torch.exp2(size_exponents).to(dtype=size_dtype)
 
+    ln = module["ln"]
     return SpatialDecodeTables(
         coord_value_lut=coord_value_lut,
         size_value_lut=size_value_lut,
         coord_logits_dim=coord_bins,
         weight=weight,
         bias=bias,
+        ln_weight=ln.weight,
+        ln_bias=ln.bias,
     )
 
 
@@ -72,7 +78,11 @@ def spatial_decode_logits(
     tables: SpatialDecodeTables,
 ) -> tuple[Tensor, Tensor, Tensor]:
     hidden = hidden_state.unsqueeze(0) if hidden_state.ndim == 1 else hidden_state
-    logits = F.linear(hidden, tables.weight, tables.bias)
+    hidden_norm = layer_norm(
+        hidden,
+        LayerNormWeights(weight=tables.ln_weight, bias=tables.ln_bias),
+    )
+    logits = F.linear(hidden_norm, tables.weight, tables.bias)
 
     coord_logits = logits[:, : tables.coord_logits_dim]
     size_flat = logits[:, tables.coord_logits_dim :]
@@ -101,6 +111,7 @@ def spatial_bins_to_values(
 def build_region_module(config: RegionConfig, dtype: torch.dtype) -> nn.ModuleDict:
     module = nn.ModuleDict(
         {
+            "ln": nn.LayerNorm(config.dim, dtype=dtype),
             "coord_encoder": nn.Linear(config.coord_feat_dim, config.dim, dtype=dtype),
             "coord_decoder": nn.Linear(config.dim, config.coord_out_dim, dtype=dtype),
             "size_encoder": nn.Linear(config.size_feat_dim, config.dim, dtype=dtype),

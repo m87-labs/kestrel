@@ -156,6 +156,9 @@ def _assign_region_weights(
     region["size_decoder"].weight.data.copy_(convert(get_tensor("region_model.size_head.weight")))
     region["size_decoder"].bias.data.copy_(convert(get_tensor("region_model.size_head.bias")))
 
+    region["ln"].weight.data.copy_(convert(get_tensor("region_model.ln.weight")))
+    region["ln"].bias.data.copy_(convert(get_tensor("region_model.ln.bias")))
+
     # Fourier feature parameters are stored transposed in checkpoints.
     region.coord_features.data.copy_(
         convert(get_tensor("region_model.coordinate_features.weight")).T
