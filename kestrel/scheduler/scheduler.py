@@ -639,16 +639,21 @@ class GenerationScheduler:
             rng=self._sampling_rng,
         )
 
-        # Record event after staging buffers are ready (before pending writes).
-        # D2H copies from staging buffers, not pending buffers, so we can
-        # overlap the pending writes with the D2H transfer.
+        # Record event after staging buffers are ready.
+        #
+        # The copy stream waits on this event, so D2H can overlap with the
+        # writes to `_pending_*` below (these writes are not needed for D2H).
         slot.step_done_event.record()
 
         # Write to shared pending buffers for next step's input gathering.
-        # These run in parallel with D2H since they're after the event record.
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
         self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
         self._pending_size_values.index_copy_(0, batch_idx, size_decode)
+
+        # Record a second event after pending writes so we can safely release/reuse
+        # batch indices (e.g. finalize a sequence and admit a new one into the same
+        # batch slot) without racing the `_pending_*` updates.
+        slot.commit_done_event.record()
 
         # Start async D2H transfer from per-slot staging buffers.
         # Pass the step_done_event so copy stream waits only on staging writes.
@@ -678,6 +683,11 @@ class GenerationScheduler:
         """
         # Wait for D2H transfer
         token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+
+        # Ensure `_pending_*` writes for this step have completed before we release
+        # or reuse any batch indices (these writes intentionally do not gate D2H).
+        slot = self.runtime.decode_slots[step.slot_id]
+        slot.commit_done_event.synchronize()
 
         # Render typed tokens from packed tensors
         tokens = render_tokens_from_packed(
