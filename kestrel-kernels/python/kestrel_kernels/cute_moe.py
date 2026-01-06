@@ -1413,10 +1413,10 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
         # WGMMA expects affine layouts; move swizzle to the pointer (recast) via `swizzle=...`.
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner, dtype=self.dtype)
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner, dtype=self.dtype)
-        # Flash-attn-style swizzled SMEM layout for C. This makes `stmatrix` stores conflict-free
-        # and preserves 128-bit vector contiguity for the subsequent SMEM->GMEM scatter stores.
-        sC_layout_atom = ampere_helpers.get_smem_layout_atom(self.dtype, block_n)
-        sC_layout = cute.tile_to_shape(sC_layout_atom, (block_m, block_n), (0, 1))
+        # Pure row-major SMEM layout for C (no swizzle).
+        # This allows conflict-free vectorized reads when threads read consecutive N elements.
+        # We use individual stores (not stmatrix) to write accumulator elements.
+        sC_layout = cute.make_layout((block_m, block_n), stride=(block_n, 1))
         sC_linear = storage.sC.get_tensor(
             cute.make_layout((block_m * block_n,), stride=(1,))
         )
@@ -1757,40 +1757,69 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
 
                     stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-                # Epilogue: apply routed weight (if needed), then store to SMEM via stmatrix
-                # and scatter to GMEM. This avoids precomputing all output coords up front.
+                # Epilogue: Triton-style approach
+                # 1. Convert accumulator to BF16 (with optional routed weight scaling)
+                # 2. Store to SMEM using individual stores with computed (M, N) coordinates
+                #    (not stmatrix - this allows pure row-major layout)
+                # 3. Read consecutive N elements from SMEM (conflict-free with row-major)
+                # 4. 128-bit scatter stores to GMEM
                 rC = cute.make_fragment_like(acc, self.dtype)
                 thr_mma = tiled_mma.get_slice(tx)
+                cC = cute.make_identity_tensor((block_m, block_n))
+                tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
+                tAcc = fa_utils.make_acc_tensor_mn_view(acc)
+                tRC = fa_utils.make_acc_tensor_mn_view(rC)
+
+                # Convert F32 -> BF16 with optional routed weight scaling
                 if const_expr(self.mul_routed_weight):
-                    cC = cute.make_identity_tensor((block_m, block_n))
-                    tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
-                    tAcc = fa_utils.make_acc_tensor_mn_view(acc)
-                    tRC = fa_utils.make_acc_tensor_mn_view(rC)
                     for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                         m = Int32(tC_coords[mi, 0][0])
                         row_scale = Float32(sW[m])
                         for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
                             tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * row_scale)
                 else:
-                    rC.store(acc.load().to(self.dtype))
+                    for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
+                            tRC[mi, ni] = self.dtype(tAcc[mi, ni])
 
-                smem_store_atom = fa_utils.get_smem_store_atom(90, self.dtype)
-                if const_expr(block_n == 32):
-                    # When block_n=32, each warp effectively owns 32 / 4 = 8 columns of C.
-                    # fa_utils does `stmatrix.x4`, which is a wider store. Use a narrower variant.
-                    smem_store_atom = cute.make_copy_atom(
-                        warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
-                        self.dtype,
-                    )
-                smem_thr_store = cute.make_tiled_copy_C(smem_store_atom, tiled_mma).get_slice(tx)
-                tCsC = smem_thr_store.partition_D(sC)
-                tCrC = smem_thr_store.retile(rC)
-                cute.copy(smem_store_atom, tCrC, tCsC)
+                # Store to SMEM using XOR-swizzled addresses (Triton-style).
+                # This distributes stores across banks to avoid conflicts.
+                # The XOR swizzle pattern: for each store, XOR the offset with
+                # a value derived from the row, which rotates which banks are hit.
+                # Pattern: offset ^ ((m & 0x7) << 4) where m is the row index.
+                # This ensures threads storing to different rows hit different banks.
+                sC_base_i64 = sC.iterator.toint()
+                for mi in cutlass.range_constexpr(cute.size(tRC.shape[0])):
+                    for ni in cutlass.range_constexpr(cute.size(tRC.shape[1])):
+                        m = Int32(tC_coords[mi, ni][0])
+                        n = Int32(tC_coords[mi, ni][1])
+                        # Row-major offset: m * block_n + n
+                        s_offset = m * Int32(block_n) + n
+                        # XOR swizzle: rotate bank assignment based on row index
+                        # XOR with (m & 0x7) << 4 = (m % 8) * 16 bytes = (m % 8) * 4 banks
+                        xor_swizzle = (m & Int32(0x7)) << 4
+                        s_offset_swizzled = s_offset ^ xor_swizzle
+                        s_ptr = cute.make_ptr(
+                            self.dtype,
+                            sC_base_i64 + cutlass.Int64(s_offset_swizzled) * element_bytes,
+                            cute.AddressSpace.smem,
+                            assumed_align=2,
+                        )
+                        s_tensor = cute.make_tensor(s_ptr, (1,))
+                        s_tensor[0] = tRC[mi, ni]
                 cute.arch.barrier()
 
+                # Read from SMEM with XOR-swizzled addresses (vectorized) and scatter store to GMEM.
+                # XOR with a constant preserves consecutiveness within blocks, so we can do
+                # vectorized 128-bit SMEM loads.
                 vec_size = 8
                 copy_bits = vec_size * self.dtype.width
                 gmem_store_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    self.dtype,
+                    num_bits_per_copy=copy_bits,
+                )
+                smem_load_atom = cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(),
                     self.dtype,
                     num_bits_per_copy=copy_bits,
@@ -1807,16 +1836,21 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                     if aid_c < num_valid_tokens:
                         col0 = n_start + n0
                         if const_expr(N % block_n == 0) or (col0 < N_const):
-                            s_linear_c = Int32(sC_layout((Int32(r_c), n0)))
-                            s_off_bytes_c = cutlass.Int64(s_linear_c) * element_bytes
+                            # Vectorized SMEM load with XOR swizzle
+                            # XOR swizzle preserves consecutiveness, so we compute base and load 8 elements
+                            m_val = Int32(r_c)
+                            xor_swizzle_r = (m_val & Int32(0x7)) << 4
+                            s_linear_base = m_val * Int32(block_n) + n0
+                            s_offset_swizzled = s_linear_base ^ xor_swizzle_r
                             s_ptr_c = cute.make_ptr(
                                 self.dtype,
-                                sC.iterator.toint() + s_off_bytes_c,
+                                sC_base_i64 + cutlass.Int64(s_offset_swizzled) * element_bytes,
                                 cute.AddressSpace.smem,
                                 assumed_align=align_bytes,
                             )
                             src_c = cute.make_tensor(s_ptr_c, (vec_size,))
 
+                            # Vectorized store to GMEM
                             row_off_bytes = (
                                 cutlass.Int64(aid_c) * stride_cm_elems * element_bytes
                             )
@@ -1828,8 +1862,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                                 assumed_align=align_bytes,
                             )
                             dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
-
-                            cute.copy(gmem_store_atom, src_c, dst_c)
+                            cute.copy(smem_load_atom, src_c, dst_c)
 
 
 class _FusedMoeMatmulCuTeFp8:
