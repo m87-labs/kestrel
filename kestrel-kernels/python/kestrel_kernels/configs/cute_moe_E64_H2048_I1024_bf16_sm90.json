@@ -140,11 +140,11 @@
     },
     "4096": {
       "block_m": 128,
-      "block_n": 128,
+      "block_n": 256,
       "block_k": 64,
       "num_warps": 8,
-      "num_stages": 2,
-      "time_us": 812.9
+      "num_stages": 3,
+      "time_us": 545.1
     }
   },
   "down": {
@@ -289,8 +289,8 @@
       "block_n": 256,
       "block_k": 64,
       "num_warps": 8,
-      "num_stages": 2,
-      "time_us": 542.0
+      "num_stages": 3,
+      "time_us": 382.5
     }
   }
 }

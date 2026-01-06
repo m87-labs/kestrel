@@ -8,6 +8,7 @@ This file provides an equivalent kernel using NVIDIA's CuTe DSL.
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -31,6 +32,31 @@ from kestrel_kernels.flash_attn.cute import copy_utils
 from kestrel_kernels.flash_attn.cute import hopper_helpers as sm90_utils
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 
+from typing import Type
+
+
+def tiled_copy_2d_bypass(
+    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int
+) -> cute.TiledCopy:
+    """Like copy_utils.tiled_copy_2d but with L1 cache bypass for async copies.
+
+    Uses LoadCacheMode.GLOBAL which generates cp.async.cg (bypass L1, cache in L2),
+    matching Triton's LDGSTS.E.BYPASS.128 pattern for gathered/scattered access.
+    """
+    num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
+    copy_elems = num_copy_bits // dtype.width
+    copy_op = cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL)
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    gmem_threads_per_row = major_mode_size // copy_elems
+    assert num_threads % gmem_threads_per_row == 0
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
 _CUTLASS_INITIALIZED = False
 _CUTE_KERNEL_ATTRS_SET: set[str] = set()
 _DEVICE_CACHE_CONFIG_SET = False
@@ -50,6 +76,7 @@ def _wgmma_gemm_no_fence(
     tCrB: cute.Tensor,
     wg_wait: cutlass.Constexpr[int] = 0,
 ) -> None:
+    warpgroup.fence()
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     mma_atom.set(warpgroup.Field.ACCUMULATE, True)
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
@@ -1479,9 +1506,8 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                 element_bytes = cutlass.Int64(self.dtype.width // 8)
 
                 # Use tiled_copy_A with gather to respect swizzled SMEM layout.
-                tiled_copy_A = copy_utils.tiled_copy_2d(
-                    self.dtype, block_k, num_threads, is_async=True
-                )
+                # Use L1 bypass for gathered A tiles (avoids L1 cache thrashing).
+                tiled_copy_A = tiled_copy_2d_bypass(self.dtype, block_k, num_threads)
                 thr_copy_A = tiled_copy_A.get_slice(tx)
                 # Create gather copy function that respects swizzle via partition_D
                 copy_A = copy_utils.gather_m_get_copy_fn(
@@ -1493,9 +1519,8 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                     K_const,
                 )
 
-                tiled_copy_B = copy_utils.tiled_copy_2d(
-                    self.dtype, block_k, num_threads, is_async=True
-                )
+                # Use L1 bypass for B tiles as well (streaming access pattern).
+                tiled_copy_B = tiled_copy_2d_bypass(self.dtype, block_k, num_threads)
                 thr_copy_B = tiled_copy_B.get_slice(tx)
                 cB = cute.make_identity_tensor((block_n, block_k))
                 tBcB = thr_copy_B.partition_S(cB)
@@ -1503,8 +1528,16 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
 
                 mB_expert = mB[expert_id, None, None]
 
-                # Prologue: prefetch the first `num_stages` K tiles.
-                for stage_prefetch in cutlass.range_constexpr(num_stages):
+                # With wg_wait=1, we need one free stage for writing (the WGMMA we just
+                # issued might still be reading). So we only prefetch num_stages-1 tiles.
+                # With wg_wait=0, we can prefetch all num_stages tiles.
+                use_wgmma_pipelining: cutlass.Constexpr[bool] = num_stages >= 3
+                prologue_tiles: cutlass.Constexpr[int] = (
+                    num_stages - 1 if use_wgmma_pipelining else num_stages
+                )
+
+                # Prologue: prefetch the first tiles.
+                for stage_prefetch in cutlass.range_constexpr(prologue_tiles):
                     tile_idx_prefetch = Int32(stage_prefetch)
                     k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                     tile_in_range = tile_idx_prefetch < k_tiles
@@ -1594,8 +1627,19 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                 stage_idx = Int32(0)
                 main_tiles = k_tiles - Int32(num_stages - 1)
 
+                # With wg_wait=1, we write to a different stage than we read from,
+                # because our WGMMA might still be pending (reading the current stage).
+                # The safe stage is (stage_idx + num_stages - 1) % num_stages.
+                # We also prefetch one tile earlier and wait for one less group.
+                cp_async_wait_val: cutlass.Constexpr[int] = (
+                    num_stages - 2 if use_wgmma_pipelining else num_stages - 1
+                )
+                prefetch_offset: cutlass.Constexpr[int] = (
+                    num_stages - 1 if use_wgmma_pipelining else num_stages
+                )
+
                 for tile_idx in cutlass.range(main_tiles, unroll=1):
-                    cute.arch.cp_async_wait_group(num_stages - 1)
+                    cute.arch.cp_async_wait_group(cp_async_wait_val)
                     # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
                     cute.arch.barrier()
 
@@ -1605,20 +1649,31 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                         acc,
                         tSrA[None, None, None, stage_idx],
                         tSrB[None, None, None, stage_idx],
-                        wg_wait=0,
+                        wg_wait=1 if use_wgmma_pipelining else 0,
                     )
                     cute.arch.barrier()
 
-                    next_tile = tile_idx + Int32(num_stages)
+                    # Compute write stage: with wg_wait=1, write to a stage that's not
+                    # being read by the current (potentially pending) WGMMA.
+                    if const_expr(use_wgmma_pipelining):
+                        write_stage = (
+                            stage_idx - Int32(1)
+                            if stage_idx > Int32(0)
+                            else Int32(num_stages - 1)
+                        )
+                    else:
+                        write_stage = stage_idx
+
+                    next_tile = tile_idx + Int32(prefetch_offset)
                     k_start_next = next_tile * Int32(block_k)
                     tile_in_range_next = next_tile < k_tiles
 
                     # A tile: use gather copy to respect swizzled SMEM layout.
                     if tile_in_range_next:
                         if const_expr(K % block_k == 0):
-                            copy_A(next_tile, stage_idx)
+                            copy_A(next_tile, write_stage)
                         else:
-                            copy_A(next_tile, stage_idx, pred=True)
+                            copy_A(next_tile, write_stage, pred=True)
 
                     # B tile: only copy when tile is in range.
                     if tile_in_range_next:
@@ -1627,7 +1682,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                         else:
                             full_k_tile_next = (k_start_next + Int32(block_k)) <= K_const
 
-                        sB_stage = sB[None, None, stage_idx]
+                        sB_stage = sB[None, None, write_stage]
                         gB_tile = cute.local_tile(
                             mB_expert,
                             (block_n, block_k),
@@ -2111,8 +2166,15 @@ class _FusedMoeMatmulCuTeFp8:
                     r_a = r_base_a + Int32(it_a) * r_stride_a
                     aid_row_r[it_a] = sAid[r_a]
 
-                # Prologue: prefetch the first `num_stages` K tiles.
-                for stage_prefetch in cutlass.range_constexpr(num_stages):
+                # With wg_wait=1, we need one free stage for writing (the WGMMA we just
+                # issued might still be reading). So we only prefetch num_stages-1 tiles.
+                use_wgmma_pipelining: cutlass.Constexpr[bool] = num_stages >= 3
+                prologue_tiles: cutlass.Constexpr[int] = (
+                    num_stages - 1 if use_wgmma_pipelining else num_stages
+                )
+
+                # Prologue: prefetch the first tiles.
+                for stage_prefetch in cutlass.range_constexpr(prologue_tiles):
                     tile_idx_prefetch = Int32(stage_prefetch)
                     k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                     tile_in_range = tile_idx_prefetch < k_tiles
@@ -2192,8 +2254,18 @@ class _FusedMoeMatmulCuTeFp8:
 
                 stage_idx = Int32(0)
                 main_tiles = k_tiles - Int32(num_stages - 1)
+
+                # With wg_wait=1, we write to a different stage than we read from,
+                # because our WGMMA might still be pending (reading the current stage).
+                cp_async_wait_val: cutlass.Constexpr[int] = (
+                    num_stages - 2 if use_wgmma_pipelining else num_stages - 1
+                )
+                prefetch_offset: cutlass.Constexpr[int] = (
+                    num_stages - 1 if use_wgmma_pipelining else num_stages
+                )
+
                 for tile_idx in cutlass.range(main_tiles, unroll=1):
-                    cute.arch.cp_async_wait_group(num_stages - 1)
+                    cute.arch.cp_async_wait_group(cp_async_wait_val)
                     # NOTE: fence_proxy omitted - cp_async data visible after wait_group.
                     cute.arch.barrier()
 
@@ -2203,15 +2275,26 @@ class _FusedMoeMatmulCuTeFp8:
                         acc,
                         tSrA[None, None, None, stage_idx],
                         tSrB[None, None, None, stage_idx],
-                        wg_wait=0,
+                        wg_wait=1 if use_wgmma_pipelining else 0,
                     )
                     cute.arch.barrier()
 
-                    next_tile = tile_idx + Int32(num_stages)
+                    # Compute write stage: with wg_wait=1, write to a stage that's not
+                    # being read by the current (potentially pending) WGMMA.
+                    if const_expr(use_wgmma_pipelining):
+                        write_stage = (
+                            stage_idx - Int32(1)
+                            if stage_idx > Int32(0)
+                            else Int32(num_stages - 1)
+                        )
+                    else:
+                        write_stage = stage_idx
+
+                    next_tile = tile_idx + Int32(prefetch_offset)
                     if next_tile < k_tiles:
                         k_start_next = next_tile * Int32(block_k)
 
-                        # Prefetch next A tile into the stage we just consumed.
+                        # Prefetch next A tile into the safe write stage.
                         for it_a2 in cutlass.range_constexpr(iters_a):
                             r_a2 = r_base_a + Int32(it_a2) * r_stride_a
                             k_a2 = Int32(kvec_a * Int32(vec_size_in))
@@ -2234,7 +2317,7 @@ class _FusedMoeMatmulCuTeFp8:
                             )
                             src_a2 = cute.make_tensor(g_ptr_a2, (vec_size_in,))
 
-                            s_linear_a2 = Int32(sA_layout((Int32(r_a2), k_a2, stage_idx)))
+                            s_linear_a2 = Int32(sA_layout((Int32(r_a2), k_a2, write_stage)))
                             s_ptr_a2 = cute.make_ptr(
                                 self.fp8_dtype,
                                 sA.iterator.toint()
@@ -2246,7 +2329,7 @@ class _FusedMoeMatmulCuTeFp8:
                             pred_in[0] = valid_a2
                             cute.copy(atom_async_copy_a, src_a2, dst_a2, pred=pred_in)
 
-                        # Prefetch next B tile into the same stage.
+                        # Prefetch next B tile into the safe write stage.
                         iters_b2 = total_vec_b // num_threads
                         for it_b2 in cutlass.range_constexpr(iters_b2):
                             vec_linear_b2 = tx + Int32(it_b2 * num_threads)
@@ -2272,7 +2355,7 @@ class _FusedMoeMatmulCuTeFp8:
                             )
                             src_b2 = cute.make_tensor(g_ptr_b2, (vec_size_in,))
 
-                            s_linear_b2 = Int32(sB_layout((Int32(n_b2), k_b2, stage_idx)))
+                            s_linear_b2 = Int32(sB_layout((Int32(n_b2), k_b2, write_stage)))
                             s_ptr_b2 = cute.make_ptr(
                                 self.fp8_dtype,
                                 sB.iterator.toint()
