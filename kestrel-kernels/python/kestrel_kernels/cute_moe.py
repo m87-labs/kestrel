@@ -1888,50 +1888,95 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                                 self.dtype,
                             )
 
-                            # 16 shuffles to gather data for all 4 chunks from all 4 threads
-                            # Chunk 0: gather packed_c0 from all threads
-                            g0_0 = shfl_sync_idx_b32(packed_c0, src_lane_0)
-                            g0_1 = shfl_sync_idx_b32(packed_c0, src_lane_1)
-                            g0_2 = shfl_sync_idx_b32(packed_c0, src_lane_2)
-                            g0_3 = shfl_sync_idx_b32(packed_c0, src_lane_3)
-                            # Chunk 1: gather packed_c1 from all threads
-                            g1_0 = shfl_sync_idx_b32(packed_c1, src_lane_0)
-                            g1_1 = shfl_sync_idx_b32(packed_c1, src_lane_1)
-                            g1_2 = shfl_sync_idx_b32(packed_c1, src_lane_2)
-                            g1_3 = shfl_sync_idx_b32(packed_c1, src_lane_3)
-                            # Chunk 2: gather packed_c2 from all threads
-                            g2_0 = shfl_sync_idx_b32(packed_c2, src_lane_0)
-                            g2_1 = shfl_sync_idx_b32(packed_c2, src_lane_1)
-                            g2_2 = shfl_sync_idx_b32(packed_c2, src_lane_2)
-                            g2_3 = shfl_sync_idx_b32(packed_c2, src_lane_3)
-                            # Chunk 3: gather packed_c3 from all threads
-                            g3_0 = shfl_sync_idx_b32(packed_c3, src_lane_0)
-                            g3_1 = shfl_sync_idx_b32(packed_c3, src_lane_1)
-                            g3_2 = shfl_sync_idx_b32(packed_c3, src_lane_2)
-                            g3_3 = shfl_sync_idx_b32(packed_c3, src_lane_3)
+                            # 3-shuffle ring exchange (+ 1 local) instead of 16 shuffles + 4-way branch
+                            # Goal: lane g needs packed_c[g] from all 4 lanes in its group.
+                            # Local contribution: s[g] = packed[g] (already have it)
+                            # Ring rounds: for offset in 1,2,3:
+                            #   dst = (g + offset) % 4  -> what value the destination lane needs from me
+                            #   src = (g - offset) % 4  -> which lane to read from
+                            #   send = packed[dst], recv = shfl(send, src) -> recv is packed[g] from lane src
 
-                            # Each thread selects gathered values for its assigned chunk
-                            # Thread 0 → chunk 0, Thread 1 → chunk 1, etc.
-                            # Initialize before control flow (DSL requirement)
-                            s0 = g0_0
-                            s1 = g0_1
-                            s2 = g0_2
-                            s3 = g0_3
+                            # Initialize s0-s3 with local contribution based on lane_in_group
+                            # s[lane_in_group] = packed[lane_in_group], others will be filled by shuffles
+                            s0 = packed_c0  # Will be overwritten unless lane_in_group == 0
+                            s1 = packed_c1  # Will be overwritten unless lane_in_group == 1
+                            s2 = packed_c2  # Will be overwritten unless lane_in_group == 2
+                            s3 = packed_c3  # Will be overwritten unless lane_in_group == 3
+
+                            # Round 1: offset = 1
+                            # dst = (g + 1) % 4, src = (g - 1) % 4 = (g + 3) % 4
+                            # Lane 0: dst=1, src=3 -> send packed_c1, recv from lane 3
+                            # Lane 1: dst=2, src=0 -> send packed_c2, recv from lane 0
+                            # Lane 2: dst=3, src=1 -> send packed_c3, recv from lane 1
+                            # Lane 3: dst=0, src=2 -> send packed_c0, recv from lane 2
+                            send1 = packed_c1  # Default for lane 0
                             if lane_in_group == 1:
-                                s0 = g1_0
-                                s1 = g1_1
-                                s2 = g1_2
-                                s3 = g1_3
+                                send1 = packed_c2
                             elif lane_in_group == 2:
-                                s0 = g2_0
-                                s1 = g2_1
-                                s2 = g2_2
-                                s3 = g2_3
+                                send1 = packed_c3
                             elif lane_in_group == 3:
-                                s0 = g3_0
-                                s1 = g3_1
-                                s2 = g3_2
-                                s3 = g3_3
+                                send1 = packed_c0
+                            src1 = Int32(group_base_lane) + ((lane_in_group + 3) & 3)
+                            recv1 = shfl_sync_idx_b32(send1, src1)
+                            # Store recv1 into s[src1 % 4] = s[(g + 3) % 4]
+                            if lane_in_group == 0:
+                                s3 = recv1
+                            elif lane_in_group == 1:
+                                s0 = recv1
+                            elif lane_in_group == 2:
+                                s1 = recv1
+                            else:
+                                s2 = recv1
+
+                            # Round 2: offset = 2
+                            # dst = (g + 2) % 4, src = (g + 2) % 4 (same! it's a swap)
+                            # Lane 0: dst=2, src=2 -> send packed_c2, recv from lane 2
+                            # Lane 1: dst=3, src=3 -> send packed_c3, recv from lane 3
+                            # Lane 2: dst=0, src=0 -> send packed_c0, recv from lane 0
+                            # Lane 3: dst=1, src=1 -> send packed_c1, recv from lane 1
+                            send2 = packed_c2  # Default for lane 0
+                            if lane_in_group == 1:
+                                send2 = packed_c3
+                            elif lane_in_group == 2:
+                                send2 = packed_c0
+                            elif lane_in_group == 3:
+                                send2 = packed_c1
+                            src2 = Int32(group_base_lane) + ((lane_in_group + 2) & 3)
+                            recv2 = shfl_sync_idx_b32(send2, src2)
+                            # Store recv2 into s[(g + 2) % 4]
+                            if lane_in_group == 0:
+                                s2 = recv2
+                            elif lane_in_group == 1:
+                                s3 = recv2
+                            elif lane_in_group == 2:
+                                s0 = recv2
+                            else:
+                                s1 = recv2
+
+                            # Round 3: offset = 3
+                            # dst = (g + 3) % 4, src = (g + 1) % 4
+                            # Lane 0: dst=3, src=1 -> send packed_c3, recv from lane 1
+                            # Lane 1: dst=0, src=2 -> send packed_c0, recv from lane 2
+                            # Lane 2: dst=1, src=3 -> send packed_c1, recv from lane 3
+                            # Lane 3: dst=2, src=0 -> send packed_c2, recv from lane 0
+                            send3 = packed_c3  # Default for lane 0
+                            if lane_in_group == 1:
+                                send3 = packed_c0
+                            elif lane_in_group == 2:
+                                send3 = packed_c1
+                            elif lane_in_group == 3:
+                                send3 = packed_c2
+                            src3 = Int32(group_base_lane) + ((lane_in_group + 1) & 3)
+                            recv3 = shfl_sync_idx_b32(send3, src3)
+                            # Store recv3 into s[(g + 1) % 4]
+                            if lane_in_group == 0:
+                                s1 = recv3
+                            elif lane_in_group == 1:
+                                s2 = recv3
+                            elif lane_in_group == 2:
+                                s3 = recv3
+                            else:
+                                s0 = recv3
 
                             # Compute store address: each thread stores to a different chunk
                             # Thread T stores chunk (base_chunk + T) at N offset (base_chunk + T) * 8
