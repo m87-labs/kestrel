@@ -1,0 +1,296 @@
+{
+  "description": "CuTe MoE FP8 kernel configs optimized for H100 (SM90)",
+  "up": {
+    "1": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 5,
+      "time_us": 134.6
+    },
+    "2": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 148.3
+    },
+    "4": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 167.1
+    },
+    "8": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 185.3
+    },
+    "16": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 248.0
+    },
+    "24": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 3,
+      "time_us": 236.3
+    },
+    "32": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 272.1
+    },
+    "48": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 228.1
+    },
+    "64": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 226.0
+    },
+    "96": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 262.1
+    },
+    "128": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 269.3
+    },
+    "256": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 3,
+      "time_us": 272.8
+    },
+    "512": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 4,
+      "time_us": 235.1
+    },
+    "1024": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 5,
+      "time_us": 268.6
+    },
+    "1536": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 306.7
+    },
+    "2048": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 346.8
+    },
+    "3072": {
+      "block_m": 192,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 12,
+      "num_stages": 4,
+      "time_us": 396.4
+    },
+    "4096": {
+      "block_m": 192,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 12,
+      "num_stages": 4,
+      "time_us": 401.1
+    }
+  },
+  "down": {
+    "1": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 3,
+      "time_us": 124.2
+    },
+    "2": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 4,
+      "time_us": 130.3
+    },
+    "4": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 158.7
+    },
+    "8": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 5,
+      "time_us": 152.2
+    },
+    "16": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 164.7
+    },
+    "24": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 4,
+      "time_us": 234.9
+    },
+    "32": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 208.6
+    },
+    "48": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 181.1
+    },
+    "64": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 178.9
+    },
+    "96": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 211.8
+    },
+    "128": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 4,
+      "num_stages": 8,
+      "time_us": 212.6
+    },
+    "256": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 5,
+      "time_us": 174.6
+    },
+    "512": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 187.6
+    },
+    "1024": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 4,
+      "time_us": 213.3
+    },
+    "1536": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "time_us": 232.5
+    },
+    "2048": {
+      "block_m": 64,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "time_us": 273.8
+    },
+    "3072": {
+      "block_m": 192,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 12,
+      "num_stages": 3,
+      "time_us": 303.1
+    },
+    "4096": {
+      "block_m": 192,
+      "block_n": 256,
+      "block_k": 64,
+      "num_warps": 12,
+      "num_stages": 4,
+      "time_us": 306.2
+    }
+  },
+  "generated": "2026-01-07"
+}

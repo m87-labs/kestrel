@@ -786,6 +786,7 @@ class FusedMoEModule(nn.Module):
                     block_k=128,
                     num_warps=4,
                     num_stages=num_stages,
+                    dtype="fp8",
                 )
                 a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
                 if mul_routed_weight:

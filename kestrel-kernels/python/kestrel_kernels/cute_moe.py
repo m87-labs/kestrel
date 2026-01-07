@@ -293,9 +293,13 @@ class CuteMoeConfig:
     block_k: int = 64
     num_warps: int = 4
     num_stages: int = 2
+    dtype: str = "bf16"  # "bf16" or "fp8"
 
     def __post_init__(self) -> None:
         """Validate config constraints at construction time."""
+        if self.dtype not in ("bf16", "fp8"):
+            raise ValueError(f"dtype must be 'bf16' or 'fp8', got '{self.dtype}'")
+
         # CRITICAL: block_m must not exceed num_threads!
         # The kernel's metadata loading loop uses `if tx < block_m` to load per-row
         # metadata into shared memory. With only num_threads threads, rows beyond
@@ -306,13 +310,21 @@ class CuteMoeConfig:
                 f"With {self.num_warps} warps, max block_m is {self.num_threads}."
             )
 
-        # block_k must be divisible by 16 (MMA K dimension).
+        if self.dtype == "fp8":
+            self._validate_fp8()
+        else:
+            self._validate_bf16()
+
+    def _validate_bf16(self) -> None:
+        """Validate constraints for BF16 kernel."""
+        # block_k must be divisible by 16 (MMA K dimension for BF16).
         if self.block_k % 16 != 0:
             raise ValueError(
-                f"block_k ({self.block_k}) must be divisible by 16 (MMA K dimension)."
+                f"block_k ({self.block_k}) must be divisible by 16 (BF16 MMA K dimension)."
             )
 
-        # block_n must be divisible by 8 * num_warps (MMA layout constraint).
+        # block_n must be divisible by 8 * num_warps (Ampere MMA layout constraint).
+        # This applies to the non-WGMMA path (block_m < 64).
         mma_n_coverage = 8 * self.num_warps
         if self.block_n % mma_n_coverage != 0:
             raise ValueError(
@@ -326,10 +338,10 @@ class CuteMoeConfig:
             )
 
         # Shared memory constraint: sA + sB + metadata must fit in H100's 228KB.
-        # WGMMA also needs sC for epilogue; non-WGMMA writes directly to GMEM.
-        # Use ~200KB limit to leave room for alignment padding and metadata.
-        sA_bytes = self.num_stages * self.block_m * self.block_k * 2
-        sB_bytes = self.num_stages * self.block_n * self.block_k * 2
+        # BF16 = 2 bytes per element.
+        bytes_per_elem = 2
+        sA_bytes = self.num_stages * self.block_m * self.block_k * bytes_per_elem
+        sB_bytes = self.num_stages * self.block_n * self.block_k * bytes_per_elem
         total_bytes = sA_bytes + sB_bytes
         max_bytes = 200 * 1024
         if total_bytes > max_bytes:
@@ -343,12 +355,7 @@ class CuteMoeConfig:
         # WGMMA warpgroup constraint: when block_m >= 128 and meets WGMMA criteria,
         # the BF16 WGMMA kernel path requires (block_m // 64) warpgroups.
         # Each warpgroup = 4 warps, so num_warps must be (block_m // 64) * 4.
-        # This ensures the tiled_mma atom_layout_mnk=(block_m // 64, 1, 1) has enough threads.
-        if (
-            self.block_m >= 128
-            and self.block_m % 64 == 0
-            and self.block_k % 16 == 0
-        ):
+        if self.block_m >= 128 and self.block_m % 64 == 0:
             required_warpgroups = self.block_m // 64
             required_warps = required_warpgroups * 4
             if self.num_warps != required_warps:
@@ -357,6 +364,44 @@ class CuteMoeConfig:
                     f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}. "
                     f"Each warpgroup (4 warps/128 threads) handles 64 rows of M."
                 )
+
+    def _validate_fp8(self) -> None:
+        """Validate constraints for FP8 WGMMA kernel."""
+        # FP8 WGMMA always requires block_m to be a multiple of 64 (one warpgroup per 64 rows).
+        if self.block_m % 64 != 0:
+            raise ValueError(
+                f"FP8 WGMMA requires block_m ({self.block_m}) to be divisible by 64."
+            )
+
+        # FP8 WGMMA requires block_k divisible by 32 (K dimension alignment for FP8 MMA).
+        if self.block_k % 32 != 0:
+            raise ValueError(
+                f"FP8 WGMMA requires block_k ({self.block_k}) to be divisible by 32."
+            )
+
+        # FP8 WGMMA: num_warps must match warpgroups = block_m // 64, each warpgroup = 4 warps.
+        required_warpgroups = self.block_m // 64
+        required_warps = required_warpgroups * 4
+        if self.num_warps != required_warps:
+            raise ValueError(
+                f"FP8 WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
+                f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}."
+            )
+
+        # Shared memory constraint: sA + sB + metadata must fit in H100's 228KB.
+        # FP8 = 1 byte per element (half of BF16).
+        bytes_per_elem = 1
+        sA_bytes = self.num_stages * self.block_m * self.block_k * bytes_per_elem
+        sB_bytes = self.num_stages * self.block_n * self.block_k * bytes_per_elem
+        total_bytes = sA_bytes + sB_bytes
+        max_bytes = 200 * 1024
+        if total_bytes > max_bytes:
+            raise ValueError(
+                f"Shared memory exceeded: sA={sA_bytes // 1024}KB + sB={sB_bytes // 1024}KB "
+                f"= {total_bytes // 1024}KB "
+                f"(stages={self.num_stages}, m={self.block_m}, n={self.block_n}, k={self.block_k}). "
+                f"Max ~{max_bytes // 1024}KB."
+            )
 
     @property
     def num_threads(self) -> int:
@@ -483,6 +528,7 @@ def get_cute_moe_config(
         block_k=cfg["block_k"],
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
+        dtype=dtype,
     )
 
 
@@ -2049,12 +2095,16 @@ class _FusedMoeMatmulCuTeFp8:
         *,
         mul_routed_weight: bool,
         top_k: int,
+        N: int,
+        K: int,
     ) -> None:
         self.dtype = dtype
         self.fp8_dtype = fp8_dtype
         self.config = config
         self.mul_routed_weight = mul_routed_weight
         self.top_k = int(top_k)
+        self.N = int(N)
+        self.K = int(K)
 
     def _shared_storage_cls(self):
         block_m = self.config.block_m
@@ -2083,6 +2133,7 @@ class _FusedMoeMatmulCuTeFp8:
 
         sMeta_elems = block_m
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
+        sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sAScale_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMeta_elems], 16]
 
         sBScale_elems = block_n
@@ -2093,6 +2144,7 @@ class _FusedMoeMatmulCuTeFp8:
             sA: sA_struct
             sB: sB_struct
             sAid: sAid_struct
+            sTok: sTok_struct
             sAScale: sAScale_struct
             sBScale: sBScale_struct
 
@@ -2140,9 +2192,11 @@ class _FusedMoeMatmulCuTeFp8:
             mSortedTokenIds,
             mExpertIds,
             mNumTokensPostPadded,
+            self.N,
+            self.K,
             SharedStorage,
         ).launch(
-            grid=(grid_m, grid_n, 1),
+            grid=(grid_n, grid_m, 1),  # N-first for better weight reuse
             block=(self.config.num_threads, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -2161,10 +2215,12 @@ class _FusedMoeMatmulCuTeFp8:
         mSortedTokenIds: cute.Tensor,
         mExpertIds: cute.Tensor,
         mNumTokensPostPadded: cute.Tensor,
+        N: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
         SharedStorage: cutlass.Constexpr,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        pid_m, pid_n, _ = cute.arch.block_idx()
+        pid_n, pid_m, _ = cute.arch.block_idx()  # Swapped for N-first scheduling
 
         block_m = self.config.block_m
         block_n = self.config.block_n
@@ -2178,18 +2234,22 @@ class _FusedMoeMatmulCuTeFp8:
         num_tokens_post_padded = Int32(mNumTokensPostPadded[0])
         block_active = row_start < num_tokens_post_padded
 
-        N = Int32(mC.shape[1])
-        K = Int32(mAbits.shape[1])
+        N_const = Int32(N)
+        K_const = Int32(K)
         num_valid_tokens = Int32(mAbits.shape[0]) * Int32(self.top_k)
         expert_id = Int32(mExpertIds[pid_m])
 
-        full_n_tile = (n_start + Int32(block_n)) <= N
+        if const_expr(N % block_n == 0):
+            full_n_tile = True
+        else:
+            full_n_tile = (n_start + Int32(block_n)) <= N_const
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         # Shared routing/scale metadata for the M rows in this CTA.
         s_meta_layout = cute.make_layout((block_m,), stride=(1,))
         sAid = storage.sAid.get_tensor(s_meta_layout)
+        sTok = storage.sTok.get_tensor(s_meta_layout)
         sAScale = storage.sAScale.get_tensor(s_meta_layout)
         sBScale = storage.sBScale.get_tensor(cute.make_layout((block_n,), stride=(1,)))
 
@@ -2208,9 +2268,7 @@ class _FusedMoeMatmulCuTeFp8:
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner, dtype=self.fp8_dtype)
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner, dtype=self.fp8_dtype)
 
-        element_bytes_a_g = cutlass.Int64(self.fp8_dtype.width // 8)
         element_bytes_c = cutlass.Int64(self.dtype.width // 8)
-        stride_am_elems = cutlass.Int64(mAbits.stride[0])
         stride_cm_elems = cutlass.Int64(mC.stride[0])
 
         if block_active:
@@ -2227,12 +2285,19 @@ class _FusedMoeMatmulCuTeFp8:
                         aid = Int32(mSortedTokenIds[idx])
                     sAid[tx] = aid
 
+                    tok = Int32(0)
                     row_scale = Float32(0.0)
                     if aid < num_valid_tokens:
-                        tok = aid // Int32(self.top_k)
+                        if const_expr(self.top_k == 1):
+                            tok = aid
+                        elif const_expr(self.top_k == 8):
+                            tok = aid >> 3
+                        else:
+                            tok = aid // Int32(self.top_k)
                         row_scale = Float32(mAScale[tok])
                         if const_expr(self.mul_routed_weight):
                             row_scale = row_scale * Float32(mTopkWeights[aid])
+                    sTok[tx] = tok
                     sAScale[tx] = row_scale
 
                 # Prefetch per-output-channel scales for this expert + N tile into SMEM.
@@ -2313,14 +2378,24 @@ class _FusedMoeMatmulCuTeFp8:
                 tSrA = tiled_mma.make_fragment_A(wg_mma.partition_A(sA))
                 tSrB = tiled_mma.make_fragment_B(wg_mma.partition_B(sB))
 
-                # cp.async copy atoms for FP8 operands (16B vectors).
+                # Use L1 bypass for gathered A tiles (avoids L1 cache thrashing).
+                # Create TiledCopy with L1 bypass for FP8 operands.
+                tiled_copy_A = tiled_copy_2d_bypass(self.fp8_dtype, block_k, num_threads)
+                thr_copy_A = tiled_copy_A.get_slice(tx)
+                # Create gather copy function that respects swizzle via partition_D
+                num_tokens = Int32(mAbits.shape[0])
+                copy_A = copy_utils.gather_m_get_copy_fn(
+                    thr_copy_A,
+                    mAbits,
+                    sA,
+                    sTok,  # Row indices (token IDs)
+                    num_tokens,
+                    K_const,
+                )
+
+                # cp.async copy atoms for FP8 B operands (16B vectors).
                 vec_size_in = 16
                 copy_bits_in = vec_size_in * self.fp8_dtype.width
-                atom_async_copy_a = cute.make_copy_atom(
-                    cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-                    self.fp8_dtype,
-                    num_bits_per_copy=copy_bits_in,
-                )
                 atom_async_copy_b = cute.make_copy_atom(
                     cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
                     self.fp8_dtype,
@@ -2338,7 +2413,6 @@ class _FusedMoeMatmulCuTeFp8:
                 element_bytes_fp8 = cutlass.Int64(self.fp8_dtype.width // 8)
 
                 mC_base_i64 = mC.iterator.toint()
-                mA_base_i64 = mAbits.iterator.toint()
                 mB_base_i64 = mBbits.iterator.toint()
 
                 stride_be_u8 = cutlass.Int64(mBbits.stride[0])
@@ -2346,21 +2420,9 @@ class _FusedMoeMatmulCuTeFp8:
                 stride_bk_u8 = cutlass.Int64(mBbits.stride[2])
 
                 block_vec_k = block_k // vec_size_in
-                total_vec_a = block_m * block_vec_k
                 total_vec_b = block_n * block_vec_k
 
                 k_tiles = cute.ceil_div(K, block_k)
-
-                # Cache per-thread row metadata for A to avoid reloading routing metadata
-                # in the inner K-tile loops.
-                iters_a = total_vec_a // num_threads
-                r_base_a = Int32(tx // Int32(block_vec_k))
-                r_stride_a = Int32(num_threads // block_vec_k)
-                kvec_a = Int32(tx - r_base_a * Int32(block_vec_k))
-                aid_row_r = cute.make_rmem_tensor((iters_a,), Int32)
-                for it_a in cutlass.range_constexpr(iters_a):
-                    r_a = r_base_a + Int32(it_a) * r_stride_a
-                    aid_row_r[it_a] = sAid[r_a]
 
                 # With wg_wait=1, we need one free stage for writing (the WGMMA we just
                 # issued might still be reading). So we only prefetch num_stages-1 tiles.
@@ -2375,39 +2437,12 @@ class _FusedMoeMatmulCuTeFp8:
                     k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                     tile_in_range = tile_idx_prefetch < k_tiles
 
-                    # A tile: [block_m, block_k] via cp.async.
-                    for it_a in cutlass.range_constexpr(iters_a):
-                        r_a = r_base_a + Int32(it_a) * r_stride_a
-                        k_a = Int32(kvec_a * Int32(vec_size_in))
-                        kg_a = k_start_prefetch + k_a
-
-                        aid_a = aid_row_r[it_a]
-                        valid_row_a = aid_a < num_valid_tokens
-                        tok_a = aid_a // Int32(self.top_k)
-
-                        valid_a = tile_in_range and valid_row_a and (kg_a < K)
-                        g_off_bytes_a = (
-                            (cutlass.Int64(tok_a) * stride_am_elems + cutlass.Int64(kg_a))
-                            * element_bytes_fp8
-                        )
-                        g_ptr_a = cute.make_ptr(
-                            self.fp8_dtype,
-                            mA_base_i64 + g_off_bytes_a,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes_in,
-                        )
-                        src_a = cute.make_tensor(g_ptr_a, (vec_size_in,))
-
-                        s_linear_a = Int32(sA_layout((Int32(r_a), k_a, Int32(stage_prefetch))))
-                        s_ptr_a = cute.make_ptr(
-                            self.fp8_dtype,
-                            sA.iterator.toint() + cutlass.Int64(s_linear_a) * element_bytes_fp8,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes_in,
-                        )
-                        dst_a = cute.make_tensor(s_ptr_a, (vec_size_in,))
-                        pred_in[0] = valid_a
-                        cute.copy(atom_async_copy_a, src_a, dst_a, pred=pred_in)
+                    # A tile: use gather copy with L1 bypass to respect swizzled SMEM layout.
+                    if tile_in_range:
+                        if const_expr(K % block_k == 0):
+                            copy_A(tile_idx_prefetch, stage_prefetch)
+                        else:
+                            copy_A(tile_idx_prefetch, stage_prefetch, pred=True)
 
                     # B tile: [block_n, block_k] via cp.async.
                     iters_b = total_vec_b // num_threads
@@ -2490,40 +2525,11 @@ class _FusedMoeMatmulCuTeFp8:
                     if next_tile < k_tiles:
                         k_start_next = next_tile * Int32(block_k)
 
-                        # Prefetch next A tile into the safe write stage.
-                        for it_a2 in cutlass.range_constexpr(iters_a):
-                            r_a2 = r_base_a + Int32(it_a2) * r_stride_a
-                            k_a2 = Int32(kvec_a * Int32(vec_size_in))
-                            kg_a2 = k_start_next + k_a2
-
-                            aid_a2 = aid_row_r[it_a2]
-                            valid_row_a2 = aid_a2 < num_valid_tokens
-                            tok_a2 = aid_a2 // Int32(self.top_k)
-
-                            valid_a2 = valid_row_a2 and (kg_a2 < K)
-                            g_off_bytes_a2 = (
-                                (cutlass.Int64(tok_a2) * stride_am_elems + cutlass.Int64(kg_a2))
-                                * element_bytes_fp8
-                            )
-                            g_ptr_a2 = cute.make_ptr(
-                                self.fp8_dtype,
-                                mA_base_i64 + g_off_bytes_a2,
-                                cute.AddressSpace.gmem,
-                                assumed_align=align_bytes_in,
-                            )
-                            src_a2 = cute.make_tensor(g_ptr_a2, (vec_size_in,))
-
-                            s_linear_a2 = Int32(sA_layout((Int32(r_a2), k_a2, write_stage)))
-                            s_ptr_a2 = cute.make_ptr(
-                                self.fp8_dtype,
-                                sA.iterator.toint()
-                                + cutlass.Int64(s_linear_a2) * element_bytes_fp8,
-                                cute.AddressSpace.smem,
-                                assumed_align=align_bytes_in,
-                            )
-                            dst_a2 = cute.make_tensor(s_ptr_a2, (vec_size_in,))
-                            pred_in[0] = valid_a2
-                            cute.copy(atom_async_copy_a, src_a2, dst_a2, pred=pred_in)
+                        # Prefetch next A tile using gather copy with L1 bypass.
+                        if const_expr(K % block_k == 0):
+                            copy_A(next_tile, write_stage)
+                        else:
+                            copy_A(next_tile, write_stage, pred=True)
 
                         # Prefetch next B tile into the safe write stage.
                         iters_b2 = total_vec_b // num_threads
@@ -2584,77 +2590,214 @@ class _FusedMoeMatmulCuTeFp8:
 
                     stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-                # Epilogue: apply scales (and routed weight), then store/scatter.
+                # Epilogue: apply scales, then scatter stores using 128-bit coalesced writes.
+                #
+                # WGMMA accumulator layout for SM90:
+                # - Every 4 consecutive threads (tid%4 == 0,1,2,3) share the same M row
+                # - Within each 4-thread group, N values are distributed as:
+                #   Thread 0: N=0,1, 8,9, 16,17, ...  (pairs at stride 8)
+                #   Thread 1: N=2,3, 10,11, 18,19, ...
+                #   Thread 2: N=4,5, 12,13, 20,21, ...
+                #   Thread 3: N=6,7, 14,15, 22,23, ...
+                # - Each thread has n_per_m/2 "chunks", each chunk = 2 consecutive N values
+                # - For 128-bit stores (8 BF16), we gather from 4 threads via warp shuffle
+                #
                 cC = cute.make_identity_tensor((block_m, block_n))
                 thr_mma = tiled_mma.get_slice(tx)
                 tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
                 tAcc = fa_utils.make_acc_tensor_mn_view(acc)
+
+                # Load per-column B scales into registers
                 b_scale_r = cute.make_rmem_tensor((cute.size(tAcc.shape[1]),), Float32)
                 for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
                     n = Int32(tC_coords[0, ni][1])
                     b_scale_r[ni] = sBScale[n]
-                gmem_store_atom = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    self.dtype,
-                    num_bits_per_copy=2 * self.dtype.width,
-                )
-                gmem_store_atom_scalar = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    self.dtype,
-                    num_bits_per_copy=self.dtype.width,
-                )
-                vec_size_out = 2
-                src_vec = cute.make_rmem_tensor((vec_size_out,), self.dtype)
-                src_scalar = cute.make_rmem_tensor((1,), self.dtype)
-                align_bytes_out = vec_size_out * int(self.dtype.width // 8)
+
+                n_per_m: cutlass.Constexpr[int] = cute.size(tAcc.shape[1])
+                num_chunks: cutlass.Constexpr[int] = n_per_m // 2  # Each chunk = 2 N values
+
+                # Warp shuffle setup: threads 0-3, 4-7, etc. form groups
+                lane = tx % 32
+                lane_in_group = lane % 4
+                group_base_lane = lane - lane_in_group
+
+                # Precompute shuffle source lanes for 3-round ring exchange
+                src_round1 = Int32(group_base_lane) + ((lane_in_group + 3) & 3)
+                src_round2 = Int32(group_base_lane) + ((lane_in_group + 2) & 3)
+                src_round3 = Int32(group_base_lane) + ((lane_in_group + 1) & 3)
+
+                align_bytes_128 = 16
+                element_bytes_const: cutlass.Constexpr[int] = 2  # BF16 = 2 bytes
+
+                # 4-thread parallel stores: process 4 chunks at once
+                num_chunk_groups: cutlass.Constexpr[int] = num_chunks // 4
+
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                     m = Int32(tC_coords[mi, 0][0])
                     aid = sAid[m]
-                    if aid < num_valid_tokens:
+                    valid_row = aid < num_valid_tokens
+
+                    # Use row_scale=0 for invalid rows so shuffles execute uniformly
+                    row_scale = Float32(0.0)
+                    if valid_row:
                         row_scale = Float32(sAScale[m])
-                        row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes_c
-                        if full_n_tile:
-                            n_pairs = cute.size(tAcc.shape[1]) // vec_size_out
-                            for pi in cutlass.range_constexpr(n_pairs):
-                                ni0 = Int32(pi * vec_size_out)
-                                n0 = Int32(tC_coords[mi, ni0][1])
-                                col0 = n_start + n0
-                                src_vec[0] = self.dtype(
-                                    Float32(tAcc[mi, ni0]) * row_scale * b_scale_r[ni0]
-                                )
-                                src_vec[1] = self.dtype(
-                                    Float32(tAcc[mi, ni0 + 1]) * row_scale * b_scale_r[ni0 + 1]
-                                )
-                                g_off_bytes_vec = (
-                                    row_off_bytes + cutlass.Int64(col0) * element_bytes_c
-                                )
-                                g_ptr_vec = cute.make_ptr(
-                                    self.dtype,
-                                    mC_base_i64 + g_off_bytes_vec,
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=align_bytes_out,
-                                )
-                                dst_vec = cute.make_tensor(g_ptr_vec, (vec_size_out,))
-                                cute.copy(gmem_store_atom, src_vec, dst_vec)
-                        else:
-                            for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                                n = Int32(tC_coords[mi, ni][1])
-                                col = n_start + n
-                                if col < N:
-                                    src_scalar[0] = self.dtype(
-                                        Float32(tAcc[mi, ni]) * row_scale * b_scale_r[ni]
-                                    )
-                                    g_off_bytes_scalar = (
-                                        row_off_bytes + cutlass.Int64(col) * element_bytes_c
-                                    )
-                                    g_ptr_scalar = cute.make_ptr(
+
+                    row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes_c
+
+                    if full_n_tile:
+                        # Process 4 chunks at a time with all 4 threads storing in parallel
+                        for chunk_group in cutlass.range_constexpr(num_chunk_groups):
+                            base_chunk: cutlass.Constexpr[int] = chunk_group * 4
+
+                            # Each thread computes packed values for all 4 chunks
+                            ni0_c0: cutlass.Constexpr[int] = (base_chunk + 0) * 2
+                            ni0_c1: cutlass.Constexpr[int] = (base_chunk + 1) * 2
+                            ni0_c2: cutlass.Constexpr[int] = (base_chunk + 2) * 2
+                            ni0_c3: cutlass.Constexpr[int] = (base_chunk + 3) * 2
+
+                            # Apply row_scale and per-column b_scale, then pack
+                            packed_c0 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c0]) * row_scale * b_scale_r[ni0_c0],
+                                Float32(tAcc[mi, ni0_c0 + 1]) * row_scale * b_scale_r[ni0_c0 + 1],
+                                self.dtype,
+                            )
+                            packed_c1 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c1]) * row_scale * b_scale_r[ni0_c1],
+                                Float32(tAcc[mi, ni0_c1 + 1]) * row_scale * b_scale_r[ni0_c1 + 1],
+                                self.dtype,
+                            )
+                            packed_c2 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c2]) * row_scale * b_scale_r[ni0_c2],
+                                Float32(tAcc[mi, ni0_c2 + 1]) * row_scale * b_scale_r[ni0_c2 + 1],
+                                self.dtype,
+                            )
+                            packed_c3 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c3]) * row_scale * b_scale_r[ni0_c3],
+                                Float32(tAcc[mi, ni0_c3 + 1]) * row_scale * b_scale_r[ni0_c3 + 1],
+                                self.dtype,
+                            )
+
+                            # 3-shuffle ring exchange to gather packed values
+                            # Initialize with local contribution
+                            s0 = packed_c0
+                            s1 = packed_c1
+                            s2 = packed_c2
+                            s3 = packed_c3
+
+                            # Round 1: offset = 1
+                            send1 = packed_c1
+                            if lane_in_group == 1:
+                                send1 = packed_c2
+                            elif lane_in_group == 2:
+                                send1 = packed_c3
+                            elif lane_in_group == 3:
+                                send1 = packed_c0
+                            recv1 = shfl_sync_idx_b32(send1, src_round1)
+                            if lane_in_group == 0:
+                                s3 = recv1
+                            elif lane_in_group == 1:
+                                s0 = recv1
+                            elif lane_in_group == 2:
+                                s1 = recv1
+                            else:
+                                s2 = recv1
+
+                            # Round 2: offset = 2
+                            send2 = packed_c2
+                            if lane_in_group == 1:
+                                send2 = packed_c3
+                            elif lane_in_group == 2:
+                                send2 = packed_c0
+                            elif lane_in_group == 3:
+                                send2 = packed_c1
+                            recv2 = shfl_sync_idx_b32(send2, src_round2)
+                            if lane_in_group == 0:
+                                s2 = recv2
+                            elif lane_in_group == 1:
+                                s3 = recv2
+                            elif lane_in_group == 2:
+                                s0 = recv2
+                            else:
+                                s1 = recv2
+
+                            # Round 3: offset = 3
+                            send3 = packed_c3
+                            if lane_in_group == 1:
+                                send3 = packed_c0
+                            elif lane_in_group == 2:
+                                send3 = packed_c1
+                            elif lane_in_group == 3:
+                                send3 = packed_c2
+                            recv3 = shfl_sync_idx_b32(send3, src_round3)
+                            if lane_in_group == 0:
+                                s1 = recv3
+                            elif lane_in_group == 1:
+                                s2 = recv3
+                            elif lane_in_group == 2:
+                                s3 = recv3
+                            else:
+                                s0 = recv3
+
+                            # Compute store address: each thread stores to different chunk
+                            my_n_offset = Int32(base_chunk * 8) + lane_in_group * 8
+                            col0 = n_start + my_n_offset
+
+                            if valid_row:
+                                if const_expr(N % block_n == 0) or (col0 + 7 < N_const):
+                                    g_off_bytes = row_off_bytes + cutlass.Int64(col0) * element_bytes_const
+                                    g_ptr = cute.make_ptr(
                                         self.dtype,
-                                        mC_base_i64 + g_off_bytes_scalar,
+                                        mC_base_i64 + g_off_bytes,
                                         cute.AddressSpace.gmem,
-                                        assumed_align=int(self.dtype.width // 8),
+                                        assumed_align=align_bytes_128,
                                     )
-                                    dst_scalar = cute.make_tensor(g_ptr_scalar, (1,))
-                                    cute.copy(gmem_store_atom_scalar, src_scalar, dst_scalar)
+                                    store_streaming_b128(s0, s1, s2, s3, g_ptr)
+                                else:
+                                    # Boundary: fall back to 32-bit stores
+                                    for ni_local in cutlass.range_constexpr(4):
+                                        col_check = col0 + ni_local * 2
+                                        if col_check < N_const:
+                                            g_off = row_off_bytes + cutlass.Int64(col_check) * element_bytes_const
+                                            g_ptr_32 = cute.make_ptr(
+                                                self.dtype,
+                                                mC_base_i64 + g_off,
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            if const_expr(ni_local == 0):
+                                                store_streaming_b32(s0, g_ptr_32)
+                                            elif const_expr(ni_local == 1):
+                                                store_streaming_b32(s1, g_ptr_32)
+                                            elif const_expr(ni_local == 2):
+                                                store_streaming_b32(s2, g_ptr_32)
+                                            else:
+                                                store_streaming_b32(s3, g_ptr_32)
+                    else:
+                        # Non-full tile: scalar stores with bounds checking
+                        gmem_store_atom_scalar = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            self.dtype,
+                            num_bits_per_copy=self.dtype.width,
+                        )
+                        src_scalar = cute.make_rmem_tensor((1,), self.dtype)
+                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
+                            n = Int32(tC_coords[mi, ni][1])
+                            col = n_start + n
+                            if col < N_const:
+                                src_scalar[0] = self.dtype(
+                                    Float32(tAcc[mi, ni]) * row_scale * b_scale_r[ni]
+                                )
+                                g_off_bytes_scalar = (
+                                    row_off_bytes + cutlass.Int64(col) * element_bytes_c
+                                )
+                                g_ptr_scalar = cute.make_ptr(
+                                    self.dtype,
+                                    mC_base_i64 + g_off_bytes_scalar,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=int(self.dtype.width // 8),
+                                )
+                                dst_scalar = cute.make_tensor(g_ptr_scalar, (1,))
+                                cute.copy(gmem_store_atom_scalar, src_scalar, dst_scalar)
 
 
 _CUTE_TOP_K_UP_DECODE = 8
@@ -2858,8 +3001,12 @@ def _invoke_cute_moe_fp8_impl(
         raise ValueError("CuTe FP8 kernel requires block_k divisible by 32 for WGMMA")
     if int(config.block_m) % 64 != 0:
         raise ValueError("CuTe FP8 kernel requires block_m divisible by 64 for WGMMA")
-    if int(config.num_warps) != 4:
-        raise ValueError("CuTe FP8 kernel requires num_warps=4 for a single warpgroup")
+    expected_warps = (int(config.block_m) // 64) * 4
+    if int(config.num_warps) != expected_warps:
+        raise ValueError(
+            f"CuTe FP8 kernel requires num_warps={(config.block_m // 64) * 4} "
+            f"for block_m={config.block_m} (got {config.num_warps})"
+        )
     if B_scale.shape[0] != B_fp8_bits.shape[0] or B_scale.shape[1] != B_fp8_bits.shape[1]:
         raise ValueError("B_scale must have shape [E, N] matching B_fp8_bits")
     if B_scale.stride(-1) != 1:
@@ -2890,7 +3037,9 @@ def _invoke_cute_moe_fp8_impl(
 
     dtype = cutlass.BFloat16
     fp8_dtype = cutlass.Float8E4M3FN
-    key = (kind, config)
+    N_dim = int(C2d.shape[1])
+    K_dim = int(A_fp8_bits.shape[1])
+    key = (kind, config, N_dim, K_dim)
 
     a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
     a_scale_cute = _to_cute_tensor_1d_contig(A_scale.to(dtype=torch.float32))
@@ -2905,7 +3054,8 @@ def _invoke_cute_moe_fp8_impl(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if key not in _COMPILE_CACHE_FP8:
         op = _FusedMoeMatmulCuTeFp8(
-            dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k
+            dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
+            N=N_dim, K=K_dim,
         )
         compiled = cute.compile(
             op,

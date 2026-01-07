@@ -80,6 +80,12 @@ PRECOMPILE_VARIANTS = [
     # block_size=16 variants - Int32 (for tiny batch sizes)
     MoeAlignVariant("small", Int32, 8, 64, 16, False),
     MoeAlignVariant("large", Int32, 8, 64, 16, False),
+    # block_size=192 variants - Int32 (for FP8 with 3 warpgroups)
+    MoeAlignVariant("small", Int32, 8, 64, 192, False),
+    MoeAlignVariant("large", Int32, 8, 64, 192, False),
+    # block_size=256 variants - Int32 (for FP8 with 4 warpgroups)
+    MoeAlignVariant("small", Int32, 8, 64, 256, False),
+    MoeAlignVariant("large", Int32, 8, 64, 256, False),
 ]
 
 

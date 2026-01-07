@@ -32,6 +32,7 @@ class MoeVariant:
     num_stages: int
     N: int
     K: int
+    dtype: str = "bf16"  # "bf16" or "fp8"
 
     @property
     def mul_routed_weight(self) -> bool:
@@ -42,15 +43,17 @@ class MoeVariant:
         return 1 if self.kind == "down" else 8
 
     def filename(self, arch: str) -> str:
+        dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}_{arch}.so"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}_{arch}.so"
         )
 
     def function_name(self, arch: str) -> str:
+        dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}_{arch}"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}_{arch}"
         )
 
 
@@ -67,6 +70,13 @@ def get_cuda_arch() -> str:
     return f"sm{major}{minor}"
 
 
+def _parse_dtype_from_filename(config_name: str) -> str:
+    """Parse dtype (bf16 or fp8) from config filename."""
+    if "_fp8_" in config_name:
+        return "fp8"
+    return "bf16"
+
+
 def load_variants_from_configs() -> list[MoeVariant]:
     """Load all unique variants from JSON config files."""
     configs_dir = Path(__file__).parent.parent / "python" / "kestrel_kernels" / "configs"
@@ -75,6 +85,7 @@ def load_variants_from_configs() -> list[MoeVariant]:
     for config_file in configs_dir.glob("cute_moe_*.json"):
         print(f"Loading configs from: {config_file.name}")
         H, I = _parse_model_dims(config_file.name)
+        dtype = _parse_dtype_from_filename(config_file.name)
         with open(config_file) as f:
             data = json.load(f)
 
@@ -94,11 +105,12 @@ def load_variants_from_configs() -> list[MoeVariant]:
                     num_stages=cfg["num_stages"],
                     N=N_dim,
                     K=K_dim,
+                    dtype=dtype,
                 )
                 variants.add(variant)
 
     return sorted(
-        variants, key=lambda v: (v.kind, v.N, v.K, v.block_m, v.block_n, v.block_k)
+        variants, key=lambda v: (v.dtype, v.kind, v.N, v.K, v.block_m, v.block_n, v.block_k)
     )
 
 
@@ -108,19 +120,21 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
     # Import here to avoid issues with multiprocessing fork
     import cutlass.cute as cute
-    from cutlass import BFloat16
+    from cutlass import BFloat16, Float32, Float8E4M3FN
     from cuda.bindings import driver as cuda
 
     from kestrel_kernels.cute_moe import (
         CuteMoeConfig,
         _FusedMoeMatmulCuTe,
         _FusedMoeMatmulCuTeWgmmaBf16,
+        _FusedMoeMatmulCuTeFp8,
         _should_use_wgmma_bf16,
     )
 
     try:
+        dtype_str = f" ({variant.dtype})" if variant.dtype == "fp8" else ""
         print(
-            f"[{os.getpid()}] Compiling: {variant.kind} N={variant.N} K={variant.K} "
+            f"[{os.getpid()}] Compiling: {variant.kind}{dtype_str} N={variant.N} K={variant.K} "
             f"m={variant.block_m} n={variant.block_n} k={variant.block_k} "
             f"w={variant.num_warps} s={variant.num_stages}"
         )
@@ -131,26 +145,10 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
             block_k=variant.block_k,
             num_warps=variant.num_warps,
             num_stages=variant.num_stages,
+            dtype=variant.dtype,
         )
 
-        # Create the kernel operator
-        dtype = BFloat16
-        op_cls = (
-            _FusedMoeMatmulCuTeWgmmaBf16
-            if _should_use_wgmma_bf16(config)
-            else _FusedMoeMatmulCuTe
-        )
-        op = op_cls(
-            dtype,
-            config,
-            mul_routed_weight=variant.mul_routed_weight,
-            top_k=variant.top_k,
-            N=variant.N,
-            K=variant.K,
-        )
-
-        # Create fake tensors for compilation
-        # These use symbolic dimensions for dynamic shapes
+        # Symbolic dimensions for dynamic shapes
         M_in_sym = cute.sym_int()
         M_out_sym = cute.sym_int()
         K_static = variant.K
@@ -160,64 +158,164 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
         EM_blocks_sym = cute.sym_int()
         TW_sym = cute.sym_int()
 
-        # A: (M_in, K) row-major
-        a_fake = cute.runtime.make_fake_tensor(
-            dtype, (M_in_sym, K_static),
-            stride=(cute.sym_int64(divisibility=8), 1),
-            assumed_align=16,
-        )
-        # B: (E, N, K) last-dim contiguous
-        b_fake = cute.runtime.make_fake_tensor(
-            dtype, (E_sym, N_static, K_static),
-            stride=(cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8), 1),
-            assumed_align=16,
-        )
-        # C: (M_out, N) row-major
-        c_fake = cute.runtime.make_fake_tensor(
-            dtype, (M_out_sym, N_static),
-            stride=(cute.sym_int64(divisibility=8), 1),
-            assumed_align=16,
-        )
-        # topk_weights: (TW,)
-        topk_w_fake = cute.runtime.make_fake_tensor(
-            dtype, (TW_sym,),
-            stride=(1,),
-            assumed_align=16,
-        )
-        # sorted_token_ids: (EM,)
-        sorted_fake = cute.runtime.make_fake_tensor(
-            cute.Int32, (EM_sym,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        # expert_ids: (EM_blocks,)
-        expert_fake = cute.runtime.make_fake_tensor(
-            cute.Int32, (EM_blocks_sym,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        # num_tokens_post_padded: (1,)
-        post_fake = cute.runtime.make_fake_tensor(
-            cute.Int32, (1,),
-            stride=(1,),
-            assumed_align=4,
-        )
-
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-        # Compile
-        compiled = cute.compile(
-            op,
-            a_fake,
-            b_fake,
-            c_fake,
-            topk_w_fake,
-            sorted_fake,
-            expert_fake,
-            post_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
+        if variant.dtype == "fp8":
+            # FP8 kernel with separate scale tensors
+            fp8_dtype = Float8E4M3FN
+            out_dtype = BFloat16
+
+            op = _FusedMoeMatmulCuTeFp8(
+                out_dtype,
+                fp8_dtype,
+                config,
+                mul_routed_weight=variant.mul_routed_weight,
+                top_k=variant.top_k,
+                N=variant.N,
+                K=variant.K,
+            )
+
+            # A_bits: (M_in, K) uint8
+            a_bits_fake = cute.runtime.make_fake_tensor(
+                fp8_dtype, (M_in_sym, K_static),
+                stride=(cute.sym_int64(divisibility=16), 1),
+                assumed_align=16,
+            )
+            # A_scale: (M_in,) float32
+            a_scale_fake = cute.runtime.make_fake_tensor(
+                Float32, (M_in_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            # B_bits: (E, N, K) uint8
+            b_bits_fake = cute.runtime.make_fake_tensor(
+                fp8_dtype, (E_sym, N_static, K_static),
+                stride=(cute.sym_int64(divisibility=16), cute.sym_int64(divisibility=16), 1),
+                assumed_align=16,
+            )
+            # B_scale: (E, N) float32
+            b_scale_fake = cute.runtime.make_fake_tensor(
+                Float32, (E_sym, N_static),
+                stride=(cute.sym_int64(divisibility=8), 1),
+                assumed_align=4,
+            )
+            # C: (M_out, N) bfloat16
+            c_fake = cute.runtime.make_fake_tensor(
+                out_dtype, (M_out_sym, N_static),
+                stride=(cute.sym_int64(divisibility=8), 1),
+                assumed_align=16,
+            )
+            # topk_weights: (TW,) bfloat16
+            topk_w_fake = cute.runtime.make_fake_tensor(
+                out_dtype, (TW_sym,),
+                stride=(1,),
+                assumed_align=16,
+            )
+            # sorted_token_ids: (EM,)
+            sorted_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (EM_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            # expert_ids: (EM_blocks,)
+            expert_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (EM_blocks_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            # num_tokens_post_padded: (1,)
+            post_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (1,),
+                stride=(1,),
+                assumed_align=4,
+            )
+
+            compiled = cute.compile(
+                op,
+                a_bits_fake,
+                a_scale_fake,
+                b_bits_fake,
+                b_scale_fake,
+                c_fake,
+                topk_w_fake,
+                sorted_fake,
+                expert_fake,
+                post_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            # BF16 kernel
+            dtype = BFloat16
+            op_cls = (
+                _FusedMoeMatmulCuTeWgmmaBf16
+                if _should_use_wgmma_bf16(config)
+                else _FusedMoeMatmulCuTe
+            )
+            op = op_cls(
+                dtype,
+                config,
+                mul_routed_weight=variant.mul_routed_weight,
+                top_k=variant.top_k,
+                N=variant.N,
+                K=variant.K,
+            )
+
+            # A: (M_in, K) row-major
+            a_fake = cute.runtime.make_fake_tensor(
+                dtype, (M_in_sym, K_static),
+                stride=(cute.sym_int64(divisibility=8), 1),
+                assumed_align=16,
+            )
+            # B: (E, N, K) last-dim contiguous
+            b_fake = cute.runtime.make_fake_tensor(
+                dtype, (E_sym, N_static, K_static),
+                stride=(cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8), 1),
+                assumed_align=16,
+            )
+            # C: (M_out, N) row-major
+            c_fake = cute.runtime.make_fake_tensor(
+                dtype, (M_out_sym, N_static),
+                stride=(cute.sym_int64(divisibility=8), 1),
+                assumed_align=16,
+            )
+            # topk_weights: (TW,)
+            topk_w_fake = cute.runtime.make_fake_tensor(
+                dtype, (TW_sym,),
+                stride=(1,),
+                assumed_align=16,
+            )
+            # sorted_token_ids: (EM,)
+            sorted_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (EM_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            # expert_ids: (EM_blocks,)
+            expert_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (EM_blocks_sym,),
+                stride=(1,),
+                assumed_align=4,
+            )
+            # num_tokens_post_padded: (1,)
+            post_fake = cute.runtime.make_fake_tensor(
+                cute.Int32, (1,),
+                stride=(1,),
+                assumed_align=4,
+            )
+
+            compiled = cute.compile(
+                op,
+                a_fake,
+                b_fake,
+                c_fake,
+                topk_w_fake,
+                sorted_fake,
+                expert_fake,
+                post_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
 
         # Export to object file
         obj_path = output_dir / f"cute_moe_tmp_{os.getpid()}.o"
