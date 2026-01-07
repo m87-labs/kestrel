@@ -33,6 +33,71 @@ from kestrel_kernels.flash_attn.cute import hopper_helpers as sm90_utils
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 
 from typing import Type
+from cutlass.cutlass_dsl import dsl_user_op, T
+from cutlass._mlir.dialects import llvm
+
+
+@dsl_user_op
+def store_streaming_b32(value: Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Store 32 bits (e.g. 2xBF16) with cache streaming hint (st.global.cs).
+
+    Bypasses L1 and marks for early L2 eviction - useful for scattered write-only stores.
+    """
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.toint(loc=loc, ip=ip).ir_value(), Int32(value).ir_value(loc=loc, ip=ip)],
+        "st.global.cs.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def store_streaming_b128(
+    v0: Int32, v1: Int32, v2: Int32, v3: Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
+    """Store 128 bits (e.g. 8xBF16) with cache streaming hint (st.global.cs.v4.b32).
+
+    Stores 4x32-bit values in a single 128-bit transaction.
+    Bypasses L1 and marks for early L2 eviction - useful for scattered write-only stores.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint(loc=loc, ip=ip).ir_value(),
+            Int32(v0).ir_value(loc=loc, ip=ip),
+            Int32(v1).ir_value(loc=loc, ip=ip),
+            Int32(v2).ir_value(loc=loc, ip=ip),
+            Int32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.cs.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def shfl_sync_idx_b32(value: Int32, src_lane: Int32, *, loc=None, ip=None) -> Int32:
+    """Warp shuffle - read value from src_lane within the warp.
+
+    Uses shfl.sync.idx.b32 with full mask (0xffffffff) for all threads participating.
+    The fourth operand 0x1f means width=32 (full warp).
+    The fifth operand 0xffffffff is the membership mask (all threads participate).
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(value).ir_value(loc=loc, ip=ip), Int32(src_lane).ir_value(loc=loc, ip=ip)],
+        "shfl.sync.idx.b32 $0, $1, $2, 0x1f, 0xffffffff;",
+        "=r,r,r",
+        has_side_effects=True,  # Synchronization point
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
 
 
 def tiled_copy_2d_bypass(
@@ -570,7 +635,7 @@ class _FusedMoeMatmulCuTe:
             self.K,
             SharedStorage,
         ).launch(
-            grid=(grid_m, grid_n, 1),
+            grid=(grid_n, grid_m, 1),  # N-first for better weight reuse
             block=(self.config.num_threads, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -592,7 +657,7 @@ class _FusedMoeMatmulCuTe:
         SharedStorage: cutlass.Constexpr,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        pid_m, pid_n, _ = cute.arch.block_idx()
+        pid_n, pid_m, _ = cute.arch.block_idx()  # Swapped for N-first scheduling
 
         block_m = self.config.block_m
         block_n = self.config.block_n
@@ -1265,10 +1330,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
         sB_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cute.cosize(sB_layout)], 1024
         ]
-        sC_elems = block_m * block_n
-        sC_struct = cute.struct.Align[
-            cute.struct.MemRange[self.dtype, sC_elems], 16
-        ]
+
         sMeta_elems = block_m
         sAid_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
         sTok_struct = cute.struct.Align[cute.struct.MemRange[Int32, sMeta_elems], 16]
@@ -1283,7 +1345,6 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
         class SharedStorage:
             sA: sA_struct
             sB: sB_struct
-            sC: sC_struct
             sAid: sAid_struct
             sTok: sTok_struct
             sArowBase: sArowBase_struct
@@ -1335,7 +1396,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
             self.K,
             SharedStorage,
         ).launch(
-            grid=(grid_m, grid_n, 1),
+            grid=(grid_n, grid_m, 1),  # N-first for better weight reuse (like Triton GROUP_SIZE_M=1)
             block=(self.config.num_threads, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -1357,7 +1418,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
         SharedStorage: cutlass.Constexpr,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        pid_m, pid_n, _ = cute.arch.block_idx()
+        pid_n, pid_m, _ = cute.arch.block_idx()  # Swapped for N-first scheduling
 
         block_m = self.config.block_m
         block_n = self.config.block_n
@@ -1413,14 +1474,6 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
         # WGMMA expects affine layouts; move swizzle to the pointer (recast) via `swizzle=...`.
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner, dtype=self.dtype)
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner, dtype=self.dtype)
-        # Pure row-major SMEM layout for C (no swizzle).
-        # This allows conflict-free vectorized reads when threads read consecutive N elements.
-        # We use individual stores (not stmatrix) to write accumulator elements.
-        sC_layout = cute.make_layout((block_m, block_n), stride=(block_n, 1))
-        sC_linear = storage.sC.get_tensor(
-            cute.make_layout((block_m * block_n,), stride=(1,))
-        )
-        sC = cute.make_tensor(sC_linear.iterator, sC_layout)
         element_bytes = cutlass.Int64(self.dtype.width // 8)
         stride_am_elems = cutlass.Int64(mA.stride[0])
         stride_cm_elems = cutlass.Int64(mC.stride[0])
@@ -1757,112 +1810,168 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
 
                     stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
-                # Epilogue: Triton-style approach
-                # 1. Convert accumulator to BF16 (with optional routed weight scaling)
-                # 2. Store to SMEM using individual stores with computed (M, N) coordinates
-                #    (not stmatrix - this allows pure row-major layout)
-                # 3. Read consecutive N elements from SMEM (conflict-free with row-major)
-                # 4. 128-bit scatter stores to GMEM
-                rC = cute.make_fragment_like(acc, self.dtype)
+                # Epilogue: Scatter stores to GMEM using 128-bit vectorized stores.
+                #
+                # WGMMA accumulator layout for SM90:
+                # - Every 4 consecutive threads (tid%4 == 0,1,2,3) share the same M row
+                # - Within each 4-thread group, N values are distributed as:
+                #   Thread 0: N=0,1, 8,9, 16,17, ...  (pairs at stride 8)
+                #   Thread 1: N=2,3, 10,11, 18,19, ...
+                #   Thread 2: N=4,5, 12,13, 20,21, ...
+                #   Thread 3: N=6,7, 14,15, 22,23, ...
+                # - Each thread has n_per_m/2 "chunks", each chunk = 2 consecutive N values
+                # - For 128-bit stores (8 BF16), we gather from 4 threads via warp shuffle
+                #
                 thr_mma = tiled_mma.get_slice(tx)
                 cC = cute.make_identity_tensor((block_m, block_n))
                 tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
                 tAcc = fa_utils.make_acc_tensor_mn_view(acc)
-                tRC = fa_utils.make_acc_tensor_mn_view(rC)
 
-                # Convert F32 -> BF16 with optional routed weight scaling
-                if const_expr(self.mul_routed_weight):
-                    for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
-                        m = Int32(tC_coords[mi, 0][0])
-                        row_scale = Float32(sW[m])
-                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                            tRC[mi, ni] = self.dtype(Float32(tAcc[mi, ni]) * row_scale)
-                else:
-                    for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
-                        for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
-                            tRC[mi, ni] = self.dtype(tAcc[mi, ni])
+                n_per_m: cutlass.Constexpr[int] = cute.size(tAcc.shape[1])
+                num_chunks: cutlass.Constexpr[int] = n_per_m // 2  # Each chunk = 2 N values per thread
 
-                # Store to SMEM using XOR-swizzled addresses (Triton-style).
-                # This distributes stores across banks to avoid conflicts.
-                # The XOR swizzle pattern: for each store, XOR the offset with
-                # a value derived from the row, which rotates which banks are hit.
-                # Pattern: offset ^ ((m & 0x7) << 4) where m is the row index.
-                # This ensures threads storing to different rows hit different banks.
-                sC_base_i64 = sC.iterator.toint()
-                for mi in cutlass.range_constexpr(cute.size(tRC.shape[0])):
-                    for ni in cutlass.range_constexpr(cute.size(tRC.shape[1])):
-                        m = Int32(tC_coords[mi, ni][0])
-                        n = Int32(tC_coords[mi, ni][1])
-                        # Row-major offset: m * block_n + n
-                        s_offset = m * Int32(block_n) + n
-                        # XOR swizzle: rotate bank assignment based on row index
-                        # XOR with (m & 0x7) << 4 = (m % 8) * 16 bytes = (m % 8) * 4 banks
-                        xor_swizzle = (m & Int32(0x7)) << 4
-                        s_offset_swizzled = s_offset ^ xor_swizzle
-                        s_ptr = cute.make_ptr(
-                            self.dtype,
-                            sC_base_i64 + cutlass.Int64(s_offset_swizzled) * element_bytes,
-                            cute.AddressSpace.smem,
-                            assumed_align=2,
-                        )
-                        s_tensor = cute.make_tensor(s_ptr, (1,))
-                        s_tensor[0] = tRC[mi, ni]
-                cute.arch.barrier()
+                # Warp shuffle setup: threads 0-3, 4-7, etc. form groups
+                lane = tx % 32  # Lane within warp
+                lane_in_group = lane % 4  # Position within 4-thread group (0-3)
+                group_base_lane = lane - lane_in_group  # First lane of this group
 
-                # Read from SMEM with XOR-swizzled addresses (vectorized) and scatter store to GMEM.
-                # XOR with a constant preserves consecutiveness within blocks, so we can do
-                # vectorized 128-bit SMEM loads.
-                vec_size = 8
-                copy_bits = vec_size * self.dtype.width
-                gmem_store_atom = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    self.dtype,
-                    num_bits_per_copy=copy_bits,
-                )
-                smem_load_atom = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    self.dtype,
-                    num_bits_per_copy=copy_bits,
-                )
-                align_bytes = vec_size * int(self.dtype.width // 8)
-                vec_n = block_n // vec_size
-                total_vec_c = block_m * vec_n
+                # Precompute shuffle source lanes BEFORE any conditionals (avoids SSA issues)
+                src_lane_0 = Int32(group_base_lane)
+                src_lane_1 = Int32(group_base_lane + 1)
+                src_lane_2 = Int32(group_base_lane + 2)
+                src_lane_3 = Int32(group_base_lane + 3)
 
-                for vec_linear_c in range(tx, total_vec_c, num_threads):
-                    r_c = vec_linear_c // vec_n
-                    nvec_c = vec_linear_c - r_c * vec_n
-                    n0 = Int32(nvec_c * vec_size)
-                    aid_c = sAid[r_c]
-                    if aid_c < num_valid_tokens:
-                        col0 = n_start + n0
-                        if const_expr(N % block_n == 0) or (col0 < N_const):
-                            # Vectorized SMEM load with XOR swizzle
-                            # XOR swizzle preserves consecutiveness, so we compute base and load 8 elements
-                            m_val = Int32(r_c)
-                            xor_swizzle_r = (m_val & Int32(0x7)) << 4
-                            s_linear_base = m_val * Int32(block_n) + n0
-                            s_offset_swizzled = s_linear_base ^ xor_swizzle_r
-                            s_ptr_c = cute.make_ptr(
+                align_bytes_128 = 16  # 128-bit aligned
+                element_bytes_const: cutlass.Constexpr[int] = 2  # BF16 = 2 bytes
+
+                # 4-thread parallel stores: process 4 chunks at once, each thread stores one
+                # This achieves 100% store coalescing (4 threads × 16 bytes = 64 bytes = 2 sectors)
+                num_chunk_groups: cutlass.Constexpr[int] = num_chunks // 4
+
+                for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
+                    m = Int32(tC_coords[mi, 0][0])
+                    aid = sAid[m]
+                    if aid < num_valid_tokens:
+                        row_scale = Float32(1.0)
+                        if const_expr(self.mul_routed_weight):
+                            row_scale = Float32(sW[m])
+                        row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes
+
+                        # Process 4 chunks at a time with all 4 threads storing in parallel
+                        for chunk_group in cutlass.range_constexpr(num_chunk_groups):
+                            base_chunk: cutlass.Constexpr[int] = chunk_group * 4
+
+                            # Each thread computes packed values for all 4 chunks
+                            ni0_c0: cutlass.Constexpr[int] = (base_chunk + 0) * 2
+                            ni0_c1: cutlass.Constexpr[int] = (base_chunk + 1) * 2
+                            ni0_c2: cutlass.Constexpr[int] = (base_chunk + 2) * 2
+                            ni0_c3: cutlass.Constexpr[int] = (base_chunk + 3) * 2
+
+                            packed_c0 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c0]) * row_scale,
+                                Float32(tAcc[mi, ni0_c0 + 1]) * row_scale,
                                 self.dtype,
-                                sC_base_i64 + cutlass.Int64(s_offset_swizzled) * element_bytes,
-                                cute.AddressSpace.smem,
-                                assumed_align=align_bytes,
                             )
-                            src_c = cute.make_tensor(s_ptr_c, (vec_size,))
-
-                            # Vectorized store to GMEM
-                            row_off_bytes = (
-                                cutlass.Int64(aid_c) * stride_cm_elems * element_bytes
-                            )
-                            g_off_bytes_c = row_off_bytes + cutlass.Int64(col0) * element_bytes
-                            g_ptr_c = cute.make_ptr(
+                            packed_c1 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c1]) * row_scale,
+                                Float32(tAcc[mi, ni0_c1 + 1]) * row_scale,
                                 self.dtype,
-                                mC_base_i64 + g_off_bytes_c,
-                                cute.AddressSpace.gmem,
-                                assumed_align=align_bytes,
                             )
-                            dst_c = cute.make_tensor(g_ptr_c, (vec_size,))
-                            cute.copy(smem_load_atom, src_c, dst_c)
+                            packed_c2 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c2]) * row_scale,
+                                Float32(tAcc[mi, ni0_c2 + 1]) * row_scale,
+                                self.dtype,
+                            )
+                            packed_c3 = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0_c3]) * row_scale,
+                                Float32(tAcc[mi, ni0_c3 + 1]) * row_scale,
+                                self.dtype,
+                            )
+
+                            # 16 shuffles to gather data for all 4 chunks from all 4 threads
+                            # Chunk 0: gather packed_c0 from all threads
+                            g0_0 = shfl_sync_idx_b32(packed_c0, src_lane_0)
+                            g0_1 = shfl_sync_idx_b32(packed_c0, src_lane_1)
+                            g0_2 = shfl_sync_idx_b32(packed_c0, src_lane_2)
+                            g0_3 = shfl_sync_idx_b32(packed_c0, src_lane_3)
+                            # Chunk 1: gather packed_c1 from all threads
+                            g1_0 = shfl_sync_idx_b32(packed_c1, src_lane_0)
+                            g1_1 = shfl_sync_idx_b32(packed_c1, src_lane_1)
+                            g1_2 = shfl_sync_idx_b32(packed_c1, src_lane_2)
+                            g1_3 = shfl_sync_idx_b32(packed_c1, src_lane_3)
+                            # Chunk 2: gather packed_c2 from all threads
+                            g2_0 = shfl_sync_idx_b32(packed_c2, src_lane_0)
+                            g2_1 = shfl_sync_idx_b32(packed_c2, src_lane_1)
+                            g2_2 = shfl_sync_idx_b32(packed_c2, src_lane_2)
+                            g2_3 = shfl_sync_idx_b32(packed_c2, src_lane_3)
+                            # Chunk 3: gather packed_c3 from all threads
+                            g3_0 = shfl_sync_idx_b32(packed_c3, src_lane_0)
+                            g3_1 = shfl_sync_idx_b32(packed_c3, src_lane_1)
+                            g3_2 = shfl_sync_idx_b32(packed_c3, src_lane_2)
+                            g3_3 = shfl_sync_idx_b32(packed_c3, src_lane_3)
+
+                            # Each thread selects gathered values for its assigned chunk
+                            # Thread 0 → chunk 0, Thread 1 → chunk 1, etc.
+                            # Initialize before control flow (DSL requirement)
+                            s0 = g0_0
+                            s1 = g0_1
+                            s2 = g0_2
+                            s3 = g0_3
+                            if lane_in_group == 1:
+                                s0 = g1_0
+                                s1 = g1_1
+                                s2 = g1_2
+                                s3 = g1_3
+                            elif lane_in_group == 2:
+                                s0 = g2_0
+                                s1 = g2_1
+                                s2 = g2_2
+                                s3 = g2_3
+                            elif lane_in_group == 3:
+                                s0 = g3_0
+                                s1 = g3_1
+                                s2 = g3_2
+                                s3 = g3_3
+
+                            # Compute store address: each thread stores to a different chunk
+                            # Thread T stores chunk (base_chunk + T) at N offset (base_chunk + T) * 8
+                            # WGMMA layout is linear: chunk C covers N = C*8 to C*8+7
+                            # No shuffle needed - compute directly from base_chunk (constexpr)
+                            my_n_offset = Int32(base_chunk * 8) + lane_in_group * 8
+                            col0 = n_start + my_n_offset
+
+                            # Bounds check and store
+                            # For aligned dimensions, skip bounds check
+                            if const_expr(N % block_n == 0) or (col0 + 7 < N_const):
+                                g_off_bytes = row_off_bytes + cutlass.Int64(col0) * element_bytes
+                                g_ptr = cute.make_ptr(
+                                    self.dtype,
+                                    mC_base_i64 + g_off_bytes,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=align_bytes_128,
+                                )
+                                # ALL 4 threads store simultaneously - perfect coalescing!
+                                store_streaming_b128(s0, s1, s2, s3, g_ptr)
+                            else:
+                                # Near boundary: fall back to individual 32-bit stores
+                                for ni_local in cutlass.range_constexpr(4):
+                                    col_check = col0 + ni_local * 2
+                                    if col_check < N_const:
+                                        g_off = row_off_bytes + cutlass.Int64(col_check) * element_bytes
+                                        g_ptr_32 = cute.make_ptr(
+                                            self.dtype,
+                                            mC_base_i64 + g_off,
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        if const_expr(ni_local == 0):
+                                            store_streaming_b32(s0, g_ptr_32)
+                                        elif const_expr(ni_local == 1):
+                                            store_streaming_b32(s1, g_ptr_32)
+                                        elif const_expr(ni_local == 2):
+                                            store_streaming_b32(s2, g_ptr_32)
+                                        else:
+                                            store_streaming_b32(s3, g_ptr_32)
 
 
 class _FusedMoeMatmulCuTeFp8:
