@@ -1835,11 +1835,11 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                 lane_in_group = lane % 4  # Position within 4-thread group (0-3)
                 group_base_lane = lane - lane_in_group  # First lane of this group
 
-                # Precompute shuffle source lanes BEFORE any conditionals (avoids SSA issues)
-                src_lane_0 = Int32(group_base_lane)
-                src_lane_1 = Int32(group_base_lane + 1)
-                src_lane_2 = Int32(group_base_lane + 2)
-                src_lane_3 = Int32(group_base_lane + 3)
+                # Precompute shuffle source lanes for 3-round ring exchange (hoisted from hot loop)
+                # Round 1: src = (g + 3) % 4, Round 2: src = (g + 2) % 4, Round 3: src = (g + 1) % 4
+                src_round1 = Int32(group_base_lane) + ((lane_in_group + 3) & 3)
+                src_round2 = Int32(group_base_lane) + ((lane_in_group + 2) & 3)
+                src_round3 = Int32(group_base_lane) + ((lane_in_group + 1) & 3)
 
                 align_bytes_128 = 16  # 128-bit aligned
                 element_bytes_const: cutlass.Constexpr[int] = 2  # BF16 = 2 bytes
@@ -1851,14 +1851,24 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                     m = Int32(tC_coords[mi, 0][0])
                     aid = sAid[m]
-                    if aid < num_valid_tokens:
-                        row_scale = Float32(1.0)
+                    valid_row = aid < num_valid_tokens
+
+                    # CORRECTNESS: Use row_scale=0 for invalid lanes so packed values become 0.
+                    # This allows shuffles to execute uniformly across all lanes (no divergent
+                    # branches around shfl.sync with 0xffffffff mask). Only stores are predicated.
+                    row_scale = Float32(0.0)
+                    if valid_row:
                         if const_expr(self.mul_routed_weight):
                             row_scale = Float32(sW[m])
-                        row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes
+                        else:
+                            row_scale = Float32(1.0)
 
-                        # Process 4 chunks at a time with all 4 threads storing in parallel
-                        for chunk_group in cutlass.range_constexpr(num_chunk_groups):
+                    # row_off_bytes only used when valid_row, but compute unconditionally
+                    # to avoid divergent branch. Invalid lanes use aid=0 which is harmless.
+                    row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes
+
+                    # Process 4 chunks at a time with all 4 threads storing in parallel
+                    for chunk_group in cutlass.range_constexpr(num_chunk_groups):
                             base_chunk: cutlass.Constexpr[int] = chunk_group * 4
 
                             # Each thread computes packed values for all 4 chunks
@@ -1916,8 +1926,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                                 send1 = packed_c3
                             elif lane_in_group == 3:
                                 send1 = packed_c0
-                            src1 = Int32(group_base_lane) + ((lane_in_group + 3) & 3)
-                            recv1 = shfl_sync_idx_b32(send1, src1)
+                            recv1 = shfl_sync_idx_b32(send1, src_round1)
                             # Store recv1 into s[src1 % 4] = s[(g + 3) % 4]
                             if lane_in_group == 0:
                                 s3 = recv1
@@ -1941,8 +1950,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                                 send2 = packed_c0
                             elif lane_in_group == 3:
                                 send2 = packed_c1
-                            src2 = Int32(group_base_lane) + ((lane_in_group + 2) & 3)
-                            recv2 = shfl_sync_idx_b32(send2, src2)
+                            recv2 = shfl_sync_idx_b32(send2, src_round2)
                             # Store recv2 into s[(g + 2) % 4]
                             if lane_in_group == 0:
                                 s2 = recv2
@@ -1966,8 +1974,7 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                                 send3 = packed_c1
                             elif lane_in_group == 3:
                                 send3 = packed_c2
-                            src3 = Int32(group_base_lane) + ((lane_in_group + 1) & 3)
-                            recv3 = shfl_sync_idx_b32(send3, src3)
+                            recv3 = shfl_sync_idx_b32(send3, src_round3)
                             # Store recv3 into s[(g + 1) % 4]
                             if lane_in_group == 0:
                                 s1 = recv3
@@ -1985,38 +1992,40 @@ class _FusedMoeMatmulCuTeWgmmaBf16:
                             my_n_offset = Int32(base_chunk * 8) + lane_in_group * 8
                             col0 = n_start + my_n_offset
 
-                            # Bounds check and store
-                            # For aligned dimensions, skip bounds check
-                            if const_expr(N % block_n == 0) or (col0 + 7 < N_const):
-                                g_off_bytes = row_off_bytes + cutlass.Int64(col0) * element_bytes
-                                g_ptr = cute.make_ptr(
-                                    self.dtype,
-                                    mC_base_i64 + g_off_bytes,
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=align_bytes_128,
-                                )
-                                # ALL 4 threads store simultaneously - perfect coalescing!
-                                store_streaming_b128(s0, s1, s2, s3, g_ptr)
-                            else:
-                                # Near boundary: fall back to individual 32-bit stores
-                                for ni_local in cutlass.range_constexpr(4):
-                                    col_check = col0 + ni_local * 2
-                                    if col_check < N_const:
-                                        g_off = row_off_bytes + cutlass.Int64(col_check) * element_bytes
-                                        g_ptr_32 = cute.make_ptr(
-                                            self.dtype,
-                                            mC_base_i64 + g_off,
-                                            cute.AddressSpace.gmem,
-                                            assumed_align=4,
-                                        )
-                                        if const_expr(ni_local == 0):
-                                            store_streaming_b32(s0, g_ptr_32)
-                                        elif const_expr(ni_local == 1):
-                                            store_streaming_b32(s1, g_ptr_32)
-                                        elif const_expr(ni_local == 2):
-                                            store_streaming_b32(s2, g_ptr_32)
-                                        else:
-                                            store_streaming_b32(s3, g_ptr_32)
+                            # Only predicate the stores (shuffles above are uniform across all lanes)
+                            if valid_row:
+                                # Bounds check and store
+                                # For aligned dimensions, skip bounds check
+                                if const_expr(N % block_n == 0) or (col0 + 7 < N_const):
+                                    g_off_bytes = row_off_bytes + cutlass.Int64(col0) * element_bytes
+                                    g_ptr = cute.make_ptr(
+                                        self.dtype,
+                                        mC_base_i64 + g_off_bytes,
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=align_bytes_128,
+                                    )
+                                    # ALL 4 threads store simultaneously - perfect coalescing!
+                                    store_streaming_b128(s0, s1, s2, s3, g_ptr)
+                                else:
+                                    # Near boundary: fall back to individual 32-bit stores
+                                    for ni_local in cutlass.range_constexpr(4):
+                                        col_check = col0 + ni_local * 2
+                                        if col_check < N_const:
+                                            g_off = row_off_bytes + cutlass.Int64(col_check) * element_bytes
+                                            g_ptr_32 = cute.make_ptr(
+                                                self.dtype,
+                                                mC_base_i64 + g_off,
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            if const_expr(ni_local == 0):
+                                                store_streaming_b32(s0, g_ptr_32)
+                                            elif const_expr(ni_local == 1):
+                                                store_streaming_b32(s1, g_ptr_32)
+                                            elif const_expr(ni_local == 2):
+                                                store_streaming_b32(s2, g_ptr_32)
+                                            else:
+                                                store_streaming_b32(s3, g_ptr_32)
 
 
 class _FusedMoeMatmulCuTeFp8:
