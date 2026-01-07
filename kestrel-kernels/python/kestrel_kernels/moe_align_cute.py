@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -13,6 +14,89 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, const_expr
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+
+# Precompiled kernel registry
+_precompiled_cache: Dict[Tuple, Any] = {}
+_precompiled_dir = Path(__file__).parent / "precompiled"
+
+# Cache the architecture string
+_cuda_arch: Optional[str] = None
+
+
+def _get_cuda_arch() -> str:
+    """Get the CUDA architecture string (e.g., 'sm90' for Hopper, 'sm100' for Blackwell)."""
+    global _cuda_arch
+    if _cuda_arch is None:
+        major, minor = torch.cuda.get_device_capability()
+        _cuda_arch = f"sm{major}{minor}"
+    return _cuda_arch
+
+
+def _get_precompiled_kernel_path(
+    kernel_type: str,  # "small", "large", "lora_small", "lora_large"
+    topk_dtype: type,  # Int32 or Int64
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    has_expert_map: bool,
+) -> Optional[Path]:
+    """Get path to precompiled kernel if it exists."""
+    arch = _get_cuda_arch()
+    dtype_name = "i32" if topk_dtype == Int32 else "i64"
+    expert_map_str = "emap" if has_expert_map else "noemap"
+    filename = f"moe_align_{kernel_type}_{dtype_name}_k{topk}_e{num_experts}_b{block_size}_{expert_map_str}_{arch}.so"
+    path = _precompiled_dir / filename
+    return path if path.exists() else None
+
+
+def _get_precompiled_function_name(
+    kernel_type: str,
+    topk_dtype: type,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    has_expert_map: bool,
+) -> str:
+    """Get the exported function name for a precompiled kernel."""
+    arch = _get_cuda_arch()
+    dtype_name = "i32" if topk_dtype == Int32 else "i64"
+    expert_map_str = "emap" if has_expert_map else "noemap"
+    return f"moe_align_{kernel_type}_{dtype_name}_k{topk}_e{num_experts}_b{block_size}_{expert_map_str}_{arch}"
+
+
+def _load_precompiled_kernel(
+    kernel_type: str,
+    topk_dtype: type,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    has_expert_map: bool,
+) -> Optional[Any]:
+    """Load a precompiled kernel if available, return None otherwise."""
+    compile_key = (kernel_type, topk_dtype, topk, num_experts, block_size, has_expert_map)
+
+    # Check if already loaded
+    if compile_key in _precompiled_cache:
+        return _precompiled_cache[compile_key]
+
+    # Check if precompiled file exists
+    so_path = _get_precompiled_kernel_path(
+        kernel_type, topk_dtype, topk, num_experts, block_size, has_expert_map
+    )
+    if so_path is None:
+        return None
+
+    # Load the module
+    mod = cute.runtime.load_module(str(so_path))
+
+    # Get the function by its exported name
+    function_name = _get_precompiled_function_name(
+        kernel_type, topk_dtype, topk, num_experts, block_size, has_expert_map
+    )
+    kernel_fn = getattr(mod, function_name)
+    _precompiled_cache[compile_key] = kernel_fn
+    return kernel_fn
 
 
 @dsl_user_op
@@ -774,54 +858,19 @@ def moe_align_block_size(
 
     if small_batch_expert_mode:
         if key not in _COMPILE_CACHE_SMALL:
-            t_sym = cute.sym_int()
-            topk_ids_fake = cute.runtime.make_fake_tensor(
-                topk_dtype,
-                (t_sym, topk),
-                stride=(topk, 1),
-                assumed_align=topk_dtype.width // 8,
+            precompiled = _load_precompiled_kernel(
+                "small", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
             )
-            sorted_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (cute.sym_int(),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            expert_ids_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (cute.sym_int(),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            post_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (1,),
-                stride=(1,),
-                assumed_align=4,
-            )
-            expert_map_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (int(num_experts),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-            op = _MoeAlignBlockSizeCuTe(
-                num_experts=int(num_experts),
-                block_size=int(block_size),
-                has_expert_map=has_expert_map,
-                config=cfg,
-            )
-            _COMPILE_CACHE_SMALL[key] = cute.compile(
-                op,
-                topk_ids_fake,
-                sorted_fake,
-                expert_ids_fake,
-                post_fake,
-                expert_map_fake,
-                stream_fake,
-                options="--enable-tvm-ffi",
-            )
+            if precompiled is None:
+                dtype_name = "int32" if topk_dtype == Int32 else "int64"
+                arch = _get_cuda_arch()
+                raise RuntimeError(
+                    f"No precompiled kernel for moe_align_block_size(type=small, "
+                    f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                    f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                    f"Run precompile_moe_align.py on this architecture to generate it."
+                )
+            _COMPILE_CACHE_SMALL[key] = precompiled
 
         _COMPILE_CACHE_SMALL[key](
             topk_ids, sorted_token_ids, expert_ids, num_tokens_post_pad, expert_map_arg
@@ -830,61 +879,19 @@ def moe_align_block_size(
 
     # Large path: global cumsum buffer + multi-CTA scatter (matches CUDA kernel structure).
     if key not in _COMPILE_CACHE_LARGE:
-        t_sym = cute.sym_int()
-        topk_ids_fake = cute.runtime.make_fake_tensor(
-            topk_dtype,
-            (t_sym, topk),
-            stride=(topk, 1),
-            assumed_align=topk_dtype.width // 8,
+        precompiled = _load_precompiled_kernel(
+            "large", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
         )
-        sorted_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        expert_ids_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        post_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (1,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        cumsum_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (int(num_experts),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        expert_map_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (int(num_experts),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        op = _MoeAlignBlockSizeCuTeLarge(
-            num_experts=int(num_experts),
-            block_size=int(block_size),
-            has_expert_map=has_expert_map,
-            config=cfg,
-        )
-        _COMPILE_CACHE_LARGE[key] = cute.compile(
-            op,
-            topk_ids_fake,
-            sorted_fake,
-            expert_ids_fake,
-            post_fake,
-            expert_map_fake,
-            cumsum_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
+        if precompiled is None:
+            dtype_name = "int32" if topk_dtype == Int32 else "int64"
+            arch = _get_cuda_arch()
+            raise RuntimeError(
+                f"No precompiled kernel for moe_align_block_size(type=large, "
+                f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                f"Run precompile_moe_align.py on this architecture to generate it."
+            )
+        _COMPILE_CACHE_LARGE[key] = precompiled
 
     # Reuse a per-stream scratch buffer to avoid per-call allocations on the hot path.
     # NOTE: The align kernel overwrites the buffer with base offsets each call, so it
@@ -1001,76 +1008,19 @@ def moe_lora_align_block_size(
 
     if small_batch_expert_mode:
         if key not in _COMPILE_CACHE_LORA_SMALL:
-            t_sym = cute.sym_int()
-            topk_ids_fake = cute.runtime.make_fake_tensor(
-                topk_dtype,
-                (t_sym, topk),
-                stride=(topk, 1),
-                assumed_align=topk_dtype.width // 8,
+            precompiled = _load_precompiled_kernel(
+                "lora_small", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
             )
-            token_lora_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (t_sym,),
-                stride=(1,),
-                assumed_align=4,
-            )
-            sorted_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (cute.sym_int(),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            expert_ids_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (cute.sym_int(),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            post_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (cute.sym_int(),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            sorted_stride_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (1,),
-                stride=(1,),
-                assumed_align=4,
-            )
-            expert_stride_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (1,),
-                stride=(1,),
-                assumed_align=4,
-            )
-            expert_map_fake = cute.runtime.make_fake_tensor(
-                Int32,
-                (int(num_experts),),
-                stride=(1,),
-                assumed_align=4,
-            )
-            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-            op = _MoeAlignBlockSizeCuTeLora(
-                num_experts=int(num_experts),
-                block_size=int(block_size),
-                top_k=topk,
-                has_expert_map=has_expert_map,
-                config=cfg,
-            )
-            _COMPILE_CACHE_LORA_SMALL[key] = cute.compile(
-                op,
-                topk_ids_fake,
-                token_lora_fake,
-                sorted_fake,
-                expert_ids_fake,
-                post_fake,
-                sorted_stride_fake,
-                expert_stride_fake,
-                expert_map_fake,
-                stream_fake,
-                options="--enable-tvm-ffi",
-            )
+            if precompiled is None:
+                dtype_name = "int32" if topk_dtype == Int32 else "int64"
+                arch = _get_cuda_arch()
+                raise RuntimeError(
+                    f"No precompiled kernel for moe_lora_align_block_size(type=lora_small, "
+                    f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                    f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                    f"Run precompile_moe_align.py on this architecture to generate it."
+                )
+            _COMPILE_CACHE_LORA_SMALL[key] = precompiled
 
         _COMPILE_CACHE_LORA_SMALL[key](
             topk_ids,
@@ -1085,83 +1035,19 @@ def moe_lora_align_block_size(
         return
 
     if key not in _COMPILE_CACHE_LORA_LARGE:
-        t_sym = cute.sym_int()
-        topk_ids_fake = cute.runtime.make_fake_tensor(
-            topk_dtype,
-            (t_sym, topk),
-            stride=(topk, 1),
-            assumed_align=topk_dtype.width // 8,
+        precompiled = _load_precompiled_kernel(
+            "lora_large", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
         )
-        token_lora_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (t_sym,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        sorted_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        expert_ids_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        post_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        sorted_stride_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (1,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        expert_stride_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (1,),
-            stride=(1,),
-            assumed_align=4,
-        )
-        cumsum_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (cute.sym_int(),),  # [max_loras * num_experts] - dynamic for per-LoRA rows
-            stride=(1,),
-            assumed_align=4,
-        )
-        expert_map_fake = cute.runtime.make_fake_tensor(
-            Int32,
-            (int(num_experts),),
-            stride=(1,),
-            assumed_align=4,
-        )
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        op = _MoeAlignBlockSizeCuTeLargeLora(
-            num_experts=int(num_experts),
-            block_size=int(block_size),
-            top_k=topk,
-            has_expert_map=has_expert_map,
-            config=cfg,
-        )
-        _COMPILE_CACHE_LORA_LARGE[key] = cute.compile(
-            op,
-            topk_ids_fake,
-            token_lora_fake,
-            sorted_fake,
-            expert_ids_fake,
-            post_fake,
-            sorted_stride_fake,
-            expert_stride_fake,
-            expert_map_fake,
-            cumsum_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
+        if precompiled is None:
+            dtype_name = "int32" if topk_dtype == Int32 else "int64"
+            arch = _get_cuda_arch()
+            raise RuntimeError(
+                f"No precompiled kernel for moe_lora_align_block_size(type=lora_large, "
+                f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                f"Run precompile_moe_align.py on this architecture to generate it."
+            )
+        _COMPILE_CACHE_LORA_LARGE[key] = precompiled
 
     stream_id = int(torch.cuda.current_stream(topk_ids.device).cuda_stream)
     # For LoRA large path, use per-LoRA cumsum buffers to avoid race conditions
