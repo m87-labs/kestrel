@@ -21,6 +21,7 @@ from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
     _should_use_wgmma_bf16,
 )
 from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
+from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
 
 __all__ = [
     "CuteMoeConfig",
@@ -33,5 +34,6 @@ __all__ = [
     "_FusedMoeMatmulCuTe",
     "_FusedMoeMatmulCuTeWgmmaBf16",
     "_FusedMoeMatmulCuTeFp8",
+    "_FusedMoeMatmulCuTeWarpFp8",
     "_should_use_wgmma_bf16",
 ]

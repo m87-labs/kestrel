@@ -90,27 +90,43 @@ class CuteMoeConfig:
                 )
 
     def _validate_fp8(self) -> None:
-        """Validate constraints for FP8 WGMMA kernel."""
-        # FP8 WGMMA always requires block_m to be a multiple of 64 (one warpgroup per 64 rows).
-        if self.block_m % 64 != 0:
-            raise ValueError(
-                f"FP8 WGMMA requires block_m ({self.block_m}) to be divisible by 64."
-            )
+        """Validate constraints for FP8 kernels.
 
-        # FP8 WGMMA requires block_k divisible by 32 (K dimension alignment for FP8 MMA).
-        if self.block_k % 32 != 0:
-            raise ValueError(
-                f"FP8 WGMMA requires block_k ({self.block_k}) to be divisible by 32."
-            )
+        For block_m >= 64: WGMMA kernel is used with warpgroup constraints.
+        For block_m < 64: Warp-level MMA kernel is used with more flexibility.
+        """
+        if self.block_m >= 64:
+            # FP8 WGMMA requires block_m to be a multiple of 64 (one warpgroup per 64 rows).
+            if self.block_m % 64 != 0:
+                raise ValueError(
+                    f"FP8 WGMMA requires block_m ({self.block_m}) to be divisible by 64."
+                )
 
-        # FP8 WGMMA: num_warps must match warpgroups = block_m // 64, each warpgroup = 4 warps.
-        required_warpgroups = self.block_m // 64
-        required_warps = required_warpgroups * 4
-        if self.num_warps != required_warps:
-            raise ValueError(
-                f"FP8 WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
-                f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}."
-            )
+            # FP8 WGMMA requires block_k divisible by 32 (K dimension alignment for FP8 MMA).
+            if self.block_k % 32 != 0:
+                raise ValueError(
+                    f"FP8 WGMMA requires block_k ({self.block_k}) to be divisible by 32."
+                )
+
+            # FP8 WGMMA: num_warps must match warpgroups = block_m // 64, each warpgroup = 4 warps.
+            required_warpgroups = self.block_m // 64
+            required_warps = required_warpgroups * 4
+            if self.num_warps != required_warps:
+                raise ValueError(
+                    f"FP8 WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
+                    f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}."
+                )
+        else:
+            # FP8 warp-level MMA kernel: block_m must be 16 or 32 (warp MMA tile sizes)
+            if self.block_m not in (16, 32):
+                raise ValueError(
+                    f"FP8 warp kernel requires block_m to be 16 or 32 (got {self.block_m})."
+                )
+            # block_k should be divisible by 16 for warp-level MMA
+            if self.block_k % 16 != 0:
+                raise ValueError(
+                    f"FP8 warp kernel requires block_k ({self.block_k}) to be divisible by 16."
+                )
 
         # Shared memory constraint: sA + sB + metadata must fit in H100's 228KB.
         # FP8 = 1 byte per element (half of BF16).

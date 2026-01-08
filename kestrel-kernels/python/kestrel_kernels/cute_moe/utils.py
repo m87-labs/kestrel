@@ -27,6 +27,528 @@ from cutlass._mlir.dialects import llvm
 
 
 @dsl_user_op
+def bitcast_bf16_to_i32(bf16_val, *, loc=None, ip=None) -> Int32:
+    """Bitcast a single BF16 value to i32 (zero-extended).
+
+    This is needed because:
+    1. Int32(bf16_val) does float-to-int conversion, not bitcast
+    2. Our smem holds packed FP8 data in "BF16" slots (16 bits = 2 packed FP8)
+
+    The returned i32 has the 16-bit value in the low bits and zeros in the high bits.
+    This works with cvt_fp8x2_lo_to_bf16x2 which extracts only the low 16 bits.
+    """
+    from cutlass._mlir.dialects import arith
+
+    # Get the IR value (bfloat16 type)
+    ir_val = bf16_val.ir_value(loc=loc, ip=ip)
+    # Bitcast bfloat16 → i16 (same size, just type change)
+    i16_val = llvm.bitcast(T.i16(), ir_val, loc=loc, ip=ip)
+    # Zero-extend i16 → i32
+    i32_val = arith.extui(T.i32(), i16_val, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
+def bitcast_f16_to_i32(f16_val, *, loc=None, ip=None) -> Int32:
+    """Bitcast a single F16 value to i32 (zero-extended).
+
+    Same as bitcast_bf16_to_i32 but for F16. Both are 16-bit floats.
+    The returned i32 has the 16-bit value in the low bits and zeros in the high bits.
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_val = f16_val.ir_value(loc=loc, ip=ip)
+    i16_val = llvm.bitcast(T.i16(), ir_val, loc=loc, ip=ip)
+    i32_val = arith.extui(T.i32(), i16_val, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
+def pack_b16x2_to_b32(lo: Int32, hi: Int32, *, loc=None, ip=None) -> Int32:
+    """Pack two 16-bit values into one 32-bit value.
+
+    Input: lo and hi are 32-bit values where only the low 16 bits are used.
+    Output: 32-bit value with {hi[15:0], lo[15:0]}.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(lo).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo16, hi16;
+            mov.b32 {lo16, _}, $1;
+            mov.b32 {hi16, _}, $2;
+            mov.b32 $0, {lo16, hi16};
+        }
+        """,
+        "=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def unpack_b32_lo16(packed: Int32, *, loc=None, ip=None) -> Int32:
+    """Extract low 16 bits from 32-bit value, zero-extended to 32 bits."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo16, hi16;
+            mov.b32 {lo16, hi16}, $1;
+            mov.b32 $0, {lo16, 0};
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def unpack_b32_hi16(packed: Int32, *, loc=None, ip=None) -> Int32:
+    """Extract high 16 bits from 32-bit value, zero-extended to 32 bits."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo16, hi16;
+            mov.b32 {lo16, hi16}, $1;
+            mov.b32 $0, {hi16, 0};
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def cvt_fp8x2_to_bf16x2(packed_fp8x2: Int32, *, loc=None, ip=None) -> Int32:
+    """Convert 2 E4M3 FP8 values (from low 16 bits of 32-bit reg) to 2 packed BF16 values.
+
+    Input: 32-bit register with 2 packed FP8 values in the low 16 bits (high 16 bits ignored)
+    Output: 32-bit register containing 2 packed BF16 values
+
+    This is the main conversion function. Use bitcast_bf16_to_i32 to prepare the input.
+    Conversion chain: E4M3 → F16 → F32 → BF16
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(packed_fp8x2).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo, hi;
+            .reg .b32 f16x2;
+            .reg .f16 f16_0, f16_1;
+            .reg .f32 f32_0, f32_1;
+            .reg .b16 bf16_0, bf16_1;
+
+            mov.b32 {lo, hi}, $1;
+            cvt.rn.f16x2.e4m3x2 f16x2, lo;
+            mov.b32 {f16_0, f16_1}, f16x2;
+            cvt.f32.f16 f32_0, f16_0;
+            cvt.f32.f16 f32_1, f16_1;
+            cvt.rn.bf16.f32 bf16_0, f32_0;
+            cvt.rn.bf16.f32 bf16_1, f32_1;
+            mov.b32 $0, {bf16_0, bf16_1};
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def cvt_fp8x2_to_f16x2(packed_fp8x2: Int32, *, loc=None, ip=None) -> Int32:
+    """Convert 2 E4M3 FP8 values to 2 packed F16 values (FAST - single PTX instruction).
+
+    Input: 32-bit register with 2 packed FP8 values in the low 16 bits
+    Output: 32-bit register containing 2 packed F16 values
+
+    This is much faster than cvt_fp8x2_to_bf16x2 as it's a single instruction.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(packed_fp8x2).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo, hi;
+            mov.b32 {lo, hi}, $1;
+            cvt.rn.f16x2.e4m3x2 $0, lo;
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def cvt_fp8x4_to_f16x4_lo_hi(packed_fp8x4: Int32, *, loc=None, ip=None):
+    """Convert 4 E4M3 FP8 values to 4 F16 values, returning lo and hi pairs.
+
+    Input: 32-bit register with 4 packed FP8 values (each FP8 is 8 bits)
+    Output: (lo_f16x2, hi_f16x2) - two i32 registers each with 2 packed F16
+
+    This matches Triton's F2FP.F16.E4M3.UNPACK_B + F2FP.F16.E4M3.UNPACK_B.H1 pattern,
+    avoiding the PRMT overhead from separate lo/hi extraction.
+    """
+    result = llvm.inline_asm(
+        T.i64(),  # Pack both i32 results into i64
+        [Int32(packed_fp8x4).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 lo_fp8x2, hi_fp8x2;
+            .reg .b32 lo_f16x2, hi_f16x2;
+            mov.b32 {lo_fp8x2, hi_fp8x2}, $1;
+            cvt.rn.f16x2.e4m3x2 lo_f16x2, lo_fp8x2;
+            cvt.rn.f16x2.e4m3x2 hi_f16x2, hi_fp8x2;
+            mov.b64 $0, {lo_f16x2, hi_f16x2};
+        }
+        """,
+        "=l,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def unpack_i64_lo32(packed_i64, *, loc=None, ip=None) -> Int32:
+    """Extract low 32 bits from i64."""
+    from cutlass._mlir.dialects import arith
+    i32_val = arith.trunci(T.i32(), packed_i64, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
+def unpack_i64_hi32(packed_i64, *, loc=None, ip=None) -> Int32:
+    """Extract high 32 bits from i64."""
+    from cutlass._mlir.dialects import arith
+    shift_amt = arith.constant(T.i64(), 32, loc=loc, ip=ip)
+    shifted = arith.shrui(packed_i64, shift_amt, loc=loc, ip=ip)
+    i32_val = arith.trunci(T.i32(), shifted, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
+def i32_to_f16x2(packed_i32: Int32, *, loc=None, ip=None):
+    """Bitcast i32 to 2 packed F16 (returns tuple of 2 f16 values for CuTe fragment)."""
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import arith
+    ir_val = Int32(packed_i32).ir_value(loc=loc, ip=ip)
+    f16_type = ir.F16Type.get()
+    vec_type = ir.VectorType.get([2], f16_type)
+    vec_f16x2 = llvm.bitcast(vec_type, ir_val, loc=loc, ip=ip)
+    idx_0 = arith.constant(T.i32(), 0, loc=loc, ip=ip)
+    idx_1 = arith.constant(T.i32(), 1, loc=loc, ip=ip)
+    f16_lo = llvm.extractelement(vec_f16x2, idx_0, loc=loc, ip=ip)
+    f16_hi = llvm.extractelement(vec_f16x2, idx_1, loc=loc, ip=ip)
+    return f16_lo, f16_hi
+
+
+@dsl_user_op
+def cvt_fp8x2_to_f16_both(packed_fp8_in_f16, *, loc=None, ip=None):
+    """Convert 2 packed FP8 to 2 separate F16 values using LLVM vector extraction.
+
+    Input: F16 value that actually holds 2 packed FP8 values (from ldmatrix on packed smem)
+    Output: Tuple of (f16_lo, f16_hi) - both converted F16 values
+
+    Uses LLVM vector<2 x f16> and extractelement to avoid PRMT overhead from trunci/shrui.
+    """
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import arith
+
+    # Bitcast f16 → i16 (LLVM inline asm can't handle f16 directly)
+    ir_f16 = packed_fp8_in_f16.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_f16, loc=loc, ip=ip)
+
+    # PTX: convert 2 FP8 → 2 F16 packed in 32-bit register
+    result_i32 = llvm.inline_asm(
+        T.i32(),
+        [ir_i16],
+        "cvt.rn.f16x2.e4m3x2 $0, $1;",
+        "=r,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    # Bitcast i32 → vector<2 x f16> using MLIR's native VectorType
+    f16_type = ir.F16Type.get()
+    vec_type = ir.VectorType.get([2], f16_type)
+    vec_f16x2 = llvm.bitcast(vec_type, result_i32, loc=loc, ip=ip)
+
+    # Extract elements from vector (result type inferred from vector)
+    idx_0 = arith.constant(T.i32(), 0, loc=loc, ip=ip)
+    idx_1 = arith.constant(T.i32(), 1, loc=loc, ip=ip)
+    f16_lo = llvm.extractelement(vec_f16x2, idx_0, loc=loc, ip=ip)
+    f16_hi = llvm.extractelement(vec_f16x2, idx_1, loc=loc, ip=ip)
+
+    return f16_lo, f16_hi
+
+
+@dsl_user_op
+def cvt_fp8x4_to_f16x4_packed(packed_fp8x4: Int32, *, loc=None, ip=None):
+    """Convert 4 packed FP8 values to 2 packed F16x2 values (Int32 → two Int32).
+
+    Input: Int32 containing 4 packed E4M3 FP8 values (each 8 bits)
+    Output: Tuple of (lo_f16x2, hi_f16x2) - two Int32 values, each containing 2 packed F16
+
+    This avoids all bitcast overhead by working entirely with Int32 registers.
+    Uses two F2FP instructions (one for low 2 FP8, one for high 2 FP8).
+    """
+    ir_i32 = Int32(packed_fp8x4).ir_value(loc=loc, ip=ip)
+
+    # PTX: Split into lo/hi 16-bit halves, convert each to f16x2
+    # Low 2 FP8 → 2 F16 packed in Int32
+    lo_i32 = llvm.inline_asm(
+        T.i32(),
+        [ir_i32],
+        "{ .reg .b16 lo; mov.b32 {lo, _}, $1; cvt.rn.f16x2.e4m3x2 $0, lo; }",
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    # High 2 FP8 → 2 F16 packed in Int32
+    hi_i32 = llvm.inline_asm(
+        T.i32(),
+        [ir_i32],
+        "{ .reg .b16 hi; mov.b32 {_, hi}, $1; cvt.rn.f16x2.e4m3x2 $0, hi; }",
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    return Int32(lo_i32), Int32(hi_i32)
+
+
+# Keep the separate functions for compatibility but have them call the combined one
+@dsl_user_op
+def cvt_fp8x2_to_f16_lo(packed_fp8_in_f16, *, loc=None, ip=None):
+    """Convert low FP8 from packed pair to F16.
+
+    Note: For best performance, use cvt_fp8x2_to_f16_both to get both values
+    with a single conversion instruction.
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_f16 = packed_fp8_in_f16.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_f16, loc=loc, ip=ip)
+
+    result_i32 = llvm.inline_asm(
+        T.i32(),
+        [ir_i16],
+        "cvt.rn.f16x2.e4m3x2 $0, $1;",
+        "=r,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    lo_i16 = arith.trunci(T.i16(), result_i32, loc=loc, ip=ip)
+    result_f16 = llvm.bitcast(T.f16(), lo_i16, loc=loc, ip=ip)
+    return result_f16
+
+
+@dsl_user_op
+def cvt_fp8x2_to_f16_hi(packed_fp8_in_f16, *, loc=None, ip=None):
+    """Convert high FP8 from packed pair to F16.
+
+    Note: For best performance, use cvt_fp8x2_to_f16_both to get both values
+    with a single conversion instruction.
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_f16 = packed_fp8_in_f16.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_f16, loc=loc, ip=ip)
+
+    result_i32 = llvm.inline_asm(
+        T.i32(),
+        [ir_i16],
+        "cvt.rn.f16x2.e4m3x2 $0, $1;",
+        "=r,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    shift_16 = arith.constant(T.i32(), 16, loc=loc, ip=ip)
+    shifted = arith.shrui(result_i32, shift_16, loc=loc, ip=ip)
+    hi_i16 = arith.trunci(T.i16(), shifted, loc=loc, ip=ip)
+    result_f16 = llvm.bitcast(T.f16(), hi_i16, loc=loc, ip=ip)
+    return result_f16
+
+
+@dsl_user_op
+def extract_f16_lo(packed_f16x2: Int32, *, loc=None, ip=None):
+    """Extract the low F16 from a 32-bit value containing 2 packed F16.
+
+    Input: 32-bit register with {f16_hi, f16_lo}
+    Output: Single F16 value (the low one)
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_val = Int32(packed_f16x2).ir_value(loc=loc, ip=ip)
+    # Truncate to i16 (keeps low 16 bits)
+    i16_val = arith.trunci(T.i16(), ir_val, loc=loc, ip=ip)
+    # Bitcast i16 → f16
+    f16_val = llvm.bitcast(T.f16(), i16_val, loc=loc, ip=ip)
+    return f16_val
+
+
+@dsl_user_op
+def extract_f16_hi(packed_f16x2: Int32, *, loc=None, ip=None):
+    """Extract the high F16 from a 32-bit value containing 2 packed F16.
+
+    Input: 32-bit register with {f16_hi, f16_lo}
+    Output: Single F16 value (the high one)
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_val = Int32(packed_f16x2).ir_value(loc=loc, ip=ip)
+    # Shift right by 16 to get high 16 bits in low position
+    shift_amt = arith.constant(T.i32(), 16, loc=loc, ip=ip)
+    shifted = arith.shrui(ir_val, shift_amt, loc=loc, ip=ip)
+    # Truncate to i16
+    i16_val = arith.trunci(T.i16(), shifted, loc=loc, ip=ip)
+    # Bitcast i16 → f16
+    f16_val = llvm.bitcast(T.f16(), i16_val, loc=loc, ip=ip)
+    return f16_val
+
+
+@dsl_user_op
+def cvt_fp8x2_to_bf16_lo_hi(packed_fp8x2: Int32, *, loc=None, ip=None):
+    """Convert 2 FP8 to 2 separate BF16 values (combined operation for speed).
+
+    Input: 32-bit value with 2 packed FP8 in low 16 bits
+    Returns: Tuple of (bf16_lo, bf16_hi) as separate 16-bit values in i32 registers
+
+    This combines the conversion and extraction into one PTX block to reduce overhead.
+    Returns two i32 values where each has a BF16 in the low 16 bits.
+    """
+    # Returns (lo, hi) packed as i64, then caller unpacks
+    result = llvm.inline_asm(
+        T.i64(),
+        [Int32(packed_fp8x2).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 fp8_lo, fp8_hi;
+            .reg .b32 f16x2;
+            .reg .f16 f16_0, f16_1;
+            .reg .f32 f32_0, f32_1;
+            .reg .b16 bf16_0, bf16_1;
+            .reg .b32 out_lo, out_hi;
+
+            mov.b32 {fp8_lo, fp8_hi}, $1;
+            cvt.rn.f16x2.e4m3x2 f16x2, fp8_lo;
+            mov.b32 {f16_0, f16_1}, f16x2;
+            cvt.f32.f16 f32_0, f16_0;
+            cvt.f32.f16 f32_1, f16_1;
+            cvt.rn.bf16.f32 bf16_0, f32_0;
+            cvt.rn.bf16.f32 bf16_1, f32_1;
+            mov.b32 out_lo, {bf16_0, 0};
+            mov.b32 out_hi, {bf16_1, 0};
+            mov.b64 $0, {out_lo, out_hi};
+        }
+        """,
+        "=l,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def unpack_bf16_pair_lo(packed_i64, *, loc=None, ip=None):
+    """Extract the low BF16 from packed i64 result of cvt_fp8x2_to_bf16_lo_hi."""
+    from cutlass._mlir.dialects import arith
+
+    ir_val = packed_i64
+    # Truncate i64 to i32 (keeps low 32 bits)
+    i32_val = arith.trunci(T.i32(), ir_val, loc=loc, ip=ip)
+    # Truncate to i16
+    i16_val = arith.trunci(T.i16(), i32_val, loc=loc, ip=ip)
+    # Bitcast to bf16
+    bf16_val = llvm.bitcast(T.bf16(), i16_val, loc=loc, ip=ip)
+    return bf16_val
+
+
+@dsl_user_op
+def unpack_bf16_pair_hi(packed_i64, *, loc=None, ip=None):
+    """Extract the high BF16 from packed i64 result of cvt_fp8x2_to_bf16_lo_hi."""
+    from cutlass._mlir.dialects import arith
+
+    ir_val = packed_i64
+    # Shift right by 32 to get high 32 bits
+    shift_amt = arith.constant(T.i64(), 32, loc=loc, ip=ip)
+    shifted = arith.shrui(ir_val, shift_amt, loc=loc, ip=ip)
+    # Truncate to i32
+    i32_val = arith.trunci(T.i32(), shifted, loc=loc, ip=ip)
+    # Truncate to i16
+    i16_val = arith.trunci(T.i16(), i32_val, loc=loc, ip=ip)
+    # Bitcast to bf16
+    bf16_val = llvm.bitcast(T.bf16(), i16_val, loc=loc, ip=ip)
+    return bf16_val
+
+
+@dsl_user_op
+def extract_bf16_lo(packed_bf16x2: Int32, *, loc=None, ip=None):
+    """Extract the low BF16 from a 32-bit value containing 2 packed BF16.
+
+    Input: 32-bit register with {bf16_hi, bf16_lo}
+    Output: Single BF16 value (the low one)
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_val = Int32(packed_bf16x2).ir_value(loc=loc, ip=ip)
+    # Truncate to i16 (keeps low 16 bits)
+    i16_val = arith.trunci(T.i16(), ir_val, loc=loc, ip=ip)
+    # Bitcast i16 → bfloat16
+    bf16_val = llvm.bitcast(T.bf16(), i16_val, loc=loc, ip=ip)
+    return bf16_val
+
+
+@dsl_user_op
+def extract_bf16_hi(packed_bf16x2: Int32, *, loc=None, ip=None):
+    """Extract the high BF16 from a 32-bit value containing 2 packed BF16.
+
+    Input: 32-bit register with {bf16_hi, bf16_lo}
+    Output: Single BF16 value (the high one)
+    """
+    from cutlass._mlir.dialects import arith
+
+    ir_val = Int32(packed_bf16x2).ir_value(loc=loc, ip=ip)
+    # Shift right by 16 to get high 16 bits in low position
+    shift_amt = arith.constant(T.i32(), 16, loc=loc, ip=ip)
+    shifted = arith.shrui(ir_val, shift_amt, loc=loc, ip=ip)
+    # Truncate to i16
+    i16_val = arith.trunci(T.i16(), shifted, loc=loc, ip=ip)
+    # Bitcast i16 → bfloat16
+    bf16_val = llvm.bitcast(T.bf16(), i16_val, loc=loc, ip=ip)
+    return bf16_val
+
+
+@dsl_user_op
 def store_streaming_b32(value: Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     """Store 32 bits (e.g. 2xBF16) with cache streaming hint (st.global.cs).
 

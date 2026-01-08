@@ -13,6 +13,7 @@ from cutlass.cute.nvgpu import warp
 from kestrel_kernels.flash_attn.cute import ampere_helpers
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 from kestrel_kernels.cute_moe.config import CuteMoeConfig
+from kestrel_kernels.cute_moe.utils import store_streaming_b32
 
 
 class _FusedMoeMatmulCuTe:
@@ -669,22 +670,18 @@ class _FusedMoeMatmulCuTe:
                 stage_idx = stage_idx + 1 if stage_idx + 1 < num_stages else Int32(0)
 
             # Epilogue: apply routed weights (if needed), then store directly to gmem.
+            # Use streaming stores (st.global.cs) which bypass L1 and mark for early L2
+            # eviction - optimal for write-only scattered stores.
             cC = cute.make_identity_tensor((block_m, block_n))
             tC_coords = fa_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cC))
             tAcc = fa_utils.make_acc_tensor_mn_view(acc)
 
-            gmem_store_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                self.dtype,
-                num_bits_per_copy=2 * self.dtype.width,
-            )
             gmem_store_atom_scalar = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 self.dtype,
                 num_bits_per_copy=self.dtype.width,
             )
             vec_size_out = 2
-            src_vec = cute.make_rmem_tensor((vec_size_out,), self.dtype)
             src_scalar = cute.make_rmem_tensor((1,), self.dtype)
             align_bytes_out = vec_size_out * int(self.dtype.width // 8)
             align_bytes_scalar = int(self.dtype.width // 8)
@@ -705,9 +702,11 @@ class _FusedMoeMatmulCuTe:
                             ni0 = Int32(pi * vec_size_out)
                             n0 = Int32(tC_coords[mi, ni0][1])
                             col0 = n_start + n0
-                            src_vec[0] = self.dtype(Float32(tAcc[mi, ni0]) * row_scale)
-                            src_vec[1] = self.dtype(
-                                Float32(tAcc[mi, ni0 + 1]) * row_scale
+                            # Pack two BF16 values into Int32 and use streaming store
+                            packed = fa_utils.cvt_f16x2_f32(
+                                Float32(tAcc[mi, ni0]) * row_scale,
+                                Float32(tAcc[mi, ni0 + 1]) * row_scale,
+                                self.dtype,
                             )
                             g_off_bytes_vec = (
                                 row_off_bytes + cutlass.Int64(col0) * element_bytes
@@ -718,8 +717,7 @@ class _FusedMoeMatmulCuTe:
                                 cute.AddressSpace.gmem,
                                 assumed_align=align_bytes_out,
                             )
-                            dst_vec = cute.make_tensor(g_ptr_vec, (vec_size_out,))
-                            cute.copy(gmem_store_atom, src_vec, dst_vec)
+                            store_streaming_b32(packed, g_ptr_vec)
             else:
                 for mi in cutlass.range_constexpr(cute.size(tAcc.shape[0])):
                     m = Int32(tC_coords[mi, 0][0])

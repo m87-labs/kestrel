@@ -4,7 +4,6 @@ import os
 from typing import Any, Dict, Literal, Tuple
 
 import torch
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -29,6 +28,7 @@ from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
     _should_use_wgmma_bf16,
 )
 from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
+from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 
 
@@ -231,16 +231,29 @@ def _invoke_cute_moe_fp8_impl(
         raise ValueError("A_fp8_bits and B_fp8_bits must have the same K dimension")
     if int(A_fp8_bits.shape[1]) % int(config.block_k) != 0:
         raise ValueError("CuTe FP8 kernel requires K divisible by block_k")
-    if int(config.block_k) % 32 != 0:
-        raise ValueError("CuTe FP8 kernel requires block_k divisible by 32 for WGMMA")
-    if int(config.block_m) % 64 != 0:
-        raise ValueError("CuTe FP8 kernel requires block_m divisible by 64 for WGMMA")
-    expected_warps = (int(config.block_m) // 64) * 4
-    if int(config.num_warps) != expected_warps:
-        raise ValueError(
-            f"CuTe FP8 kernel requires num_warps={(config.block_m // 64) * 4} "
-            f"for block_m={config.block_m} (got {config.num_warps})"
-        )
+
+    # Validate config based on which kernel will be used
+    use_wgmma = config.block_m >= 64
+    if use_wgmma:
+        # WGMMA kernel constraints
+        if int(config.block_k) % 32 != 0:
+            raise ValueError("CuTe FP8 WGMMA kernel requires block_k divisible by 32")
+        if int(config.block_m) % 64 != 0:
+            raise ValueError("CuTe FP8 WGMMA kernel requires block_m divisible by 64")
+        expected_warps = (int(config.block_m) // 64) * 4
+        if int(config.num_warps) != expected_warps:
+            raise ValueError(
+                f"CuTe FP8 WGMMA kernel requires num_warps={(config.block_m // 64) * 4} "
+                f"for block_m={config.block_m} (got {config.num_warps})"
+            )
+    else:
+        # Warp-level MMA kernel constraints
+        if int(config.block_k) % 16 != 0:
+            raise ValueError("CuTe FP8 warp kernel requires block_k divisible by 16")
+        if int(config.block_m) not in (16, 32):
+            raise ValueError(
+                f"CuTe FP8 warp kernel requires block_m to be 16 or 32 (got {config.block_m})"
+            )
     if B_scale.shape[0] != B_fp8_bits.shape[0] or B_scale.shape[1] != B_fp8_bits.shape[1]:
         raise ValueError("B_scale must have shape [E, N] matching B_fp8_bits")
     if B_scale.stride(-1) != 1:
@@ -275,22 +288,41 @@ def _invoke_cute_moe_fp8_impl(
     K_dim = int(A_fp8_bits.shape[1])
     key = (kind, config, N_dim, K_dim)
 
-    a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
-    a_scale_cute = _to_cute_tensor_1d_contig(A_scale.to(dtype=torch.float32))
-    b_bits_cute = _to_cute_tensor_3d_last_contig_u8(B_fp8_bits)
-    b_scale_cute = _to_cute_tensor_2d_contig(B_scale.to(dtype=torch.float32))
-    c_cute = _to_cute_tensor_2d_contig(C2d)
-    sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
-    expert_cute = _to_cute_tensor_1d_i32(expert_ids)
-    post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
-    topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
+    # Ensure scales are float32 without creating copies if already float32
+    if A_scale.dtype != torch.float32:
+        A_scale = A_scale.to(dtype=torch.float32)
+    if B_scale.dtype != torch.float32:
+        B_scale = B_scale.to(dtype=torch.float32)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    # Choose between warp-level MMA (small block_m) and WGMMA (large block_m)
+    # WGMMA requires block_m >= 64; warp-level MMA works for any block_m
+    use_wgmma_fp8 = config.block_m >= 64
+
     if key not in _COMPILE_CACHE_FP8:
-        op = _FusedMoeMatmulCuTeFp8(
-            dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
-            N=N_dim, K=K_dim,
-        )
+        # Create CuTe tensors only for compilation (to derive tensor signatures)
+        a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
+        a_scale_cute = _to_cute_tensor_1d_contig(A_scale)
+        b_bits_cute = _to_cute_tensor_3d_last_contig_u8(B_fp8_bits)
+        b_scale_cute = _to_cute_tensor_2d_contig(B_scale)
+        c_cute = _to_cute_tensor_2d_contig(C2d)
+        sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
+        expert_cute = _to_cute_tensor_1d_i32(expert_ids)
+        post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
+        topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
+
+        # Use TVM-FFI env stream for automatic stream handling (matches BF16 path)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+        if use_wgmma_fp8:
+            op = _FusedMoeMatmulCuTeFp8(
+                dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
+                N=N_dim, K=K_dim,
+            )
+        else:
+            op = _FusedMoeMatmulCuTeWarpFp8(
+                dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
+                N=N_dim, K=K_dim,
+            )
         compiled = cute.compile(
             op,
             a_bits_cute,
@@ -302,23 +334,23 @@ def _invoke_cute_moe_fp8_impl(
             sorted_cute,
             expert_cute,
             post_cute,
-            stream,
+            stream_fake,
             options="--enable-tvm-ffi",
         )
         _set_compiled_kernel_shared_carveout(compiled)
         _COMPILE_CACHE_FP8[key] = compiled
 
+    # TVM-FFI handles PyTorch tensor conversion automatically (like BF16 path)
     _COMPILE_CACHE_FP8[key](
-        a_bits_cute,
-        a_scale_cute,
-        b_bits_cute,
-        b_scale_cute,
-        c_cute,
-        topk_w_cute,
-        sorted_cute,
-        expert_cute,
-        post_cute,
-        stream,
+        A_fp8_bits,
+        A_scale,
+        B_fp8_bits,
+        B_scale,
+        C2d,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
     )
 
 
