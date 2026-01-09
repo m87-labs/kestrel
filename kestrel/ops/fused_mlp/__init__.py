@@ -5,7 +5,9 @@ import torch
 from kestrel_kernels.fused_mlp import fused_mlp_gelu_bias_residual_cuda
 
 
-class _ResizableBuffer:
+class _FixedBuffer:
+    """Device-aware buffer that is pre-allocated once and never resized."""
+
     def __init__(self) -> None:
         self._tensor: torch.Tensor | None = None
 
@@ -16,22 +18,45 @@ class _ResizableBuffer:
         if numel == 0:
             return torch.empty(shape, device=device, dtype=dtype)
 
-        if (
-            self._tensor is None
-            or self._tensor.numel() < numel
-            or self._tensor.device != device
-            or self._tensor.dtype != dtype
-        ):
+        if self._tensor is None:
             self._tensor = torch.empty(numel, device=device, dtype=dtype)
+        elif self._tensor.numel() < numel:
+            raise RuntimeError(
+                f"Fused MLP buffer overflow: requested {numel} elements but "
+                f"only {self._tensor.numel()} allocated. Increase max_seq_length "
+                f"or ensure preallocate_fused_mlp_workspaces() is called."
+            )
+        elif self._tensor.device != device or self._tensor.dtype != dtype:
+            raise RuntimeError(
+                f"Fused MLP buffer device/dtype mismatch: buffer on {self._tensor.device} "
+                f"({self._tensor.dtype}), requested {device} ({dtype})."
+            )
         return self._tensor[:numel].view(*shape)
 
 
 class FusedMLPWorkspaces:
     def __init__(self) -> None:
-        self.hidden = _ResizableBuffer()
+        self.hidden = _FixedBuffer()
 
 
 _WORKSPACES = FusedMLPWorkspaces()
+
+
+def preallocate_fused_mlp_workspaces(
+    max_num_tokens: int,
+    hidden_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Pre-allocate fused MLP workspace to ensure stable pointers for CUDA graphs.
+
+    Args:
+        max_num_tokens: Maximum tokens in any forward pass.
+        hidden_dim: Hidden dimension of the MLP (intermediate size).
+        device: Target device.
+        dtype: Data type.
+    """
+    _WORKSPACES.hidden.get((max_num_tokens, hidden_dim), device=device, dtype=dtype)
 
 
 def fused_mlp_gelu_bias_residual_into(
@@ -97,4 +122,5 @@ __all__ = [
     "FusedMLPWorkspaces",
     "fused_mlp_gelu_bias_residual_cuda",
     "fused_mlp_gelu_bias_residual_into",
+    "preallocate_fused_mlp_workspaces",
 ]

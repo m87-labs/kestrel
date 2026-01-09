@@ -422,11 +422,12 @@ class MoondreamRuntime:
             and self.device.type == "cuda"
         )
 
-        # Shared streams for pipelined decoding. All decode forwards serialize on
-        # the compute stream (preserves KV ordering and _pending_* dependencies).
-        # D2H copies share the copy stream for simpler ordering guarantees.
-        self._decode_compute_stream = torch.cuda.Stream(device=self.device)
-        self._decode_lora_stream = torch.cuda.Stream(device=self.device)
+        # Primary stream for all GPU operations (prefill, decode, vision, embedding,
+        # sampling, etc.). Using a single stream ensures proper ordering and avoids
+        # synchronization issues with shared buffers.
+        # D2H copies use a separate copy stream for overlap.
+        self._primary_stream = torch.cuda.Stream(device=self.device)
+        self._lora_stream = torch.cuda.Stream(device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
 
         self._active_prefill_batch_idx: Optional[Tensor] = None
@@ -481,7 +482,7 @@ class MoondreamRuntime:
                 max_rank=max_lora_rank,
                 device=self.device,
                 dtype=self.dtype,
-                lora_stream=self._decode_lora_stream,
+                lora_stream=self._lora_stream,
             )
             self._slot_manager = AdapterSlotManager(max_slots)
 
@@ -502,7 +503,7 @@ class MoondreamRuntime:
                 hidden_dim=hidden_dim,
                 coord_dtype=coord_dtype,
                 size_dtype=size_dtype,
-                compute_stream=self._decode_compute_stream,
+                compute_stream=self._primary_stream,
                 copy_stream=self._copy_stream,
             )
             for slot_id in range(2)
@@ -525,9 +526,9 @@ class MoondreamRuntime:
         return self._copy_stream
 
     @property
-    def decode_compute_stream(self) -> torch.cuda.Stream:
-        """Shared decode compute stream for all decode forwards."""
-        return self._decode_compute_stream
+    def primary_stream(self) -> torch.cuda.Stream:
+        """Primary compute stream for all GPU operations."""
+        return self._primary_stream
 
     @property
     def decode_slots(self) -> list[DecodeSlot]:
@@ -1002,29 +1003,32 @@ class MoondreamRuntime:
             )
             self._batch_binding.tensor = batch_tensor
 
-            # 8. Prepare inputs (branch on cache hit)
-            if cache_result.can_reuse:
-                inputs_embeds, position_ids, fa3_seqused_k = self._prepare_append_prefill_inputs(
-                    tokens_list, cache_result.skip_positions, image_kv_length, prompt_len
-                )
-            else:
-                inputs_embeds, position_ids, fa3_seqused_k = self._prepare_full_prefill_inputs(
-                    tokens_list, image, image_crops, prompt_len
-                )
+            # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
+            # Use primary stream to ensure ordering with shared buffers.
+            with torch.cuda.stream(self._primary_stream):
+                # 8. Prepare inputs (branch on cache hit)
+                if cache_result.can_reuse:
+                    inputs_embeds, position_ids, fa3_seqused_k = self._prepare_append_prefill_inputs(
+                        tokens_list, cache_result.skip_positions, image_kv_length, prompt_len
+                    )
+                else:
+                    inputs_embeds, position_ids, fa3_seqused_k = self._prepare_full_prefill_inputs(
+                        tokens_list, image, image_crops, prompt_len
+                    )
 
-            # 9. Run prefill
-            self._active_prefill_batch_idx = batch_tensor
-            try:
-                hidden, logits = self._prefill(
-                    inputs_embeds,
-                    None,  # attention_mask
-                    position_ids,
-                    lora_slot,
-                    use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
-                    fa3_seqused_k=fa3_seqused_k,
-                )
-            finally:
-                self._active_prefill_batch_idx = None
+                # 9. Run prefill
+                self._active_prefill_batch_idx = batch_tensor
+                try:
+                    hidden, logits = self._prefill(
+                        inputs_embeds,
+                        None,  # attention_mask
+                        position_ids,
+                        lora_slot,
+                        use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
+                        fa3_seqused_k=fa3_seqused_k,
+                    )
+                finally:
+                    self._active_prefill_batch_idx = None
 
             # 10. Finalize cache (insert + lock transfer)
             cache_lock_node, cache_owned_page_count = self._finalize_cache_after_prefill(
@@ -1384,6 +1388,11 @@ class MoondreamRuntime:
         if self._decode_slots and self._decode_slots[0].cuda_graphs is not None:
             return
 
+        # Pre-allocate MoE workspaces to their maximum size BEFORE graph capture.
+        # This is critical: if workspaces grow after capture, the captured graphs
+        # will use stale pointers, causing memory corruption and non-determinism.
+        self._preallocate_workspaces()
+
         # Initialize graph batch sizes once
         max_effective_batch = max(1, self.max_batch_size - 1)
         self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
@@ -1391,6 +1400,54 @@ class MoondreamRuntime:
         # Capture graphs for each slot using its own buffers
         for slot in self._decode_slots:
             slot.cuda_graphs = self._capture_decode_graphs_for_slot(slot)
+
+    def _preallocate_workspaces(self) -> None:
+        """Pre-allocate all shared workspaces to ensure stable pointers for CUDA graphs.
+
+        All MoE layers share a single set of workspace buffers since they execute
+        sequentially. This reduces memory from O(num_layers * workspace) to O(workspace).
+        The buffers are fixed-size; requesting more tokens than allocated raises an error.
+        """
+        max_tokens = self.max_seq_length - 1
+
+        # Pre-allocate vision fused MLP workspace
+        # max_tokens = (max_crops + 1) * patches_per_crop
+        # The +1 accounts for the global/overview crop added by overlap_crop_image
+        vision_cfg = self.config.vision
+        patches_per_crop = (vision_cfg.crop_size // vision_cfg.enc_patch_size) ** 2
+        max_vision_tokens = (vision_cfg.max_crops + 1) * patches_per_crop
+        from kestrel.ops.fused_mlp import preallocate_fused_mlp_workspaces
+        preallocate_fused_mlp_workspaces(
+            max_num_tokens=max_vision_tokens,
+            hidden_dim=vision_cfg.enc_ff_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        # Pre-allocate MoE workspaces if MoE is enabled
+        if self.config.text.moe is not None:
+            from kestrel.fused_moe import preallocate_shared_moe_workspaces
+            from kestrel.fused_moe.lora_kernels import preallocate_lora_buffers
+
+            moe_cfg = self.config.text.moe
+            preallocate_shared_moe_workspaces(
+                max_num_tokens=max_tokens,
+                top_k=moe_cfg.experts_per_token,
+                hidden_size=moe_cfg.expert_inner_dim,
+                input_size=self.config.text.dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+            # Pre-allocate LoRA buffers if LoRA is enabled
+            if self._max_lora_rank is not None:
+                preallocate_lora_buffers(
+                    max_num_tokens=max_tokens,
+                    top_k=moe_cfg.experts_per_token,
+                    max_lora_rank=self._max_lora_rank,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
 
     def _make_graph_batch_sizes(self, max_batch: int) -> list[int]:
         seeds = [size for size in (1, 2, 4, 8) if size <= max_batch]
