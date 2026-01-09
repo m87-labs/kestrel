@@ -4,6 +4,8 @@ import pytest
 import torch
 import triton
 
+from kestrel_kernels.cute_moe import CuteMoeConfig
+
 
 # All token counts from cute_moe config
 CONFIG_TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
@@ -137,8 +139,11 @@ class TestCuteMoeKernels:
         hidden_fp8, hidden_scale = quantize_fp8_rowwise(hidden)
         up_weight_fp8, up_weight_scale = quantize_fp8_colwise(up_weight)
 
-        # FP8 config: block_m=64 is standard for fp8 WGMMA
-        config_fp8 = CuteMoeConfig(block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2, dtype="fp8")
+        # FP8 config: block_m=64 with WGMMA kernel
+        config_fp8 = CuteMoeConfig(
+            block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2,
+            dtype="fp8", kernel_type="wgmma"
+        )
         sorted_token_ids_fp8, expert_ids_fp8, num_tokens_post_padded_fp8 = moe_align_block_size(
             topk_ids, config_fp8.block_m, self.NUM_EXPERTS
         )
@@ -310,8 +315,11 @@ class TestCuteMoeKernels:
         activation_fp8, activation_scale = quantize_fp8_rowwise(activation)
         down_weight_fp8, down_weight_scale = quantize_fp8_colwise(down_weight)
 
-        # FP8 config: block_m=64 is standard for fp8 WGMMA
-        config_fp8 = CuteMoeConfig(block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2, dtype="fp8")
+        # FP8 config: block_m=64 with WGMMA kernel
+        config_fp8 = CuteMoeConfig(
+            block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2,
+            dtype="fp8", kernel_type="wgmma"
+        )
         sorted_token_ids_fp8, expert_ids_fp8, num_tokens_post_padded_fp8 = moe_align_block_size(
             topk_ids, config_fp8.block_m, self.NUM_EXPERTS
         )
@@ -364,3 +372,310 @@ class TestCuteMoeKernels:
         # FP8 has quantization error, so we use looser tolerances
         # Down kernel accumulates more error than up kernel due to reduction
         torch.testing.assert_close(out_fp8, out_ref, rtol=0.2, atol=0.4)
+
+
+# Test fixtures for kernel variant testing
+# FP8 warp configs - various block_m multiples of 16
+FP8_WARP_CONFIGS = [
+    CuteMoeConfig(block_m=16, block_n=128, block_k=64, num_warps=4, num_stages=4, dtype="fp8", kernel_type="warp"),
+    CuteMoeConfig(block_m=32, block_n=128, block_k=64, num_warps=4, num_stages=4, dtype="fp8", kernel_type="warp"),
+    CuteMoeConfig(block_m=64, block_n=128, block_k=64, num_warps=4, num_stages=4, dtype="fp8", kernel_type="warp"),
+]
+
+# FP8 wgmma configs - multiples of 64
+FP8_WGMMA_CONFIGS = [
+    CuteMoeConfig(block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2, dtype="fp8", kernel_type="wgmma"),
+    CuteMoeConfig(block_m=128, block_n=128, block_k=128, num_warps=8, num_stages=2, dtype="fp8", kernel_type="wgmma"),
+]
+
+# BF16 warp configs
+BF16_WARP_CONFIGS = [
+    CuteMoeConfig(block_m=16, block_n=64, block_k=64, num_warps=4, num_stages=2, dtype="bf16", kernel_type="warp"),
+    CuteMoeConfig(block_m=32, block_n=64, block_k=64, num_warps=4, num_stages=2, dtype="bf16", kernel_type="warp"),
+    CuteMoeConfig(block_m=64, block_n=64, block_k=64, num_warps=4, num_stages=2, dtype="bf16", kernel_type="warp"),
+]
+
+# BF16 wgmma configs
+BF16_WGMMA_CONFIGS = [
+    CuteMoeConfig(block_m=64, block_n=64, block_k=64, num_warps=4, num_stages=2, dtype="bf16", kernel_type="wgmma"),
+    CuteMoeConfig(block_m=128, block_n=64, block_k=64, num_warps=8, num_stages=2, dtype="bf16", kernel_type="wgmma"),
+]
+
+# Token counts for variant testing (subset for faster tests)
+VARIANT_TOKEN_COUNTS = [8, 32, 128]
+
+
+class TestCuteMoeKernelVariants:
+    """Tests for different kernel type variants (warp vs wgmma)."""
+
+    D_MODEL = 2048
+    D_EXPERT = 1024
+    NUM_EXPERTS = 64
+    TOP_K = 8
+
+    @pytest.mark.parametrize("num_tokens", VARIANT_TOKEN_COUNTS)
+    @pytest.mark.parametrize("config", FP8_WARP_CONFIGS + FP8_WGMMA_CONFIGS,
+                             ids=lambda c: f"m{c.block_m}_{c.kernel_type}")
+    def test_up_kernel_fp8_variants(self, device, num_tokens, config):
+        """Test FP8 up kernel correctness for all kernel type variants."""
+        torch.manual_seed(42)
+
+        from kestrel_kernels.cute_moe import invoke_cute_moe_up_fp8, invoke_cute_moe_up
+        from kestrel.fused_moe.routing import moe_align_block_size
+
+        # Create bf16 inputs
+        hidden = torch.randn(num_tokens, self.D_MODEL, device=device, dtype=torch.bfloat16)
+        up_weight = torch.randn(
+            self.NUM_EXPERTS, self.D_EXPERT * 2, self.D_MODEL, device=device, dtype=torch.bfloat16
+        ) * 0.02
+        topk_ids = torch.randint(
+            0, self.NUM_EXPERTS, (num_tokens, self.TOP_K), device=device, dtype=torch.int32
+        )
+
+        # Quantize
+        def quantize_fp8_rowwise(x: torch.Tensor):
+            abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = abs_max / 448.0
+            x_fp8 = (x / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+            return x_fp8, scale.squeeze(-1).to(torch.float32)
+
+        def quantize_fp8_colwise(w: torch.Tensor):
+            abs_max = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = abs_max / 448.0
+            w_fp8 = (w / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+            return w_fp8, scale.squeeze(-1).to(torch.float32)
+
+        hidden_fp8, hidden_scale = quantize_fp8_rowwise(hidden)
+        up_weight_fp8, up_weight_scale = quantize_fp8_colwise(up_weight)
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config.block_m, self.NUM_EXPERTS
+        )
+
+        # FP8 output
+        out_fp8 = torch.zeros(
+            num_tokens, self.TOP_K, self.D_EXPERT * 2, device=device, dtype=torch.bfloat16
+        )
+
+        # BF16 reference (using warp kernel for consistent comparison)
+        config_bf16 = CuteMoeConfig(
+            block_m=config.block_m, block_n=64, block_k=64, num_warps=4, num_stages=2,
+            dtype="bf16", kernel_type="warp"
+        )
+        out_ref = torch.zeros(
+            num_tokens, self.TOP_K, self.D_EXPERT * 2, device=device, dtype=torch.bfloat16
+        )
+
+        invoke_cute_moe_up_fp8(
+            hidden_fp8, hidden_scale, up_weight_fp8, up_weight_scale, out_fp8,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config,
+        )
+
+        invoke_cute_moe_up(
+            hidden, up_weight, out_ref,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config_bf16,
+        )
+
+        torch.testing.assert_close(out_fp8, out_ref, rtol=0.1, atol=0.2)
+
+    @pytest.mark.parametrize("num_tokens", VARIANT_TOKEN_COUNTS)
+    @pytest.mark.parametrize("config", BF16_WARP_CONFIGS + BF16_WGMMA_CONFIGS,
+                             ids=lambda c: f"m{c.block_m}_{c.kernel_type}")
+    def test_up_kernel_bf16_variants(self, device, num_tokens, config):
+        """Test BF16 up kernel correctness for all kernel type variants."""
+        torch.manual_seed(42)
+
+        from kestrel_kernels.cute_moe import invoke_cute_moe_up
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.kernels import invoke_fused_moe_kernel
+
+        hidden = torch.randn(num_tokens, self.D_MODEL, device=device, dtype=torch.bfloat16)
+        up_weight = torch.randn(
+            self.NUM_EXPERTS, self.D_EXPERT * 2, self.D_MODEL, device=device, dtype=torch.bfloat16
+        ) * 0.02
+        topk_ids = torch.randint(
+            0, self.NUM_EXPERTS, (num_tokens, self.TOP_K), device=device, dtype=torch.int32
+        )
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config.block_m, self.NUM_EXPERTS
+        )
+
+        out_cute = torch.zeros(
+            num_tokens, self.TOP_K, self.D_EXPERT * 2, device=device, dtype=torch.bfloat16
+        )
+        out_triton = torch.zeros(
+            num_tokens, self.TOP_K, self.D_EXPERT * 2, device=device, dtype=torch.bfloat16
+        )
+
+        invoke_cute_moe_up(
+            hidden, up_weight, out_cute,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config,
+        )
+
+        triton_cfg = {
+            "BLOCK_SIZE_M": config.block_m,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 2,
+        }
+        invoke_fused_moe_kernel(
+            hidden, up_weight, out_triton,
+            topk_weights=None,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=self.TOP_K,
+            config=triton_cfg,
+            compute_type=triton.language.bfloat16,
+        )
+
+        torch.testing.assert_close(out_cute, out_triton, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("num_tokens", VARIANT_TOKEN_COUNTS)
+    @pytest.mark.parametrize("config", FP8_WARP_CONFIGS + FP8_WGMMA_CONFIGS,
+                             ids=lambda c: f"m{c.block_m}_{c.kernel_type}")
+    def test_down_kernel_fp8_variants(self, device, num_tokens, config):
+        """Test FP8 down kernel correctness for all kernel type variants."""
+        torch.manual_seed(42)
+
+        from kestrel_kernels.cute_moe import invoke_cute_moe_down_fp8, invoke_cute_moe_down
+        from kestrel.fused_moe.routing import moe_align_block_size
+
+        activation = torch.randn(
+            num_tokens * self.TOP_K, self.D_EXPERT, device=device, dtype=torch.bfloat16
+        )
+        down_weight = torch.randn(
+            self.NUM_EXPERTS, self.D_MODEL, self.D_EXPERT, device=device, dtype=torch.bfloat16
+        ) * 0.02
+        topk_ids = torch.randint(
+            0, self.NUM_EXPERTS, (num_tokens, self.TOP_K), device=device, dtype=torch.int32
+        )
+        topk_weights = torch.randn(num_tokens, self.TOP_K, device=device, dtype=torch.bfloat16)
+
+        def quantize_fp8_rowwise(x: torch.Tensor):
+            abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = abs_max / 448.0
+            x_fp8 = (x / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+            return x_fp8, scale.squeeze(-1).to(torch.float32)
+
+        def quantize_fp8_colwise(w: torch.Tensor):
+            abs_max = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = abs_max / 448.0
+            w_fp8 = (w / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+            return w_fp8, scale.squeeze(-1).to(torch.float32)
+
+        activation_fp8, activation_scale = quantize_fp8_rowwise(activation)
+        down_weight_fp8, down_weight_scale = quantize_fp8_colwise(down_weight)
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config.block_m, self.NUM_EXPERTS
+        )
+
+        out_fp8 = torch.zeros(
+            num_tokens, self.TOP_K, self.D_MODEL, device=device, dtype=torch.bfloat16
+        )
+
+        config_bf16 = CuteMoeConfig(
+            block_m=config.block_m, block_n=64, block_k=64, num_warps=4, num_stages=2,
+            dtype="bf16", kernel_type="warp"
+        )
+        out_ref = torch.zeros(
+            num_tokens, self.TOP_K, self.D_MODEL, device=device, dtype=torch.bfloat16
+        )
+
+        invoke_cute_moe_down_fp8(
+            activation_fp8, activation_scale, down_weight_fp8, down_weight_scale, out_fp8,
+            topk_weights=topk_weights.view(-1),
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config,
+        )
+
+        invoke_cute_moe_down(
+            activation, down_weight, out_ref,
+            topk_weights=topk_weights.view(-1),
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config_bf16,
+        )
+
+        torch.testing.assert_close(out_fp8, out_ref, rtol=0.2, atol=0.4)
+
+    @pytest.mark.parametrize("num_tokens", VARIANT_TOKEN_COUNTS)
+    @pytest.mark.parametrize("config", BF16_WARP_CONFIGS + BF16_WGMMA_CONFIGS,
+                             ids=lambda c: f"m{c.block_m}_{c.kernel_type}")
+    def test_down_kernel_bf16_variants(self, device, num_tokens, config):
+        """Test BF16 down kernel correctness for all kernel type variants."""
+        torch.manual_seed(42)
+
+        from kestrel_kernels.cute_moe import invoke_cute_moe_down
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.kernels import invoke_fused_moe_kernel
+
+        activation = torch.randn(
+            num_tokens * self.TOP_K, self.D_EXPERT, device=device, dtype=torch.bfloat16
+        )
+        down_weight = torch.randn(
+            self.NUM_EXPERTS, self.D_MODEL, self.D_EXPERT, device=device, dtype=torch.bfloat16
+        ) * 0.02
+        topk_ids = torch.randint(
+            0, self.NUM_EXPERTS, (num_tokens, self.TOP_K), device=device, dtype=torch.int32
+        )
+        topk_weights = torch.randn(num_tokens, self.TOP_K, device=device, dtype=torch.bfloat16)
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config.block_m, self.NUM_EXPERTS
+        )
+
+        out_cute = torch.zeros(
+            num_tokens, self.TOP_K, self.D_MODEL, device=device, dtype=torch.bfloat16
+        )
+        out_triton = torch.zeros(
+            num_tokens, self.TOP_K, self.D_MODEL, device=device, dtype=torch.bfloat16
+        )
+
+        invoke_cute_moe_down(
+            activation, down_weight, out_cute,
+            topk_weights=topk_weights.view(-1),
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            config=config,
+        )
+
+        triton_cfg = {
+            "BLOCK_SIZE_M": config.block_m,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_WARPS": 4,
+            "NUM_STAGES": 2,
+        }
+        invoke_fused_moe_kernel(
+            activation, down_weight, out_triton,
+            topk_weights=topk_weights.view(-1),
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=True,
+            top_k=1,
+            config=triton_cfg,
+            compute_type=triton.language.bfloat16,
+        )
+
+        torch.testing.assert_close(out_cute, out_triton, rtol=0, atol=0)

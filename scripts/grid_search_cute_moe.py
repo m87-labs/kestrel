@@ -66,7 +66,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# Enable JIT compilation for autotuning
+# Enable JIT compilation for autotuning (covers both cute_moe and moe_align kernels)
 os.environ["KESTREL_CUTE_MOE_JIT"] = "1"
 
 import torch
@@ -96,40 +96,137 @@ D_EXPERT = 1024
 # Token counts to optimize for (decode + prefill range)
 TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
 
-# Full search space
+# Full search space for BF16 (sweeps both warp and wgmma kernel types)
+# - warp kernel: block_m can be any multiple of 16 up to num_threads
+# - wgmma kernel: block_m must be multiple of 64, num_warps derived
 FULL_SEARCH_SPACE = {
-    "block_m": [16, 32, 64, 128],
+    "kernel_type": ["warp", "wgmma"],
+    "block_m": {
+        "warp": [16, 32, 48, 64, 80, 96, 112, 128],  # multiples of 16
+        "wgmma": [64, 128, 192, 256],                 # multiples of 64
+    },
     "block_n": [32, 64, 128, 256],
     "block_k": [64, 128, 256],
-    "num_warps": [2, 4, 8],
+    "num_warps": [2, 4, 8],  # for warp kernel; wgmma derives from block_m
     "num_stages": [1, 2, 3, 4, 5],
 }
 
 # Quick search space (for faster iteration)
 QUICK_SEARCH_SPACE = {
-    "block_m": [16, 32],
+    "kernel_type": ["warp", "wgmma"],
+    "block_m": {
+        "warp": [16, 32, 64],
+        "wgmma": [64, 128],
+    },
     "block_n": [64, 128, 256],
     "block_k": [128, 256],
     "num_warps": [2, 4],
     "num_stages": [1, 2, 3],
 }
 
-# FP8 search space (different constraints due to WGMMA requirements)
-# - block_m must be divisible by 64 (WGMMA warpgroup constraint)
-# - block_k must be divisible by 32 (FP8 MMA K dimension)
-# - num_warps is derived: (block_m // 64) * 4, not a search parameter
-# - More stages possible since FP8 uses 1 byte vs 2 bytes for BF16
+# FP8 search space - principled pruning based on MoE problem dimensions:
+# - UP kernel: M=tokens*8 distributed across 64 experts, N=1024, K=2048
+# - DOWN kernel: M=tokens*8 distributed across 64 experts, N=2048, K=1024
+#
+# Token-based kernel selection (based on BF16 optimal configs):
+# - Tokens 1-48: warp only (small M tiles, WGMMA overhead not worth it)
+# - Tokens 64-512: both warp and wgmma (transition region)
+# - Tokens 1024+: wgmma only (large M, WGMMA wins at scale)
+#
+# Block_m pruning: only power-of-2 values (16, 32, 64, 128, 192 for WGMMA)
+# Non-power-of-2 (48, 80, 96, 112) rarely optimal in BF16 benchmarks.
+
+def get_fp8_search_space(num_tokens: int) -> dict:
+    """Get FP8 search space pruned based on token count."""
+    # Common parameters across all token counts
+    block_n = [64, 128, 256]
+    block_k_warp = [16, 32, 64, 128]
+    block_k_wgmma = [32, 64, 128, 256]
+    num_warps = [2, 4, 8]
+    num_stages = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    if num_tokens <= 48:
+        # Small tokens: warp kernel only, small block_m
+        return {
+            "kernel_type": ["warp"],
+            "block_m": {"warp": [16, 32]},
+            "block_n": block_n,
+            "block_k": {"warp": block_k_warp},
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    elif num_tokens <= 512:
+        # Medium tokens: both warp and wgmma
+        return {
+            "kernel_type": ["warp", "wgmma"],
+            "block_m": {
+                "warp": [16, 32, 64],
+                "wgmma": [64, 128],
+            },
+            "block_n": block_n,
+            "block_k": {
+                "warp": block_k_warp,
+                "wgmma": block_k_wgmma,
+            },
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    elif num_tokens <= 2048:
+        # Large-medium tokens (1024-2048): both warp and wgmma
+        # Warp kernel may still win due to FP8 memory bandwidth advantage
+        return {
+            "kernel_type": ["warp", "wgmma"],
+            "block_m": {
+                "warp": [16, 32, 64],
+                "wgmma": [64, 128, 192],
+            },
+            "block_n": block_n,
+            "block_k": {
+                "warp": block_k_warp,
+                "wgmma": block_k_wgmma,
+            },
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    else:
+        # Very large tokens (3072+): wgmma only (compute-bound)
+        return {
+            "kernel_type": ["wgmma"],
+            "block_m": {"wgmma": [64, 128, 192]},
+            "block_n": block_n,
+            "block_k": {"wgmma": block_k_wgmma},
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+# Full FP8 search space (for reference, not used directly - use get_fp8_search_space)
 FP8_FULL_SEARCH_SPACE = {
-    "block_m": [64, 128, 192, 256],
+    "kernel_type": ["warp", "wgmma"],
+    "block_m": {
+        "warp": [16, 32, 64],       # pruned: removed 48, 80, 96, 112, 128
+        "wgmma": [64, 128, 192],    # pruned: removed 256 (register pressure)
+    },
     "block_n": [64, 128, 256],
-    "block_k": [32, 64, 128, 256],
+    "block_k": {
+        "warp": [16, 32, 64, 128],   # must be divisible by 16
+        "wgmma": [32, 64, 128, 256], # must be divisible by 32
+    },
+    "num_warps": [2, 4, 8],  # for warp kernel; wgmma derives from block_m
     "num_stages": [1, 2, 3, 4, 5, 6, 7, 8],
 }
 
 FP8_QUICK_SEARCH_SPACE = {
-    "block_m": [64, 128],
+    "kernel_type": ["warp", "wgmma"],
+    "block_m": {
+        "warp": [16, 32],
+        "wgmma": [64, 128],
+    },
     "block_n": [64, 128, 256],
-    "block_k": [64, 128],
+    "block_k": {
+        "warp": [64, 128],
+        "wgmma": [64, 128],
+    },
+    "num_warps": [2, 4],
     "num_stages": [2, 3, 4],
 }
 
@@ -264,7 +361,7 @@ def jit_compile_config(
     is_fp8 = A_scale is not None
     dtype_str = "fp8" if is_fp8 else "bf16"
     print(f"        JIT {kind} ({dtype_str}): m={config.block_m} n={config.block_n} k={config.block_k} "
-          f"w={config.num_warps} s={config.num_stages}...", end="", flush=True)
+          f"w={config.num_warps} s={config.num_stages} t={config.kernel_type}...", end="", flush=True)
     try:
         if is_fp8:
             if kind == "up":
@@ -528,119 +625,131 @@ def run_combined_grid_search(
         print(f"          -> {result.time_us:.2f} us", flush=True)
         return result
 
-    # Test each block_m
-    for block_m in search_space["block_m"]:
-        print(f"\n  block_m={block_m}", flush=True)
+    # Helper to get block_k values (may be dict keyed by kernel_type for FP8)
+    def get_block_k_values(kernel_type: str) -> list[int]:
+        block_k = search_space["block_k"]
+        if isinstance(block_k, dict):
+            return block_k[kernel_type]
+        return block_k
 
-        # Generate shared routing for this block_m
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_m, NUM_EXPERTS
-        )
+    # Test each kernel_type and block_m combination
+    for kernel_type in search_space["kernel_type"]:
+        block_m_values = search_space["block_m"][kernel_type]
+        for block_m in block_m_values:
+            print(f"\n  kernel_type={kernel_type}, block_m={block_m}", flush=True)
 
-        # Generate all configs for this block_m
-        up_configs = []
-        down_configs = []
+            # Generate shared routing for this block_m
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, block_m, NUM_EXPERTS
+            )
 
-        if is_fp8:
-            # FP8: num_warps is derived from block_m, not a search parameter
-            num_warps = (block_m // 64) * 4
-            for block_n, block_k, num_stages in itertools.product(
-                search_space["block_n"],
-                search_space["block_k"],
-                search_space["num_stages"],
-            ):
-                try:
-                    config = CuteMoeConfig(
-                        block_m=block_m,
-                        block_n=block_n,
-                        block_k=block_k,
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                        dtype="fp8",
-                    )
-                except ValueError:
-                    continue
-                # For FP8, config validation handles constraints
-                up_configs.append(config)
-                down_configs.append(config)
-        else:
-            # BF16: num_warps is a search parameter
-            for block_n, block_k, num_warps, num_stages in itertools.product(
-                search_space["block_n"],
-                search_space["block_k"],
-                search_space["num_warps"],
-                search_space["num_stages"],
-            ):
-                try:
-                    config = CuteMoeConfig(
-                        block_m=block_m,
-                        block_n=block_n,
-                        block_k=block_k,
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                        dtype="bf16",
-                    )
-                except ValueError:
-                    continue
-                if is_valid_config(config, "up", num_tokens):
+            # Generate all configs for this block_m and kernel_type
+            up_configs = []
+            down_configs = []
+            block_k_values = get_block_k_values(kernel_type)
+            dtype_str = "fp8" if is_fp8 else "bf16"
+
+            if kernel_type == "wgmma":
+                # WGMMA: num_warps is derived from block_m
+                num_warps = (block_m // 64) * 4
+                for block_n, block_k, num_stages in itertools.product(
+                    search_space["block_n"],
+                    block_k_values,
+                    search_space["num_stages"],
+                ):
+                    try:
+                        config = CuteMoeConfig(
+                            block_m=block_m,
+                            block_n=block_n,
+                            block_k=block_k,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                            dtype=dtype_str,
+                            kernel_type="wgmma",
+                        )
+                    except ValueError:
+                        continue
                     up_configs.append(config)
-                if is_valid_config(config, "down", num_tokens):
                     down_configs.append(config)
+            else:
+                # Warp kernel: num_warps is a search parameter
+                for block_n, block_k, num_warps, num_stages in itertools.product(
+                    search_space["block_n"],
+                    block_k_values,
+                    search_space["num_warps"],
+                    search_space["num_stages"],
+                ):
+                    try:
+                        config = CuteMoeConfig(
+                            block_m=block_m,
+                            block_n=block_n,
+                            block_k=block_k,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                            dtype=dtype_str,
+                            kernel_type="warp",
+                        )
+                    except ValueError:
+                        continue
+                    if is_valid_config(config, "up", num_tokens):
+                        up_configs.append(config)
+                    if is_valid_config(config, "down", num_tokens):
+                        down_configs.append(config)
 
-        # Remove duplicates
-        up_configs = list({(c.block_n, c.block_k, c.num_warps, c.num_stages): c for c in up_configs}.values())
-        down_configs = list({(c.block_n, c.block_k, c.num_warps, c.num_stages): c for c in down_configs}.values())
+            # Remove duplicates (include kernel_type in key)
+            up_configs = list({(c.block_n, c.block_k, c.num_warps, c.num_stages, c.kernel_type): c for c in up_configs}.values())
+            down_configs = list({(c.block_n, c.block_k, c.num_warps, c.num_stages, c.kernel_type): c for c in down_configs}.values())
 
-        print(f"    UP: {len(up_configs)} configs, DOWN: {len(down_configs)} configs", flush=True)
+            print(f"    UP: {len(up_configs)} configs, DOWN: {len(down_configs)} configs", flush=True)
 
-        if not up_configs or not down_configs:
-            print(f"    Skipping: no valid configs", flush=True)
-            continue
+            if not up_configs or not down_configs:
+                print(f"    Skipping: no valid configs", flush=True)
+                continue
 
-        # Compile and benchmark UP configs
-        print(f"    Testing UP configs...", flush=True)
-        up_results = []
-        for config in up_configs:
-            result = compile_and_benchmark(config, "up", sorted_token_ids, expert_ids, num_tokens_post_padded)
-            if result is not None:
-                up_results.append(result)
+            # Compile and benchmark UP configs
+            print(f"    Testing UP configs...", flush=True)
+            up_results = []
+            for config in up_configs:
+                result = compile_and_benchmark(config, "up", sorted_token_ids, expert_ids, num_tokens_post_padded)
+                if result is not None:
+                    up_results.append(result)
 
-        if not up_results:
-            print(f"    No valid UP results", flush=True)
-            continue
-        best_up = min(up_results, key=lambda r: r.time_us)
-        print(f"    Best UP: {best_up.time_us:.2f} us (n={best_up.config.block_n} k={best_up.config.block_k} "
-              f"w={best_up.config.num_warps} s={best_up.config.num_stages})", flush=True)
+            if not up_results:
+                print(f"    No valid UP results", flush=True)
+                continue
+            best_up = min(up_results, key=lambda r: r.time_us)
+            print(f"    Best UP: {best_up.time_us:.2f} us (n={best_up.config.block_n} k={best_up.config.block_k} "
+                  f"w={best_up.config.num_warps} s={best_up.config.num_stages} t={best_up.config.kernel_type})", flush=True)
 
-        # Compile and benchmark DOWN configs
-        print(f"    Testing DOWN configs...", flush=True)
-        down_results = []
-        for config in down_configs:
-            result = compile_and_benchmark(config, "down", sorted_token_ids, expert_ids, num_tokens_post_padded)
-            if result is not None:
-                down_results.append(result)
+            # Compile and benchmark DOWN configs
+            print(f"    Testing DOWN configs...", flush=True)
+            down_results = []
+            for config in down_configs:
+                result = compile_and_benchmark(config, "down", sorted_token_ids, expert_ids, num_tokens_post_padded)
+                if result is not None:
+                    down_results.append(result)
 
-        if not down_results:
-            print(f"    No valid DOWN results", flush=True)
-            continue
-        best_down = min(down_results, key=lambda r: r.time_us)
-        print(f"    Best DOWN: {best_down.time_us:.2f} us (n={best_down.config.block_n} k={best_down.config.block_k} "
-              f"w={best_down.config.num_warps} s={best_down.config.num_stages})", flush=True)
+            if not down_results:
+                print(f"    No valid DOWN results", flush=True)
+                continue
+            best_down = min(down_results, key=lambda r: r.time_us)
+            print(f"    Best DOWN: {best_down.time_us:.2f} us (n={best_down.config.block_n} k={best_down.config.block_k} "
+                  f"w={best_down.config.num_warps} s={best_down.config.num_stages} t={best_down.config.kernel_type})", flush=True)
 
-        total_time = best_up.time_us + best_down.time_us
-        print(f"    TOTAL: {total_time:.2f} us", flush=True)
+            total_time = best_up.time_us + best_down.time_us
+            print(f"    TOTAL: {total_time:.2f} us", flush=True)
 
-        combined_results.append(CombinedBenchResult(
-            block_m=block_m,
-            num_tokens=num_tokens,
-            up_config=best_up.config,
-            up_time_us=best_up.time_us,
-            up_std_us=best_up.std_us,
-            down_config=best_down.config,
-            down_time_us=best_down.time_us,
-            down_std_us=best_down.std_us,
-            total_time_us=total_time,
-        ))
+            combined_results.append(CombinedBenchResult(
+                block_m=block_m,
+                num_tokens=num_tokens,
+                up_config=best_up.config,
+                up_time_us=best_up.time_us,
+                up_std_us=best_up.std_us,
+                down_config=best_down.config,
+                down_time_us=best_down.time_us,
+                down_std_us=best_down.std_us,
+                total_time_us=total_time,
+            ))
 
     return combined_results
 
@@ -653,6 +762,7 @@ def format_config_json(config: CuteMoeConfig) -> dict:
         "block_k": config.block_k,
         "num_warps": config.num_warps,
         "num_stages": config.num_stages,
+        "kernel_type": config.kernel_type,
     }
 
 
@@ -670,9 +780,13 @@ def run_single_token(args) -> None:
     num_tokens = args.token_counts[0]
     kernel_dtype = getattr(args, 'kernel_dtype', 'bf16')
 
-    # Select search space based on kernel dtype
+    # Select search space based on kernel dtype and token count
     if kernel_dtype == "fp8":
-        search_space = FP8_QUICK_SEARCH_SPACE if args.quick else FP8_FULL_SEARCH_SPACE
+        if args.quick:
+            search_space = FP8_QUICK_SEARCH_SPACE
+        else:
+            # Use token-count-aware pruned search space
+            search_space = get_fp8_search_space(num_tokens)
     else:
         search_space = QUICK_SEARCH_SPACE if args.quick else FULL_SEARCH_SPACE
 
@@ -707,11 +821,18 @@ def run_single_token(args) -> None:
         best = min(results, key=lambda r: r.total_time_us)
         print(f"\nBest for tokens={num_tokens}:")
         print(f"  block_m={best.block_m}")
-        print(f"  UP:   {best.up_time_us:.2f} us - n={best.up_config.block_n} k={best.up_config.block_k} "
-              f"w={best.up_config.num_warps} s={best.up_config.num_stages}")
-        print(f"  DOWN: {best.down_time_us:.2f} us - n={best.down_config.block_n} k={best.down_config.block_k} "
-              f"w={best.down_config.num_warps} s={best.down_config.num_stages}")
+        print(f"  UP:   {best.up_time_us:.2f} us - m={best.up_config.block_m} n={best.up_config.block_n} k={best.up_config.block_k} "
+              f"w={best.up_config.num_warps} s={best.up_config.num_stages} t={best.up_config.kernel_type}")
+        print(f"  DOWN: {best.down_time_us:.2f} us - m={best.down_config.block_m} n={best.down_config.block_n} k={best.down_config.block_k} "
+              f"w={best.down_config.num_warps} s={best.down_config.num_stages} t={best.down_config.kernel_type}")
         print(f"  TOTAL: {best.total_time_us:.2f} us")
+
+        # Machine-readable summary line for easy extraction
+        print(f"\n### RESULT tokens={num_tokens} ###")
+        print(f"UP_CONFIG: m={best.up_config.block_m} n={best.up_config.block_n} k={best.up_config.block_k} "
+              f"w={best.up_config.num_warps} s={best.up_config.num_stages} t={best.up_config.kernel_type} time={best.up_time_us:.2f}")
+        print(f"DOWN_CONFIG: m={best.down_config.block_m} n={best.down_config.block_n} k={best.down_config.block_k} "
+              f"w={best.down_config.num_warps} s={best.down_config.num_stages} t={best.down_config.kernel_type} time={best.down_time_us:.2f}")
 
         # Save results
         if args.output:
@@ -833,7 +954,7 @@ def aggregate_results(output_dir: Path) -> None:
         comma = "," if i < len(best_configs) - 1 else ""
         print(f'    "{num_tokens}": {{"block_m": {cfg["block_m"]}, "block_n": {cfg["block_n"]}, '
               f'"block_k": {cfg["block_k"]}, "num_warps": {cfg["num_warps"]}, '
-              f'"num_stages": {cfg["num_stages"]}, "time_us": {time_us:.1f}}}{comma}')
+              f'"num_stages": {cfg["num_stages"]}, "kernel_type": "{cfg["kernel_type"]}", "time_us": {time_us:.1f}}}{comma}')
     print('  },')
 
     # Print down configs
@@ -845,7 +966,7 @@ def aggregate_results(output_dir: Path) -> None:
         comma = "," if i < len(best_configs) - 1 else ""
         print(f'    "{num_tokens}": {{"block_m": {cfg["block_m"]}, "block_n": {cfg["block_n"]}, '
               f'"block_k": {cfg["block_k"]}, "num_warps": {cfg["num_warps"]}, '
-              f'"num_stages": {cfg["num_stages"]}, "time_us": {time_us:.1f}}}{comma}')
+              f'"num_stages": {cfg["num_stages"]}, "kernel_type": "{cfg["kernel_type"]}", "time_us": {time_us:.1f}}}{comma}')
     print('  }')
     print("}")
 
@@ -865,6 +986,21 @@ def aggregate_results(output_dir: Path) -> None:
     aggregate_file.write_text(json.dumps(aggregate_data, indent=2))
     print(f"\nAggregated results saved to: {aggregate_file}")
 
+    # Print summary table
+    print("\n" + "=" * 100)
+    print("SUMMARY TABLE")
+    print("=" * 100)
+    print(f"{'Tokens':>6} | {'UP Time':>8} | {'UP Config':^40} | {'DOWN Time':>9} | {'DOWN Config':^40}")
+    print("-" * 100)
+    for num_tokens in sorted(best_configs.keys()):
+        best = best_configs[num_tokens]
+        up = best["up_config"]
+        down = best["down_config"]
+        up_str = f"m={up['block_m']} n={up['block_n']} k={up['block_k']} w={up['num_warps']} s={up['num_stages']} {up['kernel_type']}"
+        down_str = f"m={down['block_m']} n={down['block_n']} k={down['block_k']} w={down['num_warps']} s={down['num_stages']} {down['kernel_type']}"
+        print(f"{num_tokens:>6} | {best['up_time_us']:>7.1f}us | {up_str:<40} | {best['down_time_us']:>8.1f}us | {down_str:<40}")
+    print("=" * 100)
+
 
 def run_sequential(args) -> None:
     """Run grid search sequentially for all token counts."""
@@ -876,18 +1012,16 @@ def run_sequential(args) -> None:
     token_counts = args.token_counts or TOKEN_COUNTS
     kernel_dtype = getattr(args, 'kernel_dtype', 'bf16')
 
-    # Select search space based on kernel dtype
-    if kernel_dtype == "fp8":
-        search_space = FP8_QUICK_SEARCH_SPACE if args.quick else FP8_FULL_SEARCH_SPACE
-    else:
-        search_space = QUICK_SEARCH_SPACE if args.quick else FULL_SEARCH_SPACE
+    # For BF16, select search space once (not token-dependent)
+    # For FP8, we select inside the loop based on token count
+    bf16_search_space = QUICK_SEARCH_SPACE if args.quick else FULL_SEARCH_SPACE
 
     print(f"CuTe MoE Combined Grid Search")
     print(f"  Device: {torch.cuda.get_device_name()}")
     print(f"  Data dtype: {dtype}")
     print(f"  Kernel dtype: {kernel_dtype}")
     print(f"  Token counts: {token_counts}")
-    print(f"  Search space: {'quick' if args.quick else 'full'}")
+    print(f"  Search space: {'quick' if args.quick else 'full (token-aware for FP8)'}")
     print(f"  Model: E={NUM_EXPERTS}, H={D_MODEL}, I={D_EXPERT}, top_k={TOP_K}")
     print()
 
@@ -900,6 +1034,15 @@ def run_sequential(args) -> None:
         print(f"\n{'='*60}")
         print(f"Token count: {num_tokens}")
         print(f"{'='*60}")
+
+        # Select search space (FP8 uses token-count-aware pruning)
+        if kernel_dtype == "fp8":
+            if args.quick:
+                search_space = FP8_QUICK_SEARCH_SPACE
+            else:
+                search_space = get_fp8_search_space(num_tokens)
+        else:
+            search_space = bf16_search_space
 
         results = run_combined_grid_search(
             num_tokens, search_space,
@@ -942,7 +1085,7 @@ def run_sequential(args) -> None:
         comma = "," if i < len(best_results) - 1 else ""
         print(f'    "{num_tokens}": {{"block_m": {cfg.block_m}, "block_n": {cfg.block_n}, '
               f'"block_k": {cfg.block_k}, "num_warps": {cfg.num_warps}, '
-              f'"num_stages": {cfg.num_stages}, "time_us": {best.up_time_us:.1f}}}{comma}')
+              f'"num_stages": {cfg.num_stages}, "kernel_type": "{cfg.kernel_type}", "time_us": {best.up_time_us:.1f}}}{comma}')
     print('  },')
 
     # Print down configs
@@ -953,7 +1096,7 @@ def run_sequential(args) -> None:
         comma = "," if i < len(best_results) - 1 else ""
         print(f'    "{num_tokens}": {{"block_m": {cfg.block_m}, "block_n": {cfg.block_n}, '
               f'"block_k": {cfg.block_k}, "num_warps": {cfg.num_warps}, '
-              f'"num_stages": {cfg.num_stages}, "time_us": {best.down_time_us:.1f}}}{comma}')
+              f'"num_stages": {cfg.num_stages}, "kernel_type": "{cfg.kernel_type}", "time_us": {best.down_time_us:.1f}}}{comma}')
     print('  }')
     print("}")
 
