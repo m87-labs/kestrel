@@ -14,7 +14,11 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, const_expr
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+import os
 
+
+# Enable JIT compilation for autotuning (set KESTREL_CUTE_MOE_JIT=1)
+_ENABLE_JIT = os.environ.get("KESTREL_CUTE_MOE_JIT", "0") == "1"
 
 # Precompiled kernel registry
 _precompiled_cache: Dict[Tuple, Any] = {}
@@ -97,6 +101,109 @@ def _load_precompiled_kernel(
     kernel_fn = getattr(mod, function_name)
     _precompiled_cache[compile_key] = kernel_fn
     return kernel_fn
+
+
+def _jit_compile_small(
+    topk_dtype: type,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    has_expert_map: bool,
+    config: "MoeAlignCuTeConfig",
+) -> Any:
+    """JIT compile the small path kernel on demand."""
+    t_sym = cute.sym_int()
+    topk_ids_fake = cute.runtime.make_fake_tensor(
+        topk_dtype,
+        (t_sym, topk),
+        stride=(topk, 1),
+        assumed_align=topk_dtype.width // 8,
+    )
+    sorted_fake = cute.runtime.make_fake_tensor(
+        Int32, (cute.sym_int(),), stride=(1,), assumed_align=4,
+    )
+    expert_ids_fake = cute.runtime.make_fake_tensor(
+        Int32, (cute.sym_int(),), stride=(1,), assumed_align=4,
+    )
+    post_fake = cute.runtime.make_fake_tensor(
+        Int32, (1,), stride=(1,), assumed_align=4,
+    )
+    expert_map_fake = cute.runtime.make_fake_tensor(
+        Int32, (num_experts,), stride=(1,), assumed_align=4,
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    # Import here to avoid circular dependency at module load time
+    op = _MoeAlignBlockSizeCuTe(
+        num_experts=num_experts,
+        block_size=block_size,
+        has_expert_map=has_expert_map,
+        config=config,
+    )
+    compiled = cute.compile(
+        op,
+        topk_ids_fake,
+        sorted_fake,
+        expert_ids_fake,
+        post_fake,
+        expert_map_fake,
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled
+
+
+def _jit_compile_large(
+    topk_dtype: type,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    has_expert_map: bool,
+    config: "MoeAlignCuTeConfig",
+) -> Any:
+    """JIT compile the large path kernel on demand."""
+    t_sym = cute.sym_int()
+    topk_ids_fake = cute.runtime.make_fake_tensor(
+        topk_dtype,
+        (t_sym, topk),
+        stride=(topk, 1),
+        assumed_align=topk_dtype.width // 8,
+    )
+    sorted_fake = cute.runtime.make_fake_tensor(
+        Int32, (cute.sym_int(),), stride=(1,), assumed_align=4,
+    )
+    expert_ids_fake = cute.runtime.make_fake_tensor(
+        Int32, (cute.sym_int(),), stride=(1,), assumed_align=4,
+    )
+    post_fake = cute.runtime.make_fake_tensor(
+        Int32, (1,), stride=(1,), assumed_align=4,
+    )
+    expert_map_fake = cute.runtime.make_fake_tensor(
+        Int32, (num_experts,), stride=(1,), assumed_align=4,
+    )
+    cumsum_fake = cute.runtime.make_fake_tensor(
+        Int32, (num_experts,), stride=(1,), assumed_align=4,
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    op = _MoeAlignBlockSizeCuTeLarge(
+        num_experts=num_experts,
+        block_size=block_size,
+        has_expert_map=has_expert_map,
+        config=config,
+    )
+    compiled = cute.compile(
+        op,
+        topk_ids_fake,
+        sorted_fake,
+        expert_ids_fake,
+        post_fake,
+        expert_map_fake,
+        cumsum_fake,
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled
 
 
 @dsl_user_op
@@ -862,14 +969,20 @@ def moe_align_block_size(
                 "small", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
             )
             if precompiled is None:
-                dtype_name = "int32" if topk_dtype == Int32 else "int64"
-                arch = _get_cuda_arch()
-                raise RuntimeError(
-                    f"No precompiled kernel for moe_align_block_size(type=small, "
-                    f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
-                    f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
-                    f"Run precompile_moe_align.py on this architecture to generate it."
-                )
+                if _ENABLE_JIT:
+                    # JIT compile on demand
+                    precompiled = _jit_compile_small(
+                        topk_dtype, topk, int(num_experts), int(block_size), has_expert_map, cfg
+                    )
+                else:
+                    dtype_name = "int32" if topk_dtype == Int32 else "int64"
+                    arch = _get_cuda_arch()
+                    raise RuntimeError(
+                        f"No precompiled kernel for moe_align_block_size(type=small, "
+                        f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                        f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                        f"Run precompile_moe_align.py on this architecture to generate it."
+                    )
             _COMPILE_CACHE_SMALL[key] = precompiled
 
         _COMPILE_CACHE_SMALL[key](
@@ -883,14 +996,20 @@ def moe_align_block_size(
             "large", topk_dtype, topk, int(num_experts), int(block_size), has_expert_map
         )
         if precompiled is None:
-            dtype_name = "int32" if topk_dtype == Int32 else "int64"
-            arch = _get_cuda_arch()
-            raise RuntimeError(
-                f"No precompiled kernel for moe_align_block_size(type=large, "
-                f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
-                f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
-                f"Run precompile_moe_align.py on this architecture to generate it."
-            )
+            if _ENABLE_JIT:
+                # JIT compile on demand
+                precompiled = _jit_compile_large(
+                    topk_dtype, topk, int(num_experts), int(block_size), has_expert_map, cfg
+                )
+            else:
+                dtype_name = "int32" if topk_dtype == Int32 else "int64"
+                arch = _get_cuda_arch()
+                raise RuntimeError(
+                    f"No precompiled kernel for moe_align_block_size(type=large, "
+                    f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
+                    f"block_size={block_size}, has_expert_map={has_expert_map}, arch={arch}). "
+                    f"Run precompile_moe_align.py on this architecture to generate it."
+                )
         _COMPILE_CACHE_LARGE[key] = precompiled
 
     # Reuse a per-stream scratch buffer to avoid per-call allocations on the hot path.

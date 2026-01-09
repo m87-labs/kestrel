@@ -232,28 +232,7 @@ def _invoke_cute_moe_fp8_impl(
     if int(A_fp8_bits.shape[1]) % int(config.block_k) != 0:
         raise ValueError("CuTe FP8 kernel requires K divisible by block_k")
 
-    # Validate config based on which kernel will be used
-    use_wgmma = config.block_m >= 64
-    if use_wgmma:
-        # WGMMA kernel constraints
-        if int(config.block_k) % 32 != 0:
-            raise ValueError("CuTe FP8 WGMMA kernel requires block_k divisible by 32")
-        if int(config.block_m) % 64 != 0:
-            raise ValueError("CuTe FP8 WGMMA kernel requires block_m divisible by 64")
-        expected_warps = (int(config.block_m) // 64) * 4
-        if int(config.num_warps) != expected_warps:
-            raise ValueError(
-                f"CuTe FP8 WGMMA kernel requires num_warps={(config.block_m // 64) * 4} "
-                f"for block_m={config.block_m} (got {config.num_warps})"
-            )
-    else:
-        # Warp-level MMA kernel constraints
-        if int(config.block_k) % 16 != 0:
-            raise ValueError("CuTe FP8 warp kernel requires block_k divisible by 16")
-        if int(config.block_m) not in (16, 32):
-            raise ValueError(
-                f"CuTe FP8 warp kernel requires block_m to be 16 or 32 (got {config.block_m})"
-            )
+    # Config validation is done in CuteMoeConfig.__post_init__
     if B_scale.shape[0] != B_fp8_bits.shape[0] or B_scale.shape[1] != B_fp8_bits.shape[1]:
         raise ValueError("B_scale must have shape [E, N] matching B_fp8_bits")
     if B_scale.stride(-1) != 1:
@@ -294,9 +273,8 @@ def _invoke_cute_moe_fp8_impl(
     if B_scale.dtype != torch.float32:
         B_scale = B_scale.to(dtype=torch.float32)
 
-    # Choose between warp-level MMA (small block_m) and WGMMA (large block_m)
-    # WGMMA requires block_m >= 64; warp-level MMA works for any block_m
-    use_wgmma_fp8 = config.block_m >= 64
+    # Choose between warp-level MMA and WGMMA based on kernel_type config
+    use_wgmma_fp8 = config.kernel_type == "wgmma"
 
     if key not in _COMPILE_CACHE_FP8:
         # Create CuTe tensors only for compilation (to derive tensor signatures)

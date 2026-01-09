@@ -27,13 +27,7 @@ if TYPE_CHECKING:
 
 def _should_use_wgmma_bf16(config: "CuteMoeConfig") -> bool:
     """Check if WGMMA BF16 kernel should be used for the given config."""
-    return (
-        config.block_m >= 128
-        and config.block_m % 64 == 0
-        and config.block_k % 16 == 0
-        and config.num_warps % 4 == 0
-        and config.num_warps == (config.block_m // 64) * 4
-    )
+    return config.kernel_type == "wgmma"
 
 
 class _FusedMoeMatmulCuTeWgmmaBf16:

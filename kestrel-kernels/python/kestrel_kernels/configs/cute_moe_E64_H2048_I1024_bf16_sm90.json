@@ -7,6 +7,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "warp",
       "time_us": 28.8
     },
     "2": {
@@ -15,6 +16,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 49.5
     },
     "4": {
@@ -23,6 +25,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 88.8
     },
     "8": {
@@ -31,6 +34,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 123.2
     },
     "16": {
@@ -39,6 +43,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 161.3
     },
     "24": {
@@ -47,6 +52,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 180.3
     },
     "32": {
@@ -55,6 +61,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 186.7
     },
     "48": {
@@ -63,6 +70,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 4,
+      "kernel_type": "warp",
       "time_us": 189.9
     },
     "64": {
@@ -71,6 +79,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 4,
+      "kernel_type": "warp",
       "time_us": 190.6
     },
     "96": {
@@ -79,6 +88,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 4,
+      "kernel_type": "warp",
       "time_us": 193.1
     },
     "128": {
@@ -87,6 +97,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 194.4
     },
     "256": {
@@ -95,6 +106,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 199.3
     },
     "512": {
@@ -103,6 +115,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 214.9
     },
     "1024": {
@@ -111,6 +124,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 2,
+      "kernel_type": "wgmma",
       "time_us": 261.0
     },
     "1536": {
@@ -119,6 +133,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 302.2
     },
     "2048": {
@@ -127,6 +142,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 358.0
     },
     "3072": {
@@ -135,6 +151,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 487.3
     },
     "4096": {
@@ -143,6 +160,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 593.9
     }
   },
@@ -153,6 +171,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 4,
+      "kernel_type": "warp",
       "time_us": 15.5
     },
     "2": {
@@ -161,6 +180,7 @@
       "block_k": 128,
       "num_warps": 4,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 30.5
     },
     "4": {
@@ -169,6 +189,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 49.5
     },
     "8": {
@@ -177,6 +198,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 67.6
     },
     "16": {
@@ -185,6 +207,7 @@
       "block_k": 256,
       "num_warps": 4,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 86.8
     },
     "24": {
@@ -193,6 +216,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 96.3
     },
     "32": {
@@ -201,6 +225,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 3,
+      "kernel_type": "warp",
       "time_us": 99.6
     },
     "48": {
@@ -209,6 +234,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 102.0
     },
     "64": {
@@ -217,6 +243,7 @@
       "block_k": 256,
       "num_warps": 2,
       "num_stages": 3,
+      "kernel_type": "warp",
       "time_us": 102.4
     },
     "96": {
@@ -225,6 +252,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 2,
+      "kernel_type": "warp",
       "time_us": 103.7
     },
     "128": {
@@ -233,6 +261,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 104.7
     },
     "256": {
@@ -241,6 +270,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 110.3
     },
     "512": {
@@ -249,6 +279,7 @@
       "block_k": 128,
       "num_warps": 2,
       "num_stages": 1,
+      "kernel_type": "warp",
       "time_us": 122.2
     },
     "1024": {
@@ -257,6 +288,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 2,
+      "kernel_type": "wgmma",
       "time_us": 154.9
     },
     "1536": {
@@ -265,6 +297,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 2,
+      "kernel_type": "wgmma",
       "time_us": 179.5
     },
     "2048": {
@@ -273,6 +306,7 @@
       "block_k": 128,
       "num_warps": 8,
       "num_stages": 2,
+      "kernel_type": "wgmma",
       "time_us": 210.5
     },
     "3072": {
@@ -281,6 +315,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 282.1
     },
     "4096": {
@@ -289,6 +324,7 @@
       "block_k": 64,
       "num_warps": 8,
       "num_stages": 3,
+      "kernel_type": "wgmma",
       "time_us": 332.3
     }
   },

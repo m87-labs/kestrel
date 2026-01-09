@@ -481,14 +481,15 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             cot_samples=cfg.cot_samples,
             base_temperature=cfg.temperature,
         )
-        await query_engine(
-            engine,
-            image=warmup_image,
-            prompt=warmup_prompt,
-            reasoning=warmup_reasoning,
-            max_tokens=warmup_max_tokens,
-            temperature=warmup_temp,
-        )
+        for _ in range(2):
+            await query_engine(
+                engine,
+                image=warmup_image,
+                prompt=warmup_prompt,
+                reasoning=warmup_reasoning,
+                max_tokens=warmup_max_tokens,
+                temperature=warmup_temp,
+            )
 
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
     start_time = time.perf_counter()

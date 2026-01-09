@@ -18,11 +18,14 @@ class CuteMoeConfig:
     num_warps: int = 4
     num_stages: int = 2
     dtype: str = "bf16"  # "bf16" or "fp8"
+    kernel_type: str = "warp"  # "warp" or "wgmma"
 
     def __post_init__(self) -> None:
         """Validate config constraints at construction time."""
         if self.dtype not in ("bf16", "fp8"):
             raise ValueError(f"dtype must be 'bf16' or 'fp8', got '{self.dtype}'")
+        if self.kernel_type not in ("warp", "wgmma"):
+            raise ValueError(f"kernel_type must be 'warp' or 'wgmma', got '{self.kernel_type}'")
 
         # CRITICAL: block_m must not exceed num_threads!
         # The kernel's metadata loading loop uses `if tx < block_m` to load per-row
@@ -40,26 +43,49 @@ class CuteMoeConfig:
             self._validate_bf16()
 
     def _validate_bf16(self) -> None:
-        """Validate constraints for BF16 kernel."""
+        """Validate constraints for BF16 kernel based on kernel_type."""
         # block_k must be divisible by 16 (MMA K dimension for BF16).
         if self.block_k % 16 != 0:
             raise ValueError(
                 f"block_k ({self.block_k}) must be divisible by 16 (BF16 MMA K dimension)."
             )
 
-        # block_n must be divisible by 8 * num_warps (Ampere MMA layout constraint).
-        # This applies to the non-WGMMA path (block_m < 64).
-        mma_n_coverage = 8 * self.num_warps
-        if self.block_n % mma_n_coverage != 0:
-            raise ValueError(
-                f"block_n ({self.block_n}) must be divisible by 8 * num_warps ({mma_n_coverage})."
-            )
-
-        # block_n=32 with num_warps=8 fails LDSM alignment verification
-        if self.block_n == 32 and self.num_warps == 8:
-            raise ValueError(
-                "block_n=32 with num_warps=8 causes LDSM alignment verification failure."
-            )
+        if self.kernel_type == "wgmma":
+            # WGMMA constraints
+            if self.block_m % 64 != 0:
+                raise ValueError(
+                    f"BF16 WGMMA requires block_m ({self.block_m}) to be divisible by 64."
+                )
+            if self.block_k % 32 != 0:
+                raise ValueError(
+                    f"BF16 WGMMA requires block_k ({self.block_k}) to be divisible by 32."
+                )
+            # WGMMA requires (block_m // 64) warpgroups, each warpgroup = 4 warps
+            required_warpgroups = self.block_m // 64
+            required_warps = required_warpgroups * 4
+            if self.num_warps != required_warps:
+                raise ValueError(
+                    f"BF16 WGMMA requires num_warps={required_warps} for block_m={self.block_m} "
+                    f"(got {self.num_warps}). Each warpgroup (4 warps) handles 64 rows."
+                )
+        else:  # "warp"
+            # Warp kernel constraints
+            # block_m must be multiple of 16 (MMA atom M dimension)
+            if self.block_m % 16 != 0:
+                raise ValueError(
+                    f"BF16 warp kernel requires block_m ({self.block_m}) to be divisible by 16."
+                )
+            # block_n must be divisible by 8 * num_warps (MMA layout constraint)
+            mma_n_coverage = 8 * self.num_warps
+            if self.block_n % mma_n_coverage != 0:
+                raise ValueError(
+                    f"block_n ({self.block_n}) must be divisible by 8 * num_warps ({mma_n_coverage})."
+                )
+            # block_n=32 with num_warps=8 fails LDSM alignment verification
+            if self.block_n == 32 and self.num_warps == 8:
+                raise ValueError(
+                    "block_n=32 with num_warps=8 causes LDSM alignment verification failure."
+                )
 
         # Shared memory constraint: sA + sB + metadata must fit in H100's 228KB.
         # BF16 = 2 bytes per element.
@@ -76,26 +102,9 @@ class CuteMoeConfig:
                 f"Max ~{max_bytes // 1024}KB."
             )
 
-        # WGMMA warpgroup constraint: when block_m >= 128 and meets WGMMA criteria,
-        # the BF16 WGMMA kernel path requires (block_m // 64) warpgroups.
-        # Each warpgroup = 4 warps, so num_warps must be (block_m // 64) * 4.
-        if self.block_m >= 128 and self.block_m % 64 == 0:
-            required_warpgroups = self.block_m // 64
-            required_warps = required_warpgroups * 4
-            if self.num_warps != required_warps:
-                raise ValueError(
-                    f"WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
-                    f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}. "
-                    f"Each warpgroup (4 warps/128 threads) handles 64 rows of M."
-                )
-
     def _validate_fp8(self) -> None:
-        """Validate constraints for FP8 kernels.
-
-        For block_m >= 64: WGMMA kernel is used with warpgroup constraints.
-        For block_m < 64: Warp-level MMA kernel is used with more flexibility.
-        """
-        if self.block_m >= 64:
+        """Validate constraints for FP8 kernels based on kernel_type."""
+        if self.kernel_type == "wgmma":
             # FP8 WGMMA requires block_m to be a multiple of 64 (one warpgroup per 64 rows).
             if self.block_m % 64 != 0:
                 raise ValueError(
@@ -116,11 +125,26 @@ class CuteMoeConfig:
                     f"FP8 WGMMA constraint: block_m={self.block_m} requires {required_warpgroups} "
                     f"warpgroup(s) = {required_warps} warps, but num_warps={self.num_warps}."
                 )
-        else:
-            # FP8 warp-level MMA kernel: block_m must be 16 or 32 (warp MMA tile sizes)
-            if self.block_m not in (16, 32):
+
+            # Register pressure constraint: m=256 n=256 exceeds register limit.
+            if self.block_m >= 256 and self.block_n >= 256:
                 raise ValueError(
-                    f"FP8 warp kernel requires block_m to be 16 or 32 (got {self.block_m})."
+                    f"FP8 WGMMA: block_m={self.block_m} with block_n={self.block_n} "
+                    f"exceeds register limit. Use smaller tiles."
+                )
+        else:  # "warp"
+            # FP8 warp-level MMA kernel: block_m must be multiple of 16 (MMA atom M dimension)
+            if self.block_m % 16 != 0:
+                raise ValueError(
+                    f"FP8 warp kernel requires block_m ({self.block_m}) to be divisible by 16."
+                )
+            # block_n must be divisible by 8 * num_warps (MMA layout constraint)
+            # MMA atom N=8, warps tile (1, num_warps, 1) in N dimension
+            mma_n_coverage = 8 * self.num_warps
+            if self.block_n % mma_n_coverage != 0:
+                raise ValueError(
+                    f"FP8 warp kernel: block_n ({self.block_n}) must be divisible by "
+                    f"8 * num_warps ({mma_n_coverage})."
                 )
             # block_k should be divisible by 16 for warp-level MMA
             if self.block_k % 16 != 0:
@@ -281,4 +305,5 @@ def get_cute_moe_config(
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
         dtype=dtype,
+        kernel_type=cfg["kernel_type"],
     )

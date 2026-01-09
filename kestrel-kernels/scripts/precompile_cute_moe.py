@@ -33,6 +33,7 @@ class MoeVariant:
     N: int
     K: int
     dtype: str = "bf16"  # "bf16" or "fp8"
+    kernel_type: str = "warp"  # "warp" or "wgmma"
 
     @property
     def mul_routed_weight(self) -> bool:
@@ -44,16 +45,18 @@ class MoeVariant:
 
     def filename(self, arch: str) -> str:
         dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
+        kernel_suffix = "_wgmma" if self.kernel_type == "wgmma" else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}_{arch}.so"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}_{arch}.so"
         )
 
     def function_name(self, arch: str) -> str:
         dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
+        kernel_suffix = "_wgmma" if self.kernel_type == "wgmma" else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}_{arch}"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}_{arch}"
         )
 
 
@@ -106,6 +109,7 @@ def load_variants_from_configs() -> list[MoeVariant]:
                     N=N_dim,
                     K=K_dim,
                     dtype=dtype,
+                    kernel_type=cfg["kernel_type"],
                 )
                 variants.add(variant)
 
@@ -128,13 +132,14 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
         _FusedMoeMatmulCuTe,
         _FusedMoeMatmulCuTeWgmmaBf16,
         _FusedMoeMatmulCuTeFp8,
-        _should_use_wgmma_bf16,
+        _FusedMoeMatmulCuTeWarpFp8,
     )
 
     try:
         dtype_str = f" ({variant.dtype})" if variant.dtype == "fp8" else ""
+        kernel_str = f" [{variant.kernel_type}]"
         print(
-            f"[{os.getpid()}] Compiling: {variant.kind}{dtype_str} N={variant.N} K={variant.K} "
+            f"[{os.getpid()}] Compiling: {variant.kind}{dtype_str}{kernel_str} N={variant.N} K={variant.K} "
             f"m={variant.block_m} n={variant.block_n} k={variant.block_k} "
             f"w={variant.num_warps} s={variant.num_stages}"
         )
@@ -146,6 +151,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
             num_warps=variant.num_warps,
             num_stages=variant.num_stages,
             dtype=variant.dtype,
+            kernel_type=variant.kernel_type,
         )
 
         # Symbolic dimensions for dynamic shapes
@@ -165,7 +171,13 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
             fp8_dtype = Float8E4M3FN
             out_dtype = BFloat16
 
-            op = _FusedMoeMatmulCuTeFp8(
+            # Select kernel class based on kernel_type
+            fp8_cls = (
+                _FusedMoeMatmulCuTeFp8
+                if variant.kernel_type == "wgmma"
+                else _FusedMoeMatmulCuTeWarpFp8
+            )
+            op = fp8_cls(
                 out_dtype,
                 fp8_dtype,
                 config,
@@ -247,9 +259,10 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
         else:
             # BF16 kernel
             dtype = BFloat16
+            # Select kernel class based on kernel_type
             op_cls = (
                 _FusedMoeMatmulCuTeWgmmaBf16
-                if _should_use_wgmma_bf16(config)
+                if variant.kernel_type == "wgmma"
                 else _FusedMoeMatmulCuTe
             )
             op = op_cls(
