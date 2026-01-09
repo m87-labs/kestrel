@@ -794,19 +794,12 @@ class InferenceEngine:
             )
 
         image_obj: Optional[pyvips.Image | np.ndarray] = None
-        image_hash: Optional[bytes] = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
             if not isinstance(image, (pyvips.Image, np.ndarray)):
                 raise TypeError("image must be a pyvips.Image or np.ndarray")
             image_obj = image
-            # Compute image hash for prefix caching
-            if isinstance(image, pyvips.Image):
-                raw_bytes = image.write_to_buffer(".png")
-            else:
-                raw_bytes = image.tobytes()
-            image_hash = hashlib.sha256(raw_bytes).digest()
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)
         tokens = skill_spec.build_prompt_tokens(self.runtime, request_context)

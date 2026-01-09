@@ -5,6 +5,7 @@ Adapted from the Moondream project (Apache-2.0).
 
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 import safetensors
@@ -13,6 +14,32 @@ import torch.nn as nn
 
 from ..ops import precompute_freqs_cis
 from .text import build_tau_pos_tables
+
+
+@dataclass
+class MoEScales:
+    """Per-layer FP8 MoE scales captured during weight loading."""
+
+    up_scales: List[Optional[torch.Tensor]]  # [n_layers] of [E, N] or None
+    down_scales: List[Optional[torch.Tensor]]  # [n_layers] of [E, N] or None
+
+    @classmethod
+    def empty(cls, n_layers: int) -> "MoEScales":
+        return cls(
+            up_scales=[None] * n_layers,
+            down_scales=[None] * n_layers,
+        )
+
+    def has_scales_for_layer(self, layer_idx: int) -> bool:
+        """Check if a specific layer has both up and down scales."""
+        return (
+            self.up_scales[layer_idx] is not None
+            and self.down_scales[layer_idx] is not None
+        )
+
+    def has_any_scales(self) -> bool:
+        """Check if any MoE scales were captured (indicates FP8 checkpoint)."""
+        return any(s is not None for s in self.up_scales)
 
 @contextmanager
 def safetensors_open(path: str):
@@ -27,8 +54,15 @@ def safetensors_open(path: str):
         yield get_tensor
 
 
-def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
+def _assign_text_weights(
+    get_tensor: Callable[[str], torch.Tensor],
+    model: nn.Module,
+    *,
+    moe_scales: Optional[MoEScales] = None,
+    get_raw_tensor: Optional[Callable[[str], torch.Tensor]] = None,
+) -> None:
     text = model.text
+    use_fp8_moe = moe_scales is not None and moe_scales.has_any_scales()
 
     weight_map: Dict[str, torch.Tensor] = {
         "text_model.transformer.embd.wte.weight": text.wte,
@@ -37,6 +71,9 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
         "text_model.lm_head.linear.weight": text["lm_head"].weight,
         "text_model.lm_head.linear.bias": text["lm_head"].bias,
     }
+
+    # Track MoE layers for FP8 handling
+    moe_layers: List[tuple[int, nn.Module]] = []
 
     for i, block in enumerate(text["blocks"]):
         prefix = f"text_model.transformer.h.{i}"
@@ -56,10 +93,20 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
                 {
                     f"{prefix}.gate.weight": block["mlp"]["router"].weight,
                     f"{prefix}.gate.bias": block["mlp"]["router"].bias,
-                    f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].up_experts.weight,
-                    f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].down_experts.weight,
                 }
             )
+            # Check if this specific layer has FP8 scales
+            layer_has_fp8 = use_fp8_moe and moe_scales.has_scales_for_layer(i)
+            if layer_has_fp8:
+                # FP8 MoE weights handled separately below
+                moe_layers.append((i, block))
+            else:
+                weight_map.update(
+                    {
+                        f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].up_experts.weight,
+                        f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].down_experts.weight,
+                    }
+                )
         else:
             weight_map.update(
                 {
@@ -72,6 +119,42 @@ def _assign_text_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Mo
 
     for key, tensor in weight_map.items():
         tensor.data.copy_(get_tensor(key))
+
+    # Handle FP8 MoE weights: load raw FP8 tensors and attach scales
+    if use_fp8_moe and get_raw_tensor is not None:
+        assert moe_scales is not None
+        for layer_idx, block in moe_layers:
+            prefix = f"text_model.transformer.h.{layer_idx}"
+            fused_mlp = block["mlp"]["mlp"]
+
+            # Load FP8 weights (stored as float8_e4m3fn, viewed as uint8)
+            up_weight_fp8 = get_raw_tensor(f"{prefix}.mlp.experts.weight")
+            down_weight_fp8 = get_raw_tensor(f"{prefix}.mlp.output_experts.weight")
+
+            # Convert to uint8 view for storage
+            up_weight_uint8 = up_weight_fp8.view(torch.uint8)
+            down_weight_uint8 = down_weight_fp8.view(torch.uint8)
+
+            # Replace weight data with uint8 FP8 bits
+            # First resize the weight tensor to match uint8 storage
+            up_experts = fused_mlp.up_experts
+            down_experts = fused_mlp.down_experts
+
+            # Create new uint8 weight parameter and copy FP8 bits
+            device = up_experts.weight.device
+            up_experts.weight = nn.Parameter(
+                up_weight_uint8.to(device), requires_grad=False
+            )
+            down_experts.weight = nn.Parameter(
+                down_weight_uint8.to(device), requires_grad=False
+            )
+
+            # Register scale buffers
+            up_scale = moe_scales.up_scales[layer_idx]
+            down_scale = moe_scales.down_scales[layer_idx]
+            assert up_scale is not None and down_scale is not None
+            up_experts.register_buffer("scale", up_scale.to(device))
+            down_experts.register_buffer("scale", down_scale.to(device))
 
     # Tau weights (q/v scaling). Kestrel stores these fused as a single wqwv matrix
     # for performance, but older checkpoints store tau_wq and tau_wv separately.
@@ -211,6 +294,36 @@ def load_text_weights(
     )
 
 
+def _capture_moe_scales(
+    tensors_raw: Dict[str, torch.Tensor],
+    n_layers: int,
+) -> MoEScales:
+    """Extract MoE FP8 scales from raw checkpoint tensors."""
+    moe_scales = MoEScales.empty(n_layers)
+
+    for name, tensor in tensors_raw.items():
+        if not name.startswith("text_model.transformer.h."):
+            continue
+        parts = name.split(".")
+        if len(parts) < 6:
+            continue
+        try:
+            layer_idx = int(parts[3])
+        except ValueError:
+            continue
+        if not (0 <= layer_idx < n_layers):
+            continue
+        if parts[4] != "moe_quant":
+            continue
+        target = parts[5]
+        if target == "up_scale":
+            moe_scales.up_scales[layer_idx] = tensor.detach().clone()
+        elif target == "down_scale":
+            moe_scales.down_scales[layer_idx] = tensor.detach().clone()
+
+    return moe_scales
+
+
 def load_moondream_weights(
     path: str,
     model: nn.Module,
@@ -223,6 +336,9 @@ def load_moondream_weights(
     target_dtype = target_param.dtype
     target_device = target_param.device
 
+    # Determine number of layers for MoE scale capture
+    n_layers = len(model.text.blocks)
+
     def convert(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to(target_dtype)
 
@@ -230,22 +346,47 @@ def load_moondream_weights(
         with safetensors_open(path) as get_tensor:
             name_map = {k.replace("._orig_mod", ""): k for k in get_tensor.keys()}
 
-            def getter(name: str) -> torch.Tensor:
-                raw = get_tensor(name_map[name])
-                if tensor_hook is not None:
-                    tensor_hook(name, raw)
-                return convert(raw)
+            # First pass: collect all tensors to check for MoE scales
+            all_tensors = {}
+            for orig_name in get_tensor.keys():
+                name = orig_name.replace("._orig_mod", "")
+                all_tensors[name] = get_tensor(orig_name)
 
-            _assign_text_weights(getter, model)
+            # Capture MoE scales
+            moe_scales = _capture_moe_scales(all_tensors, n_layers)
+
+            # Call tensor_hook for all tensors
+            if tensor_hook is not None:
+                for name, tensor in all_tensors.items():
+                    tensor_hook(name, tensor)
+
+            def getter(name: str) -> torch.Tensor:
+                return convert(all_tensors[name])
+
+            def raw_getter(name: str) -> torch.Tensor:
+                return all_tensors[name]
+
+            _assign_text_weights(
+                getter, model, moe_scales=moe_scales, get_raw_tensor=raw_getter
+            )
             if load_vision:
                 _assign_vision_weights(getter, model)
             if region is not None:
                 _assign_region_weights(getter, region, convert=convert)
     else:
         tensors_raw = torch.load(path, map_location=target_device, weights_only=True)
-        tensors: dict[str, torch.Tensor] = {}
+
+        # Normalize names and capture MoE scales
+        tensors_normalized: dict[str, torch.Tensor] = {}
         for key, value in tensors_raw.items():
             name = key.replace("._orig_mod", "")
+            tensors_normalized[name] = value
+
+        moe_scales = _capture_moe_scales(tensors_normalized, n_layers)
+
+        # Call tensor_hook and prepare converted tensors
+        tensors: dict[str, torch.Tensor] = {}
+        for name, value in tensors_normalized.items():
             if tensor_hook is not None:
                 tensor_hook(name, value)
             tensors[name] = convert(value)
@@ -253,7 +394,12 @@ def load_moondream_weights(
         def getter(name: str) -> torch.Tensor:
             return tensors[name]
 
-        _assign_text_weights(getter, model)
+        def raw_getter(name: str) -> torch.Tensor:
+            return tensors_normalized[name]
+
+        _assign_text_weights(
+            getter, model, moe_scales=moe_scales, get_raw_tensor=raw_getter
+        )
         if load_vision:
             _assign_vision_weights(getter, model)
         if region is not None:
@@ -263,4 +409,4 @@ def load_moondream_weights(
     _refresh_tau_pos_tables(model)
 
 
-__all__ = ["load_moondream_weights", "load_text_weights"]
+__all__ = ["load_moondream_weights", "load_text_weights", "MoEScales"]

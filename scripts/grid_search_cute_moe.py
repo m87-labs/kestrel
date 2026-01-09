@@ -843,7 +843,7 @@ def run_single_token(args) -> None:
 
 
 def launch_parallel(args) -> None:
-    """Launch all token counts as parallel processes."""
+    """Launch token counts as parallel processes with limited concurrency."""
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -852,15 +852,20 @@ def launch_parallel(args) -> None:
         _LOCK_FILE.unlink()
 
     token_counts = args.token_counts or TOKEN_COUNTS
+    max_parallel = args.max_parallel
 
-    print(f"Launching {len(token_counts)} parallel processes...")
+    print(f"Launching {len(token_counts)} processes ({max_parallel} at a time)...")
     print(f"  Token counts: {token_counts}")
     print(f"  Output dir: {output_dir}")
     print()
 
-    # Launch all processes
-    processes = []
-    for num_tokens in token_counts:
+    # Track running and pending processes
+    pending = list(token_counts)
+    running = []  # (num_tokens, proc, log_file)
+    completed_count = 0
+
+    def launch_one(num_tokens: int):
+        """Launch a single process for a token count."""
         output_file = output_dir / f"tokens{num_tokens}.json"
         log_file = output_dir / f"tokens{num_tokens}.log"
 
@@ -876,26 +881,35 @@ def launch_parallel(args) -> None:
         if args.quick:
             cmd.append("--quick")
 
-        with open(log_file, "w") as log:
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-            processes.append((num_tokens, proc, log_file))
-            print(f"  Started: tokens={num_tokens} (PID {proc.pid})")
+        log = open(log_file, "w")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        print(f"  Started: tokens={num_tokens} (PID {proc.pid})")
+        return (num_tokens, proc, log_file, log)
 
-    print(f"\nAll {len(processes)} processes launched.")
-    print(f"Monitor progress: tail -f {output_dir}/*.log")
+    # Initial batch
+    while pending and len(running) < max_parallel:
+        num_tokens = pending.pop(0)
+        running.append(launch_one(num_tokens))
+
+    print(f"\nMonitor progress: tail -f {output_dir}/*.log")
     print(f"Or check completed: ls -la {output_dir}/*.json")
     print()
 
-    # Wait for all processes to complete
-    completed = 0
-    while processes:
-        for i, (num_tokens, proc, log_file) in enumerate(processes):
+    # Process completions and launch new ones
+    while running:
+        for i, (num_tokens, proc, log_file, log_handle) in enumerate(running):
             ret = proc.poll()
             if ret is not None:
-                completed += 1
+                completed_count += 1
+                log_handle.close()
                 status = "OK" if ret == 0 else f"FAILED (exit {ret})"
-                print(f"  [{completed}/{len(token_counts)}] tokens={num_tokens}: {status}")
-                processes.pop(i)
+                print(f"  [{completed_count}/{len(token_counts)}] tokens={num_tokens}: {status}")
+                running.pop(i)
+
+                # Launch next one if any pending
+                if pending:
+                    next_tokens = pending.pop(0)
+                    running.append(launch_one(next_tokens))
                 break
         else:
             time.sleep(1)
@@ -1121,6 +1135,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CuTe MoE grid search")
     parser.add_argument("--launch-parallel", action="store_true",
                         help="Launch all token counts as parallel processes")
+    parser.add_argument("--max-parallel", type=int, default=5,
+                        help="Max concurrent processes for --launch-parallel (default: 5)")
     parser.add_argument("--num-tokens", type=int, action="append", dest="token_counts",
                         help="Token counts to test (can repeat)")
     parser.add_argument("--output", type=str, help="Write results to JSON file")
