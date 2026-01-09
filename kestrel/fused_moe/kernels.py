@@ -177,16 +177,21 @@ def _fused_moe_kernel_fp8_w8a8(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    # Split-K: extract pid_sk from combined program_id
+    pid_sk_m_n = tl.program_id(axis=0)
+    pid_sk = pid_sk_m_n % SPLIT_K
+    pid_m_n = pid_sk_m_n // SPLIT_K
+
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
+    group_id = pid_m_n // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
+    pid_n = (pid_m_n % num_pid_in_group) // group_size_m
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
@@ -198,37 +203,44 @@ def _fused_moe_kernel_fp8_w8a8(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        _write_zeros_to_output(
-            c_ptr,
-            stride_cm,
-            stride_cn,
-            pid_n,
-            N,
-            offs_token,
-            token_mask,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            compute_type,
-        )
+        # Only first split writes zeros to avoid race conditions
+        if pid_sk == 0:
+            _write_zeros_to_output(
+                c_ptr,
+                stride_cm,
+                stride_cn,
+                pid_n,
+                N,
+                offs_token,
+                token_mask,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                compute_type,
+            )
         return
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_row = offs_token // top_k
-    a_ptrs = a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
+
+    # Split-K: strided K loop - each pid_sk handles K/SPLIT_K elements
+    STEP_K: tl.constexpr = BLOCK_SIZE_K * SPLIT_K
+    base_k = pid_sk * BLOCK_SIZE_K
+
+    a_ptrs = a_ptr + (a_row[:, None] * stride_am + (base_k + offs_k[None, :]) * stride_ak)
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
-        + offs_k[:, None] * stride_bk
+        + (base_k + offs_k[:, None]) * stride_bk
         + offs_bn[None, :] * stride_bn
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    iters = tl.cdiv(K, BLOCK_SIZE_K)
+    iters = tl.cdiv(K, STEP_K)
     for k in range(0, iters):
-        k_base = k * BLOCK_SIZE_K
-        k_mask = (k_base + offs_k) < K
+        iter_k = k * STEP_K + base_k
+        k_mask = (iter_k + offs_k) < K
         a = tl.load(
             a_ptrs,
             mask=token_mask[:, None] & k_mask[None, :],
@@ -240,8 +252,8 @@ def _fused_moe_kernel_fp8_w8a8(
             other=0.0,
         )
         accumulator = tl.dot(a, b, acc=accumulator)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += STEP_K * stride_ak
+        b_ptrs += STEP_K * stride_bk
 
     a_scale = tl.load(
         a_scale_ptr + a_row * stride_asm, mask=token_mask, other=0.0
@@ -261,7 +273,12 @@ def _fused_moe_kernel_fp8_w8a8(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+    # Split-K: use atomic_add when SPLIT_K > 1, else store
+    if SPLIT_K == 1:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+    else:
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
 
 
 def dtype_to_triton(dtype: torch.dtype) -> tl.dtype:
@@ -358,6 +375,7 @@ def invoke_fused_moe_kernel_fp8_w8a8(
     top_k: int,
     config: Dict[str, int],
     compute_type: tl.dtype,
+    split_k: int = 1,
 ) -> None:
     """FP8 W8A8 fused MoE kernel (Triton).
 
@@ -367,6 +385,7 @@ def invoke_fused_moe_kernel_fp8_w8a8(
       - B_fp8: [E, N, K] float8_e4m3fn (quantized)
       - B_scale: [E, N] float32 (per-output-channel scale)
       - C: [num_tokens, top_k, N] bf16/fp16 output (flattened via strides)
+      - split_k: Split-K parallelism factor (default 1 = disabled)
     """
     assert A_fp8.ndim == 2 and A_scale.ndim == 1
     assert B_fp8.ndim == 3 and B_scale.ndim == 2
@@ -381,9 +400,13 @@ def invoke_fused_moe_kernel_fp8_w8a8(
         assert topk_weights is not None
         assert topk_weights.stride(0) == 1
 
+    # Zero output buffer when using Split-K (atomic_add requires zeroed output)
+    if split_k > 1:
+        C.zero_()
+
     EM = sorted_token_ids.size(0)
     grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B_fp8.size(1), META["BLOCK_SIZE_N"]),
+        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B_fp8.size(1), META["BLOCK_SIZE_N"]) * split_k,
     )
 
     topk_ptr = topk_weights if topk_weights is not None else A_scale
@@ -418,6 +441,7 @@ def invoke_fused_moe_kernel_fp8_w8a8(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
+        SPLIT_K=split_k,
         num_warps=config["NUM_WARPS"],
         num_stages=config["NUM_STAGES"],
     )

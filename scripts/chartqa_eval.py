@@ -603,7 +603,7 @@ def parse_args() -> EvalConfig:
         help="Print per-question debugging output.",
     )
     parser.add_argument(
-        "--disable-prefix-caching",
+        "--disable-prefix-cache",
         action="store_true",
         help="Disable prefix caching (enabled by default).",
     )
@@ -623,7 +623,7 @@ def parse_args() -> EvalConfig:
         cot_samples=int(args.cot),
         temperature=float(args.temperature),
         debug=bool(args.debug),
-        enable_prefix_cache=not args.disable_prefix_caching,
+        enable_prefix_cache=not args.disable_prefix_cache,
     )
     return cfg
 
