@@ -298,12 +298,17 @@ class MoondreamRuntime:
         if cfg.enable_prefix_cache:
             self.prefix_cache = RadixPrefixCache()
 
+        # Primary stream for all GPU operations. Created early because PageTable
+        # needs it for H2D copies that must synchronize with graph replay.
+        self._primary_stream = torch.cuda.Stream(device=self.device)
+
         self.page_table = PageTable(
             n_pages=n_pages,
             page_size=self.page_size,
             max_batch_size=self.max_batch_size,
             device=str(self.device),
             prefix_cache=self.prefix_cache,
+            h2d_stream=self._primary_stream,
         )
 
         self.model = MoondreamModel(
@@ -422,11 +427,8 @@ class MoondreamRuntime:
             and self.device.type == "cuda"
         )
 
-        # Primary stream for all GPU operations (prefill, decode, vision, embedding,
-        # sampling, etc.). Using a single stream ensures proper ordering and avoids
-        # synchronization issues with shared buffers.
-        # D2H copies use a separate copy stream for overlap.
-        self._primary_stream = torch.cuda.Stream(device=self.device)
+        # Additional streams: LoRA operations and D2H copies.
+        # (Primary stream was created earlier for PageTable H2D sync.)
         self._lora_stream = torch.cuda.Stream(device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
 
@@ -434,7 +436,6 @@ class MoondreamRuntime:
 
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
-        self._graph_pool: object | None = None
         self._batch_binding: _BatchBinding = _BatchBinding()
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
@@ -983,8 +984,10 @@ class MoondreamRuntime:
         # 5. Allocate batch slot
         batch_idx = self.page_table.allocate()
         # GPU-only buffer avoids async H2D races on shared pinned host memory.
+        # Fill runs on primary stream to synchronize with page table H2D copies.
         batch_tensor = self._prefill_batch_idx
-        batch_tensor.fill_(batch_idx)
+        with torch.cuda.stream(self._primary_stream):
+            batch_tensor.fill_(batch_idx)
 
         # 6. Cache lookup (maps pages, acquires temp lock)
         cache_result = self._lookup_prefix_cache(
@@ -1376,7 +1379,6 @@ class MoondreamRuntime:
                 slot.cuda_graphs = None
 
             self._graph_batch_sizes = []
-            self._graph_pool = None
 
             self._ensure_cuda_graphs_ready()
 
@@ -1513,12 +1515,10 @@ class MoondreamRuntime:
                             self._run_decode_forward(slot, bs)
                             torch.cuda.synchronize(device=device)
 
-                            # Capture the graph
-                            with torch.cuda.graph(graph, self._graph_pool):
+                            # Capture the graph (each graph gets its own pool for isolation)
+                            with torch.cuda.graph(graph):
                                 self._run_decode_forward(slot, bs)
 
-                        if self._graph_pool is None:
-                            self._graph_pool = graph.pool()
                         cuda_graphs[bs] = graph
                         torch.cuda.synchronize(device=device)
                 finally:
