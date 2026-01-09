@@ -120,7 +120,11 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
 
     def _shared_storage_cls(self):
         cosize_kv_stage = self.num_stages_smem * self.tile_tokens * self.head_dim
-        offset_cols = self.bdx + self.bdx // 4
+        # Use larger padding for FP8 (tile_size_per_bdx=2) to avoid bank conflicts.
+        if self.tile_size_per_bdx == 2:
+            offset_cols = self.bdx + self.bdx // 2  # 12 for bdx=8
+        else:
+            offset_cols = self.bdx + self.bdx // 4  # 10 for bdx=8
         cosize_offsets = self.tile_tokens * offset_cols
 
         sK_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_kv, cosize_kv_stage], 16]
@@ -204,14 +208,24 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
             (self.num_stages_smem, self.tile_tokens, self.head_dim),
             stride=(self.tile_tokens * self.head_dim, self.head_dim, 1),
         )
-        offset_cols = self.bdx + self.bdx // 4
+        # Use larger padding for FP8 (tile_size_per_bdx=2) to avoid bank conflicts.
+        # For tile_size_per_bdx=2: offset_cols = bdx + bdx//2 (12 for bdx=8, row stride 24)
+        # For tile_size_per_bdx=4: offset_cols = bdx + bdx//4 (10 for bdx=8, row stride 40)
+        offset_cols = (
+            self.bdx + self.bdx // 2
+            if self.tile_size_per_bdx == 2
+            else self.bdx + self.bdx // 4
+        )
         sOffsets_token_major_layout = cute.make_layout(
             (self.tile_tokens, offset_cols), stride=(offset_cols, 1)
         )
         # sOMerge layout for merging partial outputs across bdz partitions.
-        # Bank conflict avoidance: we use XOR swizzle in the access pattern.
-        # Swizzle formula: c' = c XOR ((c >> 4) * 3) distributes accesses across banks.
-        # This is applied manually at each access site (see _swizzle_col).
+        # Bank conflict avoidance via XOR swizzle at access sites:
+        #   c' = c ^ ((c >> 4) * 3) ^ ((row & 3) << 3)
+        # where row = warp_id * bdy + ty (or tz * bdy + ty for generic path)
+        # - The (c >> 4) * 3 term spreads tx values across banks
+        # - The ((row & 3) << 3) term ensures different rows hit different banks
+        #   (row stride of 128 = 4*32 causes bank conflicts without this)
         sOMerge_layout = cute.make_layout(
             (self.bdz, self.bdy, self.head_dim),
             stride=(self.bdy * self.head_dim, self.head_dim, 1),
@@ -846,10 +860,12 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                             if (tz & Int32(tz_merge_mask)) == Int32(0):
                                 warp_id = tz >> Int32(tz_merge_shift)
                                 for i in cutlass.range_constexpr(self.vec_size):
-                                    # XOR swizzle to avoid bank conflicts: c' = c ^ ((c >> 4) * 3)
+                                    # XOR swizzle to avoid bank conflicts:
+                                    # c' = c ^ ((c >> 4) * 3) ^ ((row & 3) << 3)
                                     c = tx * self.vec_size + i
                                     chunk = c >> Int32(4)
-                                    c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                    row = warp_id * Int32(self.bdy) + ty
+                                    c_swizzled = c ^ (chunk + (chunk << Int32(1))) ^ ((row & Int32(3)) << Int32(3))
                                     sOMerge[warp_id, ty, c_swizzled] = o[i]
                                 if tx == 0:
                                     sM[warp_id, ty] = m
@@ -872,7 +888,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                                         # XOR swizzle to match the store pattern
                                         c = tx * self.vec_size + i
                                         chunk = c >> Int32(4)
-                                        c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                        row = z * self.bdy + ty
+                                        c_swizzled = c ^ (chunk + (chunk << Int32(1))) ^ ((row & Int32(3)) << Int32(3))
                                         oz[i] = sOMerge[z, ty, c_swizzled]
                                     if d_merge == Float32(0.0):
                                         m_merge = mz
@@ -894,10 +911,12 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                     else:
                         if qo_head_active:
                             for i in cutlass.range_constexpr(self.vec_size):
-                                # XOR swizzle to avoid bank conflicts: c' = c ^ ((c >> 4) * 3)
+                                # XOR swizzle to avoid bank conflicts:
+                                # c' = c ^ ((c >> 4) * 3) ^ ((row & 3) << 3)
                                 c = tx * self.vec_size + i
                                 chunk = c >> Int32(4)
-                                c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                row = tz * Int32(self.bdy) + ty
+                                c_swizzled = c ^ (chunk + (chunk << Int32(1))) ^ ((row & Int32(3)) << Int32(3))
                                 sOMerge[tz, ty, c_swizzled] = o[i]
                             if tx == 0:
                                 sM[tz, ty] = m
@@ -918,7 +937,8 @@ class FlashAttentionDecodeSm90PersistentSplitFused:
                                         # XOR swizzle to match the store pattern
                                         c = tx * self.vec_size + i
                                         chunk = c >> Int32(4)
-                                        c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                        row = z * self.bdy + ty
+                                        c_swizzled = c ^ (chunk + (chunk << Int32(1))) ^ ((row & Int32(3)) << Int32(3))
                                         oz[i] = sOMerge[z, ty, c_swizzled]
                                     if d_merge == Float32(0.0):
                                         m_merge = mz
