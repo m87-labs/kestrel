@@ -102,57 +102,57 @@
     },
     "256": {
       "block_m": 64,
-      "block_n": 64,
+      "block_n": 256,
       "block_k": 256,
       "num_warps": 4,
-      "num_stages": 3,
+      "num_stages": 2,
       "kernel_type": "wgmma",
-      "time_us": 272.8
+      "time_us": 115.8
     },
     "512": {
       "block_m": 64,
       "block_n": 256,
       "block_k": 128,
       "num_warps": 4,
-      "num_stages": 4,
-      "kernel_type": "wgmma",
-      "time_us": 235.1
-    },
-    "1024": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
       "num_stages": 5,
       "kernel_type": "wgmma",
-      "time_us": 268.6
+      "time_us": 126.5
     },
-    "1536": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
-      "num_stages": 2,
-      "kernel_type": "wgmma",
-      "time_us": 306.7
-    },
-    "2048": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
-      "num_stages": 2,
-      "kernel_type": "wgmma",
-      "time_us": 346.8
-    },
-    "3072": {
+    "1024": {
       "block_m": 192,
       "block_n": 256,
-      "block_k": 64,
+      "block_k": 128,
       "num_warps": 12,
+      "num_stages": 3,
+      "kernel_type": "wgmma",
+      "time_us": 160.8
+    },
+    "1536": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
       "num_stages": 4,
       "kernel_type": "wgmma",
-      "time_us": 396.4
+      "time_us": 183.8
+    },
+    "2048": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "kernel_type": "wgmma",
+      "time_us": 208.7
+    },
+    "3072": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "kernel_type": "wgmma",
+      "time_us": 276.2
     },
     "4096": {
       "block_m": 192,
@@ -161,7 +161,7 @@
       "num_warps": 12,
       "num_stages": 4,
       "kernel_type": "wgmma",
-      "time_us": 401.1
+      "time_us": 288.5
     }
   },
   "down": {
@@ -267,11 +267,11 @@
     "256": {
       "block_m": 64,
       "block_n": 256,
-      "block_k": 128,
+      "block_k": 256,
       "num_warps": 4,
-      "num_stages": 5,
+      "num_stages": 2,
       "kernel_type": "wgmma",
-      "time_us": 174.6
+      "time_us": 69.2
     },
     "512": {
       "block_m": 64,
@@ -280,53 +280,53 @@
       "num_warps": 4,
       "num_stages": 1,
       "kernel_type": "wgmma",
-      "time_us": 187.6
+      "time_us": 78.7
     },
     "1024": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
-      "num_stages": 4,
-      "kernel_type": "wgmma",
-      "time_us": 213.3
-    },
-    "1536": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
-      "num_stages": 2,
-      "kernel_type": "wgmma",
-      "time_us": 232.5
-    },
-    "2048": {
-      "block_m": 64,
-      "block_n": 256,
-      "block_k": 128,
-      "num_warps": 4,
-      "num_stages": 1,
-      "kernel_type": "wgmma",
-      "time_us": 273.8
-    },
-    "3072": {
       "block_m": 192,
       "block_n": 256,
       "block_k": 128,
       "num_warps": 12,
       "num_stages": 3,
       "kernel_type": "wgmma",
-      "time_us": 303.1
+      "time_us": 108.5
+    },
+    "1536": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "kernel_type": "wgmma",
+      "time_us": 127.0
+    },
+    "2048": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "kernel_type": "wgmma",
+      "time_us": 138.6
+    },
+    "3072": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 128,
+      "num_warps": 8,
+      "num_stages": 4,
+      "kernel_type": "wgmma",
+      "time_us": 179.9
     },
     "4096": {
       "block_m": 192,
       "block_n": 256,
       "block_k": 64,
       "num_warps": 12,
-      "num_stages": 4,
+      "num_stages": 5,
       "kernel_type": "wgmma",
-      "time_us": 306.2
+      "time_us": 193.4
     }
   },
-  "generated": "2026-01-07"
+  "generated": "2026-01-08"
 }

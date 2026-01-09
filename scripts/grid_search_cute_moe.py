@@ -171,25 +171,9 @@ def get_fp8_search_space(num_tokens: int) -> dict:
             "num_warps": num_warps,
             "num_stages": num_stages,
         }
-    elif num_tokens <= 2048:
-        # Large-medium tokens (1024-2048): both warp and wgmma
-        # Warp kernel may still win due to FP8 memory bandwidth advantage
-        return {
-            "kernel_type": ["warp", "wgmma"],
-            "block_m": {
-                "warp": [16, 32, 64],
-                "wgmma": [64, 128, 192],
-            },
-            "block_n": block_n,
-            "block_k": {
-                "warp": block_k_warp,
-                "wgmma": block_k_wgmma,
-            },
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
     else:
-        # Very large tokens (3072+): wgmma only (compute-bound)
+        # Large tokens (1024+): wgmma only
+        # Crossover from warp to wgmma happens at ~256 tokens
         return {
             "kernel_type": ["wgmma"],
             "block_m": {"wgmma": [64, 128, 192]},
