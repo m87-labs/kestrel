@@ -212,6 +212,10 @@ class FlashAttentionDecodeSm90:
         sOffsets_token_major_layout = cute.make_layout(
             (self.tile_tokens, offset_cols), stride=(offset_cols, 1)
         )
+        # sOMerge layout for merging partial outputs across bdz partitions.
+        # Bank conflict avoidance: we use XOR swizzle in the access pattern.
+        # Swizzle formula: c' = c XOR ((c >> 4) * 3) distributes accesses across banks.
+        # This is applied manually at each access site (see _swizzle_col).
         sOMerge_layout = cute.make_layout(
             (self.bdz, self.bdy, self.head_dim),
             stride=(self.bdy * self.head_dim, self.head_dim, 1),
@@ -819,7 +823,11 @@ class FlashAttentionDecodeSm90:
                     if (tz & Int32(tz_merge_mask)) == Int32(0):
                         warp_id = tz >> Int32(tz_merge_shift)
                         for i in cutlass.range_constexpr(self.vec_size):
-                            sOMerge[warp_id, ty, tx * self.vec_size + i] = o[i]
+                            # XOR swizzle to avoid bank conflicts: c' = c ^ ((c >> 4) * 3)
+                            c = tx * self.vec_size + i
+                            chunk = c >> Int32(4)
+                            c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                            sOMerge[warp_id, ty, c_swizzled] = o[i]
                         if tx == 0:
                             sM[warp_id, ty] = m
                             sD[warp_id, ty] = d
@@ -839,7 +847,11 @@ class FlashAttentionDecodeSm90:
                         if dz > Float32(0.0):
                             mz = sM[z, ty]
                             for i in cutlass.range_constexpr(self.vec_size):
-                                oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
+                                # XOR swizzle to match the store pattern
+                                c = tx * self.vec_size + i
+                                chunk = c >> Int32(4)
+                                c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                oz[i] = sOMerge[z, ty, c_swizzled]
                             if d_merge == Float32(0.0):
                                 m_merge = mz
                                 d_merge = dz
@@ -861,7 +873,11 @@ class FlashAttentionDecodeSm90:
                 # Generic merge path (no warp-level tz reduction).
                 if qo_head_active:
                     for i in cutlass.range_constexpr(self.vec_size):
-                        sOMerge[tz, ty, tx * self.vec_size + i] = o[i]
+                        # XOR swizzle to avoid bank conflicts: c' = c ^ ((c >> 4) * 3)
+                        c = tx * self.vec_size + i
+                        chunk = c >> Int32(4)
+                        c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                        sOMerge[tz, ty, c_swizzled] = o[i]
                     if tx == 0:
                         sM[tz, ty] = m
                         sD[tz, ty] = d
@@ -878,7 +894,11 @@ class FlashAttentionDecodeSm90:
                         if dz > Float32(0.0):
                             mz = sM[z, ty]
                             for i in cutlass.range_constexpr(self.vec_size):
-                                oz[i] = sOMerge[z, ty, tx * self.vec_size + i]
+                                # XOR swizzle to match the store pattern
+                                c = tx * self.vec_size + i
+                                chunk = c >> Int32(4)
+                                c_swizzled = c ^ (chunk + (chunk << Int32(1)))
+                                oz[i] = sOMerge[z, ty, c_swizzled]
                             if d_merge == Float32(0.0):
                                 m_merge = mz
                                 d_merge = dz
