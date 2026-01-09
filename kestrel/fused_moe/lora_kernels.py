@@ -3,8 +3,12 @@ import triton
 import triton.language as tl
 
 
-class _ResizableBuffer:
-    """Device-aware buffer that grows as needed and reuses storage."""
+class _FixedBuffer:
+    """Device-aware buffer that is pre-allocated once and never resized.
+
+    After the first allocation, requesting a larger size will raise an error.
+    This ensures CUDA graph replay uses stable pointers.
+    """
 
     def __init__(self) -> None:
         self._tensor: torch.Tensor | None = None
@@ -22,13 +26,19 @@ class _ResizableBuffer:
         if numel == 0:
             return torch.empty(shape, device=device, dtype=dtype)
 
-        if (
-            self._tensor is None
-            or self._tensor.numel() < numel
-            or self._tensor.device != device
-            or self._tensor.dtype != dtype
-        ):
+        if self._tensor is None:
             self._tensor = torch.empty(numel, device=device, dtype=dtype)
+        elif self._tensor.numel() < numel:
+            raise RuntimeError(
+                f"LoRA buffer overflow: requested {numel} elements but "
+                f"only {self._tensor.numel()} allocated. Increase max_seq_length "
+                f"or ensure preallocate_lora_buffers() is called."
+            )
+        elif self._tensor.device != device or self._tensor.dtype != dtype:
+            raise RuntimeError(
+                f"LoRA buffer device/dtype mismatch: buffer on {self._tensor.device} "
+                f"({self._tensor.dtype}), requested {device} ({dtype})."
+            )
         return self._tensor[:numel].view(*shape)
 
 
@@ -317,9 +327,39 @@ def _batched_fused_moe_lora_kernel(
     tl.store(out_ptrs, out_new, mask=out_mask)
 
 
-_BATCHED_INTERMEDIATE_BUFFER = _ResizableBuffer()
-_BATCHED_LORA_OUTPUT_BUFFER = _ResizableBuffer()
-_SINGLE_INTERMEDIATE_BUFFER = _ResizableBuffer()
+_BATCHED_INTERMEDIATE_BUFFER = _FixedBuffer()
+_BATCHED_LORA_OUTPUT_BUFFER = _FixedBuffer()  # Currently unused
+_SINGLE_INTERMEDIATE_BUFFER = _FixedBuffer()
+
+
+def preallocate_lora_buffers(
+    max_num_tokens: int,
+    top_k: int,
+    max_lora_rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Pre-allocate LoRA intermediate buffers to ensure stable pointers.
+
+    Args:
+        max_num_tokens: Maximum tokens in any forward pass.
+        top_k: Number of experts per token.
+        max_lora_rank: Maximum LoRA rank used.
+        device: Target device.
+        dtype: Data type for buffers.
+    """
+    # Both buffers have shape (num_valid_tokens, rank) where num_valid_tokens = M * top_k
+    max_valid_tokens = max_num_tokens * top_k
+    _BATCHED_INTERMEDIATE_BUFFER.get(
+        (max_valid_tokens, max_lora_rank),
+        device=device,
+        dtype=dtype,
+    )
+    _SINGLE_INTERMEDIATE_BUFFER.get(
+        (max_valid_tokens, max_lora_rank),
+        device=device,
+        dtype=dtype,
+    )
 
 
 def _get_lora_kernel_params(

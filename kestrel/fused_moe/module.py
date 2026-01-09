@@ -28,8 +28,12 @@ from kestrel_kernels.cute_moe import (
 )
 
 
-class _ResizableBuffer:
-    """Device-aware buffer that grows as needed and reuses storage."""
+class _FixedBuffer:
+    """Device-aware buffer that is pre-allocated once and never resized.
+
+    After the first allocation, requesting a larger size will raise an error.
+    This ensures CUDA graph replay uses stable pointers.
+    """
 
     def __init__(self) -> None:
         self._tensor: torch.Tensor | None = None
@@ -45,13 +49,22 @@ class _ResizableBuffer:
         if numel == 0:
             return torch.empty(shape, device=device, dtype=dtype)
 
-        if (
-            self._tensor is None
-            or self._tensor.numel() < numel
-            or self._tensor.device != device
-            or self._tensor.dtype != dtype
-        ):
+        if self._tensor is None:
+            # First allocation - create the buffer
             self._tensor = torch.empty(numel, device=device, dtype=dtype)
+        elif self._tensor.numel() < numel:
+            # Buffer too small - this is a bug, workspaces should be pre-allocated
+            raise RuntimeError(
+                f"MoE workspace buffer overflow: requested {numel} elements but "
+                f"only {self._tensor.numel()} allocated. This indicates the buffer "
+                f"was not pre-allocated to sufficient size before CUDA graph capture. "
+                f"Increase max_seq_length or ensure preallocate_workspaces() is called."
+            )
+        elif self._tensor.device != device or self._tensor.dtype != dtype:
+            raise RuntimeError(
+                f"MoE workspace device/dtype mismatch: buffer is on {self._tensor.device} "
+                f"with dtype {self._tensor.dtype}, but requested {device} with {dtype}."
+            )
         return self._tensor[:numel].view(*shape)
 
 
@@ -210,14 +223,92 @@ _HARDCODED_CONFIGS: dict[tuple[int, int], dict[int, dict[str, int]]] = {
 
 class _MoEWorkspaces:
     def __init__(self) -> None:
-        self.up = _ResizableBuffer()
-        self.down = _ResizableBuffer()
-        self.output = _ResizableBuffer()
-        self.activation = _ResizableBuffer()
-        self.lora_up = _ResizableBuffer()
-        self.lora_down = _ResizableBuffer()
-        self.fp8_bits = _ResizableBuffer()
-        self.fp8_scale = _ResizableBuffer()
+        self.up = _FixedBuffer()
+        self.down = _FixedBuffer()
+        self.output = _FixedBuffer()
+        self.activation = _FixedBuffer()
+        self.lora_up = _FixedBuffer()
+        self.lora_down = _FixedBuffer()
+        self.fp8_bits = _FixedBuffer()
+        self.fp8_scale = _FixedBuffer()
+
+
+# Shared workspace for all MoE layers. Since layers execute sequentially,
+# we can safely reuse the same buffers across all layers, reducing memory
+# from O(num_layers * workspace_size) to O(workspace_size).
+_SHARED_MOE_WORKSPACES: _MoEWorkspaces | None = None
+
+
+def get_shared_moe_workspaces() -> _MoEWorkspaces:
+    """Get the shared MoE workspace instance, creating it if needed."""
+    global _SHARED_MOE_WORKSPACES
+    if _SHARED_MOE_WORKSPACES is None:
+        _SHARED_MOE_WORKSPACES = _MoEWorkspaces()
+    return _SHARED_MOE_WORKSPACES
+
+
+def preallocate_shared_moe_workspaces(
+    max_num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+    input_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Pre-allocate shared MoE workspaces to ensure stable pointers for CUDA graphs.
+
+    This must be called before capturing CUDA graphs. All FusedMoEModule instances
+    share these workspaces, so this only needs to be called once.
+
+    Args:
+        max_num_tokens: Maximum tokens in any forward pass (typically max_seq_length - 1).
+        top_k: Number of experts per token.
+        hidden_size: MoE intermediate dimension (expert_inner_dim).
+        input_size: Model hidden dimension.
+        device: Target device.
+        dtype: Data type for workspace tensors.
+    """
+    ws = get_shared_moe_workspaces()
+    ws.up.get(
+        (max_num_tokens, top_k, hidden_size * 2),
+        device=device,
+        dtype=dtype,
+    )
+    ws.activation.get(
+        (max_num_tokens * top_k, hidden_size),
+        device=device,
+        dtype=dtype,
+    )
+    ws.down.get(
+        (max_num_tokens, top_k, input_size),
+        device=device,
+        dtype=dtype,
+    )
+    ws.output.get(
+        (max_num_tokens, input_size),
+        device=device,
+        dtype=dtype,
+    )
+    ws.lora_up.get(
+        (max_num_tokens, top_k, hidden_size * 2),
+        device=device,
+        dtype=dtype,
+    )
+    ws.lora_down.get(
+        (max_num_tokens, top_k, input_size),
+        device=device,
+        dtype=dtype,
+    )
+    ws.fp8_bits.get(
+        (max_num_tokens * top_k, hidden_size),
+        device=device,
+        dtype=torch.uint8,
+    )
+    ws.fp8_scale.get(
+        (max_num_tokens * top_k,),
+        device=device,
+        dtype=torch.float32,
+    )
 
 
 @dataclass
@@ -298,12 +389,16 @@ class FusedMoEModule(nn.Module):
         self.input_size = input_size
         self.num_experts = num_experts
         self.config = config or FusedMoEConfig()
-        self._workspaces = _MoEWorkspaces()
         self._tuned_configs: dict[int, dict[str, int] | None] = {}
         self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
         self._lora_activation_event = torch.cuda.Event(enable_timing=False)
         self._lora_up_event = torch.cuda.Event(enable_timing=False)
         self._lora_down_event = torch.cuda.Event(enable_timing=False)
+
+    @property
+    def _workspaces(self) -> _MoEWorkspaces:
+        """Return the shared MoE workspaces."""
+        return get_shared_moe_workspaces()
 
     def _compute_lora_routing(
         self,

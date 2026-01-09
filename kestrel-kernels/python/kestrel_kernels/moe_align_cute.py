@@ -1172,9 +1172,16 @@ def moe_lora_align_block_size(
     # For LoRA large path, use per-LoRA cumsum buffers to avoid race conditions
     buf_key = (dev_idx, stream_id, int(num_experts), max_loras)
     cumsum_buffer = _CUMSUM_BUFFER_CACHE.get(buf_key)
-    if cumsum_buffer is None or cumsum_buffer.numel() < max_loras * int(num_experts):
-        cumsum_buffer = torch.empty((max_loras * int(num_experts),), device=topk_ids.device, dtype=torch.int32)
+    required_size = max_loras * int(num_experts)
+    if cumsum_buffer is None:
+        cumsum_buffer = torch.empty((required_size,), device=topk_ids.device, dtype=torch.int32)
         _CUMSUM_BUFFER_CACHE[buf_key] = cumsum_buffer
+    elif cumsum_buffer.numel() < required_size:
+        raise RuntimeError(
+            f"LoRA cumsum buffer overflow: requested {required_size} elements but "
+            f"only {cumsum_buffer.numel()} allocated. This indicates the buffer "
+            f"was not pre-allocated for sufficient max_loras before CUDA graph capture."
+        )
 
     _COMPILE_CACHE_LORA_LARGE[key](
         topk_ids,

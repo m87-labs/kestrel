@@ -213,7 +213,11 @@ def _verify_same_expert_buckets(
         )
 
 
-@pytest.mark.parametrize("num_tokens,block_size", [(4, 16), (128, 64)])
+@pytest.mark.parametrize("num_tokens,block_size", [
+    (1, 16), (2, 16), (3, 16), (4, 16), (5, 16), (6, 16), (7, 16), (8, 16),
+    (9, 16), (15, 16), (16, 16), (17, 16), (31, 16), (32, 16), (33, 16),
+    (128, 64), (127, 64), (129, 64),
+])
 def test_moe_align_block_size_cute_matches_cuda(device, num_tokens: int, block_size: int):
     torch.manual_seed(0)
     topk = 8

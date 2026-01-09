@@ -21,9 +21,9 @@ def _torch_moe_sum_reference(x: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("topk", [4, 8])
-def test_moe_sum_matches_reference(device: torch.device, topk: int) -> None:
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 128, 256])
+def test_moe_sum_matches_reference(device: torch.device, topk: int, num_tokens: int) -> None:
     torch.manual_seed(0)
-    num_tokens = 256
     hidden = 2048
     x = torch.randn((num_tokens, topk, hidden), device=device, dtype=torch.bfloat16)
     out = torch.empty((num_tokens, hidden), device=device, dtype=torch.bfloat16)

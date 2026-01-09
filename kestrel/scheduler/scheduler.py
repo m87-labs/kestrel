@@ -172,7 +172,7 @@ class GenerationScheduler:
 
         # Only enter stream context if there's GPU work to do
         if has_forward or has_queued or len(self.running) > 0:
-            with torch.cuda.stream(self.runtime.decode_compute_stream):
+            with torch.cuda.stream(self.runtime.primary_stream):
                 # 1. Launch forward if none in-flight (forward doesn't need mask)
                 if not has_forward and pipeline.can_launch_forward():
                     plan = self.schedule_decode_step()
@@ -403,34 +403,36 @@ class GenerationScheduler:
                 progress = True
                 continue
 
-            first_logits = logits.squeeze(0)
-            sampled_ids, temps, top_ps = self._sample_batch(
-                first_logits.unsqueeze(0), [seq], self._sampled_token_ids
-            )
-            hidden_last = seq.state.last_hidden
-            if hidden_last is None:  # pragma: no cover - defensive
-                raise RuntimeError("Missing last_hidden after prefill")
-            coord_out = self._decode_coord_values[:1]
-            size_out = self._decode_size_values[:1]
-            coord_decode, size_decode = compute_spatial_values(
-                sampled_ids.view(-1),
-                hidden_last,
-                [seq.request],
-                self.runtime.spatial_tables,
-                temperatures=temps,
-                top_ps=top_ps,
-                out_coord=coord_out,
-                out_size=size_out,
-                rng=self._sampling_rng,
-            )
-            batch_idx = seq.state.batch_idx
-            self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
-            self._pending_coord_values[batch_idx].copy_(coord_decode[0])
-            self._pending_size_values[batch_idx].copy_(size_decode[0])
+            # Sampling and spatial decoding on primary stream
+            with torch.cuda.stream(self.runtime.primary_stream):
+                first_logits = logits.squeeze(0)
+                sampled_ids, temps, top_ps = self._sample_batch(
+                    first_logits.unsqueeze(0), [seq], self._sampled_token_ids
+                )
+                hidden_last = seq.state.last_hidden
+                if hidden_last is None:  # pragma: no cover - defensive
+                    raise RuntimeError("Missing last_hidden after prefill")
+                coord_out = self._decode_coord_values[:1]
+                size_out = self._decode_size_values[:1]
+                coord_decode, size_decode = compute_spatial_values(
+                    sampled_ids.view(-1),
+                    hidden_last,
+                    [seq.request],
+                    self.runtime.spatial_tables,
+                    temperatures=temps,
+                    top_ps=top_ps,
+                    out_coord=coord_out,
+                    out_size=size_out,
+                    rng=self._sampling_rng,
+                )
+                batch_idx = seq.state.batch_idx
+                self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
+                self._pending_coord_values[batch_idx].copy_(coord_decode[0])
+                self._pending_size_values[batch_idx].copy_(size_decode[0])
 
-            # Record event for D2H transfer synchronization
-            prefill_done_event = torch.cuda.Event()
-            prefill_done_event.record()
+                # Record event for D2H transfer synchronization
+                prefill_done_event = torch.cuda.Event()
+                prefill_done_event.record()
             transfer = self._render_buffer.transfer(
                 sampled_ids, coord_decode, size_decode, ready_event=prefill_done_event
             )
@@ -513,7 +515,7 @@ class GenerationScheduler:
         Wrapper that enters the compute stream context before calling
         _launch_forward_on_stream. Use this when calling from outside advance().
         """
-        with torch.cuda.stream(self.runtime.decode_compute_stream):
+        with torch.cuda.stream(self.runtime.primary_stream):
             return self._launch_forward_on_stream(plan, slot_id)
 
     def _launch_forward_on_stream(

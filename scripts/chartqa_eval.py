@@ -691,11 +691,11 @@ def print_results(results: Dict[str, Any]) -> None:
 
         # Request latency stats (prefill + decode)
         if request_times_ms:
-            mean_ms = sum(request_times_ms) / len(request_times_ms)
+            p50_ms = percentile(request_times_ms, 50)
             p90_ms = percentile(request_times_ms, 90)
             p99_ms = percentile(request_times_ms, 99)
             print(f"\nRequest Latency (prefill + decode):")
-            print(f"  Mean: {mean_ms:.2f} ms")
+            print(f"  P50:  {p50_ms:.2f} ms")
             print(f"  P90:  {p90_ms:.2f} ms")
             print(f"  P99:  {p99_ms:.2f} ms")
 
