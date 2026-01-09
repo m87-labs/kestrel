@@ -669,6 +669,40 @@ class MoondreamRuntime:
             return [TextToken(int(tid)) for tid in tokens_view[0].tolist()]
         return list(prompt_tokens)
 
+    def check_prefix_cache(
+        self,
+        tokens_list: list[Token],
+        image_hash: bytes | None,
+        adapter_id: str | None,
+    ) -> bool:
+        """Check if an image+tokens combo would hit the prefix cache.
+
+        This is a lightweight check that does not acquire locks or map pages.
+        Used for early cache lookup to skip crop computation on cache hits.
+
+        Returns True if the cache would hit and cover the full image prefix.
+        """
+        if self.prefix_cache is None:
+            return False
+        if image_hash is None:
+            return False
+
+        image_kv_length = self.image_prefix_length
+        cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
+
+        # Build namespace
+        image_hash_int = int.from_bytes(image_hash[:16], "big")
+        namespace = CacheNamespace(
+            lora_id=adapter_id,
+            image_hash=image_hash_int,
+        )
+
+        match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
+
+        # Cache hit must cover at least BOS + full image prefix
+        min_hit_length = 1 + image_kv_length
+        return match.matched_kv_length >= min_hit_length
+
     def _build_cache_tokens(
         self,
         tokens_list: list[Token],

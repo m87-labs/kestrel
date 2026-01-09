@@ -811,7 +811,7 @@ class InferenceEngine:
             prompt_tokens=tokens_cpu,
             prompt_length=tokens_cpu.shape[1],
             image=image_obj,
-            image_hash=image_hash,
+            image_hash=None,  # Computed in scheduler thread if prefix cache enabled
             max_new_tokens=max_new_tokens,
             temperature=self._normalize_temperature(temperature),
             top_p=self._normalize_top_p(top_p),
@@ -986,6 +986,24 @@ class InferenceEngine:
             if req.image is None:
                 admit_request(req, None)
                 return
+
+            # Compute image hash and check prefix cache for early skip
+            if runtime.prefix_cache is not None:
+                # Hash using raw bytes (faster than PNG encoding)
+                if isinstance(req.image, np.ndarray):
+                    raw_bytes = req.image.tobytes()
+                else:
+                    raw_bytes = req.image.write_to_memory()
+                image_hash = hashlib.sha256(raw_bytes).digest()
+                req.image_hash = image_hash
+
+                # Early cache lookup - skip crop computation if cache hit
+                tokens_list = runtime._normalize_prompt_tokens(req.prompt_tokens)
+                if runtime.check_prefix_cache(tokens_list, image_hash, req.adapter):
+                    admit_request(req, None)  # No crops needed
+                    return
+
+            # Cache miss or prefix cache disabled - compute crops
             executor = self._image_executor
             if executor is None:
                 try:
