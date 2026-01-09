@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Precompile MoE align kernel variants for AOT deployment."""
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ from kestrel_kernels.moe_align_cute import (
     _MoeAlignBlockSizeCuTeLora,
     _MoeAlignBlockSizeCuTeLargeLora,
 )
+
+# Path to config JSON files
+_CONFIGS_DIR = Path(__file__).parent.parent / "python" / "kestrel_kernels" / "configs"
 
 
 @dataclass(frozen=True)
@@ -58,35 +62,80 @@ def get_cuda_arch() -> str:
     return f"sm{major}{minor}"
 
 
-# Default variants to precompile for Kestrel's MoE configuration
-# These cover both small-batch (decode) and large-batch (prefill) scenarios
-PRECOMPILE_VARIANTS = [
-    # block_size=128 variants - Int64
-    MoeAlignVariant("small", Int64, 8, 64, 128, False),
-    MoeAlignVariant("large", Int64, 8, 64, 128, False),
-    MoeAlignVariant("lora_small", Int64, 8, 64, 128, False),
-    MoeAlignVariant("lora_large", Int64, 8, 64, 128, False),
-    # block_size=128 variants - Int32
-    MoeAlignVariant("small", Int32, 8, 64, 128, False),
-    MoeAlignVariant("large", Int32, 8, 64, 128, False),
-    MoeAlignVariant("lora_small", Int32, 8, 64, 128, False),
-    MoeAlignVariant("lora_large", Int32, 8, 64, 128, False),
-    # block_size=64 variants - Int32 (for smaller batch sizes)
-    MoeAlignVariant("small", Int32, 8, 64, 64, False),
-    MoeAlignVariant("large", Int32, 8, 64, 64, False),
-    # block_size=32 variants - Int32 (for very small batch sizes)
-    MoeAlignVariant("small", Int32, 8, 64, 32, False),
-    MoeAlignVariant("large", Int32, 8, 64, 32, False),
-    # block_size=16 variants - Int32 (for tiny batch sizes)
-    MoeAlignVariant("small", Int32, 8, 64, 16, False),
-    MoeAlignVariant("large", Int32, 8, 64, 16, False),
-    # block_size=192 variants - Int32 (for FP8 with 3 warpgroups)
-    MoeAlignVariant("small", Int32, 8, 64, 192, False),
-    MoeAlignVariant("large", Int32, 8, 64, 192, False),
-    # block_size=256 variants - Int32 (for FP8 with 4 warpgroups)
-    MoeAlignVariant("small", Int32, 8, 64, 256, False),
-    MoeAlignVariant("large", Int32, 8, 64, 256, False),
-]
+def get_block_m_values_from_configs(arch: str) -> set[int]:
+    """Extract all unique block_m values from cute_moe config JSON files.
+
+    Args:
+        arch: CUDA architecture string (e.g., 'sm90')
+
+    Returns:
+        Set of unique block_m values found across all config files for the given arch.
+    """
+    block_m_values: set[int] = set()
+
+    if not _CONFIGS_DIR.exists():
+        print(f"Warning: Config directory {_CONFIGS_DIR} does not exist")
+        return block_m_values
+
+    # Find all config files for this architecture
+    pattern = f"cute_moe_*_{arch}.json"
+    config_files = list(_CONFIGS_DIR.glob(pattern))
+
+    if not config_files:
+        print(f"Warning: No config files found matching {pattern} in {_CONFIGS_DIR}")
+        return block_m_values
+
+    for config_file in config_files:
+        try:
+            with open(config_file) as f:
+                configs = json.load(f)
+
+            # Extract block_m from both "up" and "down" sections
+            for section in ("up", "down"):
+                section_configs = configs.get(section, {})
+                for cfg in section_configs.values():
+                    if "block_m" in cfg:
+                        block_m_values.add(cfg["block_m"])
+
+            print(f"Loaded block_m values from {config_file.name}")
+        except Exception as e:
+            print(f"Warning: Failed to load {config_file}: {e}")
+
+    return block_m_values
+
+
+def generate_precompile_variants(arch: str) -> list[MoeAlignVariant]:
+    """Generate precompile variants based on block_m values from config files.
+
+    Args:
+        arch: CUDA architecture string (e.g., 'sm90')
+
+    Returns:
+        List of MoeAlignVariant to precompile.
+    """
+    block_m_values = get_block_m_values_from_configs(arch)
+
+    if not block_m_values:
+        # Fallback to default values if no configs found
+        print("Warning: No block_m values found in configs, using defaults")
+        block_m_values = {16, 32, 64, 128}
+
+    print(f"Block_m values from configs: {sorted(block_m_values)}")
+
+    variants = []
+
+    # Generate all kernel types for each block_size and dtype
+    kernel_types = ["small", "large", "lora_small", "lora_large"]
+    dtypes = [Int32, Int64]
+
+    for block_size in sorted(block_m_values):
+        for dtype in dtypes:
+            for kernel_type in kernel_types:
+                variants.append(
+                    MoeAlignVariant(kernel_type, dtype, 8, 64, block_size, False)
+                )
+
+    return variants
 
 
 def compile_variant(variant: MoeAlignVariant, arch: str, output_dir: Path) -> Path:
@@ -307,11 +356,15 @@ def main():
     if not init_file.exists():
         init_file.write_text('"""Precompiled CuTe DSL kernels."""\n')
 
+    # Generate variants based on config files
+    variants = generate_precompile_variants(arch)
+    print(f"Total variants to compile: {len(variants)}")
+
     # Compile all variants for the current architecture
     failed = []
     succeeded = []
 
-    for variant in PRECOMPILE_VARIANTS:
+    for variant in variants:
         try:
             so_path = compile_variant(variant, arch, output_dir)
             succeeded.append((variant, so_path))
