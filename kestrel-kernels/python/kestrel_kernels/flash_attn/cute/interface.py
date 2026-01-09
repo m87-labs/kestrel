@@ -391,6 +391,7 @@ def _flash_attn_fwd(
     #
     # Default behavior: enable only during CUDA graph capture (decode is graph-replayed in
     # production) and only for small batches where the baseline grid under-fills the GPU.
+    #
     sm90_persist_oversub = 4
     sm90_persistent_split_enabled = (
         torch.cuda.is_current_stream_capturing()

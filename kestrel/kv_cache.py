@@ -1,4 +1,5 @@
 
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -9,6 +10,13 @@ import triton.language as tl
 from kestrel_kernels.kv_cache_write import reshape_and_cache_flash as reshape_and_cache_flash_cuda
 
 from kestrel.utils import CpuGpuBuffer
+
+
+def _maybe_stream_context(stream: torch.cuda.Stream | None):
+    """Return a stream context manager, or nullcontext if stream is None."""
+    if stream is not None:
+        return torch.cuda.stream(stream)
+    return nullcontext()
 
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
@@ -123,11 +131,15 @@ class PageTable:
         max_batch_size: int,
         device: str = "cuda",
         prefix_cache=None,
+        *,
+        h2d_stream: torch.cuda.Stream | None = None,
     ):
         self.n_pages = n_pages
         self.page_size = page_size
         self.max_batch_size = max_batch_size
         self.device = device
+        # Stream for H2D copies (ensures proper synchronization with graph replay)
+        self._h2d_stream = h2d_stream
 
         # page table: [logical_batch_idx, logical_block_idx] -> physical_page_idx
         self._page_table_buffer = CpuGpuBuffer(
@@ -391,10 +403,14 @@ class PageTable:
             return
         gpu_slice = self.page_table[batch_idx, start:end]
         cpu_slice = self._page_table_cpu_tensor[batch_idx, start:end]
-        gpu_slice.copy_(cpu_slice, non_blocking=True)
+        # Use the designated H2D stream to avoid races with graph replay.
+        with _maybe_stream_context(self._h2d_stream):
+            gpu_slice.copy_(cpu_slice, non_blocking=True)
 
     def _sync_full_page_table(self) -> None:
-        self._page_table_buffer.copy_to_gpu()
+        # Use the designated H2D stream to avoid races with graph replay.
+        with _maybe_stream_context(self._h2d_stream):
+            self._page_table_buffer.copy_to_gpu()
 
     # =========================================================================
     # Prefix cache integration methods
