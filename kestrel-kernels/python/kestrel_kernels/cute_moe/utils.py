@@ -263,6 +263,276 @@ def i32_to_f16x2(packed_i32: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def cvt_bf16_to_f16(bf16_val, *, loc=None, ip=None):
+    """Convert a single BF16 value to F16 (single PTX instruction).
+
+    Input: BF16 value
+    Output: F16 value
+
+    Uses cvt.rn.f16.bf16 which is a single instruction on SM90.
+    """
+    ir_bf16 = bf16_val.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_bf16, loc=loc, ip=ip)
+
+    result_i16 = llvm.inline_asm(
+        T.i16(),
+        [ir_i16],
+        "cvt.rn.f16.bf16 $0, $1;",
+        "=h,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    result_f16 = llvm.bitcast(T.f16(), result_i16, loc=loc, ip=ip)
+    return result_f16
+
+
+@dsl_user_op
+def load_bf16x2_as_i32(ptr, *, loc=None, ip=None) -> Int32:
+    """Load 2 consecutive BF16 values from gmem as an Int32.
+
+    Input: pointer to gmem (Int64 address)
+    Output: Int32 containing {bf16[1], bf16[0]}
+
+    Uses ld.global.b32 for a single 32-bit load.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [ptr],
+        "ld.global.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def cvt_bf16x2_to_f16x2(packed_bf16x2: Int32, *, loc=None, ip=None) -> Int32:
+    """Convert 2 packed BF16 values to 2 packed F16 values (2 PTX instructions).
+
+    Input: 32-bit register with 2 packed BF16 values {bf16[1], bf16[0]}
+    Output: 32-bit register containing 2 packed F16 values {f16[1], f16[0]}
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(packed_bf16x2).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 bf16_0, bf16_1, f16_0, f16_1;
+            mov.b32 {bf16_0, bf16_1}, $1;
+            cvt.rn.f16.bf16 f16_0, bf16_0;
+            cvt.rn.f16.bf16 f16_1, bf16_1;
+            mov.b32 $0, {f16_0, f16_1};
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def cvt_bf16_to_f16_simple(bf16_in_f16_slot, *, loc=None, ip=None):
+    """Convert a single BF16 value to F16.
+
+    Input: F16-typed value that actually holds a BF16 value (from ldmatrix)
+    Output: F16 value
+
+    Used for W8A16 kernel where A is loaded as contiguous BF16 values.
+    Each smem slot holds one BF16, and ldmatrix loads it into an F16-typed register.
+    """
+    ir_f16 = bf16_in_f16_slot.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_f16, loc=loc, ip=ip)
+
+    result_i16 = llvm.inline_asm(
+        T.i16(),
+        [ir_i16],
+        "cvt.rn.f16.bf16 $0, $1;",
+        "=h,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    result_f16 = llvm.bitcast(T.f16(), result_i16, loc=loc, ip=ip)
+    return result_f16
+
+
+@dsl_user_op
+def cvt_bf16x2_to_f16x2_deinterleaved(packed_bf16_in_f16, *, loc=None, ip=None):
+    """Convert BF16 to F16 (placeholder - returns same value for both lo/hi).
+
+    This is a compatibility wrapper. For W8A16 with proper even/odd split,
+    the kernel needs to handle the register-level deinterleave differently.
+    """
+    ir_f16 = packed_bf16_in_f16.ir_value(loc=loc, ip=ip)
+    ir_i16 = llvm.bitcast(T.i16(), ir_f16, loc=loc, ip=ip)
+
+    result_i16 = llvm.inline_asm(
+        T.i16(),
+        [ir_i16],
+        "cvt.rn.f16.bf16 $0, $1;",
+        "=h,h",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    result_f16 = llvm.bitcast(T.f16(), result_i16, loc=loc, ip=ip)
+    # Return same value for both - kernel needs proper register handling
+    return result_f16, result_f16
+
+
+@dsl_user_op
+def deinterleave_f16x4(packed_01: Int32, packed_23: Int32, *, loc=None, ip=None):
+    """Deinterleave 4 F16 values from 2 packed pairs into even/odd pairs.
+
+    Input:
+      packed_01: {f16[1], f16[0]}  (hi=1, lo=0)
+      packed_23: {f16[3], f16[2]}  (hi=3, lo=2)
+
+    Output:
+      even: {f16[2], f16[0]}  (hi=2, lo=0)
+      odd:  {f16[3], f16[1]}  (hi=3, lo=1)
+
+    Uses PRMT for efficient permutation.
+    """
+    ir_01 = Int32(packed_01).ir_value(loc=loc, ip=ip)
+    ir_23 = Int32(packed_23).ir_value(loc=loc, ip=ip)
+
+    # PRMT(a, b, selector) selects bytes from {b, a} based on selector nibbles
+    # packed_01 = [byte3:byte2 | byte1:byte0] = {f16[1] | f16[0]}
+    # packed_23 = [byte3:byte2 | byte1:byte0] = {f16[3] | f16[2]}
+    # For even: want {f16[2], f16[0]} = bytes [23_byte1:23_byte0 | 01_byte1:01_byte0]
+    #   = PRMT(packed_01, packed_23, 0x5410) where:
+    #     nibble 0 -> byte 0 of result = byte 0 of a (01_byte0)
+    #     nibble 1 -> byte 1 of result = byte 1 of a (01_byte1)
+    #     nibble 2 -> byte 2 of result = byte 4 of {b,a} = byte 0 of b (23_byte0)
+    #     nibble 3 -> byte 3 of result = byte 5 of {b,a} = byte 1 of b (23_byte1)
+    even = llvm.inline_asm(
+        T.i32(),
+        [ir_01, ir_23],
+        "prmt.b32 $0, $1, $2, 0x5410;",
+        "=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    # For odd: want {f16[3], f16[1]} = bytes [23_byte3:23_byte2 | 01_byte3:01_byte2]
+    #   = PRMT(packed_01, packed_23, 0x7632)
+    odd = llvm.inline_asm(
+        T.i32(),
+        [ir_01, ir_23],
+        "prmt.b32 $0, $1, $2, 0x7632;",
+        "=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+    return Int32(even), Int32(odd)
+
+
+@dsl_user_op
+def bitcast_f16x2_to_i32(f16x2, *, loc=None, ip=None) -> Int32:
+    """Bitcast packed F16x2 (from ldmatrix) to Int32 for register manipulation.
+
+    Input: F16x2 value from tensor element (2 packed F16 in a 32-bit register)
+    Output: Int32 with same bit pattern
+    """
+    from cutlass._mlir import ir as mlir_ir
+
+    # f16x2 might be a tuple of 2 F16 values from tensor indexing
+    # We need to pack them into a single i32
+    if hasattr(f16x2, '__iter__') or isinstance(f16x2, tuple):
+        # It's a tuple (f16_lo, f16_hi) - pack into i32
+        f16_lo, f16_hi = f16x2
+        ir_lo = f16_lo if hasattr(f16_lo, 'ir_value') else f16_lo
+        ir_hi = f16_hi if hasattr(f16_hi, 'ir_value') else f16_hi
+        if hasattr(ir_lo, 'ir_value'):
+            ir_lo = ir_lo.ir_value(loc=loc, ip=ip)
+        if hasattr(ir_hi, 'ir_value'):
+            ir_hi = ir_hi.ir_value(loc=loc, ip=ip)
+
+        # Bitcast each f16 to i16
+        i16_lo = llvm.bitcast(T.i16(), ir_lo, loc=loc, ip=ip)
+        i16_hi = llvm.bitcast(T.i16(), ir_hi, loc=loc, ip=ip)
+
+        # Pack into i32: {hi, lo}
+        result = llvm.inline_asm(
+            T.i32(),
+            [i16_lo, i16_hi],
+            "mov.b32 $0, {$1, $2};",
+            "=r,h,h",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+        return Int32(result)
+    else:
+        # Single value - assume it's already a packed representation
+        ir_val = f16x2.ir_value(loc=loc, ip=ip) if hasattr(f16x2, 'ir_value') else f16x2
+        # Get the type and bitcast appropriately
+        f16_type = mlir_ir.F16Type.get()
+        vec_type = mlir_ir.VectorType.get([2], f16_type)
+        # Try to bitcast - if it fails, it might already be i32
+        try:
+            result = llvm.bitcast(T.i32(), ir_val, loc=loc, ip=ip)
+            return Int32(result)
+        except Exception:
+            return Int32(ir_val)
+
+
+@dsl_user_op
+def bitcast_i32_to_f16x2(i32_val: Int32, *, loc=None, ip=None):
+    """Bitcast Int32 to F16x2 tuple for storing back to tensor fragment.
+
+    Input: Int32 containing 2 packed F16 values
+    Output: Tuple of (f16_lo, f16_hi)
+    """
+    from cutlass._mlir import ir as mlir_ir
+    from cutlass._mlir.dialects import arith
+
+    ir_i32 = Int32(i32_val).ir_value(loc=loc, ip=ip)
+
+    # Bitcast i32 to vector<2 x f16>
+    f16_type = mlir_ir.F16Type.get()
+    vec_type = mlir_ir.VectorType.get([2], f16_type)
+    vec_f16x2 = llvm.bitcast(vec_type, ir_i32, loc=loc, ip=ip)
+
+    # Extract elements
+    idx_0 = arith.constant(T.i32(), 0, loc=loc, ip=ip)
+    idx_1 = arith.constant(T.i32(), 1, loc=loc, ip=ip)
+    f16_lo = llvm.extractelement(vec_f16x2, idx_0, loc=loc, ip=ip)
+    f16_hi = llvm.extractelement(vec_f16x2, idx_1, loc=loc, ip=ip)
+
+    return f16_lo, f16_hi
+
+
+@dsl_user_op
+def store_smem_b32(value: Int32, smem_ptr, *, loc=None, ip=None) -> None:
+    """Store 32 bits to shared memory.
+
+    Input: value (Int32), smem_ptr (Int64 address)
+    """
+    llvm.inline_asm(
+        None,
+        [smem_ptr, Int32(value).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cvt_fp8x2_to_f16_both(packed_fp8_in_f16, *, loc=None, ip=None):
     """Convert 2 packed FP8 to 2 separate F16 values using LLVM vector extraction.
 

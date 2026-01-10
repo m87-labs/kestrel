@@ -510,6 +510,9 @@ class MoondreamRuntime:
             for slot_id in range(2)
         ]
 
+        # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
+        self._preallocate_workspaces()
+
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
 
@@ -1331,7 +1334,8 @@ class MoondreamRuntime:
 
         if is_new:
             try:
-                self._lora_workspace.load_slot_(slot, adapter)
+                with torch.cuda.stream(self._primary_stream):
+                    self._lora_workspace.load_slot_(slot, adapter)
             except Exception:
                 # Rollback on load failure
                 self._slot_manager.release_on_error(slot)
@@ -1389,11 +1393,6 @@ class MoondreamRuntime:
         # Check if graphs already captured (first slot has graphs)
         if self._decode_slots and self._decode_slots[0].cuda_graphs is not None:
             return
-
-        # Pre-allocate MoE workspaces to their maximum size BEFORE graph capture.
-        # This is critical: if workspaces grow after capture, the captured graphs
-        # will use stale pointers, causing memory corruption and non-determinism.
-        self._preallocate_workspaces()
 
         # Initialize graph batch sizes once
         max_effective_batch = max(1, self.max_batch_size - 1)

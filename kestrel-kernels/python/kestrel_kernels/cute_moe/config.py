@@ -205,6 +205,7 @@ def _load_cute_moe_configs(
         return json.load(f)
 
 
+@lru_cache(maxsize=None)
 def get_cute_moe_block_m(
     num_tokens: int,
     *,
@@ -254,6 +255,7 @@ def get_cute_moe_block_m(
     return cfg["block_m"]
 
 
+@lru_cache(maxsize=None)
 def get_cute_moe_config(
     kind: Literal["up", "down"],
     num_tokens: int,
