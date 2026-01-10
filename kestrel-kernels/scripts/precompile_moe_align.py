@@ -128,12 +128,23 @@ def generate_precompile_variants(arch: str) -> list[MoeAlignVariant]:
     kernel_types = ["small", "large", "lora_small", "lora_large"]
     dtypes = [Int32, Int64]
 
+    # MoE variants (topk=8, num_experts=64)
     for block_size in sorted(block_m_values):
         for dtype in dtypes:
             for kernel_type in kernel_types:
                 variants.append(
                     MoeAlignVariant(kernel_type, dtype, 8, 64, block_size, False)
                 )
+
+    # LoRA on dense layers (topk=1, num_experts=1) - needed for non-MoE models
+    # Only need lora_small and lora_large variants, and only int32
+    for block_size in sorted(block_m_values):
+        variants.append(
+            MoeAlignVariant("lora_small", Int32, 1, 1, block_size, False)
+        )
+        variants.append(
+            MoeAlignVariant("lora_large", Int32, 1, 1, block_size, False)
+        )
 
     return variants
 
