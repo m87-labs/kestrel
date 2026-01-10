@@ -2,41 +2,13 @@ from __future__ import annotations
 
 import torch
 
+from kestrel.utils.buffers import FixedBuffer
 from kestrel_kernels.fused_mlp import fused_mlp_gelu_bias_residual_cuda
-
-
-class _FixedBuffer:
-    """Device-aware buffer that is pre-allocated once and never resized."""
-
-    def __init__(self) -> None:
-        self._tensor: torch.Tensor | None = None
-
-    def get(self, shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        numel = 1
-        for dim in shape:
-            numel *= dim
-        if numel == 0:
-            return torch.empty(shape, device=device, dtype=dtype)
-
-        if self._tensor is None:
-            self._tensor = torch.empty(numel, device=device, dtype=dtype)
-        elif self._tensor.numel() < numel:
-            raise RuntimeError(
-                f"Fused MLP buffer overflow: requested {numel} elements but "
-                f"only {self._tensor.numel()} allocated. Increase max_seq_length "
-                f"or ensure preallocate_fused_mlp_workspaces() is called."
-            )
-        elif self._tensor.device != device or self._tensor.dtype != dtype:
-            raise RuntimeError(
-                f"Fused MLP buffer device/dtype mismatch: buffer on {self._tensor.device} "
-                f"({self._tensor.dtype}), requested {device} ({dtype})."
-            )
-        return self._tensor[:numel].view(*shape)
 
 
 class FusedMLPWorkspaces:
     def __init__(self) -> None:
-        self.hidden = _FixedBuffer()
+        self.hidden = FixedBuffer("Fused MLP hidden workspace")
 
 
 _WORKSPACES = FusedMLPWorkspaces()
