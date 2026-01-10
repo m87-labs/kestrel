@@ -8,7 +8,6 @@ all unique kernel variants needed.
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +16,9 @@ from pathlib import Path
 import torch
 
 # Insert package path for local imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
+
+from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link
 
 
 @dataclass(frozen=True)
@@ -67,20 +68,6 @@ def _parse_model_dims(config_name: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def get_cuda_arch() -> str:
-    """Get the CUDA architecture string (e.g., 'sm90' for Hopper)."""
-    import os
-    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
-    if arch_list:
-        # Parse first arch from env var (e.g., "9.0" -> "sm90", "9.0;8.0" -> "sm90")
-        first_arch = arch_list.split(";")[0].strip()
-        if "." in first_arch:
-            major, minor = first_arch.split(".")
-            return f"sm{major}{minor}"
-    major, minor = torch.cuda.get_device_capability()
-    return f"sm{major}{minor}"
-
-
 def _parse_dtype_from_filename(config_name: str) -> str:
     """Parse dtype (bf16 or fp8) from config filename."""
     if "_fp8_" in config_name:
@@ -90,7 +77,7 @@ def _parse_dtype_from_filename(config_name: str) -> str:
 
 def load_variants_from_configs() -> list[MoeVariant]:
     """Load all unique variants from JSON config files."""
-    configs_dir = Path(__file__).parent.parent / "python" / "kestrel_kernels" / "configs"
+    configs_dir = Path(__file__).parent.parent.parent / "python" / "kestrel_kernels" / "configs"
     variants: set[MoeVariant] = set()
 
     for config_file in configs_dir.glob("cute_moe_*.json"):
@@ -126,14 +113,13 @@ def load_variants_from_configs() -> list[MoeVariant]:
     )
 
 
-def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Path, str | None]:
+def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Path | None, str | None]:
     """Compile a single variant. Returns (variant, output_path, error_or_none)."""
     variant, arch, output_dir = args
 
     # Import here to avoid issues with multiprocessing fork
     import cutlass.cute as cute
     from cutlass import BFloat16, Float32, Float8E4M3FN
-    from cuda.bindings import driver as cuda
 
     from kestrel_kernels.cute_moe import (
         CuteMoeConfig,
@@ -195,8 +181,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 K=variant.K,
             )
 
-            # A_bits: (M_in, K) uint8 - use UInt8 to match dispatch path
-            # Dispatch uses _to_cute_tensor_2d_contig_u8 which creates uint8 tensors
+            # A_bits: (M_in, K) uint8
             a_bits_fake = cute.runtime.make_fake_tensor(
                 cute.Uint8, (M_in_sym, K_static),
                 stride=(cute.sym_int64(divisibility=16), 1),
@@ -208,7 +193,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 stride=(1,),
                 assumed_align=4,
             )
-            # B_bits: (E, N, K) uint8 - use UInt8 to match dispatch path
+            # B_bits: (E, N, K) uint8
             b_bits_fake = cute.runtime.make_fake_tensor(
                 cute.Uint8, (E_sym, N_static, K_static),
                 stride=(cute.sym_int64(divisibility=16), cute.sym_int64(divisibility=16), 1),
@@ -339,30 +324,9 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 options="--enable-tvm-ffi",
             )
 
-        # Export to object file
-        obj_path = output_dir / f"cute_moe_tmp_{os.getpid()}.o"
-        function_name = variant.function_name(arch)
-        compiled.export_to_c(str(obj_path), function_name=function_name)
-
-        # Get runtime libraries and link to shared object
-        runtime_libs = cute.runtime.find_runtime_libraries(enable_tvm_ffi=True)
-
-        so_filename = variant.filename(arch)
-        so_path = output_dir / so_filename
-
-        # Link command
-        cmd = [
-            "gcc",
-            "-shared",
-            "-o",
-            str(so_path),
-            str(obj_path),
-            *runtime_libs,
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-
-        # Clean up object file
-        obj_path.unlink()
+        # Link to shared object
+        so_path = output_dir / variant.filename(arch)
+        compile_and_link(compiled, variant.function_name(arch), so_path, "cute_moe_tmp")
 
         print(f"[{os.getpid()}] Created: {so_path.name}")
         return (variant, so_path, None)
@@ -372,7 +336,6 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
 
 
 def main():
-    # Detect architecture
     arch = get_cuda_arch()
     print(f"Detected CUDA architecture: {arch}")
 
@@ -384,15 +347,7 @@ def main():
         print("No config files found! Add JSON configs to kestrel_kernels/configs/")
         sys.exit(1)
 
-    # Output directory for precompiled kernels
-    script_dir = Path(__file__).parent
-    output_dir = script_dir.parent / "python" / "kestrel_kernels" / "precompiled"
-    output_dir.mkdir(exist_ok=True)
-
-    # Create __init__.py in precompiled directory
-    init_file = output_dir / "__init__.py"
-    if not init_file.exists():
-        init_file.write_text('"""Precompiled CuTe DSL kernels."""\n')
+    output_dir = get_precompiled_dir()
 
     # Compile sequentially - parallel compilation causes issues with CUDA context
     failed = []
@@ -405,7 +360,7 @@ def main():
         else:
             succeeded.append((result_variant, so_path))
 
-    print(f"\nPrecompilation complete:")
+    print(f"\nCuTe MoE precompilation complete:")
     print(f"  Succeeded: {len(succeeded)}")
     print(f"  Failed: {len(failed)}")
 

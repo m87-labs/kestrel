@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -22,51 +21,8 @@ _ENABLE_JIT = os.environ.get("KESTREL_CUTE_MOE_JIT", "0") == "1"
 
 # Precompiled kernel registry
 _precompiled_cache: Dict[Tuple, Any] = {}
-_precompiled_dir = Path(__file__).parent / "precompiled"
 
-# Cache the architecture string
-_cuda_arch: Optional[str] = None
-
-
-def _get_cuda_arch() -> str:
-    """Get the CUDA architecture string (e.g., 'sm90' for Hopper, 'sm100' for Blackwell)."""
-    global _cuda_arch
-    if _cuda_arch is None:
-        major, minor = torch.cuda.get_device_capability()
-        _cuda_arch = f"sm{major}{minor}"
-    return _cuda_arch
-
-
-def _get_precompiled_kernel_path(
-    kernel_type: str,  # "small", "large", "lora_small", "lora_large"
-    topk_dtype: type,  # Int32 or Int64
-    topk: int,
-    num_experts: int,
-    block_size: int,
-    has_expert_map: bool,
-) -> Optional[Path]:
-    """Get path to precompiled kernel if it exists."""
-    arch = _get_cuda_arch()
-    dtype_name = "i32" if topk_dtype == Int32 else "i64"
-    expert_map_str = "emap" if has_expert_map else "noemap"
-    filename = f"moe_align_{kernel_type}_{dtype_name}_k{topk}_e{num_experts}_b{block_size}_{expert_map_str}_{arch}.so"
-    path = _precompiled_dir / filename
-    return path if path.exists() else None
-
-
-def _get_precompiled_function_name(
-    kernel_type: str,
-    topk_dtype: type,
-    topk: int,
-    num_experts: int,
-    block_size: int,
-    has_expert_map: bool,
-) -> str:
-    """Get the exported function name for a precompiled kernel."""
-    arch = _get_cuda_arch()
-    dtype_name = "i32" if topk_dtype == Int32 else "i64"
-    expert_map_str = "emap" if has_expert_map else "noemap"
-    return f"moe_align_{kernel_type}_{dtype_name}_k{topk}_e{num_experts}_b{block_size}_{expert_map_str}_{arch}"
+from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 
 def _load_precompiled_kernel(
@@ -84,20 +40,19 @@ def _load_precompiled_kernel(
     if compile_key in _precompiled_cache:
         return _precompiled_cache[compile_key]
 
-    # Check if precompiled file exists
-    so_path = _get_precompiled_kernel_path(
-        kernel_type, topk_dtype, topk, num_experts, block_size, has_expert_map
-    )
-    if so_path is None:
-        return None
+    # Build filename and function name
+    arch = get_cuda_arch()
+    dtype_name = "i32" if topk_dtype == Int32 else "i64"
+    expert_map_str = "emap" if has_expert_map else "noemap"
+    base_name = f"moe_align_{kernel_type}_{dtype_name}_k{topk}_e{num_experts}_b{block_size}_{expert_map_str}_{arch}"
+    filename = f"{base_name}.so"
+    function_name = base_name
 
     # Load the module
-    mod = cute.runtime.load_module(str(so_path))
+    mod = load_precompiled_module(filename)
+    if mod is None:
+        return None
 
-    # Get the function by its exported name
-    function_name = _get_precompiled_function_name(
-        kernel_type, topk_dtype, topk, num_experts, block_size, has_expert_map
-    )
     kernel_fn = getattr(mod, function_name)
     _precompiled_cache[compile_key] = kernel_fn
     return kernel_fn

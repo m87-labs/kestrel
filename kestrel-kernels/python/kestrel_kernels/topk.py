@@ -2,7 +2,6 @@
 
 import math
 from functools import partial
-from pathlib import Path
 from typing import Optional, Type
 
 import torch
@@ -16,7 +15,8 @@ from cutlass._mlir.dialects import nvvm
 
 # Precompiled kernel registry
 _precompiled_cache: dict = {}
-_precompiled_dir = Path(__file__).parent / "precompiled"
+
+from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 
 torch2cute_dtype_map = {
@@ -33,33 +33,6 @@ _cute_dtype_to_name = {
     Float32: "float32",
 }
 
-# Cache the architecture string
-_cuda_arch: str | None = None
-
-
-def _get_cuda_arch() -> str:
-    """Get the CUDA architecture string (e.g., 'sm90' for Hopper, 'sm100' for Blackwell)."""
-    global _cuda_arch
-    if _cuda_arch is None:
-        major, minor = torch.cuda.get_device_capability()
-        _cuda_arch = f"sm{major}{minor}"
-    return _cuda_arch
-
-
-def _get_precompiled_kernel_path(dtype, N: int, k: int, softmax: bool) -> Path | None:
-    """Get path to precompiled kernel if it exists."""
-    dtype_name = _cute_dtype_to_name.get(dtype)
-    if dtype_name is None:
-        return None
-
-    arch = _get_cuda_arch()
-    softmax_str = "softmax" if softmax else "nosoftmax"
-    filename = f"topk_{dtype_name}_n{N}_k{k}_{softmax_str}_{arch}.so"
-    path = _precompiled_dir / filename
-
-    return path if path.exists() else None
-
-
 def _load_precompiled_kernel(dtype, N: int, k: int, softmax: bool):
     """Load a precompiled kernel if available, return None otherwise."""
     compile_key = (dtype, N, k, softmax)
@@ -68,19 +41,20 @@ def _load_precompiled_kernel(dtype, N: int, k: int, softmax: bool):
     if compile_key in _precompiled_cache:
         return _precompiled_cache[compile_key]
 
-    # Check if precompiled file exists
-    so_path = _get_precompiled_kernel_path(dtype, N, k, softmax)
-    if so_path is None:
+    # Build filename
+    dtype_name = _cute_dtype_to_name.get(dtype)
+    if dtype_name is None:
         return None
 
-    # Load the module
-    mod = cute.runtime.load_module(str(so_path))
-
-    # Get the function by its exported name
-    dtype_name = _cute_dtype_to_name[dtype]
-    arch = _get_cuda_arch()
+    arch = get_cuda_arch()
     softmax_str = "softmax" if softmax else "nosoftmax"
+    filename = f"topk_{dtype_name}_n{N}_k{k}_{softmax_str}_{arch}.so"
     function_name = f"topk_{dtype_name}_n{N}_k{k}_{softmax_str}_{arch}"
+
+    # Load the module
+    mod = load_precompiled_module(filename)
+    if mod is None:
+        return None
 
     kernel_fn = getattr(mod, function_name)
     _precompiled_cache[compile_key] = kernel_fn

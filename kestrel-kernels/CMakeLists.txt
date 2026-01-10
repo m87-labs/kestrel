@@ -94,36 +94,44 @@ add_kestrel_kernel(rotary_embedding "${KESTREL_OPS_DIR}/rotary_embedding/kernel.
 add_kestrel_kernel(fp8_quant "${CMAKE_CURRENT_LIST_DIR}/csrc/fp8_quant/kernel.cu")
 add_kestrel_kernel(tau_tail "${CMAKE_CURRENT_LIST_DIR}/csrc/tau_tail/kernel.cu")
 
-# Precompile CuTe DSL kernels (topk, cute_moe, moe_align)
-# Split into separate targets so Ninja can run them in parallel
-set(PRECOMPILE_TOPK_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/scripts/precompile_topk.py")
-set(PRECOMPILE_CUTE_MOE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/scripts/precompile_cute_moe.py")
-set(PRECOMPILE_MOE_ALIGN_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/scripts/precompile_moe_align.py")
+# Precompile CuTe DSL kernels using unified precompile module
 set(PRECOMPILED_OUTPUT_DIR "${CMAKE_CURRENT_LIST_DIR}/python/kestrel_kernels/precompiled")
 
+# Main target: precompile all kernel families
+add_custom_target(precompile_cute_kernels ALL
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile
+  WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+  COMMENT "Precompiling CuTe DSL kernels (topk, cute_moe, moe_align, flash_attn)"
+  VERBATIM
+)
+
+# Individual targets for development/debugging
 add_custom_target(precompile_topk
-  COMMAND ${Python_EXECUTABLE} "${PRECOMPILE_TOPK_SCRIPT}"
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels topk
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
   COMMENT "Precompiling CuTe DSL topk kernel"
   VERBATIM
 )
 
 add_custom_target(precompile_cute_moe
-  COMMAND ${Python_EXECUTABLE} "${PRECOMPILE_CUTE_MOE_SCRIPT}"
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels cute_moe
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
   COMMENT "Precompiling CuTe DSL cute_moe kernels"
   VERBATIM
 )
 
 add_custom_target(precompile_moe_align
-  COMMAND ${Python_EXECUTABLE} "${PRECOMPILE_MOE_ALIGN_SCRIPT}"
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels moe_align
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
   COMMENT "Precompiling CuTe DSL moe_align kernels"
   VERBATIM
 )
 
-add_custom_target(precompile_cute_kernels ALL
-  DEPENDS precompile_topk precompile_cute_moe precompile_moe_align
+add_custom_target(precompile_flash_attn
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels flash_attn
+  WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+  COMMENT "Precompiling CuTe DSL flash_attn kernels"
+  VERBATIM
 )
 
 # Install precompiled kernels

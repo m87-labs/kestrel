@@ -1,7 +1,6 @@
 """CuTe MoE kernel utilities, PTX helpers, and initialization."""
 
 import math
-from pathlib import Path
 from typing import Any, Dict, Tuple, Type
 
 import torch
@@ -533,6 +532,124 @@ def store_smem_b32(value: Int32, smem_ptr, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def load_smem_u16(smem_ptr, *, loc=None, ip=None) -> Int32:
+    """Load 16 bits from shared memory, zero-extended to 32 bits.
+
+    Input: smem_ptr - Int64 address in shared memory
+    Output: Int32 with loaded 16-bit value zero-extended
+    """
+    # Convert smem_ptr to IR value if it has ir_value method
+    if hasattr(smem_ptr, 'ir_value'):
+        ptr_ir = smem_ptr.ir_value(loc=loc, ip=ip)
+    else:
+        ptr_ir = smem_ptr
+
+    result = llvm.inline_asm(
+        T.i32(),
+        [ptr_ir],
+        "ld.shared.u16 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def store_smem_u16(value: Int32, smem_ptr, *, loc=None, ip=None) -> None:
+    """Store low 16 bits to shared memory.
+
+    Input: value - Int32 with value in low 16 bits, smem_ptr - Int64 address
+    """
+    # Convert smem_ptr to IR value if it has ir_value method
+    if hasattr(smem_ptr, 'ir_value'):
+        ptr_ir = smem_ptr.ir_value(loc=loc, ip=ip)
+    else:
+        ptr_ir = smem_ptr
+
+    # Note: with no output, operands are numbered starting at $0
+    # $0 = ptr_ir (l = 64-bit), $1 = value (r = 32-bit)
+    llvm.inline_asm(
+        None,
+        [ptr_ir, Int32(value).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 v16; mov.b32 {v16, _}, $1; st.shared.b16 [$0], v16; }",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def repack_fp8_pair_for_k16_slices(src_lo: Int32, src_hi: Int32, *, loc=None, ip=None):
+    """Repack two FP8 halfwords from adjacent-K to slice-K layout.
+
+    Used for W8A16 kernel to fix K-dimension mismatch between BF16 A and FP8 B.
+
+    Input:
+      src_lo: 16-bit container with bytes (k+2i, k+2i+1) for some i in 0..7
+      src_hi: 16-bit container with bytes (k+16+2i, k+16+2i+1) for same i
+
+    Output: (dst_even, dst_odd) as i64 where:
+      lo 32 bits (dst_even): 16-bit container with bytes (k+2i, k+16+2i)
+      hi 32 bits (dst_odd): 16-bit container with bytes (k+2i+1, k+16+2i+1)
+
+    After F2FP on dst_even: lo=k+2i, hi=k+16+2i (both in same slice relative to chunk start)
+    After F2FP on dst_odd: lo=k+2i+1, hi=k+16+2i+1 (both in same slice relative to chunk start)
+
+    The transformation:
+      dst_even = (src_lo & 0xFF) | ((src_hi & 0xFF) << 8)
+      dst_odd  = (src_lo >> 8) | (src_hi & 0xFF00)
+    """
+    ir_lo = Int32(src_lo).ir_value(loc=loc, ip=ip)
+    ir_hi = Int32(src_hi).ir_value(loc=loc, ip=ip)
+
+    # Use PRMT for efficient byte permutation
+    # PRMT(a, b, sel): selects bytes from {b, a} (8 bytes: a at 0-3, b at 4-7)
+    # sel is interpreted as 4 nibbles, each selecting source byte for result byte 0-3
+    # Nibbles are in little-endian order within the hex value
+    #
+    # dst_even: result[0]=a[0], result[1]=b[0]
+    #   nibble 0 (bits 0-3) = 0 (select a[0])
+    #   nibble 1 (bits 4-7) = 4 (select b[0])
+    #   sel = 0x0040
+    #
+    # dst_odd: result[0]=a[1], result[1]=b[1]
+    #   nibble 0 (bits 0-3) = 1 (select a[1])
+    #   nibble 1 (bits 4-7) = 5 (select b[1])
+    #   sel = 0x0051
+    result = llvm.inline_asm(
+        T.i64(),
+        [ir_lo, ir_hi],
+        "{ .reg .u32 de, do; prmt.b32 de, $1, $2, 0x0040; prmt.b32 do, $1, $2, 0x0051; mov.b64 $0, {de, do}; }",
+        "=l,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return result
+
+
+@dsl_user_op
+def unpack_repack_result_lo(packed_i64, *, loc=None, ip=None) -> Int32:
+    """Extract low 32 bits (dst_even) from repack result."""
+    from cutlass._mlir.dialects import arith
+    i32_val = arith.trunci(T.i32(), packed_i64, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
+def unpack_repack_result_hi(packed_i64, *, loc=None, ip=None) -> Int32:
+    """Extract high 32 bits (dst_odd) from repack result."""
+    from cutlass._mlir.dialects import arith
+    shift_amt = arith.constant(T.i64(), 32, loc=loc, ip=ip)
+    shifted = arith.shrui(packed_i64, shift_amt, loc=loc, ip=ip)
+    i32_val = arith.trunci(T.i32(), shifted, loc=loc, ip=ip)
+    return Int32(i32_val)
+
+
+@dsl_user_op
 def cvt_fp8x2_to_f16_both(packed_fp8_in_f16, *, loc=None, ip=None):
     """Convert 2 packed FP8 to 2 separate F16 values using LLVM vector extraction.
 
@@ -938,22 +1055,8 @@ _DEVICE_CACHE_CONFIG_SET = False
 # Precompiled kernel registry
 _precompiled_cache: Dict[Tuple[str, CuteMoeConfig, int, int], Any] = {}
 _precompiled_cache_fp8: Dict[Tuple[str, CuteMoeConfig], Any] = {}
-_precompiled_dir = Path(__file__).parent.parent / "precompiled"
 
-
-def _get_precompiled_kernel_path(
-    kind: str, config: CuteMoeConfig, N: int, K: int
-) -> Path | None:
-    """Get path to precompiled kernel if it exists."""
-    arch = _get_cuda_arch()
-    dtype_suffix = "_fp8" if config.dtype == "fp8" else ""
-    kernel_suffix = "_wgmma" if config.kernel_type == "wgmma" else ""
-    filename = (
-        f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}_{arch}.so"
-    )
-    path = _precompiled_dir / filename
-    return path if path.exists() else None
+from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 
 def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
@@ -965,22 +1068,21 @@ def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
     if compile_key in cache:
         return cache[compile_key]
 
-    # Check if precompiled file exists
-    so_path = _get_precompiled_kernel_path(kind, config, N, K)
-    if so_path is None:
-        return None
-
-    # Load the module
-    mod = cute.runtime.load_module(str(so_path))
-
-    # Get the function by its exported name (must match precompile script)
-    arch = _get_cuda_arch()
+    # Build filename and function name
+    arch = get_cuda_arch()
     dtype_suffix = "_fp8" if config.dtype == "fp8" else ""
     kernel_suffix = "_wgmma" if config.kernel_type == "wgmma" else ""
-    function_name = (
+    base_name = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
         f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}_{arch}"
     )
+    filename = f"{base_name}.so"
+    function_name = base_name
+
+    # Load the module
+    mod = load_precompiled_module(filename)
+    if mod is None:
+        return None
 
     kernel_fn = getattr(mod, function_name)
     cache[compile_key] = kernel_fn
