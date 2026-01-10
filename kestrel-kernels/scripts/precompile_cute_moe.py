@@ -187,9 +187,10 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 K=variant.K,
             )
 
-            # A_bits: (M_in, K) uint8
+            # A_bits: (M_in, K) uint8 - use UInt8 to match dispatch path
+            # Dispatch uses _to_cute_tensor_2d_contig_u8 which creates uint8 tensors
             a_bits_fake = cute.runtime.make_fake_tensor(
-                fp8_dtype, (M_in_sym, K_static),
+                cute.Uint8, (M_in_sym, K_static),
                 stride=(cute.sym_int64(divisibility=16), 1),
                 assumed_align=16,
             )
@@ -199,9 +200,9 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 stride=(1,),
                 assumed_align=4,
             )
-            # B_bits: (E, N, K) uint8
+            # B_bits: (E, N, K) uint8 - use UInt8 to match dispatch path
             b_bits_fake = cute.runtime.make_fake_tensor(
-                fp8_dtype, (E_sym, N_static, K_static),
+                cute.Uint8, (E_sym, N_static, K_static),
                 stride=(cute.sym_int64(divisibility=16), cute.sym_int64(divisibility=16), 1),
                 assumed_align=16,
             )

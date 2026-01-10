@@ -277,46 +277,62 @@ def _invoke_cute_moe_fp8_impl(
     use_wgmma_fp8 = config.kernel_type == "wgmma"
 
     if key not in _COMPILE_CACHE_FP8:
-        # Create CuTe tensors only for compilation (to derive tensor signatures)
-        a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
-        a_scale_cute = _to_cute_tensor_1d_contig(A_scale)
-        b_bits_cute = _to_cute_tensor_3d_last_contig_u8(B_fp8_bits)
-        b_scale_cute = _to_cute_tensor_2d_contig(B_scale)
-        c_cute = _to_cute_tensor_2d_contig(C2d)
-        sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
-        expert_cute = _to_cute_tensor_1d_i32(expert_ids)
-        post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
-        topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
+        if _ENABLE_JIT:
+            # JIT compile for autotuning
+            # Create CuTe tensors only for compilation (to derive tensor signatures)
+            a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
+            a_scale_cute = _to_cute_tensor_1d_contig(A_scale)
+            b_bits_cute = _to_cute_tensor_3d_last_contig_u8(B_fp8_bits)
+            b_scale_cute = _to_cute_tensor_2d_contig(B_scale)
+            c_cute = _to_cute_tensor_2d_contig(C2d)
+            sorted_cute = _to_cute_tensor_1d_i32(sorted_token_ids)
+            expert_cute = _to_cute_tensor_1d_i32(expert_ids)
+            post_cute = _to_cute_tensor_scalar_i32(num_tokens_post_padded)
+            topk_w_cute = _to_cute_tensor_1d_contig(topk_weights)
 
-        # Use TVM-FFI env stream for automatic stream handling (matches BF16 path)
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            # Use TVM-FFI env stream for automatic stream handling (matches BF16 path)
+            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-        if use_wgmma_fp8:
-            op = _FusedMoeMatmulCuTeFp8(
-                dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
-                N=N_dim, K=K_dim,
+            if use_wgmma_fp8:
+                op = _FusedMoeMatmulCuTeFp8(
+                    dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
+                    N=N_dim, K=K_dim,
+                )
+            else:
+                op = _FusedMoeMatmulCuTeWarpFp8(
+                    dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
+                    N=N_dim, K=K_dim,
+                )
+            compiled = cute.compile(
+                op,
+                a_bits_cute,
+                a_scale_cute,
+                b_bits_cute,
+                b_scale_cute,
+                c_cute,
+                topk_w_cute,
+                sorted_cute,
+                expert_cute,
+                post_cute,
+                stream_fake,
+                options="--enable-tvm-ffi",
             )
+            _set_compiled_kernel_shared_carveout(compiled)
+            _COMPILE_CACHE_FP8[key] = compiled
         else:
-            op = _FusedMoeMatmulCuTeWarpFp8(
-                dtype, fp8_dtype, config, mul_routed_weight=mul_routed_weight, top_k=top_k,
-                N=N_dim, K=K_dim,
-            )
-        compiled = cute.compile(
-            op,
-            a_bits_cute,
-            a_scale_cute,
-            b_bits_cute,
-            b_scale_cute,
-            c_cute,
-            topk_w_cute,
-            sorted_cute,
-            expert_cute,
-            post_cute,
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
-        _set_compiled_kernel_shared_carveout(compiled)
-        _COMPILE_CACHE_FP8[key] = compiled
+            # Load precompiled kernel
+            from kestrel_kernels.cute_moe.config import _get_cuda_arch
+
+            precompiled = _load_precompiled_kernel(kind, config, N_dim, K_dim)
+            if precompiled is not None:
+                _COMPILE_CACHE_FP8[key] = precompiled
+            else:
+                arch = _get_cuda_arch()
+                raise RuntimeError(
+                    "No precompiled kernel for "
+                    f"cute_moe_fp8(kind={kind}, config={config}, N={N_dim}, K={K_dim}, arch={arch}). "
+                    f"Run precompile_cute_moe.py on this architecture to generate it."
+                )
 
     # TVM-FFI handles PyTorch tensor conversion automatically (like BF16 path)
     _COMPILE_CACHE_FP8[key](

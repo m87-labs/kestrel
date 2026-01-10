@@ -676,9 +676,11 @@ def _get_precompiled_kernel_path(
 ) -> Path | None:
     """Get path to precompiled kernel if it exists."""
     arch = _get_cuda_arch()
+    dtype_suffix = "_fp8" if config.dtype == "fp8" else ""
+    kernel_suffix = "_wgmma" if config.kernel_type == "wgmma" else ""
     filename = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}_{arch}.so"
+        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}_{arch}.so"
     )
     path = _precompiled_dir / filename
     return path if path.exists() else None
@@ -688,9 +690,10 @@ def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
     """Load a precompiled kernel if available, return None otherwise."""
     compile_key = (kind, config, N, K)
 
-    # Check if already loaded
-    if compile_key in _precompiled_cache:
-        return _precompiled_cache[compile_key]
+    # Check if already loaded (use appropriate cache based on dtype)
+    cache = _precompiled_cache_fp8 if config.dtype == "fp8" else _precompiled_cache
+    if compile_key in cache:
+        return cache[compile_key]
 
     # Check if precompiled file exists
     so_path = _get_precompiled_kernel_path(kind, config, N, K)
@@ -700,15 +703,17 @@ def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
     # Load the module
     mod = cute.runtime.load_module(str(so_path))
 
-    # Get the function by its exported name
+    # Get the function by its exported name (must match precompile script)
     arch = _get_cuda_arch()
+    dtype_suffix = "_fp8" if config.dtype == "fp8" else ""
+    kernel_suffix = "_wgmma" if config.kernel_type == "wgmma" else ""
     function_name = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}_{arch}"
+        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}_{arch}"
     )
 
     kernel_fn = getattr(mod, function_name)
-    _precompiled_cache[compile_key] = kernel_fn
+    cache[compile_key] = kernel_fn
     return kernel_fn
 
 
