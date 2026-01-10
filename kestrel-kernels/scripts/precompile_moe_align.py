@@ -58,6 +58,14 @@ class MoeAlignVariant:
 
 def get_cuda_arch() -> str:
     """Get the CUDA architecture string (e.g., 'sm90' for Hopper)."""
+    import os
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    if arch_list:
+        # Parse first arch from env var (e.g., "9.0" -> "sm90", "9.0;8.0" -> "sm90")
+        first_arch = arch_list.split(";")[0].strip()
+        if "." in first_arch:
+            major, minor = first_arch.split(".")
+            return f"sm{major}{minor}"
     major, minor = torch.cuda.get_device_capability()
     return f"sm{major}{minor}"
 
