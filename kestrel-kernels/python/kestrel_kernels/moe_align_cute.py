@@ -931,7 +931,7 @@ def moe_align_block_size(
                     )
                 else:
                     dtype_name = "int32" if topk_dtype == Int32 else "int64"
-                    arch = _get_cuda_arch()
+                    arch = get_cuda_arch()
                     raise RuntimeError(
                         f"No precompiled kernel for moe_align_block_size(type=small, "
                         f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
@@ -958,7 +958,7 @@ def moe_align_block_size(
                 )
             else:
                 dtype_name = "int32" if topk_dtype == Int32 else "int64"
-                arch = _get_cuda_arch()
+                arch = get_cuda_arch()
                 raise RuntimeError(
                     f"No precompiled kernel for moe_align_block_size(type=large, "
                     f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
@@ -1087,7 +1087,7 @@ def moe_lora_align_block_size(
             )
             if precompiled is None:
                 dtype_name = "int32" if topk_dtype == Int32 else "int64"
-                arch = _get_cuda_arch()
+                arch = get_cuda_arch()
                 raise RuntimeError(
                     f"No precompiled kernel for moe_lora_align_block_size(type=lora_small, "
                     f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "
@@ -1114,7 +1114,7 @@ def moe_lora_align_block_size(
         )
         if precompiled is None:
             dtype_name = "int32" if topk_dtype == Int32 else "int64"
-            arch = _get_cuda_arch()
+            arch = get_cuda_arch()
             raise RuntimeError(
                 f"No precompiled kernel for moe_lora_align_block_size(type=lora_large, "
                 f"dtype={dtype_name}, topk={topk}, num_experts={num_experts}, "

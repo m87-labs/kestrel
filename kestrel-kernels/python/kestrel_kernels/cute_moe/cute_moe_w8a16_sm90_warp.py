@@ -3,12 +3,20 @@
 FP8 weights with BF16 activations.
 
 Key insight: Both A and B can use cp.async for gmem→smem.
-- A: BF16 values in natural layout, then per-element BF16→F16 conversion during ldmatrix
-- B: Packed FP8, unpacked to even/odd after ldmatrix
+- A: BF16 values in natural layout, then per-element BF16→F16 conversion after ldmatrix
+- B: Packed FP8, must be repacked in smem before ldmatrix
 
-For A, since MMA expects F16 and we have BF16, we convert during the fragment load.
-We don't need to match B's even/odd structure because A's K layout is contiguous
-and B's unpacking creates the right structure.
+The K-dimension mismatch problem:
+- A (BF16) after ldmatrix has consecutive K indices: K=0,1,2,...,15 per MMA fragment
+- B (FP8) after cp.async has adjacent K pairs: (K=0,K=1), (K=2,K=3), ...
+- After F2FP unpack: lo=0,2,4,... (even K), hi=1,3,5,... (odd K)
+- This doesn't match A's consecutive layout!
+
+Solution: In-place repack of B in shared memory per 32-K chunk:
+- Before: containers hold (K=i, K=i+1) adjacent pairs
+- After: containers hold (K=i, K=i+16) slice pairs
+- Now F2FP gives: lo=0,1,2,...,15 (consecutive!), hi=16,17,...,31 (consecutive!)
+- Two MMAs per chunk: A[0:16]×B_lo, A[16:32]×B_hi - both with matching K indices
 
 IMPORTANT: This kernel treats A's BF16 values directly. The MMA uses F16, so we
 convert BF16→F16 per element as we load A fragments from smem.
@@ -30,6 +38,11 @@ from kestrel_kernels.cute_moe.utils import (
     store_streaming_b32,
     cvt_fp8x2_to_f16_both,
     cvt_bf16_to_f16,
+    load_smem_u16,
+    store_smem_u16,
+    repack_fp8_pair_for_k16_slices,
+    unpack_repack_result_lo,
+    unpack_repack_result_hi,
 )
 
 if TYPE_CHECKING:
@@ -486,10 +499,66 @@ class _FusedMoeMatmulCuTeWarpW8A16:
             smem_thr_copy_A = cute.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(tx)
             smem_thr_copy_B = cute.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(tx)
 
+            # Repack B helper: converts (k,k+1) pairs to (k,k+16) pairs for a 32-K chunk
+            # Work distribution for repack:
+            # - num_chunks_per_row = half_k // 16 (each 32-K chunk = 16 halfwords in smem)
+            # - total_pair_ops = block_n × num_chunks_per_row × 8
+            num_chunks_per_row = half_k // 16
+            total_repack_pairs = Int32(block_n * num_chunks_per_row * 8)
+
             # Main loop
             main_tiles = k_tiles - Int32(num_stages - 1)
             for tile_idx in cutlass.range(main_tiles, unroll=1):
                 cute.arch.cp_async_wait_group(num_stages - 1)
+                cute.arch.barrier()
+
+                # Repack B stage: convert (k,k+1) pairs to (k,k+16) pairs
+                # After repack, F2FP will give consecutive K indices in each half
+                sB_repack_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
+                for pair_idx in range(tx, total_repack_pairs, num_threads):
+                    # Decode pair_idx -> (n_row, chunk_idx, i)
+                    pairs_per_row = Int32(num_chunks_per_row * 8)
+                    n_row = pair_idx // pairs_per_row
+                    remainder = pair_idx - n_row * pairs_per_row
+                    chunk_idx = remainder // Int32(8)
+                    i = remainder - chunk_idx * Int32(8)
+
+                    # Compute smem positions for src[i] and src[i+8]
+                    chunk_base = chunk_idx * Int32(16)
+                    pos_lo = chunk_base + i
+                    pos_hi = chunk_base + i + Int32(8)
+
+                    # Compute smem addresses using tile layout
+                    addr_lo = sB_tile_layout((n_row, pos_lo))
+                    addr_hi = sB_tile_layout((n_row, pos_hi))
+
+                    smem_ptr_lo = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_lo) * element_bytes_bf16
+                    smem_ptr_hi = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_hi) * element_bytes_bf16
+
+                    # Load src[i] and src[i+8]
+                    src_lo = load_smem_u16(smem_ptr_lo)
+                    src_hi = load_smem_u16(smem_ptr_hi)
+
+                    # Repack: dst_even = (lo.byte0, hi.byte0), dst_odd = (lo.byte1, hi.byte1)
+                    packed_result = repack_fp8_pair_for_k16_slices(src_lo, src_hi)
+                    dst_even = unpack_repack_result_lo(packed_result)
+                    dst_odd = unpack_repack_result_hi(packed_result)
+
+                    # Compute destination positions: 2*i and 2*i+1
+                    dst_pos_even = chunk_base + i * Int32(2)
+                    dst_pos_odd = chunk_base + i * Int32(2) + Int32(1)
+
+                    addr_dst_even = sB_tile_layout((n_row, dst_pos_even))
+                    addr_dst_odd = sB_tile_layout((n_row, dst_pos_odd))
+
+                    smem_ptr_dst_even = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_even) * element_bytes_bf16
+                    smem_ptr_dst_odd = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_odd) * element_bytes_bf16
+
+                    # Store dst_even and dst_odd
+                    store_smem_u16(dst_even, smem_ptr_dst_even)
+                    store_smem_u16(dst_odd, smem_ptr_dst_odd)
+
+                # Barrier after repack to ensure all threads see the repacked data
                 cute.arch.barrier()
 
                 # Get smem for current stage
@@ -653,6 +722,46 @@ class _FusedMoeMatmulCuTeWarpW8A16:
             # Tail drain
             for drain_idx in cutlass.range_constexpr(num_stages - 1):
                 cute.arch.cp_async_wait_group(num_stages - 2 - drain_idx)
+                cute.arch.barrier()
+
+                # Repack B stage (same as main loop)
+                sB_repack_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
+                for pair_idx in range(tx, total_repack_pairs, num_threads):
+                    pairs_per_row = Int32(num_chunks_per_row * 8)
+                    n_row = pair_idx // pairs_per_row
+                    remainder = pair_idx - n_row * pairs_per_row
+                    chunk_idx = remainder // Int32(8)
+                    i = remainder - chunk_idx * Int32(8)
+
+                    chunk_base = chunk_idx * Int32(16)
+                    pos_lo = chunk_base + i
+                    pos_hi = chunk_base + i + Int32(8)
+
+                    addr_lo = sB_tile_layout((n_row, pos_lo))
+                    addr_hi = sB_tile_layout((n_row, pos_hi))
+
+                    smem_ptr_lo = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_lo) * element_bytes_bf16
+                    smem_ptr_hi = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_hi) * element_bytes_bf16
+
+                    src_lo = load_smem_u16(smem_ptr_lo)
+                    src_hi = load_smem_u16(smem_ptr_hi)
+
+                    packed_result = repack_fp8_pair_for_k16_slices(src_lo, src_hi)
+                    dst_even = unpack_repack_result_lo(packed_result)
+                    dst_odd = unpack_repack_result_hi(packed_result)
+
+                    dst_pos_even = chunk_base + i * Int32(2)
+                    dst_pos_odd = chunk_base + i * Int32(2) + Int32(1)
+
+                    addr_dst_even = sB_tile_layout((n_row, dst_pos_even))
+                    addr_dst_odd = sB_tile_layout((n_row, dst_pos_odd))
+
+                    smem_ptr_dst_even = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_even) * element_bytes_bf16
+                    smem_ptr_dst_odd = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_odd) * element_bytes_bf16
+
+                    store_smem_u16(dst_even, smem_ptr_dst_even)
+                    store_smem_u16(dst_odd, smem_ptr_dst_odd)
+
                 cute.arch.barrier()
 
                 sA_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_a) * element_bytes_bf16

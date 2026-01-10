@@ -512,7 +512,7 @@ def _topk_fwd(
         precompiled = _load_precompiled_kernel(dtype, N, k, softmax)
         if precompiled is None:
             dtype_name = _cute_dtype_to_name.get(dtype, dtype.__name__)
-            arch = _get_cuda_arch()
+            arch = get_cuda_arch()
             raise RuntimeError(
                 f"No precompiled kernel for topk(dtype={dtype_name}, N={N}, k={k}, "
                 f"softmax={softmax}, arch={arch}). "
