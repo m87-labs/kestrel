@@ -21,10 +21,13 @@ from kestrel_kernels.activation import gelu_residual_cuda
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 from kestrel_kernels.cute_moe import (
     get_cute_moe_block_m,
+    get_cute_moe_config,
     invoke_cute_moe_down,
     invoke_cute_moe_down_fp8,
     invoke_cute_moe_up,
     invoke_cute_moe_up_fp8,
+    invoke_cute_moe_up_w8a16,
+    invoke_cute_moe_down_w8a16,
 )
 
 
@@ -531,6 +534,7 @@ class FusedMoEModule(nn.Module):
         fp8_down_bits: torch.Tensor | None = None
         fp8_down_scale: torch.Tensor | None = None
         if up_is_fp8w:
+            # W8A8: need FP8 activation buffers for both warp and WGMMA kernels
             fp8_up_bits = self._workspaces.fp8_bits.get(
                 (num_tokens, self.input_size),
                 device=hidden_states.device,
@@ -658,11 +662,17 @@ class FusedMoEModule(nn.Module):
 
         if use_single_lora:
             # Single-LoRA path: reuse MoE routing, offset by lora_id
+            lora_up_out = self._workspaces.lora_up.get(
+                (num_tokens, self.top_k, self.hidden_size * 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            lora_up_out.zero_()
             apply_moe_lora_single(
                 x=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                output=up_out,
+                output=lora_up_out,
                 lora_a=lora_workspace.up_a,
                 lora_b=lora_workspace.up_b,
                 sorted_token_ids=sorted_token_ids,
@@ -676,6 +686,7 @@ class FusedMoEModule(nn.Module):
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
+            up_out.add_(lora_up_out)
 
         activation_in = up_out.view(num_tokens * self.top_k, -1)
         activation_out = self._workspaces.activation.get(
@@ -749,11 +760,17 @@ class FusedMoEModule(nn.Module):
 
         if use_single_lora:
             # Single-LoRA path for down projection
+            lora_down_out = self._workspaces.lora_down.get(
+                (num_tokens, self.top_k, self.input_size),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            lora_down_out.zero_()
             apply_moe_lora_single(
                 x=down_in,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                output=down_out,
+                output=lora_down_out,
                 lora_a=lora_workspace.down_a,
                 lora_b=lora_workspace.down_b,
                 sorted_token_ids=sorted_token_ids,
@@ -767,6 +784,7 @@ class FusedMoEModule(nn.Module):
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
+            down_out.add_(lora_down_out)
 
         fused = self._workspaces.output.get(
             (num_tokens, self.input_size),
@@ -870,42 +888,73 @@ class FusedMoEModule(nn.Module):
 
         if backend == "cute":
             if b_is_fp8w:
-                # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
                 if B_scale is None:
                     raise ValueError("B_scale is required for FP8-weight MoE")
-                if a_fp8_bits is None or a_fp8_scale is None:
-                    raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
 
-                self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
-                if mul_routed_weight:
-                    if int(top_k) != 1:
-                        raise ValueError("CuTe fp8 moe_down expects top_k=1")
-                    if topk_weights is None:
-                        raise ValueError("topk_weights is required when mul_routed_weight=True")
-                    invoke_cute_moe_down_fp8(
-                        a_fp8_bits,
-                        a_fp8_scale,
-                        B,
-                        B_scale,
-                        C,
-                        topk_weights=topk_weights,
-                        sorted_token_ids=sorted_token_ids,
-                        expert_ids=expert_ids,
-                        num_tokens_post_padded=num_tokens_post_padded,
-                    )
+                # Check if we should use W8A16 (warp kernel) or W8A8 (WGMMA)
+                use_w8a16 = a_fp8_bits is None and a_fp8_scale is None
+                if use_w8a16:
+                    # W8A16: BF16 activations + FP8 weights (warp kernel only)
+                    # Skips FP8 activation quantization for faster decode.
+                    if mul_routed_weight:
+                        if int(top_k) != 1:
+                            raise ValueError("CuTe W8A16 moe_down expects top_k=1")
+                        if topk_weights is None:
+                            raise ValueError("topk_weights is required when mul_routed_weight=True")
+                        invoke_cute_moe_down_w8a16(
+                            A,
+                            B,
+                            B_scale,
+                            C,
+                            topk_weights=topk_weights,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                        )
+                    else:
+                        if int(top_k) != 8:
+                            raise ValueError("CuTe W8A16 moe_up expects top_k=8")
+                        invoke_cute_moe_up_w8a16(
+                            A,
+                            B,
+                            B_scale,
+                            C,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                        )
                 else:
-                    if int(top_k) != 8:
-                        raise ValueError("CuTe fp8 moe_up expects top_k=8")
-                    invoke_cute_moe_up_fp8(
-                        a_fp8_bits,
-                        a_fp8_scale,
-                        B,
-                        B_scale,
-                        C,
-                        sorted_token_ids=sorted_token_ids,
-                        expert_ids=expert_ids,
-                        num_tokens_post_padded=num_tokens_post_padded,
-                    )
+                    # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
+                    self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
+                    if mul_routed_weight:
+                        if int(top_k) != 1:
+                            raise ValueError("CuTe fp8 moe_down expects top_k=1")
+                        if topk_weights is None:
+                            raise ValueError("topk_weights is required when mul_routed_weight=True")
+                        invoke_cute_moe_down_fp8(
+                            a_fp8_bits,
+                            a_fp8_scale,
+                            B,
+                            B_scale,
+                            C,
+                            topk_weights=topk_weights,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                        )
+                    else:
+                        if int(top_k) != 8:
+                            raise ValueError("CuTe fp8 moe_up expects top_k=8")
+                        invoke_cute_moe_up_fp8(
+                            a_fp8_bits,
+                            a_fp8_scale,
+                            B,
+                            B_scale,
+                            C,
+                            sorted_token_ids=sorted_token_ids,
+                            expert_ids=expert_ids,
+                            num_tokens_post_padded=num_tokens_post_padded,
+                        )
                 return
 
             # Unquantized BF16 CuTe path: use auto-config selection.
@@ -1047,3 +1096,19 @@ class FusedMoEModule(nn.Module):
         if backend == "auto":
             return "triton" if num_tokens >= self.config.auto_backend_token_threshold else "cute"
         return backend
+
+    def _uses_warp_kernel_fp8(self, num_tokens: int) -> bool:
+        """Check if FP8 path uses warp kernel (W8A16) vs WGMMA (W8A8).
+
+        For warp kernel, we skip FP8 activation quantization since the MMA is
+        F16 x F16 anyway - there's no compute benefit to quantizing activations.
+        Only WGMMA benefits from FP8 activations (native FP8 x FP8 MMA).
+        """
+        config = get_cute_moe_config(
+            "up", num_tokens,
+            num_experts=self.num_experts,
+            hidden_size=self.input_size,
+            intermediate_size=self.hidden_size,
+            dtype="fp8",
+        )
+        return config.kernel_type == "warp"
