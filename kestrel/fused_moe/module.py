@@ -16,6 +16,7 @@ from .lora_kernels import apply_moe_lora_batched, apply_moe_lora_single
 from .routing import moe_align_block_size, moe_lora_align_block_size
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
+from kestrel.utils.buffers import FixedBuffer
 from kestrel_kernels.activation import gelu_residual_cuda
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 from kestrel_kernels.cute_moe import (
@@ -25,46 +26,6 @@ from kestrel_kernels.cute_moe import (
     invoke_cute_moe_up,
     invoke_cute_moe_up_fp8,
 )
-
-
-class _FixedBuffer:
-    """Device-aware buffer that is pre-allocated once and never resized.
-
-    After the first allocation, requesting a larger size will raise an error.
-    This ensures CUDA graph replay uses stable pointers.
-    """
-
-    def __init__(self) -> None:
-        self._tensor: torch.Tensor | None = None
-
-    def get(
-        self,
-        shape: tuple[int, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        numel = prod(shape)
-        if numel == 0:
-            return torch.empty(shape, device=device, dtype=dtype)
-
-        if self._tensor is None:
-            # First allocation - create the buffer
-            self._tensor = torch.empty(numel, device=device, dtype=dtype)
-        elif self._tensor.numel() < numel:
-            # Buffer too small - this is a bug, workspaces should be pre-allocated
-            raise RuntimeError(
-                f"MoE workspace buffer overflow: requested {numel} elements but "
-                f"only {self._tensor.numel()} allocated. This indicates the buffer "
-                f"was not pre-allocated to sufficient size before CUDA graph capture. "
-                f"Increase max_seq_length or ensure preallocate_workspaces() is called."
-            )
-        elif self._tensor.device != device or self._tensor.dtype != dtype:
-            raise RuntimeError(
-                f"MoE workspace device/dtype mismatch: buffer is on {self._tensor.device} "
-                f"with dtype {self._tensor.dtype}, but requested {device} with {dtype}."
-            )
-        return self._tensor[:numel].view(*shape)
 
 
 _HARDCODED_CONFIGS: dict[tuple[int, int], dict[int, dict[str, int]]] = {
@@ -222,14 +183,14 @@ _HARDCODED_CONFIGS: dict[tuple[int, int], dict[int, dict[str, int]]] = {
 
 class _MoEWorkspaces:
     def __init__(self) -> None:
-        self.up = _FixedBuffer()
-        self.down = _FixedBuffer()
-        self.output = _FixedBuffer()
-        self.activation = _FixedBuffer()
-        self.lora_up = _FixedBuffer()
-        self.lora_down = _FixedBuffer()
-        self.fp8_bits = _FixedBuffer()
-        self.fp8_scale = _FixedBuffer()
+        self.up = FixedBuffer("MoE up workspace")
+        self.down = FixedBuffer("MoE down workspace")
+        self.output = FixedBuffer("MoE output workspace")
+        self.activation = FixedBuffer("MoE activation workspace")
+        self.lora_up = FixedBuffer("MoE LoRA up workspace")
+        self.lora_down = FixedBuffer("MoE LoRA down workspace")
+        self.fp8_bits = FixedBuffer("MoE FP8 bits workspace")
+        self.fp8_scale = FixedBuffer("MoE FP8 scale workspace")
 
 
 # Shared workspace for all MoE layers. Since layers execute sequentially,
@@ -561,6 +522,36 @@ class FusedMoEModule(nn.Module):
             dtype=hidden_states.dtype,
         )
 
+        # Pre-allocate FP8 activation buffers once for both up and down projections.
+        # Up projection: shape (num_tokens, input_size)
+        # Down projection: shape (num_tokens * top_k, hidden_size)
+        # We allocate them here to avoid repeated workspace.get() calls in the hot path.
+        fp8_up_bits: torch.Tensor | None = None
+        fp8_up_scale: torch.Tensor | None = None
+        fp8_down_bits: torch.Tensor | None = None
+        fp8_down_scale: torch.Tensor | None = None
+        if up_is_fp8w:
+            fp8_up_bits = self._workspaces.fp8_bits.get(
+                (num_tokens, self.input_size),
+                device=hidden_states.device,
+                dtype=torch.uint8,
+            )
+            fp8_up_scale = self._workspaces.fp8_scale.get(
+                (num_tokens,),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            fp8_down_bits = self._workspaces.fp8_bits.get(
+                (num_tokens * self.top_k, self.hidden_size),
+                device=hidden_states.device,
+                dtype=torch.uint8,
+            )
+            fp8_down_scale = self._workspaces.fp8_scale.get(
+                (num_tokens * self.top_k,),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+
         compute_type = dtype_to_triton(hidden_states.dtype)
 
         # LoRA handling: dispatch based on workspace mode
@@ -655,6 +646,8 @@ class FusedMoEModule(nn.Module):
             top_k=self.top_k,
             triton_config=triton_config,
             compute_type=compute_type,
+            a_fp8_bits=fp8_up_bits,
+            a_fp8_scale=fp8_up_scale,
         )
 
         if use_batched_lora:
@@ -744,6 +737,8 @@ class FusedMoEModule(nn.Module):
             top_k=1,
             triton_config=triton_config,
             compute_type=compute_type,
+            a_fp8_bits=fp8_down_bits,
+            a_fp8_scale=fp8_down_scale,
         )
 
         if use_batched_lora:
@@ -807,6 +802,17 @@ class FusedMoEModule(nn.Module):
         fp8_e4m3fn_rowwise_quant_cuda(out_bits, out_scale, x)
         return out_bits, out_scale
 
+    def _quantize_fp8_into(
+        self,
+        x: torch.Tensor,
+        out_bits: torch.Tensor,
+        out_scale: torch.Tensor,
+    ) -> None:
+        """Quantize x into pre-allocated FP8 buffers (fast path, no workspace.get)."""
+        from kestrel_kernels.fp8_quant import fp8_e4m3fn_rowwise_quant_cuda
+
+        fp8_e4m3fn_rowwise_quant_cuda(out_bits, out_scale, x)
+
     def _invoke_fused_moe_kernel(
         self,
         A: torch.Tensor,
@@ -822,6 +828,8 @@ class FusedMoEModule(nn.Module):
         top_k: int,
         triton_config: dict[str, int],
         compute_type,
+        a_fp8_bits: torch.Tensor | None = None,
+        a_fp8_scale: torch.Tensor | None = None,
     ) -> None:
         b_is_fp8w = B.dtype == torch.uint8
         backend = self._resolve_backend(num_tokens=int(C.shape[0]), is_fp8=b_is_fp8w)
@@ -831,6 +839,8 @@ class FusedMoEModule(nn.Module):
             # and do FP8 dot with per-output-channel weight scales.
             if B_scale is None:
                 raise ValueError("B_scale is required for FP8-weight MoE")
+            if a_fp8_bits is None or a_fp8_scale is None:
+                raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
 
             triton_fp8_config = {
                 "BLOCK_SIZE_M": 64,
@@ -840,10 +850,10 @@ class FusedMoEModule(nn.Module):
                 "NUM_WARPS": 4,
                 "NUM_STAGES": 4,
             }
-            a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
+            self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
             invoke_fused_moe_kernel_triton_fp8(
-                a_bits.view(torch.float8_e4m3fn),
-                a_scale,
+                a_fp8_bits.view(torch.float8_e4m3fn),
+                a_fp8_scale,
                 B.view(torch.float8_e4m3fn),
                 B_scale,
                 C,
@@ -863,16 +873,18 @@ class FusedMoEModule(nn.Module):
                 # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
                 if B_scale is None:
                     raise ValueError("B_scale is required for FP8-weight MoE")
+                if a_fp8_bits is None or a_fp8_scale is None:
+                    raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
 
-                a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
+                self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
                 if mul_routed_weight:
                     if int(top_k) != 1:
                         raise ValueError("CuTe fp8 moe_down expects top_k=1")
                     if topk_weights is None:
                         raise ValueError("topk_weights is required when mul_routed_weight=True")
                     invoke_cute_moe_down_fp8(
-                        a_bits,
-                        a_scale,
+                        a_fp8_bits,
+                        a_fp8_scale,
                         B,
                         B_scale,
                         C,
@@ -885,8 +897,8 @@ class FusedMoEModule(nn.Module):
                     if int(top_k) != 8:
                         raise ValueError("CuTe fp8 moe_up expects top_k=8")
                     invoke_cute_moe_up_fp8(
-                        a_bits,
-                        a_scale,
+                        a_fp8_bits,
+                        a_fp8_scale,
                         B,
                         B_scale,
                         C,

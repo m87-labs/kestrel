@@ -2,44 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-
-class _FixedBuffer:
-    """Device-aware buffer that is pre-allocated once and never resized.
-
-    After the first allocation, requesting a larger size will raise an error.
-    This ensures CUDA graph replay uses stable pointers.
-    """
-
-    def __init__(self) -> None:
-        self._tensor: torch.Tensor | None = None
-
-    def get(
-        self,
-        shape: tuple[int, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        numel = 1
-        for dim in shape:
-            numel *= dim
-        if numel == 0:
-            return torch.empty(shape, device=device, dtype=dtype)
-
-        if self._tensor is None:
-            self._tensor = torch.empty(numel, device=device, dtype=dtype)
-        elif self._tensor.numel() < numel:
-            raise RuntimeError(
-                f"LoRA buffer overflow: requested {numel} elements but "
-                f"only {self._tensor.numel()} allocated. Increase max_seq_length "
-                f"or ensure preallocate_lora_buffers() is called."
-            )
-        elif self._tensor.device != device or self._tensor.dtype != dtype:
-            raise RuntimeError(
-                f"LoRA buffer device/dtype mismatch: buffer on {self._tensor.device} "
-                f"({self._tensor.dtype}), requested {device} ({dtype})."
-            )
-        return self._tensor[:numel].view(*shape)
+from kestrel.utils.buffers import FixedBuffer
 
 
 # =============================================================================
@@ -327,9 +290,8 @@ def _batched_fused_moe_lora_kernel(
     tl.store(out_ptrs, out_new, mask=out_mask)
 
 
-_BATCHED_INTERMEDIATE_BUFFER = _FixedBuffer()
-_BATCHED_LORA_OUTPUT_BUFFER = _FixedBuffer()  # Currently unused
-_SINGLE_INTERMEDIATE_BUFFER = _FixedBuffer()
+_BATCHED_INTERMEDIATE_BUFFER = FixedBuffer("LoRA batched intermediate")
+_SINGLE_INTERMEDIATE_BUFFER = FixedBuffer("LoRA single intermediate")
 
 
 def preallocate_lora_buffers(
