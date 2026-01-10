@@ -19,7 +19,6 @@ from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel_kernels.activation import gelu_residual_cuda
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 from kestrel_kernels.cute_moe import (
-    CuteMoeConfig,
     get_cute_moe_block_m,
     invoke_cute_moe_down,
     invoke_cute_moe_down_fp8,
@@ -824,8 +823,8 @@ class FusedMoEModule(nn.Module):
         triton_config: dict[str, int],
         compute_type,
     ) -> None:
-        backend = self._resolve_backend(num_tokens=int(C.shape[0]))
         b_is_fp8w = B.dtype == torch.uint8
+        backend = self._resolve_backend(num_tokens=int(C.shape[0]), is_fp8=b_is_fp8w)
 
         if b_is_fp8w and backend == "triton":
             # Triton FP8 W8A8 path (SGLang-style): quantize activations per row
@@ -865,24 +864,6 @@ class FusedMoEModule(nn.Module):
                 if B_scale is None:
                     raise ValueError("B_scale is required for FP8-weight MoE")
 
-                num_tokens = int(C.shape[0])
-                # Match Triton's fp8 W8A8 tiling, but keep a smaller N tile
-                # for the single-token case where occupancy is otherwise poor.
-                block_n = 64 if (not mul_routed_weight) and (num_tokens == 1) else 128
-
-                # Prefer deeper pipelining for small decode batches to better hide
-                # DRAM latency; fall back to fewer stages for larger batches where
-                # occupancy becomes the limiting factor.
-                num_stages = 4 if num_tokens <= 16 else 2
-
-                cute_cfg = CuteMoeConfig(
-                    block_m=64,
-                    block_n=block_n,
-                    block_k=128,
-                    num_warps=4,
-                    num_stages=num_stages,
-                    dtype="fp8",
-                )
                 a_bits, a_scale = self._quantize_fp8_e4m3fn_rowwise(A)
                 if mul_routed_weight:
                     if int(top_k) != 1:
@@ -899,7 +880,6 @@ class FusedMoEModule(nn.Module):
                         sorted_token_ids=sorted_token_ids,
                         expert_ids=expert_ids,
                         num_tokens_post_padded=num_tokens_post_padded,
-                        config=cute_cfg,
                     )
                 else:
                     if int(top_k) != 8:
@@ -913,7 +893,6 @@ class FusedMoEModule(nn.Module):
                         sorted_token_ids=sorted_token_ids,
                         expert_ids=expert_ids,
                         num_tokens_post_padded=num_tokens_post_padded,
-                        config=cute_cfg,
                     )
                 return
 
@@ -1033,28 +1012,25 @@ class FusedMoEModule(nn.Module):
     ) -> int:
         """Get block_m for moe_align_block_size based on backend.
 
-        For FP8 weights, both CuTe and Triton use block_m=64.
-        For BF16 weights:
-          - backend="cute": Use CuTe config block_m
-          - backend="triton": Use Triton block_m
-          - backend="auto": Use CuTe for smaller batches, Triton otherwise
+        For both FP8 and BF16 weights with CuTe backend, use auto-selected config.
+        For Triton backend, use Triton block_m.
         """
-        if is_fp8_weights:
-            # SM90 FP8 WGMMA path uses block_m=64 for both backends
-            return 64
-
-        backend = self._resolve_backend(num_tokens=num_tokens)
+        backend = self._resolve_backend(num_tokens=num_tokens, is_fp8=is_fp8_weights)
         if backend == "cute":
             return get_cute_moe_block_m(
                 num_tokens,
                 num_experts=self.num_experts,
                 hidden_size=self.input_size,
                 intermediate_size=self.hidden_size,
+                dtype="fp8" if is_fp8_weights else "bf16",
             )
         else:
             return triton_block_m
 
-    def _resolve_backend(self, *, num_tokens: int) -> str:
+    def _resolve_backend(self, *, num_tokens: int, is_fp8: bool = False) -> str:
+        # FP8 always uses CuTe backend (tuned configs available for all batch sizes)
+        if is_fp8:
+            return "cute"
         backend = self.config.backend.lower()
         if backend == "auto":
             return "triton" if num_tokens >= self.config.auto_backend_token_threshold else "cute"
