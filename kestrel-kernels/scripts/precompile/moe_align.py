@@ -23,7 +23,7 @@ from kestrel_kernels.moe_align_cute import (
     _MoeAlignBlockSizeCuTeLargeLora,
 )
 
-from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link
+from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link, PARALLEL_COMPILE, COMPILE_WORKERS
 
 
 # Path to config JSON files
@@ -131,9 +131,15 @@ def generate_precompile_variants() -> list[MoeAlignVariant]:
 
 
 def compile_variant(
-    variant: MoeAlignVariant, arch: str, output_dir: Path
+    args: tuple[MoeAlignVariant, str, Path]
 ) -> tuple[MoeAlignVariant, Path | None, str | None]:
     """Compile a single variant. Returns (variant, output_path, error_or_none)."""
+    variant, arch, output_dir = args
+
+    # Import here to avoid issues with multiprocessing spawn
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
     try:
         print(
             f"Compiling: type={variant.kernel_type}, "
@@ -332,12 +338,29 @@ def main():
     failed = []
     succeeded = []
 
-    for variant in variants:
-        result_variant, so_path, error = compile_variant(variant, arch, output_dir)
-        if error:
-            failed.append((result_variant, error))
-        else:
-            succeeded.append((result_variant, so_path))
+    if PARALLEL_COMPILE and len(variants) > 1:
+        # Use spawn context to avoid CUDA context issues with fork
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        ctx = mp.get_context("spawn")
+        print(f"Compiling {len(variants)} variants in parallel with {COMPILE_WORKERS} workers")
+
+        with ProcessPoolExecutor(max_workers=COMPILE_WORKERS, mp_context=ctx) as executor:
+            args = [(variant, arch, output_dir) for variant in variants]
+            for result_variant, so_path, error in executor.map(compile_variant, args):
+                if error:
+                    failed.append((result_variant, error))
+                else:
+                    succeeded.append((result_variant, so_path))
+    else:
+        print(f"Compiling {len(variants)} variants sequentially")
+        for variant in variants:
+            result_variant, so_path, error = compile_variant((variant, arch, output_dir))
+            if error:
+                failed.append((result_variant, error))
+            else:
+                succeeded.append((result_variant, so_path))
 
     print(f"\nMoE align precompilation complete:")
     print(f"  Succeeded: {len(succeeded)}")

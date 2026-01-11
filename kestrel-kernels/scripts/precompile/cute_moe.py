@@ -18,7 +18,7 @@ import torch
 # Insert package path for local imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
 
-from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link
+from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link, PARALLEL_COMPILE, COMPILE_WORKERS
 
 
 @dataclass(frozen=True)
@@ -349,16 +349,32 @@ def main():
 
     output_dir = get_precompiled_dir()
 
-    # Compile sequentially - parallel compilation causes issues with CUDA context
     failed = []
     succeeded = []
 
-    for variant in variants:
-        result_variant, so_path, error = compile_variant((variant, arch, output_dir))
-        if error:
-            failed.append((result_variant, error))
-        else:
-            succeeded.append((result_variant, so_path))
+    if PARALLEL_COMPILE and len(variants) > 1:
+        # Use spawn context to avoid CUDA context issues with fork
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        ctx = mp.get_context("spawn")
+        print(f"Compiling {len(variants)} variants in parallel with {COMPILE_WORKERS} workers")
+
+        with ProcessPoolExecutor(max_workers=COMPILE_WORKERS, mp_context=ctx) as executor:
+            args = [(variant, arch, output_dir) for variant in variants]
+            for result_variant, so_path, error in executor.map(compile_variant, args):
+                if error:
+                    failed.append((result_variant, error))
+                else:
+                    succeeded.append((result_variant, so_path))
+    else:
+        print(f"Compiling {len(variants)} variants sequentially")
+        for variant in variants:
+            result_variant, so_path, error = compile_variant((variant, arch, output_dir))
+            if error:
+                failed.append((result_variant, error))
+            else:
+                succeeded.append((result_variant, so_path))
 
     print(f"\nCuTe MoE precompilation complete:")
     print(f"  Succeeded: {len(succeeded)}")

@@ -7,6 +7,10 @@ from pathlib import Path
 import torch
 import cutlass.cute as cute
 
+# Parallel compilation settings
+PARALLEL_COMPILE = True
+COMPILE_WORKERS = os.cpu_count() or 4
+
 
 def get_cuda_arch() -> str:
     """Get the CUDA architecture string (e.g., 'sm90' for Hopper).

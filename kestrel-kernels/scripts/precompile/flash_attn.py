@@ -22,7 +22,7 @@ from cutlass import BFloat16, Float16
 # Insert package path for local imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
 
-from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link
+from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link, PARALLEL_COMPILE, COMPILE_WORKERS
 
 
 @dataclass(frozen=True)
@@ -340,9 +340,10 @@ def compile_decode_variant(
 
 
 def compile_variant(
-    variant: FlashAttnVariant, arch: str, output_dir: Path
+    args: tuple[FlashAttnVariant, str, Path]
 ) -> tuple[FlashAttnVariant, Path | None, str | None]:
     """Compile a single variant."""
+    variant, arch, output_dir = args
     if variant.kernel_type == "forward":
         return compile_forward_variant(variant, arch, output_dir)
     elif variant.kernel_type == "decode":
@@ -370,12 +371,29 @@ def main():
     failed = []
     succeeded = []
 
-    for variant in VARIANTS:
-        result_variant, so_path, error = compile_variant(variant, arch, output_dir)
-        if error:
-            failed.append((result_variant, error))
-        else:
-            succeeded.append((result_variant, so_path))
+    if PARALLEL_COMPILE and len(VARIANTS) > 1:
+        # Use spawn context to avoid CUDA context issues with fork
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        ctx = mp.get_context("spawn")
+        print(f"Compiling {len(VARIANTS)} variants in parallel with {COMPILE_WORKERS} workers")
+
+        with ProcessPoolExecutor(max_workers=COMPILE_WORKERS, mp_context=ctx) as executor:
+            args = [(variant, arch, output_dir) for variant in VARIANTS]
+            for result_variant, so_path, error in executor.map(compile_variant, args):
+                if error:
+                    failed.append((result_variant, error))
+                else:
+                    succeeded.append((result_variant, so_path))
+    else:
+        print(f"Compiling {len(VARIANTS)} variants sequentially")
+        for variant in VARIANTS:
+            result_variant, so_path, error = compile_variant((variant, arch, output_dir))
+            if error:
+                failed.append((result_variant, error))
+            else:
+                succeeded.append((result_variant, so_path))
 
     print(f"\nFlash Attention precompilation complete:")
     print(f"  Succeeded: {len(succeeded)}")
