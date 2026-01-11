@@ -58,7 +58,7 @@ class MoeAlignVariant:
         )
 
 
-def get_block_m_values_from_configs(arch: str) -> set[int]:
+def get_block_m_values_from_configs() -> set[int]:
     """Extract all unique block_m values from cute_moe config JSON files."""
     block_m_values: set[int] = set()
 
@@ -66,12 +66,11 @@ def get_block_m_values_from_configs(arch: str) -> set[int]:
         print(f"Warning: Config directory {_CONFIGS_DIR} does not exist")
         return block_m_values
 
-    # Find all config files for this architecture
-    pattern = f"cute_moe_*_{arch}.json"
-    config_files = list(_CONFIGS_DIR.glob(pattern))
+    # Load all config files regardless of arch (like cute_moe.py does)
+    config_files = list(_CONFIGS_DIR.glob("cute_moe_*.json"))
 
     if not config_files:
-        print(f"Warning: No config files found matching {pattern} in {_CONFIGS_DIR}")
+        print(f"Warning: No config files found in {_CONFIGS_DIR}")
         return block_m_values
 
     for config_file in config_files:
@@ -93,9 +92,9 @@ def get_block_m_values_from_configs(arch: str) -> set[int]:
     return block_m_values
 
 
-def generate_precompile_variants(arch: str) -> list[MoeAlignVariant]:
+def generate_precompile_variants() -> list[MoeAlignVariant]:
     """Generate precompile variants based on block_m values from config files."""
-    block_m_values = get_block_m_values_from_configs(arch)
+    block_m_values = get_block_m_values_from_configs()
 
     if not block_m_values:
         # Fallback to default values if no configs found
@@ -326,7 +325,7 @@ def main():
     output_dir = get_precompiled_dir()
 
     # Generate variants based on config files
-    variants = generate_precompile_variants(arch)
+    variants = generate_precompile_variants()
     print(f"Total variants to compile: {len(variants)}")
 
     # Compile all variants for the current architecture
