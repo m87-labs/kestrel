@@ -601,6 +601,13 @@ class _FusedMoeMatmulCuTeFp8:
                     if valid_row:
                         row_scale = Float32(sAScale[m])
 
+                    # Pre-multiply row_scale with b_scale for each column to reduce
+                    # dependent multiplications in the hot loop (improves precision
+                    # by combining scales before multiplying with large accumulator values)
+                    combined_scale_r = cute.make_rmem_tensor((cute.size(tAcc.shape[1]),), Float32)
+                    for ni in cutlass.range_constexpr(cute.size(tAcc.shape[1])):
+                        combined_scale_r[ni] = row_scale * b_scale_r[ni]
+
                     row_off_bytes = cutlass.Int64(aid) * stride_cm_elems * element_bytes_c
 
                     if full_n_tile:
@@ -614,25 +621,25 @@ class _FusedMoeMatmulCuTeFp8:
                             ni0_c2: cutlass.Constexpr[int] = (base_chunk + 2) * 2
                             ni0_c3: cutlass.Constexpr[int] = (base_chunk + 3) * 2
 
-                            # Apply row_scale and per-column b_scale, then pack
+                            # Apply combined scale (row_scale * b_scale), then pack
                             packed_c0 = fa_utils.cvt_f16x2_f32(
-                                Float32(tAcc[mi, ni0_c0]) * row_scale * b_scale_r[ni0_c0],
-                                Float32(tAcc[mi, ni0_c0 + 1]) * row_scale * b_scale_r[ni0_c0 + 1],
+                                Float32(tAcc[mi, ni0_c0]) * combined_scale_r[ni0_c0],
+                                Float32(tAcc[mi, ni0_c0 + 1]) * combined_scale_r[ni0_c0 + 1],
                                 self.dtype,
                             )
                             packed_c1 = fa_utils.cvt_f16x2_f32(
-                                Float32(tAcc[mi, ni0_c1]) * row_scale * b_scale_r[ni0_c1],
-                                Float32(tAcc[mi, ni0_c1 + 1]) * row_scale * b_scale_r[ni0_c1 + 1],
+                                Float32(tAcc[mi, ni0_c1]) * combined_scale_r[ni0_c1],
+                                Float32(tAcc[mi, ni0_c1 + 1]) * combined_scale_r[ni0_c1 + 1],
                                 self.dtype,
                             )
                             packed_c2 = fa_utils.cvt_f16x2_f32(
-                                Float32(tAcc[mi, ni0_c2]) * row_scale * b_scale_r[ni0_c2],
-                                Float32(tAcc[mi, ni0_c2 + 1]) * row_scale * b_scale_r[ni0_c2 + 1],
+                                Float32(tAcc[mi, ni0_c2]) * combined_scale_r[ni0_c2],
+                                Float32(tAcc[mi, ni0_c2 + 1]) * combined_scale_r[ni0_c2 + 1],
                                 self.dtype,
                             )
                             packed_c3 = fa_utils.cvt_f16x2_f32(
-                                Float32(tAcc[mi, ni0_c3]) * row_scale * b_scale_r[ni0_c3],
-                                Float32(tAcc[mi, ni0_c3 + 1]) * row_scale * b_scale_r[ni0_c3 + 1],
+                                Float32(tAcc[mi, ni0_c3]) * combined_scale_r[ni0_c3],
+                                Float32(tAcc[mi, ni0_c3 + 1]) * combined_scale_r[ni0_c3 + 1],
                                 self.dtype,
                             )
 
@@ -744,7 +751,7 @@ class _FusedMoeMatmulCuTeFp8:
                             col = n_start + n
                             if col < N_const:
                                 src_scalar[0] = self.dtype(
-                                    Float32(tAcc[mi, ni]) * row_scale * b_scale_r[ni]
+                                    Float32(tAcc[mi, ni]) * combined_scale_r[ni]
                                 )
                                 g_off_bytes_scalar = (
                                     row_off_bytes + cutlass.Int64(col) * element_bytes_c
