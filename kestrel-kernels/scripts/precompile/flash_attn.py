@@ -92,7 +92,9 @@ def _arch_supports_sm90(arch: str) -> bool:
     """Check if architecture supports SM90 features (Hopper+)."""
     if not arch.startswith("sm"):
         return False
-    version = int(arch[2:])
+    # Strip any suffix like 'a' from sm90a
+    version_str = arch[2:].rstrip("abcdefghijklmnopqrstuvwxyz")
+    version = int(version_str)
     return version >= 90
 
 
