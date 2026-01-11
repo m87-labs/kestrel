@@ -228,8 +228,7 @@ class _FusedMoeMatmulCuTeFp8:
                 _ = Int32(0)
 
             else:
-                # Load per-row routing metadata + activation scales once per CTA to avoid
-                # redundant global loads across threads.
+                # Load per-row routing metadata + activation scales once per CTA.
                 if tx < Int32(block_m):
                     idx = row_start + tx
                     aid = Int32(num_valid_tokens)  # padded sentinel
@@ -251,7 +250,6 @@ class _FusedMoeMatmulCuTeFp8:
                             row_scale = row_scale * Float32(mTopkWeights[aid])
                     sTok[tx] = tok
                     sAScale[tx] = row_scale
-
                 # Prefetch per-output-channel scales for this expert + N tile into SMEM.
                 #
                 # Use cp.async so the gmem->smem transfer is counted as LDGSTS (like A/B)
@@ -324,8 +322,13 @@ class _FusedMoeMatmulCuTeFp8:
                 acc.fill(0.0)
 
                 # WGMMA operand fragments (indexed by stage).
-                warp_group_idx = cute.arch.make_warp_uniform(tx // num_threads)
-                warp_group_thread_layout = cute.make_layout((1,), stride=(num_threads,))
+                # A warpgroup is 4 warps = 128 threads. Must compute warpgroup index correctly.
+                num_threads_per_wg = 128
+                warp_group_idx = cute.arch.make_warp_uniform(tx // Int32(num_threads_per_wg))
+                warp_group_thread_layout = cute.make_layout(
+                    num_threads // num_threads_per_wg,  # Number of warpgroups
+                    stride=num_threads_per_wg,
+                )
                 wg_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
                 tSrA = tiled_mma.make_fragment_A(wg_mma.partition_A(sA))
                 tSrB = tiled_mma.make_fragment_B(wg_mma.partition_B(sB))
@@ -397,41 +400,43 @@ class _FusedMoeMatmulCuTeFp8:
                             copy_A(tile_idx_prefetch, stage_prefetch, pred=True)
 
                     # B tile: [block_n, block_k] via cp.async.
-                    iters_b = total_vec_b // num_threads
+                    # FIX: use ceil to ensure all vectors are covered when total_vec_b % num_threads != 0
+                    iters_b: cutlass.Constexpr[int] = (total_vec_b + num_threads - 1) // num_threads
                     for it_b in cutlass.range_constexpr(iters_b):
                         vec_linear_b = tx + Int32(it_b * num_threads)
-                        n_b = vec_linear_b // block_vec_k
-                        kvec_b = vec_linear_b - n_b * block_vec_k
-                        k_b = Int32(kvec_b * vec_size_in)
-                        ng_b = n_start + Int32(n_b)
-                        kg_b = k_start_prefetch + k_b
+                        if vec_linear_b < Int32(total_vec_b):
+                            n_b = vec_linear_b // block_vec_k
+                            kvec_b = vec_linear_b - n_b * block_vec_k
+                            k_b = Int32(kvec_b * vec_size_in)
+                            ng_b = n_start + Int32(n_b)
+                            kg_b = k_start_prefetch + k_b
 
-                        valid_b = tile_in_range and full_n_tile and (kg_b < K)
-                        if not full_n_tile:
-                            valid_b = tile_in_range and (ng_b < N) and (kg_b < K)
-                        base_off_u8 = (
-                            cutlass.Int64(expert_id) * stride_be_u8
-                            + cutlass.Int64(ng_b) * stride_bn_u8
-                            + cutlass.Int64(kg_b) * stride_bk_u8
-                        )
-                        g_ptr_b = cute.make_ptr(
-                            self.fp8_dtype,
-                            mB_base_i64 + base_off_u8,
-                            cute.AddressSpace.gmem,
-                            assumed_align=align_bytes_in,
-                        )
-                        src_b = cute.make_tensor(g_ptr_b, (vec_size_in,))
+                            valid_b = tile_in_range and full_n_tile and (kg_b < K)
+                            if not full_n_tile:
+                                valid_b = tile_in_range and (ng_b < N) and (kg_b < K)
+                            base_off_u8 = (
+                                cutlass.Int64(expert_id) * stride_be_u8
+                                + cutlass.Int64(ng_b) * stride_bn_u8
+                                + cutlass.Int64(kg_b) * stride_bk_u8
+                            )
+                            g_ptr_b = cute.make_ptr(
+                                self.fp8_dtype,
+                                mB_base_i64 + base_off_u8,
+                                cute.AddressSpace.gmem,
+                                assumed_align=align_bytes_in,
+                            )
+                            src_b = cute.make_tensor(g_ptr_b, (vec_size_in,))
 
-                        s_linear_b = Int32(sB_layout((Int32(n_b), k_b, Int32(stage_prefetch))))
-                        s_ptr_b = cute.make_ptr(
-                            self.fp8_dtype,
-                            sB.iterator.toint() + cutlass.Int64(s_linear_b) * element_bytes_fp8,
-                            cute.AddressSpace.smem,
-                            assumed_align=align_bytes_in,
-                        )
-                        dst_b = cute.make_tensor(s_ptr_b, (vec_size_in,))
-                        pred_in[0] = valid_b
-                        cute.copy(atom_async_copy_b, src_b, dst_b, pred=pred_in)
+                            s_linear_b = Int32(sB_layout((Int32(n_b), k_b, Int32(stage_prefetch))))
+                            s_ptr_b = cute.make_ptr(
+                                self.fp8_dtype,
+                                sB.iterator.toint() + cutlass.Int64(s_linear_b) * element_bytes_fp8,
+                                cute.AddressSpace.smem,
+                                assumed_align=align_bytes_in,
+                            )
+                            dst_b = cute.make_tensor(s_ptr_b, (vec_size_in,))
+                            pred_in[0] = valid_b
+                            cute.copy(atom_async_copy_b, src_b, dst_b, pred=pred_in)
 
                     cute.arch.cp_async_commit_group()
 
@@ -484,42 +489,44 @@ class _FusedMoeMatmulCuTeFp8:
                             copy_A(next_tile, write_stage, pred=True)
 
                         # Prefetch next B tile into the safe write stage.
-                        iters_b2 = total_vec_b // num_threads
+                        # FIX: use ceil to ensure all vectors are covered
+                        iters_b2: cutlass.Constexpr[int] = (total_vec_b + num_threads - 1) // num_threads
                         for it_b2 in cutlass.range_constexpr(iters_b2):
                             vec_linear_b2 = tx + Int32(it_b2 * num_threads)
-                            n_b2 = vec_linear_b2 // block_vec_k
-                            kvec_b2 = vec_linear_b2 - n_b2 * block_vec_k
-                            k_b2 = Int32(kvec_b2 * vec_size_in)
-                            ng_b2 = n_start + Int32(n_b2)
-                            kg_b2 = k_start_next + k_b2
+                            if vec_linear_b2 < Int32(total_vec_b):
+                                n_b2 = vec_linear_b2 // block_vec_k
+                                kvec_b2 = vec_linear_b2 - n_b2 * block_vec_k
+                                k_b2 = Int32(kvec_b2 * vec_size_in)
+                                ng_b2 = n_start + Int32(n_b2)
+                                kg_b2 = k_start_next + k_b2
 
-                            valid_b2 = full_n_tile and (kg_b2 < K)
-                            if not full_n_tile:
-                                valid_b2 = (ng_b2 < N) and (kg_b2 < K)
-                            base_off_u8_2 = (
-                                cutlass.Int64(expert_id) * stride_be_u8
-                                + cutlass.Int64(ng_b2) * stride_bn_u8
-                                + cutlass.Int64(kg_b2) * stride_bk_u8
-                            )
-                            g_ptr_b2 = cute.make_ptr(
-                                self.fp8_dtype,
-                                mB_base_i64 + base_off_u8_2,
-                                cute.AddressSpace.gmem,
-                                assumed_align=align_bytes_in,
-                            )
-                            src_b2 = cute.make_tensor(g_ptr_b2, (vec_size_in,))
+                                valid_b2 = full_n_tile and (kg_b2 < K)
+                                if not full_n_tile:
+                                    valid_b2 = (ng_b2 < N) and (kg_b2 < K)
+                                base_off_u8_2 = (
+                                    cutlass.Int64(expert_id) * stride_be_u8
+                                    + cutlass.Int64(ng_b2) * stride_bn_u8
+                                    + cutlass.Int64(kg_b2) * stride_bk_u8
+                                )
+                                g_ptr_b2 = cute.make_ptr(
+                                    self.fp8_dtype,
+                                    mB_base_i64 + base_off_u8_2,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=align_bytes_in,
+                                )
+                                src_b2 = cute.make_tensor(g_ptr_b2, (vec_size_in,))
 
-                            s_linear_b2 = Int32(sB_layout((Int32(n_b2), k_b2, write_stage)))
-                            s_ptr_b2 = cute.make_ptr(
-                                self.fp8_dtype,
-                                sB.iterator.toint()
-                                + cutlass.Int64(s_linear_b2) * element_bytes_fp8,
-                                cute.AddressSpace.smem,
-                                assumed_align=align_bytes_in,
-                            )
-                            dst_b2 = cute.make_tensor(s_ptr_b2, (vec_size_in,))
-                            pred_in[0] = valid_b2
-                            cute.copy(atom_async_copy_b, src_b2, dst_b2, pred=pred_in)
+                                s_linear_b2 = Int32(sB_layout((Int32(n_b2), k_b2, write_stage)))
+                                s_ptr_b2 = cute.make_ptr(
+                                    self.fp8_dtype,
+                                    sB.iterator.toint()
+                                    + cutlass.Int64(s_linear_b2) * element_bytes_fp8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=align_bytes_in,
+                                )
+                                dst_b2 = cute.make_tensor(s_ptr_b2, (vec_size_in,))
+                                pred_in[0] = valid_b2
+                                cute.copy(atom_async_copy_b, src_b2, dst_b2, pred=pred_in)
 
                         cute.arch.cp_async_commit_group()
 
