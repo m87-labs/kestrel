@@ -19,6 +19,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
+import warnings
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
@@ -64,6 +65,7 @@ from kestrel_kernels.flash_attn.cute.block_sparsity import (
     get_block_sparse_expected_shapes,
     get_block_sparse_expected_shapes_bwd,
 )
+from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -90,6 +92,142 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+# Import mask for hash comparison in precompiled kernel lookup
+from kestrel_kernels.flash_attn.cute.mask_definitions import cute_prefix_lm_mask_730
+
+_cute_dtype_to_name = {
+    cutlass.BFloat16: "bf16",
+    cutlass.Float16: "f16",
+}
+
+
+def _try_load_precompiled_flash_attn(compile_key, use_sm90_decode_fastpath: bool):
+    """Try to load a precompiled flash attention kernel if available.
+
+    Returns the loaded kernel function or None if not available.
+    """
+    # Unpack compile_key fields we care about
+    (
+        dtype, dtype_kv, head_dim, head_dim_v, qhead_per_kvhead, causal,
+        score_mod_hash, mask_mod_hash, use_block_sparsity, n_aux,
+        lse_is_none, cu_seqlens_q_none, cu_seqlens_k_none,
+        seqused_q_none, seqused_k_none, has_page_table,
+        has_window_left, has_window_right, has_sink,
+        m_block, n_block, num_threads, num_splits, is_split_kv,
+        pack_gqa, cc, paged_kv_non_tma, use_decode_fastpath, intra_wg_overlap,
+    ) = compile_key
+
+    # Only precompile for SM90
+    if cc != 9:
+        return None
+
+    # Check basic requirements for all precompiled variants
+    # Note: hash values are False (not None) when the callable is not present
+    if score_mod_hash:
+        return None
+    if use_block_sparsity or n_aux > 0:
+        return None
+    if has_window_left or has_window_right or has_sink:
+        return None
+    if qhead_per_kvhead != 1:  # Only MHA for now
+        return None
+
+    dtype_name = _cute_dtype_to_name.get(dtype)
+    if dtype_name is None:
+        return None
+
+    arch = get_cuda_arch()
+
+    if use_sm90_decode_fastpath:
+        # Decode variant
+        if head_dim not in (64, 128):
+            return None
+
+        # Determine KV dtype name
+        if dtype_kv == cutlass.Float8E4M3FN:
+            dtype_kv_name = "fp8_e4m3"
+        elif dtype_kv == cutlass.BFloat16:
+            dtype_kv_name = "bf16"
+        elif dtype_kv == cutlass.Float16:
+            dtype_kv_name = "f16"
+        else:
+            return None
+
+        # Decode is always causal
+        if not causal:
+            return None
+
+        filename = f"flash_attn_decode_sm90_{dtype_name}_{dtype_kv_name}_hd{head_dim}_causal_{arch}.so"
+    else:
+        # Forward variant
+        if head_dim not in (64, 72, 128):
+            return None
+        if head_dim != head_dim_v:
+            return None
+
+        # Determine KV dtype name for forward
+        # For FP8 paged prefill, dtype_kv is Float8E4M3FN
+        if dtype_kv is not None and dtype_kv != dtype:
+            if dtype_kv == cutlass.Float8E4M3FN:
+                dtype_kv_name = "fp8_e4m3"
+            else:
+                return None  # Unsupported dtype_kv for forward
+            dtype_kv_str = f"_{dtype_kv_name}"
+        else:
+            dtype_kv_str = ""
+
+        # Check for matching mask
+        # Note: mask_mod_hash is False (not None) when no mask is provided
+        mask_str = ""
+        if mask_mod_hash:
+            # Check if it's the prefix_lm_730 mask
+            prefix_lm_hash = getattr(cute_prefix_lm_mask_730, "__cute_hash__", None)
+            if mask_mod_hash == prefix_lm_hash:
+                mask_str = "_prefix_lm_730"
+            else:
+                return None  # Unknown mask, can't use precompiled
+
+        # Check for standard tile sizes
+        if m_block != 128 or n_block != 128 or num_threads != 384:
+            return None
+
+        causal_str = "_causal" if causal else ""
+        paged_str = "_paged" if paged_kv_non_tma else ""
+
+        filename = f"flash_attn_forward_sm90_{dtype_name}{dtype_kv_str}_hd{head_dim}{causal_str}{mask_str}{paged_str}_{arch}.so"
+
+    # Try to load the module
+    mod = load_precompiled_module(filename)
+    if mod is None:
+        return None
+
+    fn_name = filename.replace(".so", "")
+    kernel_fn = getattr(mod, fn_name, None)
+    if kernel_fn is None:
+        return None
+
+    # Create a wrapper that removes the stream parameter (position 8, 0-indexed)
+    # because TVM FFI precompiled kernels don't take stream as a parameter.
+    # The runtime call signature is:
+    #   (q, k, v, out, lse, scale, k_scale, v_scale, stream, cu_seqlens_q, ...)
+    # But precompiled expects:
+    #   (q, k, v, out, lse, scale, k_scale, v_scale, cu_seqlens_q, ...)
+    def precompiled_wrapper(
+        q, k, v, out, lse, softmax_scale, k_scale, v_scale,
+        stream,  # This is ignored - TVM FFI uses env stream
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+        window_size_left, window_size_right, learnable_sink,
+        sparse_tensors, aux_tensors,
+    ):
+        return kernel_fn(
+            q, k, v, out, lse, softmax_scale, k_scale, v_scale,
+            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+            window_size_left, window_size_right, learnable_sink,
+            sparse_tensors, aux_tensors,
+        )
+
+    return precompiled_wrapper
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -624,6 +762,19 @@ def _flash_attn_fwd(
         intra_wg_overlap,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
+        # Try loading precompiled kernel first
+        precompiled = _try_load_precompiled_flash_attn(compile_key, use_sm90_decode_fastpath)
+        if precompiled is not None:
+            _flash_attn_fwd.compile_cache[compile_key] = precompiled
+    if compile_key not in _flash_attn_fwd.compile_cache:
+        # JIT compile if no precompiled version available
+        kernel_type = "decode" if use_sm90_decode_fastpath else "forward"
+        warnings.warn(
+            f"Flash Attention {kernel_type} kernel not precompiled (hd={head_dim}, "
+            f"causal={causal}, paged={inferred_paged_kv_non_tma}, "
+            f"mask={'yes' if mask_mod is not None else 'no'}). JIT compiling...",
+            stacklevel=3,
+        )
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,

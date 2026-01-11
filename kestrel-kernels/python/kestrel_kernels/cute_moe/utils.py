@@ -520,11 +520,85 @@ def store_smem_b32(value: Int32, smem_ptr, *, loc=None, ip=None) -> None:
 
     Input: value (Int32), smem_ptr (Int64 address)
     """
+    if hasattr(smem_ptr, 'ir_value'):
+        ptr_ir = smem_ptr.ir_value(loc=loc, ip=ip)
+    else:
+        ptr_ir = smem_ptr
+
     llvm.inline_asm(
         None,
-        [smem_ptr, Int32(value).ir_value(loc=loc, ip=ip)],
+        [ptr_ir, Int32(value).ir_value(loc=loc, ip=ip)],
         "st.shared.b32 [$0], $1;",
         "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def load_smem_u32(smem_ptr, *, loc=None, ip=None) -> Int32:
+    """Load 32 bits from shared memory.
+
+    Input: smem_ptr - Int64 address in shared memory
+    Output: Int32 with loaded value
+    """
+    if hasattr(smem_ptr, 'ir_value'):
+        ptr_ir = smem_ptr.ir_value(loc=loc, ip=ip)
+    else:
+        ptr_ir = smem_ptr
+
+    result = llvm.inline_asm(
+        T.i32(),
+        [ptr_ir],
+        "ld.shared.u32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def byte_perm_u32(a: Int32, b: Int32, selector: int, *, loc=None, ip=None) -> Int32:
+    """Byte permutation using PTX prmt instruction.
+
+    Selects 4 bytes from the concatenation of b and a (8 bytes total).
+    Byte indices: a[0..3] = indices 0..3, b[0..3] = indices 4..7.
+
+    The selector is a 16-bit immediate where each nibble (4 bits) specifies
+    which source byte to place in the corresponding result byte position.
+
+    Example: selector=0x5140 produces result[0]=a[0], result[1]=b[0],
+             result[2]=a[1], result[3]=b[1]
+
+    Input: a, b - Int32 source values, selector - 16-bit immediate
+    Output: Int32 with permuted bytes
+    """
+    ir_a = Int32(a).ir_value(loc=loc, ip=ip)
+    ir_b = Int32(b).ir_value(loc=loc, ip=ip)
+
+    result = llvm.inline_asm(
+        T.i32(),
+        [ir_a, ir_b],
+        f"prmt.b32 $0, $1, $2, {selector};",
+        "=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def warp_sync(*, loc=None, ip=None) -> None:
+    """Synchronize all threads within a warp."""
+    llvm.inline_asm(
+        None,
+        [],
+        "bar.warp.sync 0xffffffff;",
+        "",
         has_side_effects=True,
         loc=loc,
         ip=ip,

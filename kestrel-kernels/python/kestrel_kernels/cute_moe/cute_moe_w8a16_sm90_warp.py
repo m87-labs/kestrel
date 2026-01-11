@@ -38,11 +38,10 @@ from kestrel_kernels.cute_moe.utils import (
     store_streaming_b32,
     cvt_fp8x2_to_f16_both,
     cvt_bf16_to_f16,
-    load_smem_u16,
-    store_smem_u16,
-    repack_fp8_pair_for_k16_slices,
-    unpack_repack_result_lo,
-    unpack_repack_result_hi,
+    load_smem_u32,
+    store_smem_b32,
+    byte_perm_u32,
+    warp_sync,
 )
 
 if TYPE_CHECKING:
@@ -499,12 +498,20 @@ class _FusedMoeMatmulCuTeWarpW8A16:
             smem_thr_copy_A = cute.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(tx)
             smem_thr_copy_B = cute.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(tx)
 
-            # Repack B helper: converts (k,k+1) pairs to (k,k+16) pairs for a 32-K chunk
-            # Work distribution for repack:
-            # - num_chunks_per_row = half_k // 16 (each 32-K chunk = 16 halfwords in smem)
-            # - total_pair_ops = block_n × num_chunks_per_row × 8
+            # Vectorized repack: convert (k,k+1) pairs to (k,k+16) pairs using 32-bit ops
+            # Each 32-K chunk has two 16-byte segments (seg0: K=0..15, seg1: K=16..31)
+            # We load as 4x u32, permute bytes, and store back
             num_chunks_per_row = half_k // 16
-            total_repack_pairs = Int32(block_n * num_chunks_per_row * 8)
+            num_warps = self.config.num_warps
+            warp_id = tx >> 5
+            lane = tx & 31
+
+            # Each warp handles a slice of N rows
+            n_per_warp = block_n // num_warps
+            n0 = warp_id * Int32(n_per_warp)
+
+            # Compute lane validity once (for n_per_warp < 32 case)
+            lane_valid = lane < Int32(n_per_warp) if n_per_warp < 32 else True
 
             # Main loop
             main_tiles = k_tiles - Int32(num_stages - 1)
@@ -512,54 +519,72 @@ class _FusedMoeMatmulCuTeWarpW8A16:
                 cute.arch.cp_async_wait_group(num_stages - 1)
                 cute.arch.barrier()
 
-                # Repack B stage: convert (k,k+1) pairs to (k,k+16) pairs
-                # After repack, F2FP will give consecutive K indices in each half
-                sB_repack_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
-                for pair_idx in range(tx, total_repack_pairs, num_threads):
-                    # Decode pair_idx -> (n_row, chunk_idx, i)
-                    pairs_per_row = Int32(num_chunks_per_row * 8)
-                    n_row = pair_idx // pairs_per_row
-                    remainder = pair_idx - n_row * pairs_per_row
-                    chunk_idx = remainder // Int32(8)
-                    i = remainder - chunk_idx * Int32(8)
+                # Vectorized repack of B stage using 32-bit loads/stores + byte_perm
+                sB_stage_off = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
 
-                    # Compute smem positions for src[i] and src[i+8]
-                    chunk_base = chunk_idx * Int32(16)
-                    pos_lo = chunk_base + i
-                    pos_hi = chunk_base + i + Int32(8)
+                # Each lane handles one n_row (or multiple via +32 stride)
+                for n_offset in cutlass.range_constexpr(n_per_warp // 32 if n_per_warp >= 32 else 1):
+                    n_row = n0 + lane + Int32(n_offset * 32)
 
-                    # Compute smem addresses using tile layout
-                    addr_lo = sB_tile_layout((n_row, pos_lo))
-                    addr_hi = sB_tile_layout((n_row, pos_hi))
+                    if lane_valid:
+                        for chunk_idx in cutlass.range_constexpr(num_chunks_per_row):
+                            chunk_base = Int32(chunk_idx * 16)
 
-                    smem_ptr_lo = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_lo) * element_bytes_bf16
-                    smem_ptr_hi = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_hi) * element_bytes_bf16
+                            # Read all 16 halfwords first (8 u32 loads for positions 0-15)
+                            # to avoid in-place conflicts
+                            addr0 = Int32(sB_tile_layout((n_row, chunk_base + Int32(0))))
+                            addr2 = Int32(sB_tile_layout((n_row, chunk_base + Int32(2))))
+                            addr4 = Int32(sB_tile_layout((n_row, chunk_base + Int32(4))))
+                            addr6 = Int32(sB_tile_layout((n_row, chunk_base + Int32(6))))
+                            addr8 = Int32(sB_tile_layout((n_row, chunk_base + Int32(8))))
+                            addr10 = Int32(sB_tile_layout((n_row, chunk_base + Int32(10))))
+                            addr12 = Int32(sB_tile_layout((n_row, chunk_base + Int32(12))))
+                            addr14 = Int32(sB_tile_layout((n_row, chunk_base + Int32(14))))
 
-                    # Load src[i] and src[i+8]
-                    src_lo = load_smem_u16(smem_ptr_lo)
-                    src_hi = load_smem_u16(smem_ptr_hi)
+                            ptr0 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr0) * element_bytes_bf16
+                            ptr2 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr2) * element_bytes_bf16
+                            ptr4 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr4) * element_bytes_bf16
+                            ptr6 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr6) * element_bytes_bf16
+                            ptr8 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr8) * element_bytes_bf16
+                            ptr10 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr10) * element_bytes_bf16
+                            ptr12 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr12) * element_bytes_bf16
+                            ptr14 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr14) * element_bytes_bf16
 
-                    # Repack: dst_even = (lo.byte0, hi.byte0), dst_odd = (lo.byte1, hi.byte1)
-                    packed_result = repack_fp8_pair_for_k16_slices(src_lo, src_hi)
-                    dst_even = unpack_repack_result_lo(packed_result)
-                    dst_odd = unpack_repack_result_hi(packed_result)
+                            # Load all data into registers first
+                            # Input layout: pos i has (k_2i, k_2i+1)
+                            in0 = load_smem_u32(ptr0)   # pos 0,1: (k0,k1,k2,k3)
+                            in2 = load_smem_u32(ptr2)   # pos 2,3: (k4,k5,k6,k7)
+                            in4 = load_smem_u32(ptr4)   # pos 4,5: (k8,k9,k10,k11)
+                            in6 = load_smem_u32(ptr6)   # pos 6,7: (k12,k13,k14,k15)
+                            in8 = load_smem_u32(ptr8)   # pos 8,9: (k16,k17,k18,k19)
+                            in10 = load_smem_u32(ptr10) # pos 10,11: (k20,k21,k22,k23)
+                            in12 = load_smem_u32(ptr12) # pos 12,13: (k24,k25,k26,k27)
+                            in14 = load_smem_u32(ptr14) # pos 14,15: (k28,k29,k30,k31)
 
-                    # Compute destination positions: 2*i and 2*i+1
-                    dst_pos_even = chunk_base + i * Int32(2)
-                    dst_pos_odd = chunk_base + i * Int32(2) + Int32(1)
+                            # Compute repacked outputs
+                            # perm(in_j, in_j+8, 0x5140) → out[2j, 2j+1]
+                            # perm(in_j, in_j+8, 0x7362) → out[2j+2, 2j+3]
+                            out0 = byte_perm_u32(in0, in8, 0x5140)   # (k0,k16,k1,k17) → pos 0,1
+                            out2 = byte_perm_u32(in0, in8, 0x7362)   # (k2,k18,k3,k19) → pos 2,3
+                            out4 = byte_perm_u32(in2, in10, 0x5140)  # (k4,k20,k5,k21) → pos 4,5
+                            out6 = byte_perm_u32(in2, in10, 0x7362)  # (k6,k22,k7,k23) → pos 6,7
+                            out8 = byte_perm_u32(in4, in12, 0x5140)  # (k8,k24,k9,k25) → pos 8,9
+                            out10 = byte_perm_u32(in4, in12, 0x7362) # (k10,k26,k11,k27) → pos 10,11
+                            out12 = byte_perm_u32(in6, in14, 0x5140) # (k12,k28,k13,k29) → pos 12,13
+                            out14 = byte_perm_u32(in6, in14, 0x7362) # (k14,k30,k15,k31) → pos 14,15
 
-                    addr_dst_even = sB_tile_layout((n_row, dst_pos_even))
-                    addr_dst_odd = sB_tile_layout((n_row, dst_pos_odd))
+                            # Write all repacked data
+                            store_smem_b32(out0, ptr0)
+                            store_smem_b32(out2, ptr2)
+                            store_smem_b32(out4, ptr4)
+                            store_smem_b32(out6, ptr6)
+                            store_smem_b32(out8, ptr8)
+                            store_smem_b32(out10, ptr10)
+                            store_smem_b32(out12, ptr12)
+                            store_smem_b32(out14, ptr14)
 
-                    smem_ptr_dst_even = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_even) * element_bytes_bf16
-                    smem_ptr_dst_odd = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_odd) * element_bytes_bf16
-
-                    # Store dst_even and dst_odd
-                    store_smem_u16(dst_even, smem_ptr_dst_even)
-                    store_smem_u16(dst_odd, smem_ptr_dst_odd)
-
-                # Barrier after repack to ensure all threads see the repacked data
-                cute.arch.barrier()
+                # Warp sync - each warp only reads its own N slice
+                warp_sync()
 
                 # Get smem for current stage
                 sA_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_a) * element_bytes_bf16
@@ -724,45 +749,63 @@ class _FusedMoeMatmulCuTeWarpW8A16:
                 cute.arch.cp_async_wait_group(num_stages - 2 - drain_idx)
                 cute.arch.barrier()
 
-                # Repack B stage (same as main loop)
-                sB_repack_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
-                for pair_idx in range(tx, total_repack_pairs, num_threads):
-                    pairs_per_row = Int32(num_chunks_per_row * 8)
-                    n_row = pair_idx // pairs_per_row
-                    remainder = pair_idx - n_row * pairs_per_row
-                    chunk_idx = remainder // Int32(8)
-                    i = remainder - chunk_idx * Int32(8)
+                # Vectorized repack of B stage (same as main loop)
+                sB_stage_off = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
 
-                    chunk_base = chunk_idx * Int32(16)
-                    pos_lo = chunk_base + i
-                    pos_hi = chunk_base + i + Int32(8)
+                for n_offset in cutlass.range_constexpr(n_per_warp // 32 if n_per_warp >= 32 else 1):
+                    n_row = n0 + lane + Int32(n_offset * 32)
 
-                    addr_lo = sB_tile_layout((n_row, pos_lo))
-                    addr_hi = sB_tile_layout((n_row, pos_hi))
+                    if lane_valid:
+                        for chunk_idx in cutlass.range_constexpr(num_chunks_per_row):
+                            chunk_base = Int32(chunk_idx * 16)
 
-                    smem_ptr_lo = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_lo) * element_bytes_bf16
-                    smem_ptr_hi = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_hi) * element_bytes_bf16
+                            # Read all, then write all (same as main loop)
+                            addr0 = Int32(sB_tile_layout((n_row, chunk_base + Int32(0))))
+                            addr2 = Int32(sB_tile_layout((n_row, chunk_base + Int32(2))))
+                            addr4 = Int32(sB_tile_layout((n_row, chunk_base + Int32(4))))
+                            addr6 = Int32(sB_tile_layout((n_row, chunk_base + Int32(6))))
+                            addr8 = Int32(sB_tile_layout((n_row, chunk_base + Int32(8))))
+                            addr10 = Int32(sB_tile_layout((n_row, chunk_base + Int32(10))))
+                            addr12 = Int32(sB_tile_layout((n_row, chunk_base + Int32(12))))
+                            addr14 = Int32(sB_tile_layout((n_row, chunk_base + Int32(14))))
 
-                    src_lo = load_smem_u16(smem_ptr_lo)
-                    src_hi = load_smem_u16(smem_ptr_hi)
+                            ptr0 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr0) * element_bytes_bf16
+                            ptr2 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr2) * element_bytes_bf16
+                            ptr4 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr4) * element_bytes_bf16
+                            ptr6 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr6) * element_bytes_bf16
+                            ptr8 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr8) * element_bytes_bf16
+                            ptr10 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr10) * element_bytes_bf16
+                            ptr12 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr12) * element_bytes_bf16
+                            ptr14 = sB_fp8_base_i64 + sB_stage_off + cutlass.Int64(addr14) * element_bytes_bf16
 
-                    packed_result = repack_fp8_pair_for_k16_slices(src_lo, src_hi)
-                    dst_even = unpack_repack_result_lo(packed_result)
-                    dst_odd = unpack_repack_result_hi(packed_result)
+                            in0 = load_smem_u32(ptr0)
+                            in2 = load_smem_u32(ptr2)
+                            in4 = load_smem_u32(ptr4)
+                            in6 = load_smem_u32(ptr6)
+                            in8 = load_smem_u32(ptr8)
+                            in10 = load_smem_u32(ptr10)
+                            in12 = load_smem_u32(ptr12)
+                            in14 = load_smem_u32(ptr14)
 
-                    dst_pos_even = chunk_base + i * Int32(2)
-                    dst_pos_odd = chunk_base + i * Int32(2) + Int32(1)
+                            out0 = byte_perm_u32(in0, in8, 0x5140)
+                            out2 = byte_perm_u32(in0, in8, 0x7362)
+                            out4 = byte_perm_u32(in2, in10, 0x5140)
+                            out6 = byte_perm_u32(in2, in10, 0x7362)
+                            out8 = byte_perm_u32(in4, in12, 0x5140)
+                            out10 = byte_perm_u32(in4, in12, 0x7362)
+                            out12 = byte_perm_u32(in6, in14, 0x5140)
+                            out14 = byte_perm_u32(in6, in14, 0x7362)
 
-                    addr_dst_even = sB_tile_layout((n_row, dst_pos_even))
-                    addr_dst_odd = sB_tile_layout((n_row, dst_pos_odd))
+                            store_smem_b32(out0, ptr0)
+                            store_smem_b32(out2, ptr2)
+                            store_smem_b32(out4, ptr4)
+                            store_smem_b32(out6, ptr6)
+                            store_smem_b32(out8, ptr8)
+                            store_smem_b32(out10, ptr10)
+                            store_smem_b32(out12, ptr12)
+                            store_smem_b32(out14, ptr14)
 
-                    smem_ptr_dst_even = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_even) * element_bytes_bf16
-                    smem_ptr_dst_odd = sB_fp8_base_i64 + sB_repack_stage_offset + cutlass.Int64(addr_dst_odd) * element_bytes_bf16
-
-                    store_smem_u16(dst_even, smem_ptr_dst_even)
-                    store_smem_u16(dst_odd, smem_ptr_dst_odd)
-
-                cute.arch.barrier()
+                warp_sync()
 
                 sA_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_a) * element_bytes_bf16
                 sB_stage_offset = cutlass.Int64(stage_idx) * cutlass.Int64(stage_stride_b) * element_bytes_bf16
