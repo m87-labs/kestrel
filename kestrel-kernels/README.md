@@ -20,11 +20,13 @@ Wheels must be built on a machine with an H100 GPU (e.g., p1) since precompilati
 
 # Build the wheel
 cd ~/code/kestrel/kestrel-kernels
-CUDACXX=/usr/local/cuda/bin/nvcc ~/.local/bin/uv run python -m build --wheel
+TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc ~/.local/bin/uv run python -m build --wheel
 
 # Wheel is output to dist/
 ls dist/*.whl
 ```
+
+**Important:** `TORCH_CUDA_ARCH_LIST=9.0a` ensures precompiled kernels use the `sm90a` architecture string, which is required for production deployments.
 
 ## Releasing to GitHub
 
