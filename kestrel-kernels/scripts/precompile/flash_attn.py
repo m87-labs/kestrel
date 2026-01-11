@@ -101,8 +101,8 @@ def _arch_supports_sm90(arch: str) -> bool:
 def _make_fake_tensor(dtype, shape, divisibility=8, assumed_align=16):
     """Create a fake tensor for compilation.
 
-    Note: Don't call mark_layout_dynamic on fake tensors - it returns None.
-    Fake tensors work directly with cute.compile.
+    Note: Fake tensors use symbolic dimensions for shape/stride, allowing
+    cute.compile to generate dynamic kernels that work with runtime tensor sizes.
     """
     if dtype is None:
         return None
@@ -118,6 +118,16 @@ def _make_fake_tensor(dtype, shape, divisibility=8, assumed_align=16):
         shape,
         stride=tuple(strides),
         assumed_align=assumed_align,
+    )
+
+
+def _make_fake_tensor_1d_int32(shape):
+    """Create a fake 1D int32 tensor matching to_cute_tensor(..., assumed_align=4, leading_dim=0)."""
+    return cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        shape,
+        stride=(1,),  # 1D tensor has trivial stride
+        assumed_align=4,  # Matches JIT path for seqused_k/page_table
     )
 
 
@@ -184,9 +194,10 @@ def compile_forward_variant(
             max_num_pages_per_seq = cute.sym_int()
             k_tensor = _make_fake_tensor(kv_tensor_dtype, (n_pages, page_size, num_heads, head_dim))
             v_tensor = _make_fake_tensor(kv_tensor_dtype, (n_pages, page_size, num_heads, head_dim))
-            page_table = _make_fake_tensor(cutlass.Int32, (batch, max_num_pages_per_seq))
-            # seqused_k is REQUIRED for paged FA3 (text.py raises if None)
-            seqused_k = _make_fake_tensor(cutlass.Int32, (batch,))
+            # page_table uses assumed_align=4 in JIT (to_cute_tensor(..., assumed_align=4, leading_dim=1))
+            page_table = _make_fake_tensor(cutlass.Int32, (batch, max_num_pages_per_seq), assumed_align=4)
+            # seqused_k uses assumed_align=4 in JIT (to_cute_tensor(..., assumed_align=4, leading_dim=0))
+            seqused_k = _make_fake_tensor_1d_int32((batch,))
         else:
             # Non-paged K/V: shape is (batch, seqlen_k, n_kv_heads, head_dim)
             seqlen_k = cute.sym_int()
@@ -284,8 +295,9 @@ def compile_decode_variant(
         o_tensor = _make_fake_tensor(variant.dtype, (batch, seqlen_q, num_heads, head_dim))
 
         # Decode requires page_table and seqused_k
-        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len))
-        seqused_k = _make_fake_tensor(cutlass.Int32, (batch,))
+        # Use assumed_align=4 to match JIT path (to_cute_tensor(..., assumed_align=4))
+        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), assumed_align=4)
+        seqused_k = _make_fake_tensor_1d_int32((batch,))
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 

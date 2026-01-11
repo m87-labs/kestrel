@@ -14,8 +14,6 @@ from kestrel_kernels.cute_moe.dispatch import (
     invoke_cute_moe_down,
     invoke_cute_moe_up_fp8,
     invoke_cute_moe_down_fp8,
-    invoke_cute_moe_up_w8a16,
-    invoke_cute_moe_down_w8a16,
 )
 from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_warp import _FusedMoeMatmulCuTe
 from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
@@ -24,7 +22,6 @@ from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
 )
 from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
 from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
-from kestrel_kernels.cute_moe.cute_moe_w8a16_sm90_warp import _FusedMoeMatmulCuTeWarpW8A16
 
 __all__ = [
     "CuteMoeConfig",
@@ -34,12 +31,9 @@ __all__ = [
     "invoke_cute_moe_down",
     "invoke_cute_moe_up_fp8",
     "invoke_cute_moe_down_fp8",
-    "invoke_cute_moe_up_w8a16",
-    "invoke_cute_moe_down_w8a16",
     "_FusedMoeMatmulCuTe",
     "_FusedMoeMatmulCuTeWgmmaBf16",
     "_FusedMoeMatmulCuTeFp8",
     "_FusedMoeMatmulCuTeWarpFp8",
-    "_FusedMoeMatmulCuTeWarpW8A16",
     "_should_use_wgmma_bf16",
 ]
