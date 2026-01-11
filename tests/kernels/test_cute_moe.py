@@ -7,8 +7,8 @@ import triton
 from kestrel_kernels.cute_moe import CuteMoeConfig
 
 
-# All token counts from cute_moe config
-CONFIG_TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
+# All token counts from cute_moe config + regression tests around 770 token threshold
+CONFIG_TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 768, 769, 770, 771, 800, 1024, 1536, 2048, 3072, 4096]
 
 
 @pytest.fixture
@@ -108,7 +108,6 @@ class TestCuteMoeKernels:
             invoke_cute_moe_up,
             invoke_cute_moe_up_fp8,
             get_cute_moe_config,
-            CuteMoeConfig,
         )
         from kestrel.fused_moe.routing import moe_align_block_size
 
@@ -139,10 +138,13 @@ class TestCuteMoeKernels:
         hidden_fp8, hidden_scale = quantize_fp8_rowwise(hidden)
         up_weight_fp8, up_weight_scale = quantize_fp8_colwise(up_weight)
 
-        # FP8 config: block_m=64 with WGMMA kernel
-        config_fp8 = CuteMoeConfig(
-            block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2,
-            dtype="fp8", kernel_type="wgmma"
+        # FP8 config from precompiled configs
+        config_fp8 = get_cute_moe_config(
+            "up", num_tokens,
+            num_experts=self.NUM_EXPERTS,
+            hidden_size=self.D_MODEL,
+            intermediate_size=self.D_EXPERT,
+            dtype="fp8",
         )
         sorted_token_ids_fp8, expert_ids_fp8, num_tokens_post_padded_fp8 = moe_align_block_size(
             topk_ids, config_fp8.block_m, self.NUM_EXPERTS
@@ -281,7 +283,6 @@ class TestCuteMoeKernels:
             invoke_cute_moe_down,
             invoke_cute_moe_down_fp8,
             get_cute_moe_config,
-            CuteMoeConfig,
         )
         from kestrel.fused_moe.routing import moe_align_block_size
 
@@ -315,10 +316,13 @@ class TestCuteMoeKernels:
         activation_fp8, activation_scale = quantize_fp8_rowwise(activation)
         down_weight_fp8, down_weight_scale = quantize_fp8_colwise(down_weight)
 
-        # FP8 config: block_m=64 with WGMMA kernel
-        config_fp8 = CuteMoeConfig(
-            block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=2,
-            dtype="fp8", kernel_type="wgmma"
+        # FP8 config from precompiled configs
+        config_fp8 = get_cute_moe_config(
+            "down", num_tokens,
+            num_experts=self.NUM_EXPERTS,
+            hidden_size=self.D_MODEL,
+            intermediate_size=self.D_EXPERT,
+            dtype="fp8",
         )
         sorted_token_ids_fp8, expert_ids_fp8, num_tokens_post_padded_fp8 = moe_align_block_size(
             topk_ids, config_fp8.block_m, self.NUM_EXPERTS
@@ -401,8 +405,8 @@ BF16_WGMMA_CONFIGS = [
     CuteMoeConfig(block_m=128, block_n=64, block_k=64, num_warps=8, num_stages=2, dtype="bf16", kernel_type="wgmma"),
 ]
 
-# Token counts for variant testing (subset for faster tests)
-VARIANT_TOKEN_COUNTS = [8, 32, 128]
+# Token counts for variant testing (subset for faster tests + 770 regression)
+VARIANT_TOKEN_COUNTS = [8, 32, 128, 770]
 
 
 class TestCuteMoeKernelVariants:
