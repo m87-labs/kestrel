@@ -27,5 +27,5 @@ dependencies = [
 [tool.scikit-build]
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
-wheel.packages = ["python/kestrel_kernels"]
+wheel.packages = []  # Disable auto-include - CMake install() controls contents
 cmake.args = ["-DCMAKE_CUDA_ARCHITECTURES=90a"]

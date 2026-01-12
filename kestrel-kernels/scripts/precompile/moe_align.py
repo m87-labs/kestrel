@@ -15,7 +15,7 @@ from cutlass import Int32, Int64
 # Insert package path for local imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
 
-from kestrel_kernels.moe_align_cute import (
+from kestrel_kernels.moe_align.kernel import (
     MoeAlignCuTeConfig,
     _MoeAlignBlockSizeCuTe,
     _MoeAlignBlockSizeCuTeLarge,

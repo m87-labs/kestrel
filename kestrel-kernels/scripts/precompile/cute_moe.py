@@ -121,13 +121,11 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
     import cutlass.cute as cute
     from cutlass import BFloat16, Float32, Float8E4M3FN
 
-    from kestrel_kernels.cute_moe import (
-        CuteMoeConfig,
-        _FusedMoeMatmulCuTe,
-        _FusedMoeMatmulCuTeWgmmaBf16,
-        _FusedMoeMatmulCuTeFp8,
-        _FusedMoeMatmulCuTeWarpFp8,
-    )
+    from kestrel_kernels.cute_moe import CuteMoeConfig
+    from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_warp import _FusedMoeMatmulCuTe
+    from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import _FusedMoeMatmulCuTeWgmmaBf16
+    from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
+    from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
 
     try:
         dtype_str = f" ({variant.dtype})" if variant.dtype == "fp8" else ""

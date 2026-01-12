@@ -134,9 +134,63 @@ add_custom_target(precompile_flash_attn
   VERBATIM
 )
 
-# Install precompiled kernels
+# Install precompiled kernels (.so files only)
 install(
   DIRECTORY "${PRECOMPILED_OUTPUT_DIR}/"
   DESTINATION kestrel_kernels/precompiled
-  FILES_MATCHING PATTERN "*.so" PATTERN "*.py"
+  FILES_MATCHING PATTERN "*.so"
 )
+
+# ============================================================================
+# Python Distribution Files (allow-list)
+# Only these files will be included in the wheel - NO kernel source templates
+# ============================================================================
+
+set(PYTHON_DIST_FILES
+    # Core package
+    python/kestrel_kernels/__init__.py
+    python/kestrel_kernels/precompile.py
+    python/kestrel_kernels/cutils.py
+    python/kestrel_kernels/tau_tail_ops.py
+
+    # TopK - dispatch code only (NO kernel.py template)
+    python/kestrel_kernels/topk/__init__.py
+    python/kestrel_kernels/topk/dispatch.py
+
+    # MoE align - dispatch code only (NO kernel.py template)
+    python/kestrel_kernels/moe_align/__init__.py
+    python/kestrel_kernels/moe_align/dispatch.py
+
+    # CuTe MoE - dispatch code only (NO cute_moe_*.py kernel templates)
+    python/kestrel_kernels/cute_moe/__init__.py
+    python/kestrel_kernels/cute_moe/config.py
+    python/kestrel_kernels/cute_moe/dispatch.py
+    python/kestrel_kernels/cute_moe/utils.py
+
+    # Flash attention - dispatch code only (NO flash_*.py kernel templates)
+    python/kestrel_kernels/flash_attn/__init__.py
+    python/kestrel_kernels/flash_attn/cute/__init__.py
+    python/kestrel_kernels/flash_attn/cute/interface.py
+    python/kestrel_kernels/flash_attn/cute/utils.py
+    python/kestrel_kernels/flash_attn/cute/cute_dsl_utils.py
+    python/kestrel_kernels/flash_attn/cute/mask_definitions.py
+    python/kestrel_kernels/flash_attn/cute/block_sparsity.py
+
+    # Configs
+    python/kestrel_kernels/configs/__init__.py
+
+    # Precompiled placeholder
+    python/kestrel_kernels/precompiled/__init__.py
+)
+
+# Install Python files to their correct locations
+foreach(PY_FILE ${PYTHON_DIST_FILES})
+    get_filename_component(PY_DIR ${PY_FILE} DIRECTORY)
+    string(REPLACE "python/" "" DEST_DIR ${PY_DIR})
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${PY_FILE} DESTINATION ${DEST_DIR})
+endforeach()
+
+# Install config JSON files
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/kestrel_kernels/configs/
+        DESTINATION kestrel_kernels/configs
+        FILES_MATCHING PATTERN "*.json")

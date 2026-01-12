@@ -172,6 +172,11 @@ class CuteMoeConfig:
         return 32 * self.num_warps
 
 
+def _should_use_wgmma_bf16(config: "CuteMoeConfig") -> bool:
+    """Check if WGMMA BF16 kernel should be used for the given config."""
+    return config.kernel_type == "wgmma"
+
+
 # Config auto-loading from JSON files
 _CONFIGS_DIR = Path(__file__).parent.parent / "configs"
 

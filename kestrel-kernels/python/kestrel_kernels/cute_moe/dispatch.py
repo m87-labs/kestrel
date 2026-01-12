@@ -8,7 +8,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
-from kestrel_kernels.cute_moe.config import CuteMoeConfig, get_cute_moe_config
+from kestrel_kernels.cute_moe.config import CuteMoeConfig, get_cute_moe_config, _should_use_wgmma_bf16
 from kestrel_kernels.cute_moe.utils import (
     _ensure_cutlass_initialized,
     _set_compiled_kernel_shared_carveout,
@@ -22,13 +22,8 @@ from kestrel_kernels.cute_moe.utils import (
     _to_cute_tensor_3d_last_contig,
     _to_cute_tensor_3d_last_contig_u8,
 )
-from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_warp import _FusedMoeMatmulCuTe
-from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
-    _FusedMoeMatmulCuTeWgmmaBf16,
-    _should_use_wgmma_bf16,
-)
-from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
-from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
+# Note: Kernel template classes (cute_moe_*.py) are lazily imported only when
+# JIT compilation is enabled. They are not included in the distributed wheel.
 from kestrel_kernels.flash_attn.cute import utils as fa_utils
 
 
@@ -108,7 +103,16 @@ def _invoke_cute_moe_impl(
 
     if key not in _COMPILE_CACHE:
         if _ENABLE_JIT:
-            # JIT compile for autotuning
+            # JIT compile for autotuning - requires source install
+            try:
+                from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_warp import _FusedMoeMatmulCuTe
+                from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import _FusedMoeMatmulCuTeWgmmaBf16
+            except ImportError as e:
+                raise RuntimeError(
+                    "JIT compilation requires source install. "
+                    "Install from source for JIT support."
+                ) from e
+
             from cutlass import BFloat16
 
             op_cls = (
@@ -278,7 +282,16 @@ def _invoke_cute_moe_fp8_impl(
 
     if key not in _COMPILE_CACHE_FP8:
         if _ENABLE_JIT:
-            # JIT compile for autotuning
+            # JIT compile for autotuning - requires source install
+            try:
+                from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
+                from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
+            except ImportError as e:
+                raise RuntimeError(
+                    "JIT compilation requires source install. "
+                    "Install from source for JIT support."
+                ) from e
+
             # Create CuTe tensors only for compilation (to derive tensor signatures)
             a_bits_cute = _to_cute_tensor_2d_contig_u8(A_fp8_bits)
             a_scale_cute = _to_cute_tensor_1d_contig(A_scale)

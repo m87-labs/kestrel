@@ -38,25 +38,60 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from kestrel_kernels.flash_attn.cute import utils
-from kestrel_kernels.flash_attn.cute.flash_fwd import (
-    FlashAttentionForwardSm80,
-    FlashAttentionForwardSm90,
-)
-from kestrel_kernels.flash_attn.cute.flash_decode_sm90 import FlashAttentionDecodeSm90
-from kestrel_kernels.flash_attn.cute.flash_decode_sm90_persistent_fused import (
-    FlashAttentionDecodeSm90PersistentSplitFused,
-)
-from kestrel_kernels.flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from kestrel_kernels.flash_attn.cute.flash_bwd_preprocess import (
-    FlashAttentionBackwardPreprocess,
-)
-from kestrel_kernels.flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from kestrel_kernels.flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from kestrel_kernels.flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from kestrel_kernels.flash_attn.cute.flash_bwd_postprocess import (
-    FlashAttentionBackwardPostprocess,
-)
-from kestrel_kernels.flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+
+# Lazy import cache for kernel classes - only imported when JIT compilation is needed.
+# These modules are not included in the distributed wheel.
+_KERNEL_CLASSES = {}
+
+def _get_kernel_class(name: str):
+    """Lazily import kernel class for JIT compilation."""
+    if name in _KERNEL_CLASSES:
+        return _KERNEL_CLASSES[name]
+
+    try:
+        if name == "FlashAttentionForwardSm80":
+            from kestrel_kernels.flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+            _KERNEL_CLASSES[name] = FlashAttentionForwardSm80
+        elif name == "FlashAttentionForwardSm90":
+            from kestrel_kernels.flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+            _KERNEL_CLASSES[name] = FlashAttentionForwardSm90
+        elif name == "FlashAttentionDecodeSm90":
+            from kestrel_kernels.flash_attn.cute.flash_decode_sm90 import FlashAttentionDecodeSm90
+            _KERNEL_CLASSES[name] = FlashAttentionDecodeSm90
+        elif name == "FlashAttentionDecodeSm90PersistentSplitFused":
+            from kestrel_kernels.flash_attn.cute.flash_decode_sm90_persistent_fused import FlashAttentionDecodeSm90PersistentSplitFused
+            _KERNEL_CLASSES[name] = FlashAttentionDecodeSm90PersistentSplitFused
+        elif name == "FlashAttentionForwardSm100":
+            from kestrel_kernels.flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+            _KERNEL_CLASSES[name] = FlashAttentionForwardSm100
+        elif name == "FlashAttentionBackwardPreprocess":
+            from kestrel_kernels.flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+            _KERNEL_CLASSES[name] = FlashAttentionBackwardPreprocess
+        elif name == "FlashAttentionBackwardSm80":
+            from kestrel_kernels.flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+            _KERNEL_CLASSES[name] = FlashAttentionBackwardSm80
+        elif name == "FlashAttentionBackwardSm90":
+            from kestrel_kernels.flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+            _KERNEL_CLASSES[name] = FlashAttentionBackwardSm90
+        elif name == "FlashAttentionBackwardSm100":
+            from kestrel_kernels.flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+            _KERNEL_CLASSES[name] = FlashAttentionBackwardSm100
+        elif name == "FlashAttentionBackwardPostprocess":
+            from kestrel_kernels.flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+            _KERNEL_CLASSES[name] = FlashAttentionBackwardPostprocess
+        elif name == "FlashAttentionForwardCombine":
+            from kestrel_kernels.flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+            _KERNEL_CLASSES[name] = FlashAttentionForwardCombine
+        else:
+            raise ValueError(f"Unknown kernel class: {name}")
+    except ImportError as e:
+        raise RuntimeError(
+            f"JIT compilation requires source install. "
+            f"Kernel template '{name}' not available in wheel distribution. "
+            f"Install from source for JIT support."
+        ) from e
+
+    return _KERNEL_CLASSES[name]
 
 from kestrel_kernels.flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -554,6 +589,7 @@ def _flash_attn_fwd(
     if sm90_persistent_split_enabled:
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         # Baseline SM90 decode launches one CTA per (batch, kv_head_group).
+        FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
         tmp_kernel = FlashAttentionDecodeSm90PersistentSplitFused(
             dtype=dtype,
             dtype_kv=dtype_kv,
@@ -837,6 +873,7 @@ def _flash_attn_fwd(
                 )
             if use_sm90_decode_fastpath:
                 tile_size_per_bdx = 2 if kv_is_fp8 and qhead_per_kvhead == 1 else 4
+                FlashAttentionDecodeSm90 = _get_kernel_class("FlashAttentionDecodeSm90")
                 fa_fwd = FlashAttentionDecodeSm90(
                     dtype,
                     head_dim,
@@ -848,6 +885,7 @@ def _flash_attn_fwd(
                 )
             else:
                 # fa_fwd = FlashAttentionForwardSm80(
+                FlashAttentionForwardSm90 = _get_kernel_class("FlashAttentionForwardSm90")
                 fa_fwd = FlashAttentionForwardSm90(
                     dtype,
                     head_dim,
@@ -870,6 +908,7 @@ def _flash_attn_fwd(
                     paged_kv_non_tma=inferred_paged_kv_non_tma,
                 )
         elif compute_capability == 10:
+            FlashAttentionForwardSm100 = _get_kernel_class("FlashAttentionForwardSm100")
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -1304,6 +1343,7 @@ def _flash_attn_bwd(
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
         ]
+        FlashAttentionBackwardPreprocess = _get_kernel_class("FlashAttentionBackwardPreprocess")
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
             head_dim_v,
@@ -1413,6 +1453,7 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
+        FlashAttentionBackwardSm80 = _get_kernel_class("FlashAttentionBackwardSm80")
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -1434,6 +1475,7 @@ def _flash_attn_bwd(
             V_in_regs=V_in_regs,
         )
         if compute_capability == 9:
+            FlashAttentionBackwardSm90 = _get_kernel_class("FlashAttentionBackwardSm90")
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
                 head_dim,
@@ -1455,6 +1497,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
             )
         else:
+            FlashAttentionBackwardSm100 = _get_kernel_class("FlashAttentionBackwardSm100")
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
                 head_dim_v,
@@ -1565,6 +1608,7 @@ def _flash_attn_bwd(
             for t in (cu_seqlens_q, seqused_q)
         ]
         arch = compute_capability * 10
+        FlashAttentionBackwardPostprocess = _get_kernel_class("FlashAttentionBackwardPostprocess")
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
@@ -1598,6 +1642,7 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
+            FlashAttentionBackwardPostprocess = _get_kernel_class("FlashAttentionBackwardPostprocess")
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
@@ -1635,6 +1680,7 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
+            FlashAttentionBackwardPostprocess = _get_kernel_class("FlashAttentionBackwardPostprocess")
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
@@ -1975,6 +2021,7 @@ def _flash_attn_sm90_decode_persistent_split_fused(
         split_counters_tensor = to_cute_tensor(split_counters, assumed_align=4, leading_dim=1)
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+        FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
         fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
             dtype=dtype,
             dtype_kv=dtype_kv,
@@ -2153,6 +2200,7 @@ def _flash_attn_fwd_combine(
         cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor = (
             optional_tensors
         )
+        FlashAttentionForwardCombine = _get_kernel_class("FlashAttentionForwardCombine")
         fa_combine = FlashAttentionForwardCombine(
             dtype=dtype,
             dtype_partial=dtype_partial,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from kestrel_kernels.moe_align_cute import (
+from kestrel_kernels.moe_align import (
     moe_align_block_size as moe_align_block_size_cute,
     moe_lora_align_block_size as moe_lora_align_block_size_cute,
 )

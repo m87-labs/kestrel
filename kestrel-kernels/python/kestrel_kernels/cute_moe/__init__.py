@@ -2,6 +2,9 @@
 
 This package provides fused Mixture-of-Experts GEMM kernels using NVIDIA's
 CuTe DSL with optimized memory access patterns for both BF16 and FP8 precision.
+
+Note: Kernel template source files (cute_moe_*.py) are not included in the
+distributed wheel. They are only needed for JIT compilation during development.
 """
 
 from kestrel_kernels.cute_moe.config import (
@@ -15,13 +18,6 @@ from kestrel_kernels.cute_moe.dispatch import (
     invoke_cute_moe_up_fp8,
     invoke_cute_moe_down_fp8,
 )
-from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_warp import _FusedMoeMatmulCuTe
-from kestrel_kernels.cute_moe.cute_moe_bf16_sm90_wgmma import (
-    _FusedMoeMatmulCuTeWgmmaBf16,
-    _should_use_wgmma_bf16,
-)
-from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_wgmma import _FusedMoeMatmulCuTeFp8
-from kestrel_kernels.cute_moe.cute_moe_fp8_sm90_warp import _FusedMoeMatmulCuTeWarpFp8
 
 __all__ = [
     "CuteMoeConfig",
@@ -31,9 +27,4 @@ __all__ = [
     "invoke_cute_moe_down",
     "invoke_cute_moe_up_fp8",
     "invoke_cute_moe_down_fp8",
-    "_FusedMoeMatmulCuTe",
-    "_FusedMoeMatmulCuTeWgmmaBf16",
-    "_FusedMoeMatmulCuTeFp8",
-    "_FusedMoeMatmulCuTeWarpFp8",
-    "_should_use_wgmma_bf16",
 ]

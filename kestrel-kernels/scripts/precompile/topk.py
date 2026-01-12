@@ -15,7 +15,7 @@ from cutlass import BFloat16, Int32
 # Insert package path for local imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
 
-from kestrel_kernels.topk import TopK, make_fake_tensor
+from kestrel_kernels.topk.kernel import TopK, make_fake_tensor
 
 from .utils import get_cuda_arch, get_precompiled_dir, compile_and_link
 
