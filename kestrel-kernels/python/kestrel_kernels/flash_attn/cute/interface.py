@@ -660,19 +660,28 @@ def _flash_attn_fwd(
     if sm90_persistent_split_enabled:
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         # Baseline SM90 decode launches one CTA per (batch, kv_head_group).
-        FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
-        tmp_kernel = FlashAttentionDecodeSm90PersistentSplitFused(
-            dtype=dtype,
-            dtype_kv=dtype_kv,
-            head_dim=head_dim,
-            qhead_per_kvhead=qhead_per_kvhead,
-            num_splits=2,
-            is_causal=causal,
-            is_local=local,
-            split_tokens=1,
-            persist_oversub=sm90_persist_oversub,
-        )
-        head_groups = num_head_kv * tmp_kernel.group_count
+        # Try to get kernel class for geometry calculation; if unavailable (wheel install),
+        # use a simplified group_count calculation.
+        try:
+            FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
+            tmp_kernel = FlashAttentionDecodeSm90PersistentSplitFused(
+                dtype=dtype,
+                dtype_kv=dtype_kv,
+                head_dim=head_dim,
+                qhead_per_kvhead=qhead_per_kvhead,
+                num_splits=2,
+                is_causal=causal,
+                is_local=local,
+                split_tokens=1,
+                persist_oversub=sm90_persist_oversub,
+            )
+            group_count = tmp_kernel.group_count
+        except RuntimeError:
+            # Wheel install without JIT templates - use simplified group_count calculation
+            # For qhead_per_kvhead=1 (MHA), group_count=1
+            # For GQA with small qhead_per_kvhead, group_count is typically 1
+            group_count = 1 if qhead_per_kvhead <= 8 else (qhead_per_kvhead + 7) // 8
+        head_groups = num_head_kv * group_count
         baseline_blocks = batch_size * head_groups
         # Heuristic: use split-KV when the baseline grid is too small to fill the GPU.
         #
@@ -719,12 +728,12 @@ def _flash_attn_fwd(
             lse_partial = torch.empty(
                 sm90_max_splits, *lse_shape, dtype=torch.float32, device=device
             )
-            # Counter is per (batch, head_group). Use the fused kernel's group_count.
+            # Counter is per (batch, head_group). Use group_count from earlier.
             split_counters = _get_sm90_decode_persistent_split_fused_counters(
                 device=device,
                 batch_size=batch_size,
                 num_kv_heads=num_head_kv,
-                group_count=tmp_kernel.group_count,
+                group_count=group_count,
             )
             _flash_attn_sm90_decode_persistent_split_fused(
                 q,
