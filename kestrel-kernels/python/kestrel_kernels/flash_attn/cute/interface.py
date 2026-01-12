@@ -294,36 +294,46 @@ def _try_load_precompiled_persistent_split_fused(
     else:
         return None
 
-    filename = (
-        f"flash_attn_decode_persistent_split_fused_sm90_{dtype_name}_"
-        f"{dtype_kv_name}_hd{head_dim}_s{num_splits}_t{split_tokens}_{arch}.so"
-    )
+    # Try both sm90 and sm90a suffixes since precompilation might generate either
+    arch_variants = [arch]
+    if arch == "sm90a":
+        arch_variants.append("sm90")
+    elif arch == "sm90":
+        arch_variants.append("sm90a")
 
-    mod = load_precompiled_module(filename)
-    if mod is None:
-        return None
+    for try_arch in arch_variants:
+        filename = (
+            f"flash_attn_decode_persistent_split_fused_sm90_{dtype_name}_"
+            f"{dtype_kv_name}_hd{head_dim}_s{num_splits}_t{split_tokens}_{try_arch}.so"
+        )
 
-    fn_name = filename.replace(".so", "")
-    kernel_fn = getattr(mod, fn_name, None)
-    if kernel_fn is None:
-        return None
+        mod = load_precompiled_module(filename)
+        if mod is None:
+            continue
 
-    # Create wrapper that removes stream parameter (TVM FFI uses env stream)
-    def precompiled_wrapper(
-        q, k, v, out, lse, seqused_k, page_table,
-        out_partial, lse_partial, split_counters,
-        softmax_scale, k_scale, v_scale,
-        window_size_left, window_size_right,
-        stream,  # Ignored - TVM FFI uses env stream
-    ):
-        return kernel_fn(
+        fn_name = filename.replace(".so", "")
+        kernel_fn = getattr(mod, fn_name, None)
+        if kernel_fn is None:
+            continue
+
+        # Create wrapper that removes stream parameter (TVM FFI uses env stream)
+        def precompiled_wrapper(
             q, k, v, out, lse, seqused_k, page_table,
             out_partial, lse_partial, split_counters,
             softmax_scale, k_scale, v_scale,
             window_size_left, window_size_right,
-        )
+            stream,  # Ignored - TVM FFI uses env stream
+        ):
+            return kernel_fn(
+                q, k, v, out, lse, seqused_k, page_table,
+                out_partial, lse_partial, split_counters,
+                softmax_scale, k_scale, v_scale,
+                window_size_left, window_size_right,
+            )
 
-    return precompiled_wrapper
+        return precompiled_wrapper
+
+    return None
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
