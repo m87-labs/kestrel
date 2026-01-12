@@ -15,6 +15,24 @@ from .kernels import (
 from .lora_kernels import apply_moe_lora_batched, apply_moe_lora_single
 from .routing import moe_align_block_size, moe_lora_align_block_size
 
+
+def _to_power_of_2(x: int) -> int:
+    """Round x down to the nearest power of 2.
+
+    Triton's tl.arange requires the range to be a power of 2. The CuTe MoE
+    configs can return non-power-of-2 block_m values (e.g., 192 for FP8 with
+    large token counts). This helper ensures LoRA kernels receive valid values.
+
+    We round DOWN (not up) to ensure the resulting block size has precompiled
+    routing kernels available (precompiled for: 16, 32, 64, 128, 192).
+    """
+    if x <= 0:
+        return 1
+    if x & (x - 1) == 0:
+        return x  # Already a power of 2
+    # Round down: find the highest set bit
+    return 1 << (x.bit_length() - 1)
+
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.utils.buffers import FixedBuffer
 from kestrel_kernels.activation import gelu_residual_cuda
@@ -597,6 +615,11 @@ class FusedMoEModule(nn.Module):
         expert_ids_lora = None
         num_tokens_lora = None
 
+        # LoRA kernels use Triton which requires power-of-2 block sizes for tl.arange.
+        # CuTe MoE configs can return non-power-of-2 values (e.g., 192 for FP8).
+        # Round DOWN to ensure precompiled routing kernels exist (16, 32, 64, 128).
+        lora_block_m = _to_power_of_2(block_size_m)
+
         # Launch batched LoRA up before base MoE so it can overlap if we have a
         # dedicated LoRA stream. Always compute into the LoRA buffer and add
         # into the base output after the fused kernel runs.
@@ -611,7 +634,7 @@ class FusedMoEModule(nn.Module):
                 sorted_lora, expert_ids_lora, num_tokens_lora = self._compute_lora_routing(
                     topk_ids=topk_ids,
                     lora_slot_ids=lora_slot_ids,
-                    block_size_m=block_size_m,
+                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                     lora_workspace=lora_workspace,
                 )
                 lora_up_out = self._workspaces.lora_up.get(
@@ -628,7 +651,7 @@ class FusedMoEModule(nn.Module):
                     sorted_lora=sorted_lora,
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
-                    block_size_m=block_size_m,
+                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                     shrink_config=lora_shrink_cfg,
                     expand_config=lora_expand_cfg,
                 )
@@ -659,7 +682,18 @@ class FusedMoEModule(nn.Module):
                 up_out.add_(lora_up_out)
 
         if use_single_lora:
-            # Single-LoRA path: reuse MoE routing, offset by lora_id
+            # Single-LoRA path: use separate routing if block_m needs adjustment
+            # for Triton's power-of-2 constraint.
+            if lora_block_m == block_size_m:
+                # Can reuse main MoE routing
+                lora_sorted = sorted_token_ids
+                lora_expert_ids = expert_ids
+                lora_num_tokens = num_tokens_post_padded
+            else:
+                # Need separate routing with power-of-2 block_m
+                lora_sorted, lora_expert_ids, lora_num_tokens = moe_align_block_size(
+                    topk_ids, lora_block_m, self.num_experts
+                )
             lora_up_out = self._workspaces.lora_up.get(
                 (num_tokens, self.top_k, self.hidden_size * 2),
                 device=hidden_states.device,
@@ -673,13 +707,13 @@ class FusedMoEModule(nn.Module):
                 output=lora_up_out,
                 lora_a=lora_workspace.up_a,
                 lora_b=lora_workspace.up_b,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
+                sorted_token_ids=lora_sorted,
+                expert_ids=lora_expert_ids,
+                num_tokens_post_padded=lora_num_tokens,
                 lora_id=lora_workspace.single_lora_id,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
-                block_size_m=block_size_m,
+                block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                 mul_routed_weight=False,
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
@@ -721,7 +755,7 @@ class FusedMoEModule(nn.Module):
                     sorted_lora=sorted_lora,
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
-                    block_size_m=block_size_m,
+                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                     shrink_config=lora_shrink_cfg,
                     expand_config=lora_expand_cfg,
                 )
@@ -758,6 +792,7 @@ class FusedMoEModule(nn.Module):
 
         if use_single_lora:
             # Single-LoRA path for down projection
+            # Reuse lora_sorted/lora_expert_ids/lora_num_tokens from up path
             lora_down_out = self._workspaces.lora_down.get(
                 (num_tokens, self.top_k, self.input_size),
                 device=hidden_states.device,
@@ -771,13 +806,13 @@ class FusedMoEModule(nn.Module):
                 output=lora_down_out,
                 lora_a=lora_workspace.down_a,
                 lora_b=lora_workspace.down_b,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
+                sorted_token_ids=lora_sorted,
+                expert_ids=lora_expert_ids,
+                num_tokens_post_padded=lora_num_tokens,
                 lora_id=lora_workspace.single_lora_id,
                 top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
                 num_experts=self.num_experts,
-                block_size_m=block_size_m,
+                block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                 mul_routed_weight=True,
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,

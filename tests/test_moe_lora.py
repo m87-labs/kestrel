@@ -999,6 +999,278 @@ class TestMoELoRACudaGraph:
         torch.testing.assert_close(out_graph2, out_eager2, rtol=1e-5, atol=1e-5)
 
 
+def _to_power_of_2(x: int) -> int:
+    """Round x down to the nearest power of 2.
+
+    Triton's tl.arange requires the range to be a power of 2.
+    We round DOWN to ensure we use a block size that has precompiled kernels.
+    (The CuTe MoE configs define block_m values like 192 which aren't power of 2,
+    but rounding down to 128 ensures we have precompiled routing kernels.)
+    """
+    if x <= 0:
+        return 1
+    if x & (x - 1) == 0:
+        return x  # Already a power of 2
+    # Round down: find the highest set bit
+    return 1 << (x.bit_length() - 1)
+
+
+class TestToPowerOf2Helper:
+    """Unit tests for the _to_power_of_2 helper function."""
+
+    def test_already_power_of_2(self):
+        """Power-of-2 values should be unchanged."""
+        assert _to_power_of_2(1) == 1
+        assert _to_power_of_2(2) == 2
+        assert _to_power_of_2(4) == 4
+        assert _to_power_of_2(8) == 8
+        assert _to_power_of_2(16) == 16
+        assert _to_power_of_2(32) == 32
+        assert _to_power_of_2(64) == 64
+        assert _to_power_of_2(128) == 128
+        assert _to_power_of_2(256) == 256
+
+    def test_round_down_non_power_of_2(self):
+        """Non-power-of-2 values should round down."""
+        # Values from actual CuTe MoE configs
+        assert _to_power_of_2(192) == 128  # FP8 config value
+        # Other potential values
+        assert _to_power_of_2(96) == 64
+        assert _to_power_of_2(48) == 32
+        assert _to_power_of_2(24) == 16
+        # Edge cases near powers of 2
+        assert _to_power_of_2(3) == 2
+        assert _to_power_of_2(5) == 4
+        assert _to_power_of_2(7) == 4
+        assert _to_power_of_2(9) == 8
+        assert _to_power_of_2(15) == 8
+        assert _to_power_of_2(17) == 16
+        assert _to_power_of_2(31) == 16
+        assert _to_power_of_2(33) == 32
+        assert _to_power_of_2(63) == 32
+        assert _to_power_of_2(65) == 64
+        assert _to_power_of_2(127) == 64
+        assert _to_power_of_2(129) == 128
+        assert _to_power_of_2(255) == 128
+        assert _to_power_of_2(257) == 256
+
+    def test_edge_cases(self):
+        """Edge cases for small and zero values."""
+        assert _to_power_of_2(0) == 1
+        assert _to_power_of_2(-1) == 1
+        assert _to_power_of_2(-100) == 1
+
+
+class TestNonPowerOf2BlockSize:
+    """Test that LoRA kernels work with non-power-of-2 block sizes.
+
+    Triton's tl.arange requires power-of-2 range. The CuTe MoE FP8 configs
+    can return non-power-of-2 block_m values (e.g., 192 for large token counts).
+    These tests verify that the LoRA kernels handle this correctly by
+    rounding down to the nearest power of 2.
+
+    Config analysis:
+    - FP8 block_m values: 16, 64, 128, 192 (only 192 is non-power-of-2)
+    - BF16 block_m values: 16, 32, 64, 128 (all power-of-2)
+    - Precompiled routing kernels: 16, 32, 64, 128, 192
+    - 192 → 128 (precompiled ✓)
+    """
+
+    # Test the actual config value (192) plus other non-power-of-2 values
+    @pytest.mark.parametrize("block_size_m", [192, 96, 48, 24])
+    def test_batched_lora_non_power_of_2_block_size(self, device, dtype, block_size_m):
+        """Test batched MoE LoRA kernel with non-power-of-2 block_size_m.
+
+        This is a regression test for the bug where block_m=192 (from FP8 config
+        for large token counts) caused Triton compilation to fail with:
+        'arange's range must be a power of 2'
+
+        The fix rounds block_size_m DOWN to power-of-2 for BOTH routing and kernel.
+        """
+        max_slots = 4
+        num_experts = 64  # Match Moondream MoE config
+        rank = 8
+        hidden_dim = 128
+        out_dim = 256
+        top_k = 8  # Match Moondream MoE top_k
+        num_tokens = 128  # Enough tokens to exercise the block size
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+        # Mix of different slots
+        lora_slot_ids = torch.randint(0, max_slots, (num_tokens,), dtype=torch.int32, device=device)
+
+        expected = naive_moe_lora_batched(
+            x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
+        )
+
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
+
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
+
+        # Round DOWN to power-of-2 for BOTH routing and kernel
+        lora_block_m = _to_power_of_2(block_size_m)
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            lora_block_m,  # Power-of-2 for routing
+            num_experts,
+            max_loras,
+        )
+
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_batched(
+            x=x,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_lora,
+            expert_ids=expert_ids_lora,
+            num_tokens_post_padded=num_tokens_lora,
+            top_k=top_k,
+            num_experts=num_experts,
+            block_size_m=lora_block_m,  # Power-of-2 for kernel
+            mul_routed_weight=False,
+        )
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("block_size_m", [192, 96, 48, 24])
+    def test_single_lora_non_power_of_2_block_size(self, device, dtype, block_size_m):
+        """Test single MoE LoRA kernel with non-power-of-2 block_size_m."""
+        max_slots = 4
+        num_experts = 64
+        rank = 8
+        hidden_dim = 128
+        out_dim = 256
+        top_k = 8  # Match Moondream MoE top_k
+        num_tokens = 128
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+
+        # All tokens use slot 2 (lora_id = 1)
+        lora_slot = 2
+        lora_id = lora_slot - 1
+        lora_slot_ids = torch.full((num_tokens,), lora_slot, dtype=torch.int32, device=device)
+
+        expected = naive_moe_lora_batched(
+            x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
+        )
+
+        from kestrel.fused_moe.routing import moe_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_single
+
+        # Round DOWN to power-of-2 for BOTH routing and kernel
+        lora_block_m = _to_power_of_2(block_size_m)
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, lora_block_m, num_experts  # Power-of-2 for routing
+        )
+
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_single(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_id=lora_id,
+            top_k=top_k,
+            num_experts=num_experts,
+            block_size_m=lora_block_m,  # Power-of-2 for kernel
+            mul_routed_weight=False,
+        )
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    # Also test that power-of-2 values still work (regression protection)
+    @pytest.mark.parametrize("block_size_m", [16, 32, 64, 128])
+    def test_batched_lora_power_of_2_block_size(self, device, dtype, block_size_m):
+        """Test that power-of-2 block sizes still work correctly."""
+        max_slots = 4
+        num_experts = 64
+        rank = 8
+        hidden_dim = 128
+        out_dim = 256
+        top_k = 8
+        num_tokens = 128
+
+        max_loras = max_slots - 1
+        num_super_experts = max_loras * num_experts
+        lora_a = torch.randn(num_super_experts, rank, hidden_dim, dtype=dtype, device=device) * 0.1
+        lora_b = torch.randn(num_super_experts, out_dim, rank, dtype=dtype, device=device) * 0.1
+
+        x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
+        lora_slot_ids = torch.randint(0, max_slots, (num_tokens,), dtype=torch.int32, device=device)
+
+        expected = naive_moe_lora_batched(
+            x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
+        )
+
+        from kestrel.fused_moe.routing import moe_lora_align_block_size
+        from kestrel.fused_moe.lora_kernels import apply_moe_lora_batched
+
+        token_lora_mapping = torch.where(
+            lora_slot_ids > 0,
+            lora_slot_ids - 1,
+            torch.tensor(-1, device=device, dtype=lora_slot_ids.dtype),
+        ).to(torch.int32)
+
+        # Power-of-2 values should be unchanged
+        lora_block_m = _to_power_of_2(block_size_m)
+        assert lora_block_m == block_size_m, f"Power-of-2 {block_size_m} should be unchanged"
+
+        sorted_lora, expert_ids_lora, num_tokens_lora = moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            lora_block_m,
+            num_experts,
+            max_loras,
+        )
+
+        output = torch.zeros(num_tokens, top_k, out_dim, dtype=dtype, device=device)
+        apply_moe_lora_batched(
+            x=x,
+            topk_weights=topk_weights,
+            output=output,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            sorted_token_ids=sorted_lora,
+            expert_ids=expert_ids_lora,
+            num_tokens_post_padded=num_tokens_lora,
+            top_k=top_k,
+            num_experts=num_experts,
+            block_size_m=lora_block_m,
+            mul_routed_weight=False,
+        )
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+
 class TestLoRAStream:
     """Validate batched LoRA path with a dedicated stream."""
 

@@ -225,7 +225,7 @@ def test_moe_align_block_size_cute_matches_cuda(device, num_tokens: int, block_s
 
     topk_ids = _make_topk_ids(num_tokens, topk, num_experts, device)
 
-    from kestrel_kernels.moe_align_cute import moe_align_block_size as moe_align_block_size_cute
+    from kestrel_kernels.moe_align import moe_align_block_size as moe_align_block_size_cute
 
     sorted_cute, expert_cute, post_cute = _alloc_outputs(
         topk_ids=topk_ids, num_experts=num_experts, block_size=block_size
@@ -266,7 +266,7 @@ def test_moe_align_block_size_cute_matches_cuda_with_expert_map(device):
     for i, expert_id in enumerate(local_experts):
         expert_map[expert_id] = i
 
-    from kestrel_kernels.moe_align_cute import moe_align_block_size as moe_align_block_size_cute
+    from kestrel_kernels.moe_align import moe_align_block_size as moe_align_block_size_cute
 
     sorted_cute, expert_cute, post_cute = _alloc_outputs(
         topk_ids=topk_ids, num_experts=num_experts, block_size=block_size
@@ -302,7 +302,7 @@ def test_moe_lora_align_block_size_single_lora(device):
     topk_ids = _make_topk_ids(num_tokens, topk, num_experts, device)
     token_lora_mapping = torch.zeros((num_tokens,), device=device, dtype=torch.int32)
 
-    from kestrel_kernels.moe_align_cute import (
+    from kestrel_kernels.moe_align import (
         moe_lora_align_block_size as moe_lora_align_block_size_cute,
     )
 
@@ -360,7 +360,7 @@ def test_moe_lora_align_block_size_multi_lora(device):
         dtype=torch.int32,
     )
 
-    from kestrel_kernels.moe_align_cute import (
+    from kestrel_kernels.moe_align import (
         moe_lora_align_block_size as moe_lora_align_block_size_cute,
     )
 
