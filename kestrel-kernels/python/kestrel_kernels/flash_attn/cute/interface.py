@@ -265,6 +265,67 @@ def _try_load_precompiled_flash_attn(compile_key, use_sm90_decode_fastpath: bool
     return precompiled_wrapper
 
 
+def _try_load_precompiled_persistent_split_fused(
+    dtype, dtype_kv, head_dim: int, num_splits: int, split_tokens: int
+):
+    """Try to load a precompiled persistent split-fused decode kernel if available.
+
+    Returns the loaded kernel function or None if not available.
+    """
+    arch = get_cuda_arch()
+
+    # Only precompile for SM90 and head_dim 64 (Moondream config)
+    if not arch.startswith("sm9"):
+        return None
+    if head_dim != 64:
+        return None
+
+    dtype_name = _cute_dtype_to_name.get(dtype)
+    if dtype_name is None:
+        return None
+
+    # Determine KV dtype name
+    if dtype_kv == cutlass.Float8E4M3FN:
+        dtype_kv_name = "fp8_e4m3"
+    elif dtype_kv == cutlass.BFloat16:
+        dtype_kv_name = "bf16"
+    elif dtype_kv == cutlass.Float16:
+        dtype_kv_name = "f16"
+    else:
+        return None
+
+    filename = (
+        f"flash_attn_decode_persistent_split_fused_sm90_{dtype_name}_"
+        f"{dtype_kv_name}_hd{head_dim}_s{num_splits}_t{split_tokens}_{arch}.so"
+    )
+
+    mod = load_precompiled_module(filename)
+    if mod is None:
+        return None
+
+    fn_name = filename.replace(".so", "")
+    kernel_fn = getattr(mod, fn_name, None)
+    if kernel_fn is None:
+        return None
+
+    # Create wrapper that removes stream parameter (TVM FFI uses env stream)
+    def precompiled_wrapper(
+        q, k, v, out, lse, seqused_k, page_table,
+        out_partial, lse_partial, split_counters,
+        softmax_scale, k_scale, v_scale,
+        window_size_left, window_size_right,
+        stream,  # Ignored - TVM FFI uses env stream
+    ):
+        return kernel_fn(
+            q, k, v, out, lse, seqused_k, page_table,
+            out_partial, lse_partial, split_counters,
+            softmax_scale, k_scale, v_scale,
+            window_size_left, window_size_right,
+        )
+
+    return precompiled_wrapper
+
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -2005,55 +2066,63 @@ def _flash_attn_sm90_decode_persistent_split_fused(
         lse is None,
     )
     if compile_key not in _flash_attn_sm90_decode_persistent_split_fused.compile_cache:
-        q_tensor = to_cute_tensor(q)
-        k_for_cute = k.view(torch.uint8) if kv_is_fp8 else k
-        v_for_cute = v.view(torch.uint8) if kv_is_fp8 else v
-        k_tensor = to_cute_tensor(k_for_cute)
-        v_tensor = to_cute_tensor(v_for_cute)
-        out_tensor = to_cute_tensor(out)
-        lse_tensor = (
-            to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+        # Try loading precompiled kernel first
+        precompiled = _try_load_precompiled_persistent_split_fused(
+            dtype, dtype_kv, head_dim, int(num_splits), int(split_tokens)
         )
-        page_table_tensor = to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
-        seqused_k_tensor = to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0)
-        out_partial_tensor = to_cute_tensor(out_partial, leading_dim=4)
-        lse_partial_tensor = to_cute_tensor(lse_partial, assumed_align=4)
-        split_counters_tensor = to_cute_tensor(split_counters, assumed_align=4, leading_dim=1)
-        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if precompiled is not None:
+            _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = precompiled
+        else:
+            # JIT compile if no precompiled version available
+            q_tensor = to_cute_tensor(q)
+            k_for_cute = k.view(torch.uint8) if kv_is_fp8 else k
+            v_for_cute = v.view(torch.uint8) if kv_is_fp8 else v
+            k_tensor = to_cute_tensor(k_for_cute)
+            v_tensor = to_cute_tensor(v_for_cute)
+            out_tensor = to_cute_tensor(out)
+            lse_tensor = (
+                to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+            )
+            page_table_tensor = to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
+            seqused_k_tensor = to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0)
+            out_partial_tensor = to_cute_tensor(out_partial, leading_dim=4)
+            lse_partial_tensor = to_cute_tensor(lse_partial, assumed_align=4)
+            split_counters_tensor = to_cute_tensor(split_counters, assumed_align=4, leading_dim=1)
+            current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
-        fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
-            dtype=dtype,
-            dtype_kv=dtype_kv,
-            head_dim=head_dim,
-            qhead_per_kvhead=int(qhead_per_kvhead),
-            num_splits=int(num_splits),
-            is_causal=bool(causal),
-            is_local=bool(local),
-            split_tokens=int(split_tokens),
-            persist_oversub=int(persist_oversub),
-            tile_size_per_bdx=2 if kv_is_fp8 and int(qhead_per_kvhead) == 1 else 4,
-        )
-        _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = cute.compile(
-            fa_fused,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            out_tensor,
-            lse_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            out_partial_tensor,
-            lse_partial_tensor,
-            split_counters_tensor,
-            softmax_scale,
-            k_scale,
-            v_scale,
-            window_size_left,
-            window_size_right,
-            current_stream,
-            options="--enable-tvm-ffi",
-        )
+            FlashAttentionDecodeSm90PersistentSplitFused = _get_kernel_class("FlashAttentionDecodeSm90PersistentSplitFused")
+            fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
+                dtype=dtype,
+                dtype_kv=dtype_kv,
+                head_dim=head_dim,
+                qhead_per_kvhead=int(qhead_per_kvhead),
+                num_splits=int(num_splits),
+                is_causal=bool(causal),
+                is_local=bool(local),
+                split_tokens=int(split_tokens),
+                persist_oversub=int(persist_oversub),
+                tile_size_per_bdx=2 if kv_is_fp8 and int(qhead_per_kvhead) == 1 else 4,
+            )
+            _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = cute.compile(
+                fa_fused,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                out_tensor,
+                lse_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                out_partial_tensor,
+                lse_partial_tensor,
+                split_counters_tensor,
+                softmax_scale,
+                k_scale,
+                v_scale,
+                window_size_left,
+                window_size_right,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     k_for_call = k.view(torch.uint8) if kv_is_fp8 else k

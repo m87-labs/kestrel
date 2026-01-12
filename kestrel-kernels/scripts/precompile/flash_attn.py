@@ -69,6 +69,43 @@ class FlashAttnVariant:
         return self.filename(arch).replace(".so", "")
 
 
+@dataclass(frozen=True)
+class FlashAttnDecodePersistentSplitFusedVariant:
+    """A persistent split-fused decode kernel variant to precompile."""
+
+    dtype_name: str  # "bf16"
+    dtype_kv_name: str  # "bf16" or "fp8_e4m3"
+    head_dim: int
+    num_splits: int
+    split_tokens: int
+
+    @property
+    def dtype(self):
+        return BFloat16 if self.dtype_name == "bf16" else Float16
+
+    @property
+    def dtype_kv(self):
+        if self.dtype_kv_name == "bf16":
+            return BFloat16
+        if self.dtype_kv_name == "f16":
+            return Float16
+        if self.dtype_kv_name == "fp8_e4m3":
+            return cutlass.Float8E4M3FN
+        raise ValueError(f"Unknown dtype_kv: {self.dtype_kv_name}")
+
+    def filename(self, arch: str) -> str:
+        """Generate filename for the precompiled kernel."""
+        return (
+            f"flash_attn_decode_persistent_split_fused_sm90_{self.dtype_name}_"
+            f"{self.dtype_kv_name}_hd{self.head_dim}_s{self.num_splits}_"
+            f"t{self.split_tokens}_{arch}.so"
+        )
+
+    def function_name(self, arch: str) -> str:
+        """Generate function name for the precompiled kernel."""
+        return self.filename(arch).replace(".so", "")
+
+
 # Moondream-specific variants
 VARIANTS = [
     # Text forward (causal, paged, bf16 KV)
@@ -85,6 +122,25 @@ VARIANTS = [
     FlashAttnVariant("decode", "bf16", "fp8_e4m3", 64, True, None, False),
     # Vision forward (non-paged, non-causal)
     FlashAttnVariant("forward", "bf16", None, 72, False, None, False),
+]
+
+# Persistent split-fused decode variants for various num_splits/split_tokens combos
+# These are used when batch size is small and GPU is underutilized
+PERSISTENT_SPLIT_FUSED_VARIANTS = [
+    # BF16 KV variants (num_splits 2-4, split_tokens 64 or 256)
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 2, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 2, 256),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 3, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 3, 256),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 4, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "bf16", 64, 4, 256),
+    # FP8 KV variants
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 2, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 2, 256),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 3, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 3, 256),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 4, 64),
+    FlashAttnDecodePersistentSplitFusedVariant("bf16", "fp8_e4m3", 64, 4, 256),
 ]
 
 
@@ -339,6 +395,114 @@ def compile_decode_variant(
         return (variant, None, f"{e}\n{traceback.format_exc()}")
 
 
+def compile_persistent_split_fused_variant(
+    variant: FlashAttnDecodePersistentSplitFusedVariant, arch: str, output_dir: Path
+) -> tuple[FlashAttnDecodePersistentSplitFusedVariant, Path | None, str | None]:
+    """Compile a persistent split-fused decode kernel variant."""
+    try:
+        is_fp8 = variant.dtype_kv_name == "fp8_e4m3"
+        print(f"Compiling persistent_split_fused: dtype={variant.dtype_name} "
+              f"dtype_kv={variant.dtype_kv_name} head_dim={variant.head_dim} "
+              f"num_splits={variant.num_splits} split_tokens={variant.split_tokens}")
+
+        from kestrel_kernels.flash_attn.cute.flash_decode_sm90_persistent_fused import (
+            FlashAttentionDecodeSm90PersistentSplitFused
+        )
+
+        # Create kernel instance
+        # qhead_per_kvhead=1 for MHA, tile_size_per_bdx=2 for FP8, else 4
+        fa_fused = FlashAttentionDecodeSm90PersistentSplitFused(
+            dtype=variant.dtype,
+            dtype_kv=variant.dtype_kv,
+            head_dim=variant.head_dim,
+            qhead_per_kvhead=1,  # MHA
+            num_splits=variant.num_splits,
+            is_causal=True,
+            is_local=False,
+            split_tokens=variant.split_tokens,
+            persist_oversub=1,
+            tile_size_per_bdx=2 if is_fp8 else 4,
+        )
+
+        # Create symbolic dimensions
+        batch = cute.sym_int()
+        seqlen_q = cute.sym_int()
+        num_heads = cute.sym_int()
+        head_dim = variant.head_dim
+
+        # Q/O shapes: (batch, seqlen_q, num_heads, head_dim)
+        q_tensor = _make_fake_tensor(variant.dtype, (batch, seqlen_q, num_heads, head_dim))
+        o_tensor = _make_fake_tensor(variant.dtype, (batch, seqlen_q, num_heads, head_dim))
+
+        # K/V shapes: (num_pages, page_size, num_kv_heads, head_dim) for paged KV
+        num_pages = cute.sym_int()
+        page_size = cute.sym_int()
+        max_kv_len = cute.sym_int()
+
+        # For FP8 KV, K/V are stored as uint8
+        kv_dtype = cutlass.Uint8 if is_fp8 else variant.dtype_kv
+        k_tensor = _make_fake_tensor(kv_dtype, (num_pages, page_size, num_heads, head_dim))
+        v_tensor = _make_fake_tensor(kv_dtype, (num_pages, page_size, num_heads, head_dim))
+
+        # LSE: (batch, num_heads, seqlen_q)
+        lse_tensor = _make_fake_tensor(cutlass.Float32, (batch, num_heads, seqlen_q), assumed_align=4)
+
+        # Page table and seqused_k
+        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), assumed_align=4)
+        seqused_k = _make_fake_tensor_1d_int32((batch,))
+
+        # Scratch tensors for split computation
+        # out_partial: (num_splits, batch, seqlen_q, num_heads, head_dim)
+        out_partial = _make_fake_tensor(
+            cutlass.Float32,
+            (variant.num_splits, batch, seqlen_q, num_heads, head_dim)
+        )
+        # lse_partial: (num_splits, batch, num_heads, seqlen_q)
+        lse_partial = _make_fake_tensor(
+            cutlass.Float32,
+            (variant.num_splits, batch, num_heads, seqlen_q),
+            assumed_align=4
+        )
+        # split_counters: (batch, num_kv_heads * group_count)
+        # For qhead_per_kvhead=1, group_count=1, so shape is (batch, num_kv_heads)
+        split_counters = _make_fake_tensor(cutlass.Int32, (batch, num_heads), assumed_align=4)
+
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+        # Compile
+        compiled = cute.compile(
+            fa_fused,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            seqused_k,
+            page_table,
+            out_partial,
+            lse_partial,
+            split_counters,
+            1.0,   # softmax_scale
+            1.0,   # k_scale
+            1.0,   # v_scale
+            None,  # window_size_left
+            None,  # window_size_right
+            stream,
+            options="--enable-tvm-ffi",
+        )
+
+        # Link to shared object
+        so_path = output_dir / variant.filename(arch)
+        compile_and_link(compiled, variant.function_name(arch), so_path, "flash_decode_psf_tmp")
+
+        print(f"Created: {so_path.name}")
+        return (variant, so_path, None)
+
+    except Exception as e:
+        import traceback
+        return (variant, None, f"{e}\n{traceback.format_exc()}")
+
+
 def compile_variant(
     args: tuple[FlashAttnVariant, str, Path]
 ) -> tuple[FlashAttnVariant, Path | None, str | None]:
@@ -350,6 +514,14 @@ def compile_variant(
         return compile_decode_variant(variant, arch, output_dir)
     else:
         return (variant, None, f"Unknown kernel type: {variant.kernel_type}")
+
+
+def compile_persistent_split_fused_wrapper(
+    args: tuple[FlashAttnDecodePersistentSplitFusedVariant, str, Path]
+) -> tuple[FlashAttnDecodePersistentSplitFusedVariant, Path | None, str | None]:
+    """Wrapper for parallel compilation."""
+    variant, arch, output_dir = args
+    return compile_persistent_split_fused_variant(variant, arch, output_dir)
 
 
 def main():
@@ -365,31 +537,51 @@ def main():
 
     output_dir = get_precompiled_dir()
     print(f"Output directory: {output_dir}")
-    print(f"Total variants to compile: {len(VARIANTS)}")
+
+    all_variants = len(VARIANTS) + len(PERSISTENT_SPLIT_FUSED_VARIANTS)
+    print(f"Total variants to compile: {all_variants}")
+    print(f"  - Forward/decode: {len(VARIANTS)}")
+    print(f"  - Persistent split-fused: {len(PERSISTENT_SPLIT_FUSED_VARIANTS)}")
 
     # Compile all variants
     failed = []
     succeeded = []
 
-    if PARALLEL_COMPILE and len(VARIANTS) > 1:
+    if PARALLEL_COMPILE and all_variants > 1:
         # Use spawn context to avoid CUDA context issues with fork
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
         ctx = mp.get_context("spawn")
-        print(f"Compiling {len(VARIANTS)} variants in parallel with {COMPILE_WORKERS} workers")
+        print(f"Compiling {all_variants} variants in parallel with {COMPILE_WORKERS} workers")
 
         with ProcessPoolExecutor(max_workers=COMPILE_WORKERS, mp_context=ctx) as executor:
+            # Compile forward/decode variants
             args = [(variant, arch, output_dir) for variant in VARIANTS]
             for result_variant, so_path, error in executor.map(compile_variant, args):
                 if error:
                     failed.append((result_variant, error))
                 else:
                     succeeded.append((result_variant, so_path))
+
+            # Compile persistent split-fused variants
+            psf_args = [(variant, arch, output_dir) for variant in PERSISTENT_SPLIT_FUSED_VARIANTS]
+            for result_variant, so_path, error in executor.map(compile_persistent_split_fused_wrapper, psf_args):
+                if error:
+                    failed.append((result_variant, error))
+                else:
+                    succeeded.append((result_variant, so_path))
     else:
-        print(f"Compiling {len(VARIANTS)} variants sequentially")
+        print(f"Compiling {all_variants} variants sequentially")
         for variant in VARIANTS:
             result_variant, so_path, error = compile_variant((variant, arch, output_dir))
+            if error:
+                failed.append((result_variant, error))
+            else:
+                succeeded.append((result_variant, so_path))
+
+        for variant in PERSISTENT_SPLIT_FUSED_VARIANTS:
+            result_variant, so_path, error = compile_persistent_split_fused_variant(variant, arch, output_dir)
             if error:
                 failed.append((result_variant, error))
             else:
@@ -402,7 +594,10 @@ def main():
     if failed:
         print("\nFailed variants:")
         for variant, error in failed:
-            print(f"  {variant.kernel_type} hd={variant.head_dim}: {error[:300]}")
+            if hasattr(variant, 'kernel_type'):
+                print(f"  {variant.kernel_type} hd={variant.head_dim}: {error[:300]}")
+            else:
+                print(f"  persistent_split_fused s={variant.num_splits} t={variant.split_tokens}: {error[:300]}")
         # Don't exit with error - Flash Attention precompilation is optional
         # sys.exit(1)
 
