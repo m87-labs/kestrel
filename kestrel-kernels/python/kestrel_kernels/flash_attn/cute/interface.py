@@ -266,7 +266,7 @@ def _try_load_precompiled_flash_attn(compile_key, use_sm90_decode_fastpath: bool
 
 
 def _try_load_precompiled_persistent_split_fused(
-    dtype, dtype_kv, head_dim: int, num_splits: int, split_tokens: int
+    dtype, dtype_kv, head_dim: int, num_splits: int, split_tokens: int, *, lse_is_none: bool
 ):
     """Try to load a precompiled persistent split-fused decode kernel if available.
 
@@ -278,6 +278,11 @@ def _try_load_precompiled_persistent_split_fused(
     if not arch.startswith("sm9"):
         return None
     if head_dim != 64:
+        return None
+
+    # Precompiled kernels are compiled with lse=None (we don't use lse output).
+    # If caller wants lse output, fall back to JIT.
+    if not lse_is_none:
         return None
 
     dtype_name = _cute_dtype_to_name.get(dtype)
@@ -2087,7 +2092,8 @@ def _flash_attn_sm90_decode_persistent_split_fused(
     if compile_key not in _flash_attn_sm90_decode_persistent_split_fused.compile_cache:
         # Try loading precompiled kernel first
         precompiled = _try_load_precompiled_persistent_split_fused(
-            dtype, dtype_kv, head_dim, int(num_splits), int(split_tokens)
+            dtype, dtype_kv, head_dim, int(num_splits), int(split_tokens),
+            lse_is_none=(lse is None),
         )
         if precompiled is not None:
             _flash_attn_sm90_decode_persistent_split_fused.compile_cache[compile_key] = precompiled

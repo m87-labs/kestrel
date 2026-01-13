@@ -24,8 +24,24 @@ dependencies = [
   "torch==2.9.1",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "triton>=3.0",
+]
+
 [tool.scikit-build]
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
 wheel.packages = []  # Disable auto-include - CMake install() controls contents
 cmake.args = ["-DCMAKE_CUDA_ARCHITECTURES=90a"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = ["-v", "--tb=short"]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]

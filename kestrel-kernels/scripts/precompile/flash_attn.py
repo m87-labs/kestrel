@@ -444,8 +444,9 @@ def compile_persistent_split_fused_variant(
         k_tensor = _make_fake_tensor(kv_dtype, (num_pages, page_size, num_heads, head_dim))
         v_tensor = _make_fake_tensor(kv_dtype, (num_pages, page_size, num_heads, head_dim))
 
-        # LSE: (batch, num_heads, seqlen_q)
-        lse_tensor = _make_fake_tensor(cutlass.Float32, (batch, num_heads, seqlen_q), assumed_align=4)
+        # LSE: We don't use lse output in kestrel, so precompile without it.
+        # This avoids allocating an unused tensor at runtime.
+        lse_tensor = None
 
         # Page table and seqused_k
         page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), assumed_align=4)
