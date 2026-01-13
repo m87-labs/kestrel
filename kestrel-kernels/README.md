@@ -163,10 +163,10 @@ Grouped GEMM kernels for Mixture-of-Experts layers, written in CuTe DSL for H100
 
 | Context | Tokens | Kestrel | vLLM (Triton) | vs vLLM |
 |---------|--------|---------|---------------|---------|
-| decode | 1 | 33 us | 52 us | **1.57x** |
-| batch 4 | 4 | 84 us | 106 us | **1.26x** |
-| batch 16 | 16 | 148 us | 172 us | **1.16x** |
-| prefill | 740 | 251 us | 485 us | **1.93x** |
+| decode | 1 | 37 us | 56 us | **1.50x** |
+| batch 4 | 4 | 87 us | 108 us | **1.23x** |
+| batch 16 | 16 | 148 us | 171 us | **1.16x** |
+| prefill | 740 | 250 us | 485 us | **1.94x** |
 
 **Python API:**
 ```python
@@ -225,6 +225,29 @@ CuTe DSL implementation of GELU residual activation for BF16. Computes `GELU(h) 
 | batch 4 | 32 | 2.4 us | 3.0 us | 8.6 us | **1.24x** | **3.6x** |
 | batch 16 | 128 | 2.6 us | 2.9 us | 8.9 us | **1.09x** | **3.4x** |
 | prefill | 5920 | 9.9 us | 11.2 us | 55.9 us | **1.14x** | **5.6x** |
+
+#### `fp8_quant_cute` - FP8 Quantization (CuTe DSL)
+CuTe DSL implementation of FP8 row-wise quantization. Converts BF16 tensors to FP8 (e4m3fn) with per-row dynamic scaling.
+
+Future optimization: 32-byte loads (16 bf16 per load) to halve load/store instruction count.
+
+**hidden=1024** (MoE down projection input):
+
+| Context | Rows | CuTe | CUDA | vs CUDA |
+|---------|------|------|------|---------|
+| decode | 8 | 2.5 us | 2.7 us | **1.09x** |
+| batch 4 | 32 | 2.8 us | 3.0 us | **1.07x** |
+| batch 16 | 128 | 2.8 us | 3.0 us | **1.08x** |
+| prefill | 5920 | 5.3 us | 6.6 us | **1.23x** |
+
+**hidden=2048** (MoE up projection input):
+
+| Context | Rows | CuTe | CUDA | vs CUDA |
+|---------|------|------|------|---------|
+| decode | 8 | 2.6 us | 2.7 us | **1.02x** |
+| batch 4 | 32 | 2.9 us | 3.0 us | **1.04x** |
+| batch 16 | 128 | 2.9 us | 3.0 us | **1.04x** |
+| prefill | 5920 | 8.2 us | 10.7 us | **1.31x** |
 
 #### `flash_attn` - Flash Attention (Prefill & Decode)
 Flash Attention kernels written in CuTe DSL, with a dedicated decode path optimized for paged FP8 KV cache. 1.3-2.5x faster than FlashInfer on typical Moondream workloads.

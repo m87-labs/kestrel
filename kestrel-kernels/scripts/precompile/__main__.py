@@ -13,7 +13,7 @@ import sys
 # Ensure torch is imported first (for libtorch.so)
 import torch
 
-from . import topk, cute_moe, moe_align, flash_attn, gelu_residual
+from . import topk, cute_moe, moe_align, flash_attn, gelu_residual, fp8_quant
 from .utils import get_cuda_arch
 
 
@@ -23,6 +23,7 @@ KERNEL_MODULES = {
     "moe_align": moe_align,
     "flash_attn": flash_attn,
     "gelu_residual": gelu_residual,
+    "fp8_quant": fp8_quant,
 }
 
 

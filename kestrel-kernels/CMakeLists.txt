@@ -101,7 +101,7 @@ set(PRECOMPILED_OUTPUT_DIR "${CMAKE_CURRENT_LIST_DIR}/python/kestrel_kernels/pre
 add_custom_target(precompile_cute_kernels ALL
   COMMAND ${Python_EXECUTABLE} -m scripts.precompile
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
-  COMMENT "Precompiling CuTe DSL kernels (topk, cute_moe, moe_align, flash_attn, gelu_residual)"
+  COMMENT "Precompiling CuTe DSL kernels (topk, cute_moe, moe_align, flash_attn, gelu_residual, fp8_quant)"
   VERBATIM
 )
 
@@ -138,6 +138,13 @@ add_custom_target(precompile_gelu_residual
   COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels gelu_residual
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
   COMMENT "Precompiling CuTe DSL gelu_residual kernels"
+  VERBATIM
+)
+
+add_custom_target(precompile_fp8_quant
+  COMMAND ${Python_EXECUTABLE} -m scripts.precompile --kernels fp8_quant
+  WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+  COMMENT "Precompiling CuTe DSL fp8_quant kernels"
   VERBATIM
 )
 
@@ -187,6 +194,10 @@ set(PYTHON_DIST_FILES
     # GELU residual - dispatch code only (NO kernel.py template)
     python/kestrel_kernels/gelu_residual/__init__.py
     python/kestrel_kernels/gelu_residual/dispatch.py
+
+    # FP8 quant CuTe - dispatch code only (NO kernel.py template)
+    python/kestrel_kernels/fp8_quant_cute/__init__.py
+    python/kestrel_kernels/fp8_quant_cute/dispatch.py
 
     # Configs
     python/kestrel_kernels/configs/__init__.py

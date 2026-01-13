@@ -35,6 +35,7 @@ def _to_power_of_2(x: int) -> int:
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.utils.buffers import FixedBuffer
+from kestrel_kernels.fp8_quant_cute import fp8_quant_cute
 from kestrel_kernels.gelu_residual import gelu_residual_cute
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 from kestrel_kernels.cute_moe import (
@@ -836,10 +837,8 @@ class FusedMoEModule(nn.Module):
         if x.ndim != 2:
             raise ValueError("Expected 2D activation matrix")
 
-        # Use a custom CUDA kernel to keep this path CUDA-graph-capturable and avoid
+        # Use CuTe DSL kernel to keep this path CUDA-graph-capturable and avoid
         # per-call allocations.
-        from kestrel_kernels.fp8_quant import fp8_e4m3fn_rowwise_quant_cuda
-
         out_bits = self._workspaces.fp8_bits.get(
             (int(x.shape[0]), int(x.shape[1])),
             device=x.device,
@@ -850,7 +849,7 @@ class FusedMoEModule(nn.Module):
             device=x.device,
             dtype=torch.float32,
         )
-        fp8_e4m3fn_rowwise_quant_cuda(out_bits, out_scale, x)
+        fp8_quant_cute(out_bits, out_scale, x)
         return out_bits, out_scale
 
     def _quantize_fp8_into(
@@ -860,9 +859,7 @@ class FusedMoEModule(nn.Module):
         out_scale: torch.Tensor,
     ) -> None:
         """Quantize x into pre-allocated FP8 buffers (fast path, no workspace.get)."""
-        from kestrel_kernels.fp8_quant import fp8_e4m3fn_rowwise_quant_cuda
-
-        fp8_e4m3fn_rowwise_quant_cuda(out_bits, out_scale, x)
+        fp8_quant_cute(out_bits, out_scale, x)
 
     def _invoke_fused_moe_kernel(
         self,
