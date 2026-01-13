@@ -152,6 +152,7 @@ set(PYTHON_DIST_FILES
     python/kestrel_kernels/precompile.py
     python/kestrel_kernels/cutils.py
     python/kestrel_kernels/tau_tail_ops.py
+    python/kestrel_kernels/fused_linear_residual_ops.py
 
     # TopK - dispatch code only (NO kernel.py template)
     python/kestrel_kernels/topk/__init__.py

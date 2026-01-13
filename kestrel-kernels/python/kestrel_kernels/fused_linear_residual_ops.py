@@ -1,3 +1,5 @@
+"""Fused linear + bias + residual using cuBLASLt epilogues."""
+
 from __future__ import annotations
 
 import torch
@@ -16,7 +18,7 @@ def fused_linear_bias_residual_into(
     """Compute: out = residual + (x @ w.T + b).
 
     Notes:
-      - Uses a fused CUDA op (cublasLt epilogues) when available.
+      - Uses a fused CUDA op (cublasLt epilogues).
       - `x`/`residual` may be 2D (M,C) or 3D (B,T,C); weights are 2D.
       - Intended for inference (no backward).
     """
@@ -55,6 +57,5 @@ def fused_linear_bias_residual_into(
 
 
 __all__ = [
-    "fused_linear_bias_residual_cuda",
     "fused_linear_bias_residual_into",
 ]

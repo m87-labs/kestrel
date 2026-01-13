@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kestrel_kernels.fused_linear_residual import fused_linear_bias_residual_cuda
+from kestrel_kernels.fused_linear_residual_ops import fused_linear_bias_residual_into
 
 
 @pytest.fixture
@@ -21,28 +21,6 @@ ATOL = 1e-1
 
 def _weight_scale(in_dim: int) -> float:
     return in_dim**-0.5
-
-
-def fused_linear_bias_residual_into(
-    *,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    b: torch.Tensor,
-    residual: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    """Compute: out = residual + (x @ w.T + b)."""
-    if x.ndim == 3:
-        bsz, t, c = x.shape
-        x2 = x.reshape(bsz * t, c)
-        r2 = residual.reshape(bsz * t, residual.shape[-1])
-        out2 = out.reshape(bsz * t, out.shape[-1])
-    else:
-        x2 = x
-        r2 = residual
-        out2 = out
-
-    fused_linear_bias_residual_cuda(out2, x2, w, b, r2)
 
 
 @pytest.mark.parametrize("crops", list(range(1, 13)))

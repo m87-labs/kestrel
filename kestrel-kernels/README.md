@@ -25,8 +25,16 @@ PyTorch eager launches separate kernels for slice, erf, multiply, and add, with 
 
 #### `fused_linear_residual` - Linear + Bias + Residual
 Fused `out = x @ W.T + bias + residual` using cuBLASLt epilogues.
-- **Input**: BF16 tensors
-- **Features**: Single kernel launch eliminates intermediate buffers
+
+| Crops | Tokens | CUDA | PyTorch | vs Eager |
+|-------|--------|------|---------|----------|
+| 1 | 729 | 9.0 us | 24 us | **2.7x** |
+| 2 | 1458 | 12 us | 24 us | **2.0x** |
+| 4 | 2916 | 16 us | 29 us | **1.8x** |
+| 8 | 5832 | 46 us | 50 us | **1.1x** |
+| 13 | 9477 | 44 us | 77 us | **1.7x** |
+
+cuBLASLt epilogues fuse bias addition and residual into the matmul, avoiding extra kernel launches and memory traffic.
 
 #### `fused_mlp` - Fused MLP with cuBLASLt
 Fused MLP computation using cuBLASLt with custom epilogues.
