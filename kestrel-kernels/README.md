@@ -111,11 +111,16 @@ Applies rotary position embedding to query and key tensors (n_heads=32, head_dim
 Vectorized bfloat162 pair processing, shared memory caching of cos/sin values, FP32 math for numerical stability. Split-head kernel for decode increases SM utilization on small batch sizes.
 
 #### `fp8_quant` - FP8 Quantization
-Converts BF16 tensors to FP8 (e4m3fn) with dynamic scale computation.
-- **Input**: BF16 tensors
-- **Output**: FP8 (e4m3fn) tensors with scales
-- **Modes**: Per-tensor or per-row scale computation
-- **Features**: Vectorized 16-byte stores, fused absmax reduction
+Converts BF16 tensors to FP8 (e4m3fn) with per-row dynamic scale computation. Used for quantizing MoE activations before FP8 GEMM.
+
+| Context | Rows | CUDA | PyTorch (eager) | vs PyTorch |
+|---------|------|------|-----------------|------------|
+| decode | 8 | 3.1 us | 53 us | **17x** |
+| batch 4 | 32 | 3.1 us | 52 us | **17x** |
+| batch 16 | 128 | 3.1 us | 52 us | **17x** |
+| prefill | 5920 | 6.6 us | 67 us | **10x** |
+
+Two kernel variants: warp-per-row for large batches (better SM utilization), block-per-row for small batches. Vectorized 16-byte loads/stores, fused absmax reduction.
 
 #### `tau_tail` - TAU Attention Scaling
 Applies per-head TAU scaling to Q and V in packed QKV. Computes `scale = tanh(tok_linear) + tau_pos_table[position]` then scales each head: `Q *= scale_q`, `V *= scale_v`.
@@ -158,10 +163,10 @@ Grouped GEMM kernels for Mixture-of-Experts layers, written in CuTe DSL for H100
 
 | Context | Tokens | Kestrel | vLLM (Triton) | vs vLLM |
 |---------|--------|---------|---------------|---------|
-| decode | 1 | 36 us | 55 us | **1.50x** |
-| batch 4 | 4 | 83 us | 106 us | **1.27x** |
-| batch 16 | 16 | 145 us | 167 us | **1.15x** |
-| prefill | 740 | 251 us | 481 us | **1.92x** |
+| decode | 1 | 33 us | 52 us | **1.57x** |
+| batch 4 | 4 | 84 us | 106 us | **1.26x** |
+| batch 16 | 16 | 148 us | 172 us | **1.16x** |
+| prefill | 740 | 251 us | 485 us | **1.93x** |
 
 **Python API:**
 ```python
@@ -210,6 +215,16 @@ moe_align_block_size(
     expert_map,  # optional for expert parallelism
 )
 ```
+
+#### `gelu_residual` - GELU Residual Activation (CuTe DSL)
+CuTe DSL implementation of GELU residual activation for BF16. Computes `GELU(h) * (g + 1)` fused gated activation used in MoE expert layers. Uses vectorized memory access and streaming stores.
+
+| Context | Rows | CuTe | CUDA | PyTorch | vs CUDA | vs PyTorch |
+|---------|------|------|------|---------|---------|------------|
+| decode | 8 | 2.3 us | 2.5 us | 7.5 us | **1.10x** | **3.3x** |
+| batch 4 | 32 | 2.4 us | 3.0 us | 8.6 us | **1.24x** | **3.6x** |
+| batch 16 | 128 | 2.6 us | 2.9 us | 8.9 us | **1.09x** | **3.4x** |
+| prefill | 5920 | 9.9 us | 11.2 us | 55.9 us | **1.14x** | **5.6x** |
 
 #### `flash_attn` - Flash Attention (Prefill & Decode)
 Flash Attention kernels written in CuTe DSL, with a dedicated decode path optimized for paged FP8 KV cache. 1.3-2.5x faster than FlashInfer on typical Moondream workloads.
