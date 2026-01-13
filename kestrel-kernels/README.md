@@ -212,16 +212,34 @@ moe_align_block_size(
 ```
 
 #### `flash_attn` - Flash Attention (Prefill & Decode)
-High-performance Flash Attention implementation for H100.
+Flash Attention kernels written in CuTe DSL, with a dedicated decode path optimized for paged FP8 KV cache. 1.3-2.5x faster than FlashInfer on typical Moondream workloads.
 
-**Prefill kernels:**
-- `FlashAttentionFwd` - Standard prefill attention
-- Supports: Causal masking, variable-length sequences, paged KV cache, FP8 KV
+- FP8 KV cache with per-tensor scaling
+- Paged KV (page_size=1) for fine-grained memory management
+- CUDA graph compatible
+- Causal masking, variable-length sequences, GQA/MQA
 
-**Decode kernels:**
-- `FlashAttentionDecodeSm90` - Single-split decode
-- `FlashAttentionDecodeSm90PersistentSplitFused` - Multi-split persistent decode (better for long sequences)
-- Supports: Paged KV cache, FP8 KV, GQA/MQA
+**FP8 Paged Decode** (with CUDA Graphs):
+
+| Batch | KV Len | Kestrel | FlashInfer | vs FlashInfer |
+|-------|--------|---------|------------|---------------|
+| 1 | 740 | 9.6 us | 12.9 us | **1.34x** |
+| 1 | 1024 | 8.7 us | 13.1 us | **1.50x** |
+| 1 | 2048 | 10.9 us | 18.4 us | **1.68x** |
+| 4 | 740 | 17.1 us | 23.9 us | **1.40x** |
+| 8 | 512 | 10.0 us | 25.2 us | **2.51x** |
+| 16 | 256 | 9.6 us | 17.6 us | **1.83x** |
+| 32 | 128 | 11.8 us | 26.5 us | **2.24x** |
+
+**FP8 Paged Prefill** (page_size=1):
+
+| Batch | Seq Len | Kestrel | FlashInfer | vs FlashInfer |
+|-------|---------|---------|------------|---------------|
+| 1 | 740 | 19.9 us | 47.6 us | **2.40x** |
+| 1 | 1024 | 27.3 us | 58.9 us | **2.16x** |
+| 1 | 2048 | 82.8 us | 169.3 us | **2.04x** |
+| 4 | 512 | 35.3 us | 60.4 us | **1.71x** |
+| 8 | 256 | 27.6 us | 42.3 us | **1.53x** |
 
 **Python API:**
 ```python
