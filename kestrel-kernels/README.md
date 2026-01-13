@@ -152,10 +152,16 @@ values, indices = topk_fwd(scores, k=8, softmax=True)
 ```
 
 #### `cute_moe` - MoE Matrix Multiplications
-Fused Mixture-of-Experts up/down projections optimized for H100.
-- **Variants**: BF16 warp, BF16 WGMMA, FP8 warp, FP8 WGMMA
-- **Operations**: Up projection (gate + up), Down projection
-- **Features**: Expert-parallel block scheduling, configurable tile sizes
+Grouped GEMM kernels for Mixture-of-Experts layers, written in CuTe DSL for H100 (SM90). Supports BF16 and FP8 (W8A8) precision with both warp-level and WGMMA variants, automatically selected based on batch size.
+
+**FP8 W8A8 Full MoE Layer** (up + activation + down + sum, E=64, k=8, with CUDA Graphs):
+
+| Context | Tokens | Kestrel | vLLM (Triton) | vs vLLM |
+|---------|--------|---------|---------------|---------|
+| decode | 1 | 36 us | 55 us | **1.50x** |
+| batch 4 | 4 | 83 us | 106 us | **1.27x** |
+| batch 16 | 16 | 145 us | 167 us | **1.15x** |
+| prefill | 740 | 251 us | 481 us | **1.92x** |
 
 **Python API:**
 ```python
