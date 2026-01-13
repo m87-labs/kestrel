@@ -98,11 +98,17 @@ Sums the weighted outputs from top-k MoE experts back into a single hidden state
 
 Vectorized 16-byte loads (8 bf16 at once), fully unrolled k=8 reduction. FP32 accumulation provides better numerical stability than bf16 accumulation. Note: vLLM has a similar kernel, but only supports topk=2,3,4 and falls back to PyTorch for topk=8.
 
-#### `rotary_embedding` - GPT-NeoX Rotary Position Embedding
-Applies rotary position embedding to query and key tensors.
-- **Input**: BF16 query/key, FP32 cos/sin cache
-- **Supports**: GPT-NeoX layout (split rotary dims)
-- **Features**: FP32 math with BF16 output, vectorized pair processing
+#### `rotary_embedding` - Rotary Position Embedding
+Applies rotary position embedding to query and key tensors (n_heads=32, head_dim=64).
+
+| Context | Tokens | Kestrel | vLLM | PyTorch (eager) | vs vLLM | vs PyTorch |
+|---------|--------|---------|------|-----------------|---------|------------|
+| decode | 1 | 3.3 us | 4.9 us | 118 us | **1.5x** | **36x** |
+| batch 4 | 4 | 3.1 us | 4.5 us | 117 us | **1.5x** | **38x** |
+| batch 16 | 16 | 3.1 us | 4.7 us | 117 us | **1.5x** | **38x** |
+| prefill | 740 | 5.0 us | 8.0 us | 119 us | **1.6x** | **24x** |
+
+Vectorized bfloat162 pair processing, shared memory caching of cos/sin values, FP32 math for numerical stability. Split-head kernel for decode increases SM utilization on small batch sizes.
 
 #### `fp8_quant` - FP8 Quantization
 Converts BF16 tensors to FP8 (e4m3fn) with dynamic scale computation.
