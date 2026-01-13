@@ -37,9 +37,17 @@ Fused `out = x @ W.T + bias + residual` using cuBLASLt epilogues.
 cuBLASLt epilogues fuse bias addition and residual into the matmul, avoiding extra kernel launches and memory traffic.
 
 #### `fused_mlp` - Fused MLP with cuBLASLt
-Fused MLP computation using cuBLASLt with custom epilogues.
-- **Input**: BF16 tensors
-- **Features**: Workspace caching, automatic heuristic selection
+Fused `out = residual + gelu(x @ W1.T + b1) @ W2.T + b2` using cuBLASLt epilogues.
+
+| Crops | Tokens | CUDA | PyTorch | vs Eager |
+|-------|--------|------|---------|----------|
+| 1 | 729 | 43 us | 56 us | **1.3x** |
+| 2 | 1458 | 72 us | 89 us | **1.2x** |
+| 4 | 2916 | 97 us | 124 us | **1.3x** |
+| 8 | 5832 | 214 us | 259 us | **1.2x** |
+| 13 | 9477 | 283 us | 379 us | **1.3x** |
+
+MLP is matmul-dominated so the speedup is modest. The gain comes from fusing GELU and residual add into cuBLASLt epilogues.
 
 #### `kv_cache_write` - KV Cache Write with Optional FP8
 Writes key/value tensors to paged KV cache with optional FP8 quantization.
