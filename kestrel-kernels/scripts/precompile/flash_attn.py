@@ -159,6 +159,7 @@ def _make_fake_tensor(dtype, shape, divisibility=8, assumed_align=16):
 
     Note: Fake tensors use symbolic dimensions for shape/stride, allowing
     cute.compile to generate dynamic kernels that work with runtime tensor sizes.
+    divisibility=8 enables potential vectorization optimizations for aligned strides.
     """
     if dtype is None:
         return None
@@ -251,7 +252,8 @@ def compile_forward_variant(
             k_tensor = _make_fake_tensor(kv_tensor_dtype, (n_pages, page_size, num_heads, head_dim))
             v_tensor = _make_fake_tensor(kv_tensor_dtype, (n_pages, page_size, num_heads, head_dim))
             # page_table uses assumed_align=4 in JIT (to_cute_tensor(..., assumed_align=4, leading_dim=1))
-            page_table = _make_fake_tensor(cutlass.Int32, (batch, max_num_pages_per_seq), assumed_align=4)
+            # Use divisibility=1 to support arbitrary num_pages_per_seq (not always divisible by 8)
+            page_table = _make_fake_tensor(cutlass.Int32, (batch, max_num_pages_per_seq), divisibility=1, assumed_align=4)
             # seqused_k uses assumed_align=4 in JIT (to_cute_tensor(..., assumed_align=4, leading_dim=0))
             seqused_k = _make_fake_tensor_1d_int32((batch,))
         else:
@@ -352,7 +354,8 @@ def compile_decode_variant(
 
         # Decode requires page_table and seqused_k
         # Use assumed_align=4 to match JIT path (to_cute_tensor(..., assumed_align=4))
-        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), assumed_align=4)
+        # Use divisibility=1 to support arbitrary kv_len (not always divisible by 8)
+        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), divisibility=1, assumed_align=4)
         seqused_k = _make_fake_tensor_1d_int32((batch,))
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -449,24 +452,30 @@ def compile_persistent_split_fused_variant(
         lse_tensor = None
 
         # Page table and seqused_k
-        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), assumed_align=4)
+        # Use divisibility=1 to support arbitrary kv_len (not always divisible by 8)
+        page_table = _make_fake_tensor(cutlass.Int32, (batch, max_kv_len), divisibility=1, assumed_align=4)
         seqused_k = _make_fake_tensor_1d_int32((batch,))
 
         # Scratch tensors for split computation
         # out_partial: (num_splits, batch, seqlen_q, num_heads, head_dim)
+        # Use divisibility=1 because seqlen_q=1 for decode leads to small strides
         out_partial = _make_fake_tensor(
             cutlass.Float32,
-            (variant.num_splits, batch, seqlen_q, num_heads, head_dim)
+            (variant.num_splits, batch, seqlen_q, num_heads, head_dim),
+            divisibility=1
         )
         # lse_partial: (num_splits, batch, num_heads, seqlen_q)
+        # Use divisibility=1 because seqlen_q=1 for decode means stride[2]=1
         lse_partial = _make_fake_tensor(
             cutlass.Float32,
             (variant.num_splits, batch, num_heads, seqlen_q),
+            divisibility=1,
             assumed_align=4
         )
         # split_counters: (batch, num_kv_heads * group_count)
         # For qhead_per_kvhead=1, group_count=1, so shape is (batch, num_kv_heads)
-        split_counters = _make_fake_tensor(cutlass.Int32, (batch, num_heads), assumed_align=4)
+        # Use divisibility=1 for flexibility with num_heads
+        split_counters = _make_fake_tensor(cutlass.Int32, (batch, num_heads), divisibility=1, assumed_align=4)
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 

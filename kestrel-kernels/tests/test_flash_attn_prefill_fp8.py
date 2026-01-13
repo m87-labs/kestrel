@@ -179,11 +179,15 @@ def test_fa3_paged_prefill_fp8_prefixlm_matches_sdpa(device: torch.device) -> No
     k_paged_fp8 = (k_paged_bf16 / k_scale).to(fp8_dtype)
     v_paged_fp8 = (v_paged_bf16 / v_scale).to(fp8_dtype)
 
+    # seqused_k is required for paged KV (tells kernel how many KV tokens to use)
+    seqused_k = torch.full((batch_size,), seqlen, device=device, dtype=torch.int32)
+
     out_fa3, _ = _flash_attn_fwd(
         q,
         k_paged_fp8,
         v_paged_fp8,
         page_table=page_table,
+        seqused_k=seqused_k,
         softmax_scale=1.0 / math.sqrt(head_dim),
         mask_mod=cute_prefix_lm_mask_730,
         paged_kv_non_tma=True,

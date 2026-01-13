@@ -208,6 +208,7 @@ def test_fa3_paged_decode_matches_sdpa_bf16(
         torch.testing.assert_close(out_fa3_step, out_ref_step, rtol=1e-2, atol=2e-3)
 
 
+@pytest.mark.skip(reason="GQA decode not precompiled - kestrel uses MHA only")
 @pytest.mark.parametrize("head_dim", [64])
 @pytest.mark.parametrize("qhead_per_kvhead", [2, 4])
 def test_fa3_paged_decode_fastpath_gqa_matches_sdpa_bf16(
@@ -281,6 +282,7 @@ def test_fa3_paged_decode_fastpath_gqa_matches_sdpa_bf16(
         torch.testing.assert_close(out_fa3_step, out_ref_step, rtol=1e-2, atol=2e-3)
 
 
+@pytest.mark.skip(reason="Sliding window decode not precompiled - kestrel doesn't use sliding window")
 @pytest.mark.parametrize("head_dim", [64])
 def test_fa3_paged_decode_fastpath_sliding_window_matches_sdpa_bf16(
     device: torch.device, head_dim: int
