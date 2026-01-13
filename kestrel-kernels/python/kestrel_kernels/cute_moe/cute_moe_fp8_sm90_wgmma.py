@@ -115,6 +115,7 @@ class _FusedMoeMatmulCuTeFp8:
         mExpertIds: cute.Tensor,  # (EM / block_m,)
         mNumTokensPostPadded: cute.Tensor,  # (1,)
         stream: cuda.CUstream,
+        use_pdl: cutlass.Constexpr[bool] = False,
     ):
         # SM90 warpgroup MMA.
         tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
@@ -147,11 +148,13 @@ class _FusedMoeMatmulCuTeFp8:
             self.N,
             self.K,
             SharedStorage,
+            use_pdl,
         ).launch(
             grid=(grid_n, grid_m, 1),  # N-first for better weight reuse
             block=(self.config.num_threads, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
+            use_pdl=use_pdl,
         )
 
     @cute.kernel
@@ -170,6 +173,7 @@ class _FusedMoeMatmulCuTeFp8:
         N: cutlass.Constexpr[int],
         K: cutlass.Constexpr[int],
         SharedStorage: cutlass.Constexpr,
+        use_pdl: cutlass.Constexpr[bool],
     ):
         tx, _, _ = cute.arch.thread_idx()
         pid_n, pid_m, _ = cute.arch.block_idx()  # Swapped for N-first scheduling
@@ -387,19 +391,14 @@ class _FusedMoeMatmulCuTeFp8:
                 )
 
                 # Prologue: prefetch the first tiles.
+                # For PDL: Load B tiles (weights, independent) first, then wait, then A tiles (dependent)
                 for stage_prefetch in cutlass.range_constexpr(prologue_tiles):
                     tile_idx_prefetch = Int32(stage_prefetch)
                     k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                     tile_in_range = tile_idx_prefetch < k_tiles
 
-                    # A tile: use gather copy with L1 bypass to respect swizzled SMEM layout.
-                    if tile_in_range:
-                        if const_expr(K % block_k == 0):
-                            copy_A(tile_idx_prefetch, stage_prefetch)
-                        else:
-                            copy_A(tile_idx_prefetch, stage_prefetch, pred=True)
-
-                    # B tile: [block_n, block_k] via cp.async.
+                    # B tile first (independent - weights already in memory)
+                    # [block_n, block_k] via cp.async.
                     # FIX: use ceil to ensure all vectors are covered when total_vec_b % num_threads != 0
                     iters_b: cutlass.Constexpr[int] = (total_vec_b + num_threads - 1) // num_threads
                     for it_b in cutlass.range_constexpr(iters_b):
@@ -437,6 +436,18 @@ class _FusedMoeMatmulCuTeFp8:
                             dst_b = cute.make_tensor(s_ptr_b, (vec_size_in,))
                             pred_in[0] = valid_b
                             cute.copy(atom_async_copy_b, src_b, dst_b, pred=pred_in)
+
+                    # PDL: Wait for quant kernel after first stage's B loads, before any A loads
+                    if const_expr(use_pdl and stage_prefetch == 0):
+                        cute.arch.griddepcontrol_wait()
+
+                    # A tile (dependent - quantized activations from quant kernel)
+                    # Use gather copy with L1 bypass to respect swizzled SMEM layout.
+                    if tile_in_range:
+                        if const_expr(K % block_k == 0):
+                            copy_A(tile_idx_prefetch, stage_prefetch)
+                        else:
+                            copy_A(tile_idx_prefetch, stage_prefetch, pred=True)
 
                     cute.arch.cp_async_commit_group()
 

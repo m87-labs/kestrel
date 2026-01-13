@@ -32,27 +32,34 @@ class Fp8QuantVariant:
     dtype: type
     hidden: int
     warps_per_block: int  # 1 for small batches, 8 for large batches
+    use_pdl: bool = False  # Programmatic Dependent Launch
 
     def _dtype_name(self) -> str:
         return self.dtype.__name__.lower()
 
     def filename(self, arch: str) -> str:
-        return f"fp8_quant_{self._dtype_name()}_h{self.hidden}_w{self.warps_per_block}_{arch}.so"
+        pdl_suffix = "_pdl" if self.use_pdl else ""
+        return f"fp8_quant_{self._dtype_name()}_h{self.hidden}_w{self.warps_per_block}{pdl_suffix}_{arch}.so"
 
     def function_name(self, arch: str) -> str:
-        return f"fp8_quant_{self._dtype_name()}_h{self.hidden}_w{self.warps_per_block}_{arch}"
+        pdl_suffix = "_pdl" if self.use_pdl else ""
+        return f"fp8_quant_{self._dtype_name()}_h{self.hidden}_w{self.warps_per_block}{pdl_suffix}_{arch}"
 
 
 # Target kernel variants to precompile
 # Benchmarked crossover points:
 # - hidden=1024: w=1 better up to ~512 rows, w=8 better above
 # - hidden=2048: w=1 always better (more register pressure favors fewer warps)
+# Note: PDL variants are used when launching with FP8 MoE kernels for overlap
 PRECOMPILE_VARIANTS = [
     # hidden=2048 (MoE input) - always use w=1
-    Fp8QuantVariant(BFloat16, 2048, 1),
+    Fp8QuantVariant(BFloat16, 2048, 1, use_pdl=False),
+    Fp8QuantVariant(BFloat16, 2048, 1, use_pdl=True),
     # hidden=1024 (after up projection) - w=1 for <=512, w=8 for >512
-    Fp8QuantVariant(BFloat16, 1024, 1),
-    Fp8QuantVariant(BFloat16, 1024, 8),
+    Fp8QuantVariant(BFloat16, 1024, 1, use_pdl=False),
+    Fp8QuantVariant(BFloat16, 1024, 1, use_pdl=True),
+    Fp8QuantVariant(BFloat16, 1024, 8, use_pdl=False),
+    Fp8QuantVariant(BFloat16, 1024, 8, use_pdl=True),
 ]
 
 
@@ -77,9 +84,10 @@ def compile_variant(
     try:
         use_single_pass = _can_use_single_pass(variant.hidden)
         kernel_type = "single-pass" if use_single_pass else "two-pass"
+        pdl_str = " [PDL]" if variant.use_pdl else ""
         print(
             f"Compiling: dtype={variant.dtype.__name__}, hidden={variant.hidden}, "
-            f"warps_per_block={variant.warps_per_block}, kernel={kernel_type}, arch={arch}"
+            f"warps_per_block={variant.warps_per_block}, kernel={kernel_type}{pdl_str}, arch={arch}"
         )
 
         # Create fake tensors for compilation
@@ -107,7 +115,7 @@ def compile_variant(
                 dtype=variant.dtype,
             )
         compiled = cute.compile(
-            kernel, mOut, mScale, mIn, num_rows, stream_fake,
+            kernel, mOut, mScale, mIn, num_rows, stream_fake, variant.use_pdl,
             options="--enable-tvm-ffi",
         )
 

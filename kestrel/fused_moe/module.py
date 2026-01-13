@@ -857,9 +857,11 @@ class FusedMoEModule(nn.Module):
         x: torch.Tensor,
         out_bits: torch.Tensor,
         out_scale: torch.Tensor,
+        *,
+        use_pdl: bool = False,
     ) -> None:
         """Quantize x into pre-allocated FP8 buffers (fast path, no workspace.get)."""
-        fp8_quant_cute(out_bits, out_scale, x)
+        fp8_quant_cute(out_bits, out_scale, x, use_pdl=use_pdl)
 
     def _invoke_fused_moe_kernel(
         self,
@@ -924,7 +926,9 @@ class FusedMoEModule(nn.Module):
                     raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
 
                 # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
-                self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
+                # Use PDL (Programmatic Dependent Launch) to overlap quant with MoE prologue.
+                # PDL allows the MoE kernel to start loading weights while quant is still running.
+                self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale, use_pdl=True)
                 if mul_routed_weight:
                     if int(top_k) != 1:
                         raise ValueError("CuTe fp8 moe_down expects top_k=1")
@@ -940,6 +944,7 @@ class FusedMoEModule(nn.Module):
                         sorted_token_ids=sorted_token_ids,
                         expert_ids=expert_ids,
                         num_tokens_post_padded=num_tokens_post_padded,
+                        use_pdl=True,
                     )
                 else:
                     if int(top_k) != 8:
@@ -953,6 +958,7 @@ class FusedMoEModule(nn.Module):
                         sorted_token_ids=sorted_token_ids,
                         expert_ids=expert_ids,
                         num_tokens_post_padded=num_tokens_post_padded,
+                        use_pdl=True,
                     )
                 return
 

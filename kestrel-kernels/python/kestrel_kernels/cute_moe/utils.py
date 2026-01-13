@@ -886,9 +886,9 @@ _precompiled_cache_fp8: Dict[Tuple[str, CuteMoeConfig], Any] = {}
 from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 
-def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
+def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int, use_pdl: bool = False):
     """Load a precompiled kernel if available, return None otherwise."""
-    compile_key = (kind, config, N, K)
+    compile_key = (kind, config, N, K, use_pdl)
 
     # Check if already loaded (use appropriate cache based on dtype)
     cache = _precompiled_cache_fp8 if config.dtype == "fp8" else _precompiled_cache
@@ -899,9 +899,10 @@ def _load_precompiled_kernel(kind: str, config: CuteMoeConfig, N: int, K: int):
     arch = get_cuda_arch()
     dtype_suffix = "_fp8" if config.dtype == "fp8" else ""
     kernel_suffix = "_wgmma" if config.kernel_type == "wgmma" else ""
+    pdl_suffix = "_pdl" if use_pdl else ""
     base_name = (
         f"cute_moe_{kind}_m{config.block_m}_n{config.block_n}_k{config.block_k}"
-        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}_{arch}"
+        f"_N{N}_K{K}_w{config.num_warps}_s{config.num_stages}{dtype_suffix}{kernel_suffix}{pdl_suffix}_{arch}"
     )
     filename = f"{base_name}.so"
     function_name = base_name

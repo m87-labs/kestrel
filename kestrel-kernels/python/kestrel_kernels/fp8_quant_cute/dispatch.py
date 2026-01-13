@@ -9,7 +9,7 @@ import torch
 from kestrel_kernels.precompile import get_cuda_arch, load_precompiled_module
 
 
-# Precompiled kernel registry: (hidden, warps_per_block) -> kernel_fn
+# Precompiled kernel registry: (hidden, warps_per_block, use_pdl) -> kernel_fn
 _precompiled_cache: dict = {}
 
 
@@ -43,9 +43,9 @@ def _get_warps_per_block(hidden: int, num_rows: int) -> int:
         return 8
 
 
-def _load_precompiled_kernel(hidden: int, warps_per_block: int):
+def _load_precompiled_kernel(hidden: int, warps_per_block: int, use_pdl: bool = False):
     """Load a precompiled kernel if available, return None otherwise."""
-    cache_key = (hidden, warps_per_block)
+    cache_key = (hidden, warps_per_block, use_pdl)
 
     # Check if already loaded
     if cache_key in _precompiled_cache:
@@ -53,8 +53,9 @@ def _load_precompiled_kernel(hidden: int, warps_per_block: int):
 
     # Build filename
     arch = get_cuda_arch()
-    filename = f"fp8_quant_bfloat16_h{hidden}_w{warps_per_block}_{arch}.so"
-    function_name = f"fp8_quant_bfloat16_h{hidden}_w{warps_per_block}_{arch}"
+    pdl_suffix = "_pdl" if use_pdl else ""
+    filename = f"fp8_quant_bfloat16_h{hidden}_w{warps_per_block}{pdl_suffix}_{arch}.so"
+    function_name = f"fp8_quant_bfloat16_h{hidden}_w{warps_per_block}{pdl_suffix}_{arch}"
 
     # Load the module
     mod = load_precompiled_module(filename)
@@ -66,12 +67,13 @@ def _load_precompiled_kernel(hidden: int, warps_per_block: int):
     return kernel_fn
 
 
-@torch.library.custom_op("kestrel::fp8_quant_cute", mutates_args={"out_bits", "out_scale"})
-def _fp8_quant_cute(
+def _fp8_quant_cute_impl(
     out_bits: torch.Tensor,
     out_scale: torch.Tensor,
     inp: torch.Tensor,
+    use_pdl: bool = False,
 ) -> None:
+    """Internal implementation that supports PDL parameter."""
     assert inp.is_cuda and out_bits.is_cuda and out_scale.is_cuda
     assert inp.dtype == torch.bfloat16
     assert out_bits.dtype == torch.uint8
@@ -88,21 +90,34 @@ def _fp8_quant_cute(
 
     warps_per_block = _get_warps_per_block(hidden, num_rows)
 
-    precompiled = _load_precompiled_kernel(hidden, warps_per_block)
+    precompiled = _load_precompiled_kernel(hidden, warps_per_block, use_pdl)
     if precompiled is None:
         arch = get_cuda_arch()
+        pdl_str = ", use_pdl=True" if use_pdl else ""
         raise RuntimeError(
-            f"No precompiled kernel for fp8_quant(hidden={hidden}, warps={warps_per_block}, arch={arch}). "
+            f"No precompiled kernel for fp8_quant(hidden={hidden}, warps={warps_per_block}{pdl_str}, arch={arch}). "
             f"Run precompile on this architecture to generate it."
         )
 
     precompiled(out_bits, out_scale, inp, num_rows)
 
 
+@torch.library.custom_op("kestrel::fp8_quant_cute", mutates_args={"out_bits", "out_scale"})
+def _fp8_quant_cute(
+    out_bits: torch.Tensor,
+    out_scale: torch.Tensor,
+    inp: torch.Tensor,
+) -> None:
+    """Custom op wrapper (no PDL support for torch.compile compatibility)."""
+    _fp8_quant_cute_impl(out_bits, out_scale, inp, use_pdl=False)
+
+
 def fp8_quant_cute(
     out_bits: torch.Tensor,
     out_scale: torch.Tensor,
     inp: torch.Tensor,
+    *,
+    use_pdl: bool = False,
 ) -> None:
     """FP8 row-wise quantization kernel.
 
@@ -112,8 +127,10 @@ def fp8_quant_cute(
         out_bits: Output FP8 tensor of shape [M, K], dtype uint8
         out_scale: Output scale tensor of shape [M], dtype float32
         inp: Input tensor of shape [M, K], dtype bfloat16
+        use_pdl: Enable Programmatic Dependent Launch for overlapping with
+            subsequent kernels (e.g., MoE matmul). Default False.
     """
-    _fp8_quant_cute(out_bits, out_scale, inp)
+    _fp8_quant_cute_impl(out_bits, out_scale, inp, use_pdl=use_pdl)
 
 
 __all__ = ["fp8_quant_cute"]

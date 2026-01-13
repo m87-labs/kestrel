@@ -464,12 +464,14 @@ class Fp8QuantSinglePass:
         mIn: cute.Tensor,
         num_rows: Int32,
         stream: cuda.CUstream,
+        use_pdl: cutlass.Constexpr[bool] = False,
     ):
         blocks = (num_rows + self.warps_per_block - 1) // self.warps_per_block
-        self.kernel(mOut, mScale, mIn, num_rows).launch(
+        self.kernel(mOut, mScale, mIn, num_rows, use_pdl).launch(
             grid=[blocks, 1, 1],
             block=[self.warps_per_block * self.WARP_SIZE, 1, 1],
             stream=stream,
+            use_pdl=use_pdl,
         )
 
     @cute.kernel
@@ -479,6 +481,7 @@ class Fp8QuantSinglePass:
         mScale: cute.Tensor,
         mIn: cute.Tensor,
         num_rows: Int32,
+        use_pdl: cutlass.Constexpr[bool],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -490,6 +493,11 @@ class Fp8QuantSinglePass:
         warp_id = tidx // warp_size
         lane_id = tidx % warp_size
         row = bidx * warps_per_block + warp_id
+
+        # PDL: Signal dependent kernels can start launching early.
+        # They will wait() before reading our output, so this is safe.
+        if const_expr(use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
         if row < num_rows:
             in_row = mIn[row, None]
@@ -838,6 +846,8 @@ def fp8_quant_cute(
     out_bits: "torch.Tensor",
     out_scale: "torch.Tensor",
     inp: "torch.Tensor",
+    *,
+    use_pdl: bool = False,
 ) -> None:
     """FP8 row-wise quantization kernel.
 
@@ -847,6 +857,8 @@ def fp8_quant_cute(
         out_bits: Output FP8 tensor of shape [M, K], dtype uint8
         out_scale: Output scale tensor of shape [M], dtype float32
         inp: Input tensor of shape [M, K], dtype bfloat16
+        use_pdl: Enable Programmatic Dependent Launch for overlapping with
+            subsequent kernels (e.g., MoE matmul). Default False.
     """
     import torch
 
@@ -869,7 +881,7 @@ def fp8_quant_cute(
     if use_single_pass:
         # Single-pass kernel - choose warps_per_block based on batch size
         warps_per_block = _get_warps_per_block(num_rows, hidden)
-        cache_key = (hidden, warps_per_block)
+        cache_key = (hidden, warps_per_block, use_pdl)
 
         if cache_key not in _compile_cache:
             mIn = _to_cute_2d_bf16(inp)
@@ -879,7 +891,7 @@ def fp8_quant_cute(
 
             kernel = Fp8QuantSinglePass(hidden=hidden, dtype=BFloat16, warps_per_block=warps_per_block)
             _compile_cache[cache_key] = cute.compile(
-                kernel, mOut, mScale, mIn, num_rows, stream_fake,
+                kernel, mOut, mScale, mIn, num_rows, stream_fake, use_pdl,
                 options="--enable-tvm-ffi"
             )
 

@@ -138,6 +138,7 @@ class _FusedMoeMatmulCuTeWarpFp8:
         mExpertIds: cute.Tensor,  # (EM / block_m,)
         mNumTokensPostPadded: cute.Tensor,  # (1,)
         stream: cuda.CUstream,
+        use_pdl: cutlass.Constexpr[bool] = False,
     ):
         # Warp-level MMA with F16 operands - enables single-instruction FP8→F16 conversion
         # (Triton uses this same approach: cvt.rn.f16x2.e4m3x2 + HMMA.16816.F32)
@@ -167,11 +168,13 @@ class _FusedMoeMatmulCuTeWarpFp8:
             self.N,
             self.K,
             SharedStorage,
+            use_pdl,
         ).launch(
             grid=(grid_n, grid_m, 1),  # N-first for better weight reuse
             block=(self.config.num_threads, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
+            use_pdl=use_pdl,
         )
 
     @cute.kernel
@@ -190,6 +193,7 @@ class _FusedMoeMatmulCuTeWarpFp8:
         N: cutlass.Constexpr[int],
         K: cutlass.Constexpr[int],
         SharedStorage: cutlass.Constexpr,
+        use_pdl: cutlass.Constexpr[bool],
     ):
         tx, _, _ = cute.arch.thread_idx()
         pid_n, pid_m, _ = cute.arch.block_idx()  # Swapped for N-first scheduling
@@ -395,55 +399,13 @@ class _FusedMoeMatmulCuTeWarpFp8:
             sB_packed_layout = sB_tile_layout
 
             # Prologue: prefetch the first `num_stages` K tiles (FP8 data)
+            # For PDL: Load B tiles (weights, independent) first, then wait, then A tiles (dependent)
             for stage_prefetch in cutlass.range_constexpr(num_stages):
                 tile_idx_prefetch = Int32(stage_prefetch)
                 k_start_prefetch = tile_idx_prefetch * Int32(block_k)
                 tile_in_range = tile_idx_prefetch < k_tiles
 
-                # A tile FP8: [block_m, block_k]
-                for vec_linear_a in range(tx, total_vec_a_fp8, num_threads):
-                    r_a = vec_linear_a // block_vec_k_fp8
-                    kvec_a = vec_linear_a - r_a * block_vec_k_fp8
-                    k_a = Int32(kvec_a * vec_size_fp8)
-                    kg_a = k_start_prefetch + k_a
-
-                    aid_a = sAid[r_a]
-                    valid_row_a = aid_a < num_valid_tokens
-                    arow_base = sArowBase[r_a]
-
-                    if const_expr(K % block_k == 0):
-                        valid_a = tile_in_range and valid_row_a
-                    else:
-                        valid_a = tile_in_range and valid_row_a and (kg_a < K_const)
-
-                    g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes_fp8
-                    g_ptr_a = cute.make_ptr(
-                        self.fp8_dtype,
-                        mA_base_i64 + g_off_bytes_a,
-                        cute.AddressSpace.gmem,
-                        assumed_align=vec_size_fp8,
-                    )
-                    src_a = cute.make_tensor(g_ptr_a, (vec_size_fp8,))
-
-                    # Store to smem with SWIZZLED layout for bank-conflict-free ldmatrix
-                    # k_a is in FP8 elements, divide by 2 to get "BF16" (packed pair) index
-                    s_linear_a = Int32(stage_prefetch) * stage_stride_a + Int32(
-                        sA_packed_layout((Int32(r_a), k_a // 2))
-                    )
-                    s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes_bf16
-                    s_ptr_a = cute.make_ptr(
-                        self.fp8_dtype,
-                        sA_fp8_base_i64 + s_off_bytes_a,
-                        cute.AddressSpace.smem,
-                        assumed_align=vec_size_fp8,
-                    )
-                    dst_a = cute.make_tensor(s_ptr_a, (vec_size_fp8,))
-                    if valid_a:
-                        cute.copy(atom_async_copy, src_a, dst_a)
-                    else:
-                        cute.copy(atom_async_copy, src_a, dst_a, pred=pred_false)
-
-                # B tile FP8: [block_n, block_k]
+                # B tile FP8 first (independent - weights already in memory)
                 if tile_in_range:
                     for vec_linear_b in range(tx, total_vec_b_fp8, num_threads):
                         r_b = vec_linear_b // block_vec_k_fp8
@@ -488,6 +450,53 @@ class _FusedMoeMatmulCuTeWarpFp8:
                             cute.copy(atom_async_copy, src_b, dst_b)
                         else:
                             cute.copy(atom_async_copy, src_b, dst_b, pred=pred_false)
+
+                # PDL: Wait for quant kernel after first stage's B loads, before any A loads
+                if const_expr(use_pdl and stage_prefetch == 0):
+                    cute.arch.griddepcontrol_wait()
+
+                # A tile FP8 (dependent - quantized activations from quant kernel)
+                for vec_linear_a in range(tx, total_vec_a_fp8, num_threads):
+                    r_a = vec_linear_a // block_vec_k_fp8
+                    kvec_a = vec_linear_a - r_a * block_vec_k_fp8
+                    k_a = Int32(kvec_a * vec_size_fp8)
+                    kg_a = k_start_prefetch + k_a
+
+                    aid_a = sAid[r_a]
+                    valid_row_a = aid_a < num_valid_tokens
+                    arow_base = sArowBase[r_a]
+
+                    if const_expr(K % block_k == 0):
+                        valid_a = tile_in_range and valid_row_a
+                    else:
+                        valid_a = tile_in_range and valid_row_a and (kg_a < K_const)
+
+                    g_off_bytes_a = arow_base + cutlass.Int64(kg_a) * element_bytes_fp8
+                    g_ptr_a = cute.make_ptr(
+                        self.fp8_dtype,
+                        mA_base_i64 + g_off_bytes_a,
+                        cute.AddressSpace.gmem,
+                        assumed_align=vec_size_fp8,
+                    )
+                    src_a = cute.make_tensor(g_ptr_a, (vec_size_fp8,))
+
+                    # Store to smem with SWIZZLED layout for bank-conflict-free ldmatrix
+                    # k_a is in FP8 elements, divide by 2 to get "BF16" (packed pair) index
+                    s_linear_a = Int32(stage_prefetch) * stage_stride_a + Int32(
+                        sA_packed_layout((Int32(r_a), k_a // 2))
+                    )
+                    s_off_bytes_a = cutlass.Int64(s_linear_a) * element_bytes_bf16
+                    s_ptr_a = cute.make_ptr(
+                        self.fp8_dtype,
+                        sA_fp8_base_i64 + s_off_bytes_a,
+                        cute.AddressSpace.smem,
+                        assumed_align=vec_size_fp8,
+                    )
+                    dst_a = cute.make_tensor(s_ptr_a, (vec_size_fp8,))
+                    if valid_a:
+                        cute.copy(atom_async_copy, src_a, dst_a)
+                    else:
+                        cute.copy(atom_async_copy, src_a, dst_a, pred=pred_false)
 
                 cute.arch.cp_async_commit_group()
 

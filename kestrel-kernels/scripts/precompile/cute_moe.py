@@ -35,6 +35,7 @@ class MoeVariant:
     K: int
     dtype: str = "bf16"  # "bf16" or "fp8"
     kernel_type: str = "warp"  # "warp" or "wgmma"
+    use_pdl: bool = False  # Programmatic Dependent Launch (FP8 only)
 
     @property
     def mul_routed_weight(self) -> bool:
@@ -47,17 +48,19 @@ class MoeVariant:
     def filename(self, arch: str) -> str:
         dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
         kernel_suffix = "_wgmma" if self.kernel_type == "wgmma" else ""
+        pdl_suffix = "_pdl" if self.use_pdl else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}_{arch}.so"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}{pdl_suffix}_{arch}.so"
         )
 
     def function_name(self, arch: str) -> str:
         dtype_suffix = "_fp8" if self.dtype == "fp8" else ""
         kernel_suffix = "_wgmma" if self.kernel_type == "wgmma" else ""
+        pdl_suffix = "_pdl" if self.use_pdl else ""
         return (
             f"cute_moe_{self.kind}_m{self.block_m}_n{self.block_n}_k{self.block_k}"
-            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}_{arch}"
+            f"_N{self.N}_K{self.K}_w{self.num_warps}_s{self.num_stages}{dtype_suffix}{kernel_suffix}{pdl_suffix}_{arch}"
         )
 
 
@@ -94,6 +97,7 @@ def load_variants_from_configs() -> list[MoeVariant]:
             else:
                 N_dim, K_dim = H, I
             for token_count, cfg in kind_configs.items():
+                # Non-PDL variant (always needed)
                 variant = MoeVariant(
                     kind=kind,
                     block_m=cfg["block_m"],
@@ -105,11 +109,29 @@ def load_variants_from_configs() -> list[MoeVariant]:
                     K=K_dim,
                     dtype=dtype,
                     kernel_type=cfg["kernel_type"],
+                    use_pdl=False,
                 )
                 variants.add(variant)
 
+                # PDL variant (for FP8 kernels only - used with fp8_quant)
+                if dtype == "fp8":
+                    variant_pdl = MoeVariant(
+                        kind=kind,
+                        block_m=cfg["block_m"],
+                        block_n=cfg["block_n"],
+                        block_k=cfg["block_k"],
+                        num_warps=cfg["num_warps"],
+                        num_stages=cfg["num_stages"],
+                        N=N_dim,
+                        K=K_dim,
+                        dtype=dtype,
+                        kernel_type=cfg["kernel_type"],
+                        use_pdl=True,
+                    )
+                    variants.add(variant_pdl)
+
     return sorted(
-        variants, key=lambda v: (v.dtype, v.kind, v.N, v.K, v.block_m, v.block_n, v.block_k)
+        variants, key=lambda v: (v.dtype, v.use_pdl, v.kind, v.N, v.K, v.block_m, v.block_n, v.block_k)
     )
 
 
@@ -130,8 +152,9 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
     try:
         dtype_str = f" ({variant.dtype})" if variant.dtype == "fp8" else ""
         kernel_str = f" [{variant.kernel_type}]"
+        pdl_str = " [PDL]" if variant.use_pdl else ""
         print(
-            f"[{os.getpid()}] Compiling: {variant.kind}{dtype_str}{kernel_str} N={variant.N} K={variant.K} "
+            f"[{os.getpid()}] Compiling: {variant.kind}{dtype_str}{kernel_str}{pdl_str} N={variant.N} K={variant.K} "
             f"m={variant.block_m} n={variant.block_n} k={variant.block_k} "
             f"w={variant.num_warps} s={variant.num_stages}"
         )
@@ -246,6 +269,7 @@ def compile_variant(args: tuple[MoeVariant, str, Path]) -> tuple[MoeVariant, Pat
                 expert_fake,
                 post_fake,
                 stream_fake,
+                variant.use_pdl,  # PDL support for FP8 kernels
                 options="--enable-tvm-ffi",
             )
         else:

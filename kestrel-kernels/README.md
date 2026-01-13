@@ -163,10 +163,10 @@ Grouped GEMM kernels for Mixture-of-Experts layers, written in CuTe DSL for H100
 
 | Context | Tokens | Kestrel | vLLM (Triton) | vs vLLM |
 |---------|--------|---------|---------------|---------|
-| decode | 1 | 37 us | 56 us | **1.50x** |
-| batch 4 | 4 | 87 us | 108 us | **1.23x** |
-| batch 16 | 16 | 148 us | 171 us | **1.16x** |
-| prefill | 740 | 250 us | 485 us | **1.94x** |
+| decode | 1 | 29 us | 51 us | **1.72x** |
+| batch 4 | 4 | 79 us | 103 us | **1.30x** |
+| batch 16 | 16 | 146 us | 169 us | **1.16x** |
+| prefill | 740 | 245 us | 481 us | **1.96x** |
 
 **Python API:**
 ```python

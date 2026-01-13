@@ -194,6 +194,7 @@ def _invoke_cute_moe_fp8_impl(
     mul_routed_weight: bool,
     top_k: int,
     config: CuteMoeConfig,
+    use_pdl: bool = False,
 ) -> None:
     if A_fp8_bits.dtype != torch.uint8:
         raise ValueError(f"Expected FP8 activation bits as uint8 (got {A_fp8_bits.dtype})")
@@ -269,7 +270,7 @@ def _invoke_cute_moe_fp8_impl(
     fp8_dtype = cutlass.Float8E4M3FN
     N_dim = int(C2d.shape[1])
     K_dim = int(A_fp8_bits.shape[1])
-    key = (kind, config, N_dim, K_dim)
+    key = (kind, config, N_dim, K_dim, use_pdl)
 
     # Ensure scales are float32 without creating copies if already float32
     if A_scale.dtype != torch.float32:
@@ -328,6 +329,7 @@ def _invoke_cute_moe_fp8_impl(
                 expert_cute,
                 post_cute,
                 stream_fake,
+                use_pdl,
                 options="--enable-tvm-ffi",
             )
             _set_compiled_kernel_shared_carveout(compiled)
@@ -336,14 +338,15 @@ def _invoke_cute_moe_fp8_impl(
             # Load precompiled kernel
             from kestrel_kernels.cute_moe.config import _get_cuda_arch
 
-            precompiled = _load_precompiled_kernel(kind, config, N_dim, K_dim)
+            precompiled = _load_precompiled_kernel(kind, config, N_dim, K_dim, use_pdl)
             if precompiled is not None:
                 _COMPILE_CACHE_FP8[key] = precompiled
             else:
                 arch = _get_cuda_arch()
+                pdl_str = ", use_pdl=True" if use_pdl else ""
                 raise RuntimeError(
                     "No precompiled kernel for "
-                    f"cute_moe_fp8(kind={kind}, config={config}, N={N_dim}, K={K_dim}, arch={arch}). "
+                    f"cute_moe_fp8(kind={kind}, config={config}, N={N_dim}, K={K_dim}{pdl_str}, arch={arch}). "
                     f"Run precompile_cute_moe.py on this architecture to generate it."
                 )
 
@@ -372,10 +375,16 @@ def invoke_cute_moe_up_fp8(
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     config: CuteMoeConfig | None = None,
+    use_pdl: bool = False,
 ) -> None:
     """CuTe fused MoE up-projection with FP8 activations+weights (W8A8).
 
     If config is None, auto-selects optimal config based on tensor shapes and GPU.
+
+    Args:
+        use_pdl: Enable Programmatic Dependent Launch. When True, the kernel will
+            call griddepcontrol_wait() before loading A tiles, allowing overlap
+            with a preceding producer kernel (e.g., FP8 quantization).
     """
     if config is None:
         # Infer model dimensions from tensor shapes
@@ -405,6 +414,7 @@ def invoke_cute_moe_up_fp8(
         mul_routed_weight=False,
         top_k=_CUTE_TOP_K_UP_DECODE,
         config=config,
+        use_pdl=use_pdl,
     )
 
 
@@ -420,10 +430,16 @@ def invoke_cute_moe_down_fp8(
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     config: CuteMoeConfig | None = None,
+    use_pdl: bool = False,
 ) -> None:
     """CuTe fused MoE down-projection with FP8 activations+weights (W8A8).
 
     If config is None, auto-selects optimal config based on tensor shapes and GPU.
+
+    Args:
+        use_pdl: Enable Programmatic Dependent Launch. When True, the kernel will
+            call griddepcontrol_wait() before loading A tiles, allowing overlap
+            with a preceding producer kernel (e.g., FP8 quantization).
     """
     if config is None:
         # Infer model dimensions from tensor shapes
@@ -454,6 +470,7 @@ def invoke_cute_moe_down_fp8(
         mul_routed_weight=True,
         top_k=1,
         config=config,
+        use_pdl=use_pdl,
     )
 
 
