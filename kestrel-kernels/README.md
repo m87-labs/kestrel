@@ -86,9 +86,17 @@ Optimized LayerNorm forward pass for common hidden dimensions.
 Specialized kernels for N=1152 and N=2048 use 4 rows/block with warp-only reductions, avoiding shared memory overhead. Two epilogue strategies trade register pressure vs memory bandwidth.
 
 #### `moe_sum` - MoE Output Summation
-Fast reduction over top-k expert outputs.
-- **Input**: BF16 tensors, topk=8
-- **Features**: Fully unrolled k=8 reduction, vectorized 16-byte memory ops
+Sums the weighted outputs from top-k MoE experts back into a single hidden state per token. Computes `out[t] = sum(expert_outputs[t, 0:k])` where each token selects k=8 experts.
+
+| Context | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|---------|--------|------|-----------------|------------|
+| decode | 1 | 3.0 us | 5.6 us | **1.9x** |
+| batch 4 | 4 | 3.0 us | 5.4 us | **1.8x** |
+| batch 16 | 16 | 2.9 us | 5.3 us | **1.8x** |
+| prefill | 740 | 5.5 us | 10 us | **1.9x** |
+| long | 1024 | 10 us | 15 us | **1.5x** |
+
+Vectorized 16-byte loads (8 bf16 at once), fully unrolled k=8 reduction. FP32 accumulation provides better numerical stability than bf16 accumulation. Note: vLLM has a similar kernel, but only supports topk=2,3,4 and falls back to PyTorch for topk=8.
 
 #### `rotary_embedding` - GPT-NeoX Rotary Position Embedding
 Applies rotary position embedding to query and key tensors.
