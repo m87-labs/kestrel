@@ -182,10 +182,17 @@ out_down = invoke_cute_moe_down(
 ```
 
 #### `moe_align` - MoE Token Alignment
-Prepares sorted token indices for block-sparse MoE operations.
-- **Input**: Expert assignments (topk_ids)
-- **Output**: Sorted token IDs, expert block IDs, padded token count
-- **Variants**: Standard and LoRA-aware versions
+Prepares sorted token indices for block-sparse MoE operations. Given topk_ids, outputs sorted token IDs grouped by expert for block-sparse matmul.
+
+| Context | Tokens | Kestrel | vLLM | vs vLLM |
+|---------|--------|---------|------|---------|
+| decode | 1 | 6.7 us | 9.8 us | **1.5x** |
+| batch 4 | 4 | 6.5 us | 9.8 us | **1.5x** |
+| batch 16 | 16 | 7.0 us | 10 us | **1.4x** |
+| prefill | 740 | 12 us | 9.2 us | 0.8x |
+| long | 1024 | 12 us | 9.5 us | 0.8x |
+
+Uses optimized single-CTA shared-memory histogram for decode (numel < 1024). Prefill path needs optimization.
 
 **Python API:**
 ```python
