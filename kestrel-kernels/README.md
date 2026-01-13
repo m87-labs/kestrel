@@ -65,9 +65,25 @@ Fused K/V processing and optimized vectorization provide 1.1-1.5x speedup over v
 
 #### `layernorm_cuda` - Fast LayerNorm Forward
 Optimized LayerNorm forward pass for common hidden dimensions.
-- **Input**: BF16 tensors
-- **Specialized for**: N=1152, N=2048 (4 rows/block, warp reductions)
-- **Features**: Vectorized 16-byte loads, two epilogue strategies for different occupancy tradeoffs
+
+**Vision Encoder (N=1152):**
+
+| Crops | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|-------|--------|------|-----------------|------------|
+| 1 | 729 | 3.9 us | 8.4 us | **2.2x** |
+| 2 | 1458 | 4.2 us | 8.4 us | **2.0x** |
+| 4 | 2916 | 5.5 us | 10 us | **1.8x** |
+| 8 | 5832 | 8.3 us | 18 us | **2.1x** |
+| 13 | 9477 | 18 us | 28 us | **1.6x** |
+
+**Text Decoder (N=2048):**
+
+| Context | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|---------|--------|------|-----------------|------------|
+| decode | 1 | 4.2 us | 8.4 us | **2.0x** |
+| prefill | 740 | 3.7 us | 8.4 us | **2.3x** |
+
+Specialized kernels for N=1152 and N=2048 use 4 rows/block with warp-only reductions, avoiding shared memory overhead. Two epilogue strategies trade register pressure vs memory bandwidth.
 
 #### `moe_sum` - MoE Output Summation
 Fast reduction over top-k expert outputs.
