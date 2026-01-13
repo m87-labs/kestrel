@@ -256,25 +256,41 @@ pip install https://github.com/m87-labs/kestrel/releases/download/kestrel-kernel
 2. Generate API tokens:
    - PyPI: Account Settings → API tokens → Add API token
    - TestPyPI: Same process on test.pypi.org
-3. Install build tools:
-   ```bash
-   pip install build twine
-   ```
 
-### Build Process (requires H100 GPU)
+### Platform Support
 
-The wheel must be built on a machine with an H100 GPU to compile the CUDA kernels.
+- **OS**: Linux only (H100s run on Linux servers)
+- **CPU**: x86_64 (works on both Intel and AMD - same wheel)
+- **GPU**: H100 (SM90) required at runtime
+- **Python**: 3.10, 3.11, 3.12, 3.13
+
+### Building Wheels (requires H100 GPU)
+
+Wheels must be built on a machine with an H100 GPU. We build separate wheels for each Python version.
 
 ```bash
-# 1. Precompile kernels (requires H100)
-python -m scripts.precompile
+# On H100 machine (e.g., p1)
+cd ~/code/kestrel/kestrel-kernels
 
-# 2. Build wheel
-python -m build --wheel
+# Install all Python versions
+~/.local/bin/uv python install 3.10 3.11 3.12 3.13
 
-# 3. Verify wheel contents (no kernel source code)
-unzip -l dist/kestrel_kernels-*.whl | grep -E "\.py$"
-# Should NOT show: cute_moe_*.py, flash_*.py, etc.
+# Build wheels for all Python versions
+mkdir -p dist-all
+for pyver in 3.10 3.11 3.12 3.13; do
+    echo "Building for Python $pyver..."
+    TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc \
+        ~/.local/bin/uv run --python $pyver python -m build --wheel
+    mv dist/*.whl dist-all/
+done
+
+# Verify wheels were created
+ls -la dist-all/
+# Should show:
+#   kestrel_kernels-0.1.0-cp310-cp310-linux_x86_64.whl
+#   kestrel_kernels-0.1.0-cp311-cp311-linux_x86_64.whl
+#   kestrel_kernels-0.1.0-cp312-cp312-linux_x86_64.whl
+#   kestrel_kernels-0.1.0-cp313-cp313-linux_x86_64.whl
 ```
 
 ### Test Upload (TestPyPI)
@@ -282,23 +298,25 @@ unzip -l dist/kestrel_kernels-*.whl | grep -E "\.py$"
 Always test on TestPyPI first:
 
 ```bash
-# Upload to TestPyPI
-twine upload --repository testpypi dist/*
+# Install twine
+~/.local/bin/uv pip install twine
 
-# Test installation
-pip install --index-url https://test.pypi.org/simple/ kestrel-kernels
+# Upload to TestPyPI
+~/.local/bin/uv run twine upload --repository testpypi dist-all/*
+
+# Test installation in a fresh environment
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ kestrel-kernels
 ```
 
 ### Production Upload (PyPI)
 
 ```bash
-# Upload to PyPI
-twine upload dist/*
+~/.local/bin/uv run twine upload dist-all/*
 ```
 
 ### Using API Tokens
 
-Store your API token in `~/.pypirc`:
+Configure `~/.pypirc`:
 
 ```ini
 [pypi]
@@ -314,7 +332,7 @@ Or use environment variables:
 ```bash
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=pypi-<your-token>
-twine upload dist/*
+~/.local/bin/uv run twine upload dist-all/*
 ```
 
 ### Versioning
@@ -326,29 +344,34 @@ Update version in `pyproject.toml` before each release:
 version = "0.1.0"  # Increment for each release
 ```
 
-### CI/CD Publishing (Optional)
+### Quick Release Script
 
-For automated releases, add to GitHub Actions:
+For convenience, here's a complete release script:
 
-```yaml
-# .github/workflows/publish.yml
-name: Publish to PyPI
-on:
-  release:
-    types: [published]
+```bash
+#!/bin/bash
+set -e
 
-jobs:
-  build:
-    runs-on: [self-hosted, gpu]  # Requires H100 runner
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build wheel
-        run: |
-          pip install build
-          python -m scripts.precompile
-          python -m build --wheel
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+VERSION=${1:?Usage: $0 <version>}
+cd ~/code/kestrel/kestrel-kernels
+
+# Clean previous builds
+rm -rf dist dist-all build *.egg-info
+mkdir -p dist-all
+
+# Build for all Python versions
+for pyver in 3.10 3.11 3.12 3.13; do
+    echo "=== Building for Python $pyver ==="
+    TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc \
+        ~/.local/bin/uv run --python $pyver python -m build --wheel
+    mv dist/*.whl dist-all/
+    rm -rf dist build *.egg-info
+done
+
+echo "=== Built wheels ==="
+ls -la dist-all/
+
+echo "=== Upload to PyPI? (ctrl-c to cancel) ==="
+read -p "Press enter to upload..."
+~/.local/bin/uv run twine upload dist-all/*
 ```
