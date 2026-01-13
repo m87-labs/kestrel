@@ -134,10 +134,15 @@ Applies per-head TAU scaling to Q and V in packed QKV. Computes `scale = tanh(to
 These kernels are written in NVIDIA CuTe DSL (Python) and precompiled to `.so` files during wheel build. The kernel source templates are excluded from wheel distribution.
 
 #### `topk` - Bitonic Top-K Selection
-Fast GPU top-k selection using bitonic sort network.
-- **Input**: BF16 scores
-- **Output**: Top-k values (optionally with softmax) and indices
-- **Features**: Warp-level bitonic sort, optional fused softmax
+GPU top-k selection using bitonic sort network with optional fused softmax.
+
+| Context | Tokens | Kestrel | Quack | PyTorch (eager) | vs Quack | vs PyTorch |
+|---------|--------|---------|-------|-----------------|----------|------------|
+| decode | 1 | 23 us | 29 us | 17 us | **1.3x** | 0.8x |
+| batch 16 | 16 | 22 us | 27 us | 17 us | **1.2x** | 0.8x |
+| prefill | 740 | 22 us | 28 us | 17 us | **1.2x** | 0.7x |
+
+Note: Currently slower than PyTorch for N=64, k=8. PyTorch uses radix-based QuickSelect which is more efficient for small N. Algorithm should be revisited.
 
 **Python API:**
 ```python

@@ -14,7 +14,6 @@ from typing import Literal
 from ..fused_moe.routing import moe_lora_align_block_size
 
 from ..fused_moe import ExpertWeights, FusedMoEModule
-from kestrel_kernels.topk import topk_fwd
 from ..fused_moe.lora_kernels import apply_moe_lora_batched
 from ..ops.layernorm_cuda import layernorm_bias
 
@@ -284,7 +283,9 @@ def moe_mlp(
     fused_mlp = mlp_module["mlp"]
 
     router_logits = router(x_flat)
-    topk_weights, topk_idxs = topk_fwd(router_logits, experts_per_token, softmax=True)
+    topk_weights, topk_idxs = torch.topk(router_logits, experts_per_token, dim=-1)
+    topk_weights = F.softmax(topk_weights, dim=-1)
+    topk_idxs = topk_idxs.to(torch.int32)
 
     # Expand slot IDs for all tokens if we have a sequence length > 1
     expanded_slot_ids = None
