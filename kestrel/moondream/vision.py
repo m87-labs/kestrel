@@ -13,7 +13,7 @@ from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
-from kestrel.ops.fused_linear_residual import fused_linear_bias_residual_into
+from kestrel_kernels.fused_linear_residual_ops import fused_linear_bias_residual_into
 from kestrel.ops.layernorm_cuda import layernorm_bias_into
 from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
 
