@@ -117,10 +117,15 @@ Converts BF16 tensors to FP8 (e4m3fn) with dynamic scale computation.
 - **Modes**: Per-tensor or per-row scale computation
 - **Features**: Vectorized 16-byte stores, fused absmax reduction
 
-#### `tau_tail` - TAU Attention Bias
-Applies TAU (Token-Aware Unet) position-dependent attention biases.
-- **Input**: FP16/BF16 QKV tensors
-- **Features**: Warp-per-head processing, vectorized loads
+#### `tau_tail` - TAU Attention Scaling
+Applies per-head TAU scaling to Q and V in packed QKV. Computes `scale = tanh(tok_linear) + tau_pos_table[position]` then scales each head: `Q *= scale_q`, `V *= scale_v`.
+
+| Context | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|---------|--------|------|-----------------|------------|
+| decode | 1 | 4.6 us | 45 us | **10x** |
+| batch 4 | 4 | 4.4 us | 46 us | **10x** |
+| batch 16 | 16 | 9.0 us | 88 us | **10x** |
+| prefill | 740 | 6.5 us | 63 us | **10x** |
 
 ---
 
