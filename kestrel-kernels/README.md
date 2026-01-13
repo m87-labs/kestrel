@@ -1,6 +1,8 @@
 # kestrel-kernels
 
-Prebuilt CUDA kernels for Kestrel. Optimized for H100 (SM90a) inference.
+Precompiled CUDA kernels for [Kestrel](https://github.com/m87-labs/kestrel), a high-performance inference engine for [Moondream](https://moondream.ai), the world's most efficient vision-language model.
+
+These kernels are optimized for NVIDIA H100 (SM90) and distributed as precompiled shared libraries for fast installation without CUDA compilation.
 
 ## Kernel Library
 
@@ -9,9 +11,17 @@ Prebuilt CUDA kernels for Kestrel. Optimized for H100 (SM90a) inference.
 These kernels are implemented in CUDA C++ and compiled during wheel build.
 
 #### `activation` - GELU Residual Activation
-Computes `GELU(h) * (g + 1)` fused activation for gated architectures.
-- **Input**: BF16 tensors
-- **Features**: Vectorized 16-byte loads/stores, handles arbitrary shapes
+Computes `GELU(h) * (g + 1)` fused gated activation used in MoE expert layers. The input tensor is split in half: `h` passes through GELU, `g` acts as a gate with +1 bias.
+
+| Tokens | CUDA | PyTorch | Compile | vs Eager |
+|--------|------|---------|---------|----------|
+| 1 | 3.8 us | 64 us | 63 us | **17x** |
+| 64 | 2.9 us | 49 us | 69 us | **17x** |
+| 740 | 3.5 us | 49 us | 68 us | **14x** |
+| 1024 | 3.9 us | 49 us | 68 us | **13x** |
+| 2048 | 5.1 us | 49 us | 68 us | **10x** |
+
+PyTorch eager launches separate kernels for slice, erf, multiply, and add, with intermediate tensors hitting global memory. Our kernel fuses everything into a single pass. torch.compile is slower than eager here, likely because the dynamic `x[:, :hidden]` slicing prevents effective fusion.
 
 #### `fused_linear_residual` - Linear + Bias + Residual
 Fused `out = x @ W.T + bias + residual` using cuBLASLt epilogues.
@@ -152,48 +162,3 @@ out = flash_attn_varlen_func(
 )
 ```
 
----
-
-## Development Setup
-
-### Prerequisites
-
-- CUDA 12.x with SM90 support
-- Python 3.10+
-- PyTorch 2.9.1
-- NVIDIA CuTe DSL 4.3.3
-
-### Install from source
-
-```bash
-cd kestrel-kernels
-CUDACXX=/usr/local/cuda/bin/nvcc uv sync --extra dev
-```
-
-### Running Tests
-
-Tests require an H100 GPU (SM90+):
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run specific test file
-pytest tests/test_topk.py -v
-```
-
-### Tuning Kernels
-
-The grid search script for CuTe MoE kernel autotuning is located at `scripts/grid_search_cute_moe.py` in the main kestrel repo. It sweeps tile sizes, warp counts, and pipeline stages to find optimal configurations.
-
-```bash
-# Run quick grid search for specific token counts
-ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 ~/.local/bin/uv run python \
-  scripts/grid_search_cute_moe.py --num-tokens 8 16 32 --quick --output results.json'
-
-# Run full grid search (takes hours)
-ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 ~/.local/bin/uv run python \
-  scripts/grid_search_cute_moe.py --output /tmp/cute_moe_grid_search.json'
-```
-
-Results should be saved to `python/kestrel_kernels/configs/` after analysis.

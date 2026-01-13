@@ -1,6 +1,50 @@
-# Release Instructions
+# Development & Release
 
-Instructions for building and publishing kestrel-kernels wheels.
+Instructions for developing, building, and publishing kestrel-kernels.
+
+## Development Setup
+
+### Prerequisites
+
+- CUDA 12.x with SM90 support
+- Python 3.10+
+- PyTorch 2.9.1
+- NVIDIA CuTe DSL 4.3.3
+
+### Install from source
+
+```bash
+cd kestrel-kernels
+CUDACXX=/usr/local/cuda/bin/nvcc uv sync --extra dev
+```
+
+### Running Tests
+
+Tests require an H100 GPU (SM90+):
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test file
+pytest tests/test_topk.py -v
+```
+
+### Tuning Kernels
+
+The grid search script for CuTe MoE kernel autotuning is located at `scripts/grid_search_cute_moe.py` in the main kestrel repo. It sweeps tile sizes, warp counts, and pipeline stages to find optimal configurations.
+
+```bash
+# Run quick grid search for specific token counts
+ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 ~/.local/bin/uv run python \
+  scripts/grid_search_cute_moe.py --num-tokens 8 16 32 --quick --output results.json'
+
+# Run full grid search (takes hours)
+ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 ~/.local/bin/uv run python \
+  scripts/grid_search_cute_moe.py --output /tmp/cute_moe_grid_search.json'
+```
+
+Results should be saved to `python/kestrel_kernels/configs/` after analysis.
 
 ## Platform Support
 
