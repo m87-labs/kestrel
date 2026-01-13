@@ -35,7 +35,7 @@ def _to_power_of_2(x: int) -> int:
 
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.utils.buffers import FixedBuffer
-from kestrel_kernels.activation import gelu_residual_cuda
+from kestrel_kernels.gelu_residual import gelu_residual_cute
 from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
 from kestrel_kernels.cute_moe import (
     get_cute_moe_block_m,
@@ -728,9 +728,9 @@ class FusedMoEModule(nn.Module):
         )
         if activation_in.dtype != torch.bfloat16:
             raise ValueError(
-                f"gelu_residual_cuda only supports bfloat16, got {activation_in.dtype}"
+                f"gelu_residual_cute only supports bfloat16, got {activation_in.dtype}"
             )
-        gelu_residual_cuda(activation_out, activation_in)
+        gelu_residual_cute(activation_out, activation_in)
 
         down_in = activation_out
         lora_down_out = None
