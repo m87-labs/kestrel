@@ -13,8 +13,8 @@ These kernels are implemented in CUDA C++ and compiled during wheel build.
 #### `activation` - GELU Residual Activation
 Computes `GELU(h) * (g + 1)` fused gated activation used in MoE expert layers. The input tensor is split in half: `h` passes through GELU, `g` acts as a gate with +1 bias.
 
-| Tokens | CUDA | PyTorch | Compile | vs Eager |
-|--------|------|---------|---------|----------|
+| Tokens | CUDA | PyTorch (eager) | Compile | vs PyTorch |
+|--------|------|-----------------|---------|------------|
 | 1 | 3.8 us | 64 us | 63 us | **17x** |
 | 64 | 2.9 us | 49 us | 69 us | **17x** |
 | 740 | 3.5 us | 49 us | 68 us | **14x** |
@@ -26,8 +26,8 @@ PyTorch eager launches separate kernels for slice, erf, multiply, and add, with 
 #### `fused_linear_residual` - Linear + Bias + Residual
 Fused `out = x @ W.T + bias + residual` using cuBLASLt epilogues.
 
-| Crops | Tokens | CUDA | PyTorch | vs Eager |
-|-------|--------|------|---------|----------|
+| Crops | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|-------|--------|------|-----------------|------------|
 | 1 | 729 | 9.0 us | 24 us | **2.7x** |
 | 2 | 1458 | 12 us | 24 us | **2.0x** |
 | 4 | 2916 | 16 us | 29 us | **1.8x** |
@@ -39,8 +39,8 @@ cuBLASLt epilogues fuse bias addition and residual into the matmul, avoiding ext
 #### `fused_mlp` - Fused MLP with cuBLASLt
 Fused `out = residual + gelu(x @ W1.T + b1) @ W2.T + b2` using cuBLASLt epilogues.
 
-| Crops | Tokens | CUDA | PyTorch | vs Eager |
-|-------|--------|------|---------|----------|
+| Crops | Tokens | CUDA | PyTorch (eager) | vs PyTorch |
+|-------|--------|------|-----------------|------------|
 | 1 | 729 | 43 us | 56 us | **1.3x** |
 | 2 | 1458 | 72 us | 89 us | **1.2x** |
 | 4 | 2916 | 97 us | 124 us | **1.3x** |
@@ -49,11 +49,19 @@ Fused `out = residual + gelu(x @ W1.T + b1) @ W2.T + b2` using cuBLASLt epilogue
 
 MLP is matmul-dominated so the speedup is modest. The gain comes from fusing GELU and residual add into cuBLASLt epilogues.
 
-#### `kv_cache_write` - KV Cache Write with Optional FP8
-Writes key/value tensors to paged KV cache with optional FP8 quantization.
-- **Input**: BF16/FP16 keys and values
-- **Output**: BF16/FP16 or FP8 (e4m3fn) KV cache
-- **Features**: Vectorized writes, per-head scaling for FP8
+#### `kv_cache_write` - KV Cache Write with FP8 Quantization
+Writes BF16 key/value tensors to FP8 paged KV cache with quantization.
+
+| Tokens | Kestrel | vLLM | PyTorch (eager) | vs vLLM | vs PyTorch |
+|--------|---------|------|-----------------|---------|------------|
+| 1 | 3.7 us | 4.9 us | 67 us | **1.3x** | **18x** |
+| 8 | 3.5 us | 4.8 us | 35 us | **1.4x** | **10x** |
+| 64 | 3.7 us | 4.8 us | 35 us | **1.3x** | **9x** |
+| 256 | 4.1 us | 4.8 us | 36 us | **1.2x** | **9x** |
+| 1024 | 8.6 us | 9.7 us | 51 us | **1.1x** | **6x** |
+| 4096 | 31 us | 46 us | 124 us | **1.5x** | **4x** |
+
+Fused K/V processing and optimized vectorization provide 1.1-1.5x speedup over vLLM's implementation.
 
 #### `layernorm_cuda` - Fast LayerNorm Forward
 Optimized LayerNorm forward pass for common hidden dimensions.

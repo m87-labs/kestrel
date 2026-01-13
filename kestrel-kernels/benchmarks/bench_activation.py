@@ -105,7 +105,7 @@ def main():
 
     token_sizes = [1, 64, 740, 1024, 2048]
 
-    header = f"{'Tokens':>6} {'CUDA':>10} {'PyTorch':>10} {'Compile':>10} {'vs Eager':>10}"
+    header = f"{'Tokens':>6} {'CUDA':>10} {'PyTorch':>10} {'Compile':>10} {'vs PyTorch':>10}"
     print("=" * 50)
     print(header)
     print("=" * 50)

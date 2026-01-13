@@ -116,7 +116,7 @@ def main():
     # Vision encoder: 729 patches per crop, up to 13 crops
     token_sizes = [729, 1458, 2916, 5832, 9477]  # 1, 2, 4, 8, 13 crops
 
-    header = f"{'Crops':>5} {'Tokens':>6} {'CUDA':>10} {'PyTorch':>10} {'vs Eager':>10}"
+    header = f"{'Crops':>5} {'Tokens':>6} {'CUDA':>10} {'PyTorch':>10} {'vs PyTorch':>10}"
     print("=" * 45)
     print(header)
     print("=" * 45)
