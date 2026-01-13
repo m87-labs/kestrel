@@ -229,8 +229,6 @@ CuTe DSL implementation of GELU residual activation for BF16. Computes `GELU(h) 
 #### `fp8_quant_cute` - FP8 Quantization (CuTe DSL)
 CuTe DSL implementation of FP8 row-wise quantization. Converts BF16 tensors to FP8 (e4m3fn) with per-row dynamic scaling.
 
-Future optimization: 32-byte loads (16 bf16 per load) to halve load/store instruction count.
-
 **hidden=1024** (MoE down projection input):
 
 | Context | Rows | CuTe | CUDA | vs CUDA |
