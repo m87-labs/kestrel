@@ -39,7 +39,12 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
-    parser.add_argument("--max-batch-size", type=int, default=4, help="Max sequences per decode step")
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=4,
+        help="Effective max sequences per decode step (excludes reserved batch_idx 0)",
+    )
     parser.add_argument("--page-size", type=int, default=1, help="KV cache page size")
     parser.add_argument(
         "--max-seq-length",

@@ -130,7 +130,7 @@ def create_decode_slot(
     *,
     device: torch.device,
     dtype: torch.dtype,
-    max_batch_size: int,
+    max_batch_slots: int,
     max_seq_len: int,
     page_size: int,
     vocab_size: int,
@@ -147,7 +147,7 @@ def create_decode_slot(
         device: CUDA device for GPU tensors.
         dtype: Model dtype (e.g., float16, bfloat16).
         kv_dtype: KV cache dtype (may differ if using FP8).
-        max_batch_size: Maximum batch size for buffer allocation.
+        max_batch_slots: Maximum batch slots for buffer allocation (includes reserved slot 0).
         max_seq_len: Maximum sequence length.
         page_size: KV cache page size.
         vocab_size: Vocabulary size for logits buffer.
@@ -168,19 +168,19 @@ def create_decode_slot(
     # Per-slot pinned host buffers for H2D metadata
     meta = DecodeMetaBuffers(
         batch_idx=CpuGpuBuffer(
-            max_batch_size,
+            max_batch_slots,
             dtype=torch.int64,
             device=device,
             pin_memory=True,
         ),
         input_pos=CpuGpuBuffer(
-            max_batch_size,
+            max_batch_slots,
             dtype=torch.int32,
             device=device,
             pin_memory=True,
         ),
         lora_slot_ids=CpuGpuBuffer(
-            max_batch_size,
+            max_batch_slots,
             dtype=torch.int32,
             device=device,
             pin_memory=True,
@@ -189,7 +189,7 @@ def create_decode_slot(
 
     # Per-slot RenderBuffer for D2H copies (shares the copy stream)
     render = RenderBuffer(
-        max_batch_size,
+        max_batch_slots,
         device,
         coord_dtype=coord_dtype,
         size_dtype=size_dtype,
@@ -198,58 +198,58 @@ def create_decode_slot(
 
     n_pages = max_seq_len // page_size
     fa3_page_table = torch.empty(
-        (max_batch_size, n_pages),
+        (max_batch_slots, n_pages),
         dtype=torch.int32,
         device=device,
     )
     fa3_seqused_k = torch.empty(
-        (max_batch_size,),
+        (max_batch_slots,),
         dtype=torch.int32,
         device=device,
     )
 
     # GPU staging for sampled outputs
     sampled_ids = torch.empty(
-        (max_batch_size,),
+        (max_batch_slots,),
         dtype=torch.long,
         device=device,
     )
     coord_staging = torch.empty(
-        (max_batch_size, 1),
+        (max_batch_slots, 1),
         dtype=coord_dtype,
         device=device,
     )
     size_staging = torch.empty(
-        (max_batch_size, 2),
+        (max_batch_slots, 2),
         dtype=size_dtype,
         device=device,
     )
 
     # Forward output buffers
     logits = torch.empty(
-        (max_batch_size, vocab_size),
+        (max_batch_slots, vocab_size),
         dtype=dtype,
         device=device,
     )
     hidden_last = torch.empty(
-        (max_batch_size, hidden_dim),
+        (max_batch_slots, hidden_dim),
         dtype=dtype,
         device=device,
     )
 
     # Decode input staging
     decode_token_ids = torch.empty(
-        (max_batch_size,),
+        (max_batch_slots,),
         dtype=torch.long,
         device=device,
     )
     decode_coord_values = torch.empty(
-        (max_batch_size, 1),
+        (max_batch_slots, 1),
         dtype=coord_dtype,
         device=device,
     )
     decode_size_values = torch.empty(
-        (max_batch_size, 2),
+        (max_batch_slots, 2),
         dtype=size_dtype,
         device=device,
     )

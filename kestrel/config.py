@@ -24,6 +24,7 @@ class RuntimeConfig:
     model_paths: ModelPaths
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+    # Effective batch size (excluding reserved batch_idx 0).
     max_batch_size: int = 4
     page_size: int = 1
     max_seq_length: int = 32768
