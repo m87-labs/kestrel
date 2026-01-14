@@ -34,6 +34,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+import os
 from dataclasses import dataclass
 from typing import (
     AsyncIterator,
@@ -273,7 +274,15 @@ class InferenceEngine:
         )
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
-        max_workers = max(1, self._runtime.max_batch_size)
+        # Keep image preprocessing parallel, but reserve a couple CPU cores
+        # for scheduler/runtime threads.
+        img_workers_multiplier = 4
+        cpu_count = os.cpu_count() or 1
+        cpu_cap = max(1, cpu_count - 2)
+        max_workers = min(
+            max(1, self._runtime.max_batch_size * img_workers_multiplier),
+            cpu_cap,
+        )
         self._image_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="kestrel-img"
         )
