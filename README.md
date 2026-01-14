@@ -34,7 +34,7 @@ cfg = RuntimeConfig(
     ),
     device="cuda",
     dtype=torch.bfloat16,
-    max_batch_size=4,
+    max_batch_size=4,  # effective; batch_idx 0 is reserved internally
 )
 engine = await InferenceEngine.create(cfg)
 
@@ -333,6 +333,7 @@ pt_file = hf_hub_download(
   ```
 
   Exercises the asynchronous engine end-to-end; expect full responses (no immediate EOS) on the first decode step.
+  `--max-batch-size` is the effective batch size; batch_idx 0 is reserved internally.
 
 ### HTTP Server
 

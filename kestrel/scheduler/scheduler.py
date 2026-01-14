@@ -69,22 +69,22 @@ class GenerationScheduler:
         coord_dtype = runtime.region.coord_features.dtype
         size_dtype = runtime.region.size_features.dtype
         self._pending_token_ids = torch.zeros(
-            (runtime.max_batch_size,),
+            (runtime.max_batch_slots,),
             dtype=torch.long,
             device=runtime.device,
         )
         self._pending_coord_values = torch.zeros(
-            (runtime.max_batch_size, 1),
+            (runtime.max_batch_slots, 1),
             dtype=coord_dtype,
             device=runtime.device,
         )
         self._pending_size_values = torch.zeros(
-            (runtime.max_batch_size, 2),
+            (runtime.max_batch_slots, 2),
             dtype=size_dtype,
             device=runtime.device,
         )
         self._render_buffer = RenderBuffer(
-            runtime.max_batch_size,
+            runtime.max_batch_slots,
             runtime.device,
             coord_dtype=coord_dtype,
             size_dtype=size_dtype,
@@ -93,27 +93,27 @@ class GenerationScheduler:
         # Preallocated staging buffers for gathering the packed decode inputs
         # from the pending per-sequence slots (avoids per-step allocations).
         self._decode_token_ids = torch.empty(
-            (runtime.max_batch_size,),
+            (runtime.max_batch_slots,),
             dtype=torch.long,
             device=runtime.device,
         )
         self._decode_coord_values = torch.empty(
-            (runtime.max_batch_size, 1),
+            (runtime.max_batch_slots, 1),
             dtype=coord_dtype,
             device=runtime.device,
         )
         self._decode_size_values = torch.empty(
-            (runtime.max_batch_size, 2),
+            (runtime.max_batch_slots, 2),
             dtype=size_dtype,
             device=runtime.device,
         )
         self._sampled_token_ids = torch.empty(
-            (runtime.max_batch_size,),
+            (runtime.max_batch_slots,),
             dtype=torch.long,
             device=runtime.device,
         )
         self._decode_batch_idx = CpuGpuBuffer(
-            runtime.max_batch_size,
+            runtime.max_batch_slots,
             dtype=torch.long,
             device=runtime.device,
             pin_memory=True,

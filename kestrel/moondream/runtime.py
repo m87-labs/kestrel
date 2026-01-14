@@ -286,11 +286,14 @@ class MoondreamRuntime:
             raise ValueError("max_seq_length must be divisible by page_size")
 
         self.page_size = cfg.page_size
-        if cfg.max_batch_size < 2:
+        if cfg.max_batch_size < 1:
             raise ValueError(
-                "max_batch_size must be at least 2; index 0 is reserved for the page table."
+                "max_batch_size must be at least 1; batch_idx 0 is reserved internally."
             )
+        # max_batch_size is the effective user-facing batch capacity.
+        # We reserve batch_idx 0 for internal bookkeeping, so allocate +1 slot.
         self.max_batch_size = cfg.max_batch_size
+        self.max_batch_slots = cfg.max_batch_size + 1
         n_pages = self.max_seq_length // self.page_size
 
         # Create prefix cache if enabled
@@ -305,7 +308,7 @@ class MoondreamRuntime:
         self.page_table = PageTable(
             n_pages=n_pages,
             page_size=self.page_size,
-            max_batch_size=self.max_batch_size,
+            max_batch_size=self.max_batch_slots,
             device=str(self.device),
             prefix_cache=self.prefix_cache,
             h2d_stream=self._primary_stream,
@@ -452,13 +455,13 @@ class MoondreamRuntime:
 
         # Multi-slot LoRA workspace and slot manager.
         # Slot 0 represents "no LoRA". Active adapters are loaded into slots 1+.
-        # With max_slots = max_batch_size, we have max_batch_size - 1 usable adapter
-        # slots, which matches effective batch size (page 0 is reserved in page table).
+        # With max_slots = max_batch_slots, we have max_batch_size usable adapter
+        # slots (slot 0 reserved), matching effective batch size.
         self._lora_workspace: TextLoRAWorkspace | None = None
         self._slot_manager: AdapterSlotManager | None = None
         self._max_lora_rank: int | None = max_lora_rank
         if max_lora_rank is not None:
-            max_slots = cfg.max_batch_size
+            max_slots = self.max_batch_slots
 
             # Validate MoE super-expert limit.
             # vLLM's moe_align_block_size kernel requires num_experts < 1024 due to
@@ -466,13 +469,13 @@ class MoondreamRuntime:
             # max_super_experts = (max_slots - 1) * num_experts.
             moe_cfg = self.config.text.moe
             if moe_cfg is not None:
-                max_super_experts = (max_slots - 1) * moe_cfg.num_experts
+                max_super_experts = self.max_batch_size * moe_cfg.num_experts
                 if max_super_experts >= 1024:
-                    max_allowed = 1 + (1023 // moe_cfg.num_experts)
+                    max_allowed = 1023 // moe_cfg.num_experts
                     raise ValueError(
                         f"max_batch_size ({cfg.max_batch_size}) is too large for MoE LoRA. "
                         f"With {moe_cfg.num_experts} experts, max_super_experts = "
-                        f"(max_batch_size - 1) * {moe_cfg.num_experts} = {max_super_experts}, "
+                        f"max_batch_size * {moe_cfg.num_experts} = {max_super_experts}, "
                         f"which exceeds vLLM's moe_align_block_size limit of 1024. "
                         f"Maximum allowed max_batch_size: {max_allowed}"
                     )
@@ -497,7 +500,7 @@ class MoondreamRuntime:
                 slot_id=slot_id,
                 device=self.device,
                 dtype=self.dtype,
-                max_batch_size=self.max_batch_size,
+                max_batch_slots=self.max_batch_slots,
                 max_seq_len=self.max_seq_length,
                 page_size=self.page_size,
                 vocab_size=vocab_size,
@@ -1395,7 +1398,7 @@ class MoondreamRuntime:
             return
 
         # Initialize graph batch sizes once
-        max_effective_batch = max(1, self.max_batch_size - 1)
+        max_effective_batch = max(1, self.max_batch_size)
         self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
 
         # Capture graphs for each slot using its own buffers

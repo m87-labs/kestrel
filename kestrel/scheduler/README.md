@@ -34,6 +34,6 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 
 - Always ensure `GenerationRequest.skill_state` is set before enqueuing; the scheduler assumes it is present when prefill begins.
 - Keep skill-specific behavior inside `SkillState.consume_step` and `SkillState.finalize` so the scheduler remains generic.
-- Batch sizing is governed by `MoondreamRuntime.max_batch_size` and KV-cache availability.
+- Batch sizing is governed by `MoondreamRuntime.max_batch_size` (effective sequences; batch_idx 0 is reserved) and KV-cache availability.
 - Stream callbacks run on the engine's loop via `call_soon_threadsafe`; they should avoid long blocking operations.
 - Tokens staged on `SkillState`s are typed (`TextToken`, `CoordToken`, `SizeToken`). The scheduler asks the runtime to render sampled ids into these structures before handing them to skills, and the runtime re-embeds them (including region values) on the next decode step.
