@@ -59,6 +59,8 @@ from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.scheduler import (
     GenerationScheduler,
     GenerationRequest,
+    RequestLifecycle,
+    RequestPhase,
     SchedulerResult,
     StreamUpdate,
 )
@@ -979,7 +981,10 @@ class InferenceEngine:
         paused_event = self._paused_event
 
         def admit_request(
-            req: _PendingRequest, crops: Optional[OverlapCropOutput]
+            req: _PendingRequest,
+            crops: Optional[OverlapCropOutput],
+            *,
+            prefix_cache_hit: bool = False,
         ) -> None:
             try:
                 generation_req, skill_state = self._build_generation_request(
@@ -988,12 +993,32 @@ class InferenceEngine:
             except Exception as exc:
                 self._fail_request(req, exc)
                 return
+            crops_ready = (
+                req.image is None or prefix_cache_hit or (crops is not None)
+            )
+            lora_slot_ready = req.adapter is None
+            phase = (
+                RequestPhase.READY_FOR_PREFILL
+                if (crops_ready and lora_slot_ready)
+                else RequestPhase.WAITING_RESOURCES
+            )
+            lifecycle = RequestLifecycle(
+                request=generation_req,
+                skill_state=skill_state,
+                phase=phase,
+                has_image=req.image is not None,
+                crops_ready=crops_ready,
+                lora_slot_ready=lora_slot_ready,
+                prefix_cache_hit=prefix_cache_hit,
+                submitted_at=req.submitted_at,
+            )
+            generation_req.lifecycle = lifecycle
             scheduler.enqueue_request(generation_req, skill_state)
             active_requests[req.request_id] = req
 
         def handle_incoming(req: _PendingRequest) -> None:
             if req.image is None:
-                admit_request(req, None)
+                admit_request(req, None, prefix_cache_hit=False)
                 return
 
             # Compute image hash and check prefix cache for early skip
@@ -1009,7 +1034,7 @@ class InferenceEngine:
                 # Early cache lookup - skip crop computation if cache hit
                 tokens_list = runtime._normalize_prompt_tokens(req.prompt_tokens)
                 if runtime.check_prefix_cache(tokens_list, image_hash, req.adapter):
-                    admit_request(req, None)  # No crops needed
+                    admit_request(req, None, prefix_cache_hit=True)  # No crops needed
                     return
 
             # Cache miss or prefix cache disabled - compute crops
@@ -1020,7 +1045,7 @@ class InferenceEngine:
                 except Exception as exc:
                     self._fail_request(req, exc)
                     return
-                admit_request(req, crops)
+                admit_request(req, crops, prefix_cache_hit=False)
                 return
             try:
                 future = executor.submit(
@@ -1054,7 +1079,7 @@ class InferenceEngine:
                 except Exception as exc:
                     self._fail_request(req, exc)
                     continue
-                admit_request(req, crops)
+                admit_request(req, crops, prefix_cache_hit=False)
                 promoted = True
             return promoted
 

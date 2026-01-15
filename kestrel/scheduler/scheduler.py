@@ -26,8 +26,9 @@ from kestrel.skills import (
 from .queues import RequestQueue, RunningQueue
 from .types import (
     GenerationRequest,
+    RequestLifecycle,
     RequestMetrics,
-    ScheduledSequence,
+    RequestPhase,
     SchedulerResult,
     StepPlan,
 )
@@ -56,7 +57,7 @@ class GenerationScheduler:
         self.runtime = runtime
         self._adapter_provider = adapter_provider
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
-        self.running: RunningQueue[ScheduledSequence] = RunningQueue()
+        self.running: RunningQueue[RequestLifecycle] = RunningQueue()
         self._completed: Deque[SchedulerResult] = deque()
         self._next_request_id = 0
         self._default_temperature = max(float(default_temperature), 0.0)
@@ -286,14 +287,13 @@ class GenerationScheduler:
         _LOGGER.exception(
             "Failed to admit request %s: %s", request.request_id, exc
         )
-        now = time.perf_counter()
-        metrics = RequestMetrics(
-            prompt_tokens=request.prompt_length,
-            decode_tokens=0,
-            prefill_time_ms=0.0,
-            ttft_ms=max((now - request.submitted_at) * 1000.0, 0.0),
-            decode_time_ms=0.0,
-        )
+        lifecycle = request.lifecycle
+        lifecycle.finish_reason = "error"
+        lifecycle.error = exc
+        lifecycle.finished = True
+        lifecycle.finalized = True
+        lifecycle.transition(RequestPhase.COMPLETED)
+        metrics = lifecycle.build_metrics(decode_tokens=0, cached_tokens=0)
         result = SchedulerResult(
             request_id=request.request_id,
             tokens=[],
@@ -317,6 +317,18 @@ class GenerationScheduler:
         request = self.waiting.peek()
         if request is None:
             return False
+        lifecycle = request.lifecycle
+        if lifecycle.phase not in (
+            RequestPhase.WAITING_RESOURCES,
+            RequestPhase.READY_FOR_PREFILL,
+        ):
+            return False
+        if (
+            lifecycle.has_image
+            and not lifecycle.prefix_cache_hit
+            and not lifecycle.crops_ready
+        ):
+            return False
         # Use active_sequences count to account for zombies (finalized but
         # inflight_refs > 0). These still hold batch slots until released.
         num_allocated = len(self.runtime.active_sequences)
@@ -334,19 +346,38 @@ class GenerationScheduler:
             request = self.waiting.peek()
             if request is None:
                 break
+            lifecycle = request.lifecycle
+            if lifecycle.phase not in (
+                RequestPhase.WAITING_RESOURCES,
+                RequestPhase.READY_FOR_PREFILL,
+            ):
+                break
+            if (
+                lifecycle.has_image
+                and not lifecycle.prefix_cache_hit
+                and not lifecycle.crops_ready
+            ):
+                break
             if not self.runtime.can_reserve(request.target_length):
                 break
 
             request = self.waiting.pop()
+            lifecycle = request.lifecycle
 
             # Acquire adapter slot at admission time (not earlier)
-            try:
-                lora_slot = self._acquire_adapter_slot(request.adapter)
-            except Exception as exc:
-                self._fail_request_early(request, exc)
-                progress = True
-                continue
-            request.lora_slot = lora_slot
+            acquired_lora = False
+            if not lifecycle.lora_slot_ready:
+                try:
+                    lora_slot = self._acquire_adapter_slot(request.adapter)
+                except Exception as exc:
+                    self._fail_request_early(request, exc)
+                    progress = True
+                    continue
+                request.lora_slot = lora_slot
+                lifecycle.lora_slot_ready = True
+                acquired_lora = True
+            if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
+                lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
 
             # If this is a segmentation request with spatial refs, convert
             # placeholder coord/size ids into typed CoordToken/SizeToken
@@ -367,6 +398,8 @@ class GenerationScheduler:
                     )
                     prompt_inputs = tokens
                 prefill_start = time.perf_counter()
+                lifecycle.prefill_started_at = prefill_start
+                lifecycle.transition(RequestPhase.PREFILLING)
                 state, logits = self.runtime.start_sequence(
                     prompt_tokens=prompt_inputs,
                     image=request.image,
@@ -377,8 +410,11 @@ class GenerationScheduler:
                     adapter_id=request.adapter,
                 )
             except Exception as exc:
-                # Release slot on failure to prevent leak
-                self.runtime.release_adapter_slot(lora_slot)
+                # Release slot on failure to prevent leak (only if acquired here)
+                if acquired_lora:
+                    self.runtime.release_adapter_slot(request.lora_slot)
+                    request.lora_slot = 0
+                    lifecycle.lora_slot_ready = False
                 self._fail_request_early(request, exc)
                 progress = True
                 continue
@@ -388,14 +424,10 @@ class GenerationScheduler:
                     self.runtime, request, request.request_context
                 )
             request.skill_state = skill_state
-            seq = ScheduledSequence(
-                request=request,
-                state=state,
-                skill_state=skill_state,
-            )
+            seq = lifecycle
+            seq.skill_state = skill_state
+            seq.sequence_state = state
             seq.skill_state.on_prefill(self.runtime)
-            seq.started_at = request.submitted_at
-            seq.prefill_started_at = prefill_start
 
             if request.max_new_tokens <= 0:
                 seq.first_token_time = prefill_start
@@ -455,7 +487,7 @@ class GenerationScheduler:
     # Split decode API (Phase 1 pipelining)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _can_dispatch(self, seq: ScheduledSequence) -> bool:
+    def _can_dispatch(self, seq: RequestLifecycle) -> bool:
         """Check if a sequence can be included in the next decode step.
 
         A sequence is dispatchable if:
@@ -494,7 +526,7 @@ class GenerationScheduler:
         if not len(self.running):
             return None
 
-        active: list[ScheduledSequence] = []
+        active: list[RequestLifecycle] = []
         for seq in self.running:
             if not seq.needs_decode():
                 continue
@@ -704,6 +736,7 @@ class GenerationScheduler:
             # Skip zombies (already finalized in a previous step)
             if seq.finalized:
                 if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
                 continue
 
@@ -716,9 +749,10 @@ class GenerationScheduler:
                 # Remove from running queue
                 self.running.remove(seq)
                 if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
 
-    def _release_sequence(self, seq: ScheduledSequence) -> None:
+    def _release_sequence(self, seq: RequestLifecycle) -> None:
         """Release resources for a finalized sequence with no in-flight refs.
 
         Called when a zombie's last in-flight reference completes. The sequence
@@ -729,7 +763,7 @@ class GenerationScheduler:
             self.runtime.release_sequence(seq.state)
 
     def _sample_batch(
-        self, logits: Tensor, sequences: List[ScheduledSequence], out: Tensor,
+        self, logits: Tensor, sequences: List[RequestLifecycle], out: Tensor,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         """Sample tokens from logits into the provided output buffer.
 
@@ -758,11 +792,7 @@ class GenerationScheduler:
             if seq.finalized:
                 allowed_tokens.append(None)
                 continue
-            state = seq.request.skill_state
-            if state is None:
-                allowed_tokens.append(None)
-                continue
-            allowed = state.allowed_token_ids(self.runtime)
+            allowed = seq.skill_state.allowed_token_ids(self.runtime)
             allowed_tokens.append(allowed)
             if allowed:
                 restrict = True
@@ -792,7 +822,7 @@ class GenerationScheduler:
         out[:batch].copy_(sampled_raw)
         return out[:batch], temps, top_ps
 
-    def _mark_finished_if_needed(self, seq: ScheduledSequence) -> bool:
+    def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
         eos_id = self.runtime.config.tokenizer.eos_id
         eos_hit = isinstance(last_token, TextToken) and last_token.token_id == eos_id
@@ -810,7 +840,7 @@ class GenerationScheduler:
         self._finalize_sequence(seq, reason)
         return True
 
-    def _finalize_sequence(self, seq: ScheduledSequence, reason: str) -> None:
+    def _finalize_sequence(self, seq: RequestLifecycle, reason: str) -> None:
         """Mark a sequence as finished and prepare its result.
 
         This marks both `finished` (for result building) and `finalized` (for
@@ -831,8 +861,11 @@ class GenerationScheduler:
         # Only release immediately if no in-flight steps reference this sequence.
         # Otherwise, release is deferred to complete_step() when inflight_refs hits 0.
         if seq.inflight_refs == 0:
+            seq.transition(RequestPhase.COMPLETED)
             if seq.state.batch_idx in self.runtime.active_sequences:
                 self.runtime.release_sequence(seq.state)
+        else:
+            seq.transition(RequestPhase.FINALIZING)
 
         self._completed.append(self._build_result(seq))
 
@@ -847,7 +880,7 @@ class GenerationScheduler:
             raise ValueError("top_p must be in the range (0, 1]")
         return value
 
-    def _build_result(self, seq: ScheduledSequence) -> SchedulerResult:
+    def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"
 
         # Finalization can raise (e.g., malformed tokens during decode). Catch
@@ -864,23 +897,8 @@ class GenerationScheduler:
             tokens = []
             output = {"error": str(exc)}
 
-        prompt_tokens = seq.state.prompt_length
         decode_tokens = len(tokens) if tokens else len(seq.skill_state.tokens)
-        queued_at = seq.request.submitted_at
-        prefill_started_at = seq.prefill_started_at or queued_at
-        completed_at = seq.completed_at or time.perf_counter()
-        first_token_time = seq.first_token_time or completed_at
-        prefill_time_ms = max((first_token_time - prefill_started_at) * 1000.0, 0.0)
-        ttft_ms = max((first_token_time - queued_at) * 1000.0, 0.0)
-        decode_time_ms = max((completed_at - first_token_time) * 1000.0, 0.0)
-        metrics = RequestMetrics(
-            prompt_tokens=prompt_tokens,
-            decode_tokens=decode_tokens,
-            prefill_time_ms=prefill_time_ms,
-            ttft_ms=ttft_ms,
-            decode_time_ms=decode_time_ms,
-            cached_tokens=seq.state.reused_page_count,
-        )
+        metrics = seq.build_metrics(decode_tokens=decode_tokens)
         return SchedulerResult(
             request_id=seq.request.request_id,
             tokens=tokens,
