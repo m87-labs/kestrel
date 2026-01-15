@@ -463,22 +463,6 @@ class MoondreamRuntime:
         if max_lora_rank is not None:
             max_slots = self.max_batch_slots
 
-            # Validate MoE super-expert limit.
-            # vLLM's moe_align_block_size kernel requires num_experts < 1024 due to
-            # CUB BlockScan using 1024 threads. With sentinel-based slot 0 filtering,
-            # max_super_experts = (max_slots - 1) * num_experts.
-            moe_cfg = self.config.text.moe
-            if moe_cfg is not None:
-                max_super_experts = self.max_batch_size * moe_cfg.num_experts
-                if max_super_experts >= 1024:
-                    max_allowed = 1023 // moe_cfg.num_experts
-                    raise ValueError(
-                        f"max_batch_size ({cfg.max_batch_size}) is too large for MoE LoRA. "
-                        f"With {moe_cfg.num_experts} experts, max_super_experts = "
-                        f"max_batch_size * {moe_cfg.num_experts} = {max_super_experts}, "
-                        f"which exceeds vLLM's moe_align_block_size limit of 1024. "
-                        f"Maximum allowed max_batch_size: {max_allowed}"
-                    )
 
             self._lora_workspace = TextLoRAWorkspace(
                 text_config=self.config.text,
