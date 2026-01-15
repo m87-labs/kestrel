@@ -3,7 +3,8 @@
 from .scheduler import GenerationScheduler
 from .types import (
     GenerationRequest,
-    ScheduledSequence,
+    RequestLifecycle,
+    RequestPhase,
     SchedulerResult,
     StreamUpdate,
 )
@@ -11,7 +12,8 @@ from .types import (
 __all__ = [
     "GenerationScheduler",
     "GenerationRequest",
-    "ScheduledSequence",
+    "RequestLifecycle",
+    "RequestPhase",
     "SchedulerResult",
     "StreamUpdate",
 ]

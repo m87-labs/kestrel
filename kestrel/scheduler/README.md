@@ -26,7 +26,7 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 
 - `GenerationScheduler.enqueue_request(request, skill_state)`: enqueue a fully prepared request/skill state duo. Used by the engine when it wants full control over state creation.
 - `GenerationScheduler.waiting` / `GenerationScheduler.running`: FIFO queues (`RequestQueue` / `RunningQueue`) tracking pending vs. active sequences.
-- `ScheduledSequence`: groups the runtime `SequenceState`, the user-facing `GenerationRequest`, and the `SkillState`. The scheduler only mutates decode bookkeeping on this container.
+- `RequestLifecycle`: groups the runtime `SequenceState`, the user-facing `GenerationRequest`, and the `SkillState`. The scheduler only mutates decode bookkeeping on this container.
 - `GenerationRequest`: immutable request metadata plus the associated `skill_state`/`request_context` set during submission.
 - `StreamCallback`: optional callable that receives `StreamUpdate` events when the scheduler stages new tokens; used by the engine to power streaming APIs.
 
