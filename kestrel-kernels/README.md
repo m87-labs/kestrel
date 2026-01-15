@@ -1,6 +1,8 @@
 # kestrel-kernels
 
-Precompiled CUDA kernels for [Kestrel](https://github.com/m87-labs/kestrel), a high-performance inference engine for [Moondream](https://moondream.ai), the world's most efficient vision-language model.
+Precompiled CUDA kernels for [Kestrel](https://pypi.org/project/kestrel/), a high-performance inference engine for [Moondream](https://moondream.ai), the world's most efficient vision-language model.
+
+**License:** These kernels are provided for use with Kestrel only. Other use is not permitted.
 
 These kernels are optimized for NVIDIA H100 (SM90) and distributed as precompiled shared libraries for fast installation without CUDA compilation.
 

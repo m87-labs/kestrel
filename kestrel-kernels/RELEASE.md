@@ -59,6 +59,8 @@ Results should be saved to `python/kestrel_kernels/configs/` after analysis.
 - Some kernels (topk, cute_moe, moe_align, flash_attn decode) are precompiled during wheel build and require an H100 GPU.
 - Other kernels (flash_attn prefill/backward) may JIT-compile at runtime if not precompiled.
 - `TORCH_CUDA_ARCH_LIST=9.0a` ensures precompiled kernels use the `sm90a` architecture string, which is required for production deployments.
+- PyPI/TestPyPI require manylinux tags; use `auditwheel repair` to produce
+  `manylinux_2_34_x86_64` wheels (see below).
 
 ## Building Wheels (requires H100 GPU)
 
@@ -71,24 +73,19 @@ cd ~/code/kestrel/kestrel-kernels
 # Install all Python versions
 ~/.local/bin/uv python install 3.10 3.11 3.12 3.13
 
-# Build wheels for all Python versions
-rm -rf dist dist-all build *.egg-info
-mkdir -p dist-all
-for pyver in 3.10 3.11 3.12 3.13; do
-    echo "Building for Python $pyver..."
-    rm -rf dist build *.egg-info
-    TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc \
-        ~/.local/bin/uv build --wheel --python $pyver
-    mv dist/*.whl dist-all/
-done
+# Install auditwheel (for manylinux repair)
+~/.local/bin/uv tool install auditwheel
+
+# Build + repair wheels for all Python versions
+./scripts/build_manylinux_wheels.sh
 
 # Verify wheels were created
 ls -la dist-all/
 # Should show:
-#   kestrel_kernels-0.1.0-cp310-cp310-linux_x86_64.whl
-#   kestrel_kernels-0.1.0-cp311-cp311-linux_x86_64.whl
-#   kestrel_kernels-0.1.0-cp312-cp312-linux_x86_64.whl
-#   kestrel_kernels-0.1.0-cp313-cp313-linux_x86_64.whl
+#   kestrel_kernels-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl
+#   kestrel_kernels-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl
+#   kestrel_kernels-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl
+#   kestrel_kernels-0.1.0-cp313-cp313-manylinux_2_34_x86_64.whl
 ```
 
 ## Releasing to GitHub
@@ -124,10 +121,10 @@ Always test on TestPyPI first:
 
 ```bash
 # Install twine
-~/.local/bin/uv pip install twine
+~/.local/bin/uv tool install twine
 
 # Upload to TestPyPI
-~/.local/bin/uv run twine upload --repository testpypi dist-all/*
+~/.local/bin/uv tool run twine upload --repository testpypi dist-all/*
 
 # Test installation in a fresh environment
 pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ kestrel-kernels
@@ -136,7 +133,7 @@ pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://
 ### Production Upload (PyPI)
 
 ```bash
-~/.local/bin/uv run twine upload dist-all/*
+~/.local/bin/uv tool run twine upload dist-all/*
 ```
 
 ### Using API Tokens
@@ -157,7 +154,7 @@ Or use environment variables:
 ```bash
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=pypi-<your-token>
-~/.local/bin/uv run twine upload dist-all/*
+~/.local/bin/uv tool run twine upload dist-all/*
 ```
 
 ### Versioning
@@ -184,13 +181,18 @@ cd ~/code/kestrel/kestrel-kernels
 rm -rf dist dist-all build *.egg-info
 mkdir -p dist-all
 
+# Ensure tools are installed
+~/.local/bin/uv tool install auditwheel
+~/.local/bin/uv tool install twine
+
 # Build for all Python versions
 for pyver in 3.10 3.11 3.12 3.13; do
     echo "=== Building for Python $pyver ==="
     rm -rf dist build *.egg-info
     TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc \
         ~/.local/bin/uv build --wheel --python $pyver
-    mv dist/*.whl dist-all/
+    raw_wheel=$(ls dist/*.whl)
+    ~/.local/bin/uv tool run auditwheel repair --plat manylinux_2_34_x86_64 -w dist-all "$raw_wheel"
 done
 
 echo "=== Built wheels ==="
@@ -198,5 +200,5 @@ ls -la dist-all/
 
 echo "=== Upload to PyPI? (ctrl-c to cancel) ==="
 read -p "Press enter to upload..."
-~/.local/bin/uv run twine upload dist-all/*
+~/.local/bin/uv tool run twine upload dist-all/*
 ```
