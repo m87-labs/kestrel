@@ -12,9 +12,7 @@ Dense layers use direct slot indexing: workspace shape is [max_slots, ...] and
 slot N maps to index N. Slot 0 contains zeros.
 
 MoE layers use "super-expert" indexing where each (slot, expert) pair is a unique
-index. However, vLLM's moe_align_block_size kernel has a hard limit of <1024
-experts due to CUB BlockScan using 1024 threads. With 64 physical experts, this
-limits us to floor(1023/64) = 15 usable slots.
+index.
 
 To maximize slot capacity, MoE workspaces exclude slot 0 entirely:
 - Workspace shape: [(max_slots-1) * num_experts, ...]
@@ -22,8 +20,7 @@ To maximize slot capacity, MoE workspaces exclude slot 0 entirely:
 - Slot 0 tokens are filtered out via sentinel values in moe_align_block_size
   (expert IDs >= num_super_experts are skipped by the kernel)
 
-This allows max_slots usable adapter slots (1 through max_slots-1) while staying
-under the 1024 super-expert limit.
+This allows max_slots usable adapter slots (1 through max_slots-1).
 """
 
 from dataclasses import dataclass
