@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import torch
 
-from kestrel.config import ModelPaths, RuntimeConfig
+from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.skills import QueryRequest, QuerySettings
 
@@ -34,9 +34,7 @@ def _parse_dtype(value: str) -> torch.dtype:
 
 
 def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--weights", type=Path, required=True, help="Path to text weights file")
-    parser.add_argument("--config", type=Path, help="Optional model config JSON")
-    parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or path")
+    parser.add_argument("--weights", type=Path, required=True, help="Path to model weights file")
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
     parser.add_argument(
@@ -118,13 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
-    model_paths = ModelPaths(
-        weights=args.weights,
-        config_json=args.config,
-        tokenizer=args.tokenizer,
-    )
     return RuntimeConfig(
-        model_paths=model_paths,
+        model_path=args.weights,
         device=args.device,
         dtype=args.dtype,
         max_batch_size=args.max_batch_size,

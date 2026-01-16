@@ -249,7 +249,7 @@ def main() -> None:
 
     patch_vision_encoder_with_nvtx(detailed=not args.compact)
 
-    from kestrel.config import ModelPaths, RuntimeConfig
+    from kestrel.config import RuntimeConfig
     from kestrel.moondream.runtime import MoondreamRuntime
     from kestrel.moondream import vision as vision_module
 
@@ -257,10 +257,8 @@ def main() -> None:
     dtype = _parse_dtype(args.dtype)
 
     runtime_cfg = RuntimeConfig(
-        model_paths=ModelPaths(weights=args.weights.expanduser(), config_json=args.config_json),
-        device="cuda",
+        model_path=args.weights.expanduser(),
         dtype=dtype,
-        max_batch_size=2,
     )
 
     print(f"Loading model from {args.weights}...")

@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 import uvicorn
 
-from kestrel.config import ModelPaths, RuntimeConfig
+from kestrel.config import RuntimeConfig
 from kestrel.server.http import create_app
 
 
@@ -50,7 +50,7 @@ def main() -> None:
     enable_cuda_graphs = env_bool("KESTREL_CUDA_GRAPHS", False)
 
     runtime_cfg = RuntimeConfig(
-        model_paths=ModelPaths(weights=str(weights)),
+        model_path=weights,
         device=device,
         dtype=dtype,
         max_batch_size=max_batch,

@@ -260,11 +260,7 @@ class MoondreamRuntime:
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
         self.graph_capture_lock = threading.RLock()
 
-        if cfg.model_paths.config_json:
-            with Path(cfg.model_paths.config_json).open("r", encoding="utf-8") as fp:
-                raw_config = json.load(fp)
-        else:
-            raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
+        raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
 
         text_section = raw_config.setdefault("text", {})
         default_context = int(
@@ -351,7 +347,7 @@ class MoondreamRuntime:
                 captured_v_scales[layer_idx] = value
 
         load_moondream_weights(
-            str(cfg.model_paths.weights),
+            str(cfg.model_path),
             self.model,
             tensor_hook=_capture_kv_scale,
             region=self.region,
@@ -395,7 +391,7 @@ class MoondreamRuntime:
                 )
             self.kv_cache_dtype = self.dtype
 
-        tokenizer_path = cfg.model_paths.tokenizer or "moondream/starmie-v1"
+        tokenizer_path = "moondream/starmie-v1"
         self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
 
         head_dim = self.config.text.dim // self.config.text.n_heads

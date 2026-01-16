@@ -242,7 +242,7 @@ def main():
     patch_text_decoder_with_nvtx()
     patch_lm_head_with_nvtx()
 
-    from kestrel.config import ModelPaths, RuntimeConfig
+    from kestrel.config import RuntimeConfig
     from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, TextToken
 
     device = torch.device("cuda")
@@ -252,9 +252,7 @@ def main():
     # Graph sizes are generated up to (max_batch_size - 1), so allocate +1.
     max_batch_size = args.batch_size + 1
     runtime_cfg = RuntimeConfig(
-        model_paths=ModelPaths(weights=args.weights.expanduser()),
-        device="cuda",
-        dtype=torch.bfloat16,
+        model_path=args.weights.expanduser(),
         max_batch_size=max_batch_size,
         enable_cuda_graphs=True,
     )

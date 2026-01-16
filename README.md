@@ -1,379 +1,239 @@
-# Kestrel Inference Engine
+# Kestrel
 
-<p align="center">
-  <img src="assets/kestrel-overview.png" alt="Kestrel inference engine diagram" width="640" />
-</p>
+High-performance inference engine for the [Moondream](https://moondream.ai) vision-language model.
 
-Kestrel wraps the Moondream vision-language model in an async, micro-batched serving stack. Every request flows through a skill-driven pipeline that normalises inputs, schedules compute, and streams results back to clients without compromising throughput.
+Kestrel provides async, micro-batched serving with streaming support, paged KV caching, and optimized CUDA kernels. It's designed for production deployments where throughput and latency matter.
 
-- **Request lifecycle** – Front-ends (CLI, HTTP) hand prompts to the shared inference engine, which resolves the active skill, prepares prompt and image tensors, and tracks latency metrics while streaming updates back to clients.
-- **Skills layer** – Query, caption, point, and detect skills ship by default. Each skill owns its prompt template, decode phases, and result shaping, and new modalities integrate by registering additional skills without modifying scheduler internals.
-- **Generation scheduler** – A cooperative scheduler batches work across requests, drains async queues, and applies temperature/top-p sampling so heterogeneous skills can share one decode loop while preserving per-request state machines.
-- **Runtime & attention core** – The Moondream runtime manages tensor allocation, paged prefill and decode, FlashInfer-backed attention, and image-token fusion, exposing entry points the scheduler drives during prefill and incremental decoding.
-- **Paged KV cache** – A vLLM-style paged cache lets sequences claim and release fixed-size pages so large numbers of long-context requests remain resident while keeping attention updates proportional to the active tokens.
-- **Vision preprocessing** – Optional image tiling and cropping run in a background thread pool before scheduling, and the resulting embeddings are stitched into the text prompt so multimodal and text-only requests follow the same execution path.
-- **Streaming & observability** – Streaming iterators surface incremental text chunks in real time, and finished results report token counts plus prefill, decode, and first-token latencies that the HTTP server forwards to clients.
-- **Serving surfaces & ops** – The CLI and Starlette HTTP server share the same engine wiring, ensuring smoke tests, benchmarks, and production traffic all exercise identical scheduling logic while respecting the central runtime configuration.
+## Features
 
-## API Overview
+- **Async micro-batching** — Cooperative scheduler batches heterogeneous requests without compromising per-request latency
+- **Streaming** — Real-time token streaming for query and caption tasks
+- **Multi-task** — Visual Q&A, captioning, point detection, object detection, and segmentation
+- **Paged KV cache** — Efficient memory management for high concurrency
+- **Prefix caching** — Radix tree-based caching for repeated prompts and images
+- **LoRA adapters** — Parameter-efficient fine-tuning support with automatic cloud loading
 
-### Python Engine
+## Requirements
+
+- Python 3.10+
+- NVIDIA Hopper GPU or newer (e.g. H100)
+- `MOONDREAM_API_KEY` environment variable (get this from [moondream.ai](https://moondream.ai))
+
+## Installation
+
+```bash
+pip install kestrel huggingface_hub
+```
+
+## Model Access
+
+The model weights are hosted on Hugging Face and require access approval:
+
+1. Request access at [vikhyatk/moondream-next](https://huggingface.co/vikhyatk/moondream-next)
+2. Once approved, authenticate with either:
+   - `huggingface-cli login`, or
+   - Set the `HF_TOKEN` environment variable
+
+## Quick Start
 
 ```python
-from pathlib import Path
+import asyncio
 
-import torch
-
-from kestrel.config import ModelPaths, RuntimeConfig
-from kestrel.engine import InferenceEngine
 import pyvips
+from huggingface_hub import hf_hub_download
 
-cfg = RuntimeConfig(
-    model_paths=ModelPaths(
-        weights=Path("~/code/moondream/model.pt").expanduser(),
-    ),
-    device="cuda",
-    dtype=torch.bfloat16,
-    max_batch_size=4,  # effective; batch_idx 0 is reserved internally
-)
-engine = await InferenceEngine.create(cfg)
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
 
-image = pyvips.Image.new_from_file("demo.jpg")
+
+async def main():
+    # Download the model (cached after first run)
+    model_path = hf_hub_download(
+        "vikhyatk/moondream-next",
+        filename="model_fp8.pt",
+        revision="1fdf7871dc596a89f73491db95543870727b5dce",
+    )
+
+    # Configure the engine
+    cfg = RuntimeConfig(model_path)
+
+    # Create the engine (loads model and warms up)
+    engine = await InferenceEngine.create(cfg)
+
+    # Load an image
+    image = pyvips.Image.new_from_file("photo.jpg")
+
+    # Visual question answering
+    result = await engine.query(
+        image=image,
+        question="What's in this image?",
+        settings={"temperature": 0.2, "max_tokens": 512},
+    )
+    print(result.output["answer"])
+
+    # Clean up
+    await engine.shutdown()
+
+
+asyncio.run(main())
+```
+
+## Tasks
+
+Kestrel supports several vision-language tasks through dedicated methods on the engine.
+
+### Query (Visual Q&A)
+
+Ask questions about an image:
+
+```python
 result = await engine.query(
     image=image,
-    question="Describe the image.",
+    question="How many people are in this photo?",
     settings={
-        "temperature": 0.2,
+        "temperature": 0.2,  # Lower = more deterministic
         "top_p": 0.9,
-        "max_tokens": 768,
+        "max_tokens": 512,
     },
 )
 print(result.output["answer"])
-
-point_result = await engine.point(
-    image,
-    "cat",
-    settings={"max_objects": 2},
-)
-print(point_result.output["points"])
-
-detect_result = await engine.detect(
-    image,
-    "cat",
-    settings={"max_objects": 4},
-)
-print(detect_result.output["objects"])
-
-caption_result = await engine.caption(
-    image,
-    length="normal",
-    settings={
-        "temperature": 0.2,
-        "top_p": 0.9,
-        "max_tokens": 768,
-    },
-)
-print(caption_result.output["caption"])
 ```
 
-- `InferenceEngine.query(...)`, `.caption(...)`, `.point(...)`, and `.detect(...)` mirror the `moondream` reference API (async, with optional `settings` dictionaries). When `stream=True` is passed to `query` or `caption`, the helpers now return an `EngineStream` async iterator that yields incremental text chunks while decoding continues. Reasoning traces remain opt-in via the `reasoning` flag.
-- Direct helpers like `engine.query(...)`, `engine.point(...)`, `engine.detect(...)`, and `engine.caption(...)` remain the supported public surface.
-- Default sampling settings mirror `external/moondream`: temperature `0.2`, top-p `0.9`, and a `max_tokens` budget of `768`. Structured skills continue to expose `max_objects=150` unless callers override it.
+### Caption
 
-#### Streaming usage
+Generate image descriptions:
 
 ```python
-query_stream = await engine.query(
-    question="Summarize the scene.",
-    reasoning=False,
-    stream=True,
-    settings={"max_tokens": 768},
+result = await engine.caption(
+    image,
+    length="normal",  # "short", "normal", or "long"
+    settings={"temperature": 0.2, "max_tokens": 512},
 )
-async for update in query_stream:
-    print(f"answer += {update.text}")
-query_result = await query_stream.result()
-print("final", query_result.output["answer"])
+print(result.output["caption"])
+```
 
-caption_stream = await engine.caption(
+### Point
+
+Locate objects as normalized (x, y) coordinates:
+
+```python
+result = await engine.point(image, "person")
+print(result.output["points"])
+# [{"x": 0.5, "y": 0.3}, {"x": 0.8, "y": 0.4}]
+```
+
+Coordinates are normalized to [0, 1] where (0, 0) is top-left.
+
+### Detect
+
+Detect objects as bounding boxes:
+
+```python
+result = await engine.detect(
+    image,
+    "car",
+    settings={"max_objects": 10},
+)
+print(result.output["objects"])
+# [{"x_min": 0.1, "y_min": 0.2, "x_max": 0.5, "y_max": 0.6}, ...]
+```
+
+Bounding box coordinates are normalized to [0, 1].
+
+### Segment
+
+Generate segmentation masks:
+
+```python
+result = await engine.segment(image, "dog")
+print(result.output["segments"])
+# [{"svg_path": "M 0.1 0.2 L ...", "bbox": {...}, "points": [...], ...}]
+```
+
+Each segment contains an `svg_path` (path data), `bbox` (bounding box), and `points` (reference coordinates).
+
+## Streaming
+
+For longer responses, you can stream tokens as they're generated:
+
+```python
+image = pyvips.Image.new_from_file("photo.jpg")
+
+stream = await engine.query(
     image=image,
-    length="short",
+    question="Describe this scene in detail.",
     stream=True,
-    settings={"temperature": 0.2, "max_tokens": 80},
+    settings={"max_tokens": 1024},
 )
-chunks = []
-async for update in caption_stream:
-    chunks.append(update.text)
-caption_result = await caption_stream.result()
-assert "".join(chunks) == caption_result.output["caption"]
+
+# Print tokens as they arrive
+async for chunk in stream:
+    print(chunk.text, end="", flush=True)
+
+# Get the final result with metrics
+result = await stream.result()
+print(f"\n\nGenerated {result.metrics.output_tokens} tokens")
 ```
 
-#### LoRA adapters (experimental)
+Streaming is supported for `query` and `caption` methods.
 
-LoRA adapters can be attached to the text model's MLP layers (both dense and MoE) for parameter-efficient fine-tuning experiments.
+## Response Format
+
+All methods return an `EngineResult` with these fields:
 
 ```python
-from kestrel.moondream.lora import LoRA, TextLoRAConfig
-from kestrel.moondream.config import load_config
-
-# Load model config (or use defaults with load_config(None))
-config = load_config(None)
-
-# Create LoRA adapter
-lora = LoRA.create(
-    text_config=config.text,
-    lora_config=TextLoRAConfig(rank=8, alpha=16.0),
-    dtype=torch.bfloat16,
-).to("cuda")
-
-# Pass to engine at creation time
-engine = await InferenceEngine.create(cfg, lora=lora)
+result.output          # Dict with task-specific output ("answer", "caption", "points", etc.)
+result.finish_reason   # "stop" (natural end) or "length" (hit max_tokens)
+result.metrics         # Timing and token counts
 ```
 
-**Limitations:**
-- LoRA must be created before engine initialization (required for CUDA graph capture).
-- A single LoRA is shared across all requests; per-request adapters are not yet supported.
-- Only text MLP layers are covered; attention LoRA is not implemented.
+The `metrics` object contains:
 
-### Skills
-
-- `kestrel.skills.base.SkillSpec` defines the contract for prompt construction, structured phase recipes, and result formatting.
-- `kestrel.skills.query.QuerySkill` is registered by default. Additional skills can be registered via `SkillRegistry([...])` and passed to `InferenceEngine.create(..., skills=registry)`.
-
-### CLI
-
-- `uv run python -m kestrel.main serve` – launch the HTTP server (see usage examples below for full command).
-- `uv run python -m kestrel.main schedule ...` – push one-off prompts through the async engine for smoke testing or benchmarking.
-
-### Evaluation Scripts
-
-- `scripts/chartqa_eval.py` – Internal helper for running ChartQA accuracy checks against a local or remote GPU install.
-
-  ```bash
-  # Install optional evaluation dependencies (datasets, tqdm) into your uv environment
-  UV_PRERELEASE=allow uv sync --extra eval
-
-  # Run a short sanity sweep over 20 examples (requires a CUDA-capable host)
-  UV_PRERELEASE=allow uv run --extra eval \
-    python scripts/chartqa_eval.py \
-    --weights ~/code/moondream/model.pt \
-    --limit 20
-
-  # Omit --limit (or pass --limit -1) once you're ready to process the full ChartQA split
-  ```
-
-  The script expects access to the ChartQA dataset (`datasets` library) and the Moondream weights. When running on a remote GPU host, sync the repository (for example with `./sync.sh p1`) before invoking the command there.
-
-### Running Unit Tests
-
-```bash
-# Install dev dependencies
-uv sync --extra dev
-
-# Run all tests
-uv run python -m pytest tests/ -v
-
-# Run a specific test file
-uv run python -m pytest tests/moondream/test_lora_workspace.py -v
+```python
+result.metrics.input_tokens     # Number of input tokens (including image)
+result.metrics.output_tokens    # Number of generated tokens
+result.metrics.prefill_time_ms  # Time to process input
+result.metrics.decode_time_ms   # Time to generate output
+result.metrics.ttft_ms          # Time to first token
 ```
 
-### Profiling the Fused MoE Kernel
+## Using Finetunes
 
-The `scripts/profile_scattermoe.py` helper (name retained for compatibility) drives the Moondream fused MoE MLP with realistic shapes (prefill: batch 1 × ~832 tokens, decode: batch 4 × 1 token) and adds NVTX ranges so Nsight Compute can latch onto the Triton kernels.
+If you've created a finetuned model through the [Moondream API](https://moondream.ai), you can use it by passing the adapter ID:
 
-1. Sync the repository to the target GPU host (e.g. `./sync.sh p1`) and ensure `uv` is on the PATH.
-2. Collect a prefill profile with richer counters:
-
-   ```bash
-   sudo bash -lc '
-     cd /home/ubuntu/code/kestrel &&
-     /opt/nvidia/nsight-compute/2024.1.1/ncu \
-       --set default \
-       --section LaunchStats \
-       --section SpeedOfLight \
-       --section Occupancy \
-       --section SchedulerStats \
-       --section WarpStateStats \
-       --section SourceCounters \
-       --section MemoryWorkloadAnalysis \
-       --target-processes all \
-       --force-overwrite \
-       --metrics gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum \
-       --export /tmp/profile_scattermoe_prefill \
-       /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
-         --mode prefill \
-         --iterations 5 \
-         --warmup-iters 3 \
-         --nvtx
-   '
-   ```
-
-3. Collect the decode profile with deeper pipeline sections and expanded stall metrics:
-
-   ```bash
-   sudo bash -lc '
-     cd /home/ubuntu/code/kestrel &&
-     /opt/nvidia/nsight-compute/2024.1.1/ncu \
-        --set default \
-        --section LaunchStats \
-        --section SpeedOfLight \
-        --section Occupancy \
-        --section SchedulerStats \
-        --section WarpStateStats \
-        --section SourceCounters \
-        --section MemoryWorkloadAnalysis \
-        --target-processes all \
-        --force-overwrite \
-        --metrics \
-gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__pipe_tensor_active.avg.pct_of_peak_sustained_active,smsp__sass_thread_inst_executed_op_ffma_pred_off.sum,smsp__warp_issue_stalled_selected.sum,smsp__warp_issue_stalled_barrier.sum,lts__t_sectors_srcunit_tex_op_read.sum,dram__bytes.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,smsp__warp_issue_stalled_long_scoreboard.sum,smsp__warp_issue_stalled_short_scoreboard.sum,smsp__warps_eligible_per_scheduler.avg,sm__pipe_fma_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,lts__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed \
-        --export /tmp/profile_scattermoe_decode \
-        /home/ubuntu/.local/bin/uv run python scripts/profile_scattermoe.py \
-        --mode decode \
-        --iterations 10 \
-        --warmup-iters 5 \
-        --refresh-routing \
-        --nvtx
-   '
-   ```
-
-The resulting `.ncu-rep` files can be opened locally via `ncu --import /tmp/profile_scattermoe_prefill.ncu-rep --page raw --csv` (or in the Nsight Compute GUI). Running under `sudo` sidesteps the performance-counter permission requirement; alternatively configure `NVreg_RestrictProfilingToAdminUsers=0` on the host.
-
-For a one-off launch-overhead snapshot, reuse the same command with `--metrics gpu__time_duration.sum` so you can divide the reported duration by the kernel count.
-
-### HTTP Endpoints
-
-`POST /v1/query`
-
-```json
-{
-  "question": "Describe the image",
-  "image_url": "data:image/png;base64,<...>",
-  "settings": {
-    "temperature": 0.2,
-    "top_p": 0.9,
-    "max_tokens": 768
-  }
-}
-```
-
-Response fields include the generated `answer`, a `finish_reason` aligned with OpenAI semantics (`stop` or `length` today), and timing metrics (`input_tokens`, `output_tokens`, `prefill_time_ms`, `decode_time_ms`, `ttft_ms`). When `"stream": true` is supplied, the endpoint upgrades to Server-Sent Events and emits incremental `chunk` payloads; the final event carries the completed answer alongside metrics.
-
-`POST /v1/point`
-
-```json
-{
-  "object": "burger",
-  "image_url": "data:image/png;base64,<...>",
-  "settings": {
-    "max_objects": 2
-  }
-}
-```
-
-Responses include `points` (normalised `[x, y]` pairs), `finish_reason`, request metadata, and the same timing metrics as `/v1/query`.
-
-`POST /v1/detect`
-
-```json
-{
-  "object": "burger",
-  "image_url": "data:image/png;base64,<...>",
-  "settings": {
-    "max_objects": 10
-  }
-}
-```
-
-Returns `objects` (each `{ "x_min", "y_min", "x_max", "y_max" }`), the finish reason, and latency metrics matching `/v1/query`.
-
-`POST /v1/caption`
-
-```json
-{
-  "image_url": "data:image/png;base64,<...>",
-  "length": "normal",
-  "settings": {
-    "temperature": 0.2,
-    "top_p": 0.9,
-    "max_tokens": 768
-  }
-}
-```
-
-Responses include the generated `caption`, finish reason, and the standard metrics block.
-
-## Usage Examples
-
-### Downloading Checkpoint
-
-To test inference, you will need a Moondream checkpoint in vixtral weights format. You can obtain by running the following. You will first need to request access to [vikhyatk/moondream-next](https://huggingface.co/vikhyatk/moondream-next) and reach out to vik to get the access request approved (be sure to mention your Hugging Face username when making this request).
-
-```
-from huggingface_hub import hf_hub_download
-
-pt_file = hf_hub_download(
-    "vikhyatk/moondream-next",
-    # moe-glu-3c-warp4_1/s1921
-    revision="d7af1649689208e30e657a8ad52017346e137c39",
-    filename="model.pt",
+```python
+result = await engine.query(
+    image=image,
+    question="What's in this image?",
+    settings={"adapter": "01J5Z3NDEKTSV4RRFFQ69G5FAV@1000"},
 )
 ```
 
-### Sampling & Benchmarking How-To
+The adapter ID format is `{finetune_id}@{step}` where:
+- `finetune_id` is the ID of your finetune job
+- `step` is the training step/checkpoint to use
 
-- **Sampling smoke test**
+Adapters are automatically downloaded and cached on first use.
 
-  ```bash
-  uv run python -m kestrel.main schedule \
-      "Tell me about the oceans." \
-      "How do rockets work?" \
-      --weights ~/code/moondream/model.pt \
-      --max-batch-size 8 \
-      --max-new-tokens 256 \
-      --device cuda --dtype bfloat16 --stream
-  ```
+## Configuration
 
-  Exercises the asynchronous engine end-to-end; expect full responses (no immediate EOS) on the first decode step.
-  `--max-batch-size` is the effective batch size; batch_idx 0 is reserved internally.
+### RuntimeConfig
 
-### HTTP Server
+```python
+RuntimeConfig(
+    model_path="/path/to/model.pt",
+    max_batch_size=8,  # Max concurrent requests (default: 4)
+)
+```
 
-- **Launch**
+### Environment Variables
 
-  ```bash
-  uv run python -m kestrel.main serve \
-      --weights ~/code/moondream/model.pt \
-      --device cuda --dtype bfloat16 \
-      --max-batch-size 64 \
-      --default-max-new-tokens 512 \
-      --host 0.0.0.0 --port 8080
-  ```
+| Variable | Description |
+|----------|-------------|
+| `MOONDREAM_API_KEY` | Required. Get this from [moondream.ai](https://moondream.ai). |
 
-  The server primes the shared engine on startup and then serves concurrent POST requests at `http://<host>:<port>/v1/query`. `/healthz` returns 200 once the warmup finishes.
+## License
 
-- **Request shape**
+Free for evaluation and non-commercial use. Commercial use requires a license from [Moondream](https://moondream.ai).
 
-  ```json
-  {
-    "question": "Describe the image",
-    "image_url": "data:image/png;base64,<...>",
-    "settings": {
-      "temperature": 0.2,
-      "top_p": 0.9
-    }
-  }
-  ```
-
-  `image_url` must be a base64 blob (raw or `data:image/...;base64,<payload>`). Responses include the generated `answer`, `request_id`, `finish_reason`, and engine timings (`input_tokens`, `output_tokens`, `prefill_time_ms`, `decode_time_ms`, `ttft_ms`).
-
-- **Point detection example**
-
-  ```bash
-  curl -s http://127.0.0.1:8080/v1/point \
-      -H 'content-type: application/json' \
-      -d '{
-            "object": "burger",
-            "image_url": "data:image/jpeg;base64,'"$(base64 -w0 external/moondream/assets/demo-1.jpg)"'"
-          }'
-  ```
-
-  Returns normalised coordinates under the `points` key.
+Copyright (c) 2024-2025 M87 Labs, Inc.
