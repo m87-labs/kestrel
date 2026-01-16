@@ -822,7 +822,7 @@ class MoondreamRuntime:
         image: Optional[pyvips.Image | np.ndarray],
         image_crops: Optional[OverlapCropOutput],
         prompt_len: int,
-    ) -> tuple[Tensor, Tensor, None]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Prepare inputs for full prefill (cache miss path)."""
         # Embed prompt tokens
         if len(tokens_list) > 0:
@@ -850,8 +850,11 @@ class MoondreamRuntime:
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
+        fa3_seqused_k = torch.tensor(
+            [prompt_len], dtype=torch.int32, device=self.device
+        )
 
-        return inputs_embeds, position_ids, None
+        return inputs_embeds, position_ids, fa3_seqused_k
 
     def _finalize_cache_after_prefill(
         self,
@@ -1080,8 +1083,8 @@ class MoondreamRuntime:
         position_ids: Tensor,
         lora_slot: int = 0,
         *,
-        use_prefix_attn: bool = False,
-        fa3_seqused_k: Optional[Tensor] = None,
+        use_prefix_attn: bool,
+        fa3_seqused_k: Tensor,
     ) -> tuple[Tensor, Tensor]:
         hidden, logits = self._prefill_fn(
             inputs_embeds,
@@ -1100,8 +1103,8 @@ class MoondreamRuntime:
         position_ids: Tensor,
         lora_slot: int = 0,
         *,
-        use_prefix_attn: bool = False,
-        fa3_seqused_k: Optional[Tensor] = None,
+        use_prefix_attn: bool,
+        fa3_seqused_k: Tensor,
     ) -> tuple[Tensor, Tensor]:
         batch_idx = self._active_prefill_batch_idx
         if batch_idx is None:
@@ -1112,10 +1115,6 @@ class MoondreamRuntime:
 
         # Build FA3 paged attention metadata for prefill
         fa3_page_table = self.page_table.page_table[batch_idx : batch_idx + 1]
-        if fa3_seqused_k is None:
-            # Standard prefill: KV length = position_ids.max() + 1
-            seqlen = position_ids.max().item() + 1
-            fa3_seqused_k = torch.tensor([seqlen], dtype=torch.int32, device=self.device)
 
         # For no-adapter prefill, skip LoRA entirely to avoid redundant work
         if lora_slot == 0:
