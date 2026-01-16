@@ -61,6 +61,7 @@ Results should be saved to `python/kestrel_kernels/configs/` after analysis.
 - `TORCH_CUDA_ARCH_LIST=9.0a` ensures precompiled kernels use the `sm90a` architecture string, which is required for production deployments.
 - PyPI/TestPyPI require manylinux tags; use `auditwheel repair` to produce
   `manylinux_2_34_x86_64` wheels (see below).
+- `auditwheel repair` requires `patchelf` on the build host.
 
 ## Building Wheels (requires H100 GPU)
 
@@ -73,10 +74,14 @@ cd ~/code/kestrel/kestrel-kernels
 # Install all Python versions
 ~/.local/bin/uv python install 3.10 3.11 3.12 3.13
 
+# Install patchelf (required by auditwheel)
+sudo apt-get update && sudo apt-get install -y patchelf
+
 # Install auditwheel (for manylinux repair)
 ~/.local/bin/uv tool install auditwheel
 
 # Build + repair wheels for all Python versions
+# (Script handles required auditwheel excludes for CUDA/Torch/TVM libs.)
 ./scripts/build_manylinux_wheels.sh
 
 # Verify wheels were created
@@ -184,16 +189,10 @@ mkdir -p dist-all
 # Ensure tools are installed
 ~/.local/bin/uv tool install auditwheel
 ~/.local/bin/uv tool install twine
+sudo apt-get update && sudo apt-get install -y patchelf
 
-# Build for all Python versions
-for pyver in 3.10 3.11 3.12 3.13; do
-    echo "=== Building for Python $pyver ==="
-    rm -rf dist build *.egg-info
-    TORCH_CUDA_ARCH_LIST=9.0a CUDACXX=/usr/local/cuda/bin/nvcc \
-        ~/.local/bin/uv build --wheel --python $pyver
-    raw_wheel=$(ls dist/*.whl)
-    ~/.local/bin/uv tool run auditwheel repair --plat manylinux_2_34_x86_64 -w dist-all "$raw_wheel"
-done
+# Build + repair wheels for all Python versions
+./scripts/build_manylinux_wheels.sh
 
 echo "=== Built wheels ==="
 ls -la dist-all/
