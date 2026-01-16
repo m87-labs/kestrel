@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from kestrel.kv_cache import PageTable
+from kestrel.moondream import runtime as runtime_mod
 from kestrel.prefix_cache import CacheNamespace, RadixPrefixCache
 
 
@@ -21,6 +22,16 @@ class MockToken:
 
     def kv_length(self) -> int:
         return self._kv_len
+
+
+def _make_runtime_for_cache(
+    cache: RadixPrefixCache, page_table: PageTable
+) -> runtime_mod.MoondreamRuntime:
+    """Construct a minimal runtime instance for cache helper tests."""
+    runtime = runtime_mod.MoondreamRuntime.__new__(runtime_mod.MoondreamRuntime)
+    runtime.prefix_cache = cache
+    runtime.page_table = page_table
+    return runtime
 
 
 # =============================================================================
@@ -749,6 +760,149 @@ class TestPageOwnershipInvariants:
 
         # Invariant restored
         assert page_table.pages_available + cache.total_cached_pages == total_pages
+
+
+# =============================================================================
+# Duplicate Prefill Tests
+# =============================================================================
+
+
+class TestDuplicatePrefill:
+    """Tests for duplicate-prefill cache handling."""
+
+    def test_duplicate_prefill_miss_does_not_lock_cache(self) -> None:
+        """Duplicate prefill after a miss should not lock cache-owned pages."""
+        cache = RadixPrefixCache()
+        page_table = PageTable(
+            n_pages=50, page_size=1, max_batch_size=5, device="cpu",
+            prefix_cache=cache,
+        )
+        runtime = _make_runtime_for_cache(cache, page_table)
+
+        tokens = [MockToken(i) for i in range(5)]
+        prompt_len = len(tokens)
+
+        # Sequence A inserts into cache and holds the lock.
+        batch_a = page_table.allocate()
+        pages_a = page_table.allocate_pages(prompt_len)
+        page_table.map_pages(batch_a, 0, pages_a)
+        insert_a = cache.insert(tokens, pages_a)
+        cache.lock(insert_a.node)
+        lock_ref_before = insert_a.node.lock_ref
+
+        # Sequence B did a cache miss earlier and computed its own pages.
+        batch_b = page_table.allocate()
+        pages_b = page_table.allocate_pages(prompt_len)
+        page_table.map_pages(batch_b, 0, pages_b)
+
+        cache_result = runtime_mod._CacheLookupResult(
+            match=None,
+            skip_positions=0,
+            temp_lock_node=None,
+            can_reuse=False,
+            namespace=None,
+        )
+
+        cache_lock_node, cache_owned_page_count = runtime._finalize_cache_after_prefill(
+            cache_tokens=tokens,
+            cache_result=cache_result,
+            prompt_len=prompt_len,
+            batch_idx=batch_b,
+            adapter_id=None,
+            image_hash=None,
+        )
+
+        assert cache_lock_node is None
+        assert cache_owned_page_count == 0
+        assert insert_a.node.lock_ref == lock_ref_before
+
+        # B's private pages should be freed on release.
+        page_table.erase(batch_b, cached_page_count=cache_owned_page_count)
+        for p in pages_b:
+            assert p in page_table.free_pages
+
+        # Cleanup A.
+        cache.unlock(insert_a.node)
+        page_table.erase(batch_a, cached_page_count=prompt_len)
+
+    def test_duplicate_prefill_partial_hit_keeps_prefix_lock(self) -> None:
+        """Duplicate prefill after partial hit keeps prefix lock, not full prompt."""
+        cache = RadixPrefixCache()
+        page_table = PageTable(
+            n_pages=60, page_size=1, max_batch_size=6, device="cpu",
+            prefix_cache=cache,
+        )
+        runtime = _make_runtime_for_cache(cache, page_table)
+
+        full_tokens = [MockToken(i) for i in range(6)]
+        prefix_len = 3
+        prefix_tokens = full_tokens[:prefix_len]
+
+        # Seed cache with prefix.
+        batch_prefix = page_table.allocate()
+        prefix_pages = page_table.allocate_pages(prefix_len)
+        page_table.map_pages(batch_prefix, 0, prefix_pages)
+        prefix_insert = cache.insert(prefix_tokens, prefix_pages)
+        cache.lock(prefix_insert.node)
+        cache.unlock(prefix_insert.node)
+        page_table.erase(batch_prefix, cached_page_count=prefix_len)
+
+        # Sequence B sees a partial hit and locks prefix.
+        match = cache.match_prefix(full_tokens)
+        assert match.matched_kv_length == prefix_len
+        temp_lock_node = match.last_node
+        cache.lock(temp_lock_node)
+
+        batch_b = page_table.allocate()
+        page_table.map_pages(batch_b, 0, match.matched_pages)
+        suffix_len = len(full_tokens) - prefix_len
+        suffix_pages_b = page_table.allocate_pages(suffix_len)
+        page_table.map_pages(batch_b, prefix_len, suffix_pages_b)
+
+        # Sequence A inserts full prompt before B finishes.
+        batch_a = page_table.allocate()
+        pages_a = page_table.allocate_pages(len(full_tokens))
+        page_table.map_pages(batch_a, 0, pages_a)
+        insert_full = cache.insert(
+            full_tokens,
+            pages_a,
+            from_node=temp_lock_node,
+            from_token_idx=prefix_len,
+            from_page_idx=prefix_len,
+        )
+
+        cache_result = runtime_mod._CacheLookupResult(
+            match=match,
+            skip_positions=prefix_len,
+            temp_lock_node=temp_lock_node,
+            can_reuse=True,
+            namespace=None,
+        )
+
+        cache_lock_node, cache_owned_page_count = runtime._finalize_cache_after_prefill(
+            cache_tokens=full_tokens,
+            cache_result=cache_result,
+            prompt_len=len(full_tokens),
+            batch_idx=batch_b,
+            adapter_id=None,
+            image_hash=None,
+        )
+
+        assert cache_lock_node is temp_lock_node
+        assert cache_owned_page_count == prefix_len
+        assert temp_lock_node.lock_ref == 1
+        assert insert_full.node.lock_ref == 0
+
+        # B releases: prefix pages stay cached; private suffix pages free.
+        page_table.erase(batch_b, cached_page_count=cache_owned_page_count)
+        for p in suffix_pages_b:
+            assert p in page_table.free_pages
+        for p in match.matched_pages:
+            assert p not in page_table.free_pages
+
+        cache.unlock(temp_lock_node)
+        # Note: batch_a/pages_a are left allocated since their cache ownership
+        # does not align with cached_page_count's "leading pages" convention.
 
 
 # =============================================================================
