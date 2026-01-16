@@ -25,7 +25,8 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["kestrel*"]
+include = ["kestrel", "kestrel.*"]
+exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
 dev = [

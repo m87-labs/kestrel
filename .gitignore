@@ -7,3 +7,4 @@ AGENTS.md
 *.ncu-rep
 ext/
 CLAUDE.md
+*.egg-info
