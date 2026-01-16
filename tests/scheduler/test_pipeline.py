@@ -7,9 +7,11 @@ import pytest
 from dataclasses import dataclass
 
 from kestrel.scheduler.pipeline import (
-    PipelineState,
+    DecodeLaunch,
+    DecodePendingCommit,
     LaunchHandle,
     PendingCommit,
+    PipelineState,
 )
 
 
@@ -32,8 +34,9 @@ class MockTransfer:
 def make_launch_handle(slot_id: int, num_seqs: int = 1) -> LaunchHandle[MockSequence]:
     """Create a LaunchHandle with mock sequences."""
     return LaunchHandle(
-        slot_id=slot_id,
+        kind="decode",
         sequences=[MockSequence(seq_id=i) for i in range(num_seqs)],
+        payload=DecodeLaunch(slot_id=slot_id),
     )
 
 
@@ -42,9 +45,10 @@ def make_step(
 ) -> PendingCommit[MockSequence, MockTransfer]:
     """Create a PendingCommit with mock sequences and transfer."""
     return PendingCommit(
-        slot_id=slot_id,
+        kind="decode",
         sequences=[MockSequence(seq_id=i) for i in range(num_seqs)],
         transfer=MockTransfer(step_id=step_id),
+        payload=DecodePendingCommit(slot_id=slot_id),
     )
 
 

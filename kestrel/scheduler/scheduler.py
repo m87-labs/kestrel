@@ -2,7 +2,8 @@
 
 
 from collections import deque
-from typing import Deque, List, Optional
+from dataclasses import dataclass
+from typing import Deque, List, Optional, cast
 
 import time
 import logging
@@ -12,10 +13,10 @@ from torch import Tensor
 
 from kestrel.moondream.runtime import (
     MoondreamRuntime,
+    Token,
     TextToken,
 )
 from kestrel.moondream.lora import AdapterProvider
-from kestrel.utils.buffers import CpuGpuBuffer
 from kestrel.skills import (
     QuerySkill,
     SegmentRequest,
@@ -32,7 +33,15 @@ from .types import (
     SchedulerResult,
     StepPlan,
 )
-from .pipeline import LaunchHandle, PendingCommit, PipelineState
+from .pipeline import (
+    DecodeLaunch,
+    DecodePendingCommit,
+    LaunchHandle,
+    PendingCommit,
+    PipelineState,
+    PrefillLaunch,
+    PrefillPendingCommit,
+)
 from .sampling import sample_tokens
 from .transfer import RenderBuffer
 from .tokens import prompt_with_spatial_tokens, render_tokens_from_packed
@@ -40,6 +49,16 @@ from .spatial import compute_spatial_values
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class PrefillStaging:
+    """Per-prefill staging buffers and RenderBuffer for D2H."""
+
+    sampled_ids: Tensor
+    coord_staging: Tensor
+    size_staging: Tensor
+    render: RenderBuffer
 
 
 class GenerationScheduler:
@@ -84,40 +103,28 @@ class GenerationScheduler:
             dtype=size_dtype,
             device=runtime.device,
         )
-        self._render_buffer = RenderBuffer(
-            runtime.max_batch_slots,
-            runtime.device,
-            coord_dtype=coord_dtype,
-            size_dtype=size_dtype,
-            copy_stream=runtime.copy_stream,
-        )
-        # Preallocated staging buffers for gathering the packed decode inputs
-        # from the pending per-sequence slots (avoids per-step allocations).
-        self._decode_token_ids = torch.empty(
-            (runtime.max_batch_slots,),
-            dtype=torch.long,
-            device=runtime.device,
-        )
-        self._decode_coord_values = torch.empty(
-            (runtime.max_batch_slots, 1),
-            dtype=coord_dtype,
-            device=runtime.device,
-        )
-        self._decode_size_values = torch.empty(
-            (runtime.max_batch_slots, 2),
-            dtype=size_dtype,
-            device=runtime.device,
-        )
-        self._sampled_token_ids = torch.empty(
-            (runtime.max_batch_slots,),
-            dtype=torch.long,
-            device=runtime.device,
-        )
-        self._decode_batch_idx = CpuGpuBuffer(
-            runtime.max_batch_slots,
-            dtype=torch.long,
-            device=runtime.device,
-            pin_memory=True,
+        # Prefill staging pool (single entry today; can be expanded later).
+        self._prefill_staging_pool: Deque[PrefillStaging] = deque(
+            [
+                PrefillStaging(
+                    sampled_ids=torch.empty(
+                        (1,), dtype=torch.long, device=runtime.device
+                    ),
+                    coord_staging=torch.empty(
+                        (1, 1), dtype=coord_dtype, device=runtime.device
+                    ),
+                    size_staging=torch.empty(
+                        (1, 2), dtype=size_dtype, device=runtime.device
+                    ),
+                    render=RenderBuffer(
+                        1,
+                        runtime.device,
+                        coord_dtype=coord_dtype,
+                        size_dtype=size_dtype,
+                        copy_stream=runtime.copy_stream,
+                    ),
+                )
+            ]
         )
         self._sampling_rng = torch.Generator(device=runtime.device)
         self._sampling_rng.manual_seed(torch.seed())
@@ -338,6 +345,85 @@ class GenerationScheduler:
             return False
         return True
 
+    def _acquire_prefill_staging(self) -> PrefillStaging:
+        """Acquire a prefill staging bundle."""
+        if not self._prefill_staging_pool:
+            raise RuntimeError("Prefill staging pool exhausted")
+        return self._prefill_staging_pool.popleft()
+
+    def _release_prefill_staging(self, staging: PrefillStaging) -> None:
+        """Return a prefill staging bundle to the pool."""
+        self._prefill_staging_pool.append(staging)
+
+    def _finalize_prefill(
+        self, handle: LaunchHandle, logits: Tensor
+    ) -> PendingCommit:
+        """Sample first token + start D2H for a prefill."""
+        if handle.kind != "prefill":
+            raise AssertionError("prefill finalize requires a prefill handle")
+        prefill_payload = cast(PrefillLaunch, handle.payload)
+        staging = cast(PrefillStaging, prefill_payload.staging)
+        seq = handle.sequences[0]
+
+        with torch.cuda.stream(self.runtime.primary_stream):
+            first_logits = logits.squeeze(0)
+            sampled_ids, temps, top_ps = self._sample_batch(
+                first_logits.unsqueeze(0), [seq], staging.sampled_ids
+            )
+            hidden_last = seq.state.last_hidden
+            if hidden_last is None:  # pragma: no cover - defensive
+                raise RuntimeError("Missing last_hidden after prefill")
+            coord_out = staging.coord_staging[:1]
+            size_out = staging.size_staging[:1]
+            coord_decode, size_decode = compute_spatial_values(
+                sampled_ids.view(-1),
+                hidden_last,
+                [seq.request],
+                self.runtime.spatial_tables,
+                temperatures=temps,
+                top_ps=top_ps,
+                out_coord=coord_out,
+                out_size=size_out,
+                rng=self._sampling_rng,
+            )
+            batch_idx = seq.state.batch_idx
+            self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
+            self._pending_coord_values[batch_idx].copy_(coord_decode[0])
+            self._pending_size_values[batch_idx].copy_(size_decode[0])
+
+            # Record event for D2H transfer synchronization
+            prefill_done_event = torch.cuda.Event()
+            prefill_done_event.record()
+
+        transfer = staging.render.transfer(
+            sampled_ids, coord_decode, size_decode, ready_event=prefill_done_event
+        )
+        return PendingCommit(
+            kind="prefill",
+            sequences=handle.sequences,
+            transfer=transfer,
+            payload=PrefillPendingCommit(staging=staging),
+        )
+
+    def _commit_prefill(self, step: PendingCommit) -> Token:
+        """Commit a prefill PendingCommit and return the first token."""
+        if step.kind != "prefill":
+            raise AssertionError("prefill commit requires a prefill pending commit")
+        payload = cast(PrefillPendingCommit, step.payload)
+        staging = cast(PrefillStaging, payload.staging)
+        try:
+            token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+            token = render_tokens_from_packed(
+                token_ids_cpu,
+                coord_cpu,
+                size_cpu,
+                coord_id=self._coord_id,
+                size_id=self._size_id,
+            )[0]
+        finally:
+            self._release_prefill_staging(staging)
+        return token
+
     def _try_prefill(self) -> bool:
         progress = False
         # Use active_sequences count to account for zombies (finalized but
@@ -435,44 +521,18 @@ class GenerationScheduler:
                 progress = True
                 continue
 
-            # Sampling and spatial decoding on primary stream
-            with torch.cuda.stream(self.runtime.primary_stream):
-                first_logits = logits.squeeze(0)
-                sampled_ids, temps, top_ps = self._sample_batch(
-                    first_logits.unsqueeze(0), [seq], self._sampled_token_ids
-                )
-                hidden_last = seq.state.last_hidden
-                if hidden_last is None:  # pragma: no cover - defensive
-                    raise RuntimeError("Missing last_hidden after prefill")
-                coord_out = self._decode_coord_values[:1]
-                size_out = self._decode_size_values[:1]
-                coord_decode, size_decode = compute_spatial_values(
-                    sampled_ids.view(-1),
-                    hidden_last,
-                    [seq.request],
-                    self.runtime.spatial_tables,
-                    temperatures=temps,
-                    top_ps=top_ps,
-                    out_coord=coord_out,
-                    out_size=size_out,
-                    rng=self._sampling_rng,
-                )
-                batch_idx = seq.state.batch_idx
-                self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
-                self._pending_coord_values[batch_idx].copy_(coord_decode[0])
-                self._pending_size_values[batch_idx].copy_(size_decode[0])
-
-                # Record event for D2H transfer synchronization
-                prefill_done_event = torch.cuda.Event()
-                prefill_done_event.record()
-            transfer = self._render_buffer.transfer(
-                sampled_ids, coord_decode, size_decode, ready_event=prefill_done_event
+            staging = self._acquire_prefill_staging()
+            handle = LaunchHandle(
+                kind="prefill",
+                sequences=[seq],
+                payload=PrefillLaunch(staging=staging),
             )
-            token_ids_cpu, coord_cpu, size_cpu = transfer.wait()
-            token = render_tokens_from_packed(
-                token_ids_cpu, coord_cpu, size_cpu,
-                coord_id=self._coord_id, size_id=self._size_id,
-            )[0]
+            try:
+                step = self._finalize_prefill(handle, logits)
+            except Exception:
+                self._release_prefill_staging(staging)
+                raise
+            token = self._commit_prefill(step)
             seq.stage_token(self.runtime, token)
 
             if self._mark_finished_if_needed(seq):
@@ -609,8 +669,9 @@ class GenerationScheduler:
             seq.state.advance()
 
         return LaunchHandle(
-            slot_id=slot_id,
+            kind="decode",
             sequences=sequences,
+            payload=DecodeLaunch(slot_id=slot_id),
         )
 
     def finalize_sampling(
@@ -699,9 +760,10 @@ class GenerationScheduler:
         )
 
         return PendingCommit(
-            slot_id=handle.slot_id,
+            kind="decode",
             sequences=sequences,
             transfer=transfer,
+            payload=DecodePendingCommit(slot_id=handle.slot_id),
         )
 
     def commit_step(self, step: PendingCommit) -> None:

@@ -101,7 +101,7 @@ This ensures clean state and prevents batch membership changes mid-pipeline.
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Literal, Protocol, TypeVar, cast
 
 
 class SequenceLike(Protocol):
@@ -132,6 +132,36 @@ class TransferLike(Protocol):
 Seq = TypeVar("Seq", bound=SequenceLike)
 Transfer = TypeVar("Transfer", bound=TransferLike)
 
+LaunchKind = Literal["decode", "prefill"]
+
+
+@dataclass(slots=True)
+class DecodeLaunch:
+    """Payload for decode launches."""
+
+    slot_id: int
+
+
+@dataclass(slots=True)
+class PrefillLaunch:
+    """Payload for prefill launches."""
+
+    staging: object
+
+
+@dataclass(slots=True)
+class DecodePendingCommit:
+    """Payload for decode pending commits."""
+
+    slot_id: int
+
+
+@dataclass(slots=True)
+class PrefillPendingCommit:
+    """Payload for prefill pending commits."""
+
+    staging: object
+
 
 @dataclass(slots=True)
 class LaunchHandle(Generic[Seq]):
@@ -143,12 +173,20 @@ class LaunchHandle(Generic[Seq]):
     3. Consumed by scheduler.finalize_sampling(handle, mask) -> PendingCommit
     4. Cleared via pipeline.on_pending_commit(step)
 
-    The slot_id indicates which ping-pong slot's resources (staging buffers,
-    CUDA graphs, etc.) are being used for this forward pass.
+    For decode launches, the payload includes slot_id indicating which
+    ping-pong slot's resources (staging buffers, CUDA graphs, etc.) are used.
     """
 
-    slot_id: int
+    kind: LaunchKind
     sequences: list[Seq]
+    payload: DecodeLaunch | PrefillLaunch
+
+    @property
+    def slot_id(self) -> int:
+        """Return slot_id for decode launches."""
+        if self.kind != "decode":
+            raise AssertionError("slot_id is only valid for decode launches")
+        return cast(DecodeLaunch, self.payload).slot_id
 
 
 @dataclass(slots=True)
@@ -167,9 +205,17 @@ class PendingCommit(Generic[Seq, Transfer]):
     preserved by launch_forward_async and finalize_sampling.
     """
 
-    slot_id: int
+    kind: LaunchKind
     sequences: list[Seq]
     transfer: Transfer
+    payload: DecodePendingCommit | PrefillPendingCommit
+
+    @property
+    def slot_id(self) -> int:
+        """Return slot_id for decode pending commits."""
+        if self.kind != "decode":
+            raise AssertionError("slot_id is only valid for decode pending commits")
+        return cast(DecodePendingCommit, self.payload).slot_id
 
 
 class PipelineState(Generic[Seq, Transfer]):
