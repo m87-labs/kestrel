@@ -142,15 +142,16 @@ Bounding box coordinates are normalized to [0, 1].
 
 ### Segment
 
-Generate segmentation masks:
+Generate a segmentation mask:
 
 ```python
 result = await engine.segment(image, "dog")
-print(result.output["segments"])
-# [{"svg_path": "M 0.1 0.2 L ...", "bbox": {...}, "points": [...], ...}]
+seg = result.output["segments"][0]
+print(seg["svg_path"])  # SVG path data for the mask
+print(seg["bbox"])      # {"x_min": ..., "y_min": ..., "x_max": ..., "y_max": ...}
 ```
 
-Each segment contains an `svg_path` (path data), `bbox` (bounding box), and `points` (reference coordinates).
+Note: Segmentation requires separate model weights. Contact [moondream.ai](https://moondream.ai) for access.
 
 ## Streaming
 
