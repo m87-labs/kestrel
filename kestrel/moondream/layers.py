@@ -275,6 +275,7 @@ def moe_mlp(
     mode: Literal["prefill", "decode"] = "decode",
     lora_workspace: MoELoRALayerWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
+    single_lora_id: int | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
     x_flat = x.view(-1, C)
@@ -298,6 +299,7 @@ def moe_mlp(
         topk_idxs,
         lora_workspace,
         expanded_slot_ids,
+        single_lora_id,
     ).view(B, T, C)
     return mlp_out
 

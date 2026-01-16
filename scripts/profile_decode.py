@@ -113,7 +113,7 @@ def patch_text_decoder_with_nvtx():
         x, module, attn_mask, position_ids, config, *,
         slot_mapping, use_prefix_attn=False, mode="decode",
         page_table=None, fa3_seqused_k=None,
-        lora_workspace=None, lora_slot_ids=None,
+        lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
     ):
         for i, block in enumerate(module.blocks):
             # LayerNorm
@@ -152,6 +152,7 @@ def patch_text_decoder_with_nvtx():
                     mode=mode,
                     lora_workspace=moe_workspace,
                     lora_slot_ids=lora_slot_ids,
+                    single_lora_id=single_lora_id,
                 )
                 nvtx.range_pop()
             else:

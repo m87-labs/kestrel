@@ -65,11 +65,6 @@ class MoELoRALayerWorkspace:
         down_a: [(max_slots-1) * num_experts, max_rank_per_expert, d_expert]
         down_b: [(max_slots-1) * num_experts, d_model,             max_rank_per_expert]
 
-    Attributes:
-        single_lora_id: When set (not None), enables single-LoRA mode for prefill.
-            This bypasses per-LoRA routing and uses the optimized single-LoRA kernel
-            with Z=1 grid dimension. Set to the lora_id (0-indexed, where slot N
-            maps to lora_id N-1). Set to None for decode (batched) mode.
     """
 
     up_a: torch.Tensor
@@ -77,7 +72,6 @@ class MoELoRALayerWorkspace:
     down_a: torch.Tensor
     down_b: torch.Tensor
     num_experts: int
-    single_lora_id: int | None = None
     stream: torch.cuda.Stream | None = None
 
 
@@ -191,37 +185,6 @@ class TextLoRAWorkspace:
         if 0 <= moe_idx < len(self.moe):
             return self.moe[moe_idx]
         return None
-
-    def set_prefill_mode(self, lora_slot: int) -> None:
-        """Set single-LoRA mode for prefill.
-
-        This enables the optimized single-LoRA kernel path which uses Z=1 grid
-        dimension, eliminating overhead from inactive LoRAs.
-
-        Args:
-            lora_slot: The slot index (1-indexed) of the active LoRA.
-                       Converted to lora_id = lora_slot - 1 internally.
-
-        Raises:
-            ValueError: If lora_slot is 0 or out of range.
-        """
-        if lora_slot == 0:
-            raise ValueError("Slot 0 is reserved (no LoRA) - use set_decode_mode() instead")
-        if lora_slot < 0 or lora_slot >= self.max_slots:
-            raise ValueError(f"Slot {lora_slot} out of range [1, {self.max_slots})")
-
-        lora_id = lora_slot - 1  # Convert slot to lora_id
-        for layer in self.moe:
-            layer.single_lora_id = lora_id
-
-    def set_decode_mode(self) -> None:
-        """Set batched mode for decode.
-
-        This uses per-LoRA routing which handles mixed LoRA batches where
-        different sequences may use different adapters.
-        """
-        for layer in self.moe:
-            layer.single_lora_id = None
 
     def clear_slot_(self, slot: int) -> None:
         """Zero out all weights in a slot.
