@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from kestrel.config import ModelPaths, RuntimeConfig
+from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
 PROMPT_PREFIX = (
@@ -53,10 +53,7 @@ def pil_to_pyvips(image: Any) -> pyvips.Image:
 async def run(weights: Path, split: str, temperature: float) -> None:
     dataset = load_dataset("vikhyatk/chartqa", split=split)
     runtime_cfg = RuntimeConfig(
-        model_paths=ModelPaths(weights=weights.expanduser()),
-        device="cuda",
-        dtype=torch.bfloat16,
-        max_batch_size=4,
+        model_path=weights.expanduser(),
     )
     engine = await InferenceEngine.create(runtime_cfg)
 

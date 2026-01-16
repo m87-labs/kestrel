@@ -9,19 +9,10 @@ import torch
 
 
 @dataclass
-class ModelPaths:
-    """Paths pointing to model assets required at runtime."""
-
-    weights: Path
-    config_json: Optional[Path] = None
-    tokenizer: Optional[str | Path] = None
-
-
-@dataclass
 class RuntimeConfig:
     """Knobs controlling the text-only inference prototype."""
 
-    model_paths: ModelPaths
+    model_path: str | Path
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     # Effective batch size (excluding reserved batch_idx 0).
@@ -46,4 +37,4 @@ class RuntimeConfig:
         return device
 
 
-__all__ = ["ModelPaths", "RuntimeConfig"]
+__all__ = ["RuntimeConfig"]

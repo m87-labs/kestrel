@@ -267,11 +267,7 @@ class InferenceEngine:
             from kestrel.cloud import MoondreamAdapterProvider
             from kestrel.moondream.config import load_config
 
-            config = load_config(
-                str(runtime_cfg.model_paths.config_json)
-                if runtime_cfg.model_paths.config_json
-                else None
-            )
+            config = load_config()
             adapter_provider = MoondreamAdapterProvider(
                 text_config=config.text,
                 api_key=api_key,

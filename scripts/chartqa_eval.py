@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from kestrel.config import ModelPaths, RuntimeConfig
+from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
 
 try:
@@ -227,9 +227,7 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
     runtime_cfg = RuntimeConfig(
-        model_paths=ModelPaths(weights=cfg.weights.expanduser()),
-        device="cuda",
-        dtype=torch.bfloat16,
+        model_path=cfg.weights.expanduser(),
         max_batch_size=cfg.max_batch_size,
         enable_prefix_cache=cfg.enable_prefix_cache,
     )
