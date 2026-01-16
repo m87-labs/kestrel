@@ -32,7 +32,7 @@ from .types import (
     SchedulerResult,
     StepPlan,
 )
-from .pipeline import ForwardHandle, InFlightStep, PipelineState
+from .pipeline import LaunchHandle, PendingCommit, PipelineState
 from .sampling import sample_tokens
 from .transfer import RenderBuffer
 from .tokens import prompt_with_spatial_tokens, render_tokens_from_packed
@@ -168,35 +168,35 @@ class GenerationScheduler:
         progressed = False
         pipeline = self._pipeline
 
-        has_forward = pipeline.has_forward_in_flight()
+        has_launch = pipeline.has_launch_in_flight()
         has_queued = pipeline.queue_depth() > 0
 
         # Only enter stream context if there's GPU work to do
-        if has_forward or has_queued or len(self.running) > 0:
+        if has_launch or has_queued or len(self.running) > 0:
             with torch.cuda.stream(self.runtime.primary_stream):
                 # 1. Launch forward if none in-flight (forward doesn't need mask)
-                if not has_forward and pipeline.can_launch_forward():
+                if not has_launch and pipeline.can_launch():
                     plan = self.schedule_decode_step()
                     if plan is not None:
                         slot_id = pipeline.free_slot_id()
                         handle = self._launch_forward_on_stream(plan, slot_id)
-                        pipeline.on_forward_launched(handle)
-                        has_forward = True  # Update for step 3
+                        pipeline.on_launch(handle)
+                        has_launch = True  # Update for step 3
                         progressed = True
 
                 # 2. Commit previous step (updates skill state for mask computation)
                 # GPU runs forward in parallel while CPU blocks on D2H.
                 oldest = pipeline.pop_oldest()
                 if oldest is not None:
-                    self.complete_step(oldest)
+                    self.commit_step(oldest)
                     pipeline.on_step_completed()
                     progressed = True
 
                 # 3. Finalize sampling (now skill state is updated for mask)
-                if has_forward:
-                    handle = pipeline.forward_handle
+                if has_launch:
+                    handle = pipeline.launch_handle
                     step = self._finalize_sampling_on_stream(handle)
-                    pipeline.on_sampling_complete(step)
+                    pipeline.on_pending_commit(step)
                     progressed = True
 
         # 4. Prefill - requires empty pipeline to avoid KV ordering issues
@@ -236,19 +236,19 @@ class GenerationScheduler:
             step = pipeline.pop_oldest()
             if step is None:
                 break
-            self.complete_step(step)
+            self.commit_step(step)
             pipeline.on_step_completed()
 
         # 2. Finalize any in-flight forward (now safe after all commits)
-        if pipeline.has_forward_in_flight():
-            handle = pipeline.forward_handle
+        if pipeline.has_launch_in_flight():
+            handle = pipeline.launch_handle
             step = self.finalize_sampling(handle)
-            pipeline.on_sampling_complete(step)
+            pipeline.on_pending_commit(step)
 
             # 3. Complete the final step
             step = pipeline.pop_oldest()
             if step is not None:
-                self.complete_step(step)
+                self.commit_step(step)
                 pipeline.on_step_completed()
 
     def pop_completed(self) -> List[SchedulerResult]:
@@ -518,7 +518,7 @@ class GenerationScheduler:
         StepPlan containing sequences ready for decoding, or None if no work.
 
         Per design doc §4.7: This method does NOT finalize sequences based on
-        GPU-progress (seq.state.length). Finalization happens in complete_step()
+        GPU-progress (seq.state.length). Finalization happens in commit_step()
         after the token is committed, using committed counts. The _can_dispatch()
         predicate uses budgeted counts to exclude sequences that would exceed
         their limits if dispatched.
@@ -541,7 +541,7 @@ class GenerationScheduler:
 
     def launch_forward_async(
         self, plan: StepPlan, slot_id: int
-    ) -> ForwardHandle:
+    ) -> LaunchHandle:
         """Launch the forward pass for a decode step (with stream context).
 
         Wrapper that enters the compute stream context before calling
@@ -552,7 +552,7 @@ class GenerationScheduler:
 
     def _launch_forward_on_stream(
         self, plan: StepPlan, slot_id: int
-    ) -> ForwardHandle:
+    ) -> LaunchHandle:
         """Launch the forward pass for a decode step.
 
         IMPORTANT: Caller must already be on the compute stream.
@@ -562,7 +562,7 @@ class GenerationScheduler:
         outputs (logits, hidden_last) are stored in the DecodeSlot's buffers
         for later retrieval by finalize_sampling.
 
-        Returns a ForwardHandle that can be passed to finalize_sampling.
+        Returns a LaunchHandle that can be passed to finalize_sampling.
         """
         sequences = plan.sequences
         batch_size = len(sequences)
@@ -608,14 +608,14 @@ class GenerationScheduler:
         for seq in sequences:
             seq.state.advance()
 
-        return ForwardHandle(
+        return LaunchHandle(
             slot_id=slot_id,
             sequences=sequences,
         )
 
     def finalize_sampling(
-        self, handle: ForwardHandle, mask: Optional[Tensor] = None
-    ) -> InFlightStep:
+        self, handle: LaunchHandle, mask: Optional[Tensor] = None
+    ) -> PendingCommit:
         """Finalize sampling for a forward pass (with stream context).
 
         Wrapper that enters the compute stream context before calling
@@ -626,8 +626,8 @@ class GenerationScheduler:
             return self._finalize_sampling_on_stream(handle, mask)
 
     def _finalize_sampling_on_stream(
-        self, handle: ForwardHandle, mask: Optional[Tensor] = None
-    ) -> InFlightStep:
+        self, handle: LaunchHandle, mask: Optional[Tensor] = None
+    ) -> PendingCommit:
         """Finalize sampling for a forward pass and start D2H transfer.
 
         IMPORTANT: Caller must already be on the compute stream.
@@ -639,7 +639,7 @@ class GenerationScheduler:
         The mask parameter is for future constrained decoding support. Currently
         masking is computed inline from skill_state.allowed_token_ids.
 
-        Returns an InFlightStep that can be passed to complete_step.
+        Returns a PendingCommit that can be passed to commit_step.
         """
         sequences = handle.sequences
         batch_size = len(sequences)
@@ -698,13 +698,13 @@ class GenerationScheduler:
             ready_event=slot.step_done_event,
         )
 
-        return InFlightStep(
+        return PendingCommit(
             slot_id=handle.slot_id,
             sequences=sequences,
             transfer=transfer,
         )
 
-    def complete_step(self, step: InFlightStep) -> None:
+    def commit_step(self, step: PendingCommit) -> None:
         """Complete a decode step: wait for D2H, commit tokens, handle termination.
 
         Blocks until the D2H transfer completes, then materializes tokens and
@@ -845,7 +845,7 @@ class GenerationScheduler:
 
         This marks both `finished` (for result building) and `finalized` (for
         pipelining). Resources are NOT released here if inflight_refs > 0;
-        release happens in complete_step() when the last in-flight reference
+        release happens in commit_step() when the last in-flight reference
         completes. This prevents releasing KV cache pages while a zombie step
         is still reading them.
         """
@@ -859,7 +859,7 @@ class GenerationScheduler:
             seq.first_token_time = seq.completed_at
 
         # Only release immediately if no in-flight steps reference this sequence.
-        # Otherwise, release is deferred to complete_step() when inflight_refs hits 0.
+        # Otherwise, release is deferred to commit_step() when inflight_refs hits 0.
         if seq.inflight_refs == 0:
             seq.transition(RequestPhase.COMPLETED)
             if seq.state.batch_idx in self.runtime.active_sequences:

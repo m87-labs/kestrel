@@ -188,7 +188,7 @@ The following invariants are **non-negotiable** throughout the implementation. T
 | **I3** | Per-step `step_done_event` anchors D2H (never `wait_stream`) | `wait_stream` captures dependency on all enqueued work; event anchors to exactly one step |
 | **I4** | `0 <= inflight_refs <= 2`; only scheduler mutates it | Prevents double-increment/decrement; `PipelineState` does queue/slot bookkeeping only |
 | **I5** | Prefill only when pipeline is drained | Freezes decode batch membership; ensures clean state for synchronous prefill |
-| **I6** | Slot reusable only after `complete_step()` (not just D2H) | Pinned host buffers and per-slot state must not be overwritten before commit consumes them |
+| **I6** | Slot reusable only after `commit_step()` (not just D2H) | Pinned host buffers and per-slot state must not be overwritten before commit consumes them |
 
 When implementing or reviewing changes, verify these invariants are preserved. Debug assertions for I4 are recommended (see §4.5).
 
@@ -203,7 +203,7 @@ Kestrel already has `RenderBuffer` (`kestrel/scheduler/transfer.py`) which provi
 To support async completion, `TransferHandle` needs:
 
 - `wait()` — blocks until D2H transfer completes (already exists). **Currently returns the CPU tensors directly**, which is fine. No need to change this.
-- `view() -> tuple[torch.Tensor, ...]` — optional accessor if we want to separate "wait for completion" from "get data". Since the current `wait()` already returns tensors, this is only needed if we want `complete_step()` to call `wait()` for synchronization and `view()` later for data access. **For simplicity, keep current behavior: `wait()` returns tensors.**
+- `view() -> tuple[torch.Tensor, ...]` — optional accessor if we want to separate "wait for completion" from "get data". Since the current `wait()` already returns tensors, this is only needed if we want `commit_step()` to call `wait()` for synchronization and `view()` later for data access. **For simplicity, keep current behavior: `wait()` returns tensors.**
 
 Optional (add only if profiling shows benefit):
 - `ready() -> bool` — non-blocking check via `event.query()`. The current design uses blocking `wait()` exclusively; D2H is fast enough that polling provides no measurable benefit.
@@ -273,8 +273,8 @@ class DecodeSlot:
 
 In constrained mode, forward runs ahead and sampling is delayed until mask computation completes. Forward outputs (`logits`, `hidden_last`) must remain valid until `finalize_sampling()` consumes them.
 
-- **Invariant:** Forward outputs live in per-slot buffers (`slot.logits`, `slot.hidden_last`). `ForwardHandle` contains only `(slot_id, sequences)` — sampling looks up outputs via `decode_slots[handle.slot_id]`.
-- **Invariant:** No new forward may run on a slot until any pending sampling for that slot has completed. This is enforced by the slot allocation logic: a slot is "in use" while `forward_handle` or any `InFlightStep` in `batch_queue` references it.
+- **Invariant:** Forward outputs live in per-slot buffers (`slot.logits`, `slot.hidden_last`). `LaunchHandle` contains only `(slot_id, sequences)` — sampling looks up outputs via `decode_slots[handle.slot_id]`.
+- **Invariant:** No new forward may run on a slot until any pending sampling for that slot has completed. This is enforced by the slot allocation logic: a slot is "in use" while `launch_handle` or any `PendingCommit` in `batch_queue` references it.
 
 **Decode compute stream topology (hard invariant):**
 
@@ -305,7 +305,7 @@ Each in-flight step "owns" the slot it used; alternating slots prevents buffer c
 **Ownership model:**
 
 - **Runtime owns both DecodeSlots.** `MoondreamRuntime` creates and holds the two slots, including their FlashInfer contexts, staging buffers, and CUDA graph state. This is consistent with the runtime owning all GPU resources.
-- **Engine loop tracks which slot is free.** The scheduler loop maintains `batch_queue: deque[InFlightStep]` and uses `free_slot_id(batch_queue, forward_handle)` to determine which slot is available via bitmask.
+- **Engine loop tracks which slot is free.** The scheduler loop maintains `batch_queue: deque[PendingCommit]` and uses `free_slot_id(batch_queue, launch_handle)` to determine which slot is available via bitmask.
 - **Scheduler is backend-agnostic.** `launch_forward_async(plan, slot_id)` receives the slot ID as a parameter; the scheduler looks up `decode_slots[slot_id]` internally.
 
 ```py
@@ -318,11 +318,11 @@ def decode_slots(self) -> list[DecodeSlot]:
 
 # In engine._scheduler_loop:
 decode_slots = runtime.decode_slots
-batch_queue: deque[InFlightStep] = deque()
-forward_handle: ForwardHandle | None = None
+batch_queue: deque[PendingCommit] = deque()
+launch_handle: LaunchHandle | None = None
 # ...
-slot_id = free_slot_id(batch_queue, forward_handle)
-forward_handle = scheduler.launch_forward_async(plan, slot_id)
+slot_id = free_slot_id(batch_queue, launch_handle)
+launch_handle = scheduler.launch_forward_async(plan, slot_id)
 ```
 
 **CUDA graph duplication:**
@@ -374,7 +374,7 @@ If sampling is also graph-captured, use a separate graph with `slot.logits` and 
 
 **Slot selection via bitmask (not identity comparison):**
 
-Each `InFlightStep` and `ForwardHandle` stores a `slot_id: int` (0 or 1) rather than a reference to the `DecodeSlot` object. This enables simple bitmask-based allocation:
+Each `PendingCommit` and `LaunchHandle` stores a `slot_id: int` (0 or 1) rather than a reference to the `DecodeSlot` object. This enables simple bitmask-based allocation:
 
 ```
 Ping-pong with 2-slot queue:
@@ -395,7 +395,7 @@ After completing step t (slot 0 freed):
 free_slot_id() returns 0 → schedule step t+2 on slot 0
 ```
 
-Slot allocation is handled by `PipelineState.free_slot_id()` (see §5 Phase 2). This is simpler than identity comparison (`step.slot is slot`) and handles all transients correctly, including the split forward/sample case where both `batch_queue` and `forward_handle` may reference slots.
+Slot allocation is handled by `PipelineState.free_slot_id()` (see §5 Phase 2). This is simpler than identity comparison (`step.slot is slot`) and handles all transients correctly, including the split forward/sample case where both `batch_queue` and `launch_handle` may reference slots.
 
 ### 4.3 Staging buffer invariants
 
@@ -420,7 +420,7 @@ Metadata H2D copies (`batch_idx`, `input_pos`, `lora_slot_ids`) use `CpuGpuBuffe
 
 - **Stream ordering is NOT sufficient** for pinned host buffer reuse. Stream ordering only orders GPU-side operations; it does not prevent the CPU from overwriting the pinned source memory while the DMA is pending.
 - **Per-slot pinned metadata buffers are required.** Each `DecodeSlot` owns its own `DecodeMetaBuffers` with independent pinned CPU tensors.
-- **Slot lifetime guarantees safety.** A slot is not reused until `complete_step()` (invariant I6), so the prior H2D copy has completed before the CPU writes new metadata.
+- **Slot lifetime guarantees safety.** A slot is not reused until `commit_step()` (invariant I6), so the prior H2D copy has completed before the CPU writes new metadata.
 
 Inside `launch_forward_async(plan, slot_id)`:
 ```python
@@ -502,7 +502,7 @@ Currently `RenderBuffer` creates its own stream in `__init__`. Change it to acce
 The engine's `pause()` and `resume()` methods must interact correctly with the pipelined decode state. `pause()` is used for hot-loading weights, rebuilding CUDA graphs, and configuration changes—operations that may invalidate in-flight state.
 
 **Hazard:** If we pause mid-pipeline, the following state may become invalid after configuration changes:
-- `forward_handle` (forward dispatched, not yet sampled)
+- `launch_handle` (forward dispatched, not yet sampled)
 - Steps in `batch_queue` (reference old slot/graph state)
 
 **Rule: Drain pipeline before acknowledging pause.**
@@ -512,18 +512,18 @@ When `paused_flag` is set, the scheduler loop must drain in the correct order (s
 ```python
 if paused_flag.is_set():
     # 1. Commit any sampled steps first (updates grammar state via consume_step)
-    #    This must happen BEFORE finalizing forward_handle, because the mask
+    #    This must happen BEFORE finalizing launch_handle, because the mask
     #    for t+1 depends on grammar state after committing t.
     while step := pipeline.pop_oldest():
-        scheduler.complete_step(step)
+        scheduler.commit_step(step)
         pipeline.on_step_completed()
 
     # 2. Then finalize any pending forward using the updated grammar state
-    if pipeline.forward_handle is not None:
-        mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
-        step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
-        pipeline.on_sampling_complete(step)
-        scheduler.complete_step(pipeline.pop_oldest())
+    if pipeline.launch_handle is not None:
+        mask = scheduler.compute_mask(pipeline.launch_handle.sequences)
+        step = scheduler.finalize_sampling(pipeline.launch_handle, mask)
+        pipeline.on_pending_commit(step)
+        scheduler.commit_step(pipeline.pop_oldest())
         pipeline.on_step_completed()
 
     # 3. Now safe to sync and acknowledge
@@ -622,7 +622,7 @@ A.refs=1       A.refs=2        A.refs=1              A.refs=0 → RELEASE
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
-After finalization, the sequence is **not in `running`** but still exists because `InFlightStep.sequences` holds a reference. No separate "zombies" container needed—zombies are just finalized sequences with `inflight_refs > 0`, reachable only via the in-flight queue.
+After finalization, the sequence is **not in `running`** but still exists because `PendingCommit.sequences` holds a reference. No separate "zombies" container needed—zombies are just finalized sequences with `inflight_refs > 0`, reachable only via the in-flight queue.
 
 **Capacity tracking:** Derive from page table state, not `len(running)`:
 
@@ -657,7 +657,7 @@ Consider adding an assertion at scheduler construction: `assert not hasattr(self
 This eliminates `CompletedStepInfo`, `apply_zombies()`, `zombie_seq_ids`, and `row_of_seq`. Zombie behavior becomes emergent:
 
 - On execution (`launch_forward_async`): `seq.inflight_refs += 1` for each sequence in the step.
-- On completion (`complete_step`): `seq.inflight_refs -= 1` for each sequence.
+- On completion (`commit_step`): `seq.inflight_refs -= 1` for each sequence.
 - If `seq.finalized` is already true at commit time → skip committing (this is the "zombie" behavior).
 - If `seq.finalized` becomes true at this step (EOS/length cap) → set it, finalize API semantics.
 - If `seq.finalized and seq.inflight_refs == 0` → release resources immediately.
@@ -668,14 +668,14 @@ This eliminates `CompletedStepInfo`, `apply_zombies()`, `zombie_seq_ids`, and `r
 
 **In-flight step record:**
 
-Track each scheduled step in an `InFlightStep` record:
+Track each scheduled step in a `PendingCommit` record:
   - `sequences: list[ScheduledSequence]`
   - `slot_id: int` (0 or 1, which ping-pong slot this step used)
   - `transfer: TransferHandle`
 
-**Row order invariant:** `InFlightStep.sequences[i]` corresponds to row `i` in the render/staging buffers for that step. This mapping is implicit (no separate `row_of_seq` needed) because:
+**Row order invariant:** `PendingCommit.sequences[i]` corresponds to row `i` in the render/staging buffers for that step. This mapping is implicit (no separate `row_of_seq` needed) because:
 - Forward and sampling write outputs in batch order
-- `complete_step` iterates `sequences` in order to match outputs to sequences
+- `commit_step` iterates `sequences` in order to match outputs to sequences
 - Maintaining this invariant is the responsibility of `launch_forward_async` and `finalize_sampling`
 
 Note: `zombie_seq_ids` and `row_of_seq` are no longer needed.
@@ -711,20 +711,20 @@ Decode and prefill have separate APIs. This makes Phase 2's "prefill only when d
   - Handles KV allocation, model prefill, sampling, D2H, commit.
   - Returns the newly-admitted sequence (now in `running`).
 
-- `launch_forward_async(plan: StepPlan, slot_id: int) -> ForwardHandle`
+- `launch_forward_async(plan: StepPlan, slot_id: int) -> LaunchHandle`
   - **Increments `seq.inflight_refs` for each sequence in the plan.** This is the commit point—refcounts are only mutated when the step is actually launched.
   - Runs FlashInfer `plan()` and model forward on GPU using `decode_slots[slot_id].compute_stream`.
   - **Calls `seq.state.advance()` immediately after dispatching forward**, before returning. This updates KV length for next-step attention indexing.
-  - Returns immediately with a `ForwardHandle` containing `slot_id` and `sequences`.
+  - Returns immediately with a `LaunchHandle` containing `slot_id` and `sequences`.
   - **Error handling:** See §4.8 for the exception model.
 
-- `finalize_sampling(handle: ForwardHandle, mask: torch.Tensor | None) -> InFlightStep`
+- `finalize_sampling(handle: LaunchHandle, mask: torch.Tensor | None) -> PendingCommit`
   - Launches sampling kernel on `decode_slots[handle.slot_id].compute_stream` (stream ordering ensures forward completes first).
   - If `mask` is provided, applies token constraints; if `None`, samples without constraints.
   - Records `step_done_event` (after all GPU writes: sampling + spatial decode + staging) and kicks off non-blocking D2H copy via `slot.render.start_transfer(ready_event=step_done_event, ...)`.
-  - Returns `InFlightStep` containing `slot_id`, `sequences`, and `transfer` handle.
+  - Returns `PendingCommit` containing `slot_id`, `sequences`, and `transfer` handle.
 
-- `complete_step(inflight) -> None`
+- `commit_step(inflight) -> None`
   - **Owns the `wait()` call.** Blocks until D2H transfer completes by calling `inflight.transfer.wait()` internally. Callers never call `wait()` directly—this ensures wait ownership is centralized and prevents double-wait bugs.
   - For each `seq` in `inflight.sequences`:
     - Decrement `seq.inflight_refs`.
@@ -754,10 +754,10 @@ Decode and prefill have separate APIs. This makes Phase 2's "prefill only when d
 **`inflight_refs` invariant:**
 
 - **Invariant:** `0 <= seq.inflight_refs <= 2` for all sequences.
-- **Ownership:** Only scheduler methods (`launch_forward_async`, `complete_step`) mutate `inflight_refs`. `PipelineState` does queue/slot bookkeeping only—it never touches refcounts.
-- **Debug assertion (recommended):** After each state transition, verify `seq.inflight_refs` matches the actual membership count across `batch_queue` and `forward_handle`. In debug builds:
+- **Ownership:** Only scheduler methods (`launch_forward_async`, `commit_step`) mutate `inflight_refs`. `PipelineState` does queue/slot bookkeeping only—it never touches refcounts.
+- **Debug assertion (recommended):** After each state transition, verify `seq.inflight_refs` matches the actual membership count across `batch_queue` and `launch_handle`. In debug builds:
   - `assert 0 <= seq.inflight_refs <= 2`
-  - `assert seq.inflight_refs == membership_count(seq, pipeline.batch_queue, pipeline.forward_handle)`
+  - `assert seq.inflight_refs == membership_count(seq, pipeline.batch_queue, pipeline.launch_handle)`
 
   This catches refcount drift bugs early without duplicating state mutation responsibilities.
 
@@ -765,13 +765,13 @@ Decode and prefill have separate APIs. This makes Phase 2's "prefill only when d
 
 We update `InferenceEngine._scheduler_loop` to maintain:
 
-- `batch_queue: deque[InFlightStep]` — fully-sampled steps awaiting completion (at most 2)
-- `forward_handle: ForwardHandle | None` — current forward pass in-flight but not yet sampled
+- `batch_queue: deque[PendingCommit]` — fully-sampled steps awaiting completion (at most 2)
+- `launch_handle: LaunchHandle | None` — current forward pass in-flight but not yet sampled
 - `decode_slots: list[DecodeSlot]` — the two ping-pong slots (slot 0 and slot 1)
 
 **Queue ordering invariant:** `batch_queue[-1]` is the **oldest** in-flight step; `batch_queue[0]` is the newest. We `appendleft(new)` and `pop()` to complete oldest first (FIFO).
 
-**Total in-flight invariant:** `len(batch_queue) + (1 if forward_handle else 0) <= 2`
+**Total in-flight invariant:** `len(batch_queue) + (1 if launch_handle else 0) <= 2`
 
 **Unified loop (handles both constrained and unconstrained):**
 
@@ -802,15 +802,15 @@ while True:
     if prefill_wanted:
         # 1) Commit any sampled steps first
         while step := pipeline.pop_oldest():
-            scheduler.complete_step(step)
+            scheduler.commit_step(step)
             pipeline.on_step_completed()
 
         # 2) If there's a pending forward, finalize and commit it
-        if pipeline.forward_handle is not None:
-            mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
-            step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
-            pipeline.on_sampling_complete(step)
-            scheduler.complete_step(pipeline.pop_oldest())
+        if pipeline.launch_handle is not None:
+            mask = scheduler.compute_mask(pipeline.launch_handle.sequences)
+            step = scheduler.finalize_sampling(pipeline.launch_handle, mask)
+            pipeline.on_pending_commit(step)
+            scheduler.commit_step(pipeline.pop_oldest())
             pipeline.on_step_completed()
 
         # 3) Now prefill is safe
@@ -820,42 +820,42 @@ while True:
     # ──────────────────────────────────────────────────────────────────────
     # DECODE: Launch forward if slot available and no forward in-flight
     # ──────────────────────────────────────────────────────────────────────
-    if pipeline.forward_handle is None:
+    if pipeline.launch_handle is None:
         slot_id = pipeline.free_slot_id()
 
         if slot_id is None:
             # Both slots busy → must complete oldest sampled step to free a slot
             step = pipeline.pop_oldest()
             if step is not None:
-                scheduler.complete_step(step)
+                scheduler.commit_step(step)
                 pipeline.on_step_completed()
             continue
 
         plan = scheduler.schedule_decode_step()
         if plan is not None:
             handle = scheduler.launch_forward_async(plan, slot_id)
-            pipeline.on_forward_launched(handle)
+            pipeline.on_launch(handle)
 
     # ──────────────────────────────────────────────────────────────────────
     # DECODE: Finalize sampling for the in-flight forward
     # ──────────────────────────────────────────────────────────────────────
-    if pipeline.forward_handle is not None:
-        needs_mask = scheduler.plan_needs_mask(pipeline.forward_handle.sequences)
+    if pipeline.launch_handle is not None:
+        needs_mask = scheduler.plan_needs_mask(pipeline.launch_handle.sequences)
 
         if needs_mask:
             # Constrained: commit previous step first to update grammar state
             step = pipeline.pop_oldest()
             if step is not None:
-                scheduler.complete_step(step)
+                scheduler.commit_step(step)
                 pipeline.on_step_completed()
 
-            mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
-            step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
+            mask = scheduler.compute_mask(pipeline.launch_handle.sequences)
+            step = scheduler.finalize_sampling(pipeline.launch_handle, mask)
         else:
             # Unconstrained: finalize immediately
-            step = scheduler.finalize_sampling(pipeline.forward_handle, mask=None)
+            step = scheduler.finalize_sampling(pipeline.launch_handle, mask=None)
 
-        pipeline.on_sampling_complete(step)
+        pipeline.on_pending_commit(step)
         continue
 
     # ──────────────────────────────────────────────────────────────────────
@@ -863,7 +863,7 @@ while True:
     # ──────────────────────────────────────────────────────────────────────
     step = pipeline.pop_oldest()
     if step is not None:
-        scheduler.complete_step(step)
+        scheduler.commit_step(step)
         pipeline.on_step_completed()
         continue
 
@@ -896,7 +896,7 @@ def plan_needs_mask(self, sequences: list[ScheduledSequence]) -> bool:
 **Why queue depth emerges naturally:**
 
 - **Unconstrained batch:** Forward t+1 launches, immediately finalized → `batch_queue` grows to 2. Both slots can be used.
-- **Constrained batch:** Forward t+1 launches, but finalization waits for commit t. This means `batch_queue` drains to 0 before step t+1's `InFlightStep` is added. Effective depth is 1.
+- **Constrained batch:** Forward t+1 launches, but finalization waits for commit t. This means `batch_queue` drains to 0 before step t+1's `PendingCommit` is added. Effective depth is 1.
 - **Mixed batch:** Treated as constrained (delayed finalization).
 
 No explicit `has_constrained_active()` gate or `max_decode_inflight` knob needed.
@@ -907,7 +907,7 @@ No explicit `has_constrained_active()` gate or `max_decode_inflight` knob needed
 2. **FIFO completion:** We always complete `batch_queue[-1]` (oldest). This guarantees step t commits before step t+1.
 3. **Liveness:** After completing a step, we `continue` to retry scheduling—completions may free sequences.
 4. **Prefill fairness:** `prefill_wanted` triggers a full drain before prefilling.
-5. **Correct masking:** For constrained batches, `compute_mask` is called after `complete_step`, ensuring grammar state is updated.
+5. **Correct masking:** For constrained batches, `compute_mask` is called after `commit_step`, ensuring grammar state is updated.
 
 **Wake sources:** Every transition that can make work schedulable must signal `wake_event`:
 - New request arrival (already signals via `_scheduler_event.set()` in `engine.py`)
@@ -971,11 +971,11 @@ GPU:           [────forward t────]   [────forward t+1─
 Concretely, within `launch_forward_async(plan, slot_id)` + `finalize_sampling(handle, mask)`:
 1. Build FlashInfer metadata for this step
 2. Call `slot.flashinfer_ctx.plan(...)` — CPU work, no GPU compute
-3. Launch forward pass — async, returns `ForwardHandle`
+3. Launch forward pass — async, returns `LaunchHandle`
 4. (Later, possibly after commit) Call `finalize_sampling`:
 5. Launch sampling — async
 6. Launch D2H transfer — async
-7. Return `InFlightStep`
+7. Return `PendingCommit`
 
 After step 6 returns, the engine loop immediately calls `schedule_decode_step()` for the next step. While the GPU is still executing step t's forward/sampling, the CPU is free to build metadata and call `plan()` for step t+1 on the **other slot's** FlashInfer context. No blocking occurs because:
 - Step t's GPU work is in-flight (async)
@@ -1046,14 +1046,14 @@ To keep pipelined planning valid without replanning, we enforce exactly three ba
 2) **EOS sequences remain in the already-planned step (zombie behavior).**
    - EOS is discovered after sampling step *t*. The sequence stays in the already-planned *t+1* batch, then is dropped from *t+2*.
    - **Tracking via refcounts:** When step *t* completes, we set `seq.finalized = True` and decrement `inflight_refs`. Since the sequence is still in step *t+1*, `inflight_refs > 0` → don't release yet.
-   - **Zombie behavior is emergent:** When step *t+1* completes, `complete_step` sees `seq.finalized = True` and skips committing (discards outputs). Then `inflight_refs` drops to 0 → release.
+   - **Zombie behavior is emergent:** When step *t+1* completes, `commit_step` sees `seq.finalized = True` and skips committing (discards outputs). Then `inflight_refs` drops to 0 → release.
    - Result finalization (resolve future, emit final stream) happens at step *t*. Only resource release is deferred.
    - Batch capacity: sequences with `finalized=True, inflight_refs > 0` count against `max_batch_size`; new admissions resume at *t+2*.
    - **EOS is the only termination condition that is not predictable at plan time.** Length-based caps are predictable and handled via rule (1).
 
 3) **Prefill admission rule: prefill only when pipeline is drained.**
    - New sequences are admitted via prefill, which runs synchronously.
-   - Prefill only runs when `batch_queue` is empty and `forward_handle is None`.
+   - Prefill only runs when `batch_queue` is empty and `launch_handle is None`.
    - This naturally freezes decode batch membership: once a forward is launched, no new sequences can join until the pipeline drains for the next prefill.
 
 **Constrained-active policy (resolves masking vs pipelined planning):**
@@ -1117,7 +1117,7 @@ CUDA errors can surface asynchronously—often at the **next synchronization poi
 
 **Consequences of async failures:**
 
-If an exception surfaces at `transfer.wait()` (inside `complete_step`), we may have:
+If an exception surfaces at `transfer.wait()` (inside `commit_step`), we may have:
 - `inflight_refs` already incremented for step t+1
 - Step t+1 already in `batch_queue`
 - Slot t+1 is using already "in-flight" with GPU kernels reading its buffers
@@ -1141,7 +1141,7 @@ def _handle_cuda_failure(self, exc: Exception) -> NoReturn:
     # 2. Resolve ALL outstanding requests to prevent hangs
     #    This includes:
     #    - Sequences in batch_queue (in-flight sampled steps)
-    #    - Sequences in forward_handle (forward dispatched, not yet sampled)
+    #    - Sequences in launch_handle (forward dispatched, not yet sampled)
     #    - Admitted sequences (scheduler.running)
     #    - Waiting requests (accepted but not yet prefilled)
     #
@@ -1149,13 +1149,13 @@ def _handle_cuda_failure(self, exc: Exception) -> NoReturn:
     #    is: every request that the engine has accepted must either complete normally
     #    or receive an error. No request may be left hanging.
 
-    self._resolve_all_inflight_requests(exc)   # batch_queue + forward_handle
+    self._resolve_all_inflight_requests(exc)   # batch_queue + launch_handle
     self._resolve_all_admitted_sequences(exc)  # scheduler.running
     self._resolve_all_waiting_requests(exc)    # scheduler.waiting
 
     # 3. Clear all state
     self.batch_queue.clear()
-    self.forward_handle = None
+    self.launch_handle = None
     self.scheduler.running.clear()
     self.scheduler.waiting.clear()
 
@@ -1183,8 +1183,8 @@ launch_forward_async:
     slot.flashinfer_ctx.plan(...)     # H2D copies enqueued
     slot.graph.replay(...)            # kernels launched
     <exception here>
-    # We return without creating ForwardHandle
-    # Slot appears "free" (not in batch_queue or forward_handle)
+    # We return without creating LaunchHandle
+    # Slot appears "free" (not in batch_queue or launch_handle)
     # But GPU is still executing kernels that read from slot buffers!
     # Next iteration reuses slot → data race / memory clobber
 ```
@@ -1206,7 +1206,7 @@ Distinguish between two exception classes:
    - Must call `_handle_cuda_failure()` and abort
 
 ```python
-def launch_forward_async(self, plan: StepPlan, slot_id: int) -> ForwardHandle:
+def launch_forward_async(self, plan: StepPlan, slot_id: int) -> LaunchHandle:
     slot = self._decode_slots[slot_id]
     gpu_work_started = False
     try:
@@ -1220,7 +1220,7 @@ def launch_forward_async(self, plan: StepPlan, slot_id: int) -> ForwardHandle:
         gpu_work_started = True
         slot.flashinfer_ctx.plan(...)  # H2D copies enqueued
         # ... forward launch ...
-        return ForwardHandle(slot_id, ...)
+        return LaunchHandle(slot_id, ...)
 
     except Exception as e:
         if gpu_work_started:
@@ -1244,12 +1244,12 @@ This separation ensures slot safety: we only attempt recovery when we can prove 
 
 ### Phase 1 — Conservative pipelining (queue depth ≤ 1)
 
-Goal: Introduce the full Phase 2 infrastructure (PipelineState, ForwardHandle, unified loop) with a conservative constraint: **at most 1 sampled step in queue**. This validates the pipelining mechanism while limiting risk.
+Goal: Introduce the full Phase 2 infrastructure (PipelineState, LaunchHandle, unified loop) with a conservative constraint: **at most 1 sampled step in queue**. This validates the pipelining mechanism while limiting risk.
 
 **Why this approach:**
 
 Instead of "total in-flight = 1" (which prevents overlap), we constrain **queue depth** only:
-- `forward_handle` may coexist with a single queued sampled step
+- `launch_handle` may coexist with a single queued sampled step
 - Always use constrained path ordering (commit previous before finalizing next)
 - This delivers real forward overlap while keeping the "at most 1 sampled step awaiting commit" safety profile
 
@@ -1271,42 +1271,42 @@ while True:
     if prefill_wanted:
         # Drain before prefill
         while step := pipeline.pop_oldest():
-            scheduler.complete_step(step)
+            scheduler.commit_step(step)
             pipeline.on_step_completed()
-        if pipeline.forward_handle is not None:
-            mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
-            step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
-            pipeline.on_sampling_complete(step)
-            scheduler.complete_step(pipeline.pop_oldest())
+        if pipeline.launch_handle is not None:
+            mask = scheduler.compute_mask(pipeline.launch_handle.sequences)
+            step = scheduler.finalize_sampling(pipeline.launch_handle, mask)
+            pipeline.on_pending_commit(step)
+            scheduler.commit_step(pipeline.pop_oldest())
             pipeline.on_step_completed()
         scheduler.try_run_prefill_sync(next_prefill)
         continue
 
     # Launch forward if none in-flight
-    if pipeline.forward_handle is None:
+    if pipeline.launch_handle is None:
         plan = scheduler.schedule_decode_step()
         if plan is not None:
             slot_id = pipeline.free_slot_id()
             handle = scheduler.launch_forward_async(plan, slot_id)
-            pipeline.on_forward_launched(handle)
+            pipeline.on_launch(handle)
 
     # Finalize sampling (always commit previous first — Phase 1 conservative path)
-    if pipeline.forward_handle is not None:
+    if pipeline.launch_handle is not None:
         # Commit previous step first (if any)
         step = pipeline.pop_oldest()
         if step is not None:
-            scheduler.complete_step(step)
+            scheduler.commit_step(step)
             pipeline.on_step_completed()
 
-        mask = scheduler.compute_mask(pipeline.forward_handle.sequences)
-        step = scheduler.finalize_sampling(pipeline.forward_handle, mask)
-        pipeline.on_sampling_complete(step)
+        mask = scheduler.compute_mask(pipeline.launch_handle.sequences)
+        step = scheduler.finalize_sampling(pipeline.launch_handle, mask)
+        pipeline.on_pending_commit(step)
         continue
 
     # Drain
     step = pipeline.pop_oldest()
     if step is not None:
-        scheduler.complete_step(step)
+        scheduler.commit_step(step)
         pipeline.on_step_completed()
         continue
 
@@ -1356,9 +1356,9 @@ Goal: 2-deep queue for all decode batches (constrained and unconstrained) using 
 - Bundle per-slot resources into `DecodeSlot` objects (§4.2); slot selection via `free_slot_id()` bitmask.
 - Implement the scheduler API split (§4.5):
   - `schedule_decode_step()` — pure selector, returns `StepPlan | None`
-  - `launch_forward_async(plan, slot_id)` — increments `seq.inflight_refs`, launches forward, returns `ForwardHandle`
-  - `finalize_sampling(handle, mask)` — launches sampling + D2H, returns `InFlightStep`
-  - `complete_step(inflight)` — blocks on transfer, decrements refcounts, handles zombies
+  - `launch_forward_async(plan, slot_id)` — increments `seq.inflight_refs`, launches forward, returns `LaunchHandle`
+  - `finalize_sampling(handle, mask)` — launches sampling + D2H, returns `PendingCommit`
+  - `commit_step(inflight)` — blocks on transfer, decrements refcounts, handles zombies
   - `try_run_prefill_sync(request)` — runs prefill synchronously when decode queue is empty
 - Add `seq.finalized` and `seq.inflight_refs` tracking to `ScheduledSequence`.
 - Update `InferenceEngine._scheduler_loop` to use the unified loop (§4.6).
@@ -1368,8 +1368,8 @@ Goal: 2-deep queue for all decode batches (constrained and unconstrained) using 
 The `PipelineState` class is now implemented in `kestrel/scheduler/pipeline.py`. The engine loop delegates to this state machine for all pipeline state transitions, making it the single source of truth.
 
 Key features:
-- **Two-phase completion:** `pop_oldest()` moves step to `completing_step` (slot stays in use), `on_step_completed()` frees the slot after scheduler finishes. This enforces invariant I6.
-- **Defensive assertions:** `on_forward_launched()` verifies slot is free, `on_sampling_complete()` verifies slot_id matches.
+- **Two-phase completion:** `pop_oldest()` moves step to `committing_step` (slot stays in use), `on_step_completed()` frees the slot after scheduler finishes. This enforces invariant I6.
+- **Defensive assertions:** `on_launch()` verifies slot is free, `on_pending_commit()` verifies slot_id matches.
 - **FIFO ordering:** Queue uses `appendleft`/`pop` for correct completion order.
 
 See `kestrel/scheduler/pipeline.py` for the full implementation and comprehensive docstrings.
@@ -1438,9 +1438,9 @@ Acceptance:
 ## 6. Expected code touch points
 
 - `kestrel/scheduler/pipeline.py`: NEW — `PipelineState` (canonical production state machine, no CUDA dependencies).
-- `kestrel/scheduler/types.py`: Add `DecodeSlot`, `StepPlan`, `InFlightStep`, `ForwardHandle`; extend `ScheduledSequence` with `finalized`, `inflight_refs`.
+- `kestrel/scheduler/types.py`: Add `DecodeSlot`, `StepPlan`, `PendingCommit`, `LaunchHandle`; extend `ScheduledSequence` with `finalized`, `inflight_refs`.
 - `kestrel/scheduler/transfer.py`: Extend with event-based `start_transfer()` API.
-- `kestrel/scheduler/scheduler.py`: Scheduler API split (`schedule_decode_step`, `launch_forward_async`, `finalize_sampling`, `complete_step`).
+- `kestrel/scheduler/scheduler.py`: Scheduler API split (`schedule_decode_step`, `launch_forward_async`, `finalize_sampling`, `commit_step`).
 - `kestrel/moondream/runtime.py`: Two `DecodeSlot` objects, ping-pong FlashInfer contexts.
 - `kestrel/engine.py`: Unified loop in `_scheduler_loop`, delegates to `PipelineState` for state transitions.
 

@@ -36,8 +36,8 @@ ARCHITECTURE
 This module provides PipelineState, a pure state machine with no CUDA
 dependencies. It manages:
 - A 2-deep queue of in-flight steps (batch_queue)
-- A handle for the current forward pass (forward_handle)
-- A step currently being completed (completing_step)
+- A handle for the current forward pass (launch_handle)
+- A step currently being completed (committing_step)
 - Slot allocation via bitmask
 
 The scheduler is responsible for:
@@ -123,7 +123,7 @@ class TransferLike(Protocol):
     """Protocol for transfer handles.
 
     Transfer handles represent an in-flight D2H copy. The actual wait() call
-    is owned by the scheduler's complete_step() method, not by PipelineState.
+    is owned by the scheduler's commit_step() method, not by PipelineState.
     """
 
     pass
@@ -134,14 +134,14 @@ Transfer = TypeVar("Transfer", bound=TransferLike)
 
 
 @dataclass(slots=True)
-class ForwardHandle(Generic[Seq]):
+class LaunchHandle(Generic[Seq]):
     """Handle for an in-flight forward pass (not yet sampled).
 
     Lifecycle:
     1. Created by scheduler.launch_forward_async(plan, slot_id)
-    2. Stored via pipeline.on_forward_launched(handle)
-    3. Consumed by scheduler.finalize_sampling(handle, mask) -> InFlightStep
-    4. Cleared via pipeline.on_sampling_complete(step)
+    2. Stored via pipeline.on_launch(handle)
+    3. Consumed by scheduler.finalize_sampling(handle, mask) -> PendingCommit
+    4. Cleared via pipeline.on_pending_commit(step)
 
     The slot_id indicates which ping-pong slot's resources (staging buffers,
     CUDA graphs, etc.) are being used for this forward pass.
@@ -152,14 +152,14 @@ class ForwardHandle(Generic[Seq]):
 
 
 @dataclass(slots=True)
-class InFlightStep(Generic[Seq, Transfer]):
+class PendingCommit(Generic[Seq, Transfer]):
     """Record of a fully-sampled step awaiting completion.
 
     Lifecycle:
     1. Created by scheduler.finalize_sampling(handle, mask)
-    2. Added to queue via pipeline.on_sampling_complete(step)
+    2. Added to queue via pipeline.on_pending_commit(step)
     3. Retrieved via pipeline.pop_oldest() (FIFO order) - slot still in use
-    4. Consumed by scheduler.complete_step(step) which calls transfer.wait()
+    4. Consumed by scheduler.commit_step(step) which calls transfer.wait()
     5. Freed via pipeline.on_step_completed() - slot now available
 
     The sequences list maintains row order: sequences[i] corresponds to row i
@@ -190,15 +190,15 @@ class PipelineState(Generic[Seq, Transfer]):
 
     A slot is "in use" if referenced by any of:
     - An entry in batch_queue (sampled, awaiting completion)
-    - The current forward_handle (forward dispatched, not yet sampled)
-    - The completing_step (popped from queue, completion in progress)
+    - The current launch_handle (forward dispatched, not yet sampled)
+    - The committing_step (popped from queue, completion in progress)
 
     Two-Phase Completion
     --------------------
-    To enforce invariant I6 (slot reusable only after complete_step()):
-    - pop_oldest() removes from queue but stores in completing_step
-    - Slot remains "in use" during the blocking complete_step() call
-    - on_step_completed() clears completing_step, freeing the slot
+    To enforce invariant I6 (slot reusable only after commit_step()):
+    - pop_oldest() removes from queue but stores in committing_step
+    - Slot remains "in use" during the blocking commit_step() call
+    - on_step_completed() clears committing_step, freeing the slot
 
     This prevents the engine loop from accidentally reusing a slot before
     the scheduler has finished reading from its pinned host buffers.
@@ -218,33 +218,33 @@ class PipelineState(Generic[Seq, Transfer]):
     -----------------------------
         slot_id = pipeline.free_slot_id()
         handle = scheduler.launch_forward_async(plan, slot_id)
-        pipeline.on_forward_launched(handle)
+        pipeline.on_launch(handle)
 
         step = scheduler.finalize_sampling(handle, mask=None)
-        pipeline.on_sampling_complete(step)
+        pipeline.on_pending_commit(step)
 
         # Later, when ready to commit:
         oldest = pipeline.pop_oldest()
-        scheduler.complete_step(oldest)  # calls transfer.wait()
+        scheduler.commit_step(oldest)  # calls transfer.wait()
         pipeline.on_step_completed()
 
     Usage Pattern (Constrained)
     ---------------------------
         slot_id = pipeline.free_slot_id()
         handle = scheduler.launch_forward_async(plan, slot_id)
-        pipeline.on_forward_launched(handle)
+        pipeline.on_launch(handle)
 
         # Must commit previous step before finalizing (need updated grammar)
         if oldest := pipeline.pop_oldest():
-            scheduler.complete_step(oldest)
+            scheduler.commit_step(oldest)
             pipeline.on_step_completed()
 
         mask = scheduler.compute_mask(handle.sequences)
         step = scheduler.finalize_sampling(handle, mask)
-        pipeline.on_sampling_complete(step)
+        pipeline.on_pending_commit(step)
     """
 
-    __slots__ = ("batch_queue", "forward_handle", "completing_step", "_num_slots")
+    __slots__ = ("batch_queue", "launch_handle", "committing_step", "_num_slots")
 
     def __init__(self, num_slots: int = 2) -> None:
         """Initialize the pipeline state machine.
@@ -261,9 +261,9 @@ class PipelineState(Generic[Seq, Transfer]):
             raise ValueError(
                 f"PipelineState currently supports exactly 2 slots, got {num_slots}"
             )
-        self.batch_queue: deque[InFlightStep[Seq, Transfer]] = deque()
-        self.forward_handle: ForwardHandle[Seq] | None = None
-        self.completing_step: InFlightStep[Seq, Transfer] | None = None
+        self.batch_queue: deque[PendingCommit[Seq, Transfer]] = deque()
+        self.launch_handle: LaunchHandle[Seq] | None = None
+        self.committing_step: PendingCommit[Seq, Transfer] | None = None
         self._num_slots = num_slots
 
     def _used_slot_mask(self) -> int:
@@ -274,17 +274,17 @@ class PipelineState(Generic[Seq, Transfer]):
         mask = 0
         for step in self.batch_queue:
             mask |= 1 << step.slot_id
-        if self.forward_handle is not None:
-            mask |= 1 << self.forward_handle.slot_id
-        if self.completing_step is not None:
-            mask |= 1 << self.completing_step.slot_id
+        if self.launch_handle is not None:
+            mask |= 1 << self.launch_handle.slot_id
+        if self.committing_step is not None:
+            mask |= 1 << self.committing_step.slot_id
         return mask
 
     def free_slot_id(self) -> int | None:
         """Return ID of a free slot, or None if all slots are in use.
 
-        A slot is in use if referenced by batch_queue, forward_handle,
-        or completing_step. Returns the lowest-numbered free slot to
+        A slot is in use if referenced by batch_queue, launch_handle,
+        or committing_step. Returns the lowest-numbered free slot to
         ensure deterministic alternation pattern.
 
         Returns:
@@ -303,7 +303,7 @@ class PipelineState(Generic[Seq, Transfer]):
         else:
             return None
 
-    def can_launch_forward(self) -> bool:
+    def can_launch(self) -> bool:
         """Check if we can launch a new forward pass.
 
         A forward can be launched iff:
@@ -313,7 +313,7 @@ class PipelineState(Generic[Seq, Transfer]):
         Returns:
             True if a forward can be launched.
         """
-        return self.forward_handle is None and self.free_slot_id() is not None
+        return self.launch_handle is None and self.free_slot_id() is not None
 
     def total_in_flight(self) -> int:
         """Return total number of steps in-flight (0, 1, or 2).
@@ -322,17 +322,17 @@ class PipelineState(Generic[Seq, Transfer]):
         - Sampled steps in batch_queue awaiting completion
         - Forward pass in-flight (if any)
 
-        Note: completing_step is not counted as it's transitioning out.
+        Note: committing_step is not counted as it's transitioning out.
         """
-        return len(self.batch_queue) + (1 if self.forward_handle else 0)
+        return len(self.batch_queue) + (1 if self.launch_handle else 0)
 
     def queue_depth(self) -> int:
         """Return number of sampled steps awaiting completion."""
         return len(self.batch_queue)
 
-    def has_forward_in_flight(self) -> bool:
+    def has_launch_in_flight(self) -> bool:
         """Check if a forward pass is in-flight (not yet sampled)."""
-        return self.forward_handle is not None
+        return self.launch_handle is not None
 
     def is_empty(self) -> bool:
         """Check if the pipeline is fully drained.
@@ -342,29 +342,29 @@ class PipelineState(Generic[Seq, Transfer]):
         acknowledging pause.
         """
         return (
-            self.forward_handle is None
+            self.launch_handle is None
             and len(self.batch_queue) == 0
-            and self.completing_step is None
+            and self.committing_step is None
         )
 
     # ─────────────────────────────────────────────────────────────────────────
     # State transitions
     # ─────────────────────────────────────────────────────────────────────────
 
-    def on_forward_launched(self, handle: ForwardHandle[Seq]) -> None:
+    def on_launch(self, handle: LaunchHandle[Seq]) -> None:
         """Record that a forward pass has been launched.
 
         Called after scheduler.launch_forward_async() returns successfully.
         The handle is stored until sampling completes.
 
         Args:
-            handle: The ForwardHandle returned by the scheduler.
+            handle: The LaunchHandle returned by the scheduler.
 
         Raises:
             AssertionError: If a forward is already in-flight, or if the
                 slot is not actually free.
         """
-        if self.forward_handle is not None:
+        if self.launch_handle is not None:
             raise AssertionError(
                 "Cannot launch forward: another forward is already in-flight"
             )
@@ -377,41 +377,41 @@ class PipelineState(Generic[Seq, Transfer]):
                 f"(used_mask=0b{used_mask:02b})"
             )
 
-        self.forward_handle = handle
+        self.launch_handle = handle
 
-    def on_sampling_complete(self, step: InFlightStep[Seq, Transfer]) -> None:
+    def on_pending_commit(self, step: PendingCommit[Seq, Transfer]) -> None:
         """Record that sampling has completed for the in-flight forward.
 
         Called after scheduler.finalize_sampling() returns successfully.
         The step is added to the front of the queue (newest first) and
-        the forward_handle is cleared.
+        the launch_handle is cleared.
 
         Args:
-            step: The InFlightStep returned by the scheduler.
+            step: The PendingCommit returned by the scheduler.
 
         Raises:
             AssertionError: If no forward is in-flight, or if the step's
-                slot_id doesn't match the forward_handle's slot_id.
+                slot_id doesn't match the launch_handle's slot_id.
         """
-        if self.forward_handle is None:
+        if self.launch_handle is None:
             raise AssertionError(
                 "Cannot complete sampling: no forward is in-flight"
             )
 
         # Verify slot_id matches (defensive check)
-        if step.slot_id != self.forward_handle.slot_id:
+        if step.slot_id != self.launch_handle.slot_id:
             raise AssertionError(
                 f"Slot mismatch: step has slot_id={step.slot_id}, "
-                f"but forward_handle has slot_id={self.forward_handle.slot_id}"
+                f"but launch_handle has slot_id={self.launch_handle.slot_id}"
             )
 
         self.batch_queue.appendleft(step)
-        self.forward_handle = None
+        self.launch_handle = None
 
-    def pop_oldest(self) -> InFlightStep[Seq, Transfer] | None:
+    def pop_oldest(self) -> PendingCommit[Seq, Transfer] | None:
         """Pop the oldest step from the queue for completion.
 
-        The step is moved to completing_step, keeping the slot marked as
+        The step is moved to committing_step, keeping the slot marked as
         in-use until on_step_completed() is called. This enforces invariant
         I6: the slot cannot be reused until the scheduler has finished
         reading from its pinned host buffers.
@@ -424,7 +424,7 @@ class PipelineState(Generic[Seq, Transfer]):
         - D2H copies complete in order
 
         Returns:
-            The oldest InFlightStep, or None if queue is empty.
+            The oldest PendingCommit, or None if queue is empty.
 
         Raises:
             AssertionError: If a step is already being completed (must call
@@ -433,44 +433,44 @@ class PipelineState(Generic[Seq, Transfer]):
         if not self.batch_queue:
             return None
 
-        if self.completing_step is not None:
+        if self.committing_step is not None:
             raise AssertionError(
                 "Cannot pop: previous step still completing "
-                f"(slot {self.completing_step.slot_id}). "
+                f"(slot {self.committing_step.slot_id}). "
                 "Call on_step_completed() first."
             )
 
-        self.completing_step = self.batch_queue.pop()
-        return self.completing_step
+        self.committing_step = self.batch_queue.pop()
+        return self.committing_step
 
     def on_step_completed(self) -> None:
         """Mark the current completing step as done, freeing its slot.
 
-        Called after scheduler.complete_step() has finished processing
+        Called after scheduler.commit_step() has finished processing
         the step (waited on transfer, committed tokens, updated state).
         This frees the slot for reuse.
 
         Raises:
             AssertionError: If no step is currently being completed.
         """
-        if self.completing_step is None:
+        if self.committing_step is None:
             raise AssertionError(
                 "Cannot complete: no step is currently being completed. "
                 "Call pop_oldest() first."
             )
-        self.completing_step = None
+        self.committing_step = None
 
-    def peek_oldest(self) -> InFlightStep[Seq, Transfer] | None:
+    def peek_oldest(self) -> PendingCommit[Seq, Transfer] | None:
         """Peek at the oldest step without removing it.
 
         Returns:
-            The oldest InFlightStep, or None if queue is empty.
+            The oldest PendingCommit, or None if queue is empty.
         """
         if self.batch_queue:
             return self.batch_queue[-1]
         return None
 
-    def drain_all(self) -> list[InFlightStep[Seq, Transfer]]:
+    def drain_all(self) -> list[PendingCommit[Seq, Transfer]]:
         """Drain all steps from the queue in completion order (oldest first).
 
         Used for:
@@ -478,16 +478,16 @@ class PipelineState(Generic[Seq, Transfer]):
         - Pause/resume: pipeline must be drained before acknowledging pause
         - Error recovery: drain to clear state after CUDA failure
 
-        Does NOT clear forward_handle or completing_step - caller must
+        Does NOT clear launch_handle or committing_step - caller must
         handle those separately.
 
         Returns:
-            List of InFlightSteps in completion order (oldest first).
+            List of PendingCommits in completion order (oldest first).
 
         Raises:
             AssertionError: If a step is currently being completed.
         """
-        if self.completing_step is not None:
+        if self.committing_step is not None:
             raise AssertionError(
                 "Cannot drain: a step is currently being completed. "
                 "Call on_step_completed() first."

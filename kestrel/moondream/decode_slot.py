@@ -52,8 +52,8 @@ class DecodeSlot:
 
     A slot is "in use" if referenced by any of:
     - An entry in PipelineState.batch_queue (sampled, awaiting completion)
-    - PipelineState.forward_handle (forward dispatched, not yet sampled)
-    - PipelineState.completing_step (popped from queue, completion in progress)
+    - PipelineState.launch_handle (forward dispatched, not yet sampled)
+    - PipelineState.committing_step (popped from queue, completion in progress)
 
     The two-phase completion model (pop_oldest -> on_step_completed) ensures
     a slot is not reused until the scheduler has finished reading from its

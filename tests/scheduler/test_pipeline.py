@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 from kestrel.scheduler.pipeline import (
     PipelineState,
-    ForwardHandle,
-    InFlightStep,
+    LaunchHandle,
+    PendingCommit,
 )
 
 
@@ -29,9 +29,9 @@ class MockTransfer:
     step_id: int = 0
 
 
-def make_forward_handle(slot_id: int, num_seqs: int = 1) -> ForwardHandle[MockSequence]:
-    """Create a ForwardHandle with mock sequences."""
-    return ForwardHandle(
+def make_launch_handle(slot_id: int, num_seqs: int = 1) -> LaunchHandle[MockSequence]:
+    """Create a LaunchHandle with mock sequences."""
+    return LaunchHandle(
         slot_id=slot_id,
         sequences=[MockSequence(seq_id=i) for i in range(num_seqs)],
     )
@@ -39,9 +39,9 @@ def make_forward_handle(slot_id: int, num_seqs: int = 1) -> ForwardHandle[MockSe
 
 def make_step(
     slot_id: int, step_id: int = 0, num_seqs: int = 1
-) -> InFlightStep[MockSequence, MockTransfer]:
-    """Create an InFlightStep with mock sequences and transfer."""
-    return InFlightStep(
+) -> PendingCommit[MockSequence, MockTransfer]:
+    """Create a PendingCommit with mock sequences and transfer."""
+    return PendingCommit(
         slot_id=slot_id,
         sequences=[MockSequence(seq_id=i) for i in range(num_seqs)],
         transfer=MockTransfer(step_id=step_id),
@@ -58,7 +58,7 @@ class TestPipelineStateInit:
         assert state.total_in_flight() == 0
         assert state.queue_depth() == 0
         assert state.free_slot_id() == 0
-        assert state.completing_step is None
+        assert state.committing_step is None
 
     def test_init_explicit_slots(self):
         """Explicit initialization with 2 slots."""
@@ -84,27 +84,27 @@ class TestSlotSelection:
     def test_forward_on_slot_0_returns_slot_1(self):
         """Forward in-flight on slot 0 returns slot 1."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
         assert state.free_slot_id() == 1
 
     def test_forward_on_slot_1_returns_slot_0(self):
         """Forward in-flight on slot 1 returns slot 0."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
         assert state.free_slot_id() == 0
 
     def test_queued_step_on_slot_0_returns_slot_1(self):
         """Step queued on slot 0 returns slot 1."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
         assert state.free_slot_id() == 1
 
     def test_queued_step_on_slot_1_returns_slot_0(self):
         """Step queued on slot 1 returns slot 0."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=0))
         assert state.free_slot_id() == 0
 
     def test_both_slots_in_use_returns_none(self):
@@ -112,11 +112,11 @@ class TestSlotSelection:
         state = PipelineState()
 
         # Launch and complete sampling on slot 0
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
         # Launch forward on slot 1
-        state.on_forward_launched(make_forward_handle(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
 
         # Both slots in use: slot 0 in queue, slot 1 in forward
         assert state.free_slot_id() is None
@@ -126,26 +126,26 @@ class TestSlotSelection:
         state = PipelineState()
 
         # Step on slot 0
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
         # Step on slot 1
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=1))
 
         assert state.free_slot_id() is None
 
-    def test_completing_step_blocks_slot(self):
+    def test_committing_step_blocks_slot(self):
         """Slot remains in-use while step is completing."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
         assert state.free_slot_id() == 1
 
-        # Pop moves to completing_step, slot still in use
+        # Pop moves to committing_step, slot still in use
         state.pop_oldest()
-        assert state.completing_step is not None
+        assert state.committing_step is not None
         assert state.free_slot_id() == 1  # slot 0 still blocked
 
         # Complete frees the slot
@@ -156,8 +156,8 @@ class TestSlotSelection:
         """Slot becomes free only after on_step_completed()."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
         # Pop but don't complete - slot still blocked
         state.pop_oldest()
@@ -171,38 +171,38 @@ class TestSlotSelection:
 class TestTwoPhaseCompletion:
     """Tests for the two-phase completion model (pop_oldest + on_step_completed)."""
 
-    def test_pop_oldest_sets_completing_step(self):
-        """pop_oldest() moves step to completing_step."""
+    def test_pop_oldest_sets_committing_step(self):
+        """pop_oldest() moves step to committing_step."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=42))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=42))
 
         step = state.pop_oldest()
         assert step is not None
         assert step.transfer.step_id == 42
-        assert state.completing_step is step
+        assert state.committing_step is step
         assert state.queue_depth() == 0
 
-    def test_on_step_completed_clears_completing_step(self):
-        """on_step_completed() clears completing_step."""
+    def test_on_step_completed_clears_committing_step(self):
+        """on_step_completed() clears committing_step."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
         state.pop_oldest()
 
-        assert state.completing_step is not None
+        assert state.committing_step is not None
         state.on_step_completed()
-        assert state.completing_step is None
+        assert state.committing_step is None
 
     def test_pop_oldest_twice_without_complete_raises(self):
         """Cannot pop again while a step is completing."""
         state = PipelineState()
 
         # Queue two steps
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=1))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=1))
 
         # Pop first
         state.pop_oldest()
@@ -218,11 +218,11 @@ class TestTwoPhaseCompletion:
         with pytest.raises(AssertionError, match="no step is currently being completed"):
             state.on_step_completed()
 
-    def test_drain_all_with_completing_step_raises(self):
+    def test_drain_all_with_committing_step_raises(self):
         """Cannot drain while a step is completing."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
         state.pop_oldest()
 
         with pytest.raises(AssertionError, match="step is currently being completed"):
@@ -236,9 +236,9 @@ class TestFIFOCompletion:
         """Single step can be popped."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
         step = make_step(slot_id=0, step_id=42)
-        state.on_sampling_complete(step)
+        state.on_pending_commit(step)
 
         popped = state.pop_oldest()
         assert popped is not None
@@ -249,12 +249,12 @@ class TestFIFOCompletion:
         state = PipelineState()
 
         # Launch step 0 on slot 0
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
         # Launch step 1 on slot 1
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=1))
 
         # Pop should return step 0 first (oldest)
         step_0 = state.pop_oldest()
@@ -285,8 +285,8 @@ class TestFIFOCompletion:
         """Peek returns oldest without removing."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
         peeked = state.peek_oldest()
         assert peeked is not None
@@ -294,7 +294,7 @@ class TestFIFOCompletion:
 
         # Still in queue
         assert state.queue_depth() == 1
-        assert state.completing_step is None
+        assert state.committing_step is None
 
         # Pop returns same step
         popped = state.pop_oldest()
@@ -315,123 +315,123 @@ class TestSlotAssertions:
         state = PipelineState()
 
         # Put slot 0 in the queue
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
 
         # Try to launch on slot 0 again
         with pytest.raises(AssertionError, match="slot 0 is in use"):
-            state.on_forward_launched(make_forward_handle(slot_id=0))
+            state.on_launch(make_launch_handle(slot_id=0))
 
     def test_launch_on_completing_slot_raises(self):
         """Launching forward on a completing slot raises."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
-        state.pop_oldest()  # slot 0 now in completing_step
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
+        state.pop_oldest()  # slot 0 now in committing_step
 
         # Try to launch on slot 0
         with pytest.raises(AssertionError, match="slot 0 is in use"):
-            state.on_forward_launched(make_forward_handle(slot_id=0))
+            state.on_launch(make_launch_handle(slot_id=0))
 
-    def test_slot_mismatch_on_sampling_complete_raises(self):
+    def test_slot_mismatch_on_pending_commit_raises(self):
         """Mismatched slot_id on sampling complete raises."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
 
         # Try to complete with wrong slot_id
         with pytest.raises(AssertionError, match="Slot mismatch"):
-            state.on_sampling_complete(make_step(slot_id=1))
+            state.on_pending_commit(make_step(slot_id=1))
 
 
 class TestStateTransitions:
     """Tests for state transition methods."""
 
-    def test_on_forward_launched_sets_handle(self):
-        """on_forward_launched stores the handle."""
+    def test_on_launch_sets_handle(self):
+        """on_launch stores the handle."""
         state = PipelineState()
-        handle = make_forward_handle(slot_id=0)
-        state.on_forward_launched(handle)
+        handle = make_launch_handle(slot_id=0)
+        state.on_launch(handle)
 
-        assert state.forward_handle is handle
-        assert state.has_forward_in_flight()
+        assert state.launch_handle is handle
+        assert state.has_launch_in_flight()
 
-    def test_on_forward_launched_twice_raises(self):
+    def test_on_launch_twice_raises(self):
         """Launching forward twice without sampling raises."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
 
         with pytest.raises(AssertionError, match="already in-flight"):
-            state.on_forward_launched(make_forward_handle(slot_id=1))
+            state.on_launch(make_launch_handle(slot_id=1))
 
-    def test_on_sampling_complete_clears_handle(self):
-        """on_sampling_complete clears forward_handle and adds to queue."""
+    def test_on_pending_commit_clears_handle(self):
+        """on_pending_commit clears launch_handle and adds to queue."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
 
         step = make_step(slot_id=0, step_id=0)
-        state.on_sampling_complete(step)
+        state.on_pending_commit(step)
 
-        assert state.forward_handle is None
-        assert not state.has_forward_in_flight()
+        assert state.launch_handle is None
+        assert not state.has_launch_in_flight()
         assert state.queue_depth() == 1
 
-    def test_on_sampling_complete_without_forward_raises(self):
+    def test_on_pending_commit_without_forward_raises(self):
         """Completing sampling without forward raises."""
         state = PipelineState()
 
         with pytest.raises(AssertionError, match="no forward is in-flight"):
-            state.on_sampling_complete(make_step(slot_id=0))
+            state.on_pending_commit(make_step(slot_id=0))
 
 
 class TestQueryMethods:
     """Tests for query/introspection methods."""
 
-    def test_can_launch_forward_empty(self):
+    def test_can_launch_empty(self):
         """Can launch forward on empty pipeline."""
         state = PipelineState()
-        assert state.can_launch_forward()
+        assert state.can_launch()
 
-    def test_can_launch_forward_with_queued_step(self):
+    def test_can_launch_with_queued_step(self):
         """Can launch forward when queue has one step."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
-        assert state.can_launch_forward()
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
+        assert state.can_launch()
 
     def test_cannot_launch_forward_with_forward_in_flight(self):
         """Cannot launch forward when forward already in-flight."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        assert not state.can_launch_forward()
+        state.on_launch(make_launch_handle(slot_id=0))
+        assert not state.can_launch()
 
     def test_cannot_launch_forward_both_slots_busy(self):
         """Cannot launch forward when both slots busy."""
         state = PipelineState()
 
         # Fill both slots in queue
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1))
 
-        assert not state.can_launch_forward()
+        assert not state.can_launch()
 
     def test_total_in_flight_counts_correctly(self):
         """total_in_flight counts queue + forward (not completing)."""
         state = PipelineState()
         assert state.total_in_flight() == 0
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
         assert state.total_in_flight() == 1
 
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
         assert state.total_in_flight() == 1  # in queue now
 
-        state.on_forward_launched(make_forward_handle(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
         assert state.total_in_flight() == 2
 
-        state.on_sampling_complete(make_step(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1))
         assert state.total_in_flight() == 2
 
         state.pop_oldest()
@@ -449,14 +449,14 @@ class TestQueryMethods:
         state = PipelineState()
         assert state.is_empty()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
         assert not state.is_empty()
 
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
         assert not state.is_empty()
 
         state.pop_oldest()
-        assert not state.is_empty()  # completing_step is set
+        assert not state.is_empty()  # committing_step is set
 
         state.on_step_completed()
         assert state.is_empty()
@@ -475,10 +475,10 @@ class TestDrainAll:
         state = PipelineState()
 
         # Add two steps
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=1))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=1))
 
         steps = state.drain_all()
         assert len(steps) == 2
@@ -488,24 +488,24 @@ class TestDrainAll:
     def test_drain_clears_queue(self):
         """drain_all clears the queue."""
         state = PipelineState()
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
 
         state.drain_all()
         assert state.queue_depth() == 0
         assert state.pop_oldest() is None
 
-    def test_drain_does_not_affect_forward_handle(self):
-        """drain_all only drains queue, not forward_handle."""
+    def test_drain_does_not_affect_launch_handle(self):
+        """drain_all only drains queue, not launch_handle."""
         state = PipelineState()
 
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0))
-        state.on_forward_launched(make_forward_handle(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
 
         steps = state.drain_all()
         assert len(steps) == 1
-        assert state.forward_handle is not None  # still has forward
+        assert state.launch_handle is not None  # still has forward
 
 
 class TestPingPongScenarios:
@@ -526,8 +526,8 @@ class TestPingPongScenarios:
             # Launch next step
             slot_id = state.free_slot_id()
             assert slot_id == expected_slot
-            state.on_forward_launched(make_forward_handle(slot_id=slot_id))
-            state.on_sampling_complete(make_step(slot_id=slot_id, step_id=step_num))
+            state.on_launch(make_launch_handle(slot_id=slot_id))
+            state.on_pending_commit(make_step(slot_id=slot_id, step_id=step_num))
 
     def test_constrained_path_single_queue_depth(self):
         """Constrained path: commit before finalizing limits queue depth."""
@@ -536,13 +536,13 @@ class TestPingPongScenarios:
         for step_num in range(5):
             # Launch forward
             slot_id = state.free_slot_id()
-            state.on_forward_launched(make_forward_handle(slot_id=slot_id))
+            state.on_launch(make_launch_handle(slot_id=slot_id))
 
             # Constrained path: commit oldest before finalizing
             if step := state.pop_oldest():
                 state.on_step_completed()
 
-            state.on_sampling_complete(make_step(slot_id=slot_id, step_id=step_num))
+            state.on_pending_commit(make_step(slot_id=slot_id, step_id=step_num))
 
             # Queue depth should be at most 1 with constrained path
             assert state.queue_depth() <= 1
@@ -552,11 +552,11 @@ class TestPingPongScenarios:
         state = PipelineState()
 
         # Launch and finalize two steps without committing
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
 
-        state.on_forward_launched(make_forward_handle(slot_id=1))
-        state.on_sampling_complete(make_step(slot_id=1, step_id=1))
+        state.on_launch(make_launch_handle(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1, step_id=1))
 
         assert state.queue_depth() == 2
         assert state.free_slot_id() is None
@@ -571,19 +571,19 @@ class TestPingPongScenarios:
         state = PipelineState()
 
         # Build up some state
-        state.on_forward_launched(make_forward_handle(slot_id=0))
-        state.on_sampling_complete(make_step(slot_id=0, step_id=0))
-        state.on_forward_launched(make_forward_handle(slot_id=1))
+        state.on_launch(make_launch_handle(slot_id=0))
+        state.on_pending_commit(make_step(slot_id=0, step_id=0))
+        state.on_launch(make_launch_handle(slot_id=1))
 
         # Prefill wanted: drain queue first
         steps = state.drain_all()
         assert len(steps) == 1
 
-        # Then handle forward (would call finalize_sampling and complete_step)
-        assert state.forward_handle is not None
+        # Then handle forward (would call finalize_sampling and commit_step)
+        assert state.launch_handle is not None
 
         # Simulate completing the forward
-        state.on_sampling_complete(make_step(slot_id=1))
+        state.on_pending_commit(make_step(slot_id=1))
         state.pop_oldest()
         state.on_step_completed()
 
