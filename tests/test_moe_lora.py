@@ -785,128 +785,6 @@ class TestSingleLoRA:
                     f"lora_id {i} and {j} should produce different outputs"
 
 
-class TestWorkspaceMode:
-    """Test workspace mode switching for prefill/decode."""
-
-    def test_set_prefill_mode(self, device, dtype):
-        """Test that set_prefill_mode sets single_lora_id on all MoE layers."""
-        from kestrel.moondream.config import TextConfig, TextMoeConfig
-        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
-
-        moe_config = TextMoeConfig(
-            num_experts=8,
-            experts_per_token=2,
-            expert_inner_dim=256,
-            start_layer=2,
-        )
-        text_config = TextConfig(
-            dim=512,
-            ff_dim=1024,
-            n_heads=8,
-            n_kv_heads=4,
-            n_layers=4,
-            vocab_size=32000,
-            moe=moe_config,
-        )
-
-        workspace = TextLoRAWorkspace(
-            text_config=text_config,
-            max_slots=4,
-            max_rank=8,
-            device=device,
-            dtype=dtype,
-        )
-
-        # Initially should be None (decode mode)
-        for layer in workspace.moe:
-            assert layer.single_lora_id is None
-
-        # Set prefill mode for slot 2
-        workspace.set_prefill_mode(lora_slot=2)
-
-        # All MoE layers should have single_lora_id = 1 (slot 2 -> lora_id 1)
-        for layer in workspace.moe:
-            assert layer.single_lora_id == 1
-
-    def test_set_decode_mode(self, device, dtype):
-        """Test that set_decode_mode clears single_lora_id."""
-        from kestrel.moondream.config import TextConfig, TextMoeConfig
-        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
-
-        moe_config = TextMoeConfig(
-            num_experts=8,
-            experts_per_token=2,
-            expert_inner_dim=256,
-            start_layer=2,
-        )
-        text_config = TextConfig(
-            dim=512,
-            ff_dim=1024,
-            n_heads=8,
-            n_kv_heads=4,
-            n_layers=4,
-            vocab_size=32000,
-            moe=moe_config,
-        )
-
-        workspace = TextLoRAWorkspace(
-            text_config=text_config,
-            max_slots=4,
-            max_rank=8,
-            device=device,
-            dtype=dtype,
-        )
-
-        # Set prefill mode first
-        workspace.set_prefill_mode(lora_slot=3)
-        for layer in workspace.moe:
-            assert layer.single_lora_id == 2
-
-        # Switch to decode mode
-        workspace.set_decode_mode()
-
-        # All should be None now
-        for layer in workspace.moe:
-            assert layer.single_lora_id is None
-
-    def test_prefill_mode_validates_slot(self, device, dtype):
-        """Test that set_prefill_mode validates the slot."""
-        from kestrel.moondream.config import TextConfig, TextMoeConfig
-        from kestrel.moondream.lora_workspace import TextLoRAWorkspace
-
-        moe_config = TextMoeConfig(
-            num_experts=8,
-            experts_per_token=2,
-            expert_inner_dim=256,
-            start_layer=2,
-        )
-        text_config = TextConfig(
-            dim=512,
-            ff_dim=1024,
-            n_heads=8,
-            n_kv_heads=4,
-            n_layers=4,
-            vocab_size=32000,
-            moe=moe_config,
-        )
-
-        workspace = TextLoRAWorkspace(
-            text_config=text_config,
-            max_slots=4,
-            max_rank=8,
-            device=device,
-            dtype=dtype,
-        )
-
-        # Slot 0 should raise
-        with pytest.raises(ValueError, match="Slot 0 is reserved"):
-            workspace.set_prefill_mode(lora_slot=0)
-
-        # Out of range slot should raise
-        with pytest.raises(ValueError, match="out of range"):
-            workspace.set_prefill_mode(lora_slot=10)
-
-
 class TestMoELoRACudaGraph:
     """Test MoE LoRA kernel with CUDA graph capture."""
 
@@ -1329,7 +1207,6 @@ class TestLoRAStream:
 
         lora_slot_ids = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0], dtype=torch.int32, device=device)
 
-        lora_workspace.single_lora_id = None
         lora_workspace.stream = None
         out_default = moe(
             hidden_states,

@@ -187,6 +187,7 @@ def text_decoder(
     fa3_seqused_k: torch.Tensor | None = None,
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
+    single_lora_id: int | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
@@ -217,6 +218,7 @@ def text_decoder(
                 mode=mode,
                 lora_workspace=moe_workspace,
                 lora_slot_ids=lora_slot_ids,
+                single_lora_id=single_lora_id,
             )
         else:
             mlp_weights = MLPWeights(

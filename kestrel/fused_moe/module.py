@@ -467,8 +467,16 @@ class FusedMoEModule(nn.Module):
         topk_ids: torch.Tensor,
         lora_workspace: MoELoRALayerWorkspace | None = None,
         lora_slot_ids: torch.Tensor | None = None,
+        single_lora_id: int | None = None,
     ) -> torch.Tensor:
-        return self.forward(hidden_states, topk_weights, topk_ids, lora_workspace, lora_slot_ids)
+        return self.forward(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            lora_workspace,
+            lora_slot_ids,
+            single_lora_id,
+        )
 
     @torch_compiler_disable()
     def forward(
@@ -478,6 +486,7 @@ class FusedMoEModule(nn.Module):
         topk_ids: torch.Tensor,
         lora_workspace: MoELoRALayerWorkspace | None = None,
         lora_slot_ids: torch.Tensor | None = None,
+        single_lora_id: int | None = None,
     ) -> torch.Tensor:
         if hidden_states.device.type != "cuda":
             raise ValueError("Fused MoE backend only supports CUDA tensors")
@@ -575,7 +584,7 @@ class FusedMoEModule(nn.Module):
 
         compute_type = dtype_to_triton(hidden_states.dtype)
 
-        # LoRA handling: dispatch based on workspace mode
+        # LoRA handling: dispatch based on call-local mode
         #
         # Single-LoRA mode (prefill): Use standard moe_align_block_size routing
         # with apply_moe_lora_single. No Z dimension overhead.
@@ -588,12 +597,12 @@ class FusedMoEModule(nn.Module):
         use_single_lora = (
             lora_workspace is not None
             and lora_slot_ids is not None
-            and lora_workspace.single_lora_id is not None
+            and single_lora_id is not None
         )
         use_batched_lora = (
             lora_workspace is not None
             and lora_slot_ids is not None
-            and lora_workspace.single_lora_id is None
+            and single_lora_id is None
         )
         lora_stream = lora_workspace.stream if use_batched_lora else None
         compute_stream = torch.cuda.current_stream()
@@ -711,7 +720,7 @@ class FusedMoEModule(nn.Module):
                 sorted_token_ids=lora_sorted,
                 expert_ids=lora_expert_ids,
                 num_tokens_post_padded=lora_num_tokens,
-                lora_id=lora_workspace.single_lora_id,
+                lora_id=single_lora_id,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
@@ -810,7 +819,7 @@ class FusedMoEModule(nn.Module):
                 sorted_token_ids=lora_sorted,
                 expert_ids=lora_expert_ids,
                 num_tokens_post_padded=lora_num_tokens,
-                lora_id=lora_workspace.single_lora_id,
+                lora_id=single_lora_id,
                 top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
                 num_experts=self.num_experts,
                 block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
@@ -1101,4 +1110,3 @@ class FusedMoEModule(nn.Module):
         if backend == "auto":
             return "triton" if num_tokens >= self.config.auto_backend_token_threshold else "cute"
         return backend
-
