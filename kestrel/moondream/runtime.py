@@ -894,6 +894,16 @@ class MoondreamRuntime:
             from_page_idx=cache_result.skip_positions,
         )
 
+        # Duplicate prefill: another sequence inserted the full prompt before we did.
+        # In this case, inserted_pages == 0 and the cache already owns a different
+        # set of pages for the full prompt. Do NOT transfer the lock to that node
+        # (we didn't use those pages); keep the existing temp lock if we reused
+        # cached prefix pages, otherwise return no lock so our pages can be freed.
+        if insert_result.inserted_pages == 0:
+            if cache_result.temp_lock_node is None:
+                return None, 0
+            return cache_result.temp_lock_node, cache_result.skip_positions
+
         # Lock transfer
         temp_lock_node = cache_result.temp_lock_node
         if temp_lock_node is None:

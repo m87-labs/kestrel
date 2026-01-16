@@ -1645,6 +1645,7 @@ Scheduler loop:
 Since step 4 completes before the next request's step 2, there's no window for duplicate prefills. Request B will always see A's cached result.
 
 **Note**: If Kestrel later adds parallel prefills (multiple prefills running concurrently), this assumption would break. In that case, the design would need explicit handling for the case where `insert()` finds an existing node - the duplicate's pages should be freed rather than claimed as cache-owned.
+Kestrel now handles this by treating `inserted_pages == 0` as a duplicate prefill: it keeps the existing temp lock (if any) and returns `cache_owned_page_count = 0` so the duplicate’s pages are freed on release.
 
 ---
 
