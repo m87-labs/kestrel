@@ -273,7 +273,7 @@ class DecodeSlot:
 
 In constrained mode, forward runs ahead and sampling is delayed until mask computation completes. Forward outputs (`logits`, `hidden_last`) must remain valid until `finalize_sampling()` consumes them.
 
-- **Invariant:** Forward outputs live in per-slot buffers (`slot.logits`, `slot.hidden_last`). `LaunchHandle` contains only `(slot_id, sequences)` — sampling looks up outputs via `decode_slots[handle.slot_id]`.
+- **Invariant:** Forward outputs live in per-slot buffers (`slot.logits`, `slot.hidden_last`). `LaunchHandle` carries `(kind, sequences, payload)`; for decode the payload contains `slot_id`, and sampling looks up outputs via `decode_slots[handle.slot_id]`.
 - **Invariant:** No new forward may run on a slot until any pending sampling for that slot has completed. This is enforced by the slot allocation logic: a slot is "in use" while `launch_handle` or any `PendingCommit` in `batch_queue` references it.
 
 **Decode compute stream topology (hard invariant):**
@@ -374,7 +374,7 @@ If sampling is also graph-captured, use a separate graph with `slot.logits` and 
 
 **Slot selection via bitmask (not identity comparison):**
 
-Each `PendingCommit` and `LaunchHandle` stores a `slot_id: int` (0 or 1) rather than a reference to the `DecodeSlot` object. This enables simple bitmask-based allocation:
+Each decode `PendingCommit` and decode `LaunchHandle` stores a `slot_id: int` in its payload rather than a reference to the `DecodeSlot` object. This enables simple bitmask-based allocation:
 
 ```
 Ping-pong with 2-slot queue:
@@ -670,7 +670,7 @@ This eliminates `CompletedStepInfo`, `apply_zombies()`, `zombie_seq_ids`, and `r
 
 Track each scheduled step in a `PendingCommit` record:
   - `sequences: list[ScheduledSequence]`
-  - `slot_id: int` (0 or 1, which ping-pong slot this step used)
+  - `payload.slot_id: int` (0 or 1, which ping-pong slot this step used)
   - `transfer: TransferHandle`
 
 **Row order invariant:** `PendingCommit.sequences[i]` corresponds to row `i` in the render/staging buffers for that step. This mapping is implicit (no separate `row_of_seq` needed) because:
@@ -715,14 +715,14 @@ Decode and prefill have separate APIs. This makes Phase 2's "prefill only when d
   - **Increments `seq.inflight_refs` for each sequence in the plan.** This is the commit point—refcounts are only mutated when the step is actually launched.
   - Runs FlashInfer `plan()` and model forward on GPU using `decode_slots[slot_id].compute_stream`.
   - **Calls `seq.state.advance()` immediately after dispatching forward**, before returning. This updates KV length for next-step attention indexing.
-  - Returns immediately with a `LaunchHandle` containing `slot_id` and `sequences`.
+  - Returns immediately with a `LaunchHandle(kind="decode")` whose payload carries `slot_id`.
   - **Error handling:** See §4.8 for the exception model.
 
 - `finalize_sampling(handle: LaunchHandle, mask: torch.Tensor | None) -> PendingCommit`
   - Launches sampling kernel on `decode_slots[handle.slot_id].compute_stream` (stream ordering ensures forward completes first).
   - If `mask` is provided, applies token constraints; if `None`, samples without constraints.
   - Records `step_done_event` (after all GPU writes: sampling + spatial decode + staging) and kicks off non-blocking D2H copy via `slot.render.start_transfer(ready_event=step_done_event, ...)`.
-  - Returns `PendingCommit` containing `slot_id`, `sequences`, and `transfer` handle.
+  - Returns `PendingCommit(kind="decode")` whose payload carries `slot_id`, plus `sequences` and `transfer`.
 
 - `commit_step(inflight) -> None`
   - **Owns the `wait()` call.** Blocks until D2H transfer completes by calling `inflight.transfer.wait()` internally. Callers never call `wait()` directly—this ensures wait ownership is centralized and prevents double-wait bugs.
@@ -1220,7 +1220,7 @@ def launch_forward_async(self, plan: StepPlan, slot_id: int) -> LaunchHandle:
         gpu_work_started = True
         slot.flashinfer_ctx.plan(...)  # H2D copies enqueued
         # ... forward launch ...
-        return LaunchHandle(slot_id, ...)
+        return LaunchHandle(kind="decode", sequences=..., payload=DecodeLaunch(slot_id=slot_id))
 
     except Exception as e:
         if gpu_work_started:

@@ -148,6 +148,16 @@ class SequenceState:
     def output_length(self) -> int:
         return self.length - (self.prompt_length or 0)
 
+
+@dataclass
+class PrefillSlot:
+    """Per-prefill slot resources.
+
+    Currently only holds the batch_idx tensor used to bind paged KV writes.
+    """
+
+    batch_idx: Tensor
+
     def mark_prefilled(self, prompt_len: int) -> None:
         self.prompt_length = prompt_len
         self.length = prompt_len
@@ -431,16 +441,18 @@ class MoondreamRuntime:
         self._lora_stream = torch.cuda.Stream(device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
 
-        self._active_prefill_batch_idx: Optional[Tensor] = None
-
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
         self._batch_binding: _BatchBinding = _BatchBinding()
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
-        self._prefill_batch_idx = torch.empty(
-            (1,), dtype=torch.int64, device=self.device
-        )
+        self._prefill_slots: list[PrefillSlot] = [
+            PrefillSlot(
+                batch_idx=torch.empty(
+                    (1,), dtype=torch.int64, device=self.device
+                )
+            )
+        ]
 
         for cache in self.layer_caches:
             cache.attach_batch_binding(self._batch_binding)
@@ -984,7 +996,8 @@ class MoondreamRuntime:
         batch_idx = self.page_table.allocate()
         # GPU-only buffer avoids async H2D races on shared pinned host memory.
         # Fill runs on primary stream to synchronize with page table H2D copies.
-        batch_tensor = self._prefill_batch_idx
+        prefill_slot = self._prefill_slots[0]
+        batch_tensor = prefill_slot.batch_idx
         with torch.cuda.stream(self._primary_stream):
             batch_tensor.fill_(batch_idx)
 
@@ -1019,18 +1032,15 @@ class MoondreamRuntime:
                     )
 
                 # 9. Run prefill
-                self._active_prefill_batch_idx = batch_tensor
-                try:
-                    hidden, logits = self._prefill(
-                        inputs_embeds,
-                        None,  # attention_mask
-                        position_ids,
-                        lora_slot,
-                        use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
-                        fa3_seqused_k=fa3_seqused_k,
-                    )
-                finally:
-                    self._active_prefill_batch_idx = None
+                hidden, logits = self._prefill(
+                    inputs_embeds,
+                    None,  # attention_mask
+                    position_ids,
+                    lora_slot,
+                    batch_idx=batch_tensor,
+                    use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
+                    fa3_seqused_k=fa3_seqused_k,
+                )
 
             # 10. Finalize cache (insert + lock transfer)
             cache_lock_node, cache_owned_page_count = self._finalize_cache_after_prefill(
@@ -1088,6 +1098,7 @@ class MoondreamRuntime:
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
         lora_slot: int = 0,
+        batch_idx: Tensor | None = None,
         *,
         use_prefix_attn: bool,
         fa3_seqused_k: Tensor,
@@ -1097,6 +1108,7 @@ class MoondreamRuntime:
             attn_mask,
             position_ids,
             lora_slot,
+            batch_idx=batch_idx,
             use_prefix_attn=use_prefix_attn,
             fa3_seqused_k=fa3_seqused_k,
         )
@@ -1108,11 +1120,11 @@ class MoondreamRuntime:
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
         lora_slot: int = 0,
+        batch_idx: Tensor | None = None,
         *,
         use_prefix_attn: bool,
         fa3_seqused_k: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        batch_idx = self._active_prefill_batch_idx
         if batch_idx is None:
             raise RuntimeError("Prefill batch index missing during warmup")
         slot_mapping = self.page_table.build_slot_mapping(
