@@ -146,7 +146,9 @@ class RadixPrefixCache(BasePrefixCache):
                 match_len += 1
 
             if match_len < len(child_tokens):
-                # Partial match - split the node
+                # Partial match - split the node unless it's locked.
+                if child.lock_ref > 0:
+                    break
                 child = self._split_node(child, match_len)
 
             # Accumulate matched pages
@@ -255,7 +257,9 @@ class RadixPrefixCache(BasePrefixCache):
                 match_len += 1
 
             if match_len < len(child_tokens):
-                # Partial match - split the node
+                # Partial match - split the node unless it's locked.
+                if child.lock_ref > 0:
+                    return InsertResult(node=current_node, inserted_pages=0)
                 child = self._split_node(child, match_len)
 
             # Advance past matched tokens
@@ -404,6 +408,7 @@ class RadixPrefixCache(BasePrefixCache):
             The new prefix parent node.
         """
         assert 0 < split_at < len(node.tokens), "Invalid split position"
+        assert node.lock_ref == 0, "Cannot split locked node"
 
         # Calculate page split point
         page_split = sum(t.kv_length() for t in node.tokens[:split_at])
