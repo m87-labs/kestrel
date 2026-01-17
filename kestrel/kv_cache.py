@@ -269,13 +269,15 @@ class PageTable:
         ] = allocated_pages_cpu
         self._sync_page_table_row(batch_idx_int, start_page_idx, end_page_idx)
 
-        # update metadata
-        allocated_pages_idx = allocated_pages_cpu.to(device=self.device, dtype=torch.long)
-        self.physical_to_logical[batch_idx, allocated_pages_idx] = torch.arange(
-            start_page_idx,
-            end_page_idx,
-            device=self.device,
-        )
+        with _maybe_stream_context(self._h2d_stream):
+            allocated_pages_idx = allocated_pages_cpu.to(
+                device=self.device, dtype=torch.long
+            )
+            self.physical_to_logical[batch_idx, allocated_pages_idx] = torch.arange(
+                start_page_idx,
+                end_page_idx,
+                device=self.device,
+            )
         # update cpu side metadata
         self.page_table_cpu[batch_idx_int] += allocated_pages_list
         self.free_pages = self.free_pages[:-num_pages_to_allocate]
@@ -487,11 +489,11 @@ class PageTable:
         # Sync to GPU
         self._sync_page_table_row(batch_idx, start=logical_start, end=end)
 
-        # Update physical_to_logical mapping
-        pages_gpu = pages_tensor.to(device=self.device, dtype=torch.long)
-        self.physical_to_logical[batch_idx, pages_gpu] = torch.arange(
-            logical_start, end, device=self.device
-        )
+        with _maybe_stream_context(self._h2d_stream):
+            pages_gpu = pages_tensor.to(device=self.device, dtype=torch.long)
+            self.physical_to_logical[batch_idx, pages_gpu] = torch.arange(
+                logical_start, end, device=self.device
+            )
 
         # Update capacity to cover all mapped pages
         new_capacity = end * self.page_size
