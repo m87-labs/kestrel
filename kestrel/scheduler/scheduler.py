@@ -19,7 +19,6 @@ from kestrel.moondream.runtime import (
 from kestrel.moondream.lora import AdapterProvider
 from kestrel.skills import (
     QuerySkill,
-    SegmentRequest,
     SkillRegistry,
     SkillState,
 )
@@ -44,7 +43,7 @@ from .pipeline import (
 )
 from .sampling import sample_tokens
 from .transfer import RenderBuffer
-from .tokens import prompt_with_spatial_tokens, render_tokens_from_packed
+from .tokens import render_tokens_from_packed
 from .spatial import compute_spatial_values
 
 
@@ -465,24 +464,8 @@ class GenerationScheduler:
             if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
                 lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
 
-            # If this is a segmentation request with spatial refs, convert
-            # placeholder coord/size ids into typed CoordToken/SizeToken
-            # so the runtime embeds region features during prefill.
             try:
-                prompt_inputs: Tensor | list[Token]
-                ctx = request.request_context
-                if isinstance(ctx, SegmentRequest) and ctx.spatial_refs:
-                    prompt_inputs = prompt_with_spatial_tokens(
-                        request.prompt_tokens,
-                        self._coord_id,
-                        self._size_id,
-                        ctx.spatial_refs,
-                    )
-                else:
-                    tokens = request.prompt_tokens.view(1, -1).to(
-                        device=self.runtime.device, dtype=torch.long
-                    )
-                    prompt_inputs = tokens
+                prompt_inputs = request.prompt_tokens
                 prefill_start = time.perf_counter()
                 lifecycle.prefill_started_at = prefill_start
                 lifecycle.transition(RequestPhase.PREFILLING)

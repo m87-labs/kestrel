@@ -173,8 +173,7 @@ class EngineStream(AsyncIterator[StreamUpdate]):
 class _PendingRequest:
     request_id: int
     prompt: str
-    prompt_tokens: torch.Tensor
-    prompt_length: int
+    prompt_tokens: Sequence[Token]
     image: Optional[pyvips.Image | np.ndarray]
     image_hash: Optional[bytes]  # SHA256 hash for prefix caching
     max_new_tokens: int
@@ -831,14 +830,11 @@ class InferenceEngine:
             image_obj = image
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)
-        tokens = skill_spec.build_prompt_tokens(self.runtime, request_context)
-
-        tokens_cpu = tokens.to(device="cpu", dtype=torch.long)
+        tokens = list(skill_spec.build_prompt_tokens(self.runtime, request_context))
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt_str,
-            prompt_tokens=tokens_cpu,
-            prompt_length=tokens_cpu.shape[1],
+            prompt_tokens=tokens,
             image=image_obj,
             image_hash=None,  # Computed in scheduler thread if prefix cache enabled
             max_new_tokens=max_new_tokens,
@@ -1050,7 +1046,7 @@ class InferenceEngine:
                 req.image_hash = image_hash
 
                 # Early cache lookup - skip crop computation if cache hit
-                tokens_list = runtime._normalize_prompt_tokens(req.prompt_tokens)
+                tokens_list = list(req.prompt_tokens)
                 if runtime.check_prefix_cache(tokens_list, image_hash, req.adapter):
                     admit_request(req, None, prefix_cache_hit=True)  # No crops needed
                     return

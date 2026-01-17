@@ -656,19 +656,6 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # start_sequence helpers
 
-    def _normalize_prompt_tokens(
-        self, prompt_tokens: Tensor | Sequence[Token]
-    ) -> list[Token]:
-        """Convert prompt_tokens to a list of Token objects."""
-        if isinstance(prompt_tokens, Tensor):
-            tokens_view = prompt_tokens.to(device=self.device, dtype=torch.long)
-            if tokens_view.ndim != 2:
-                raise ValueError(
-                    f"prompt_tokens must have shape (1, N); received {tokens_view.shape}"
-                )
-            return [TextToken(int(tid)) for tid in tokens_view[0].tolist()]
-        return list(prompt_tokens)
-
     def check_prefix_cache(
         self,
         tokens_list: list[Token],
@@ -942,7 +929,7 @@ class MoondreamRuntime:
 
     def start_sequence(
         self,
-        prompt_tokens: Tensor | Sequence[Token],
+        prompt_tokens: Sequence[Token],
         *,
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
@@ -952,7 +939,7 @@ class MoondreamRuntime:
         adapter_id: str | None = None,
     ) -> tuple[SequenceState, Tensor]:
         # 1. Normalize inputs
-        tokens_list = self._normalize_prompt_tokens(prompt_tokens)
+        tokens_list = list(prompt_tokens)
 
         # 2. Validate image/hash consistency
         if image is None:
