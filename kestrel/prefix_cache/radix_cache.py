@@ -26,6 +26,7 @@ class TreeNode:
     tokens: tuple[CacheToken, ...] = ()
     physical_pages: tuple[int, ...] = ()
     lock_ref: int = 0
+    prefill_lock_ref: int = 0
     last_access_time: float = 0.0
     heap_version: int = 0
     namespace: CacheNamespace | None = None  # Only set on root nodes
@@ -147,7 +148,7 @@ class RadixPrefixCache(BasePrefixCache):
 
             if match_len < len(child_tokens):
                 # Partial match - split the node unless it's locked.
-                if child.lock_ref > 0:
+                if child.prefill_lock_ref > 0:
                     break
                 child = self._split_node(child, match_len)
 
@@ -258,7 +259,7 @@ class RadixPrefixCache(BasePrefixCache):
 
             if match_len < len(child_tokens):
                 # Partial match - split the node unless it's locked.
-                if child.lock_ref > 0:
+                if child.prefill_lock_ref > 0:
                     return InsertResult(node=current_node, inserted_pages=0)
                 child = self._split_node(child, match_len)
 
@@ -309,6 +310,19 @@ class RadixPrefixCache(BasePrefixCache):
             current.lock_ref += 1
             current = current.parent
 
+    def lock_prefill(self, node: TreeNode | None) -> None:
+        """Prevent mutation of node and all ancestors during prefill.
+
+        Increments prefill_lock_ref up the ancestor chain.
+        """
+        if node is None:
+            return
+
+        current: TreeNode | None = node
+        while current is not None:
+            current.prefill_lock_ref += 1
+            current = current.parent
+
     def unlock(self, node: TreeNode | None) -> None:
         """Release eviction lock on node and all ancestors.
 
@@ -328,7 +342,25 @@ class RadixPrefixCache(BasePrefixCache):
             current = current.parent
 
         # Add leaf to eviction heap if now evictable
-        if node.is_leaf() and node.lock_ref == 0 and node.parent is not None:
+        if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
+            self._eviction_policy.add(node)
+
+    def unlock_prefill(self, node: TreeNode | None) -> None:
+        """Release prefill mutation lock on node and all ancestors.
+
+        Decrements prefill_lock_ref up the ancestor chain. Asserts no underflow.
+        Adds leaf to eviction heap when fully unlocked.
+        """
+        if node is None:
+            return
+
+        current: TreeNode | None = node
+        while current is not None:
+            assert current.prefill_lock_ref > 0, "Prefill lock ref underflow"
+            current.prefill_lock_ref -= 1
+            current = current.parent
+
+        if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
             self._eviction_policy.add(node)
 
     def evict(self, needed_pages: int) -> int:
@@ -371,13 +403,13 @@ class RadixPrefixCache(BasePrefixCache):
                     del parent.children[first_key]
 
                 # If parent becomes a leaf, add to eviction heap
-                if parent.is_leaf() and parent.lock_ref == 0 and parent.parent is not None:
+                if parent.is_leaf() and self._is_evictable(parent) and parent.parent is not None:
                     self._eviction_policy.add(parent)
 
                 # Prune empty namespace roots
                 if parent.parent is None and parent.is_leaf() and parent.namespace is not None:
-                    assert parent.lock_ref == 0, (
-                        f"Namespace root has non-zero lock_ref ({parent.lock_ref}) during prune"
+                    assert self._is_evictable(parent), (
+                        "Namespace root has non-zero lock_ref/prefill_lock_ref during prune"
                     )
                     del self._trees[parent.namespace]
 
@@ -408,7 +440,7 @@ class RadixPrefixCache(BasePrefixCache):
             The new prefix parent node.
         """
         assert 0 < split_at < len(node.tokens), "Invalid split position"
-        assert node.lock_ref == 0, "Cannot split locked node"
+        assert node.prefill_lock_ref == 0, "Cannot split prefill-locked node"
 
         # Calculate page split point
         page_split = sum(t.kv_length() for t in node.tokens[:split_at])
@@ -424,6 +456,7 @@ class RadixPrefixCache(BasePrefixCache):
             tokens=prefix_tokens,
             physical_pages=prefix_pages,
             lock_ref=node.lock_ref,  # Inherit lock refs
+            prefill_lock_ref=node.prefill_lock_ref,
             last_access_time=node.last_access_time,
         )
 
@@ -446,7 +479,7 @@ class RadixPrefixCache(BasePrefixCache):
         node.heap_version += 1
 
         # Add suffix to eviction heap if eligible
-        if node.is_leaf() and node.lock_ref == 0:
+        if node.is_leaf() and self._is_evictable(node):
             self._eviction_policy.add(node)
 
         return new_parent
@@ -466,9 +499,13 @@ class RadixPrefixCache(BasePrefixCache):
         while stack:
             node = stack.pop()
             if node.is_leaf():
-                if node.lock_ref == 0 and node.parent is not None:
+                if self._is_evictable(node) and node.parent is not None:
                     leaves.append(node)
             else:
                 stack.extend(node.children.values())
 
         return leaves
+
+    @staticmethod
+    def _is_evictable(node: TreeNode) -> bool:
+        return node.lock_ref == 0 and node.prefill_lock_ref == 0

@@ -88,6 +88,24 @@ class BasePrefixCache(ABC):
         ...
 
     @abstractmethod
+    def lock_prefill(self, node: TreeNode | None) -> None:
+        """Prevent mutation of node and all ancestors during prefill.
+
+        Args:
+            node: Node to lock (None is a no-op).
+        """
+        ...
+
+    @abstractmethod
+    def unlock_prefill(self, node: TreeNode | None) -> None:
+        """Release prefill lock on node and all ancestors.
+
+        Args:
+            node: Node to unlock (None is a no-op).
+        """
+        ...
+
+    @abstractmethod
     def evict(self, needed_pages: int) -> int:
         """Evict unlocked leaves to free pages using LRU policy.
 

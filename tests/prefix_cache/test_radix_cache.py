@@ -164,7 +164,7 @@ class TestNodeSplitting:
         tokens = [MockToken(i) for i in range(4)]
         insert_result = cache.insert(tokens, [0, 1, 2, 3])
         locked_node = insert_result.node
-        cache.lock(locked_node)
+        cache.lock_prefill(locked_node)
 
         query = [MockToken(0), MockToken(1), MockToken(99)]
         cache.match_prefix(query)
