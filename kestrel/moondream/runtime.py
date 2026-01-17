@@ -774,7 +774,7 @@ class MoondreamRuntime:
 
             # Lock matched prefix during prefill
             temp_lock_node = match.last_node
-            self.prefix_cache.lock(temp_lock_node)
+            self.prefix_cache.lock_prefill(temp_lock_node)
 
         return _CacheLookupResult(
             match=match,
@@ -885,7 +885,11 @@ class MoondreamRuntime:
 
         if full_prompt_cached:
             # Full prompt was cached - don't insert
-            return cache_result.temp_lock_node, cache_result.skip_positions
+            temp_lock_node = cache_result.temp_lock_node
+            if temp_lock_node is not None:
+                self.prefix_cache.lock(temp_lock_node)
+                self.prefix_cache.unlock_prefill(temp_lock_node)
+            return temp_lock_node, cache_result.skip_positions
 
         # Insert prompt into cache
         prompt_pages = self.page_table.get_pages(batch_idx, 0, prompt_len)
@@ -912,9 +916,12 @@ class MoondreamRuntime:
         # (we didn't use those pages); keep the existing temp lock if we reused
         # cached prefix pages, otherwise return no lock so our pages can be freed.
         if insert_result.inserted_pages == 0:
-            if cache_result.temp_lock_node is None:
+            temp_lock_node = cache_result.temp_lock_node
+            if temp_lock_node is None:
                 return None, 0
-            return cache_result.temp_lock_node, cache_result.skip_positions
+            self.prefix_cache.lock(temp_lock_node)
+            self.prefix_cache.unlock_prefill(temp_lock_node)
+            return temp_lock_node, cache_result.skip_positions
 
         # Lock transfer
         temp_lock_node = cache_result.temp_lock_node
@@ -922,13 +929,10 @@ class MoondreamRuntime:
             # Miss path
             self.prefix_cache.lock(insert_result.node)
             cache_lock_node = insert_result.node
-        elif insert_result.node is temp_lock_node:
-            # Identity case
-            cache_lock_node = temp_lock_node
         else:
-            # Partial hit path
+            # Hit path
             self.prefix_cache.lock(insert_result.node)
-            self.prefix_cache.unlock(temp_lock_node)
+            self.prefix_cache.unlock_prefill(temp_lock_node)
             cache_lock_node = insert_result.node
 
         cache_owned_page_count = cache_result.skip_positions + insert_result.inserted_pages
@@ -1052,7 +1056,7 @@ class MoondreamRuntime:
                 self.prefix_cache is not None
                 and cache_result.temp_lock_node is not None
             ):
-                self.prefix_cache.unlock(cache_result.temp_lock_node)
+                self.prefix_cache.unlock_prefill(cache_result.temp_lock_node)
             # Release batch slot (erase frees non-cache pages; 0 = no cache-owned pages yet)
             self.page_table.erase(batch_idx, 0)
             raise
