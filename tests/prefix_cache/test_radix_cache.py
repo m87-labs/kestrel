@@ -159,6 +159,18 @@ class TestNodeSplitting:
         child = list(match_result.last_node.children.values())[0]
         assert child.lock_ref == 1
 
+    def test_locked_node_is_not_split(self) -> None:
+        cache = RadixPrefixCache()
+        tokens = [MockToken(i) for i in range(4)]
+        insert_result = cache.insert(tokens, [0, 1, 2, 3])
+        locked_node = insert_result.node
+        cache.lock(locked_node)
+
+        query = [MockToken(0), MockToken(1), MockToken(99)]
+        cache.match_prefix(query)
+
+        assert locked_node.tokens == tuple(tokens)
+
     def test_split_with_variable_kv_length(self) -> None:
         cache = RadixPrefixCache()
         # Token with kv_length=3
