@@ -7,9 +7,17 @@ from typing import Tuple, TypedDict
 import numpy as np
 import torch
 import pyvips
-from PIL import Image
 
 from kestrel.utils.image import _vips_to_uint8_numpy
+
+
+def _ensure_vips(image: pyvips.Image | np.ndarray) -> pyvips.Image:
+    """Convert numpy array to pyvips Image if needed."""
+    if isinstance(image, pyvips.Image):
+        return image
+    h, w = image.shape[:2]
+    bands = image.shape[2] if image.ndim == 3 else 1
+    return pyvips.Image.new_from_memory(image.tobytes(), w, h, bands, "uchar")
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -82,26 +90,19 @@ def overlap_crop_image(
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
-    if isinstance(image, np.ndarray):
-        original_numpy = image
-    else:
-        original_numpy = _vips_to_uint8_numpy(image)
+    vips_image = _ensure_vips(image)
 
-    pil_image = Image.fromarray(original_numpy)
-
+    # Resize for tiled crops
     scale_x = target_size[1] / original_w
     scale_y = target_size[0] / original_h
-    target_width = int(round(original_w * scale_x))
-    target_height = int(round(original_h * scale_y))
-    resized_pil = pil_image.resize((target_width, target_height), Image.LANCZOS)
-    resized_numpy = np.array(resized_pil, dtype=np.uint8)
+    resized_vips = vips_image.resize(scale_x, vscale=scale_y, kernel="lanczos3")
+    resized_numpy = _vips_to_uint8_numpy(resized_vips)
 
+    # Resize for global crop
     scale_x_global = base_size[1] / original_w
     scale_y_global = base_size[0] / original_h
-    global_width = int(round(original_w * scale_x_global))
-    global_height = int(round(original_h * scale_y_global))
-    global_pil = pil_image.resize((global_width, global_height), Image.LANCZOS)
-    crops[0] = np.array(global_pil, dtype=np.uint8)
+    global_vips = vips_image.resize(scale_x_global, vscale=scale_y_global, kernel="lanczos3")
+    crops[0] = _vips_to_uint8_numpy(global_vips)
 
     for tile_y in range(tiling[0]):
         for tile_x in range(tiling[1]):
