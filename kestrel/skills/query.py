@@ -5,11 +5,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pyvips
-import torch
 import numpy as np
-from torch import Tensor
 
-from kestrel.moondream.runtime import CoordToken, TextToken
+from kestrel.moondream.runtime import CoordToken, TextToken, Token
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -48,7 +46,7 @@ class QuerySkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request_context: object,
-    ) -> Tensor:
+    ) -> Sequence["Token"]:
         if not isinstance(request_context, QueryRequest):
             raise ValueError("QuerySkill.build_prompt_tokens requires a QueryRequest")
         prompt = request_context.question
@@ -62,9 +60,7 @@ class QuerySkill(SkillSpec):
             ids = [*prefix, *encoded, thinking_id]
         else:
             ids = [*prefix, *encoded, *suffix]
-        if not ids:
-            return torch.empty((1, 0), dtype=torch.long)
-        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+        return [TextToken(token_id=int(tid)) for tid in ids]
 
     def create_state(
         self,

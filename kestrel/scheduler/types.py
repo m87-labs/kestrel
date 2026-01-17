@@ -7,9 +7,6 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
 import pyvips
-import torch
-from torch import Tensor
-
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
@@ -152,7 +149,7 @@ class GenerationRequest:
 
     request_id: int
     prompt: str
-    prompt_tokens: Tensor
+    prompt_tokens: Sequence[Token]
     max_new_tokens: int
     skill: SkillSpec = field(repr=False)
     request_context: object = field(repr=False)
@@ -172,18 +169,11 @@ class GenerationRequest:
     prompt_length: int = field(init=False)
 
     def __post_init__(self) -> None:
-        tokens = self.prompt_tokens
-        if tokens.ndim == 2 and tokens.shape[0] == 1:
-            tokens = tokens.squeeze(0)
-        if tokens.ndim != 1:
-            raise ValueError(
-                f"prompt_tokens must be 1D or shaped (1, L); got {self.prompt_tokens.shape}"
-            )
-        self.prompt_tokens = tokens.to(dtype=torch.long, device="cpu")
-        # Runtime unconditionally prepends a BOS token, so account for it in the
-        # prompt length even though individual skills omit it from their token
-        # buffers.
-        self.prompt_length = int(self.prompt_tokens.shape[0]) + 1
+        tokens = list(self.prompt_tokens)
+        self.prompt_tokens = tokens
+        # Prompt tokens are already materialized (including BOS if required by
+        # the template), so prompt_length is the list length.
+        self.prompt_length = len(tokens)
         if self.request_context is None:
             raise ValueError("request_context must be provided")
         if self.temperature < 0.0:

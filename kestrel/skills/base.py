@@ -4,8 +4,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from torch import Tensor
-
 if False:  # pragma: no cover - type-checking imports
     from kestrel.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
@@ -22,7 +20,7 @@ class SkillSpec:
         self,
         runtime: "MoondreamRuntime",
         request_context: object,
-    ) -> Tensor:
+    ) -> Sequence["Token"]:
         raise NotImplementedError
 
     def create_state(

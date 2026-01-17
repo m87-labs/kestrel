@@ -7,9 +7,7 @@ import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyvips
-import torch
 import numpy as np
-from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.svg import (
@@ -57,7 +55,7 @@ class SegmentSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request_context: object,
-    ) -> Tensor:
+    ) -> Sequence["Token"]:
         if not isinstance(request_context, SegmentRequest):
             raise ValueError("SegmentSkill.build_prompt_tokens requires a SegmentRequest")
         template = runtime.config.tokenizer.templates.get("segment")
@@ -68,31 +66,44 @@ class SegmentSkill(SkillSpec):
         object_name = request_context.object
         object_tokens = runtime.tokenizer.encode(object_name).ids if object_name else []
 
-        # Assemble ids in vixtral order:
-        # <prefix> <spatial placeholders> object <suffix>
-        ids: List[int] = [*prefix]
+        # Assemble tokens in vixtral order:
+        # <prefix> <spatial tokens> object <suffix>
+        tokens: List[Token] = [TextToken(token_id=int(tid)) for tid in prefix]
 
         refs = request_context.spatial_refs
         if refs:
-            coord_id = runtime.config.tokenizer.coord_id
-            size_id = runtime.config.tokenizer.size_id
             for ref in refs:
                 n = len(ref)
                 if n == 2:
-                    ids.extend([coord_id, coord_id])
+                    x, y = float(ref[0]), float(ref[1])
+                    x = min(max(x, 0.0), 1.0)
+                    y = min(max(y, 0.0), 1.0)
+                    tokens.extend([CoordToken(pos=x), CoordToken(pos=y)])
                 elif n == 4:
-                    ids.extend([coord_id, coord_id, size_id])
+                    x_min, y_min, x_max, y_max = map(float, ref)
+                    if not (0.0 <= x_min <= x_max <= 1.0 and 0.0 <= y_min <= y_max <= 1.0):
+                        raise ValueError(
+                            "bbox spatial_ref must satisfy 0<=x_min<=x_max<=1 and 0<=y_min<=y_max<=1"
+                        )
+                    x_c = (x_min + x_max) / 2.0
+                    y_c = (y_min + y_max) / 2.0
+                    width = x_max - x_min
+                    height = y_max - y_min
+                    tokens.extend(
+                        [
+                            CoordToken(pos=x_c),
+                            CoordToken(pos=y_c),
+                            SizeToken(width=width, height=height),
+                        ]
+                    )
                 else:
                     raise ValueError(
                         "Each spatial_ref must contain 2 (point) or 4 (bbox) values"
                     )
 
-        ids.extend(object_tokens)
-        ids.extend(suffix)
-
-        if not ids:
-            return torch.empty((1, 0), dtype=torch.long)
-        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in object_tokens)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
+        return tokens
 
     def create_state(
         self,

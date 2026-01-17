@@ -5,9 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
 
 import pyvips
-import torch
 import numpy as np
-from torch import Tensor
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 
@@ -47,7 +45,7 @@ class DetectSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request_context: object,
-    ) -> Tensor:
+    ) -> Sequence["Token"]:
         if not isinstance(request_context, DetectRequest):
             raise ValueError("DetectSkill.build_prompt_tokens requires a DetectRequest")
         template = runtime.config.tokenizer.templates["detect"]
@@ -58,9 +56,7 @@ class DetectSkill(SkillSpec):
         prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(prompt).ids if prompt else []
         ids = [*prefix, *object_tokens, *suffix]
-        if not ids:
-            return torch.empty((1, 0), dtype=torch.long)
-        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+        return [TextToken(token_id=int(tid)) for tid in ids]
 
     def create_state(
         self,

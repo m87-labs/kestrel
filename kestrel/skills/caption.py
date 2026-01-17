@@ -5,11 +5,9 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import pyvips
-import torch
 import numpy as np
-from torch import Tensor
 
-from kestrel.moondream.runtime import TextToken
+from kestrel.moondream.runtime import TextToken, Token
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -48,7 +46,7 @@ class CaptionSkill(SkillSpec):
         self,
         runtime: "MoondreamRuntime",
         request_context: object,
-    ) -> Tensor:
+    ) -> Sequence["Token"]:
         if not isinstance(request_context, CaptionRequest):
             raise ValueError("CaptionSkill.build_prompt_tokens requires a CaptionRequest")
         templates = runtime.config.tokenizer.templates["caption"]
@@ -61,9 +59,7 @@ class CaptionSkill(SkillSpec):
                 f"Unsupported caption length '{length_key}'. Expected one of: {valid}"
             )
         tokens = templates[length_key]
-        if not tokens:
-            return torch.empty((1, 0), dtype=torch.long)
-        return torch.tensor([tokens], dtype=torch.long)
+        return [TextToken(token_id=int(tid)) for tid in tokens]
 
     def create_state(
         self,
