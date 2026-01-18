@@ -920,6 +920,10 @@ class GenerationScheduler:
             torch.index_select(self._pending_coord_values, 0, batch_idx, out=coord_values)
             torch.index_select(self._pending_size_values, 0, batch_idx, out=size_values)
 
+            # Commit page table for all batch indices before forward pass (deferred H2D sync)
+            batch_indices_list = [seq.state.batch_idx for seq in sequences]
+            self.runtime.page_table.commit_block_table(batch_indices_list)
+
             # Run forward pass - writes to slot.logits and slot.hidden_last
             self.runtime.decode_with_slot(slot, batch_size)
         except Exception:

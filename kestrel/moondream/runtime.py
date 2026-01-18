@@ -1155,6 +1155,9 @@ class MoondreamRuntime:
         with torch.cuda.stream(self._primary_stream):
             batch_tensor.fill_(state.batch_idx)
 
+        # Commit page table for this batch before forward pass (deferred H2D sync)
+        self.page_table.commit_block_table([state.batch_idx])
+
         # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
         # Use primary stream to ensure ordering with shared buffers.
         with torch.cuda.stream(self._primary_stream):

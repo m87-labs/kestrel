@@ -957,6 +957,9 @@ class TestBackwardCompatibility:
         pages = page_table.allocate_pages(10)
         page_table.map_pages(batch_idx, 0, pages)
 
+        # Commit page table to GPU before build_slot_mapping (deferred H2D sync)
+        page_table.commit_block_table([batch_idx])
+
         # build_slot_mapping expects 2D positions when batch_idx is 1D
         # batch_idx: [batch_size], positions: [batch_size, seq_len]
         batch_tensor = torch.tensor([batch_idx], device="cpu")
