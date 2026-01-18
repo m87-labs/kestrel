@@ -492,6 +492,54 @@ class TestEviction:
         cache.unlock(result.node)
         assert cache.evictable_page_count() == 4
 
+    def test_evictable_page_count_with_split(self) -> None:
+        """Test that evictable page count is correct after node splitting."""
+        cache = RadixPrefixCache()
+
+        # Insert [A, B, C] with 3 pages
+        cache.insert([MockToken(0), MockToken(1), MockToken(2)], [0, 1, 2])
+        assert cache.evictable_page_count() == 3
+
+        # Partial match [A, B] triggers split:
+        # - New parent with [A, B] (2 pages) - not a leaf, not evictable
+        # - Suffix child with [C] (1 page) - leaf, evictable
+        result = cache.match_prefix([MockToken(0), MockToken(1)])
+        assert cache.evictable_page_count() == 1
+
+        # Insert [A, B, D] creates new branch from parent
+        # - Parent [A, B] (2 pages) - not a leaf, not evictable
+        # - Child [C] (1 page) - leaf, evictable
+        # - Child [D] (1 page) - leaf, evictable
+        cache.insert([MockToken(0), MockToken(1), MockToken(3)], [0, 1, 3])
+        assert cache.evictable_page_count() == 2
+
+    def test_evictable_page_count_with_prefill_lock(self) -> None:
+        """Test that prefill_lock affects evictable count correctly."""
+        cache = RadixPrefixCache()
+
+        result = cache.insert([MockToken(0)], [0])
+        assert cache.evictable_page_count() == 1
+
+        cache.lock_prefill(result.node)
+        assert cache.evictable_page_count() == 0
+
+        cache.unlock_prefill(result.node)
+        assert cache.evictable_page_count() == 1
+
+    def test_evictable_page_count_after_eviction(self) -> None:
+        """Test that evictable count is correct after eviction frees parent."""
+        cache = RadixPrefixCache()
+
+        # Insert [A] then [A, B] - creates parent [A] and child [B]
+        cache.insert([MockToken(0)], [0])
+        cache.insert([MockToken(0), MockToken(1)], [0, 1])
+        # Only child [B] is evictable (parent [A] has children)
+        assert cache.evictable_page_count() == 1
+
+        # Evict [B] - parent [A] becomes a leaf and evictable
+        cache.evict(1)
+        assert cache.evictable_page_count() == 1  # Now [A] is evictable
+
 
 class TestNamespace:
     """Tests for namespace isolation."""

@@ -81,6 +81,7 @@ class RadixPrefixCache(BasePrefixCache):
         self._trees: dict[CacheNamespace, TreeNode] = {}
         self._default_namespace = CacheNamespace()
         self._total_cached_pages = 0
+        self._evictable_page_count = 0  # Incrementally tracked for O(1) lookup
         self._eviction_policy = LRUEvictionPolicy(self._collect_unlocked_leaves)
         self._free_pages_sink = free_pages_sink
 
@@ -281,6 +282,13 @@ class RadixPrefixCache(BasePrefixCache):
         remaining_tokens = tuple(tokens[token_idx:])
         remaining_pages = tuple(pages[page_idx:])
 
+        # Check if parent was an evictable leaf before adding child
+        parent_was_evictable_leaf = (
+            current_node.is_leaf()
+            and self._is_evictable(current_node)
+            and current_node.parent is not None
+        )
+
         new_node = TreeNode(
             parent=current_node,
             tokens=remaining_tokens,
@@ -293,6 +301,11 @@ class RadixPrefixCache(BasePrefixCache):
 
         inserted_pages = len(remaining_pages)
         self._total_cached_pages += inserted_pages
+        # New node is unlocked leaf, so it's evictable
+        self._evictable_page_count += inserted_pages
+        # Parent is no longer a leaf, so subtract its pages if it was evictable
+        if parent_was_evictable_leaf:
+            self._evictable_page_count -= len(current_node.physical_pages)
 
         # Add to eviction heap (will be skipped if locked immediately after)
         self._eviction_policy.add(new_node)
@@ -310,6 +323,10 @@ class RadixPrefixCache(BasePrefixCache):
         if node is None:
             return
 
+        # If node was an evictable leaf, it's no longer evictable after lock
+        if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
+            self._evictable_page_count -= len(node.physical_pages)
+
         current: TreeNode | None = node
         while current is not None:
             current.lock_ref += 1
@@ -322,6 +339,10 @@ class RadixPrefixCache(BasePrefixCache):
         """
         if node is None:
             return
+
+        # If node was an evictable leaf, it's no longer evictable after lock
+        if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
+            self._evictable_page_count -= len(node.physical_pages)
 
         current: TreeNode | None = node
         while current is not None:
@@ -348,6 +369,7 @@ class RadixPrefixCache(BasePrefixCache):
 
         # Add leaf to eviction heap if now evictable
         if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
+            self._evictable_page_count += len(node.physical_pages)
             self._eviction_policy.add(node)
 
     def unlock_prefill(self, node: TreeNode | None) -> None:
@@ -366,6 +388,7 @@ class RadixPrefixCache(BasePrefixCache):
             current = current.parent
 
         if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
+            self._evictable_page_count += len(node.physical_pages)
             self._eviction_policy.add(node)
 
     def evict(self, needed_pages: int) -> int:
@@ -395,6 +418,8 @@ class RadixPrefixCache(BasePrefixCache):
             node_pages = list(candidate.physical_pages)
             freed_count += len(node_pages)
             self._total_cached_pages -= len(node_pages)
+            # Node was evictable, so subtract from evictable count
+            self._evictable_page_count -= len(node_pages)
 
             # Send freed pages to sink (e.g., PageTable.free_pages_to_pool)
             if self._free_pages_sink is not None:
@@ -409,6 +434,7 @@ class RadixPrefixCache(BasePrefixCache):
 
                 # If parent becomes a leaf, add to eviction heap
                 if parent.is_leaf() and self._is_evictable(parent) and parent.parent is not None:
+                    self._evictable_page_count += len(parent.physical_pages)
                     self._eviction_policy.add(parent)
 
                 # Prune empty namespace roots
@@ -429,10 +455,7 @@ class RadixPrefixCache(BasePrefixCache):
         Returns:
             Number of pages in unlocked leaf nodes.
         """
-        total = 0
-        for leaf in self._collect_unlocked_leaves():
-            total += len(leaf.physical_pages)
-        return total
+        return self._evictable_page_count
 
     def _split_node(self, node: TreeNode, split_at: int) -> TreeNode:
         """Split a node into prefix parent and suffix child.
@@ -446,6 +469,9 @@ class RadixPrefixCache(BasePrefixCache):
         """
         assert 0 < split_at < len(node.tokens), "Invalid split position"
         assert node.prefill_lock_ref == 0, "Cannot split prefill-locked node"
+
+        # Check if node was evictable before split (for incremental tracking)
+        was_evictable = node.is_leaf() and self._is_evictable(node) and node.parent is not None
 
         # Calculate page split point
         page_split = sum(t.kv_length() for t in node.tokens[:split_at])
@@ -479,6 +505,10 @@ class RadixPrefixCache(BasePrefixCache):
         if new_parent.parent is not None:
             prefix_key = prefix_tokens[0].cache_key()
             new_parent.parent.children[prefix_key] = new_parent
+
+        # If node was evictable, prefix pages move to non-leaf parent (not evictable)
+        if was_evictable:
+            self._evictable_page_count -= len(prefix_pages)
 
         # Invalidate stale heap entries for suffix node
         node.heap_version += 1
