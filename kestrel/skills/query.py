@@ -8,6 +8,7 @@ import pyvips
 import numpy as np
 
 from kestrel.moondream.runtime import CoordToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -34,6 +35,7 @@ class QueryRequest:
     reasoning: bool
     stream: bool
     settings: QuerySettings
+    spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
 class QuerySkill(SkillSpec):
@@ -55,12 +57,16 @@ class QuerySkill(SkillSpec):
         suffix: Sequence[int] = template["suffix"]
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
         reasoning = request_context.reasoning
+        tokens: List[Token] = [TextToken(token_id=int(tid)) for tid in prefix]
+        tokens.extend(build_spatial_tokens(request_context.spatial_refs))
+
+        tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
         if reasoning:
             thinking_id = runtime.config.tokenizer.thinking_id
-            ids = [*prefix, *encoded, thinking_id]
+            tokens.append(TextToken(token_id=int(thinking_id)))
         else:
-            ids = [*prefix, *encoded, *suffix]
-        return [TextToken(token_id=int(tid)) for tid in ids]
+            tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
+        return tokens
 
     def create_state(
         self,

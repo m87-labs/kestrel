@@ -29,7 +29,6 @@ import asyncio
 import hashlib
 import itertools
 import logging
-import math
 import queue
 import threading
 import time
@@ -84,6 +83,7 @@ from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.moondream.lora import AdapterProvider
+from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -408,8 +408,8 @@ class InferenceEngine:
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("question must be a non-empty string")
-        if spatial_refs is not None:
-            raise ValueError("spatial_refs are not supported")
+        if spatial_refs and image is None:
+            raise ValueError("spatial_refs can only be used with an image")
 
         temperature = self._default_temperature
         top_p = self._default_top_p
@@ -438,6 +438,7 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
+        normalized_refs = normalize_spatial_refs(spatial_refs)
         request = QueryRequest(
             question=normalized_question,
             image=image,
@@ -448,6 +449,7 @@ class InferenceEngine:
                 top_p=top_p,
                 max_tokens=max_tokens,
             ),
+            spatial_refs=normalized_refs,
         )
         if stream:
             return await self.submit_streaming(
@@ -679,30 +681,7 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
-        normalized_refs: Optional[List[Tuple[float, ...]]] = None
-        if spatial_refs is not None:
-            normalized_refs = []
-            for idx, ref in enumerate(spatial_refs):
-                if len(ref) not in (2, 4):
-                    raise ValueError(
-                        f"spatial_refs[{idx}] must contain 2 (point) or 4 (bbox) values"
-                    )
-                converted = [float(value) for value in ref]
-                if not all(math.isfinite(value) for value in converted):
-                    raise ValueError(
-                        f"spatial_refs[{idx}] contains non-finite values"
-                    )
-                if not all(0.0 <= value <= 1.0 for value in converted):
-                    raise ValueError(
-                        f"spatial_refs[{idx}] values must be normalised to [0, 1]"
-                    )
-                if len(converted) == 4:
-                    x_min, y_min, x_max, y_max = converted
-                    if x_min > x_max or y_min > y_max:
-                        raise ValueError(
-                            f"spatial_refs[{idx}] bbox must satisfy x_min<=x_max and y_min<=y_max"
-                        )
-                normalized_refs.append(tuple(converted))
+        normalized_refs = normalize_spatial_refs(spatial_refs)
 
         request = SegmentRequest(
             object=normalized_object,
@@ -713,7 +692,7 @@ class InferenceEngine:
                 top_p=top_p,
                 max_tokens=max_tokens,
             ),
-            spatial_refs=tuple(normalized_refs) if normalized_refs else None,
+            spatial_refs=normalized_refs,
         )
 
         return await self.submit(

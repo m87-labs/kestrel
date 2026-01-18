@@ -132,6 +132,8 @@ class _ServerState:
             else:
                 raise ValueError("Field 'settings' must be an object if provided")
 
+            spatial_refs = _parse_spatial_refs(payload.get("spatial_refs"))
+
             image_data = payload.get("image_url")
             if image_data is None:
                 image: Optional[pyvips.Image | np.ndarray] = None
@@ -139,6 +141,8 @@ class _ServerState:
                 image = load_vips_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
+            if spatial_refs and image is None:
+                raise ValueError("Field 'spatial_refs' requires image_url")
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -162,6 +166,7 @@ class _ServerState:
                     image=image,
                     question=question,
                     reasoning=reasoning,
+                    spatial_refs=spatial_refs,
                     stream=True,
                     settings=settings_dict,
                 )
@@ -221,6 +226,7 @@ class _ServerState:
                 image=image,
                 question=question,
                 reasoning=reasoning,
+                spatial_refs=spatial_refs,
                 stream=False,
                 settings=settings_dict,
             )
