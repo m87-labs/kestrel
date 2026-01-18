@@ -161,6 +161,7 @@ class PrefillSlot:
     slot_id: int
     batch_idx: Tensor
     step_done_event: torch.cuda.Event
+    commit_done_event: torch.cuda.Event
 
 
 @dataclass
@@ -427,6 +428,9 @@ class MoondreamRuntime:
                 slot_id=0,
                 batch_idx=torch.empty((1,), dtype=torch.int64, device=self.device),
                 step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
+                commit_done_event=torch.cuda.Event(
+                    enable_timing=False, blocking=False
+                ),
             )
         ]
         self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
