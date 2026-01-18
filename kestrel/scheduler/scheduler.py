@@ -3,7 +3,7 @@
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, cast
+from typing import Deque, List, Optional
 
 import time
 import logging
@@ -13,6 +13,8 @@ from torch import Tensor
 
 from kestrel.moondream.runtime import (
     MoondreamRuntime,
+    PreparedSequence,
+    PrefillSlot,
     Token,
     TextToken,
 )
@@ -58,6 +60,20 @@ class PrefillStaging:
     coord_staging: Tensor
     size_staging: Tensor
     render: RenderBuffer
+
+
+@dataclass(slots=True)
+class PreparedPrefill:
+    """CPU-prepared prefill that is ready for GPU launch.
+
+    Holds the request plus any runtime-side prepared state (KV allocation,
+    prefix-cache lookup/locks, etc.) so the actual pipeline "launch" can be
+    limited to GPU enqueue work (embed/image encode/prefill forward).
+    """
+
+    request: GenerationRequest
+    prepared: PreparedSequence
+    acquired_lora: bool
 
 
 class GenerationScheduler:
@@ -125,7 +141,7 @@ class GenerationScheduler:
             dtype=torch.float32,
             device=runtime.device,
         )
-        # Prefill staging pool (single entry today; can be expanded later).
+        # Prefill staging pool (size matches max in-flight prefills).
         self._prefill_staging_pool: Deque[PrefillStaging] = deque(
             [
                 PrefillStaging(
@@ -146,11 +162,13 @@ class GenerationScheduler:
                         copy_stream=runtime.copy_stream,
                     ),
                 )
+                for _ in range(len(runtime.prefill_slots))
             ]
         )
         self._sampling_rng = torch.Generator(device=runtime.device)
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
+        self._prepared_prefill: PreparedPrefill | None = None
 
     # ------------------------------------------------------------------
     # Submission
@@ -175,6 +193,7 @@ class GenerationScheduler:
         return (
             len(self.waiting) > 0
             or len(self.running) > 0
+            or self._prepared_prefill is not None
             or not self._pipeline.is_empty()
         )
 
@@ -196,22 +215,36 @@ class GenerationScheduler:
         """
         progressed = False
         pipeline = self._pipeline
+        prefill_admissible = self._is_prefill_admissible()
+        has_prepared = self._prepared_prefill is not None
 
         has_launch = pipeline.has_launch_in_flight()
         has_queued = pipeline.queue_depth() > 0
 
-        # Only enter stream context if there's GPU work to do
-        if has_launch or has_queued or len(self.running) > 0:
+        # Only enter stream context if there's GPU work to do.
+        if has_launch or has_queued or len(self.running) > 0 or prefill_admissible or has_prepared:
             with torch.cuda.stream(self.runtime.primary_stream):
                 # 1. Launch forward if none in-flight (forward doesn't need mask)
-                if not has_launch and pipeline.can_launch():
-                    plan = self.schedule_decode_step()
-                    if plan is not None:
-                        slot_id = pipeline.free_slot_id()
-                        handle = self._launch_forward_on_stream(plan, slot_id)
-                        pipeline.on_launch(handle)
-                        has_launch = True  # Update for step 3
-                        progressed = True
+                if pipeline.can_launch():
+                    launched_forward = False
+                    if prefill_admissible or has_prepared:
+                        progressed |= self._launch_prefill_step(pipeline)
+                        launched_forward = pipeline.has_launch_in_flight()
+                    if not launched_forward:
+                        plan = self.schedule_decode_step()
+                        if plan is not None:
+                            slot_id = pipeline.free_slot_id()
+                            if slot_id is None:  # pragma: no cover - defensive
+                                raise AssertionError(
+                                    "Pipeline reported can_launch but no free slot_id"
+                                )
+                            handle = self.launch_forward_async(plan, slot_id)
+                            pipeline.on_launch(handle)
+                            progressed = True
+
+                # Prepare next prefill while the GPU forward is in flight.
+                if pipeline.has_launch_in_flight():
+                    progressed |= self._maybe_prepare_prefill(pipeline)
 
                 # 2. Commit previous step (updates skill state for mask computation)
                 # GPU runs forward in parallel while CPU blocks on D2H.
@@ -222,23 +255,11 @@ class GenerationScheduler:
                     progressed = True
 
                 # 3. Finalize sampling (now skill state is updated for mask)
-                if has_launch:
-                    handle = pipeline.launch_handle
-                    step = self._finalize_sampling_on_stream(handle)
+                handle = pipeline.launch_handle
+                if handle is not None:
+                    step = self.finalize_sampling(handle)
                     pipeline.on_pending_commit(step)
                     progressed = True
-
-        # 4. Prefill - requires empty pipeline to avoid KV ordering issues
-        # Per design doc §4.5: only drain if prefill is actually admissible.
-        # Draining when prefill can't proceed (batch full, KV exhausted) would
-        # collapse overlap under backlog for no benefit.
-        if len(self.waiting) > 0:
-            prefill_admissible = self._is_prefill_admissible()
-            if prefill_admissible and not pipeline.is_empty():
-                self._drain_pipeline()
-                progressed = True
-            if prefill_admissible or pipeline.is_empty():
-                progressed |= self._try_prefill()
 
         if not progressed:
             stalled = self.waiting.peek()
@@ -279,6 +300,9 @@ class GenerationScheduler:
             if step is not None:
                 self.commit_step(step)
                 pipeline.on_step_completed()
+
+        # Drop any CPU-prepared prefill so pause/shutdown sees a clean runtime state.
+        self._abort_prepared_prefill(requeue=True)
 
     def pop_completed(self) -> List[SchedulerResult]:
         """Retrieve all completed results accumulated so far."""
@@ -358,12 +382,16 @@ class GenerationScheduler:
             and not lifecycle.crops_ready
         ):
             return False
-        # Use active_sequences count to account for zombies (finalized but
-        # inflight_refs > 0). These still hold batch slots until released.
-        num_allocated = len(self.runtime.active_sequences)
-        if num_allocated >= self.runtime.max_batch_size:
-            return False
-        if not self.runtime.can_reserve(request.target_length):
+        reserve_length = request.target_length
+        if lifecycle.has_image and lifecycle.prefix_cache_hit:
+            # Prefix-cache hits are guaranteed (by runtime.check_prefix_cache) to cover at
+            # least BOS + the full image prefix, so admission can be less pessimistic
+            # than reserving the entire target length from scratch.
+            reserve_length = max(
+                reserve_length - (1 + self.runtime.image_prefix_length),
+                1,
+            )
+        if not self.runtime.can_reserve(reserve_length):
             return False
         return True
 
@@ -377,47 +405,204 @@ class GenerationScheduler:
         """Return a prefill staging bundle to the pool."""
         self._prefill_staging_pool.append(staging)
 
-    def _finalize_prefill(
-        self, handle: LaunchHandle, logits: Tensor
-    ) -> PendingCommit:
-        """Sample first token + start D2H for a prefill."""
+    def _abort_prepared_prefill(self, *, requeue: bool) -> None:
+        prepared_prefill = self._prepared_prefill
+        if prepared_prefill is None:
+            return
+        self._prepared_prefill = None
+
+        request = prepared_prefill.request
+        lifecycle = request.lifecycle
+        prepared_seq = prepared_prefill.prepared
+        prefill_slot = prepared_seq.prefill_slot
+        try:
+            self.runtime.abort_prepared_sequence(prepared_seq)
+        finally:
+            try:
+                self.runtime.release_prefill_slot(prefill_slot)
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+
+            if prepared_prefill.acquired_lora:
+                try:
+                    self.runtime.release_adapter_slot(request.lora_slot)
+                except Exception:  # pragma: no cover - defensive cleanup
+                    pass
+                request.lora_slot = 0
+                lifecycle.lora_slot_ready = False
+
+        # Reset timing for an aborted attempt.
+        lifecycle.prefill_started_at = None
+        lifecycle.prefill_completed_at = None
+
+        if requeue:
+            phase = (
+                RequestPhase.READY_FOR_PREFILL
+                if (lifecycle.crops_ready and lifecycle.lora_slot_ready)
+                else RequestPhase.WAITING_RESOURCES
+            )
+            lifecycle.transition(phase)
+            self.waiting.push(request)
+        else:
+            lifecycle.finish_reason = "error"
+            lifecycle.error = RuntimeError("Prepared prefill aborted")
+            lifecycle.finished = True
+            lifecycle.finalized = True
+            lifecycle.transition(RequestPhase.COMPLETED)
+            metrics = lifecycle.build_metrics(decode_tokens=0, cached_tokens=0)
+            result = SchedulerResult(
+                request_id=request.request_id,
+                tokens=[],
+                finish_reason="error",
+                metrics=metrics,
+                output={"error": "Prepared prefill aborted"},
+            )
+            self._completed.append(result)
+
+    def _prepare_prefill_for_slot(self, slot_id: int) -> bool:
+        """Perform heavy prefill preparation for the next waiting request.
+
+        This does KV allocation/reservation + prefix-cache lookup ahead of time so
+        the pipeline "launch" can be limited to GPU enqueue work.
+        """
+
+        if self._prepared_prefill is not None:
+            return False
+        if not self._is_prefill_admissible():
+            return False
+
+        request = self.waiting.pop()
+        lifecycle = request.lifecycle
+
+        acquired_lora = False
+        if not lifecycle.lora_slot_ready:
+            try:
+                lora_slot = self._acquire_adapter_slot(request.adapter)
+            except Exception as exc:
+                self._fail_request_early(request, exc)
+                return True
+            request.lora_slot = lora_slot
+            lifecycle.lora_slot_ready = True
+            acquired_lora = True
+
+        if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
+            lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
+
+        prefill_slot: PrefillSlot | None = None
+        try:
+            prompt_inputs = request.prompt_tokens
+            prefill_start = time.perf_counter()
+            lifecycle.prefill_started_at = prefill_start
+            lifecycle.transition(RequestPhase.PREFILLING)
+
+            prefill_slot = self.runtime.acquire_prefill_slot(slot_id)
+            assert prefill_slot.slot_id == slot_id, (
+                f"Prefill slot mismatch: got {prefill_slot.slot_id}, expected {slot_id}"
+            )
+            prepared = self.runtime.prepare_sequence(
+                prompt_tokens=prompt_inputs,
+                prefill_slot=prefill_slot,
+                image=request.image,
+                image_crops=request.image_crops,
+                max_new_tokens=request.max_new_tokens,
+                lora_slot=request.lora_slot,
+                image_hash=request.image_hash,
+                adapter_id=request.adapter,
+            )
+        except Exception as exc:
+            if prefill_slot is not None:
+                self.runtime.release_prefill_slot(prefill_slot)
+            if acquired_lora:
+                self.runtime.release_adapter_slot(request.lora_slot)
+                request.lora_slot = 0
+                lifecycle.lora_slot_ready = False
+            self._fail_request_early(request, exc)
+            return True
+
+        seq = lifecycle
+        seq.sequence_state = prepared.state
+
+        # Persist per-sequence sampling parameters for later decode steps.
+        batch_idx = prepared.state.batch_idx
+        with torch.cuda.stream(self.runtime.primary_stream):
+            self._sampling_temps_by_batch[batch_idx] = seq.request.temperature
+            self._sampling_top_ps_by_batch[batch_idx] = seq.request.top_p
+
+        self._prepared_prefill = PreparedPrefill(
+            request=request,
+            prepared=prepared,
+            acquired_lora=acquired_lora,
+        )
+        return True
+
+    def _maybe_prepare_prefill(self, pipeline: PipelineState) -> bool:
+        """Prepare a prefill while a GPU forward is in flight."""
+
+        if self._prepared_prefill is not None:
+            return False
+        if not pipeline.has_launch_in_flight():
+            return False
+        slot_id = pipeline.free_slot_id()
+        if slot_id is None:
+            return False
+        return self._prepare_prefill_for_slot(slot_id)
+
+    def _finalize_prefill(self, handle: LaunchHandle) -> PendingCommit:
+        """Sample first token + start D2H for a prefill.
+
+        IMPORTANT: Caller must already be on the primary stream.
+        """
         if handle.kind != "prefill":
             raise AssertionError("prefill finalize requires a prefill handle")
-        prefill_payload = cast(PrefillLaunch, handle.payload)
-        staging = cast(PrefillStaging, prefill_payload.staging)
-        prefill_slot = self.runtime.prefill_slots[prefill_payload.prefill_slot_id]
+        prefill_payload = handle.payload
+        if not isinstance(prefill_payload, PrefillLaunch):
+            raise AssertionError("prefill finalize requires a PrefillLaunch payload")
+        staging = prefill_payload.staging
+        logits = prefill_payload.logits
+        prepared_seq = prefill_payload.prepared
+        prefill_slot = prepared_seq.prefill_slot
+        if prefill_payload.slot_id != prefill_slot.slot_id:  # pragma: no cover - defensive
+            raise AssertionError(
+                "Prefill slot mismatch: payload slot_id "
+                f"{prefill_payload.slot_id} != prepared slot_id {prefill_slot.slot_id}"
+            )
         seq = handle.sequences[0]
 
-        with torch.cuda.stream(self.runtime.primary_stream):
-            first_logits = logits.squeeze(0)
-            sampled_ids, temps, top_ps = self._sample_batch(
-                first_logits.unsqueeze(0),
-                [seq],
-                staging.sampled_ids,
-                batch_idx=prefill_slot.batch_idx,
-            )
-            hidden_last = seq.state.last_hidden
-            if hidden_last is None:  # pragma: no cover - defensive
-                raise RuntimeError("Missing last_hidden after prefill")
-            coord_out = staging.coord_staging[:1]
-            size_out = staging.size_staging[:1]
-            coord_decode, size_decode = compute_spatial_values(
-                sampled_ids.view(-1),
-                hidden_last,
-                [seq.request],
-                self.runtime.spatial_tables,
-                temperatures=temps,
-                top_ps=top_ps,
-                out_coord=coord_out,
-                out_size=size_out,
-                rng=self._sampling_rng,
-            )
-            prefill_slot.step_done_event.record()
-            batch_idx = seq.state.batch_idx
-            self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
-            self._pending_coord_values[batch_idx].copy_(coord_decode[0])
-            self._pending_size_values[batch_idx].copy_(size_decode[0])
-            prefill_slot.commit_done_event.record()
+        first_logits = logits.squeeze(0)
+        sampled_ids, temps, top_ps = self._sample_batch(
+            first_logits.unsqueeze(0),
+            [seq],
+            staging.sampled_ids,
+            batch_idx=prefill_slot.batch_idx,
+        )
+        hidden_last = seq.state.last_hidden
+        if hidden_last is None:  # pragma: no cover - defensive
+            raise RuntimeError("Missing last_hidden after prefill")
+        coord_out = staging.coord_staging[:1]
+        size_out = staging.size_staging[:1]
+        coord_decode, size_decode = compute_spatial_values(
+            sampled_ids.view(-1),
+            hidden_last,
+            [seq.request],
+            self.runtime.spatial_tables,
+            temperatures=temps,
+            top_ps=top_ps,
+            out_coord=coord_out,
+            out_size=size_out,
+            rng=self._sampling_rng,
+        )
+        prefill_slot.step_done_event.record()
+        batch_idx = seq.state.batch_idx
+        self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
+        self._pending_coord_values[batch_idx].copy_(coord_decode[0])
+        self._pending_size_values[batch_idx].copy_(size_decode[0])
+        prefill_slot.commit_done_event.record()
+        seq.packed_pending_ready = True
+        seq.uncommitted_prefill_token = True
+
+        # Mark the sequence runnable immediately after the first token is sampled.
+        # This allows decode forward to overlap with the CPU commit of token0.
+        self.running.push(seq)
 
         transfer = staging.render.transfer(
             sampled_ids, coord_decode, size_decode, ready_event=prefill_slot.step_done_event
@@ -428,7 +613,8 @@ class GenerationScheduler:
             transfer=transfer,
             payload=PrefillPendingCommit(
                 staging=staging,
-                prefill_slot_id=prefill_payload.prefill_slot_id,
+                slot_id=prefill_payload.slot_id,
+                prepared=prepared_seq,
             ),
         )
 
@@ -436,12 +622,21 @@ class GenerationScheduler:
         """Commit a prefill PendingCommit and return the first token."""
         if step.kind != "prefill":
             raise AssertionError("prefill commit requires a prefill pending commit")
-        payload = cast(PrefillPendingCommit, step.payload)
-        staging = cast(PrefillStaging, payload.staging)
-        prefill_slot = self.runtime.prefill_slots[payload.prefill_slot_id]
+        payload = step.payload
+        if not isinstance(payload, PrefillPendingCommit):
+            raise AssertionError("prefill commit requires a PrefillPendingCommit payload")
+        staging = payload.staging
+        prepared_seq = payload.prepared
+        prefill_slot = prepared_seq.prefill_slot
+        if payload.slot_id != prefill_slot.slot_id:  # pragma: no cover - defensive
+            raise AssertionError(
+                "Prefill slot mismatch: payload slot_id "
+                f"{payload.slot_id} != prepared slot_id {prefill_slot.slot_id}"
+            )
         try:
             token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
             prefill_slot.commit_done_event.synchronize()
+            self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
             token = render_tokens_from_packed(
                 token_ids_cpu,
                 coord_cpu,
@@ -454,126 +649,119 @@ class GenerationScheduler:
             self.runtime.release_prefill_slot(prefill_slot)
         return token
 
-    def _try_prefill(self) -> bool:
-        progress = False
-        # Use active_sequences count to account for zombies (finalized but
-        # inflight_refs > 0). These still hold batch slots until released.
-        while len(self.waiting) and len(self.runtime.active_sequences) < self.runtime.max_batch_size:
-            request = self.waiting.peek()
-            if request is None:
-                break
-            lifecycle = request.lifecycle
-            if lifecycle.phase not in (
-                RequestPhase.WAITING_RESOURCES,
-                RequestPhase.READY_FOR_PREFILL,
-            ):
-                break
-            if (
-                lifecycle.has_image
-                and not lifecycle.prefix_cache_hit
-                and not lifecycle.crops_ready
-            ):
-                break
-            if not self.runtime.can_reserve(request.target_length):
-                break
+    def _launch_prefill_step(self, pipeline: PipelineState) -> bool:
+        """Launch a single prefill forward and enqueue it into the shared pipeline.
 
-            request = self.waiting.pop()
-            lifecycle = request.lifecycle
+        Returns True if any progress was made (request admitted, failed early,
+        or prefill launched), False otherwise.
+        """
+        if pipeline.has_launch_in_flight():
+            return False
+        if pipeline.committing_step is not None:
+            return False
 
-            # Acquire adapter slot at admission time (not earlier)
-            acquired_lora = False
-            if not lifecycle.lora_slot_ready:
-                try:
-                    lora_slot = self._acquire_adapter_slot(request.adapter)
-                except Exception as exc:
-                    self._fail_request_early(request, exc)
-                    progress = True
-                    continue
-                request.lora_slot = lora_slot
-                lifecycle.lora_slot_ready = True
-                acquired_lora = True
-            if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
-                lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
+        prepared_prefill = self._prepared_prefill
+        if prepared_prefill is not None:
+            slot_id = prepared_prefill.prepared.prefill_slot.slot_id
+            if not pipeline.is_slot_free(slot_id):
+                return False
+        else:
+            slot_id = pipeline.free_slot_id()
+            if slot_id is None:
+                return False
+            progressed = self._prepare_prefill_for_slot(slot_id)
+            if not progressed:
+                return False
+            prepared_prefill = self._prepared_prefill
+            if prepared_prefill is None:
+                # Preparation may have failed the request early; that's still progress.
+                return True
 
-            prefill_slot = None
+        assert prepared_prefill is not None
+        request = prepared_prefill.request
+        lifecycle = request.lifecycle
+        seq = lifecycle
+        prepared_seq = prepared_prefill.prepared
+        prefill_slot = prepared_seq.prefill_slot
+        acquired_lora = prepared_prefill.acquired_lora
+
+        def fail_prepared(exc: Exception, *, staging: PrefillStaging | None = None) -> bool:
+            if staging is not None:
+                self._release_prefill_staging(staging)
             try:
-                prompt_inputs = request.prompt_tokens
-                prefill_start = time.perf_counter()
-                lifecycle.prefill_started_at = prefill_start
-                lifecycle.transition(RequestPhase.PREFILLING)
-                prefill_slot = self.runtime.acquire_prefill_slot()
-                state, logits = self.runtime.start_sequence(
-                    prompt_tokens=prompt_inputs,
-                    prefill_slot=prefill_slot,
-                    image=request.image,
-                    image_crops=request.image_crops,
-                    max_new_tokens=request.max_new_tokens,
-                    lora_slot=request.lora_slot,
-                    image_hash=request.image_hash,
-                    adapter_id=request.adapter,
-                )
-            except Exception as exc:
-                if prefill_slot is not None:
+                self.runtime.abort_prepared_sequence(prepared_seq)
+            finally:
+                try:
                     self.runtime.release_prefill_slot(prefill_slot)
-                # Release slot on failure to prevent leak (only if acquired here)
+                except Exception:
+                    pass
                 if acquired_lora:
-                    self.runtime.release_adapter_slot(request.lora_slot)
+                    try:
+                        self.runtime.release_adapter_slot(request.lora_slot)
+                    except Exception:
+                        pass
                     request.lora_slot = 0
                     lifecycle.lora_slot_ready = False
-                self._fail_request_early(request, exc)
-                progress = True
-                continue
-            skill_state = request.skill_state
-            if skill_state is None:
-                skill_state = request.skill.create_state(
-                    self.runtime, request, request.request_context
+                self._prepared_prefill = None
+            self._fail_request_early(request, exc)
+            return True
+
+        # For 0-length generation, we don't need token0 sampling/D2H staging.
+        if request.max_new_tokens <= 0:
+            try:
+                self.runtime.launch_prepared_sequence(
+                    prepared_seq,
+                    image=request.image,
+                    image_crops=request.image_crops,
                 )
-            request.skill_state = skill_state
-            seq = lifecycle
-            seq.skill_state = skill_state
-            seq.sequence_state = state
-            seq.skill_state.on_prefill(self.runtime)
-            with torch.cuda.stream(self.runtime.primary_stream):
-                batch_idx = state.batch_idx
-                self._sampling_temps_by_batch[batch_idx] = seq.request.temperature
-                self._sampling_top_ps_by_batch[batch_idx] = seq.request.top_p
+                lifecycle.prefill_completed_at = time.perf_counter()
+                # Ensure prefill forward completes before cache finalize + release.
+                with torch.cuda.stream(self.runtime.primary_stream):
+                    prefill_slot.commit_done_event.record()
+                prefill_slot.commit_done_event.synchronize()
+                self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
+            except Exception as exc:
+                return fail_prepared(exc)
 
-            if request.max_new_tokens <= 0:
-                seq.first_token_time = prefill_start
-                self._finalize_sequence(seq, "length")
-                self.runtime.release_prefill_slot(prefill_slot)
-                progress = True
-                continue
+            self._prepared_prefill = None
+            seq.first_token_time = lifecycle.prefill_started_at or time.perf_counter()
+            self._finalize_sequence(seq, "length")
+            self.runtime.release_prefill_slot(prefill_slot)
+            return True
 
-            try:
-                staging = self._acquire_prefill_staging()
-            except Exception:
-                self.runtime.release_prefill_slot(prefill_slot)
-                raise
-            handle = LaunchHandle(
-                kind="prefill",
-                sequences=[seq],
-                payload=PrefillLaunch(
-                    staging=staging,
-                    prefill_slot_id=prefill_slot.slot_id,
-                ),
+        try:
+            staging = self._acquire_prefill_staging()
+        except Exception:
+            return False
+
+        try:
+            logits = self.runtime.launch_prepared_sequence(
+                prepared_seq,
+                image=request.image,
+                image_crops=request.image_crops,
             )
-            try:
-                step = self._finalize_prefill(handle, logits)
-            except Exception:
-                self._release_prefill_staging(staging)
-                self.runtime.release_prefill_slot(prefill_slot)
-                raise
-            token = self._commit_prefill(step)
-            seq.stage_token(self.runtime, token)
+            lifecycle.prefill_completed_at = time.perf_counter()
+        except Exception as exc:
+            return fail_prepared(exc, staging=staging)
 
-            if self._mark_finished_if_needed(seq):
-                progress = True
-                continue
+        # Prefill is enqueued; mark prepared slot consumed.
+        self._prepared_prefill = None
 
-            self.running.push(seq)
-            progress = True
-        return progress
+        # Prefill has completed (KV/logits enqueued); notify skill.
+        seq.skill_state.on_prefill(self.runtime)
+
+        handle = LaunchHandle(
+            kind="prefill",
+            sequences=[seq],
+            payload=PrefillLaunch(
+                staging=staging,
+                slot_id=slot_id,
+                logits=logits,
+                prepared=prepared_seq,
+            ),
+        )
+        pipeline.on_launch(handle)
+        return True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Split decode API (Phase 1 pipelining)
@@ -599,7 +787,12 @@ class GenerationScheduler:
         # Max new tokens budget - account for in-flight steps
         if seq.request.max_new_tokens is not None:
             committed = seq.skill_state.token_count
-            if committed + seq.inflight_refs >= seq.request.max_new_tokens:
+            if (
+                committed
+                + seq.inflight_refs
+                + (1 if seq.uncommitted_prefill_token else 0)
+                >= seq.request.max_new_tokens
+            ):
                 return False
         return True
 
@@ -639,7 +832,8 @@ class GenerationScheduler:
         Wrapper that enters the compute stream context before calling
         _launch_forward_on_stream. Use this when calling from outside advance().
         """
-        with torch.cuda.stream(self.runtime.primary_stream):
+        slot = self.runtime.decode_slots[slot_id]
+        with torch.cuda.stream(slot.compute_stream):
             return self._launch_forward_on_stream(plan, slot_id)
 
     def _launch_forward_on_stream(
@@ -663,6 +857,7 @@ class GenerationScheduler:
         # Commit sequences to this step (rollback if forward fails)
         for seq in sequences:
             seq.inflight_refs += 1
+            seq.packed_pending_ready = False
 
         try:
             # Prepare all CPU metadata buffers
@@ -693,6 +888,7 @@ class GenerationScheduler:
             # Rollback inflight_refs on failure
             for seq in sequences:
                 seq.inflight_refs -= 1
+                seq.packed_pending_ready = True
             raise
 
         # Advance sequence states (KV length) immediately after forward dispatch.
@@ -714,9 +910,16 @@ class GenerationScheduler:
         Wrapper that enters the compute stream context before calling
         _finalize_sampling_on_stream. Use this when calling from outside advance().
         """
-        slot = self.runtime.decode_slots[handle.slot_id]
-        with torch.cuda.stream(slot.compute_stream):
-            return self._finalize_sampling_on_stream(handle, mask)
+        if handle.kind == "decode":
+            slot = self.runtime.decode_slots[handle.slot_id]
+            with torch.cuda.stream(slot.compute_stream):
+                return self._finalize_sampling_on_stream(handle, mask)
+        if handle.kind == "prefill":
+            if mask is not None:
+                raise AssertionError("Prefill finalize does not support masks")
+            with torch.cuda.stream(self.runtime.primary_stream):
+                return self._finalize_prefill(handle)
+        raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 
     def _finalize_sampling_on_stream(
         self, handle: LaunchHandle, mask: Optional[Tensor] = None
@@ -781,6 +984,8 @@ class GenerationScheduler:
         # batch indices (e.g. finalize a sequence and admit a new one into the same
         # batch slot) without racing the `_pending_*` updates.
         slot.commit_done_event.record()
+        for seq in sequences:
+            seq.packed_pending_ready = True
 
         # Start async D2H transfer from per-slot staging buffers.
         # Pass the step_done_event so copy stream waits only on staging writes.
@@ -799,7 +1004,7 @@ class GenerationScheduler:
         )
 
     def commit_step(self, step: PendingCommit) -> None:
-        """Complete a decode step: wait for D2H, commit tokens, handle termination.
+        """Complete a pending step (prefill or decode).
 
         Blocks until the D2H transfer completes, then materializes tokens and
         commits them to each sequence (calls consume_step, emits streaming).
@@ -809,6 +1014,26 @@ class GenerationScheduler:
         are released immediately. Zombies (finalized with refs > 0) are skipped
         at commit time and released when their last step completes.
         """
+        if step.kind == "prefill":
+            if len(step.sequences) != 1:
+                raise AssertionError("Prefill commit expects exactly one sequence")
+            seq = step.sequences[0]
+            token = self._commit_prefill(step)
+            seq.stage_token(self.runtime, token)
+            seq.uncommitted_prefill_token = False
+            if self._mark_finished_if_needed(seq):
+                seq.finalized = True
+                # Prefill sequences are enqueued into `running` immediately after the
+                # first token is sampled, so remove on termination here.
+                self.running.remove(seq)
+                if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
+                    self._release_sequence(seq)
+            return
+
+        if step.kind != "decode":
+            raise AssertionError(f"Unsupported commit kind {step.kind!r}")
+
         # Wait for D2H transfer
         token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
 

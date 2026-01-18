@@ -12,13 +12,15 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, Image as HFImage
 except ImportError as exc:  # pragma: no cover - import guard
     raise RuntimeError(
         "`datasets` is required for the ChartQA evaluation. "
         "Install optional extras via `pip install kestrel[eval]` or "
         "`uv run --extra eval ...` before running this script."
     ) from exc
+
+import kestrel_native
 
 try:
     from tqdm import tqdm
@@ -65,27 +67,12 @@ class EvalConfig:
     enable_prefix_cache: bool
 
 
-def pil_to_numpy(image: Any) -> np.ndarray:
-    """Convert a PIL.Image to numpy array (H, W, C) uint8."""
-    try:
-        from PIL import Image as PILImage  # type: ignore
-    except ImportError as exc:  # pragma: no cover - import guard
-        raise RuntimeError(
-            "Pillow is required to convert dataset images for evaluation."
-        ) from exc
-
-    if not isinstance(image, PILImage.Image):
-        raise TypeError(
-            "Expected the dataset to yield PIL.Image objects."
-        )
-
-    mode = image.mode
-    if mode not in ("RGB", "RGBA"):
-        image = image.convert("RGB")
-    elif mode == "RGBA":
-        image = image.convert("RGB")
-
-    return np.asarray(image, dtype=np.uint8)
+def decode_image(image_data: Dict[str, Any]) -> np.ndarray:
+    """Decode image bytes using native decoder."""
+    result = kestrel_native.decode_image(image_data["bytes"])
+    if result is None:
+        raise ValueError("Unsupported image format")
+    return result
 
 
 def relaxed_correctness(
@@ -306,6 +293,7 @@ async def query_engine(
 
 async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     dataset = load_dataset("vikhyatk/chartqa", split=cfg.dataset_split)
+    dataset = dataset.cast_column("image", HFImage(decode=False))
     limit = cfg.limit
     if limit is not None:
         limit = min(limit, len(dataset))
@@ -458,7 +446,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
 
     # Run a warmup query to exclude startup time from measurements
     if rows:
-        warmup_image = pil_to_numpy(rows[0]["image"])
+        warmup_image = decode_image(rows[0]["image"])
         warmup_qa = rows[0]["qa"][0]
         warmup_prompt, warmup_reasoning, warmup_max_tokens, warmup_temp = build_prompt_and_settings(
             warmup_qa["question"],
@@ -479,7 +467,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
     start_time = time.perf_counter()
     for row_idx, row in enumerate(rows):
-        image = pil_to_numpy(row["image"])
+        image = decode_image(row["image"])
         for qa_idx, qa in enumerate(row["qa"]):
             tasks.append(
                 asyncio.create_task(evaluate_single(row_idx, qa_idx, image, qa))
@@ -651,19 +639,11 @@ def print_results(results: Dict[str, Any]) -> None:
         avg_output_tokens = (
             total_output_tokens / request_count if request_count else 0.0
         )
-        total_prefill_s = total_prefill_ms / 1000.0
-        total_decode_s = total_decode_ms / 1000.0
-        effective_prefill = (
-            total_input_tokens / total_prefill_s if total_prefill_s > 0 else 0.0
-        )
-        effective_decode = (
-            total_output_tokens / total_decode_s if total_decode_s > 0 else 0.0
-        )
-
         print(f"\nAvg Input Tokens / Request: {avg_input_tokens:.2f}")
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
-        print(f"Prefill Throughput (per request): {effective_prefill:.2f} tok/s")
-        print(f"Decode Throughput (per request): {effective_decode:.2f} tok/s")
+        if wall_time_s > 0:
+            print(f"Prefill Throughput: {total_input_tokens / wall_time_s:.2f} tok/s")
+            print(f"Decode Throughput: {total_output_tokens / wall_time_s:.2f} tok/s")
         # Prefix cache stats (only when enabled)
         if results.get("prefix_cache_enabled", False) and request_count > 0:
             cache_hit_count = usage.get("cache_hit_count", 0)

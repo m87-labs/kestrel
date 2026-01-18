@@ -91,17 +91,15 @@ When inflight_refs drops to 0 for a finalized sequence -> release resources.
 
 PREFILL HANDLING
 ----------------
-Prefill runs synchronously and requires draining the pipeline first:
-1. Complete all sampled steps in batch_queue
-2. Finalize and complete any pending forward
-3. Now safe to run prefill
-
-This ensures clean state and prevents batch membership changes mid-pipeline.
+Prefill can be represented as `kind="prefill"` launches and pending commits in
+this same pipeline. The scheduler owns any policy constraints (e.g., whether it
+is safe to interleave prefill and decode steps) and is responsible for preserving
+correct FIFO commit order across kinds.
 """
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Generic, Literal, Protocol, TypeVar, cast
+from typing import Generic, Literal, Protocol, TypeVar
 
 
 class SequenceLike(Protocol):
@@ -147,7 +145,9 @@ class PrefillLaunch:
     """Payload for prefill launches."""
 
     staging: object
-    prefill_slot_id: int
+    slot_id: int
+    logits: object
+    prepared: object
 
 
 @dataclass(slots=True)
@@ -162,7 +162,8 @@ class PrefillPendingCommit:
     """Payload for prefill pending commits."""
 
     staging: object
-    prefill_slot_id: int
+    slot_id: int
+    prepared: object
 
 
 @dataclass(slots=True)
@@ -185,10 +186,8 @@ class LaunchHandle(Generic[Seq]):
 
     @property
     def slot_id(self) -> int:
-        """Return slot_id for decode launches."""
-        if self.kind != "decode":
-            raise AssertionError("slot_id is only valid for decode launches")
-        return cast(DecodeLaunch, self.payload).slot_id
+        """Return the pipeline slot ID for the launch."""
+        return self.payload.slot_id
 
 
 @dataclass(slots=True)
@@ -214,10 +213,8 @@ class PendingCommit(Generic[Seq, Transfer]):
 
     @property
     def slot_id(self) -> int:
-        """Return slot_id for decode pending commits."""
-        if self.kind != "decode":
-            raise AssertionError("slot_id is only valid for decode pending commits")
-        return cast(DecodePendingCommit, self.payload).slot_id
+        """Return the pipeline slot ID for the pending commit."""
+        return self.payload.slot_id
 
 
 class PipelineState(Generic[Seq, Transfer]):
@@ -350,6 +347,17 @@ class PipelineState(Generic[Seq, Transfer]):
             return 1
         else:
             return None
+
+    def is_slot_free(self, slot_id: int) -> bool:
+        """Return True if the given slot_id is not currently referenced.
+
+        This is useful for schedulers that want to select a specific slot (e.g.,
+        to launch a prepared prefill) rather than always using free_slot_id().
+        """
+        if slot_id < 0 or slot_id >= self._num_slots:
+            raise ValueError(f"Invalid slot_id {slot_id}")
+        used_mask = self._used_slot_mask()
+        return (used_mask & (1 << slot_id)) == 0
 
     def can_launch(self) -> bool:
         """Check if we can launch a new forward pass.

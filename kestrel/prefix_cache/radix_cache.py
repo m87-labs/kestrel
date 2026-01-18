@@ -263,6 +263,11 @@ class RadixPrefixCache(BasePrefixCache):
                     return InsertResult(node=current_node, inserted_pages=0)
                 child = self._split_node(child, match_len)
 
+            # Guard against inserting when the caller didn't map the cache's
+            # existing prefix pages into its own page table (prevents corruption).
+            if tuple(pages[page_idx : page_idx + child.total_kv_length]) != child.physical_pages:
+                return InsertResult(node=current_node, inserted_pages=0)
+
             # Advance past matched tokens
             page_idx += child.total_kv_length
             token_idx += len(child.tokens)

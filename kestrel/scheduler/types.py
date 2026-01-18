@@ -38,7 +38,8 @@ class RequestLifecycle:
     prefix_cache_hit: bool = False
 
     # Decode pipeline state
-    pending_token: Optional[Token] = None
+    packed_pending_ready: bool = False
+    uncommitted_prefill_token: bool = False
     inflight_refs: int = 0
     finalized: bool = False
     finished: bool = False
@@ -46,6 +47,7 @@ class RequestLifecycle:
     # Timing
     submitted_at: float = 0.0
     prefill_started_at: Optional[float] = None
+    prefill_completed_at: Optional[float] = None
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
 
@@ -75,6 +77,7 @@ class RequestLifecycle:
     ) -> "RequestMetrics":
         queued_at = self.submitted_at
         prefill_started_at = self.prefill_started_at or queued_at
+        prefill_completed_at = self.prefill_completed_at or prefill_started_at
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
         if self.sequence_state is not None:
@@ -88,9 +91,9 @@ class RequestLifecycle:
         return RequestMetrics(
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
-            prefill_time_ms=max((first_token_time - prefill_started_at) * 1000.0, 0.0),
+            prefill_time_ms=max((prefill_completed_at - prefill_started_at) * 1000.0, 0.0),
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),
-            decode_time_ms=max((completed_at - first_token_time) * 1000.0, 0.0),
+            decode_time_ms=max((completed_at - prefill_completed_at) * 1000.0, 0.0),
             cached_tokens=cached_tokens,
         )
 
@@ -99,7 +102,6 @@ class RequestLifecycle:
         runtime: MoondreamRuntime,
         token: Token,
     ) -> None:
-        self.pending_token = token
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
         if self.phase not in (
@@ -140,7 +142,7 @@ class RequestLifecycle:
         return tokens[-1] if tokens else None
 
     def needs_decode(self) -> bool:
-        return not self.finished and self.pending_token is not None
+        return not self.finished and self.packed_pending_ready
 
 
 @dataclass

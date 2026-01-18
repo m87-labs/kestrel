@@ -18,8 +18,8 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 ## Execution Flow
 
 1. **Submission**: `GenerationScheduler.enqueue_request(...)` pushes a prepared request/skill-state pair into the waiting queue.
-2. **Prefill** (`_try_prefill`): whenever capacity allows, the scheduler pops waiting requests, runs `runtime.start_sequence`, and primes the `SkillState` with the first sampled token.
-3. **Decode Loop** (`_decode_step`): batches active sequences, feeds pending tokens into `runtime.decode_batch`, stages new tokens on each `SkillState`, and re-queues sequences until they finish or hit limits.
+2. **Prefill** (`_launch_prefill_step` + `_finalize_prefill`): whenever capacity allows, the scheduler pops a waiting request, runs `runtime.start_sequence`, and samples token0 into the shared pending buffers. The token is committed later via `commit_step` (pipelined like decode).
+3. **Decode Loop** (pipelined in `advance`): batches active sequences, feeds pending tokens into `runtime.decode_with_slot`, stages new tokens on each `SkillState`, and re-queues sequences until they finish or hit limits.
 4. **Finalization** (`_finalize_sequence`): once a sequence ends, the scheduler releases runtime resources, asks the `SkillState` to `finalize`, and records a `SchedulerResult`.
 
 ## Internal API Summary

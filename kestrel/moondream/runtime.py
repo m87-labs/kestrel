@@ -153,9 +153,10 @@ class SequenceState:
 class PrefillSlot:
     """Per-prefill slot resources.
 
-    Prefill is synchronous today, so we only use a single slot. This is still
-    structured as a slot so we can add more slots later to allow multiple
-    prefills queued up in the pipeline without clobbering per-prefill buffers.
+    Prefill work runs on the primary stream, but can be pipelined from the CPU
+    side (e.g., commit token0 for request A while the GPU runs request B's
+    prefill). Slots avoid clobbering per-prefill buffers when multiple prefills
+    are in-flight.
     """
 
     slot_id: int
@@ -173,6 +174,30 @@ class _CacheLookupResult:
     temp_lock_node: TreeNode | None
     can_reuse: bool
     namespace: CacheNamespace | None
+
+
+@dataclass(slots=True)
+class PreparedSequence:
+    """Prepared prefill state for a sequence before GPU prefill is launched.
+
+    This bundles the CPU-side work and KV/prefix-cache bookkeeping needed to
+    safely launch the GPU prefill later without stalling the GPU on admission
+    work (e.g., cache lookup, page allocation, and reservation).
+
+    Lifecycle:
+    - created by `MoondreamRuntime.prepare_sequence(...)`
+    - consumed by `MoondreamRuntime.launch_prepared_sequence(...)` (GPU enqueue)
+    - finalized by `MoondreamRuntime.finalize_prepared_sequence_after_prefill(...)`
+    - aborted by `MoondreamRuntime.abort_prepared_sequence(...)` on error/pause
+    """
+
+    state: "SequenceState"
+    tokens_list: list["Token"]
+    cache_tokens: list[CacheToken]
+    cache_result: _CacheLookupResult
+    adapter_id: str | None
+    image_hash: bytes | None
+    prefill_slot: "PrefillSlot"
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -423,15 +448,16 @@ class MoondreamRuntime:
         self._graph_batch_sizes: list[int] = []
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
+        # Prefill can be pipelined (CPU committing token0 while GPU runs the next prefill).
+        # Keep 2 slots to avoid clobbering per-prefill GPU buffers like `batch_idx`.
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
-                slot_id=0,
+                slot_id=slot_id,
                 batch_idx=torch.empty((1,), dtype=torch.int64, device=self.device),
                 step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
-                commit_done_event=torch.cuda.Event(
-                    enable_timing=False, blocking=False
-                ),
+                commit_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
             )
+            for slot_id in range(2)
         ]
         self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
 
@@ -511,10 +537,20 @@ class MoondreamRuntime:
     def prefill_slots(self) -> list[PrefillSlot]:
         return self._prefill_slots
 
-    def acquire_prefill_slot(self) -> PrefillSlot:
-        if not self._prefill_slot_free:
-            raise RuntimeError("Prefill slot pool exhausted")
-        return self._prefill_slot_free.pop()
+    def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
+        if slot_id is None:
+            if not self._prefill_slot_free:
+                raise RuntimeError("Prefill slot pool exhausted")
+            return self._prefill_slot_free.pop()
+
+        if slot_id < 0 or slot_id >= len(self._prefill_slots):
+            raise ValueError(f"Invalid prefill_slot_id {slot_id}")
+
+        for idx in range(len(self._prefill_slot_free) - 1, -1, -1):
+            slot = self._prefill_slot_free[idx]
+            if slot.slot_id == slot_id:
+                return self._prefill_slot_free.pop(idx)
+        raise RuntimeError(f"Prefill slot {slot_id} is already in use")
 
     def release_prefill_slot(self, slot: PrefillSlot) -> None:
         self._prefill_slot_free.append(slot)
@@ -887,11 +923,14 @@ class MoondreamRuntime:
             from_page_idx=cache_result.skip_positions,
         )
 
-        # Duplicate prefill: another sequence inserted the full prompt before we did.
-        # In this case, inserted_pages == 0 and the cache already owns a different
-        # set of pages for the full prompt. Do NOT transfer the lock to that node
-        # (we didn't use those pages); keep the existing temp lock if we reused
-        # cached prefix pages, otherwise return no lock so our pages can be freed.
+        # Insert refused or redundant: another sequence inserted the full prompt
+        # before we did, or the cache rejected insertion (e.g., because the caller
+        # didn't map the cached prefix pages into its own page table).
+        #
+        # In this case, inserted_pages == 0 and we must NOT transfer the lock to
+        # the returned node (we didn't use those pages); keep the existing temp
+        # lock if we reused cached prefix pages, otherwise return no lock so our
+        # pages can be freed.
         if insert_result.inserted_pages == 0:
             temp_lock_node = cache_result.temp_lock_node
             if temp_lock_node is None:
@@ -929,12 +968,58 @@ class MoondreamRuntime:
         image_hash: bytes | None = None,
         adapter_id: str | None = None,
     ) -> tuple[SequenceState, Tensor]:
+        prepared = self.prepare_sequence(
+            prompt_tokens=prompt_tokens,
+            prefill_slot=prefill_slot,
+            image=image,
+            image_crops=image_crops,
+            max_new_tokens=max_new_tokens,
+            lora_slot=lora_slot,
+            image_hash=image_hash,
+            adapter_id=adapter_id,
+        )
+        try:
+            logits = self.launch_prepared_sequence(
+                prepared, image=image, image_crops=image_crops
+            )
+            self.finalize_prepared_sequence_after_prefill(prepared)
+        except Exception:
+            self.abort_prepared_sequence(prepared)
+            raise
+        return prepared.state, logits
+
+    def prepare_sequence(
+        self,
+        prompt_tokens: Sequence[Token],
+        *,
+        prefill_slot: PrefillSlot,
+        image: Optional[pyvips.Image | np.ndarray] = None,
+        image_crops: Optional[OverlapCropOutput] = None,
+        max_new_tokens: Optional[int] = None,
+        lora_slot: int = 0,
+        image_hash: bytes | None = None,
+        adapter_id: str | None = None,
+    ) -> PreparedSequence:
+        """Prepare a sequence for GPU prefill without launching the prefill forward.
+
+        This performs all CPU-side admission work and KV/prefix-cache setup:
+        - validate inputs
+        - allocate a batch slot
+        - perform prefix cache lookup + map cached pages (if enabled)
+        - reserve KV capacity up to target_length
+
+        The returned PreparedSequence can be launched later via
+        `launch_prepared_sequence` and finalized via
+        `finalize_prepared_sequence_after_prefill`.
+        """
+
         # 1. Normalize inputs
         tokens_list = list(prompt_tokens)
 
         # 2. Validate image/hash consistency
-        if image is None:
-            assert image_hash is None, "image_hash must be None when image is None"
+        has_image = image is not None or image_crops is not None
+        if not has_image:
+            assert image_hash is None, "image_hash must be None when no image is provided"
         else:
             # Image prompts must have at least one text token after BOS to ensure
             # correct suffix slicing on cache hit (text_kv_cached >= 0).
@@ -944,16 +1029,16 @@ class MoondreamRuntime:
                 )
             if self.prefix_cache is not None:
                 assert image_hash is not None, (
-                    "image_hash must be provided when image is not None and prefix cache is enabled"
+                    "image_hash must be provided when prefix cache is enabled for image prompts"
                 )
 
         # 3. Compute dimensions
-        image_kv_length = self.image_prefix_length if image is not None else 0
+        image_kv_length = self.image_prefix_length if has_image else 0
         prompt_len = len(tokens_list) + image_kv_length
 
         # Build image_regions for attention masking. Until multi-image support,
         # this must be either [] (no image) or [(1, 1+image_kv_length)] (single image).
-        if image is not None:
+        if has_image:
             image_regions: list[tuple[int, int]] = [(1, 1 + image_kv_length)]
             # Validate single-image invariant
             assert len(image_regions) == 1, "Multi-image not yet supported"
@@ -976,6 +1061,7 @@ class MoondreamRuntime:
 
         # 5. Allocate batch slot
         batch_idx = self.page_table.allocate()
+
         # GPU-only buffer avoids async H2D races on shared pinned host memory.
         # Fill runs on primary stream to synchronize with page table H2D copies.
         batch_tensor = prefill_slot.batch_idx
@@ -987,73 +1073,132 @@ class MoondreamRuntime:
             cache_tokens, adapter_id, image_hash, image_kv_length, prompt_len, batch_idx
         )
 
-        # Steps 7-10 can fail; ensure we clean up batch slot and cache lock on error.
+        # 7. Reserve remaining pages for decode. On cache hit, map_pages() in step 6
+        # already set capacity to skip_positions, so reserve() only allocates suffix
+        # pages (target_length - skip_positions), not the full target_length.
         try:
-            # 7. Reserve remaining pages for decode. On cache hit, map_pages() in step 6
-            # already set capacity to skip_positions, so reserve() only allocates suffix
-            # pages (target_length - skip_positions), not the full target_length.
             self.page_table.reserve(
                 batch_idx_int=batch_idx,
                 batch_idx=batch_tensor,
                 seq_len=target_length,
             )
-
-            # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
-            # Use primary stream to ensure ordering with shared buffers.
-            with torch.cuda.stream(self._primary_stream):
-                # 8. Prepare inputs (branch on cache hit)
-                if cache_result.can_reuse:
-                    inputs_embeds, position_ids, fa3_seqused_k = self._prepare_append_prefill_inputs(
-                        tokens_list, cache_result.skip_positions, image_kv_length, prompt_len
-                    )
-                else:
-                    inputs_embeds, position_ids, fa3_seqused_k = self._prepare_full_prefill_inputs(
-                        tokens_list, image, image_crops, prompt_len
-                    )
-
-                # 9. Run prefill
-                hidden, logits = self._prefill(
-                    inputs_embeds,
-                    None,  # attention_mask
-                    position_ids,
-                    lora_slot,
-                    batch_idx=batch_tensor,
-                    use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
-                    fa3_seqused_k=fa3_seqused_k,
-                )
-
-            # 10. Finalize cache (insert + lock transfer)
-            cache_lock_node, cache_owned_page_count = self._finalize_cache_after_prefill(
-                cache_tokens, cache_result, prompt_len, batch_idx, adapter_id, image_hash
-            )
         except Exception:
             # Release temp cache lock if held
-            if (
-                self.prefix_cache is not None
-                and cache_result.temp_lock_node is not None
-            ):
+            if self.prefix_cache is not None and cache_result.temp_lock_node is not None:
                 self.prefix_cache.unlock_prefill(cache_result.temp_lock_node)
-            # Release batch slot (erase frees non-cache pages; 0 = no cache-owned pages yet)
-            self.page_table.erase(batch_idx, 0)
+            # Release batch slot; do NOT free cache-owned mapped prefix pages.
+            self.page_table.erase(batch_idx, cache_result.skip_positions)
             raise
 
-        # 11. Create state
         state = SequenceState(
             batch_idx=batch_idx,
             length=prompt_len,
             max_length=target_length,
             prompt_length=prompt_len,
             image_length=image_kv_length,
-            last_hidden=hidden[:, -1, :].squeeze(0).detach(),
+            last_hidden=None,
             lora_slot=lora_slot,
             cache_tokens=cache_tokens if self.prefix_cache else None,
-            cache_lock_node=cache_lock_node,
-            cache_owned_page_count=cache_owned_page_count,
+            cache_lock_node=None,
+            # Treat mapped prefix pages as cache-owned so we never free them by accident.
+            cache_owned_page_count=cache_result.skip_positions,
             reused_page_count=cache_result.skip_positions,
             image_regions=image_regions if image_regions else None,
         )
-        self.active_sequences[batch_idx] = state
-        return state, logits
+
+        return PreparedSequence(
+            state=state,
+            tokens_list=tokens_list,
+            cache_tokens=cache_tokens,
+            cache_result=cache_result,
+            adapter_id=adapter_id,
+            image_hash=image_hash,
+            prefill_slot=prefill_slot,
+        )
+
+    def launch_prepared_sequence(
+        self,
+        prepared: PreparedSequence,
+        *,
+        image: Optional[pyvips.Image | np.ndarray] = None,
+        image_crops: Optional[OverlapCropOutput] = None,
+    ) -> Tensor:
+        """Launch GPU prefill work for a prepared sequence and return logits."""
+
+        tokens_list = prepared.tokens_list
+        state = prepared.state
+        cache_result = prepared.cache_result
+        prompt_len = state.prompt_length or state.length
+        image_kv_length = state.image_length
+        batch_tensor = prepared.prefill_slot.batch_idx
+
+        # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
+        # Use primary stream to ensure ordering with shared buffers.
+        with torch.cuda.stream(self._primary_stream):
+            if cache_result.can_reuse:
+                inputs_embeds, position_ids, fa3_seqused_k = (
+                    self._prepare_append_prefill_inputs(
+                        tokens_list,
+                        cache_result.skip_positions,
+                        image_kv_length,
+                        prompt_len,
+                    )
+                )
+            else:
+                inputs_embeds, position_ids, fa3_seqused_k = (
+                    self._prepare_full_prefill_inputs(
+                        tokens_list,
+                        image,
+                        image_crops,
+                        prompt_len,
+                    )
+                )
+
+            hidden, logits = self._prefill(
+                inputs_embeds,
+                None,  # attention_mask
+                position_ids,
+                state.lora_slot,
+                batch_idx=batch_tensor,
+                use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
+                fa3_seqused_k=fa3_seqused_k,
+            )
+
+        state.last_hidden = hidden[:, -1, :].squeeze(0).detach()
+        return logits
+
+    def finalize_prepared_sequence_after_prefill(
+        self, prepared: PreparedSequence
+    ) -> None:
+        """Finalize prefix cache state after prefill completes."""
+
+        state = prepared.state
+        prompt_len = state.prompt_length or state.length
+        cache_lock_node, cache_owned_page_count = self._finalize_cache_after_prefill(
+            prepared.cache_tokens,
+            prepared.cache_result,
+            prompt_len,
+            state.batch_idx,
+            prepared.adapter_id,
+            prepared.image_hash,
+        )
+        state.cache_lock_node = cache_lock_node
+        state.cache_owned_page_count = cache_owned_page_count
+        self.active_sequences[state.batch_idx] = state
+
+    def abort_prepared_sequence(self, prepared: PreparedSequence) -> None:
+        """Abort a prepared sequence and release its reserved resources."""
+
+        # Release temp cache lock if held.
+        if self.prefix_cache is not None and prepared.cache_result.temp_lock_node is not None:
+            self.prefix_cache.unlock_prefill(prepared.cache_result.temp_lock_node)
+
+        # Ensure we don't keep an incomplete sequence registered.
+        batch_idx = prepared.state.batch_idx
+        self.active_sequences.pop(batch_idx, None)
+
+        # Release batch slot; do NOT free cache-owned mapped prefix pages.
+        self.page_table.erase(batch_idx, prepared.cache_result.skip_positions)
 
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)
