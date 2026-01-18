@@ -1,21 +1,11 @@
 """Image tiling helpers for the Moondream vision encoder."""
 
-import ctypes
-import ctypes.util
 import math
 from typing import Tuple, TypedDict
 
 import numpy as np
 import pyvips
 import torch
-
-# Set VIPS concurrency to a low value to avoid internal thread contention
-# when using multiple Python threads. With low concurrency, each vips operation
-# uses fewer internal threads, allowing Python-level parallelism to scale better.
-# Must use C API since env var is only read at vips initialization.
-_vips_lib = ctypes.CDLL(ctypes.util.find_library("vips"))
-_vips_lib.vips_concurrency_set.argtypes = [ctypes.c_int]
-_vips_lib.vips_concurrency_set(2)
 
 from kestrel.utils.image import _vips_to_uint8_numpy
 
