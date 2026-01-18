@@ -33,7 +33,7 @@ import math
 import queue
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 import os
 from dataclasses import dataclass
 from typing import (
@@ -65,6 +65,7 @@ from kestrel.scheduler import (
     StreamUpdate,
 )
 from kestrel.moondream.image_crops import OverlapCropOutput
+from kestrel.moondream.image_preprocessor import ImagePreprocessor
 from kestrel.moondream.vision import compute_overlap_crops
 from kestrel.skills import (
     CaptionSkill,
@@ -214,7 +215,7 @@ class InferenceEngine:
         self._request_ids = itertools.count()
         self._shutdown = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._image_executor: Optional[ThreadPoolExecutor] = None
+        self._image_preprocessor = ImagePreprocessor()
         self._skills = skills or SkillRegistry(
             [
                 QuerySkill(),
@@ -291,14 +292,6 @@ class InferenceEngine:
         self._runtime = await loop.run_in_executor(
             None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
         )
-        if self._image_executor is not None:
-            self._image_executor.shutdown(wait=True)
-        # Use 16 threads for image preprocessing. This value was determined empirically
-        # to balance parallelism with libvips internal thread contention (controlled
-        # by VIPS_CONCURRENCY=2 in image_crops.py).
-        self._image_executor = ThreadPoolExecutor(
-            max_workers=16, thread_name_prefix="kestrel-img"
-        )
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
@@ -343,9 +336,7 @@ class InferenceEngine:
             self._scheduler_event.set()
             self._scheduler_thread.join()
             self._scheduler_thread = None
-        if self._image_executor is not None:
-            self._image_executor.shutdown(wait=True)
-            self._image_executor = None
+        self._image_preprocessor.shutdown(wait=True)
 
     async def submit(
         self,
@@ -1045,20 +1036,9 @@ class InferenceEngine:
                     admit_request(req, None, prefix_cache_hit=True)  # No crops needed
                     return
 
-            # Cache miss or prefix cache disabled - compute crops
-            executor = self._image_executor
-            if executor is None:
-                try:
-                    crops = compute_overlap_crops(req.image, runtime.config.vision)
-                except Exception as exc:
-                    self._fail_request(req, exc)
-                    return
-                admit_request(req, crops, prefix_cache_hit=False)
-                return
+            # Cache miss or prefix cache disabled - compute crops asynchronously
             try:
-                future = executor.submit(
-                    compute_overlap_crops, req.image, runtime.config.vision
-                )
+                future = self._image_preprocessor.submit(req.image, runtime.config.vision)
             except Exception as exc:
                 self._fail_request(req, exc)
                 return
