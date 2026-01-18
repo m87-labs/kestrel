@@ -183,7 +183,7 @@ class PageTable:
             )
         else:
             # check if we can reserve new pages for an existing request
-            return self.reserve(batch_idx_int, None, size, dry_run=True)
+            return self.reserve(batch_idx_int, size, dry_run=True)
 
     def allocate(self) -> int:
         """allocate a new batch"""
@@ -201,8 +201,7 @@ class PageTable:
 
     def reserve(
         self,
-        batch_idx_int: int,
-        batch_idx: torch.Tensor,
+        batch_idx: int,
         seq_len: int,
         dry_run: bool = False,
     ) -> bool:
@@ -211,19 +210,20 @@ class PageTable:
         hold `seq_len` elements.
 
         Args:
-            batch_idx_int (int): batch index to be reserved;
-            batch_idx (Tensor): batch index to be reserved; shape :math:`(1)`.
-            seq_len (Tensor): minimum capacity for the given batch; shape :math:`(1)`.
+            batch_idx (int): batch index to be reserved.
+            seq_len (int): minimum capacity for the given batch.
+            dry_run (bool): if True, just check if allocation is possible without
+                actually allocating.
 
         Returns:
             bool: True if the reservation was successful, False if the reservation was not successful (no space, and in this case, no update is done)
         """
 
-        if seq_len <= self.capacity[batch_idx_int]:
+        if seq_len <= self.capacity[batch_idx]:
             return True
 
         num_pages_to_allocate = _cdiv(
-            seq_len - self.capacity[batch_idx_int], self.page_size
+            seq_len - self.capacity[batch_idx], self.page_size
         )
 
         available = self.pages_available
@@ -242,14 +242,14 @@ class PageTable:
         if not can_allocate:
             msg = (
                 f"Cannot reserve {num_pages_to_allocate} pages for a sequence of length {seq_len} "
-                f"in batch {batch_idx_int}. Only {self.pages_available} pages available. "
-                f"Current capacity is {self.capacity[batch_idx_int]} tokens."
+                f"in batch {batch_idx}. Only {self.pages_available} pages available. "
+                f"Current capacity is {self.capacity[batch_idx]} tokens."
             )
             if self.prefix_cache is not None:
                 msg += " All cached prefixes are locked by active sequences."
             raise RuntimeError(msg)
 
-        start_page_idx = self.capacity[batch_idx_int] // self.page_size
+        start_page_idx = self.capacity[batch_idx] // self.page_size
         end_page_idx = start_page_idx + num_pages_to_allocate
 
         # find empty physical pages
@@ -257,9 +257,9 @@ class PageTable:
         allocated_pages_cpu = torch.as_tensor(allocated_pages_list, dtype=torch.int32)
         # update page table on host first, then sync the touched slice once
         self._page_table_cpu_tensor[
-            batch_idx_int, start_page_idx:end_page_idx
+            batch_idx, start_page_idx:end_page_idx
         ] = allocated_pages_cpu
-        self._sync_page_table_row(batch_idx_int, start_page_idx, end_page_idx)
+        self._sync_page_table_row(batch_idx, start_page_idx, end_page_idx)
 
         with _maybe_stream_context(self._h2d_stream):
             allocated_pages_idx = allocated_pages_cpu.to(
@@ -271,9 +271,9 @@ class PageTable:
                 device=self.device,
             )
         # update cpu side metadata
-        self.page_table_cpu[batch_idx_int] += allocated_pages_list
+        self.page_table_cpu[batch_idx] += allocated_pages_list
         del self.free_pages[-num_pages_to_allocate:]
-        self.capacity[batch_idx_int] += num_pages_to_allocate * self.page_size
+        self.capacity[batch_idx] += num_pages_to_allocate * self.page_size
         return True
 
     def erase(self, batch_idx: int, cached_page_count: int = 0) -> None:
@@ -553,6 +553,29 @@ class PageTable:
                 return True
             pages_needed = (size - current + self.page_size - 1) // self.page_size
 
+        available = self.pages_available
+        if available >= pages_needed:
+            return True
+
+        # Check if eviction could free enough
+        if self.prefix_cache is not None:
+            evictable = self.prefix_cache.evictable_page_count()
+            return available + evictable >= pages_needed
+        return False
+
+    def can_reserve_pages(self, size: int) -> bool:
+        """Check if pages can be reserved, ignoring batch slot availability.
+
+        This is used for prefill preparation which doesn't require a batch slot
+        until launch time. Only checks page availability (with eviction).
+
+        Args:
+            size: Number of KV positions needed.
+
+        Returns:
+            True if pages are available (with eviction if needed).
+        """
+        pages_needed = (size + self.page_size - 1) // self.page_size
         available = self.pages_available
         if available >= pages_needed:
             return True

@@ -148,6 +148,7 @@ class PrefillLaunch:
     slot_id: int
     logits: object
     prepared: object
+    prefill_slot: object
 
 
 @dataclass(slots=True)
@@ -164,6 +165,7 @@ class PrefillPendingCommit:
     staging: object
     slot_id: int
     prepared: object
+    prefill_slot: object
 
 
 @dataclass(slots=True)

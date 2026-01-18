@@ -313,12 +313,7 @@ def main():
         with torch.inference_mode():
             for _ in range(args.batch_size):
                 batch_idx = runtime.page_table.allocate()
-                batch_tensor = torch.tensor([batch_idx], device=device, dtype=torch.int64)
-                runtime.page_table.reserve(
-                    batch_idx_int=batch_idx,
-                    batch_idx=batch_tensor,
-                    seq_len=args.prompt_len + max_new_tokens,
-                )
+                runtime.page_table.reserve(batch_idx, args.prompt_len + max_new_tokens)
                 seq_states.append(
                     SequenceState(
                         batch_idx=batch_idx,

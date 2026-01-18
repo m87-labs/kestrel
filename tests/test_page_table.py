@@ -919,9 +919,8 @@ class TestBackwardCompatibility:
             n_pages=100, page_size=1, max_batch_size=10, device="cpu"
         )
         batch_idx = page_table.allocate()
-        batch_tensor = torch.tensor([batch_idx], dtype=torch.int32)
 
-        success = page_table.reserve(batch_idx, batch_tensor, 10)
+        success = page_table.reserve(batch_idx, 10)
 
         assert success is True
         assert page_table.capacity[batch_idx] == 10
@@ -942,8 +941,7 @@ class TestBackwardCompatibility:
         )
         initial = page_table.pages_available
         batch_idx = page_table.allocate()
-        batch_tensor = torch.tensor([batch_idx], dtype=torch.int32)
-        page_table.reserve(batch_idx, batch_tensor, 10)
+        page_table.reserve(batch_idx, 10)
 
         # Old-style erase (no cached_page_count)
         page_table.erase(batch_idx)

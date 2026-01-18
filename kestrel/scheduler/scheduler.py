@@ -357,7 +357,7 @@ class GenerationScheduler:
         self._completed.append(result)
 
     def _is_prefill_admissible(self) -> bool:
-        """Check if the next pending prefill can be admitted.
+        """Check if the next pending prefill can be admitted (full check).
 
         Returns True if:
         - There's a waiting request
@@ -395,6 +395,45 @@ class GenerationScheduler:
             return False
         return True
 
+    def _can_prepare_prefill(self) -> bool:
+        """Check if we can prepare the next prefill (without batch slot check).
+
+        Unlike _is_prefill_admissible(), this does NOT check batch slot
+        availability. Used for background prefill preparation which doesn't
+        require a batch slot until launch time.
+
+        Returns True if:
+        - There's a waiting request
+        - Request is in the right phase
+        - Image crops are ready (if needed)
+        - KV cache has enough pages (ignoring batch slots)
+        """
+        request = self.waiting.peek()
+        if request is None:
+            return False
+        lifecycle = request.lifecycle
+        if lifecycle.phase not in (
+            RequestPhase.WAITING_RESOURCES,
+            RequestPhase.READY_FOR_PREFILL,
+        ):
+            return False
+        if (
+            lifecycle.has_image
+            and not lifecycle.prefix_cache_hit
+            and not lifecycle.crops_ready
+        ):
+            return False
+        reserve_length = request.target_length
+        if lifecycle.has_image and lifecycle.prefix_cache_hit:
+            reserve_length = max(
+                reserve_length - (1 + self.runtime.image_prefix_length),
+                1,
+            )
+        # Only check pages, not batch slots - slot acquired at launch time
+        if not self.runtime.can_reserve_pages(reserve_length):
+            return False
+        return True
+
     def _acquire_prefill_staging(self) -> PrefillStaging:
         """Acquire a prefill staging bundle."""
         if not self._prefill_staging_pool:
@@ -414,15 +453,11 @@ class GenerationScheduler:
         request = prepared_prefill.request
         lifecycle = request.lifecycle
         prepared_seq = prepared_prefill.prepared
-        prefill_slot = prepared_seq.prefill_slot
+        # Note: No prefill_slot to release here - slots are acquired at launch time,
+        # not at prepare time. PreparedSequence is decoupled from PrefillSlot.
         try:
             self.runtime.abort_prepared_sequence(prepared_seq)
         finally:
-            try:
-                self.runtime.release_prefill_slot(prefill_slot)
-            except Exception:  # pragma: no cover - defensive cleanup
-                pass
-
             if prepared_prefill.acquired_lora:
                 try:
                     self.runtime.release_adapter_slot(request.lora_slot)
@@ -459,16 +494,24 @@ class GenerationScheduler:
             )
             self._completed.append(result)
 
-    def _prepare_prefill_for_slot(self, slot_id: int) -> bool:
+    def _prepare_prefill(self) -> bool:
         """Perform heavy prefill preparation for the next waiting request.
 
         This does KV allocation/reservation + prefix-cache lookup ahead of time so
         the pipeline "launch" can be limited to GPU enqueue work.
+
+        Note: PrefillSlot is NOT acquired here. It is acquired at launch time,
+        allowing preparation to proceed even when all prefill slots are occupied
+        by in-flight prefills.
+
+        Note: Uses _can_prepare_prefill() which skips batch slot availability
+        check. The page table has an extra slot reserved for preparation, so we
+        can always prepare even at max batch size.
         """
 
         if self._prepared_prefill is not None:
             return False
-        if not self._is_prefill_admissible():
+        if not self._can_prepare_prefill():
             return False
 
         request = self.waiting.pop()
@@ -488,20 +531,14 @@ class GenerationScheduler:
         if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
             lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
 
-        prefill_slot: PrefillSlot | None = None
         try:
             prompt_inputs = request.prompt_tokens
             prefill_start = time.perf_counter()
             lifecycle.prefill_started_at = prefill_start
             lifecycle.transition(RequestPhase.PREFILLING)
 
-            prefill_slot = self.runtime.acquire_prefill_slot(slot_id)
-            assert prefill_slot.slot_id == slot_id, (
-                f"Prefill slot mismatch: got {prefill_slot.slot_id}, expected {slot_id}"
-            )
             prepared = self.runtime.prepare_sequence(
                 prompt_tokens=prompt_inputs,
-                prefill_slot=prefill_slot,
                 image=request.image,
                 image_crops=request.image_crops,
                 max_new_tokens=request.max_new_tokens,
@@ -510,8 +547,6 @@ class GenerationScheduler:
                 adapter_id=request.adapter,
             )
         except Exception as exc:
-            if prefill_slot is not None:
-                self.runtime.release_prefill_slot(prefill_slot)
             if acquired_lora:
                 self.runtime.release_adapter_slot(request.lora_slot)
                 request.lora_slot = 0
@@ -536,16 +571,18 @@ class GenerationScheduler:
         return True
 
     def _maybe_prepare_prefill(self, pipeline: PipelineState) -> bool:
-        """Prepare a prefill while a GPU forward is in flight."""
+        """Prepare a prefill while a GPU forward is in flight.
 
+        Since PreparedSequence is decoupled from PrefillSlot, we can prepare
+        even when all prefill slots are occupied by in-flight prefills. The
+        slot is acquired at launch time instead.
+        """
         if self._prepared_prefill is not None:
             return False
         if not pipeline.has_launch_in_flight():
             return False
-        slot_id = pipeline.free_slot_id()
-        if slot_id is None:
-            return False
-        return self._prepare_prefill_for_slot(slot_id)
+
+        return self._prepare_prefill()
 
     def _finalize_prefill(self, handle: LaunchHandle) -> PendingCommit:
         """Sample first token + start D2H for a prefill.
@@ -560,12 +597,7 @@ class GenerationScheduler:
         staging = prefill_payload.staging
         logits = prefill_payload.logits
         prepared_seq = prefill_payload.prepared
-        prefill_slot = prepared_seq.prefill_slot
-        if prefill_payload.slot_id != prefill_slot.slot_id:  # pragma: no cover - defensive
-            raise AssertionError(
-                "Prefill slot mismatch: payload slot_id "
-                f"{prefill_payload.slot_id} != prepared slot_id {prefill_slot.slot_id}"
-            )
+        prefill_slot = prefill_payload.prefill_slot
         seq = handle.sequences[0]
 
         first_logits = logits.squeeze(0)
@@ -615,6 +647,7 @@ class GenerationScheduler:
                 staging=staging,
                 slot_id=prefill_payload.slot_id,
                 prepared=prepared_seq,
+                prefill_slot=prefill_slot,
             ),
         )
 
@@ -627,12 +660,7 @@ class GenerationScheduler:
             raise AssertionError("prefill commit requires a PrefillPendingCommit payload")
         staging = payload.staging
         prepared_seq = payload.prepared
-        prefill_slot = prepared_seq.prefill_slot
-        if payload.slot_id != prefill_slot.slot_id:  # pragma: no cover - defensive
-            raise AssertionError(
-                "Prefill slot mismatch: payload slot_id "
-                f"{payload.slot_id} != prepared slot_id {prefill_slot.slot_id}"
-            )
+        prefill_slot = payload.prefill_slot
         try:
             token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
             prefill_slot.commit_done_event.synchronize()
@@ -660,16 +688,15 @@ class GenerationScheduler:
         if pipeline.committing_step is not None:
             return False
 
+        # Need a free pipeline slot to launch
+        slot_id = pipeline.free_slot_id()
+        if slot_id is None:
+            return False
+
+        # Get or create a prepared prefill
         prepared_prefill = self._prepared_prefill
-        if prepared_prefill is not None:
-            slot_id = prepared_prefill.prepared.prefill_slot.slot_id
-            if not pipeline.is_slot_free(slot_id):
-                return False
-        else:
-            slot_id = pipeline.free_slot_id()
-            if slot_id is None:
-                return False
-            progressed = self._prepare_prefill_for_slot(slot_id)
+        if prepared_prefill is None:
+            progressed = self._prepare_prefill()
             if not progressed:
                 return False
             prepared_prefill = self._prepared_prefill
@@ -682,19 +709,27 @@ class GenerationScheduler:
         lifecycle = request.lifecycle
         seq = lifecycle
         prepared_seq = prepared_prefill.prepared
-        prefill_slot = prepared_seq.prefill_slot
         acquired_lora = prepared_prefill.acquired_lora
 
-        def fail_prepared(exc: Exception, *, staging: PrefillStaging | None = None) -> bool:
+        # Acquire prefill slot at launch time (decoupled from prepare)
+        prefill_slot = self.runtime.acquire_prefill_slot(slot_id)
+
+        def fail_prepared(
+            exc: Exception,
+            *,
+            staging: PrefillStaging | None = None,
+            release_slot: bool = True,
+        ) -> bool:
             if staging is not None:
                 self._release_prefill_staging(staging)
             try:
                 self.runtime.abort_prepared_sequence(prepared_seq)
             finally:
-                try:
-                    self.runtime.release_prefill_slot(prefill_slot)
-                except Exception:
-                    pass
+                if release_slot:
+                    try:
+                        self.runtime.release_prefill_slot(prefill_slot)
+                    except Exception:
+                        pass
                 if acquired_lora:
                     try:
                         self.runtime.release_adapter_slot(request.lora_slot)
@@ -711,6 +746,7 @@ class GenerationScheduler:
             try:
                 self.runtime.launch_prepared_sequence(
                     prepared_seq,
+                    prefill_slot,
                     image=request.image,
                     image_crops=request.image_crops,
                 )
@@ -737,6 +773,7 @@ class GenerationScheduler:
         try:
             logits = self.runtime.launch_prepared_sequence(
                 prepared_seq,
+                prefill_slot,
                 image=request.image,
                 image_crops=request.image_crops,
             )
@@ -758,6 +795,7 @@ class GenerationScheduler:
                 slot_id=slot_id,
                 logits=logits,
                 prepared=prepared_seq,
+                prefill_slot=prefill_slot,
             ),
         )
         pipeline.on_launch(handle)

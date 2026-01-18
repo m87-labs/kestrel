@@ -189,6 +189,10 @@ class PreparedSequence:
     - consumed by `MoondreamRuntime.launch_prepared_sequence(...)` (GPU enqueue)
     - finalized by `MoondreamRuntime.finalize_prepared_sequence_after_prefill(...)`
     - aborted by `MoondreamRuntime.abort_prepared_sequence(...)` on error/pause
+
+    Note: PreparedSequence is decoupled from PrefillSlot. The slot is acquired
+    at launch time, allowing preparation to proceed even when all prefill slots
+    are occupied by in-flight prefills.
     """
 
     state: "SequenceState"
@@ -197,7 +201,6 @@ class PreparedSequence:
     cache_result: _CacheLookupResult
     adapter_id: str | None
     image_hash: bytes | None
-    prefill_slot: "PrefillSlot"
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -301,8 +304,11 @@ class MoondreamRuntime:
             )
         # max_batch_size is the effective user-facing batch capacity.
         # We reserve batch_idx 0 for internal bookkeeping, so allocate +1 slot.
+        # We also add +1 extra slot for prefill preparation, allowing prepare to
+        # run even at max batch size (the prepared sequence claims the extra slot,
+        # then launches when an active sequence completes).
         self.max_batch_size = cfg.max_batch_size
-        self.max_batch_slots = cfg.max_batch_size + 1
+        self.max_batch_slots = cfg.max_batch_size + 2
         n_pages = self.max_seq_length // self.page_size
 
         # Create prefix cache if enabled
@@ -522,6 +528,14 @@ class MoondreamRuntime:
         """Return True if a request of ``total_length`` tokens can be admitted."""
 
         return self.page_table.can_reserve_with_eviction(total_length)
+
+    def can_reserve_pages(self, total_length: int) -> bool:
+        """Return True if pages are available for ``total_length`` tokens.
+
+        Unlike can_reserve(), this does NOT check batch slot availability.
+        Used for prefill preparation which doesn't require a batch slot.
+        """
+        return self.page_table.can_reserve_pages(total_length)
 
     @property
     def copy_stream(self) -> torch.cuda.Stream:
@@ -970,7 +984,6 @@ class MoondreamRuntime:
     ) -> tuple[SequenceState, Tensor]:
         prepared = self.prepare_sequence(
             prompt_tokens=prompt_tokens,
-            prefill_slot=prefill_slot,
             image=image,
             image_crops=image_crops,
             max_new_tokens=max_new_tokens,
@@ -980,7 +993,7 @@ class MoondreamRuntime:
         )
         try:
             logits = self.launch_prepared_sequence(
-                prepared, image=image, image_crops=image_crops
+                prepared, prefill_slot, image=image, image_crops=image_crops
             )
             self.finalize_prepared_sequence_after_prefill(prepared)
         except Exception:
@@ -992,7 +1005,6 @@ class MoondreamRuntime:
         self,
         prompt_tokens: Sequence[Token],
         *,
-        prefill_slot: PrefillSlot,
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
@@ -1011,6 +1023,10 @@ class MoondreamRuntime:
         The returned PreparedSequence can be launched later via
         `launch_prepared_sequence` and finalized via
         `finalize_prepared_sequence_after_prefill`.
+
+        Note: This method is decoupled from PrefillSlot. The slot is acquired
+        at launch time, allowing preparation to proceed even when all prefill
+        slots are occupied by in-flight prefills.
         """
 
         # 1. Normalize inputs
@@ -1056,17 +1072,16 @@ class MoondreamRuntime:
                 f"Requested length {target_length} exceeds max_seq_length={self.max_seq_length}."
             )
 
-        # 4. Build cache tokens
-        cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
+        # 4. Build cache tokens (skip when prefix cache is disabled).
+        if self.prefix_cache is None:
+            cache_tokens = []
+        else:
+            cache_tokens = self._build_cache_tokens(
+                tokens_list, image_hash, image_kv_length
+            )
 
         # 5. Allocate batch slot
         batch_idx = self.page_table.allocate()
-
-        # GPU-only buffer avoids async H2D races on shared pinned host memory.
-        # Fill runs on primary stream to synchronize with page table H2D copies.
-        batch_tensor = prefill_slot.batch_idx
-        with torch.cuda.stream(self._primary_stream):
-            batch_tensor.fill_(batch_idx)
 
         # 6. Cache lookup (maps pages, acquires temp lock)
         cache_result = self._lookup_prefix_cache(
@@ -1077,11 +1092,7 @@ class MoondreamRuntime:
         # already set capacity to skip_positions, so reserve() only allocates suffix
         # pages (target_length - skip_positions), not the full target_length.
         try:
-            self.page_table.reserve(
-                batch_idx_int=batch_idx,
-                batch_idx=batch_tensor,
-                seq_len=target_length,
-            )
+            self.page_table.reserve(batch_idx, target_length)
         except Exception:
             # Release temp cache lock if held
             if self.prefix_cache is not None and cache_result.temp_lock_node is not None:
@@ -1113,24 +1124,36 @@ class MoondreamRuntime:
             cache_result=cache_result,
             adapter_id=adapter_id,
             image_hash=image_hash,
-            prefill_slot=prefill_slot,
         )
 
     def launch_prepared_sequence(
         self,
         prepared: PreparedSequence,
+        prefill_slot: PrefillSlot,
         *,
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
-        """Launch GPU prefill work for a prepared sequence and return logits."""
+        """Launch GPU prefill work for a prepared sequence and return logits.
+
+        Args:
+            prepared: The prepared sequence from prepare_sequence().
+            prefill_slot: The prefill slot to use for this launch. The slot's
+                batch_idx tensor will be filled with the sequence's batch index.
+        """
 
         tokens_list = prepared.tokens_list
         state = prepared.state
         cache_result = prepared.cache_result
         prompt_len = state.prompt_length or state.length
         image_kv_length = state.image_length
-        batch_tensor = prepared.prefill_slot.batch_idx
+        batch_tensor = prefill_slot.batch_idx
+
+        # Fill the prefill slot's batch_idx tensor with the sequence's batch index.
+        # This must be done on the primary stream to ensure proper ordering with
+        # subsequent GPU operations.
+        with torch.cuda.stream(self._primary_stream):
+            batch_tensor.fill_(state.batch_idx)
 
         # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
         # Use primary stream to ensure ordering with shared buffers.
