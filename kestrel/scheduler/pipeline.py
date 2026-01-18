@@ -147,6 +147,7 @@ class PrefillLaunch:
     """Payload for prefill launches."""
 
     staging: object
+    prefill_slot_id: int
 
 
 @dataclass(slots=True)
@@ -161,6 +162,7 @@ class PrefillPendingCommit:
     """Payload for prefill pending commits."""
 
     staging: object
+    prefill_slot_id: int
 
 
 @dataclass(slots=True)

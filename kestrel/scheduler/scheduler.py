@@ -362,6 +362,7 @@ class GenerationScheduler:
             raise AssertionError("prefill finalize requires a prefill handle")
         prefill_payload = cast(PrefillLaunch, handle.payload)
         staging = cast(PrefillStaging, prefill_payload.staging)
+        prefill_slot = self.runtime.prefill_slots[prefill_payload.prefill_slot_id]
         seq = handle.sequences[0]
 
         with torch.cuda.stream(self.runtime.primary_stream):
@@ -385,23 +386,23 @@ class GenerationScheduler:
                 out_size=size_out,
                 rng=self._sampling_rng,
             )
+            prefill_slot.step_done_event.record()
             batch_idx = seq.state.batch_idx
             self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
             self._pending_coord_values[batch_idx].copy_(coord_decode[0])
             self._pending_size_values[batch_idx].copy_(size_decode[0])
 
-            # Record event for D2H transfer synchronization
-            prefill_done_event = torch.cuda.Event()
-            prefill_done_event.record()
-
         transfer = staging.render.transfer(
-            sampled_ids, coord_decode, size_decode, ready_event=prefill_done_event
+            sampled_ids, coord_decode, size_decode, ready_event=prefill_slot.step_done_event
         )
         return PendingCommit(
             kind="prefill",
             sequences=handle.sequences,
             transfer=transfer,
-            payload=PrefillPendingCommit(staging=staging),
+            payload=PrefillPendingCommit(
+                staging=staging,
+                prefill_slot_id=prefill_payload.prefill_slot_id,
+            ),
         )
 
     def _commit_prefill(self, step: PendingCommit) -> Token:
@@ -410,6 +411,7 @@ class GenerationScheduler:
             raise AssertionError("prefill commit requires a prefill pending commit")
         payload = cast(PrefillPendingCommit, step.payload)
         staging = cast(PrefillStaging, payload.staging)
+        prefill_slot = self.runtime.prefill_slots[payload.prefill_slot_id]
         try:
             token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
             token = render_tokens_from_packed(
@@ -421,6 +423,7 @@ class GenerationScheduler:
             )[0]
         finally:
             self._release_prefill_staging(staging)
+            self.runtime.release_prefill_slot(prefill_slot)
         return token
 
     def _try_prefill(self) -> bool:
@@ -464,13 +467,16 @@ class GenerationScheduler:
             if lifecycle.phase == RequestPhase.WAITING_RESOURCES:
                 lifecycle.transition(RequestPhase.READY_FOR_PREFILL)
 
+            prefill_slot = None
             try:
                 prompt_inputs = request.prompt_tokens
                 prefill_start = time.perf_counter()
                 lifecycle.prefill_started_at = prefill_start
                 lifecycle.transition(RequestPhase.PREFILLING)
+                prefill_slot = self.runtime.acquire_prefill_slot()
                 state, logits = self.runtime.start_sequence(
                     prompt_tokens=prompt_inputs,
+                    prefill_slot=prefill_slot,
                     image=request.image,
                     image_crops=request.image_crops,
                     max_new_tokens=request.max_new_tokens,
@@ -479,6 +485,8 @@ class GenerationScheduler:
                     adapter_id=request.adapter,
                 )
             except Exception as exc:
+                if prefill_slot is not None:
+                    self.runtime.release_prefill_slot(prefill_slot)
                 # Release slot on failure to prevent leak (only if acquired here)
                 if acquired_lora:
                     self.runtime.release_adapter_slot(request.lora_slot)
@@ -501,19 +509,28 @@ class GenerationScheduler:
             if request.max_new_tokens <= 0:
                 seq.first_token_time = prefill_start
                 self._finalize_sequence(seq, "length")
+                self.runtime.release_prefill_slot(prefill_slot)
                 progress = True
                 continue
 
-            staging = self._acquire_prefill_staging()
+            try:
+                staging = self._acquire_prefill_staging()
+            except Exception:
+                self.runtime.release_prefill_slot(prefill_slot)
+                raise
             handle = LaunchHandle(
                 kind="prefill",
                 sequences=[seq],
-                payload=PrefillLaunch(staging=staging),
+                payload=PrefillLaunch(
+                    staging=staging,
+                    prefill_slot_id=prefill_slot.slot_id,
+                ),
             )
             try:
                 step = self._finalize_prefill(handle, logits)
             except Exception:
                 self._release_prefill_staging(staging)
+                self.runtime.release_prefill_slot(prefill_slot)
                 raise
             token = self._commit_prefill(step)
             seq.stage_token(self.runtime, token)

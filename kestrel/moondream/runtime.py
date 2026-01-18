@@ -149,24 +149,18 @@ class SequenceState:
         return self.length - (self.prompt_length or 0)
 
 
-@dataclass
+@dataclass(slots=True)
 class PrefillSlot:
     """Per-prefill slot resources.
 
-    Currently only holds the batch_idx tensor used to bind paged KV writes.
+    Prefill is synchronous today, so we only use a single slot. This is still
+    structured as a slot so we can add more slots later to allow multiple
+    prefills queued up in the pipeline without clobbering per-prefill buffers.
     """
 
+    slot_id: int
     batch_idx: Tensor
-
-    def mark_prefilled(self, prompt_len: int) -> None:
-        self.prompt_length = prompt_len
-        self.length = prompt_len
-
-    def at_capacity(self) -> bool:
-        return self.length >= self.max_length
-
-    def remaining_new_tokens(self) -> int:
-        return max(self.max_length - self.length, 0)
+    step_done_event: torch.cuda.Event
 
 
 @dataclass
@@ -178,11 +172,6 @@ class _CacheLookupResult:
     temp_lock_node: TreeNode | None
     can_reuse: bool
     namespace: CacheNamespace | None
-
-
-@dataclass
-class _BatchBinding:
-    tensor: Tensor | None = None
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -208,10 +197,6 @@ class _LayerPagedCache(torch.nn.Module):
             k_scale=k_scale,
             v_scale=v_scale,
         ).to(device)
-        self._batch_binding = _BatchBinding()
-
-    def attach_batch_binding(self, binding: _BatchBinding) -> None:
-        self._batch_binding = binding
 
     def update(
         self,
@@ -238,18 +223,10 @@ class _LayerPagedCache(torch.nn.Module):
                 f"KV sequence length {k_val.shape[1]} does not match position tensor {input_pos.shape}"
             )
 
-        batch_idx = self._batch_binding.tensor
-
-        if seq_len == 1:
-            batch_idx_arg = batch_idx.expand(k_val.shape[0])
-        else:
-            batch_idx_arg = batch_idx.view(1).expand_as(input_pos)
-
         return self.cache.update(
             input_pos=input_pos,
             k_val=k_val,
             v_val=v_val,
-            batch_idx=batch_idx_arg,
             slot_mapping=slot_mapping,
         )
 
@@ -443,19 +420,16 @@ class MoondreamRuntime:
 
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
-        self._batch_binding: _BatchBinding = _BatchBinding()
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
-                batch_idx=torch.empty(
-                    (1,), dtype=torch.int64, device=self.device
-                )
+                slot_id=0,
+                batch_idx=torch.empty((1,), dtype=torch.int64, device=self.device),
+                step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
             )
         ]
-
-        for cache in self.layer_caches:
-            cache.attach_batch_binding(self._batch_binding)
+        self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
 
         self._prefill_fn = self._prefill_impl
 
@@ -528,6 +502,18 @@ class MoondreamRuntime:
     def primary_stream(self) -> torch.cuda.Stream:
         """Primary compute stream for all GPU operations."""
         return self._primary_stream
+
+    @property
+    def prefill_slots(self) -> list[PrefillSlot]:
+        return self._prefill_slots
+
+    def acquire_prefill_slot(self) -> PrefillSlot:
+        if not self._prefill_slot_free:
+            raise RuntimeError("Prefill slot pool exhausted")
+        return self._prefill_slot_free.pop()
+
+    def release_prefill_slot(self, slot: PrefillSlot) -> None:
+        self._prefill_slot_free.append(slot)
 
     @property
     def decode_slots(self) -> list[DecodeSlot]:
@@ -931,6 +917,7 @@ class MoondreamRuntime:
         self,
         prompt_tokens: Sequence[Token],
         *,
+        prefill_slot: PrefillSlot,
         image: Optional[pyvips.Image | np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
@@ -987,7 +974,6 @@ class MoondreamRuntime:
         batch_idx = self.page_table.allocate()
         # GPU-only buffer avoids async H2D races on shared pinned host memory.
         # Fill runs on primary stream to synchronize with page table H2D copies.
-        prefill_slot = self._prefill_slots[0]
         batch_tensor = prefill_slot.batch_idx
         with torch.cuda.stream(self._primary_stream):
             batch_tensor.fill_(batch_idx)
@@ -1007,7 +993,6 @@ class MoondreamRuntime:
                 batch_idx=batch_tensor,
                 seq_len=target_length,
             )
-            self._batch_binding.tensor = batch_tensor
 
             # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
             # Use primary stream to ensure ordering with shared buffers.
@@ -1220,17 +1205,11 @@ class MoondreamRuntime:
             out_seqused_k=slot.fa3_seqused_k[:graph_batch_size],
         )
 
-        # Set batch binding (identical for both paths)
-        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:graph_batch_size]
-
         # Execute (only difference between paths)
         if use_graph:
             slot.cuda_graphs[graph_batch_size].replay()
         else:
             self._run_decode_forward(slot, graph_batch_size)
-
-        # Restore batch binding to actual batch size
-        self._batch_binding.tensor = slot.meta.batch_idx.gpu[:batch_size]
 
     def _run_decode_forward(
         self,
@@ -1498,9 +1477,6 @@ class MoondreamRuntime:
                                 out_page_table=slot.fa3_page_table[:bs],
                                 out_seqused_k=slot.fa3_seqused_k[:bs],
                             )
-
-                            # Set batch binding
-                            self._batch_binding.tensor = slot.meta.batch_idx.gpu[:bs]
 
                             # Warmup run (not captured)
                             self._run_decode_forward(slot, bs)
