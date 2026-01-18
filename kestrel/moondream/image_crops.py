@@ -3,6 +3,7 @@
 import math
 from typing import Tuple, TypedDict
 
+import kestrel_native
 import numpy as np
 import pyvips
 import torch
@@ -10,20 +11,14 @@ import torch
 from kestrel.utils.image import _vips_to_uint8_numpy
 
 
-def _ensure_vips(image: pyvips.Image | np.ndarray) -> pyvips.Image:
-    """Convert numpy array to pyvips Image if needed.
-
-    MEMORY SAFETY: This function uses memoryview to avoid copying data. The returned
-    VipsImage holds a reference to the numpy array's memory. Callers must ensure the
-    input array remains alive and unmodified until all vips operations (including
-    lazy operations like resize) are fully evaluated (e.g., via write_to_memory).
-    """
-    if isinstance(image, pyvips.Image):
-        return image
-    image = np.ascontiguousarray(image)
-    h, w = image.shape[:2]
-    bands = image.shape[2] if image.ndim == 3 else 1
-    return pyvips.Image.new_from_memory(memoryview(image), w, h, bands, "uchar")
+def _ensure_numpy(image: pyvips.Image | np.ndarray) -> np.ndarray:
+    """Convert pyvips Image to numpy array if needed."""
+    if isinstance(image, np.ndarray):
+        # Only copy if not already C-contiguous
+        if image.flags['C_CONTIGUOUS']:
+            return image
+        return np.ascontiguousarray(image)
+    return _vips_to_uint8_numpy(image)
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -97,19 +92,13 @@ def overlap_crop_image(
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
-    vips_image = _ensure_vips(image)
+    np_image = _ensure_numpy(image)
 
-    # Resize for tiled crops
-    scale_x = target_size[1] / original_w
-    scale_y = target_size[0] / original_h
-    resized_vips = vips_image.resize(scale_x, vscale=scale_y, kernel="lanczos3")
-    resized_numpy = _vips_to_uint8_numpy(resized_vips)
+    # Resize for tiled crops using native Lanczos3
+    resized_numpy = kestrel_native.resize_lanczos3(np_image, target_size[0], target_size[1])
 
-    # Resize for global crop
-    scale_x_global = base_size[1] / original_w
-    scale_y_global = base_size[0] / original_h
-    global_vips = vips_image.resize(scale_x_global, vscale=scale_y_global, kernel="lanczos3")
-    crops[0] = _vips_to_uint8_numpy(global_vips)
+    # Resize for global crop using native Lanczos3
+    crops[0] = kestrel_native.resize_lanczos3(np_image, base_size[0], base_size[1])
 
     for tile_y in range(tiling[0]):
         for tile_x in range(tiling[1]):

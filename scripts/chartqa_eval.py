@@ -29,6 +29,7 @@ except ImportError as exc:  # pragma: no cover - import guard
         "`uv run --extra eval ...` before running this script."
     ) from exc
 
+import numpy as np
 import torch
 
 # Ensure repo root (containing the ``kestrel`` package) is importable when running directly.
@@ -39,13 +40,6 @@ if str(REPO_ROOT) not in sys.path:
 from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
 
-try:
-    import pyvips  # type: ignore
-except ImportError as exc:  # pragma: no cover - import guard
-    raise RuntimeError(
-        "pyvips is required to run the ChartQA evaluation. "
-        "Install pyvips and its dependencies before executing this script."
-    ) from exc
 
 # Prompt templates and generation limits derived from vixtral-train.
 PREFIX = (
@@ -71,11 +65,8 @@ class EvalConfig:
     enable_prefix_cache: bool
 
 
-def pil_to_pyvips(image: Any) -> pyvips.Image:
-    """Convert a PIL.Image or pyvips.Image to pyvips.Image."""
-    if isinstance(image, pyvips.Image):
-        return image
-
+def pil_to_numpy(image: Any) -> np.ndarray:
+    """Convert a PIL.Image to numpy array (H, W, C) uint8."""
     try:
         from PIL import Image as PILImage  # type: ignore
     except ImportError as exc:  # pragma: no cover - import guard
@@ -85,7 +76,7 @@ def pil_to_pyvips(image: Any) -> pyvips.Image:
 
     if not isinstance(image, PILImage.Image):
         raise TypeError(
-            "Expected the dataset to yield PIL.Image or pyvips.Image objects."
+            "Expected the dataset to yield PIL.Image objects."
         )
 
     mode = image.mode
@@ -94,11 +85,7 @@ def pil_to_pyvips(image: Any) -> pyvips.Image:
     elif mode == "RGBA":
         image = image.convert("RGB")
 
-    width, height = image.size
-    bands = len(image.getbands())
-    data = image.tobytes()
-
-    return pyvips.Image.new_from_memory(data, width, height, bands, format="uchar")
+    return np.asarray(image, dtype=np.uint8)
 
 
 def relaxed_correctness(
@@ -291,7 +278,7 @@ def evaluate_prediction(
 async def query_engine(
     engine: InferenceEngine,
     *,
-    image: pyvips.Image,
+    image: np.ndarray,
     prompt: str,
     reasoning: bool,
     max_tokens: int,
@@ -360,7 +347,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     async def evaluate_single(
         row_idx: int,
         qa_idx: int,
-        image: pyvips.Image,
+        image: np.ndarray,
         qa: Dict[str, Any],
     ) -> Tuple[int, int, Dict[str, Any], bool, bool]:
         question = qa["question"]
@@ -471,7 +458,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
 
     # Run a warmup query to exclude startup time from measurements
     if rows:
-        warmup_image = pil_to_pyvips(rows[0]["image"])
+        warmup_image = pil_to_numpy(rows[0]["image"])
         warmup_qa = rows[0]["qa"][0]
         warmup_prompt, warmup_reasoning, warmup_max_tokens, warmup_temp = build_prompt_and_settings(
             warmup_qa["question"],
@@ -492,7 +479,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
     start_time = time.perf_counter()
     for row_idx, row in enumerate(rows):
-        image = pil_to_pyvips(row["image"])
+        image = pil_to_numpy(row["image"])
         for qa_idx, qa in enumerate(row["qa"]):
             tasks.append(
                 asyncio.create_task(evaluate_single(row_idx, qa_idx, image, qa))
