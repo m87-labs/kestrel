@@ -396,17 +396,16 @@ class GenerationScheduler:
         return True
 
     def _can_prepare_prefill(self) -> bool:
-        """Check if we can prepare the next prefill (without batch slot check).
-
-        Unlike _is_prefill_admissible(), this does NOT check batch slot
-        availability. Used for background prefill preparation which doesn't
-        require a batch slot until launch time.
+        """Check if we can prepare the next prefill.
 
         Returns True if:
         - There's a waiting request
         - Request is in the right phase
         - Image crops are ready (if needed)
-        - KV cache has enough pages (ignoring batch slots)
+        - KV cache has enough pages and a batch slot is available
+
+        Note: We allow preparing one prefill ahead even at max decode capacity.
+        The +1 extra batch slot (max_batch_slots = max_batch_size + 2) enables this.
         """
         request = self.waiting.peek()
         if request is None:
@@ -429,8 +428,8 @@ class GenerationScheduler:
                 reserve_length - (1 + self.runtime.image_prefix_length),
                 1,
             )
-        # Only check pages, not batch slots - slot acquired at launch time
-        if not self.runtime.can_reserve_pages(reserve_length):
+        # Check pages and batch slot availability (slot allocated during prepare)
+        if not self.runtime.can_reserve(reserve_length):
             return False
         return True
 
@@ -691,6 +690,10 @@ class GenerationScheduler:
         # Need a free pipeline slot to launch
         slot_id = pipeline.free_slot_id()
         if slot_id is None:
+            return False
+
+        # Don't launch if decode batch is at capacity
+        if len(self.running) >= self.runtime.max_batch_size:
             return False
 
         # Get or create a prepared prefill

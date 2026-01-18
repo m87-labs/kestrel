@@ -309,7 +309,7 @@ class MoondreamRuntime:
         # then launches when an active sequence completes).
         self.max_batch_size = cfg.max_batch_size
         self.max_batch_slots = cfg.max_batch_size + 2
-        n_pages = self.max_seq_length // self.page_size
+        n_pages = cfg.kv_cache_pages
 
         # Create prefix cache if enabled
         self.prefix_cache: RadixPrefixCache | None = None
@@ -503,8 +503,7 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.dtype,
                 max_batch_slots=self.max_batch_slots,
-                max_seq_len=self.max_seq_length,
-                page_size=self.page_size,
+                kv_cache_pages=n_pages,
                 vocab_size=vocab_size,
                 hidden_dim=hidden_dim,
                 coord_dtype=coord_dtype,

@@ -131,8 +131,7 @@ def create_decode_slot(
     device: torch.device,
     dtype: torch.dtype,
     max_batch_slots: int,
-    max_seq_len: int,
-    page_size: int,
+    kv_cache_pages: int,
     vocab_size: int,
     hidden_dim: int,
     coord_dtype: torch.dtype,
@@ -146,17 +145,14 @@ def create_decode_slot(
         slot_id: The slot index (0 or 1).
         device: CUDA device for GPU tensors.
         dtype: Model dtype (e.g., float16, bfloat16).
-        kv_dtype: KV cache dtype (may differ if using FP8).
         max_batch_slots: Maximum batch slots for buffer allocation (includes reserved slot 0).
-        max_seq_len: Maximum sequence length.
-        page_size: KV cache page size.
+        kv_cache_pages: Total number of KV cache pages.
         vocab_size: Vocabulary size for logits buffer.
         hidden_dim: Hidden dimension for hidden_last buffer.
         coord_dtype: Dtype for coord values.
         size_dtype: Dtype for size values.
         compute_stream: Shared decode compute stream (same for both slots).
         copy_stream: Shared copy stream for D2H transfers.
-        use_cuda_graphs: Whether to enable CUDA graph capture for this slot.
 
     Returns:
         A fully initialized DecodeSlot.
@@ -196,9 +192,8 @@ def create_decode_slot(
         copy_stream=copy_stream,
     )
 
-    n_pages = max_seq_len // page_size
     fa3_page_table = torch.empty(
-        (max_batch_slots, n_pages),
+        (max_batch_slots, kv_cache_pages),
         dtype=torch.int32,
         device=device,
     )
