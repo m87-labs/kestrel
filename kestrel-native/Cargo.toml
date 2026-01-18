@@ -19,3 +19,4 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "tiff",
 ] }
+fast_image_resize = "5"
