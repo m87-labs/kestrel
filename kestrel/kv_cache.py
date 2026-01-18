@@ -535,7 +535,7 @@ class PageTable:
         Args:
             pages: Physical page indices to free.
         """
-        self.free_pages.extend(reversed(pages))
+        self.free_pages.extend(pages)
 
     def can_reserve_with_eviction(
         self, size: int, batch_idx_int: int | None = None
