@@ -29,7 +29,6 @@ import asyncio
 import hashlib
 import itertools
 import logging
-import math
 import queue
 import threading
 import time
@@ -84,6 +83,7 @@ from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.moondream.lora import AdapterProvider
+from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -862,31 +862,7 @@ class InferenceEngine:
     def _normalize_spatial_refs(
         self, spatial_refs: Optional[Sequence[Sequence[float]]]
     ) -> Optional[Tuple[Tuple[float, ...], ...]]:
-        if spatial_refs is None:
-            return None
-        normalized_refs: List[Tuple[float, ...]] = []
-        for idx, ref in enumerate(spatial_refs):
-            if len(ref) not in (2, 4):
-                raise ValueError(
-                    f"spatial_refs[{idx}] must contain 2 (point) or 4 (bbox) values"
-                )
-            converted = [float(value) for value in ref]
-            if not all(math.isfinite(value) for value in converted):
-                raise ValueError(
-                    f"spatial_refs[{idx}] contains non-finite values"
-                )
-            if not all(0.0 <= value <= 1.0 for value in converted):
-                raise ValueError(
-                    f"spatial_refs[{idx}] values must be normalised to [0, 1]"
-                )
-            if len(converted) == 4:
-                x_min, y_min, x_max, y_max = converted
-                if x_min > x_max or y_min > y_max:
-                    raise ValueError(
-                        f"spatial_refs[{idx}] bbox must satisfy x_min<=x_max and y_min<=y_max"
-                    )
-            normalized_refs.append(tuple(converted))
-        return tuple(normalized_refs) if normalized_refs else None
+        return normalize_spatial_refs(spatial_refs)
 
     def _extract_adapter_id(
         self, settings: Optional[Mapping[str, object]]

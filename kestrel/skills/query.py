@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pyvips
 import numpy as np
 
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.moondream.runtime import CoordToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -57,40 +58,7 @@ class QuerySkill(SkillSpec):
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
         reasoning = request_context.reasoning
         tokens: List[Token] = [TextToken(token_id=int(tid)) for tid in prefix]
-
-        refs = request_context.spatial_refs
-        if refs:
-            for ref in refs:
-                n = len(ref)
-                if n == 2:
-                    x, y = float(ref[0]), float(ref[1])
-                    x = min(max(x, 0.0), 1.0)
-                    y = min(max(y, 0.0), 1.0)
-                    tokens.extend([CoordToken(pos=x), CoordToken(pos=y)])
-                elif n == 4:
-                    x_min, y_min, x_max, y_max = map(float, ref)
-                    if not (
-                        0.0 <= x_min <= x_max <= 1.0
-                        and 0.0 <= y_min <= y_max <= 1.0
-                    ):
-                        raise ValueError(
-                            "bbox spatial_ref must satisfy 0<=x_min<=x_max<=1 and 0<=y_min<=y_max<=1"
-                        )
-                    x_c = (x_min + x_max) / 2.0
-                    y_c = (y_min + y_max) / 2.0
-                    width = x_max - x_min
-                    height = y_max - y_min
-                    tokens.extend(
-                        [
-                            CoordToken(pos=x_c),
-                            CoordToken(pos=y_c),
-                            SizeToken(width=width, height=height),
-                        ]
-                    )
-                else:
-                    raise ValueError(
-                        "Each spatial_ref must contain 2 (point) or 4 (bbox) values"
-                    )
+        tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 
         tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
         if reasoning:
