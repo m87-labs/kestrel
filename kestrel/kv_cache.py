@@ -272,7 +272,7 @@ class PageTable:
             )
         # update cpu side metadata
         self.page_table_cpu[batch_idx_int] += allocated_pages_list
-        self.free_pages = self.free_pages[:-num_pages_to_allocate]
+        del self.free_pages[-num_pages_to_allocate:]
         self.capacity[batch_idx_int] += num_pages_to_allocate * self.page_size
         return True
 
@@ -439,7 +439,10 @@ class PageTable:
                 msg += ", all cached prefixes are locked by active sequences"
             raise RuntimeError(msg)
 
-        return [self.free_pages.pop() for _ in range(count)]
+        # Slice from end (LIFO order) instead of pop() loop
+        allocated = self.free_pages[-count:]
+        del self.free_pages[-count:]
+        return allocated
 
     def map_pages(
         self,
@@ -507,10 +510,7 @@ class PageTable:
         Returns:
             List of physical page indices.
         """
-        return [
-            self._page_table_cpu_tensor[batch_idx, i].item()
-            for i in range(start, end)
-        ]
+        return self._page_table_cpu_tensor[batch_idx, start:end].tolist()
 
     def free_pages_to_pool(self, pages: tuple[int, ...] | list[int]) -> None:
         """Return pages to free pool. Called by cache eviction.

@@ -851,7 +851,7 @@ class TestDuplicatePrefill:
         match = cache.match_prefix(full_tokens)
         assert match.matched_kv_length == prefix_len
         temp_lock_node = match.last_node
-        cache.lock(temp_lock_node)
+        cache.lock_prefill(temp_lock_node)
 
         batch_b = page_table.allocate()
         page_table.map_pages(batch_b, 0, match.matched_pages)
