@@ -102,6 +102,29 @@ class GenerationScheduler:
             dtype=size_dtype,
             device=runtime.device,
         )
+        # Persistent per-batch sampling parameters on GPU to avoid per-step
+        # CPU->GPU copies during sampling/spatial decode.
+        self._sampling_temps_by_batch = torch.zeros(
+            (runtime.max_batch_slots,),
+            dtype=torch.float32,
+            device=runtime.device,
+        )
+        self._sampling_top_ps_by_batch = torch.ones(
+            (runtime.max_batch_slots,),
+            dtype=torch.float32,
+            device=runtime.device,
+        )
+        # Scratch buffers for per-step gathers (max effective batch size).
+        self._sampling_temps = torch.empty(
+            (runtime.max_batch_size,),
+            dtype=torch.float32,
+            device=runtime.device,
+        )
+        self._sampling_top_ps = torch.empty(
+            (runtime.max_batch_size,),
+            dtype=torch.float32,
+            device=runtime.device,
+        )
         # Prefill staging pool (single entry today; can be expanded later).
         self._prefill_staging_pool: Deque[PrefillStaging] = deque(
             [
@@ -368,7 +391,10 @@ class GenerationScheduler:
         with torch.cuda.stream(self.runtime.primary_stream):
             first_logits = logits.squeeze(0)
             sampled_ids, temps, top_ps = self._sample_batch(
-                first_logits.unsqueeze(0), [seq], staging.sampled_ids
+                first_logits.unsqueeze(0),
+                [seq],
+                staging.sampled_ids,
+                batch_idx=prefill_slot.batch_idx,
             )
             hidden_last = seq.state.last_hidden
             if hidden_last is None:  # pragma: no cover - defensive
@@ -505,6 +531,10 @@ class GenerationScheduler:
             seq.skill_state = skill_state
             seq.sequence_state = state
             seq.skill_state.on_prefill(self.runtime)
+            with torch.cuda.stream(self.runtime.primary_stream):
+                batch_idx = state.batch_idx
+                self._sampling_temps_by_batch[batch_idx] = seq.request.temperature
+                self._sampling_top_ps_by_batch[batch_idx] = seq.request.top_p
 
             if request.max_new_tokens <= 0:
                 seq.first_token_time = prefill_start
@@ -716,7 +746,7 @@ class GenerationScheduler:
         # Sample tokens directly into per-slot staging buffer for D2H.
         # This prevents race with next step's sampling writing to shared buffer.
         sampled_ids, temps, top_ps = self._sample_batch(
-            logits, sequences, slot.sampled_ids
+            logits, sequences, slot.sampled_ids, batch_idx=batch_idx
         )
 
         # Compute spatial values into slot's staging buffers
@@ -825,7 +855,12 @@ class GenerationScheduler:
             self.runtime.release_sequence(seq.state)
 
     def _sample_batch(
-        self, logits: Tensor, sequences: List[RequestLifecycle], out: Tensor,
+        self,
+        logits: Tensor,
+        sequences: List[RequestLifecycle],
+        out: Tensor,
+        *,
+        batch_idx: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         """Sample tokens from logits into the provided output buffer.
 
@@ -873,13 +908,13 @@ class GenerationScheduler:
             torch.argmax(logits, dim=-1, out=out[:batch])
             return out[:batch], None, None
 
-        temps_cpu = torch.empty(batch, dtype=torch.float32)
-        top_ps_cpu = torch.empty(batch, dtype=torch.float32)
-        for i, seq in enumerate(sequences):
-            temps_cpu[i] = seq.request.temperature
-            top_ps_cpu[i] = seq.request.top_p
-        temps = temps_cpu.to(device=logits.device)
-        top_ps = top_ps_cpu.to(device=logits.device)
+        if batch_idx is None:
+            raise AssertionError("batch_idx is required for non-greedy sampling")
+        batch_idx = batch_idx.view(-1)[:batch]
+        temps = self._sampling_temps[:batch]
+        top_ps = self._sampling_top_ps[:batch]
+        torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
+        torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
         sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._sampling_rng)
         out[:batch].copy_(sampled_raw)
         return out[:batch], temps, top_ps

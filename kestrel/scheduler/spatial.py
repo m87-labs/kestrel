@@ -55,16 +55,7 @@ def compute_spatial_values(
 
     do_sample = not all(req.temperature <= 0.0 for req in requests)
     if do_sample and (temperatures is None or top_ps is None):
-        temps_cpu = torch.tensor(
-            [req.temperature for req in requests],
-            dtype=torch.float32,
-        )
-        top_ps_cpu = torch.tensor(
-            [req.top_p for req in requests],
-            dtype=torch.float32,
-        )
-        temperatures = temps_cpu.to(device=hidden.device)
-        top_ps = top_ps_cpu.to(device=hidden.device)
+        raise RuntimeError("Missing sampling parameters for spatial decode")
 
     coord_logits, width_logits, height_logits = spatial_decode_logits(
         hidden, spatial_tables
@@ -75,8 +66,7 @@ def compute_spatial_values(
         width_bins = torch.argmax(width_logits, dim=-1)
         height_bins = torch.argmax(height_logits, dim=-1)
     else:
-        if temperatures is None or top_ps is None:  # pragma: no cover - defensive
-            raise RuntimeError("Missing sampling parameters for spatial decode")
+        assert temperatures is not None and top_ps is not None
         coord_bins_raw = sample_tokens(
             coord_logits, temperatures, top_ps, generator=rng
         )

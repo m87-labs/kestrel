@@ -677,15 +677,15 @@ def print_results(results: Dict[str, Any]) -> None:
         print(f"Avg Output Tokens / Request: {avg_output_tokens:.2f}")
         print(f"Prefill Throughput (per request): {effective_prefill:.2f} tok/s")
         print(f"Decode Throughput (per request): {effective_decode:.2f} tok/s")
-        if wall_time_s > 0.0 and request_count > 0:
-            requests_per_second = request_count / wall_time_s
-            print(f"Requests per second: {requests_per_second:.2f}")
-
         # Prefix cache stats (only when enabled)
         if results.get("prefix_cache_enabled", False) and request_count > 0:
             cache_hit_count = usage.get("cache_hit_count", 0)
             hit_rate = cache_hit_count / request_count * 100.0
             print(f"Prefix cache hit rate: {hit_rate:.1f}%")
+
+        if wall_time_s > 0.0 and request_count > 0:
+            requests_per_second = request_count / wall_time_s
+            print(f"Requests per second: {requests_per_second:.2f}")
 
         # Request latency stats (prefill + decode)
         if request_times_ms:
