@@ -376,6 +376,13 @@ class PageTable:
                 raise ValueError("batch_idx and positions shape mismatch")
             batch_tiled = batch_idx
 
+        # Fast path for page_size=1 (required for prefix caching)
+        if self.page_size == 1:
+            batch_flat = batch_tiled.to(torch.long).reshape(-1)
+            pos_flat = positions.to(torch.long).reshape(-1)
+            slots = self.page_table[batch_flat, pos_flat]
+            return slots.to(dtype=torch.int64).view_as(positions)
+
         page_size = self.page_size
         logical_block_idx = positions // page_size
         logical_block_offset = positions % page_size
