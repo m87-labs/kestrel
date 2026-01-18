@@ -417,6 +417,7 @@ class GenerationScheduler:
             self._pending_token_ids[batch_idx].copy_(sampled_ids.view(-1)[0])
             self._pending_coord_values[batch_idx].copy_(coord_decode[0])
             self._pending_size_values[batch_idx].copy_(size_decode[0])
+            prefill_slot.commit_done_event.record()
 
         transfer = staging.render.transfer(
             sampled_ids, coord_decode, size_decode, ready_event=prefill_slot.step_done_event
@@ -440,6 +441,7 @@ class GenerationScheduler:
         prefill_slot = self.runtime.prefill_slots[payload.prefill_slot_id]
         try:
             token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+            prefill_slot.commit_done_event.synchronize()
             token = render_tokens_from_packed(
                 token_ids_cpu,
                 coord_cpu,
