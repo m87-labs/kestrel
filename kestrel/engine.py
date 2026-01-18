@@ -293,17 +293,11 @@ class InferenceEngine:
         )
         if self._image_executor is not None:
             self._image_executor.shutdown(wait=True)
-        # Keep image preprocessing parallel, but reserve a couple CPU cores
-        # for scheduler/runtime threads.
-        img_workers_multiplier = 4
-        cpu_count = os.cpu_count() or 1
-        cpu_cap = max(1, cpu_count - 2)
-        max_workers = min(
-            max(1, self._runtime.max_batch_size * img_workers_multiplier),
-            cpu_cap,
-        )
+        # Use 16 threads for image preprocessing. This value was determined empirically
+        # to balance parallelism with libvips internal thread contention (controlled
+        # by VIPS_CONCURRENCY=2 in image_crops.py).
         self._image_executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="kestrel-img"
+            max_workers=16, thread_name_prefix="kestrel-img"
         )
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(
