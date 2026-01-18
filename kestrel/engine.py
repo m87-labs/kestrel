@@ -438,7 +438,7 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
-        normalized_refs = self._normalize_spatial_refs(spatial_refs)
+        normalized_refs = normalize_spatial_refs(spatial_refs)
         request = QueryRequest(
             question=normalized_question,
             image=image,
@@ -681,7 +681,7 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
-        normalized_refs = self._normalize_spatial_refs(spatial_refs)
+        normalized_refs = normalize_spatial_refs(spatial_refs)
 
         request = SegmentRequest(
             object=normalized_object,
@@ -858,11 +858,6 @@ class InferenceEngine:
         if not normalized:
             raise ValueError("adapter must be a non-empty string")
         return normalized
-
-    def _normalize_spatial_refs(
-        self, spatial_refs: Optional[Sequence[Sequence[float]]]
-    ) -> Optional[Tuple[Tuple[float, ...], ...]]:
-        return normalize_spatial_refs(spatial_refs)
 
     def _extract_adapter_id(
         self, settings: Optional[Mapping[str, object]]
