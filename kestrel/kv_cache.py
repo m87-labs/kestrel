@@ -67,17 +67,9 @@ class PagedKVCache(torch.nn.Module):
         input_pos,
         k_val,
         v_val,
-        batch_idx=None,
         *,
         slot_mapping: torch.Tensor,
     ):
-        assert (
-            batch_idx is not None
-        ), "batch_idx is required for paged kv cache, are you using non-paged attention?"
-
-        if batch_idx.ndim != 1 and batch_idx.ndim != 2:
-            raise ValueError("batch_idx must be 1D or 2D")
-
         k_view = k_val.view(-1, k_val.shape[2], k_val.shape[3])
         v_view = v_val.view(-1, v_val.shape[2], v_val.shape[3])
 
