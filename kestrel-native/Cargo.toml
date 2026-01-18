@@ -1,0 +1,21 @@
+[package]
+name = "kestrel-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kestrel_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+ndarray = "0.16"
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+] }
