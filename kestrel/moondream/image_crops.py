@@ -1,23 +1,39 @@
 """Image tiling helpers for the Moondream vision encoder."""
 
-
+import ctypes
+import ctypes.util
 import math
 from typing import Tuple, TypedDict
 
 import numpy as np
-import torch
 import pyvips
+import torch
+
+# Set VIPS concurrency to a low value to avoid internal thread contention
+# when using multiple Python threads. With low concurrency, each vips operation
+# uses fewer internal threads, allowing Python-level parallelism to scale better.
+# Must use C API since env var is only read at vips initialization.
+_vips_lib = ctypes.CDLL(ctypes.util.find_library("vips"))
+_vips_lib.vips_concurrency_set.argtypes = [ctypes.c_int]
+_vips_lib.vips_concurrency_set(2)
 
 from kestrel.utils.image import _vips_to_uint8_numpy
 
 
 def _ensure_vips(image: pyvips.Image | np.ndarray) -> pyvips.Image:
-    """Convert numpy array to pyvips Image if needed."""
+    """Convert numpy array to pyvips Image if needed.
+
+    MEMORY SAFETY: This function uses memoryview to avoid copying data. The returned
+    VipsImage holds a reference to the numpy array's memory. Callers must ensure the
+    input array remains alive and unmodified until all vips operations (including
+    lazy operations like resize) are fully evaluated (e.g., via write_to_memory).
+    """
     if isinstance(image, pyvips.Image):
         return image
+    image = np.ascontiguousarray(image)
     h, w = image.shape[:2]
     bands = image.shape[2] if image.ndim == 3 else 1
-    return pyvips.Image.new_from_memory(image.tobytes(), w, h, bands, "uchar")
+    return pyvips.Image.new_from_memory(memoryview(image), w, h, bands, "uchar")
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -83,7 +99,8 @@ def overlap_crop_image(
     )
 
     num_crops = tiling[0] * tiling[1] + 1
-    crops = np.zeros((num_crops, base_size[0], base_size[1], num_bands), dtype=np.uint8)
+    # Use empty instead of zeros - all regions are fully written by the code below.
+    crops = np.empty((num_crops, base_size[0], base_size[1], num_bands), dtype=np.uint8)
 
     target_size = (
         tiling[0] * crop_window_size + total_margin_pixels,
