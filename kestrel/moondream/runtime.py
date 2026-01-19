@@ -38,10 +38,15 @@ from .text import (
     text_decoder,
     text_encoder,
 )
-from .vision import encode_image
+from .vision import (
+    prepare_crops,
+    prepare_crops_from_overlap,
+    vision_encoder,
+    vision_projection,
+)
 from .lora import LoRA
 from .lora_workspace import AdapterSlotManager, TextLoRAWorkspace
-from .image_crops import OverlapCropOutput
+from .image_crops import OverlapCropOutput, reconstruct_from_crops
 from .region import (
     build_region_module,
     build_spatial_decode_tables,
@@ -452,6 +457,12 @@ class MoondreamRuntime:
 
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
+
+        # Vision encoder CUDA graphs
+        self._vision_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._vision_input: torch.Tensor | None = None   # [max_crops, 3, 378, 378]
+        self._vision_output: torch.Tensor | None = None  # [max_crops, 729, 1152]
+
         coord_dtype = self.region.coord_features.dtype
         size_dtype = self.region.size_features.dtype
         # Prefill can be pipelined (CPU committing token0 while GPU runs the next prefill).
@@ -519,6 +530,10 @@ class MoondreamRuntime:
 
         if self._use_cuda_graphs:
             self._ensure_cuda_graphs_ready()
+
+        # Allocate vision encoder buffers (always, for consistency)
+        self._allocate_vision_buffers()
+        self._capture_vision_graphs()
 
     # ------------------------------------------------------------------
     # Capacity helpers
@@ -683,14 +698,53 @@ class MoondreamRuntime:
         *,
         overlap: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
-        return encode_image(
-            image,
-            self.model.vision,
-            self.config.vision,
-            device=self.device,
-            dtype=self.dtype,
-            overlap=overlap,
-        )
+        with torch.inference_mode():
+            if overlap is not None:
+                crops, tiling = prepare_crops_from_overlap(overlap, self.device, self.dtype)
+            else:
+                if image is None:
+                    raise ValueError("image must be provided when overlap is not supplied")
+                crops, tiling = prepare_crops(image, self.config.vision, self.device, self.dtype)
+
+            batch_size = crops.shape[0]
+
+            # Always use stable buffers for consistency
+            self._vision_input[:batch_size].copy_(crops)
+
+            # Use CUDA graph if available, otherwise eager
+            if batch_size in self._vision_graphs:
+                self._vision_graphs[batch_size].replay()
+            else:
+                out = vision_encoder(
+                    self._vision_input[:batch_size],
+                    self.model.vision,
+                    self.config.vision,
+                )
+                self._vision_output[:batch_size].copy_(out)
+
+            outputs = self._vision_output[:batch_size]
+
+            # Rest unchanged: projection, reconstruction
+            global_features = outputs[0]
+            local = outputs[1:].reshape(
+                -1,
+                self.config.vision.enc_n_layers,
+                self.config.vision.enc_n_layers,
+                self.config.vision.enc_dim,
+            )
+            reconstructed = reconstruct_from_crops(
+                local.to(dtype=torch.float32),
+                tiling,
+                overlap_margin=self.config.vision.overlap_margin,
+                patch_size=1,
+            )
+            reconstructed = reconstructed.to(device=self.device, dtype=outputs.dtype)
+            return vision_projection(
+                global_features,
+                reconstructed,
+                self.model.vision,
+                self.config.vision,
+            )
 
     # ------------------------------------------------------------------
     # start_sequence helpers
@@ -1506,7 +1560,7 @@ class MoondreamRuntime:
         self._slot_manager.release(slot)
 
     def rebuild_cuda_graphs(self) -> None:
-        """Reset and recapture CUDA graphs used for decode.
+        """Reset and recapture CUDA graphs used for decode and vision encoding.
 
         This is intended for workflows that mutate runtime-owned tensors
         (e.g. weight tying or hot-swapping checkpoints) where a previously
@@ -1523,13 +1577,17 @@ class MoondreamRuntime:
             if torch.cuda.is_available() and self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
 
-            # Clear per-slot graph state
+            # Clear vision graphs
+            self._vision_graphs = {}
+
+            # Clear per-slot decode graph state
             for slot in self._decode_slots:
                 slot.cuda_graphs = None
 
             self._graph_batch_sizes = []
 
             self._ensure_cuda_graphs_ready()
+            self._capture_vision_graphs()
 
     def _ensure_cuda_graphs_ready(self) -> None:
         """Capture CUDA graphs for all slots using slot buffers directly."""
@@ -1678,6 +1736,57 @@ class MoondreamRuntime:
             if size >= batch_size:
                 return size
         return None
+
+    def _allocate_vision_buffers(self) -> None:
+        """Allocate stable buffers for vision encoder."""
+        config = self.config.vision
+        max_batch = config.max_crops + 1  # Support up to max_crops + 1
+        patches = (config.crop_size // config.enc_patch_size) ** 2  # 729
+
+        self._vision_input = torch.zeros(
+            (max_batch, config.in_channels, config.crop_size, config.crop_size),
+            dtype=self.dtype, device=self.device
+        )
+        self._vision_output = torch.empty(
+            (max_batch, patches, config.enc_dim),
+            dtype=self.dtype, device=self.device
+        )
+
+    def _capture_vision_graphs(self) -> None:
+        """Capture CUDA graphs for vision encoder at all crop counts."""
+        if not self._use_cuda_graphs:
+            return
+
+        config = self.config.vision
+        max_batch = config.max_crops + 1
+
+        with self.graph_capture_lock:
+            torch.cuda.synchronize(device=self.device)
+
+            for batch_size in range(1, max_batch + 1):
+                graph = torch.cuda.CUDAGraph()
+
+                with torch.inference_mode():
+                    # Warmup
+                    out = vision_encoder(
+                        self._vision_input[:batch_size],
+                        self.model.vision,
+                        config,
+                    )
+                    self._vision_output[:batch_size].copy_(out)
+                    torch.cuda.synchronize(device=self.device)
+
+                    # Capture
+                    with torch.cuda.graph(graph):
+                        out = vision_encoder(
+                            self._vision_input[:batch_size],
+                            self.model.vision,
+                            config,
+                        )
+                        self._vision_output[:batch_size].copy_(out)
+
+                self._vision_graphs[batch_size] = graph
+                torch.cuda.synchronize(device=self.device)
 
 
 __all__ = ["MoondreamRuntime", "SequenceState", "DEFAULT_MAX_TOKENS"]
