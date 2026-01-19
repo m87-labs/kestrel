@@ -77,6 +77,29 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import kestrel_kernels as _kk  # noqa: E402
+import kestrel_kernels.cute_moe as _kk_cute_moe  # noqa: E402
+import kestrel_kernels.flash_attn.cute as _kk_fa_cute  # noqa: E402
+
+_KK_SRC = _REPO_ROOT / "kestrel-kernels" / "python" / "kestrel_kernels"
+if _KK_SRC.exists():
+    kk_path = str(_KK_SRC)
+    if kk_path not in _kk.__path__:
+        # Allow source package discovery for submodules while keeping compiled extensions.
+        _kk.__path__.append(kk_path)
+    cute_moe_src = _KK_SRC / "cute_moe"
+    if cute_moe_src.exists():
+        cute_moe_path = str(cute_moe_src)
+        if cute_moe_path not in _kk_cute_moe.__path__:
+            # Make JIT template modules visible to the already-imported cute_moe package.
+            _kk_cute_moe.__path__.append(cute_moe_path)
+    fa_cute_src = _KK_SRC / "flash_attn" / "cute"
+    if fa_cute_src.exists():
+        fa_cute_path = str(fa_cute_src)
+        if fa_cute_path not in _kk_fa_cute.__path__:
+            # Ensure flash_attn cute helpers are importable for CuTe templates.
+            _kk_fa_cute.__path__.append(fa_cute_path)
+
 from kestrel.fused_moe.routing import moe_align_block_size
 from kestrel_kernels.cute_moe import (
     CuteMoeConfig,
@@ -94,7 +117,7 @@ D_MODEL = 2048
 D_EXPERT = 1024
 
 # Token counts to optimize for (decode + prefill range)
-TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
+TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]
 
 # Full search space for BF16 (sweeps both warp and wgmma kernel types)
 # - warp kernel: block_m can be any multiple of 16 up to num_threads
