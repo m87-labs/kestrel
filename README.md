@@ -1,5 +1,7 @@
 # Kestrel
 
+![Kestrel Overview](https://raw.githubusercontent.com/m87-labs/kestrel/main/assets/kestrel-overview.png)
+
 High-performance inference engine for the [Moondream](https://moondream.ai) vision-language model.
 
 Kestrel provides async, micro-batched serving with streaming support, paged KV caching, and optimized CUDA kernels. It's designed for production deployments where throughput and latency matter.
@@ -236,5 +238,3 @@ RuntimeConfig(
 ## License
 
 Free for evaluation and non-commercial use. Commercial use requires a license from [Moondream](https://moondream.ai).
-
-Copyright (c) 2024-2025 M87 Labs, Inc.
