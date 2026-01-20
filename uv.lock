@@ -770,13 +770,14 @@ wheels = [
 
 [[package]]
 name = "kestrel"
-version = "0.1.0"
+version = "0.0.2"
 source = { virtual = "." }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "flashinfer-python" },
     { name = "httpx" },
     { name = "kestrel-kernels" },
+    { name = "kestrel-native" },
     { name = "opencv-python-headless" },
     { name = "pillow" },
     { name = "pypotrace" },
@@ -807,7 +808,8 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'eval'", specifier = ">=3.0" },
     { name = "flashinfer-python", specifier = ">=0.6.0" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "kestrel-kernels", directory = "kestrel-kernels" },
+    { name = "kestrel-kernels", specifier = "==0.1.0" },
+    { name = "kestrel-native", directory = "kestrel-native" },
     { name = "opencv-python-headless", specifier = ">=4.5" },
     { name = "pillow", specifier = ">=10" },
     { name = "pypotrace", specifier = "==0.3" },
@@ -829,24 +831,30 @@ provides-extras = ["dev", "eval"]
 [[package]]
 name = "kestrel-kernels"
 version = "0.1.0"
-source = { directory = "kestrel-kernels" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
     { name = "torch" },
     { name = "torch-c-dlpack-ext" },
 ]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/f7/8aa429025cae4c03d4ed7bd06763eb42d7cc566dbb7f0493b8962752a864/kestrel_kernels-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:f3c2923523478e4286b25c67eab850450d3009f4a54433ce137f6ba5084dafe4", size = 5523647, upload-time = "2026-01-15T19:57:54.465Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/25/3953e6abbf38d55b42342008a1834eb911fb2c898f954f65cc8bc98db683/kestrel_kernels-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:16dc94caa388e5b6718ac2578f2481c4012f62702c3068a2ebc52736defaf42f", size = 5536926, upload-time = "2026-01-15T19:57:56.659Z" },
+    { url = "https://files.pythonhosted.org/packages/95/f6/bcc1a9dd8e64d97a1acf994ee5c443f2db7b40df84a17096809e16aa2d73/kestrel_kernels-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:c6717e6a6d73795374309bf9224a04339b0491eedfbda058858a85fdeb3555d5", size = 5542630, upload-time = "2026-01-15T19:57:58.484Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/b0/a84c2c0d997c9e9f7bc693c3a600a00df1c34ed18d796b35e930845f2f5a/kestrel_kernels-0.1.0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:84f04577a420055e2250ac828fd87921581d10d65985a753ac7fdd31006f3631", size = 5540738, upload-time = "2026-01-15T19:58:00.336Z" },
+]
+
+[[package]]
+name = "kestrel-native"
+version = "0.1.0"
+source = { directory = "kestrel-native" }
+dependencies = [
+    { name = "numpy" },
+]
 
 [package.metadata]
-requires-dist = [
-    { name = "apache-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", specifier = ">=4.3.4" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "torch", specifier = "==2.9.1" },
-    { name = "torch-c-dlpack-ext" },
-    { name = "triton", marker = "extra == 'dev'", specifier = ">=3.0" },
-]
-provides-extras = ["dev"]
+requires-dist = [{ name = "numpy" }]
 
 [[package]]
 name = "markupsafe"

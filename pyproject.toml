@@ -6,8 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.1",
-    "kestrel-kernels==0.1.0",
-    "kestrel-native==0.1.0",
     "tokenizers>=0.15",
     "safetensors>=0.4",
     "transformers>=4.44",
@@ -38,5 +36,3 @@ eval = [
     "tqdm>=4.66",
 ]
 
-[tool.uv.sources]
-kestrel-native = { path = "kestrel-native" }
