@@ -3,6 +3,7 @@ import asyncio
 import collections
 import contextlib
 import io
+import json
 import subprocess
 import textwrap
 import time
@@ -65,6 +66,8 @@ class EvalConfig:
     temperature: float
     debug: bool
     enable_prefix_cache: bool
+    dump_jsonl: Optional[Path] = None
+    concurrency: Optional[int] = None
 
 
 def decode_image(image_data: Dict[str, Any]) -> np.ndarray:
@@ -318,6 +321,16 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     request_count = 0
     request_times_ms: List[float] = []  # prefill + decode per request
     cache_hit_count = 0  # requests with cached_tokens > 0
+    semaphore = (
+        asyncio.Semaphore(cfg.concurrency)
+        if cfg.concurrency is not None and cfg.concurrency > 0
+        else None
+    )
+    dump_handle = None
+    if cfg.dump_jsonl is not None:
+        dump_path = cfg.dump_jsonl.expanduser()
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_handle = dump_path.open("w", encoding="utf-8")
 
     def record_metrics(metrics: EngineMetrics) -> None:
         nonlocal total_input_tokens, total_output_tokens
@@ -338,6 +351,17 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         image: np.ndarray,
         qa: Dict[str, Any],
     ) -> Tuple[int, int, Dict[str, Any], bool, bool]:
+        if semaphore is None:
+            return await _evaluate_single_impl(row_idx, qa_idx, image, qa)
+        async with semaphore:
+            return await _evaluate_single_impl(row_idx, qa_idx, image, qa)
+
+    async def _evaluate_single_impl(
+        row_idx: int,
+        qa_idx: int,
+        image: np.ndarray,
+        qa: Dict[str, Any],
+    ) -> Tuple[int, int, Dict[str, Any], bool, bool]:
         question = qa["question"]
         answer = qa["answer"]
         source = qa.get("source", "model")
@@ -351,6 +375,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
 
         chart_reasoning = None
         chart_grounding = None
+        metrics_for_dump = None
 
         if cfg.cot_samples > 1:
             if cfg.use_pot:
@@ -374,6 +399,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                 candidate_answer = strip_trailing_percent(candidate_answer)
                 candidates.append(candidate_answer)
                 if idx == 0:
+                    metrics_for_dump = candidate_metrics
                     chart_reasoning = candidate_reasoning
                     chart_grounding = candidate_grounding
             if candidates:
@@ -396,6 +422,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                 temperature=temperature,
             )
             record_metrics(metrics)
+            metrics_for_dump = metrics
             model_answer = strip_trailing_percent(model_answer)
 
         if cfg.use_pot:
@@ -441,6 +468,35 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "is_correct": is_correct,
             "source": source,
         }
+
+        if dump_handle is not None:
+            metrics_dump = None
+            if metrics_for_dump is not None:
+                metrics_dump = {
+                    "input_tokens": metrics_for_dump.input_tokens,
+                    "output_tokens": metrics_for_dump.output_tokens,
+                    "prefill_time_ms": metrics_for_dump.prefill_time_ms,
+                    "decode_time_ms": metrics_for_dump.decode_time_ms,
+                    "ttft_ms": metrics_for_dump.ttft_ms,
+                    "cached_tokens": metrics_for_dump.cached_tokens,
+                }
+            dump_handle.write(
+                json.dumps(
+                    {
+                        "row_idx": row_idx,
+                        "qa_idx": qa_idx,
+                        "question": question,
+                        "ground_truth_raw": answer,
+                        "model_answer_raw": model_answer,
+                        "is_correct": is_correct,
+                        "source": source,
+                        "metrics": metrics_dump,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            dump_handle.flush()
 
         return row_idx, qa_idx, result_entry, is_correct, source == "human"
 
@@ -490,6 +546,8 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             progress.update(1)
     finally:
         progress.close()
+        if dump_handle is not None:
+            dump_handle.close()
         await engine.shutdown()
 
     wall_time_s = max(time.perf_counter() - start_time, 0.0)
@@ -580,6 +638,18 @@ def parse_args() -> EvalConfig:
         action="store_true",
         help="Disable prefix caching (enabled by default).",
     )
+    parser.add_argument(
+        "--dump-jsonl",
+        type=Path,
+        default=None,
+        help="Optional path to write per-question results as JSONL (debugging).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="Limit number of concurrent in-flight questions (0 = unlimited).",
+    )
     args = parser.parse_args()
 
     if args.pot and args.cot:
@@ -597,6 +667,8 @@ def parse_args() -> EvalConfig:
         temperature=float(args.temperature),
         debug=bool(args.debug),
         enable_prefix_cache=not args.disable_prefix_cache,
+        dump_jsonl=args.dump_jsonl,
+        concurrency=None if int(args.concurrency) <= 0 else int(args.concurrency),
     )
     return cfg
 

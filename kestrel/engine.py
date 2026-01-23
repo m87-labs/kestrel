@@ -257,13 +257,9 @@ class InferenceEngine:
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
     ) -> "InferenceEngine":
-        # MOONDREAM_API_KEY is always required
-        api_key = os.environ.get("MOONDREAM_API_KEY")
-        if not api_key:
-            raise ValueError("MOONDREAM_API_KEY environment variable is required.")
-
         # Auto-create provider if none provided
-        if adapter_provider is None:
+        api_key = os.environ.get("MOONDREAM_API_KEY")
+        if adapter_provider is None and api_key:
             from kestrel.cloud import MoondreamAdapterProvider
             from kestrel.moondream.config import load_config
 

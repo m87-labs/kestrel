@@ -38,7 +38,17 @@ def prepare_crops_from_overlap(
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
     crops_cpu = torch.from_numpy(overlap["crops"])
     crops_cpu = crops_cpu.permute(0, 3, 1, 2).contiguous().pin_memory()
-    crops = crops_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
+    # NOTE: Use async H2D for performance.
+    #
+    # Important: non_blocking=True enqueues the H2D copy on the *current* CUDA stream.
+    # Ensure the copy is enqueued on the same stream as the consumer (e.g. CUDA graph
+    # replay), or add an explicit dependency (wait_stream/event). Otherwise, the
+    # consumer can observe stale/partially-copied inputs.
+    crops = crops_cpu.to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )
     crops = crops.div_(255.0)
     crops = crops.sub_(0.5).div_(0.5)
     crops = crops.to(dtype=dtype)

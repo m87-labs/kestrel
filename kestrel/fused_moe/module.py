@@ -47,7 +47,6 @@ from kestrel_kernels.cute_moe import (
     invoke_cute_moe_up_fp8,
 )
 
-
 _HARDCODED_CONFIGS: dict[tuple[int, int], dict[int, dict[str, int]]] = {
     (
         64,
@@ -737,9 +736,7 @@ class FusedMoEModule(nn.Module):
             dtype=hidden_states.dtype,
         )
         if activation_in.dtype != torch.bfloat16:
-            raise ValueError(
-                f"gelu_residual_cute only supports bfloat16, got {activation_in.dtype}"
-            )
+            raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
         gelu_residual_cute(activation_out, activation_in)
 
         down_in = activation_out
