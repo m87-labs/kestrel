@@ -5,20 +5,14 @@ from typing import Tuple, TypedDict
 
 import kestrel_native
 import numpy as np
-import pyvips
 import torch
 
-from kestrel.utils.image import _vips_to_uint8_numpy
 
-
-def _ensure_numpy(image: pyvips.Image | np.ndarray) -> np.ndarray:
-    """Convert pyvips Image to numpy array if needed."""
-    if isinstance(image, np.ndarray):
-        # Only copy if not already C-contiguous
-        if image.flags['C_CONTIGUOUS']:
-            return image
-        return np.ascontiguousarray(image)
-    return _vips_to_uint8_numpy(image)
+def _ensure_contiguous(image: np.ndarray) -> np.ndarray:
+    """Ensure numpy array is C-contiguous."""
+    if image.flags['C_CONTIGUOUS']:
+        return image
+    return np.ascontiguousarray(image)
 
 
 def select_tiling(height: int, width: int, crop_size: int, max_crops: int) -> Tuple[int, int]:
@@ -53,7 +47,7 @@ class OverlapCropOutput(TypedDict):
 
 
 def overlap_crop_image(
-    image: pyvips.Image | np.ndarray,
+    image: np.ndarray,
     *,
     overlap_margin: int,
     max_crops: int,
@@ -62,12 +56,8 @@ def overlap_crop_image(
 ) -> OverlapCropOutput:
     """Create a global crop plus overlapping local crops with consistent margins."""
 
-    if isinstance(image, np.ndarray):
-        original_h, original_w = image.shape[:2]
-        num_bands = image.shape[2] if image.ndim == 3 else 1
-    else:
-        original_h, original_w = image.height, image.width
-        num_bands = image.bands
+    original_h, original_w = image.shape[:2]
+    num_bands = image.shape[2] if image.ndim == 3 else 1
 
     margin_pixels = patch_size * overlap_margin
     total_margin_pixels = margin_pixels * 2
@@ -92,7 +82,7 @@ def overlap_crop_image(
         tiling[1] * crop_window_size + total_margin_pixels,
     )
 
-    np_image = _ensure_numpy(image)
+    np_image = _ensure_contiguous(image)
 
     # Resize for tiled crops using native Lanczos3
     resized_numpy = kestrel_native.resize_lanczos3(np_image, target_size[0], target_size[1])

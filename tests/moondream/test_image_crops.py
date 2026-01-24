@@ -1,7 +1,6 @@
 """Tests for image cropping and preprocessing."""
 
 import numpy as np
-import pyvips
 import pytest
 
 from kestrel.moondream.config import VisionConfig
@@ -69,24 +68,6 @@ class TestOverlapCropImage:
         assert result["crops"].shape[1] == config.crop_size
         assert result["crops"].shape[2] == config.crop_size
         assert result["crops"].shape[3] == 3
-
-    def test_pyvips_input(self, config):
-        """Test with pyvips.Image input."""
-        np_image = np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8)
-        vips_image = pyvips.Image.new_from_memory(
-            np_image.tobytes(), 1024, 1024, 3, "uchar"
-        )
-
-        result = overlap_crop_image(
-            vips_image,
-            overlap_margin=config.overlap_margin,
-            max_crops=config.max_crops,
-            base_size=(config.crop_size, config.crop_size),
-            patch_size=config.enc_patch_size,
-        )
-
-        assert result["crops"].dtype == np.uint8
-        assert result["crops"].shape[1] == config.crop_size
 
     def test_num_crops_matches_tiling(self, config):
         """Number of crops should be tiling[0] * tiling[1] + 1 (for global crop)."""

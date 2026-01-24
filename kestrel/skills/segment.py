@@ -6,7 +6,6 @@ from typing import Iterable
 import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import pyvips
 import numpy as np
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
@@ -40,7 +39,7 @@ class SegmentRequest:
     """Segment payload used internally by the scheduler."""
 
     object: str
-    image: Optional[pyvips.Image | np.ndarray]
+    image: Optional[np.ndarray | bytes]
     stream: bool
     settings: SegmentSettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None

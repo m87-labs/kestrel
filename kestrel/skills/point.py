@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
 
-import pyvips
 import numpy as np
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
@@ -29,7 +28,7 @@ class PointRequest:
     """Validated point payload aligned with the planned API."""
 
     object: str
-    image: Optional[pyvips.Image | np.ndarray]
+    image: Optional[np.ndarray | bytes]
     stream: bool
     settings: PointSettings
 

@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import pyvips
 import numpy as np
 
 from kestrel.moondream.runtime import CoordToken, TextToken, Token
@@ -31,7 +30,7 @@ class QueryRequest:
     """Validated query payload aligned with the fal_inference API."""
 
     question: str
-    image: Optional[pyvips.Image | np.ndarray]
+    image: Optional[np.ndarray | bytes]
     reasoning: bool
     stream: bool
     settings: QuerySettings

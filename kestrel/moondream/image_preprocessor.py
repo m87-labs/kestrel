@@ -5,8 +5,8 @@ This module provides a thread pool for image preprocessing operations.
 
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import kestrel_native
 import numpy as np
-import pyvips
 
 from kestrel.moondream.config import VisionConfig
 from kestrel.moondream.image_crops import OverlapCropOutput, overlap_crop_image
@@ -44,21 +44,30 @@ class ImagePreprocessor:
 
     def preprocess(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         config: VisionConfig,
     ) -> OverlapCropOutput:
         """Preprocess an image synchronously.
 
-        Normalizes the image to sRGB and creates overlap crops for the
-        vision encoder.
+        Decodes raw bytes if needed, normalizes to sRGB, and creates overlap
+        crops for the vision encoder.
 
         Args:
-            image: Input image as pyvips.Image or numpy array.
+            image: Input image as numpy array or raw image bytes.
             config: Vision configuration with crop parameters.
 
         Returns:
             OverlapCropOutput with crops array and tiling info.
+
+        Raises:
+            ValueError: If bytes cannot be decoded as a supported image format.
         """
+        if isinstance(image, bytes):
+            decoded = kestrel_native.decode_image(image)
+            if decoded is None:
+                raise ValueError("Unsupported image format")
+            image = decoded
+
         normalized = ensure_srgb(image)
         return overlap_crop_image(
             normalized,
@@ -70,13 +79,13 @@ class ImagePreprocessor:
 
     def submit(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         config: VisionConfig,
     ) -> Future[OverlapCropOutput]:
         """Submit an image for asynchronous preprocessing.
 
         Args:
-            image: Input image as pyvips.Image or numpy array.
+            image: Input image as numpy array or raw image bytes.
             config: Vision configuration with crop parameters.
 
         Returns:

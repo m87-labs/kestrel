@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import pyvips
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -17,7 +16,7 @@ from starlette.routing import Route
 from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
-from kestrel.utils.image import load_vips_from_base64
+from kestrel.utils.image import load_image_bytes_from_base64
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -136,9 +135,9 @@ class _ServerState:
 
             image_data = payload.get("image_url")
             if image_data is None:
-                image: Optional[pyvips.Image | np.ndarray] = None
+                image: Optional[bytes] = None
             elif isinstance(image_data, str):
-                image = load_vips_from_base64(image_data)
+                image = load_image_bytes_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
             if spatial_refs and image is None:
@@ -278,9 +277,9 @@ class _ServerState:
 
             image_data = payload.get("image_url")
             if image_data is None:
-                image: Optional[pyvips.Image | np.ndarray] = None
+                image: Optional[bytes] = None
             elif isinstance(image_data, str):
-                image = load_vips_from_base64(image_data)
+                image = load_image_bytes_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
         except ValueError as exc:
@@ -356,7 +355,7 @@ class _ServerState:
                 raise ValueError("Field 'image_url' must be provided")
             if not isinstance(image_data, str):
                 raise ValueError("Field 'image_url' must be a string")
-            image = load_vips_from_base64(image_data)
+            image = load_image_bytes_from_base64(image_data)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -478,9 +477,9 @@ class _ServerState:
 
             image_data = payload.get("image_url")
             if image_data is None:
-                image: Optional[pyvips.Image | np.ndarray] = None
+                image: Optional[bytes] = None
             elif isinstance(image_data, str):
-                image = load_vips_from_base64(image_data)
+                image = load_image_bytes_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
         except ValueError as exc:
@@ -555,9 +554,9 @@ class _ServerState:
 
             image_data = payload.get("image_url")
             if image_data is None:
-                image: Optional[pyvips.Image | np.ndarray] = None
+                image: Optional[bytes] = None
             elif isinstance(image_data, str):
-                image = load_vips_from_base64(image_data)
+                image = load_image_bytes_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
         except ValueError as exc:

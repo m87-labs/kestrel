@@ -51,7 +51,6 @@ from typing import (
 
 import numpy as np
 import torch
-import pyvips
 
 from kestrel.config import RuntimeConfig
 from kestrel.moondream.runtime import MoondreamRuntime
@@ -175,7 +174,7 @@ class _PendingRequest:
     request_id: int
     prompt: str
     prompt_tokens: Sequence[Token]
-    image: Optional[pyvips.Image | np.ndarray]
+    image: Optional[np.ndarray | bytes]
     image_hash: Optional[bytes]  # SHA256 hash for prefix caching
     max_new_tokens: int
     temperature: float
@@ -341,7 +340,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray | bytes] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineResult:
@@ -360,7 +359,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image | np.ndarray] = ...,
+        image: Optional[np.ndarray | bytes] = ...,
         question: Optional[str] = ...,
         reasoning: bool = ...,
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
@@ -371,7 +370,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image | np.ndarray] = ...,
+        image: Optional[np.ndarray | bytes] = ...,
         question: Optional[str] = ...,
         reasoning: bool = ...,
         spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
@@ -382,7 +381,7 @@ class InferenceEngine:
     @overload
     async def query(
         self,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray | bytes] = None,
         question: Optional[str] = None,
         reasoning: bool = True,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -392,7 +391,7 @@ class InferenceEngine:
 
     async def query(
         self,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray | bytes] = None,
         question: Optional[str] = None,
         reasoning: bool = True,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -469,7 +468,7 @@ class InferenceEngine:
 
     async def point(
         self,
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray | bytes],
         object: str,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
@@ -517,7 +516,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         *,
         length: str = ...,
         stream: Literal[True],
@@ -527,7 +526,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         *,
         length: str = ...,
         stream: Literal[False] = ...,
@@ -537,7 +536,7 @@ class InferenceEngine:
     @overload
     async def caption(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         *,
         length: str = ...,
         stream: bool = ...,
@@ -546,7 +545,7 @@ class InferenceEngine:
 
     async def caption(
         self,
-        image: pyvips.Image | np.ndarray,
+        image: np.ndarray | bytes,
         *,
         length: str = "normal",
         stream: bool = False,
@@ -606,7 +605,7 @@ class InferenceEngine:
 
     async def detect(
         self,
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray | bytes],
         object: str,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
@@ -648,7 +647,7 @@ class InferenceEngine:
 
     async def segment(
         self,
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray | bytes],
         object: str,
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
@@ -708,7 +707,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray | bytes] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> EngineStream:
@@ -760,7 +759,7 @@ class InferenceEngine:
         max_new_tokens: int,
         request_context: object,
         adapter: Optional[str],
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray | bytes],
         temperature: Optional[float],
         top_p: Optional[float],
         stream_queue: Optional[_StreamQueue],
@@ -781,12 +780,12 @@ class InferenceEngine:
                 "Adapter support requires an adapter_provider at engine creation."
             )
 
-        image_obj: Optional[pyvips.Image | np.ndarray] = None
+        image_obj: Optional[np.ndarray | bytes] = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
-            if not isinstance(image, (pyvips.Image, np.ndarray)):
-                raise TypeError("image must be a pyvips.Image or np.ndarray")
+            if not isinstance(image, (np.ndarray, bytes)):
+                raise TypeError("image must be np.ndarray or bytes")
             image_obj = image
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)
@@ -1001,7 +1000,7 @@ class InferenceEngine:
                 if isinstance(req.image, np.ndarray):
                     raw_bytes = req.image.tobytes()
                 else:
-                    raw_bytes = req.image.write_to_memory()
+                    raw_bytes = req.image  # Already bytes
                 image_hash = hashlib.sha256(raw_bytes).digest()
                 req.image_hash = image_hash
 

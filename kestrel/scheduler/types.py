@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
-import pyvips
 from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
@@ -158,7 +157,7 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
-    image: Optional[pyvips.Image | np.ndarray] = None
+    image: Optional[np.ndarray | bytes] = None
     image_hash: Optional[bytes] = None  # SHA256 hash for prefix caching
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0

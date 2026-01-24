@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-import pyvips
 import numpy as np
 
 from kestrel.moondream.runtime import TextToken, Token
@@ -29,7 +28,7 @@ class CaptionRequest:
     """Caption payload carried through the scheduler."""
 
     length: str
-    image: Optional[pyvips.Image | np.ndarray]
+    image: Optional[np.ndarray | bytes]
     stream: bool
     settings: CaptionSettings
 

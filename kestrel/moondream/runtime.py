@@ -12,7 +12,6 @@ import warnings
 import threading
 
 import numpy as np
-import pyvips
 import torch
 from torch import Tensor
 
@@ -694,7 +693,7 @@ class MoondreamRuntime:
 
     def encode_image(
         self,
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray],
         *,
         overlap: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
@@ -907,7 +906,7 @@ class MoondreamRuntime:
     def _prepare_full_prefill_inputs(
         self,
         tokens_list: list[Token],
-        image: Optional[pyvips.Image | np.ndarray],
+        image: Optional[np.ndarray],
         image_crops: Optional[OverlapCropOutput],
         prompt_len: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -1028,7 +1027,7 @@ class MoondreamRuntime:
         prompt_tokens: Sequence[Token],
         *,
         prefill_slot: PrefillSlot,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
@@ -1058,7 +1057,7 @@ class MoondreamRuntime:
         self,
         prompt_tokens: Sequence[Token],
         *,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
@@ -1184,7 +1183,7 @@ class MoondreamRuntime:
         prepared: PreparedSequence,
         prefill_slot: PrefillSlot,
         *,
-        image: Optional[pyvips.Image | np.ndarray] = None,
+        image: Optional[np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
         """Launch GPU prefill work for a prepared sequence and return logits.

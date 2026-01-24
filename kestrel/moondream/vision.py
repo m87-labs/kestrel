@@ -6,7 +6,6 @@ from typing import Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pyvips
 import numpy as np
 
 from .config import VisionConfig
@@ -19,7 +18,7 @@ from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
 
 
 def prepare_crops(
-    image: pyvips.Image | np.ndarray,
+    image: np.ndarray,
     config: VisionConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -230,7 +229,7 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
 
 
 def encode_image(
-    image: Optional[pyvips.Image | np.ndarray],
+    image: Optional[np.ndarray],
     module: nn.Module,
     config: VisionConfig,
     *,
@@ -271,7 +270,7 @@ def encode_image(
 
 
 def compute_overlap_crops(
-    image: pyvips.Image | np.ndarray, config: VisionConfig
+    image: np.ndarray, config: VisionConfig
 ) -> OverlapCropOutput:
     normalized = ensure_srgb(image)
     return overlap_crop_image(

@@ -328,11 +328,11 @@ class SegmentRefiner:
         refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
         return (refined_mask_full > 0.5).astype(np.uint8)
 
-    def __call__(self, image, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
+    def __call__(self, image: np.ndarray | bytes, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
         """Refine a coarse SVG segmentation.
 
         Args:
-            image: RGB image (numpy array or pyvips Image).
+            image: RGB image (numpy array or raw bytes).
             svg_path: SVG path string from model output.
             bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
 
@@ -625,17 +625,23 @@ def _paste_mask(full_h: int, full_w: int, crop_mask: np.ndarray, crop_xyxy: Tupl
     return full_mask
 
 
-def _ensure_numpy_rgb(image) -> np.ndarray:
-    """Convert image to RGB numpy array (H, W, 3) uint8. Accepts numpy or pyvips."""
+def _ensure_numpy_rgb(image: np.ndarray | bytes) -> np.ndarray:
+    """Convert image to RGB numpy array (H, W, 3) uint8. Accepts numpy or raw bytes."""
     if isinstance(image, np.ndarray):
+        # Handle grayscale and RGBA
+        if image.ndim == 2:
+            return np.stack([image, image, image], axis=-1)
+        if image.shape[2] == 4:
+            return image[:, :, :3]
+        if image.shape[2] == 1:
+            return np.repeat(image, 3, axis=2)
         return image
-    # Assume pyvips
-    if image.bands == 4:
-        image = image.extract_band(0, n=3)
-    elif image.bands == 1:
-        image = image.bandjoin([image, image])
-    mem = image.write_to_memory()
-    return np.frombuffer(mem, dtype=np.uint8).reshape(image.height, image.width, image.bands)
+    # Decode bytes
+    import kestrel_native
+    decoded = kestrel_native.decode_image(image)
+    if decoded is None:
+        raise ValueError("Unsupported image format")
+    return decoded
 
 
 __all__ = [
