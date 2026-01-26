@@ -29,9 +29,9 @@ pip install kestrel huggingface_hub
 
 ## Model Access
 
-The model weights are hosted on Hugging Face and require access approval:
+The model weights are hosted on Hugging Face and require access approval (automatically granted upon request):
 
-1. Request access at [vikhyatk/moondream-next](https://huggingface.co/vikhyatk/moondream-next)
+1. Request access at [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview)
 2. Once approved, authenticate with either:
    - `huggingface-cli login`, or
    - Set the `HF_TOKEN` environment variable
@@ -51,9 +51,8 @@ from kestrel.engine import InferenceEngine
 async def main():
     # Download the model (cached after first run)
     model_path = hf_hub_download(
-        "vikhyatk/moondream-next",
+        "vikhyatk/moondream3-preview",
         filename="model_fp8.pt",
-        revision="1fdf7871dc596a89f73491db95543870727b5dce",
     )
 
     # Configure the engine
