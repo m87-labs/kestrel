@@ -275,21 +275,29 @@ def build_text_model(
                                 {
                                     "qkv": nn.Linear(config.dim, qkv_dim, dtype=dtype),
                                     "proj": nn.Linear(
-                                    config.dim, config.dim, dtype=dtype
+                                        config.dim, config.dim, dtype=dtype
                                     ),
-                                    "tau": nn.ParameterDict(
+                                    **(
                                         {
-                                            "wqwv": nn.Parameter(
-                                                torch.empty(
-                                                    config.n_heads * 2,
-                                                    qkv_dim,
-                                                    dtype=dtype,
-                                                )
-                                            ),
-                                            "alpha": nn.Parameter(
-                                                torch.empty(config.n_heads, dtype=dtype)
-                                            ),
+                                            "tau": nn.ParameterDict(
+                                                {
+                                                    "wqwv": nn.Parameter(
+                                                        torch.empty(
+                                                            config.n_heads * 2,
+                                                            qkv_dim,
+                                                            dtype=dtype,
+                                                        )
+                                                    ),
+                                                    "alpha": nn.Parameter(
+                                                        torch.empty(
+                                                            config.n_heads, dtype=dtype
+                                                        )
+                                                    ),
+                                                }
+                                            )
                                         }
+                                        if config.tau_attn
+                                        else {}
                                     ),
                                 }
                             ),
@@ -319,6 +327,7 @@ def build_text_model(
     cos_sin_cache = precompute_freqs_cis(
         config.dim // (2 * config.n_heads),
         config.max_context,
+        theta=config.rope_theta,
         dtype=torch.float32,
         device=device,
     )

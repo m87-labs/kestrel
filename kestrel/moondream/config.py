@@ -24,12 +24,14 @@ class TextConfig:
     ff_dim: int = 8192
     n_layers: int = 24
     vocab_size: int = 51200
-    max_context: int = 4096
+    max_context: int = 32768
     n_heads: int = 32
     n_kv_heads: int = 32
     prefix_attn: int = 730
     group_size: Optional[int] = None
     moe: Optional[TextMoeConfig] = field(default_factory=TextMoeConfig)
+    tau_attn: bool = True
+    rope_theta: float = 1_500_000.0
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,8 @@ class RegionConfig:
     coord_out_dim: int = 1024
     size_feat_dim: int = 512
     size_out_dim: int = 2048
+    decoder_arch: str = "linear"
+    use_ln: bool = True
 
 
 @dataclass(frozen=True)
@@ -99,13 +103,58 @@ class MoondreamTextConfig:
         }
 
 
+# Shared configs between MD2 and MD3
+_VISION_CONFIG = {
+    "enc_dim": 1152,
+    "enc_patch_size": 14,
+    "enc_n_layers": 27,
+    "enc_ff_dim": 4304,
+    "enc_n_heads": 16,
+    "proj_out_dim": 2048,
+    "crop_size": 378,
+    "in_channels": 3,
+    "max_crops": 12,
+    "overlap_margin": 4,
+    "proj_inner_dim": 8192,
+}
+
+_TOKENIZER_CONFIG = {
+    "bos_id": 0,
+    "eos_id": 0,
+    "answer_id": 3,
+    "thinking_id": 4,
+    "coord_id": 5,
+    "size_id": 6,
+    "start_ground_points_id": 7,
+    "end_ground_id": 9,
+    "templates": {
+        "caption": {
+            "short": [1, 32708, 2, 12492, 3],
+            "normal": [1, 32708, 2, 6382, 3],
+            "long": [1, 32708, 2, 4059, 3],
+        },
+        "query": {"prefix": [1, 15381, 2], "suffix": [3]},
+        "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
+        "point": {"prefix": [1, 2581, 2], "suffix": [3]},
+        "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
+    },
+}
+
+_REGION_CONFIG = {
+    "dim": 2048,
+    "coord_feat_dim": 256,
+    "coord_out_dim": 1024,
+    "size_feat_dim": 512,
+    "size_out_dim": 2048,
+}
+
 DEFAULT_MOONDREAM3_CONFIG = {
     "text": {
         "dim": 2048,
         "ff_dim": 8192,
         "n_layers": 24,
         "vocab_size": 51200,
-        "max_context": 4096,
+        "max_context": 32768,
         "n_heads": 32,
         "n_kv_heads": 32,
         "prefix_attn": 730,
@@ -116,36 +165,45 @@ DEFAULT_MOONDREAM3_CONFIG = {
             "experts_per_token": 8,
             "expert_inner_dim": 1024,
         },
+        "tau_attn": True,
+        "rope_theta": 1_500_000.0,
     },
+    "tokenizer": _TOKENIZER_CONFIG,
+    "vision": _VISION_CONFIG,
+    "region": _REGION_CONFIG,
+}
+
+# Moondream 2 uses Phi-1.5 text backbone without MoE or TAU attention.
+DEFAULT_MOONDREAM2_CONFIG = {
+    "text": {
+        "dim": 2048,
+        "ff_dim": 8192,
+        "n_layers": 24,
+        "vocab_size": 51200,
+        "max_context": 2048,
+        "n_heads": 32,
+        "n_kv_heads": 32,
+        "prefix_attn": 730,
+        "group_size": None,
+        "moe": None,
+        "tau_attn": False,
+        "rope_theta": 10_000.0,
+    },
+    "vision": _VISION_CONFIG,
     "tokenizer": {
-        "bos_id": 0,
-        "eos_id": 0,
-        "answer_id": 3,
-        "thinking_id": 4,
-        "coord_id": 5,
-        "size_id": 6,
-        "start_ground_points_id": 7,
-        "end_ground_id": 9,
+        **_TOKENIZER_CONFIG,
         "templates": {
-            "caption": {
-                "short": [1, 32708, 2, 12492, 3],
-                "normal": [1, 32708, 2, 6382, 3],
-                "long": [1, 32708, 2, 4059, 3],
-            },
-            "query": {"prefix": [1, 15381, 2], "suffix": [3]},
-            "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
-            "point": {"prefix": [1, 2581, 2], "suffix": [3]},
-            "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
+            **_TOKENIZER_CONFIG["templates"],
+            "segment": None,  # MD2 doesn't support segment
         },
     },
     "region": {
-        "dim": 2048,
-        "coord_feat_dim": 256,
-        "coord_out_dim": 1024,
-        "size_feat_dim": 512,
-        "size_out_dim": 2048,
+        **_REGION_CONFIG,
+        "decoder_arch": "mlp",
+        "use_ln": False,
     },
 }
+
 
 @dataclass(frozen=True)
 class VisionConfig:
@@ -199,17 +257,9 @@ class MoondreamConfig:
         }
 
 
-DEFAULT_MOONDREAM_CONFIG = {
-    "text": deepcopy(DEFAULT_MOONDREAM3_CONFIG["text"]),
-    "vision": VisionConfig().__dict__.copy(),
-    "tokenizer": deepcopy(DEFAULT_MOONDREAM3_CONFIG["tokenizer"]),
-    "region": RegionConfig().__dict__.copy(),
-}
-
-
 def load_config() -> MoondreamConfig:
     """Return the default MoondreamConfig."""
-    return MoondreamConfig.from_dict(deepcopy(DEFAULT_MOONDREAM_CONFIG))
+    return MoondreamConfig.from_dict(deepcopy(DEFAULT_MOONDREAM3_CONFIG))
 
 __all__ = [
     "TextMoeConfig",
@@ -219,7 +269,7 @@ __all__ = [
     "VisionConfig",
     "MoondreamTextConfig",
     "MoondreamConfig",
+    "DEFAULT_MOONDREAM2_CONFIG",
     "DEFAULT_MOONDREAM3_CONFIG",
-    "DEFAULT_MOONDREAM_CONFIG",
     "load_config",
 ]

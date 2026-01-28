@@ -18,10 +18,14 @@ class SpatialDecodeTables:
     coord_value_lut: Tensor
     size_value_lut: Tensor
     coord_logits_dim: int
-    weight: Tensor
-    bias: Tensor
-    ln_weight: Tensor
-    ln_bias: Tensor
+    # For linear decoders: precomputed concatenated weights
+    weight: Tensor | None = None
+    bias: Tensor | None = None
+    ln_weight: Tensor | None = None
+    ln_bias: Tensor | None = None
+    # For MLP decoders: module references
+    coord_decoder: nn.Module | None = None
+    size_decoder: nn.Module | None = None
 
 
 def fourier_features(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -43,34 +47,49 @@ def build_spatial_decode_tables(
     coord_decoder = module["coord_decoder"]
     size_decoder = module["size_decoder"]
 
-    weight = torch.cat((coord_decoder.weight, size_decoder.weight), dim=0).contiguous()
-    bias = torch.cat((coord_decoder.bias, size_decoder.bias), dim=0).contiguous()
-
-    coord_bins = int(coord_decoder.out_features)
     device = module.coord_features.device
     coord_dtype = module.coord_features.dtype
+    size_dtype = module.size_features.dtype
+
+    # Check if decoders are linear (MD3) or MLP (MD2)
+    is_mlp = isinstance(coord_decoder, nn.ModuleDict)
+
+    if is_mlp:
+        coord_bins = int(coord_decoder["fc2"].out_features)
+        size_bins = int(size_decoder["fc2"].out_features // 2)
+    else:
+        coord_bins = int(coord_decoder.out_features)
+        size_bins = int(size_decoder.out_features // 2)
+
+    # Build LUTs (shared between both architectures)
     coord_value_lut = torch.linspace(
         0.0, 1.0, coord_bins, device=device, dtype=torch.float32
     ).to(dtype=coord_dtype)
-
-    size_bins = int(size_decoder.out_features // 2)
-    size_device = module.size_features.device
-    size_dtype = module.size_features.dtype
     size_exponents = torch.linspace(
-        -10.0, 0.0, size_bins, device=size_device, dtype=torch.float32
+        -10.0, 0.0, size_bins, device=device, dtype=torch.float32
     )
     size_value_lut = torch.exp2(size_exponents).to(dtype=size_dtype)
 
-    ln = module["ln"]
-    return SpatialDecodeTables(
-        coord_value_lut=coord_value_lut,
-        size_value_lut=size_value_lut,
-        coord_logits_dim=coord_bins,
-        weight=weight,
-        bias=bias,
-        ln_weight=ln.weight,
-        ln_bias=ln.bias,
-    )
+    if is_mlp:
+        return SpatialDecodeTables(
+            coord_value_lut=coord_value_lut,
+            size_value_lut=size_value_lut,
+            coord_logits_dim=coord_bins,
+            coord_decoder=coord_decoder,
+            size_decoder=size_decoder,
+        )
+    else:
+        # Linear decoders - precompute concatenated weights
+        ln = module["ln"]
+        return SpatialDecodeTables(
+            coord_value_lut=coord_value_lut,
+            size_value_lut=size_value_lut,
+            coord_logits_dim=coord_bins,
+            weight=torch.cat((coord_decoder.weight, size_decoder.weight), dim=0).contiguous(),
+            bias=torch.cat((coord_decoder.bias, size_decoder.bias), dim=0).contiguous(),
+            ln_weight=ln.weight,
+            ln_bias=ln.bias,
+        )
 
 
 def spatial_decode_logits(
@@ -78,17 +97,32 @@ def spatial_decode_logits(
     tables: SpatialDecodeTables,
 ) -> tuple[Tensor, Tensor, Tensor]:
     hidden = hidden_state.unsqueeze(0) if hidden_state.ndim == 1 else hidden_state
-    hidden_norm = layer_norm(
-        hidden,
-        LayerNormWeights(weight=tables.ln_weight, bias=tables.ln_bias),
-    )
-    logits = F.linear(hidden_norm, tables.weight, tables.bias)
 
-    coord_logits = logits[:, : tables.coord_logits_dim]
-    size_flat = logits[:, tables.coord_logits_dim :]
-    bins = int(size_flat.shape[-1] // 2)
-    width_logits = size_flat[:, :bins]
-    height_logits = size_flat[:, bins:]
+    if tables.coord_decoder is not None:
+        # MLP decoders (MD2)
+        coord_logits = F.gelu(tables.coord_decoder["fc1"](hidden))
+        coord_logits = tables.coord_decoder["fc2"](coord_logits)
+
+        size_logits = F.gelu(tables.size_decoder["fc1"](hidden))
+        size_logits = tables.size_decoder["fc2"](size_logits)
+
+        bins = int(size_logits.shape[-1] // 2)
+        width_logits = size_logits[:, :bins]
+        height_logits = size_logits[:, bins:]
+    else:
+        # Linear decoders (MD3)
+        hidden_norm = layer_norm(
+            hidden,
+            LayerNormWeights(weight=tables.ln_weight, bias=tables.ln_bias),
+        )
+        logits = F.linear(hidden_norm, tables.weight, tables.bias)
+
+        coord_logits = logits[:, : tables.coord_logits_dim]
+        size_flat = logits[:, tables.coord_logits_dim :]
+        bins = int(size_flat.shape[-1] // 2)
+        width_logits = size_flat[:, :bins]
+        height_logits = size_flat[:, bins:]
+
     return coord_logits, width_logits, height_logits
 
 
@@ -109,15 +143,32 @@ def spatial_bins_to_values(
 
 
 def build_region_module(config: RegionConfig, dtype: torch.dtype) -> nn.ModuleDict:
-    module = nn.ModuleDict(
-        {
-            "ln": nn.LayerNorm(config.dim, dtype=dtype),
-            "coord_encoder": nn.Linear(config.coord_feat_dim, config.dim, dtype=dtype),
-            "coord_decoder": nn.Linear(config.dim, config.coord_out_dim, dtype=dtype),
-            "size_encoder": nn.Linear(config.size_feat_dim, config.dim, dtype=dtype),
-            "size_decoder": nn.Linear(config.dim, config.size_out_dim, dtype=dtype),
-        }
-    )
+    if config.decoder_arch == "linear":
+        coord_decoder = nn.Linear(config.dim, config.coord_out_dim, dtype=dtype)
+        size_decoder = nn.Linear(config.dim, config.size_out_dim, dtype=dtype)
+    elif config.decoder_arch == "mlp":
+        inner_dim = 8192
+        coord_decoder = nn.ModuleDict({
+            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype),
+            "fc2": nn.Linear(inner_dim, config.coord_out_dim, dtype=dtype),
+        })
+        size_decoder = nn.ModuleDict({
+            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype),
+            "fc2": nn.Linear(inner_dim, config.size_out_dim, dtype=dtype),
+        })
+    else:
+        raise ValueError(f"Unknown decoder_arch: {config.decoder_arch}")
+
+    modules: dict = {
+        "coord_encoder": nn.Linear(config.coord_feat_dim, config.dim, dtype=dtype),
+        "coord_decoder": coord_decoder,
+        "size_encoder": nn.Linear(config.size_feat_dim, config.dim, dtype=dtype),
+        "size_decoder": size_decoder,
+    }
+    if config.use_ln:
+        modules["ln"] = nn.LayerNorm(config.dim, dtype=dtype)
+
+    module = nn.ModuleDict(modules)
 
     coord_feats = torch.empty(config.coord_feat_dim // 2, 1, dtype=dtype).T
     size_feats = torch.empty(config.size_feat_dim // 2, 2, dtype=dtype).T

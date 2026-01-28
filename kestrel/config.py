@@ -18,10 +18,11 @@ class RuntimeConfig:
     # Effective batch size (excluding reserved batch_idx 0).
     max_batch_size: int = 4
     page_size: int = 1
-    max_seq_length: int = 32768
     kv_cache_pages: int = 65536
     enable_cuda_graphs: bool = True
     enable_prefix_cache: bool = True
+    # Model: "moondream2" or "moondream3-preview"
+    model: str = "moondream3-preview"
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

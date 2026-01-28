@@ -54,13 +54,64 @@ def safetensors_open(path: str):
         yield get_tensor
 
 
-def _assign_text_weights(
+def _detect_checkpoint_format(keys: List[str]) -> str:
+    """Detect checkpoint format from key names.
+
+    Returns 'md3' for Moondream 3 format (text_model.transformer.h.*)
+    or 'md2' for Moondream 2 format (model.text.blocks.*).
+    """
+    for key in keys:
+        if key.startswith("text_model.transformer."):
+            return "md3"
+        if key.startswith("model.text.blocks."):
+            return "md2"
+    raise ValueError(
+        "Could not detect checkpoint format. Expected keys starting with "
+        "'text_model.transformer.' (MD3) or 'model.text.blocks.' (MD2)."
+    )
+
+
+def _assign_md2_text_weights(
+    get_tensor: Callable[[str], torch.Tensor],
+    model: nn.Module,
+) -> None:
+    """Assign text weights from Moondream 2 checkpoint format (model.text.*)."""
+    text = model.text
+
+    # Core text model weights
+    text.wte.data.copy_(get_tensor("model.text.wte"))
+    text["post_ln"].weight.data.copy_(get_tensor("model.text.post_ln.weight"))
+    text["post_ln"].bias.data.copy_(get_tensor("model.text.post_ln.bias"))
+    text["lm_head"].weight.data.copy_(get_tensor("model.text.lm_head.weight"))
+    text["lm_head"].bias.data.copy_(get_tensor("model.text.lm_head.bias"))
+
+    # Block weights
+    for i, block in enumerate(text["blocks"]):
+        prefix = f"model.text.blocks.{i}"
+        block["ln"].weight.data.copy_(get_tensor(f"{prefix}.ln.weight"))
+        block["ln"].bias.data.copy_(get_tensor(f"{prefix}.ln.bias"))
+        block["attn"]["qkv"].weight.data.copy_(get_tensor(f"{prefix}.attn.qkv.weight"))
+        block["attn"]["qkv"].bias.data.copy_(get_tensor(f"{prefix}.attn.qkv.bias"))
+        block["attn"]["proj"].weight.data.copy_(get_tensor(f"{prefix}.attn.proj.weight"))
+        block["attn"]["proj"].bias.data.copy_(get_tensor(f"{prefix}.attn.proj.bias"))
+        # MD2 always uses dense MLP (no MoE)
+        block["mlp"]["fc1"].weight.data.copy_(get_tensor(f"{prefix}.mlp.fc1.weight"))
+        block["mlp"]["fc1"].bias.data.copy_(get_tensor(f"{prefix}.mlp.fc1.bias"))
+        block["mlp"]["fc2"].weight.data.copy_(get_tensor(f"{prefix}.mlp.fc2.weight"))
+        block["mlp"]["fc2"].bias.data.copy_(get_tensor(f"{prefix}.mlp.fc2.bias"))
+
+    for param in text.parameters():
+        param.data = param.data.contiguous()
+
+
+def _assign_md3_text_weights(
     get_tensor: Callable[[str], torch.Tensor],
     model: nn.Module,
     *,
     moe_scales: Optional[MoEScales] = None,
     get_raw_tensor: Optional[Callable[[str], torch.Tensor]] = None,
 ) -> None:
+    """Assign text weights from Moondream 3 checkpoint format (text_model.transformer.*)."""
     text = model.text
     use_fp8_moe = moe_scales is not None and moe_scales.has_any_scales()
 
@@ -158,7 +209,11 @@ def _assign_text_weights(
 
     # Tau weights (q/v scaling). Kestrel stores these fused as a single wqwv matrix
     # for performance, but older checkpoints store tau_wq and tau_wv separately.
+    # Skip for models without TAU (e.g., Moondream 2).
     for i, block in enumerate(text["blocks"]):
+        tau = block["attn"].get("tau")
+        if tau is None:
+            continue
         prefix = f"text_model.transformer.h.{i}"
         try:
             tau_wqwv = get_tensor(f"{prefix}.tau_wqwv")
@@ -166,17 +221,50 @@ def _assign_text_weights(
             tau_wq = get_tensor(f"{prefix}.tau_wq")
             tau_wv = get_tensor(f"{prefix}.tau_wv")
             tau_wqwv = torch.cat([tau_wq, tau_wv], dim=0)
-        block["attn"]["tau"]["wqwv"].data.copy_(tau_wqwv)
-        block["attn"]["tau"]["alpha"].data.copy_(get_tensor(f"{prefix}.tau_alpha"))
+        tau["wqwv"].data.copy_(tau_wqwv)
+        tau["alpha"].data.copy_(get_tensor(f"{prefix}.tau_alpha"))
 
     for param in text.parameters():
         param.data = param.data.contiguous()
 
 
-def _assign_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
-    if not hasattr(model, "vision"):
-        return
+def _assign_md2_vision_weights(
+    get_tensor: Callable[[str], torch.Tensor], model: nn.Module
+) -> None:
+    """Assign vision weights from Moondream 2 checkpoint format (model.vision.*)."""
+    vision = model.vision
 
+    vision["patch_emb"].weight.data.copy_(get_tensor("model.vision.patch_emb.weight"))
+    vision["patch_emb"].bias.data.copy_(get_tensor("model.vision.patch_emb.bias"))
+    vision.pos_emb.data.copy_(get_tensor("model.vision.pos_emb"))
+    vision["post_ln"].weight.data.copy_(get_tensor("model.vision.post_ln.weight"))
+    vision["post_ln"].bias.data.copy_(get_tensor("model.vision.post_ln.bias"))
+    vision["proj_mlp"]["fc1"].weight.data.copy_(get_tensor("model.vision.proj_mlp.fc1.weight"))
+    vision["proj_mlp"]["fc1"].bias.data.copy_(get_tensor("model.vision.proj_mlp.fc1.bias"))
+    vision["proj_mlp"]["fc2"].weight.data.copy_(get_tensor("model.vision.proj_mlp.fc2.weight"))
+    vision["proj_mlp"]["fc2"].bias.data.copy_(get_tensor("model.vision.proj_mlp.fc2.bias"))
+
+    for i, block in enumerate(vision["blocks"]):
+        prefix = f"model.vision.blocks.{i}"
+        block["ln1"].weight.data.copy_(get_tensor(f"{prefix}.ln1.weight"))
+        block["ln1"].bias.data.copy_(get_tensor(f"{prefix}.ln1.bias"))
+        block["ln2"].weight.data.copy_(get_tensor(f"{prefix}.ln2.weight"))
+        block["ln2"].bias.data.copy_(get_tensor(f"{prefix}.ln2.bias"))
+        block["attn"]["qkv"].weight.data.copy_(get_tensor(f"{prefix}.attn.qkv.weight"))
+        block["attn"]["qkv"].bias.data.copy_(get_tensor(f"{prefix}.attn.qkv.bias"))
+        block["attn"]["proj"].weight.data.copy_(get_tensor(f"{prefix}.attn.proj.weight"))
+        block["attn"]["proj"].bias.data.copy_(get_tensor(f"{prefix}.attn.proj.bias"))
+        block["mlp"]["fc1"].weight.data.copy_(get_tensor(f"{prefix}.mlp.fc1.weight"))
+        block["mlp"]["fc1"].bias.data.copy_(get_tensor(f"{prefix}.mlp.fc1.bias"))
+        block["mlp"]["fc2"].weight.data.copy_(get_tensor(f"{prefix}.mlp.fc2.weight"))
+        block["mlp"]["fc2"].bias.data.copy_(get_tensor(f"{prefix}.mlp.fc2.bias"))
+
+    for param in vision.parameters():
+        param.data = param.data.contiguous()
+
+
+def _assign_md3_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
+    """Assign vision weights from Moondream 3 checkpoint format (vision_encoder.*)."""
     vision = model.vision
     weight_map: Dict[str, torch.Tensor] = {
         "vision_encoder.encoder.model.visual.patch_embed.linear.weight": vision[
@@ -220,16 +308,37 @@ def _assign_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.
         param.data = param.data.contiguous()
 
 
-def _assign_region_weights(
+def _assign_md2_region_weights(
     get_tensor: Callable[[str], torch.Tensor],
     region: nn.Module,
     *,
     convert: Callable[[torch.Tensor], torch.Tensor],
 ) -> None:
-    if not isinstance(region, nn.Module):
-        raise TypeError("region must be an nn.Module with encoder/decoder attributes")
+    """Assign region weights from Moondream 2 checkpoint format (model.region.*)."""
+    region["coord_encoder"].weight.data.copy_(convert(get_tensor("model.region.coord_encoder.weight")))
+    region["coord_encoder"].bias.data.copy_(convert(get_tensor("model.region.coord_encoder.bias")))
+    region["coord_decoder"]["fc1"].weight.data.copy_(convert(get_tensor("model.region.coord_decoder.fc1.weight")))
+    region["coord_decoder"]["fc1"].bias.data.copy_(convert(get_tensor("model.region.coord_decoder.fc1.bias")))
+    region["coord_decoder"]["fc2"].weight.data.copy_(convert(get_tensor("model.region.coord_decoder.fc2.weight")))
+    region["coord_decoder"]["fc2"].bias.data.copy_(convert(get_tensor("model.region.coord_decoder.fc2.bias")))
+    region["size_encoder"].weight.data.copy_(convert(get_tensor("model.region.size_encoder.weight")))
+    region["size_encoder"].bias.data.copy_(convert(get_tensor("model.region.size_encoder.bias")))
+    region["size_decoder"]["fc1"].weight.data.copy_(convert(get_tensor("model.region.size_decoder.fc1.weight")))
+    region["size_decoder"]["fc1"].bias.data.copy_(convert(get_tensor("model.region.size_decoder.fc1.bias")))
+    region["size_decoder"]["fc2"].weight.data.copy_(convert(get_tensor("model.region.size_decoder.fc2.weight")))
+    region["size_decoder"]["fc2"].bias.data.copy_(convert(get_tensor("model.region.size_decoder.fc2.bias")))
 
-    # Linear layers
+    region.coord_features.data.copy_(convert(get_tensor("model.region.coord_features")))
+    region.size_features.data.copy_(convert(get_tensor("model.region.size_features")))
+
+
+def _assign_md3_region_weights(
+    get_tensor: Callable[[str], torch.Tensor],
+    region: nn.Module,
+    *,
+    convert: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """Assign region weights from Moondream 3 checkpoint format (region_model.*)."""
     region["coord_encoder"].weight.data.copy_(convert(get_tensor("region_model.coordinate_encoder.weight")))
     region["coord_encoder"].bias.data.copy_(convert(get_tensor("region_model.coordinate_encoder.bias")))
     region["coord_decoder"].weight.data.copy_(convert(get_tensor("region_model.coordinate_head.weight")))
@@ -269,6 +378,9 @@ def _refresh_tau_pos_tables(model: nn.Module) -> None:
     if not hasattr(model, "text") or not hasattr(model, "config"):
         return
     text_cfg = model.config.text
+    # Skip for models without TAU attention (e.g., Moondream 2).
+    if not getattr(text_cfg, "tau_attn", True):
+        return
     target_param = next(model.text.parameters())
     build_tau_pos_tables(
         model.text,
@@ -342,68 +454,59 @@ def load_moondream_weights(
     def convert(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to(target_dtype)
 
+    def assign_weights(
+        all_tensors: dict[str, torch.Tensor],
+        getter: Callable[[str], torch.Tensor],
+        raw_getter: Callable[[str], torch.Tensor],
+    ) -> None:
+        checkpoint_format = _detect_checkpoint_format(list(all_tensors.keys()))
+        moe_scales = _capture_moe_scales(all_tensors, n_layers)
+
+        if checkpoint_format == "md2":
+            _assign_md2_text_weights(getter, model)
+            if load_vision:
+                _assign_md2_vision_weights(getter, model)
+            if region is not None:
+                _assign_md2_region_weights(getter, region, convert=convert)
+        else:
+            _assign_md3_text_weights(
+                getter, model, moe_scales=moe_scales, get_raw_tensor=raw_getter
+            )
+            if load_vision:
+                _assign_md3_vision_weights(getter, model)
+            if region is not None:
+                _assign_md3_region_weights(getter, region, convert=convert)
+
     if path.endswith(".safetensors"):
         with safetensors_open(path) as get_tensor:
-            name_map = {k.replace("._orig_mod", ""): k for k in get_tensor.keys()}
-
-            # First pass: collect all tensors to check for MoE scales
             all_tensors = {}
             for orig_name in get_tensor.keys():
                 name = orig_name.replace("._orig_mod", "")
                 all_tensors[name] = get_tensor(orig_name)
 
-            # Capture MoE scales
-            moe_scales = _capture_moe_scales(all_tensors, n_layers)
-
-            # Call tensor_hook for all tensors
             if tensor_hook is not None:
                 for name, tensor in all_tensors.items():
                     tensor_hook(name, tensor)
 
-            def getter(name: str) -> torch.Tensor:
-                return convert(all_tensors[name])
-
-            def raw_getter(name: str) -> torch.Tensor:
-                return all_tensors[name]
-
-            _assign_text_weights(
-                getter, model, moe_scales=moe_scales, get_raw_tensor=raw_getter
+            assign_weights(
+                all_tensors,
+                getter=lambda name: convert(all_tensors[name]),
+                raw_getter=lambda name: all_tensors[name],
             )
-            if load_vision:
-                _assign_vision_weights(getter, model)
-            if region is not None:
-                _assign_region_weights(getter, region, convert=convert)
     else:
         tensors_raw = torch.load(path, map_location=target_device, weights_only=True)
+        all_tensors = {k.replace("._orig_mod", ""): v for k, v in tensors_raw.items()}
 
-        # Normalize names and capture MoE scales
-        tensors_normalized: dict[str, torch.Tensor] = {}
-        for key, value in tensors_raw.items():
-            name = key.replace("._orig_mod", "")
-            tensors_normalized[name] = value
-
-        moe_scales = _capture_moe_scales(tensors_normalized, n_layers)
-
-        # Call tensor_hook and prepare converted tensors
-        tensors: dict[str, torch.Tensor] = {}
-        for name, value in tensors_normalized.items():
-            if tensor_hook is not None:
+        if tensor_hook is not None:
+            for name, value in all_tensors.items():
                 tensor_hook(name, value)
-            tensors[name] = convert(value)
 
-        def getter(name: str) -> torch.Tensor:
-            return tensors[name]
-
-        def raw_getter(name: str) -> torch.Tensor:
-            return tensors_normalized[name]
-
-        _assign_text_weights(
-            getter, model, moe_scales=moe_scales, get_raw_tensor=raw_getter
+        converted = {name: convert(value) for name, value in all_tensors.items()}
+        assign_weights(
+            all_tensors,
+            getter=lambda name: converted[name],
+            raw_getter=lambda name: all_tensors[name],
         )
-        if load_vision:
-            _assign_vision_weights(getter, model)
-        if region is not None:
-            _assign_region_weights(getter, region, convert=convert)
 
     _refresh_rotary_tables(model)
     _refresh_tau_pos_tables(model)

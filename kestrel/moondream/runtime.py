@@ -29,7 +29,11 @@ from kestrel.prefix_cache import (
     TreeNode,
 )
 
-from .config import DEFAULT_MOONDREAM_CONFIG, MoondreamConfig
+from .config import (
+    DEFAULT_MOONDREAM2_CONFIG,
+    DEFAULT_MOONDREAM3_CONFIG,
+    MoondreamConfig,
+)
 from .model import MoondreamModel
 from .weights import load_moondream_weights
 from .text import (
@@ -280,24 +284,18 @@ class MoondreamRuntime:
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
         self.graph_capture_lock = threading.RLock()
 
-        raw_config = deepcopy(DEFAULT_MOONDREAM_CONFIG)
-
-        text_section = raw_config.setdefault("text", {})
-        default_context = int(
-            text_section.get("max_context", DEFAULT_MOONDREAM_CONFIG["text"]["max_context"])
-        )
-        requested_context = cfg.max_seq_length
-        if requested_context is not None and requested_context != default_context:
-            text_section["max_context"] = int(requested_context)
+        # Select config based on model version
+        if cfg.model == "moondream2":
+            raw_config = deepcopy(DEFAULT_MOONDREAM2_CONFIG)
+        else:
+            raw_config = deepcopy(DEFAULT_MOONDREAM3_CONFIG)
 
         self.config = MoondreamConfig.from_dict(raw_config)
 
         self._kv_layer_k_scales: list[float] | None = None
         self._kv_layer_v_scales: list[float] | None = None
 
-        self.max_seq_length = int(
-            cfg.max_seq_length if cfg.max_seq_length is not None else self.config.text.max_context
-        )
+        self.max_seq_length = self.config.text.max_context
         if self.max_seq_length % cfg.page_size != 0:
             raise ValueError("max_seq_length must be divisible by page_size")
 
@@ -414,8 +412,7 @@ class MoondreamRuntime:
                 )
             self.kv_cache_dtype = self.dtype
 
-        tokenizer_path = "moondream/starmie-v1"
-        self.tokenizer = Tokenizer.from_pretrained(tokenizer_path)
+        self.tokenizer = Tokenizer.from_pretrained("moondream/starmie-v1")
 
         head_dim = self.config.text.dim // self.config.text.n_heads
         self.head_dim = head_dim

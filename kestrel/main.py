@@ -45,10 +45,10 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--page-size", type=int, default=1, help="KV cache page size")
     parser.add_argument(
-        "--max-seq-length",
-        type=int,
-        default=131072,
-        help="Maximum total sequence length (prompt + generation)",
+        "--model",
+        default="moondream3-preview",
+        choices=["moondream2", "moondream3-preview"],
+        help="Model version to use",
     )
     parser.add_argument(
         "--disable-cuda-graphs",
@@ -122,8 +122,8 @@ def _create_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         dtype=args.dtype,
         max_batch_size=args.max_batch_size,
         page_size=args.page_size,
-        max_seq_length=args.max_seq_length,
         enable_cuda_graphs=not args.disable_cuda_graphs,
+        model=args.model,
     )
 
 
