@@ -29,40 +29,46 @@ pip install kestrel huggingface_hub
 
 ## Model Access
 
-The model weights are hosted on Hugging Face and require access approval (automatically granted upon request):
+Kestrel supports both Moondream 3 and Moondream 2:
 
-1. Request access at [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview)
-2. Once approved, authenticate with either:
-   - `huggingface-cli login`, or
-   - Set the `HF_TOKEN` environment variable
+| Model | Repository | Notes |
+|-------|------------|-------|
+| Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
+| Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Requires access approval |
+
+For Moondream 3, request access (automatically granted) then authenticate with `huggingface-cli login` or set `HF_TOKEN`.
 
 ## Quick Start
 
 ```python
 import asyncio
 
-import pyvips
+import numpy as np
 from huggingface_hub import hf_hub_download
+from PIL import Image
 
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
 
 async def main():
-    # Download the model (cached after first run)
-    model_path = hf_hub_download(
-        "vikhyatk/moondream3-preview",
-        filename="model_fp8.pt",
-    )
+    # Download model weights (cached after first run)
+    # For Moondream 2:
+    model_path = hf_hub_download("vikhyatk/moondream2", filename="model.safetensors")
+    model = "moondream2"
+
+    # For Moondream 3:
+    # model_path = hf_hub_download("vikhyatk/moondream3-preview", filename="model_fp8.pt")
+    # model = "moondream3-preview"
 
     # Configure the engine
-    cfg = RuntimeConfig(model_path)
+    cfg = RuntimeConfig(model_path, model=model)
 
     # Create the engine (loads model and warms up)
     engine = await InferenceEngine.create(cfg)
 
-    # Load an image
-    image = pyvips.Image.new_from_file("photo.jpg")
+    # Load an image (as numpy array)
+    image = np.array(Image.open("photo.jpg").convert("RGB"))
 
     # Visual question answering
     result = await engine.query(
@@ -143,7 +149,7 @@ Bounding box coordinates are normalized to [0, 1].
 
 ### Segment
 
-Generate a segmentation mask:
+Generate a segmentation mask (Moondream 3 only):
 
 ```python
 result = await engine.segment(image, "dog")
@@ -152,14 +158,14 @@ print(seg["svg_path"])  # SVG path data for the mask
 print(seg["bbox"])      # {"x_min": ..., "y_min": ..., "x_max": ..., "y_max": ...}
 ```
 
-Note: Segmentation requires separate model weights. Contact [moondream.ai](https://moondream.ai) for access.
+Note: Segmentation requires Moondream 3 and separate model weights. Contact [moondream.ai](https://moondream.ai) for access.
 
 ## Streaming
 
 For longer responses, you can stream tokens as they're generated:
 
 ```python
-image = pyvips.Image.new_from_file("photo.jpg")
+image = np.array(Image.open("photo.jpg").convert("RGB"))
 
 stream = await engine.query(
     image=image,
