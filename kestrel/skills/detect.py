@@ -53,9 +53,13 @@ class DetectSkill(SkillSpec):
         prefix: Sequence[int] = template["prefix"]
         suffix: Sequence[int] = template["suffix"]
         prompt = request_context.object
-        object_tokens = runtime.tokenizer.encode(prompt).ids if prompt else []
+        object_tokens = runtime.tokenizer.encode(" " + prompt).ids if prompt else []
         ids = [*prefix, *object_tokens, *suffix]
-        return [TextToken(token_id=int(tid)) for tid in ids]
+        tokens = []
+        if runtime.model_name == "moondream2":
+            tokens.append(TextToken(token_id=int(runtime.config.tokenizer.bos_id)))
+        tokens.extend(TextToken(token_id=int(tid)) for tid in ids)
+        return tokens
 
     def create_state(
         self,

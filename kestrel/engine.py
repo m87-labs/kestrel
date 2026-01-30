@@ -614,7 +614,7 @@ class InferenceEngine:
             raise ValueError("object must be a non-empty string")
 
         adapter = self._extract_adapter_id(settings)
-        max_objects = 150
+        max_objects = 50
         temperature = 0.0
         top_p = 1.0
         if settings is not None:

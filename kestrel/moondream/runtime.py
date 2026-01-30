@@ -561,6 +561,11 @@ class MoondreamRuntime:
     def prefill_slots(self) -> list[PrefillSlot]:
         return self._prefill_slots
 
+    @property
+    def model_name(self) -> str:
+        """Return the model name (e.g., 'moondream2', 'moondream3-preview')."""
+        return self._cfg.model
+
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:
             if not self._prefill_slot_free:

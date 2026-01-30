@@ -56,10 +56,23 @@ class QuerySkill(SkillSpec):
         suffix: Sequence[int] = template["suffix"]
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
         reasoning = request_context.reasoning
-        tokens: List[Token] = [TextToken(token_id=int(tid)) for tid in prefix]
+        # The runtime's _prepare_full_prefill_inputs treats the first token as BOS
+        # (placed before the image). MD2's HF model prepends BOS (token 0) separately,
+        # so we must include it here. MD3 templates already start with the correct
+        # first-position token.
+        is_md2 = runtime.model_name == "moondream2"
+        bos_id = runtime.config.tokenizer.bos_id
+        tokens: List[Token] = []
+        if is_md2:
+            tokens.append(TextToken(token_id=int(bos_id)))
+        tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 
         tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
+        # MD2 HF model adds suffix before thinking_id or doubles suffix for non-reasoning
+        is_md2 = runtime.model_name == "moondream2"
+        if is_md2:
+            tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
         if reasoning:
             thinking_id = runtime.config.tokenizer.thinking_id
             tokens.append(TextToken(token_id=int(thinking_id)))
@@ -102,6 +115,21 @@ class QuerySkillState(SkillState):
         self._end_ground_id: Optional[int] = None
         self._streaming = bool(query_request.stream)
         self._answer_stream_offset = 0
+        # After reasoning completes (answer_id generated), HF force-feeds suffix
+        # tokens before answer generation. We replicate this by constraining
+        # allowed_token_ids to force suffix tokens one at a time.
+        self._suffix_tokens: Optional[List[int]] = None
+        self._suffix_inject_idx: int = 0
+
+    def allowed_token_ids(
+        self, runtime: "MoondreamRuntime"
+    ) -> Optional[Sequence[int]]:
+        if (
+            self._suffix_tokens is not None
+            and self._suffix_inject_idx < len(self._suffix_tokens)
+        ):
+            return [self._suffix_tokens[self._suffix_inject_idx]]
+        return None
 
     def consume_step(
         self,
@@ -111,6 +139,15 @@ class QuerySkillState(SkillState):
         if self._reasoning_enabled:
             self._ensure_token_ids(runtime)
         self.append_token(step.token)
+
+        # Track suffix injection progress
+        if (
+            self._suffix_tokens is not None
+            and self._suffix_inject_idx < len(self._suffix_tokens)
+        ):
+            self._suffix_inject_idx += 1
+            # Don't collect suffix tokens as answer tokens
+            return None
 
         if not self._reasoning_enabled:
             if isinstance(step.token, TextToken):
@@ -126,6 +163,11 @@ class QuerySkillState(SkillState):
                     self._flush_current_chunk()
                     self._pending_coord = None
                     self._answer_stream_offset = 0
+                    # Force-feed suffix tokens before answer generation,
+                    # matching HF's behavior of prefilling suffix after reasoning.
+                    suffix = runtime.config.tokenizer.templates["query"]["suffix"]
+                    self._suffix_tokens = list(suffix)
+                    self._suffix_inject_idx = 0
                     return None
                 if token_id == self._start_ground_id or token_id == self._end_ground_id:
                     self._flush_current_chunk()

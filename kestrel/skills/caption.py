@@ -57,8 +57,12 @@ class CaptionSkill(SkillSpec):
             raise ValueError(
                 f"Unsupported caption length '{length_key}'. Expected one of: {valid}"
             )
-        tokens = templates[length_key]
-        return [TextToken(token_id=int(tid)) for tid in tokens]
+        token_ids = templates[length_key]
+        tokens = []
+        if runtime.model_name == "moondream2":
+            tokens.append(TextToken(token_id=int(runtime.config.tokenizer.bos_id)))
+        tokens.extend(TextToken(token_id=int(tid)) for tid in token_ids)
+        return tokens
 
     def create_state(
         self,

@@ -211,9 +211,9 @@ def _assign_md3_text_weights(
     # for performance, but older checkpoints store tau_wq and tau_wv separately.
     # Skip for models without TAU (e.g., Moondream 2).
     for i, block in enumerate(text["blocks"]):
-        tau = block["attn"].get("tau")
-        if tau is None:
+        if "tau" not in block["attn"]:
             continue
+        tau = block["attn"]["tau"]
         prefix = f"text_model.transformer.h.{i}"
         try:
             tau_wqwv = get_tensor(f"{prefix}.tau_wqwv")

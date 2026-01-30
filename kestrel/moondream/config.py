@@ -174,6 +174,7 @@ DEFAULT_MOONDREAM3_CONFIG = {
 }
 
 # Moondream 2 uses Phi-1.5 text backbone without MoE or TAU attention.
+# Latest MD2 (2025-06-21) uses the same Starmie tokenizer as MD3.
 DEFAULT_MOONDREAM2_CONFIG = {
     "text": {
         "dim": 2048,
