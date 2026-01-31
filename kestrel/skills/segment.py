@@ -151,7 +151,7 @@ class SegmentSkillState(SkillState):
         coarse_path = svg_path
         coarse_bbox = bbox
 
-        if svg_path and bbox and not parse_error and self._request.image is not None:
+        if svg_path and bbox and not parse_error and self._request.image is not None and runtime.seg_refiner is not None:
             refined_path, refined_bbox = runtime.seg_refiner(
                 self._request.image, svg_path, bbox
             )

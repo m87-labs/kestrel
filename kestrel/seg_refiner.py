@@ -7,14 +7,19 @@ import threading
 import traceback
 from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
-from PIL import Image
-from resvg import render, usvg
+
+try:
+    import cv2
+    from PIL import Image
+    from resvg import render, usvg
+    _HAS_SEG_DEPS = True
+except ImportError:
+    _HAS_SEG_DEPS = False
 
 from .moondream.vision import vision_encoder
 from .moondream.config import VisionConfig
@@ -260,6 +265,11 @@ class SegmentRefiner:
     """Refines coarse segmentation masks."""
 
     def __init__(self, vision_module: nn.Module, vision_config: VisionConfig, device: torch.device):
+        if not _HAS_SEG_DEPS:
+            raise ImportError(
+                "Segmentation refinement requires optional dependencies: "
+                "pip install pillow opencv-python-headless resvg"
+            )
         self._device = device
         self._vision_module = vision_module
         self._vision_config = vision_config

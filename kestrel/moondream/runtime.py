@@ -56,7 +56,7 @@ from .region import (
     encode_coordinate,
     encode_size,
 )
-from ..seg_refiner import SegmentRefiner
+from ..seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from .decode_slot import DecodeSlot, create_decode_slot
 
 
@@ -476,7 +476,10 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
+        self.seg_refiner = (
+            SegmentRefiner(self.model.vision, self.config.vision, self.device)
+            if _HAS_SEG_DEPS else None
+        )
 
         # Multi-slot LoRA workspace and slot manager.
         # Slot 0 represents "no LoRA". Active adapters are loaded into slots 1+.
