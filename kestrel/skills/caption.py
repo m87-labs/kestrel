@@ -89,6 +89,13 @@ class CaptionSkillState(SkillState):
         self._streaming = bool(caption_request.stream)
         self._stream_offset = 0
 
+    def suppressed_token_ids(
+        self, runtime: "MoondreamRuntime"
+    ) -> Optional[Sequence[int]]:
+        if runtime.model_name != "moondream2":
+            return None
+        return [runtime.config.tokenizer.answer_id]
+
     def consume_step(
         self,
         runtime: "MoondreamRuntime",

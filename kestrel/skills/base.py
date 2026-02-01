@@ -96,6 +96,14 @@ class SkillState:
         """Optional per-skill restriction on the next sampled token ids."""
         return None
 
+    def suppressed_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+        """Optional per-skill token ids to suppress (set logits to -inf).
+
+        Complement of allowed_token_ids: these tokens are forced to -inf
+        rather than being the only ones kept.
+        """
+        return None
+
     # Streaming -------------------------------------------------------
 
     def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:

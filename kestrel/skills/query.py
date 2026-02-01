@@ -131,6 +131,24 @@ class QuerySkillState(SkillState):
             return [self._suffix_tokens[self._suffix_inject_idx]]
         return None
 
+    def suppressed_token_ids(
+        self, runtime: "MoondreamRuntime"
+    ) -> Optional[Sequence[int]]:
+        if runtime.model_name != "moondream2":
+            return None
+        tcfg = runtime.config.tokenizer
+        if self._reasoning_enabled and self._collecting_reasoning:
+            # During reasoning: suppress eos and size tokens (matching HF).
+            return [tcfg.eos_id, tcfg.size_id]
+        # Don't suppress during suffix injection (allowed_token_ids handles that).
+        if (
+            self._suffix_tokens is not None
+            and self._suffix_inject_idx < len(self._suffix_tokens)
+        ):
+            return None
+        # During answer generation: suppress answer_id (matching HF).
+        return [tcfg.answer_id]
+
     def consume_step(
         self,
         runtime: "MoondreamRuntime",

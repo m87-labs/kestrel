@@ -45,12 +45,11 @@ def prepare_crops_from_overlap(
     # consumer can observe stale/partially-copied inputs.
     crops = crops_cpu.to(
         device=device,
-        dtype=torch.float32,
+        dtype=dtype,
         non_blocking=True,
     )
     crops = crops.div_(255.0)
     crops = crops.sub_(0.5).div_(0.5)
-    crops = crops.to(dtype=dtype)
     return crops, overlap["tiling"]
 
 
@@ -171,12 +170,11 @@ def vision_projection(
     module: nn.Module,
     config: VisionConfig,
 ) -> torch.Tensor:
-    dtype = global_features.dtype
-    reconstructed = local_features.to(dtype=dtype).permute(2, 0, 1)
+    reconstructed = local_features.permute(2, 0, 1)
     reconstructed = F.adaptive_avg_pool2d(
-        reconstructed.to(dtype=torch.float32),
+        reconstructed,
         output_size=(config.enc_n_layers, config.enc_n_layers),
-    ).to(dtype)
+    )
     reconstructed = reconstructed.permute(1, 2, 0).reshape(-1, config.enc_dim)
     features = torch.cat([global_features, reconstructed], dim=-1)
     hidden = F.gelu(module.proj_mlp["fc1"](features), approximate="tanh")
@@ -254,12 +252,11 @@ def encode_image(
             config.enc_dim,
         )
         reconstructed = reconstruct_from_crops(
-            local.to(dtype=torch.float32),
+            local,
             tiling,
             overlap_margin=config.overlap_margin,
             patch_size=1,
         )
-        reconstructed = reconstructed.to(device=device, dtype=outputs.dtype)
         projected = vision_projection(
             global_features,
             reconstructed,

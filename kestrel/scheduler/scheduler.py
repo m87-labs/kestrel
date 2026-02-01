@@ -1176,6 +1176,15 @@ class GenerationScheduler:
                 pruned[idx] = row[idx]
                 logits[i] = pruned
 
+        # Apply per-skill token suppression (blacklist).
+        for i, seq in enumerate(sequences):
+            if seq.finalized:
+                continue
+            suppressed = seq.skill_state.suppressed_token_ids(self.runtime)
+            if suppressed:
+                idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
+                logits[i, idx] = float("-inf")
+
         if all(seq.request.temperature <= 0.0 for seq in sequences):
             torch.argmax(logits, dim=-1, out=out[:batch])
             return out[:batch], None, None
