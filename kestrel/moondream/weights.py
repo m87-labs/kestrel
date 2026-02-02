@@ -368,6 +368,7 @@ def _refresh_rotary_tables(model: nn.Module) -> None:
     cos_sin_cache = precompute_freqs_cis(
         text_cfg.dim // (2 * text_cfg.n_heads),
         text_cfg.max_context,
+        theta=text_cfg.rope_theta,
         dtype=cache.dtype,
         device=cache.device,
     )

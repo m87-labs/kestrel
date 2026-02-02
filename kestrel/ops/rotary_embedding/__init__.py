@@ -6,7 +6,7 @@ from kestrel_kernels.rotary_embedding import rotary_embedding as rotary_embeddin
 def precompute_freqs_cis(
     dim: int,
     end: int,
-    theta: float = 1_500_000.0,
+    theta: float,
     dtype: torch.dtype = torch.float32,
     *,
     device: torch.device | str | None = None,
