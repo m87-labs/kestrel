@@ -34,7 +34,10 @@ def _parse_dtype(value: str) -> torch.dtype:
 
 
 def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--weights", type=Path, required=True, help="Path to model weights file")
+    parser.add_argument(
+        "--weights", type=Path, default=None,
+        help="Path to model weights file (auto-downloaded from HuggingFace if omitted)",
+    )
     parser.add_argument("--device", default="cuda", help="Torch device to run on")
     parser.add_argument("--dtype", type=_parse_dtype, default=torch.bfloat16, help="Computation dtype")
     parser.add_argument(

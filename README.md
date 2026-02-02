@@ -43,32 +43,20 @@ For Moondream 3, request access (automatically granted) then authenticate with `
 ```python
 import asyncio
 
-import numpy as np
-from huggingface_hub import hf_hub_download
-from PIL import Image
-
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
 
 async def main():
-    # Download model weights (cached after first run)
-    # For Moondream 2:
-    model_path = hf_hub_download("vikhyatk/moondream2", filename="model.safetensors")
-    model = "moondream2"
-
-    # For Moondream 3:
-    # model_path = hf_hub_download("vikhyatk/moondream3-preview", filename="model_fp8.pt")
-    # model = "moondream3-preview"
-
-    # Configure the engine
-    cfg = RuntimeConfig(model_path, model=model)
+    # Weights are automatically downloaded from HuggingFace on first run.
+    # Use model="moondream2" or model="moondream3-preview".
+    cfg = RuntimeConfig(model="moondream2")
 
     # Create the engine (loads model and warms up)
     engine = await InferenceEngine.create(cfg)
 
-    # Load an image (as numpy array)
-    image = np.array(Image.open("photo.jpg").convert("RGB"))
+    # Load an image (JPEG, PNG, or WebP bytes)
+    image = open("photo.jpg", "rb").read()
 
     # Visual question answering
     result = await engine.query(
@@ -165,7 +153,7 @@ Note: Segmentation requires Moondream 3 and separate model weights. Contact [moo
 For longer responses, you can stream tokens as they're generated:
 
 ```python
-image = np.array(Image.open("photo.jpg").convert("RGB"))
+image = open("photo.jpg", "rb").read()
 
 stream = await engine.query(
     image=image,
@@ -229,8 +217,8 @@ Adapters are automatically downloaded and cached on first use.
 
 ```python
 RuntimeConfig(
-    model_path="/path/to/model.pt",
-    max_batch_size=8,  # Max concurrent requests (default: 4)
+    model="moondream3-preview",  # or "moondream2"
+    max_batch_size=4,            # Max concurrent requests
 )
 ```
 
@@ -239,6 +227,35 @@ RuntimeConfig(
 | Variable | Description |
 |----------|-------------|
 | `MOONDREAM_API_KEY` | Required. Get this from [moondream.ai](https://moondream.ai). |
+| `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
+| `HF_TOKEN` | HuggingFace token for gated models like Moondream 3. Alternatively, run `huggingface-cli login`. |
+
+## Benchmarks
+
+Throughput and latency for the `query` skill on a single H100 GPU, measured on the [ChartQA](https://huggingface.co/datasets/vikhyatk/chartqa) test split with prefix caching enabled.
+
+- **Direct** — the model generates a short answer (~3 output tokens per request)
+- **CoT** (Chain-of-Thought) — the model reasons step-by-step before answering (~30 output tokens per request), enabled via `reasoning=True`
+
+### Moondream 2
+
+| Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
+|-----------|---------------|----------------|-------------|--------------|
+| 1 | 36.48 | 31.91 | 11.50 | 140.11 |
+| 2 | 41.67 | 44.52 | 17.65 | 134.85 |
+| 4 | 44.41 | 67.31 | 25.46 | 153.46 |
+| 8 | 46.12 | 110.04 | 33.63 | 207.75 |
+| 16 | 46.85 | 209.27 | 37.86 | 347.70 |
+
+### Moondream 3
+
+| Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
+|-----------|---------------|----------------|-------------|--------------|
+| 1 | 27.82 | 41.05 | 9.04 | 177.28 |
+| 2 | 31.24 | 62.41 | 12.98 | 181.56 |
+| 4 | 33.18 | 90.29 | 17.75 | 221.60 |
+| 8 | 34.73 | 149.13 | 22.84 | 312.56 |
+| 16 | 35.11 | 281.28 | 26.95 | 503.55 |
 
 ## License
 

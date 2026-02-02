@@ -12,7 +12,7 @@ import torch
 class RuntimeConfig:
     """Knobs controlling the text-only inference prototype."""
 
-    model_path: str | Path
+    model_path: str | Path | None = None
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     # Effective batch size (excluding reserved batch_idx 0).
@@ -23,6 +23,12 @@ class RuntimeConfig:
     enable_prefix_cache: bool = True
     # Model: "moondream2" or "moondream3-preview"
     model: str = "moondream3-preview"
+
+    def __post_init__(self):
+        if self.model_path is None:
+            from kestrel.model_download import ensure_model_weights
+
+            self.model_path = ensure_model_weights(self.model)
 
     def resolved_dtype(self) -> torch.dtype:
         """Return the torch dtype to use for the runtime."""

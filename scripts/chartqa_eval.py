@@ -57,7 +57,7 @@ POT_MAX_TOKENS = 200
 
 @dataclass(slots=True)
 class EvalConfig:
-    weights: Path
+    model: str
     max_batch_size: int
     dataset_split: str
     limit: Optional[int]
@@ -204,7 +204,7 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
     runtime_cfg = RuntimeConfig(
-        model_path=cfg.weights.expanduser(),
+        model=cfg.model,
         max_batch_size=cfg.max_batch_size,
         enable_prefix_cache=cfg.enable_prefix_cache,
     )
@@ -587,10 +587,10 @@ def parse_args() -> EvalConfig:
         description="Evaluate Kestrel on the ChartQA benchmark."
     )
     parser.add_argument(
-        "--weights",
-        type=Path,
-        default=Path("~/code/moondream/model.pt"),
-        help="Path to the Kestrel weights checkpoint.",
+        "--model",
+        default="moondream3-preview",
+        choices=["moondream2", "moondream3-preview"],
+        help="Model to evaluate (default: moondream3-preview).",
     )
     parser.add_argument(
         "--max-batch-size",
@@ -658,7 +658,7 @@ def parse_args() -> EvalConfig:
     limit = None if args.limit is None or args.limit < 0 else int(args.limit)
 
     cfg = EvalConfig(
-        weights=args.weights,
+        model=args.model,
         max_batch_size=args.max_batch_size,
         dataset_split=args.split,
         limit=limit,
