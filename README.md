@@ -24,7 +24,7 @@ Kestrel provides async, micro-batched serving with streaming support, paged KV c
 ## Installation
 
 ```bash
-pip install kestrel huggingface_hub
+pip install kestrel
 ```
 
 ## Model Access
@@ -259,4 +259,4 @@ Throughput and latency for the `query` skill on a single H100 GPU, measured on t
 
 ## License
 
-Free for evaluation and non-commercial use. Commercial use requires a license from [Moondream](https://moondream.ai).
+Free for evaluation and non-commercial use. Commercial use requires a [Moondream Station Pro license](https://moondream.ai/pricing).

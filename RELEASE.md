@@ -48,7 +48,7 @@ Check sdist contents:
 tar -tzf dist/*.tar.gz
 ```
 
-Ensure no unwanted files (tests, scripts, docs, assets, kestrel-kernels) are included.
+Ensure no unwanted files (tests, scripts, docs, assets) are included.
 
 ### 4. Publish to PyPI
 
@@ -97,8 +97,9 @@ Excluded via `MANIFEST.in`:
 - `scripts/`
 - `docs/`
 - `assets/`
-- `kestrel-kernels/` (separate package)
 
 ## Dependencies
 
-The `kestrel-kernels` package is a separate dependency that must be published independently. See `kestrel-kernels/RELEASE.md` for its release process.
+The `kestrel-kernels` and `kestrel-native` packages are published separately
+from the `m87-labs/kestrel-proprietary` repo. See `RELEASE.md` in that repo
+for their release process.
