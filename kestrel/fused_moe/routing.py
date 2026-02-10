@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from kestrel_kernels.moe_align import (
-    moe_align_block_size as moe_align_block_size_cute,
-    moe_lora_align_block_size as moe_lora_align_block_size_cute,
-)
+from kestrel_kernels import get_runtime
+
+_KERNELS = get_runtime()
+moe_align_block_size_cute = _KERNELS.moe.moe_align_block_size
+moe_lora_align_block_size_cute = _KERNELS.moe.moe_lora_align_block_size
 
 
 def _round_up(x: int, multiple: int) -> int:

@@ -290,7 +290,7 @@ def moe_mlp(
 
     # Expand slot IDs for all tokens if we have a sequence length > 1
     expanded_slot_ids = None
-    if lora_slot_ids is not None:
+    if lora_workspace is not None and lora_slot_ids is not None:
         expanded_slot_ids = lora_slot_ids.repeat_interleave(T)
 
     mlp_out = fused_mlp(

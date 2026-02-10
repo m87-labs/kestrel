@@ -12,7 +12,7 @@ import safetensors
 import torch
 import torch.nn as nn
 
-from ..ops import precompute_freqs_cis
+from .rope import precompute_freqs_cis
 from .text import build_tau_pos_tables
 
 
@@ -113,7 +113,8 @@ def _assign_md3_text_weights(
 ) -> None:
     """Assign text weights from Moondream 3 checkpoint format (text_model.transformer.*)."""
     text = model.text
-    use_fp8_moe = moe_scales is not None and moe_scales.has_any_scales()
+    has_fp8_moe_scales = moe_scales is not None and moe_scales.has_any_scales()
+    use_fp8_moe = has_fp8_moe_scales
 
     weight_map: Dict[str, torch.Tensor] = {
         "text_model.transformer.embd.wte.weight": text.wte,
@@ -123,8 +124,8 @@ def _assign_md3_text_weights(
         "text_model.lm_head.linear.bias": text["lm_head"].bias,
     }
 
-    # Track MoE layers for FP8 handling
-    moe_layers: List[tuple[int, nn.Module]] = []
+    # Track MoE layers for FP8 handling.
+    moe_layers_fp8: List[tuple[int, nn.Module]] = []
 
     for i, block in enumerate(text["blocks"]):
         prefix = f"text_model.transformer.h.{i}"
@@ -146,11 +147,10 @@ def _assign_md3_text_weights(
                     f"{prefix}.gate.bias": block["mlp"]["router"].bias,
                 }
             )
-            # Check if this specific layer has FP8 scales
-            layer_has_fp8 = use_fp8_moe and moe_scales.has_scales_for_layer(i)
-            if layer_has_fp8:
-                # FP8 MoE weights handled separately below
-                moe_layers.append((i, block))
+            layer_has_fp8 = has_fp8_moe_scales and moe_scales.has_scales_for_layer(i)
+            if layer_has_fp8 and use_fp8_moe:
+                # FP8 MoE runtime path: keep raw FP8 bits + scales.
+                moe_layers_fp8.append((i, block))
             else:
                 weight_map.update(
                     {
@@ -174,7 +174,7 @@ def _assign_md3_text_weights(
     # Handle FP8 MoE weights: load raw FP8 tensors and attach scales
     if use_fp8_moe and get_raw_tensor is not None:
         assert moe_scales is not None
-        for layer_idx, block in moe_layers:
+        for layer_idx, block in moe_layers_fp8:
             prefix = f"text_model.transformer.h.{layer_idx}"
             fused_mlp = block["mlp"]["mlp"]
 
@@ -495,7 +495,8 @@ def load_moondream_weights(
                 raw_getter=lambda name: all_tensors[name],
             )
     else:
-        tensors_raw = torch.load(path, map_location=target_device, weights_only=True)
+        # Load .pt checkpoints on CPU first to avoid transient GPU OOM during deserialization.
+        tensors_raw = torch.load(path, map_location="cpu", weights_only=True)
         all_tensors = {k.replace("._orig_mod", ""): v for k, v in tensors_raw.items()}
 
         if tensor_hook is not None:

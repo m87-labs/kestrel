@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from kestrel.fused_moe.lora_kernels import preallocate_lora_buffers
 from kestrel.moondream.layers import apply_dense_lora
 from kestrel.moondream.lora_workspace import DenseLoRALayerWorkspace
 
@@ -45,12 +46,26 @@ def naive_dense_lora(
 def device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    return torch.device("cuda")
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 @pytest.fixture
 def dtype():
     return torch.bfloat16
+
+
+@pytest.fixture(autouse=True)
+def _preallocate_lora_intermediates(device, dtype):
+    # LoRA kernels require fixed workspaces; preallocate once per test to avoid
+    # order-dependent overflows when earlier tests allocate smaller buffers.
+    # Use the suite-wide max top_k used by MoE LoRA tests.
+    preallocate_lora_buffers(
+        max_num_tokens=4096,
+        top_k=8,
+        max_lora_rank=256,
+        device=device,
+        dtype=dtype,
+    )
 
 
 class TestApplyDenseLoRA:

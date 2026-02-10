@@ -22,16 +22,14 @@ from .layers import (
     MLPWeights,
 )
 from .lora_workspace import TextLoRAWorkspace
-from ..ops import precompute_freqs_cis
-from ..ops.rotary_embedding import rotary_embedding_cuda
-from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
-from kestrel_kernels.flash_attn.cute.mask_definitions import cute_prefix_lm_mask_730
-from kestrel_kernels.tau_tail_ops import tau_tail_apply_into
+from .rope import precompute_freqs_cis
+from kestrel_kernels import get_runtime
 
-
-# Avoid expensive runtime hashing in kestrel-kernels' compile key generation.
-# TODO: This should become dynamic once prefix length is no longer fixed.
-cute_prefix_lm_mask_730.__cute_hash__ = "kestrel_kernels.flash_attn.cute.mask_definitions.cute_prefix_lm_mask_730"
+_KERNELS = get_runtime()
+_flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
+cute_prefix_lm_mask_730 = _KERNELS.attention.prefix_lm_mask_730
+tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
+rotary_embedding = _KERNELS.rotary.rotary_embedding
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -115,7 +113,7 @@ def attn(
 
     # Apply in-place rotary embedding (GPT-NeoX style) on bshd tensors.
     # This avoids materializing per-step cos/sin tensors and keeps everything on-GPU.
-    rotary_embedding_cuda(position_matrix, q, k, head_dim, cos_sin_cache)
+    rotary_embedding(position_matrix, q, k, head_dim, cos_sin_cache)
 
     if kv_cache is None:
         raise RuntimeError("FA3 attention requires a KV cache")

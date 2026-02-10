@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from kestrel.utils.buffers import FixedBuffer
-from kestrel_kernels.fused_mlp import fused_mlp_gelu_bias_residual_cuda
+from kestrel_kernels import get_runtime
+
+fused_mlp_gelu_bias_residual_cuda = (
+    get_runtime().dense.fused_mlp_gelu_bias_residual_cuda
+)
 
 
 class FusedMLPWorkspaces:

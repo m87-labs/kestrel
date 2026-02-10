@@ -12,9 +12,12 @@ from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
-from kestrel_kernels.fused_linear_residual_ops import fused_linear_bias_residual_into
 from kestrel.ops.layernorm_cuda import layernorm_bias_into
-from kestrel_kernels.flash_attn.cute.interface import _flash_attn_fwd
+from kestrel_kernels import get_runtime
+
+_KERNELS = get_runtime()
+fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
+_flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
 
 
 def prepare_crops(

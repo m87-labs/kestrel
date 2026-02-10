@@ -59,6 +59,7 @@ POT_MAX_TOKENS = 200
 class EvalConfig:
     model: str
     max_batch_size: int
+    kv_cache_pages: Optional[int]
     dataset_split: str
     limit: Optional[int]
     use_pot: bool
@@ -203,11 +204,14 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
-    runtime_cfg = RuntimeConfig(
+    runtime_kwargs: Dict[str, Any] = dict(
         model=cfg.model,
         max_batch_size=cfg.max_batch_size,
         enable_prefix_cache=cfg.enable_prefix_cache,
     )
+    if cfg.kv_cache_pages is not None:
+        runtime_kwargs["kv_cache_pages"] = cfg.kv_cache_pages
+    runtime_cfg = RuntimeConfig(**runtime_kwargs)
     return await InferenceEngine.create(runtime_cfg)
 
 
@@ -599,6 +603,12 @@ def parse_args() -> EvalConfig:
         help="Maximum batch size for the inference engine.",
     )
     parser.add_argument(
+        "--kv-cache-pages",
+        type=int,
+        default=None,
+        help="Override KV cache pages (defaults to RuntimeConfig default).",
+    )
+    parser.add_argument(
         "--split",
         default="test",
         help="ChartQA split to evaluate (default: test).",
@@ -654,12 +664,15 @@ def parse_args() -> EvalConfig:
 
     if args.pot and args.cot:
         parser.error("Program-of-Thought and Chain-of-Thought modes are mutually exclusive.")
+    if args.kv_cache_pages is not None and args.kv_cache_pages <= 0:
+        parser.error("--kv-cache-pages must be a positive integer.")
 
     limit = None if args.limit is None or args.limit < 0 else int(args.limit)
 
     cfg = EvalConfig(
         model=args.model,
         max_batch_size=args.max_batch_size,
+        kv_cache_pages=args.kv_cache_pages,
         dataset_split=args.split,
         limit=limit,
         use_pot=bool(args.pot),

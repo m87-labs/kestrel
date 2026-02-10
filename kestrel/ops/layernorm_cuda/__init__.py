@@ -5,7 +5,11 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from kestrel_kernels.layernorm_cuda import layernorm_bias_cuda, layernorm_bias_reload_cuda
+from kestrel_kernels import get_runtime
+
+_KERNELS = get_runtime()
+layernorm_bias_cuda = _KERNELS.dense.layernorm_bias_cuda
+layernorm_bias_reload_cuda = _KERNELS.dense.layernorm_bias_reload_cuda
 
 
 def layernorm_bias_into(

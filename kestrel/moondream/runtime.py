@@ -246,9 +246,9 @@ class _LayerPagedCache(torch.nn.Module):
         if k_val.shape != v_val.shape:
             raise ValueError("k_val and v_val must match shape")
 
-        input_pos = torch.atleast_2d(pos_ids).to(
-            dtype=torch.int32, device=k_val.device
-        )
+        input_pos = torch.atleast_2d(pos_ids)
+        if input_pos.device != k_val.device:
+            input_pos = input_pos.to(device=k_val.device)
         if input_pos.shape[0] != 1 and input_pos.shape[0] != k_val.shape[0]:
             raise ValueError(
                 f"Unsupported position shape {pos_ids.shape} for batch size {k_val.shape[0]}"
@@ -397,19 +397,26 @@ class MoondreamRuntime:
             and self._kv_layer_v_scales is not None
             and self.page_size == 1
             and hasattr(torch, "float8_e4m3fn")
+            and torch.cuda.get_device_capability(self.device)[0] == 9
         ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             if (
                 self._kv_layer_k_scales is not None
                 and self._kv_layer_v_scales is not None
-                and self.page_size != 1
             ):
-                warnings.warn(
-                    "KV scales found in checkpoint but FP8 KV cache currently requires page_size==1; "
-                    "falling back to standard KV cache.",
-                    stacklevel=2,
-                )
+                if self.page_size != 1:
+                    warnings.warn(
+                        "KV scales found in checkpoint but FP8 KV cache currently requires page_size==1; "
+                        "falling back to standard KV cache.",
+                        stacklevel=2,
+                    )
+                elif torch.cuda.get_device_capability(self.device)[0] != 9:
+                    warnings.warn(
+                        "KV scales found in checkpoint but FP8 KV cache currently requires SM90 kernels; "
+                        "falling back to standard KV cache.",
+                        stacklevel=2,
+                    )
             self.kv_cache_dtype = self.dtype
 
         self.tokenizer = Tokenizer.from_pretrained("moondream/starmie-v1")

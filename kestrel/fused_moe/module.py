@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, field
 from math import prod
 from typing import Literal
@@ -7,13 +6,16 @@ import torch
 from torch import nn
 from torch.compiler import disable as torch_compiler_disable
 
-from .kernels import (
-    dtype_to_triton,
-    invoke_fused_moe_kernel as invoke_fused_moe_kernel_triton,
-    invoke_fused_moe_kernel_fp8_w8a8 as invoke_fused_moe_kernel_triton_fp8,
-)
+from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
+from kestrel.utils.buffers import FixedBuffer
+from kestrel_kernels import get_runtime
+
 from .lora_kernels import apply_moe_lora_batched, apply_moe_lora_single
 from .routing import moe_align_block_size, moe_lora_align_block_size
+
+
+_KERNELS = get_runtime()
+_MOE = _KERNELS.moe
 
 
 def _to_power_of_2(x: int) -> int:
@@ -33,19 +35,16 @@ def _to_power_of_2(x: int) -> int:
     # Round down: find the highest set bit
     return 1 << (x.bit_length() - 1)
 
-from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
-from kestrel.utils.buffers import FixedBuffer
-from kestrel_kernels.fp8_quant_cute import fp8_quant_cute
-from kestrel_kernels.gelu_residual import gelu_residual_cute
-from kestrel_kernels.moe_sum import moe_sum as moe_sum_cuda
-from kestrel_kernels.cute_moe import (
-    get_cute_moe_block_m,
-    get_cute_moe_config,
-    invoke_cute_moe_down,
-    invoke_cute_moe_down_fp8,
-    invoke_cute_moe_up,
-    invoke_cute_moe_up_fp8,
-)
+
+# FP8 Triton W8A8 path must keep routing block size aligned with kernel BLOCK_SIZE_M.
+_TRITON_FP8_CONFIG: dict[str, int] = {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "NUM_WARPS": 4,
+    "NUM_STAGES": 4,
+}
 
 _HARDCODED_CONFIGS: dict[tuple[int, int], dict[int, dict[str, int]]] = {
     (
@@ -581,7 +580,7 @@ class FusedMoEModule(nn.Module):
                 dtype=torch.float32,
             )
 
-        compute_type = dtype_to_triton(hidden_states.dtype)
+        compute_type = _MOE.dtype_to_triton(hidden_states.dtype)
 
         # LoRA handling: dispatch based on call-local mode
         #
@@ -737,7 +736,7 @@ class FusedMoEModule(nn.Module):
         )
         if activation_in.dtype != torch.bfloat16:
             raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
-        gelu_residual_cute(activation_out, activation_in)
+        _MOE.gelu_residual_cute(activation_out, activation_in)
 
         down_in = activation_out
         lora_down_out = None
@@ -831,7 +830,7 @@ class FusedMoEModule(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        moe_sum_cuda(down_out, fused)
+        _MOE.moe_sum(down_out, fused)
         return fused
 
     def _quantize_fp8_e4m3fn_rowwise(
@@ -855,7 +854,7 @@ class FusedMoEModule(nn.Module):
             device=x.device,
             dtype=torch.float32,
         )
-        fp8_quant_cute(out_bits, out_scale, x)
+        _MOE.fp8_quant_cute(out_bits, out_scale, x)
         return out_bits, out_scale
 
     def _quantize_fp8_into(
@@ -867,7 +866,7 @@ class FusedMoEModule(nn.Module):
         use_pdl: bool = False,
     ) -> None:
         """Quantize x into pre-allocated FP8 buffers (fast path, no workspace.get)."""
-        fp8_quant_cute(out_bits, out_scale, x, use_pdl=use_pdl)
+        _MOE.fp8_quant_cute(out_bits, out_scale, x, use_pdl=use_pdl)
 
     def _invoke_fused_moe_kernel(
         self,
@@ -898,16 +897,8 @@ class FusedMoEModule(nn.Module):
             if a_fp8_bits is None or a_fp8_scale is None:
                 raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
 
-            triton_fp8_config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "NUM_WARPS": 4,
-                "NUM_STAGES": 4,
-            }
             self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
-            invoke_fused_moe_kernel_triton_fp8(
+            _MOE.invoke_fused_moe_kernel_triton_fp8(
                 a_fp8_bits.view(torch.float8_e4m3fn),
                 a_fp8_scale,
                 B.view(torch.float8_e4m3fn),
@@ -919,7 +910,7 @@ class FusedMoEModule(nn.Module):
                 num_tokens_post_padded=num_tokens_post_padded,
                 mul_routed_weight=mul_routed_weight,
                 top_k=top_k,
-                config=triton_fp8_config,
+                config=_TRITON_FP8_CONFIG,
                 compute_type=compute_type,
             )
             return
@@ -940,7 +931,7 @@ class FusedMoEModule(nn.Module):
                         raise ValueError("CuTe fp8 moe_down expects top_k=1")
                     if topk_weights is None:
                         raise ValueError("topk_weights is required when mul_routed_weight=True")
-                    invoke_cute_moe_down_fp8(
+                    _MOE.invoke_cute_moe_down_fp8(
                         a_fp8_bits,
                         a_fp8_scale,
                         B,
@@ -955,7 +946,7 @@ class FusedMoEModule(nn.Module):
                 else:
                     if int(top_k) != 8:
                         raise ValueError("CuTe fp8 moe_up expects top_k=8")
-                    invoke_cute_moe_up_fp8(
+                    _MOE.invoke_cute_moe_up_fp8(
                         a_fp8_bits,
                         a_fp8_scale,
                         B,
@@ -974,7 +965,7 @@ class FusedMoEModule(nn.Module):
                     raise ValueError("CuTe moe_down expects top_k=1")
                 if topk_weights is None:
                     raise ValueError("topk_weights is required when mul_routed_weight=True")
-                invoke_cute_moe_down(
+                _MOE.invoke_cute_moe_down(
                     A,
                     B,
                     C,
@@ -987,7 +978,7 @@ class FusedMoEModule(nn.Module):
             else:
                 if int(top_k) != 8:
                     raise ValueError("CuTe moe_up expects top_k=8")
-                invoke_cute_moe_up(
+                _MOE.invoke_cute_moe_up(
                     A,
                     B,
                     C,
@@ -1005,7 +996,7 @@ class FusedMoEModule(nn.Module):
             B_dequant = B.view(torch.float8_e4m3fn).to(A.dtype) * B_scale.to(A.dtype).unsqueeze(-1)
             B = B_dequant
 
-        invoke_fused_moe_kernel_triton(
+        _MOE.invoke_fused_moe_kernel_triton(
             A,
             B,
             C,
@@ -1089,18 +1080,24 @@ class FusedMoEModule(nn.Module):
         """
         backend = self._resolve_backend(num_tokens=num_tokens, is_fp8=is_fp8_weights)
         if backend == "cute":
-            return get_cute_moe_block_m(
+            return _MOE.get_cute_moe_block_m(
                 num_tokens,
                 num_experts=self.num_experts,
                 hidden_size=self.input_size,
                 intermediate_size=self.hidden_size,
                 dtype="fp8" if is_fp8_weights else "bf16",
             )
+        if is_fp8_weights:
+            return _TRITON_FP8_CONFIG["BLOCK_SIZE_M"]
         else:
             return triton_block_m
 
     def _resolve_backend(self, *, num_tokens: int, is_fp8: bool = False) -> str:
-        # FP8 always uses CuTe backend (tuned configs available for all batch sizes)
+        device = self.up_experts.weight.device
+        # Non-SM90 GPUs run the Triton path from kestrel-kernels.
+        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] != 9:
+            return "triton"
+        # On SM90, FP8 uses CuTe backend (tuned configs available for all batch sizes).
         if is_fp8:
             return "cute"
         backend = self.config.backend.lower()

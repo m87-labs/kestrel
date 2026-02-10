@@ -5,6 +5,10 @@ import triton.language as tl
 from kestrel.utils.buffers import FixedBuffer
 
 
+def _supports_pdl(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 9
+
+
 # =============================================================================
 # Batched MoE LoRA Kernels
 # =============================================================================
@@ -66,14 +70,15 @@ def _batched_moe_lora_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_PDL: tl.constexpr,
     IS_PRIMARY: tl.constexpr,  # True for shrink (signal), False for expand (wait)
     MAX_LORAS: tl.constexpr,
 ):
     """Unified batched MoE LoRA kernel for both shrink and expand operations.
 
-    Uses IS_PRIMARY to control PDL behavior:
-    - IS_PRIMARY=True (shrink): signals gdc_launch_dependents after pointer setup
-    - IS_PRIMARY=False (expand): waits with gdc_wait before loading input
+    Uses (USE_PDL, IS_PRIMARY) to control PDL behavior:
+    - USE_PDL=True, IS_PRIMARY=True (shrink): signals gdc_launch_dependents
+    - USE_PDL=True, IS_PRIMARY=False (expand): waits with gdc_wait
     """
     # Use natural 2D grid indexing (no swizzling overhead)
     pid_m = tl.program_id(0)
@@ -86,11 +91,11 @@ def _batched_moe_lora_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Hint dependents once per CTA (primary/shrink only).
-    if IS_PRIMARY:
+    if IS_PRIMARY and USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
     # Wait once per CTA before the expand loop to ensure shrink is complete.
-    if not IS_PRIMARY:
+    if not IS_PRIMARY and USE_PDL:
         tl.extra.cuda.gdc_wait()
 
     for lora_idx in tl.static_range(0, MAX_LORAS):
@@ -424,6 +429,7 @@ def apply_moe_lora_batched(
     # Use 2D grid (M, N) and loop over LoRAs inside the kernel.
     num_rank_blocks = triton.cdiv(rank, shrink_block_size_out)
     shrink_grid = (num_m_blocks, num_rank_blocks)
+    launch_pdl = _supports_pdl(x.device)
 
     # Shrink: x @ lora_a.T -> intermediate
     # lora_a shape: [E, rank, hidden] -> N=rank, K=hidden
@@ -455,11 +461,12 @@ def apply_moe_lora_batched(
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=shrink_block_size_out,  # For rank dimension
         BLOCK_SIZE_K=shrink_block_size_hidden,
+        USE_PDL=launch_pdl,
         IS_PRIMARY=True,
         MAX_LORAS=max_loras,
         num_warps=shrink_num_warps,
         num_stages=shrink_num_stages,
-        launch_pdl=True,
+        launch_pdl=launch_pdl,
     )
 
     expand_grid = (num_m_blocks, num_n_blocks)
@@ -494,11 +501,12 @@ def apply_moe_lora_batched(
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=expand_block_size_out,
         BLOCK_SIZE_K=expand_block_size_hidden,  # For rank - may need tuning
+        USE_PDL=launch_pdl,
         IS_PRIMARY=False,
         MAX_LORAS=max_loras,
         num_warps=expand_num_warps,
         num_stages=expand_num_stages,
-        launch_pdl=True,
+        launch_pdl=launch_pdl,
     )
 
 
@@ -605,6 +613,7 @@ def apply_moe_lora_single(
     num_rank_blocks = triton.cdiv(rank, shrink_block_size_out)
     shrink_grid = (num_m_blocks, num_rank_blocks)
     expand_grid = (num_m_blocks, num_n_blocks)
+    launch_pdl = _supports_pdl(x.device)
 
     # Shrink: x @ lora_a.T -> intermediate
     _batched_moe_lora_kernel[shrink_grid](
@@ -635,11 +644,12 @@ def apply_moe_lora_single(
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=shrink_block_size_out,
         BLOCK_SIZE_K=shrink_block_size_hidden,
+        USE_PDL=launch_pdl,
         IS_PRIMARY=True,
         MAX_LORAS=1,
         num_warps=shrink_num_warps,
         num_stages=shrink_num_stages,
-        launch_pdl=True,
+        launch_pdl=launch_pdl,
     )
 
     # Expand: intermediate @ lora_b.T -> output
@@ -671,9 +681,10 @@ def apply_moe_lora_single(
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=expand_block_size_out,
         BLOCK_SIZE_K=expand_block_size_hidden,
+        USE_PDL=launch_pdl,
         IS_PRIMARY=False,
         MAX_LORAS=1,
         num_warps=expand_num_warps,
         num_stages=expand_num_stages,
-        launch_pdl=True,
+        launch_pdl=launch_pdl,
     )

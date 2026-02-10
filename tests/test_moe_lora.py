@@ -80,12 +80,38 @@ class DummyExperts(nn.Module):
 
 @pytest.fixture
 def device():
-    return torch.device("cuda")
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 @pytest.fixture
 def dtype():
     return torch.bfloat16
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _preallocate_lora_intermediate_buffers() -> None:
+    """Pre-size global LoRA intermediates to cover this test module.
+
+    LoRA kernels keep module-global FixedBuffer instances. Without up-front
+    sizing, an early small-shape test can lock in tiny storage and cause later
+    larger-shape tests in this module to fail with overflow.
+
+    Use a suite-wide upper bound so this module composes with test_dense_lora,
+    which shares the same global buffers.
+    """
+    from kestrel.fused_moe.lora_kernels import preallocate_lora_buffers
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    preallocate_lora_buffers(
+        max_num_tokens=4096,
+        top_k=8,
+        max_lora_rank=256,
+        device=device,
+        dtype=torch.bfloat16,
+    )
 
 
 class TestMoELoRA:
@@ -815,6 +841,9 @@ class TestMoELoRACudaGraph:
 
         block_size_m = 16
 
+        if torch.cuda.get_device_capability(device)[0] != 9:
+            pytest.skip("moe_lora_align_block_size CUDA graph test requires SM90 kernels")
+
         def run_kernel():
             # Use graph-safe pattern: (lora_slot_ids - 1) instead of torch.where
             token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
@@ -1159,7 +1188,7 @@ class TestLoRAStream:
         from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 
         num_experts = 64
-        top_k = 2
+        top_k = 8
         d_model = 2048
         d_expert = 1024
         rank = 8

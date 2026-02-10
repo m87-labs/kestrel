@@ -7,10 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
-
-from kestrel_kernels.kv_cache_write import reshape_and_cache_flash as reshape_and_cache_flash_cuda
+from kestrel_kernels import get_runtime
 
 from kestrel.utils import CpuGpuBuffer
+
+_KERNELS = get_runtime()
+reshape_and_cache_flash_cuda = _KERNELS.cache.reshape_and_cache_flash
 
 
 def _maybe_stream_context(stream: torch.cuda.Stream | None):
