@@ -81,8 +81,12 @@ import kestrel_kernels as _kk  # noqa: E402
 import kestrel_kernels.cute_moe as _kk_cute_moe  # noqa: E402
 import kestrel_kernels.flash_attn.cute as _kk_fa_cute  # noqa: E402
 
-_KK_SRC = _REPO_ROOT / "kestrel-kernels" / "python" / "kestrel_kernels"
-if _KK_SRC.exists():
+_KK_SRC_CANDIDATES = (
+    _REPO_ROOT / "kestrel-kernels" / "python" / "kestrel_kernels",
+    _REPO_ROOT.parent / "kestrel-proprietary" / "kestrel-kernels" / "python" / "kestrel_kernels",
+)
+_KK_SRC = next((p for p in _KK_SRC_CANDIDATES if p.exists()), None)
+if _KK_SRC is not None:
     kk_path = str(_KK_SRC)
     if kk_path not in _kk.__path__:
         # Allow source package discovery for submodules while keeping compiled extensions.
@@ -101,6 +105,7 @@ if _KK_SRC.exists():
             _kk_fa_cute.__path__.append(fa_cute_path)
 
 from kestrel.fused_moe.routing import moe_align_block_size
+from kestrel_kernels.arch import normalize_gpu_name_key, sm_arch_at_least
 from kestrel_kernels.cute_moe import (
     CuteMoeConfig,
     invoke_cute_moe_up,
@@ -118,6 +123,21 @@ D_EXPERT = 1024
 
 # Token counts to optimize for (decode + prefill range)
 TOKEN_COUNTS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+
+
+def _config_filename_for_current_gpu(*, dtype: str) -> str:
+    gpu_key = normalize_gpu_name_key(torch.cuda.get_device_name())
+    return f"cute_moe_E{NUM_EXPERTS}_H{D_MODEL}_I{D_EXPERT}_{dtype}_{gpu_key}.json"
+
+
+def _config_description_for_current_gpu() -> str:
+    return f"CuTe MoE kernel configs optimized for {torch.cuda.get_device_name()}"
+
+
+def _current_cuda_arch() -> str:
+    """Return current CUDA arch in `smXY` form."""
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm{major}{minor}"
 
 # Full search space for BF16 (sweeps both warp and wgmma kernel types)
 # - warp kernel: block_m can be any multiple of 16 up to num_threads
@@ -147,7 +167,7 @@ QUICK_SEARCH_SPACE = {
     "num_stages": [1, 2, 3],
 }
 
-# FP8 search space - principled pruning based on MoE problem dimensions:
+# FP8 SM90+ search space - principled pruning based on MoE problem dimensions:
 # - UP kernel: M=tokens*8 distributed across 64 experts, N=1024, K=2048
 # - DOWN kernel: M=tokens*8 distributed across 64 experts, N=2048, K=1024
 #
@@ -159,8 +179,8 @@ QUICK_SEARCH_SPACE = {
 # Block_m pruning: only power-of-2 values (16, 32, 64, 128, 192 for WGMMA)
 # Non-power-of-2 (48, 80, 96, 112) rarely optimal in BF16 benchmarks.
 
-def get_fp8_search_space(num_tokens: int) -> dict:
-    """Get FP8 search space pruned based on token count."""
+def get_fp8_search_space_sm90(num_tokens: int) -> dict:
+    """Get FP8 SM90+ search space pruned by token count (warp+wgmma)."""
     # Common parameters across all token counts
     block_n = [64, 128, 256]
     block_k_warp = [16, 32, 64, 128]
@@ -206,7 +226,7 @@ def get_fp8_search_space(num_tokens: int) -> dict:
             "num_stages": num_stages,
         }
 
-# Full FP8 search space (for reference, not used directly - use get_fp8_search_space)
+# Full FP8 SM90+ search space (for reference, not used directly - use get_fp8_search_space_sm90)
 FP8_FULL_SEARCH_SPACE = {
     "kernel_type": ["warp", "wgmma"],
     "block_m": {
@@ -236,6 +256,109 @@ FP8_QUICK_SEARCH_SPACE = {
     "num_warps": [2, 4],
     "num_stages": [2, 3, 4],
 }
+
+# FP8 SM89 search space (warp + qmma).
+# qmma keeps block_n=128 and num_warps=4, while sweeping block_m/block_k/num_stages.
+FP8_SM89_FULL_SEARCH_SPACE = {
+    "kernel_type": ["warp", "qmma"],
+    "block_m": {
+        "warp": [16, 32, 64, 96, 128],
+        "qmma": [16, 32, 48, 64, 80, 96, 112, 128],
+    },
+    "block_n": {
+        "warp": [64, 128, 256],
+        "qmma": [128],
+    },
+    "block_k": {
+        "warp": [16, 32, 64, 128],
+        "qmma": [64, 128],
+    },
+    "num_warps": {
+        "warp": [2, 4, 8],
+        "qmma": [4],
+    },
+    "num_stages": {
+        "warp": [1, 2, 3, 4, 5, 6, 7, 8],
+        "qmma": [2, 3, 4, 5],
+    },
+}
+
+FP8_SM89_QUICK_SEARCH_SPACE = {
+    "kernel_type": ["warp", "qmma"],
+    "block_m": {
+        "warp": [16, 32, 64],
+        "qmma": [16, 32, 64, 96, 128],
+    },
+    "block_n": {
+        "warp": [64, 128, 256],
+        "qmma": [128],
+    },
+    "block_k": {
+        "warp": [64, 128],
+        "qmma": [64, 128],
+    },
+    "num_warps": {
+        "warp": [2, 4],
+        "qmma": [4],
+    },
+    "num_stages": {
+        "warp": [2, 3, 4],
+        "qmma": [2, 3, 4, 5],
+    },
+}
+
+
+def _filter_kernel_types(search_space: dict, kernel_types: list[str]) -> dict:
+    """Keep only selected kernel types from a search-space dict."""
+    out = {"kernel_type": list(kernel_types)}
+    for key, values in search_space.items():
+        if key == "kernel_type":
+            continue
+        if isinstance(values, dict):
+            out[key] = {k: v for k, v in values.items() if k in kernel_types}
+        else:
+            out[key] = values
+    return out
+
+
+def get_fp8_search_space(num_tokens: int, *, arch: str, quick: bool) -> dict:
+    """Architecture-aware FP8 search-space selector.
+
+    - SM90+: preserve existing warp/wgmma behavior.
+    - SM89: use warp/qmma search space.
+    - <SM89: warp-only fallback.
+    """
+    if sm_arch_at_least(arch, 90):
+        if quick:
+            return FP8_QUICK_SEARCH_SPACE
+        return get_fp8_search_space_sm90(num_tokens)
+
+    if arch == "sm89":
+        # Minor search-time optimization from manual checks:
+        # - <=512 tokens: keep both warp and qmma in the search.
+        # - >512 tokens: search qmma only.
+        if num_tokens <= 512:
+            return FP8_SM89_QUICK_SEARCH_SPACE if quick else FP8_SM89_FULL_SEARCH_SPACE
+        if quick:
+            return {
+                "kernel_type": ["qmma"],
+                "block_m": {"qmma": [64, 96, 128]},
+                "block_n": {"qmma": [128]},
+                "block_k": {"qmma": [128]},
+                "num_warps": {"qmma": [4]},
+                "num_stages": {"qmma": [4]},
+            }
+        return _filter_kernel_types(FP8_SM89_FULL_SEARCH_SPACE, ["qmma"])
+
+    # Legacy fallback path: warp-only FP8.
+    return {
+        "kernel_type": ["warp"],
+        "block_m": {"warp": [16, 32, 64]},
+        "block_n": {"warp": [64, 128, 256]},
+        "block_k": {"warp": [64, 128]},
+        "num_warps": {"warp": [2, 4]},
+        "num_stages": {"warp": [2, 3, 4]},
+    }
 
 
 @dataclass
@@ -520,7 +643,7 @@ def benchmark_compiled_config(
 
 def run_combined_grid_search(
     num_tokens: int,
-    search_space: dict[str, list[int]],
+    search_space: dict[str, object],
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -632,12 +755,12 @@ def run_combined_grid_search(
         print(f"          -> {result.time_us:.2f} us", flush=True)
         return result
 
-    # Helper to get block_k values (may be dict keyed by kernel_type for FP8)
-    def get_block_k_values(kernel_type: str) -> list[int]:
-        block_k = search_space["block_k"]
-        if isinstance(block_k, dict):
-            return block_k[kernel_type]
-        return block_k
+    # Helper to resolve per-kernel-type search params (supports scalar list or dict form).
+    def get_param_values(param_name: str, kernel_type: str) -> list[int]:
+        values = search_space[param_name]
+        if isinstance(values, dict):
+            return values[kernel_type]
+        return values
 
     # Test each kernel_type and block_m combination
     for kernel_type in search_space["kernel_type"]:
@@ -653,16 +776,18 @@ def run_combined_grid_search(
             # Generate all configs for this block_m and kernel_type
             up_configs = []
             down_configs = []
-            block_k_values = get_block_k_values(kernel_type)
+            block_n_values = get_param_values("block_n", kernel_type)
+            block_k_values = get_param_values("block_k", kernel_type)
+            num_stages_values = get_param_values("num_stages", kernel_type)
             dtype_str = "fp8" if is_fp8 else "bf16"
 
             if kernel_type == "wgmma":
-                # WGMMA: num_warps is derived from block_m
+                # WGMMA variants: num_warps is derived from block_m
                 num_warps = (block_m // 64) * 4
                 for block_n, block_k, num_stages in itertools.product(
-                    search_space["block_n"],
+                    block_n_values,
                     block_k_values,
-                    search_space["num_stages"],
+                    num_stages_values,
                 ):
                     try:
                         config = CuteMoeConfig(
@@ -672,19 +797,20 @@ def run_combined_grid_search(
                             num_warps=num_warps,
                             num_stages=num_stages,
                             dtype=dtype_str,
-                            kernel_type="wgmma",
+                            kernel_type=kernel_type,
                         )
                     except ValueError:
                         continue
                     up_configs.append(config)
                     down_configs.append(config)
             else:
-                # Warp kernel: num_warps is a search parameter
+                # Warp/QMMA kernels: num_warps is taken from search-space.
+                num_warps_values = get_param_values("num_warps", kernel_type)
                 for block_n, block_k, num_warps, num_stages in itertools.product(
-                    search_space["block_n"],
+                    block_n_values,
                     block_k_values,
-                    search_space["num_warps"],
-                    search_space["num_stages"],
+                    num_warps_values,
+                    num_stages_values,
                 ):
                     try:
                         config = CuteMoeConfig(
@@ -694,7 +820,7 @@ def run_combined_grid_search(
                             num_warps=num_warps,
                             num_stages=num_stages,
                             dtype=dtype_str,
-                            kernel_type="warp",
+                            kernel_type=kernel_type,
                         )
                     except ValueError:
                         continue
@@ -786,19 +912,17 @@ def run_single_token(args) -> None:
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     num_tokens = args.token_counts[0]
     kernel_dtype = getattr(args, 'kernel_dtype', 'bf16')
+    arch = _current_cuda_arch()
 
     # Select search space based on kernel dtype and token count
     if kernel_dtype == "fp8":
-        if args.quick:
-            search_space = FP8_QUICK_SEARCH_SPACE
-        else:
-            # Use token-count-aware pruned search space
-            search_space = get_fp8_search_space(num_tokens)
+        search_space = get_fp8_search_space(num_tokens, arch=arch, quick=args.quick)
     else:
         search_space = QUICK_SEARCH_SPACE if args.quick else FULL_SEARCH_SPACE
 
     print(f"[PID {os.getpid()}] CuTe MoE Grid Search: tokens={num_tokens}", flush=True)
     print(f"  Device: {torch.cuda.get_device_name()}", flush=True)
+    print(f"  Arch: {arch}", flush=True)
     print(f"  Data dtype: {dtype}", flush=True)
     print(f"  Kernel dtype: {kernel_dtype}", flush=True)
     print(f"  Search space: {'quick' if args.quick else 'full'}", flush=True)
@@ -962,9 +1086,9 @@ def aggregate_results(output_dir: Path) -> None:
 
     # Print JSON-ready summary
     print("\n# Best configs for JSON file:")
-    print(f"# File: cute_moe_E{NUM_EXPERTS}_H{D_MODEL}_I{D_EXPERT}_bf16_sm90.json")
+    print(f"# File: {_config_filename_for_current_gpu(dtype='bf16')}")
     print("{")
-    print('  "description": "CuTe MoE kernel configs optimized for H100 (SM90)",')
+    print(f'  "description": "{_config_description_for_current_gpu()}",')
 
     # Print up configs
     print('  "up": {')
@@ -994,7 +1118,7 @@ def aggregate_results(output_dir: Path) -> None:
     # Write aggregated results
     aggregate_file = output_dir / "aggregate.json"
     aggregate_data = {
-        "description": "CuTe MoE kernel configs optimized for H100 (SM90)",
+        "description": _config_description_for_current_gpu(),
         "up": {
             str(t): {**best_configs[t]["up_config"], "time_us": best_configs[t]["up_time_us"]}
             for t in sorted(best_configs.keys())
@@ -1030,8 +1154,9 @@ def run_sequential(args) -> None:
 
     device = torch.device("cuda")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    token_counts = args.token_counts or TOKEN_COUNTS
     kernel_dtype = getattr(args, 'kernel_dtype', 'bf16')
+    arch = _current_cuda_arch()
+    token_counts = args.token_counts or TOKEN_COUNTS
 
     # For BF16, select search space once (not token-dependent)
     # For FP8, we select inside the loop based on token count
@@ -1039,6 +1164,7 @@ def run_sequential(args) -> None:
 
     print(f"CuTe MoE Combined Grid Search")
     print(f"  Device: {torch.cuda.get_device_name()}")
+    print(f"  Arch: {arch}")
     print(f"  Data dtype: {dtype}")
     print(f"  Kernel dtype: {kernel_dtype}")
     print(f"  Token counts: {token_counts}")
@@ -1058,10 +1184,7 @@ def run_sequential(args) -> None:
 
         # Select search space (FP8 uses token-count-aware pruning)
         if kernel_dtype == "fp8":
-            if args.quick:
-                search_space = FP8_QUICK_SEARCH_SPACE
-            else:
-                search_space = get_fp8_search_space(num_tokens)
+            search_space = get_fp8_search_space(num_tokens, arch=arch, quick=args.quick)
         else:
             search_space = bf16_search_space
 
@@ -1094,9 +1217,9 @@ def run_sequential(args) -> None:
 
     # Print JSON-ready summary
     print("\n\n# Best configs for JSON file:")
-    print(f"# File: cute_moe_E{NUM_EXPERTS}_H{D_MODEL}_I{D_EXPERT}_bf16_sm90.json")
+    print(f"# File: {_config_filename_for_current_gpu(dtype=kernel_dtype)}")
     print("{")
-    print('  "description": "CuTe MoE kernel configs optimized for H100 (SM90)",')
+    print(f'  "description": "{_config_description_for_current_gpu()}",')
 
     # Print up configs
     print('  "up": {')
@@ -1124,7 +1247,7 @@ def run_sequential(args) -> None:
     # Save to JSON if requested
     if args.output:
         output_data = {
-            "description": "CuTe MoE kernel configs optimized for H100 (SM90)",
+            "description": _config_description_for_current_gpu(),
             "device": torch.cuda.get_device_name(),
             "dtype": str(dtype),
             "model": {

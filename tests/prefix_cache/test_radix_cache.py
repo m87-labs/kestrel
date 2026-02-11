@@ -540,6 +540,21 @@ class TestEviction:
         cache.evict(1)
         assert cache.evictable_page_count() == 1  # Now [A] is evictable
 
+    def test_reclaimable_page_count_includes_internal_unlocked_pages(self) -> None:
+        """Unlocked internal nodes should count as reclaimable after cascade."""
+        cache = RadixPrefixCache()
+
+        # Build split tree:
+        # parent [A, B] (2 pages, internal), children [C] and [D] (1 page each)
+        cache.insert([MockToken(0), MockToken(1), MockToken(2)], [0, 1, 2])
+        cache.match_prefix([MockToken(0), MockToken(1)])  # force split at [A, B]
+        cache.insert([MockToken(0), MockToken(1), MockToken(3)], [0, 1, 3])
+
+        # Immediate evictable leaves are only C and D.
+        assert cache.evictable_page_count() == 2
+        # Cascading eviction can also reclaim internal [A, B].
+        assert cache.reclaimable_page_count() == 4
+
 
 class TestNamespace:
     """Tests for namespace isolation."""

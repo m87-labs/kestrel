@@ -530,6 +530,40 @@ class TestPrefixCacheEnabled:
         assert page_table.can_reserve_with_eviction(free_pages) is True
         assert page_table.can_reserve_with_eviction(free_pages + 1) is False
 
+    def test_can_reserve_with_eviction_uses_cascading_reclaimable_pages(self) -> None:
+        """Admission should account for internal pages reclaimable via cascade."""
+        cache = RadixPrefixCache()
+        page_table = PageTable(
+            n_pages=10, page_size=1, max_batch_size=5, device="cpu",
+            prefix_cache=cache,
+        )
+
+        # Build split tree with an internal unlocked node:
+        # [A, B] internal (2 pages), [C] leaf (1), [D] leaf (1).
+        pages_abc = page_table.allocate_pages(3)
+        cache.insert(
+            [MockToken(0), MockToken(1), MockToken(2)],
+            pages_abc,
+        )
+        cache.match_prefix([MockToken(0), MockToken(1)])  # split at [A, B]
+
+        page_d = page_table.allocate_pages(1)[0]
+        cache.insert(
+            [MockToken(0), MockToken(1), MockToken(3)],
+            [pages_abc[0], pages_abc[1], page_d],
+        )
+
+        free_pages = page_table.pages_available
+        evictable = cache.evictable_page_count()
+        reclaimable = cache.reclaimable_page_count()
+        assert evictable == 2
+        assert reclaimable == 4
+
+        needed = free_pages + 3
+        assert needed > free_pages + evictable
+        assert needed <= free_pages + reclaimable
+        assert page_table.can_reserve_with_eviction(needed) is True
+
 
 # =============================================================================
 # Page Sharing Tests

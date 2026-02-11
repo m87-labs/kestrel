@@ -82,6 +82,7 @@ class RadixPrefixCache(BasePrefixCache):
         self._default_namespace = CacheNamespace()
         self._total_cached_pages = 0
         self._evictable_page_count = 0  # Incrementally tracked for O(1) lookup
+        self._reclaimable_page_count = 0  # Incrementally tracked for O(1) lookup
         self._eviction_policy = LRUEvictionPolicy(self._collect_unlocked_leaves)
         self._free_pages_sink = free_pages_sink
 
@@ -303,6 +304,8 @@ class RadixPrefixCache(BasePrefixCache):
         self._total_cached_pages += inserted_pages
         # New node is unlocked leaf, so it's evictable
         self._evictable_page_count += inserted_pages
+        # New node starts unlocked, so all its pages are reclaimable.
+        self._reclaimable_page_count += inserted_pages
         # Parent is no longer a leaf, so subtract its pages if it was evictable
         if parent_was_evictable_leaf:
             self._evictable_page_count -= len(current_node.physical_pages)
@@ -329,6 +332,8 @@ class RadixPrefixCache(BasePrefixCache):
 
         current: TreeNode | None = node
         while current is not None:
+            if self._is_unlocked(current):
+                self._reclaimable_page_count -= len(current.physical_pages)
             current.lock_ref += 1
             current = current.parent
 
@@ -346,6 +351,8 @@ class RadixPrefixCache(BasePrefixCache):
 
         current: TreeNode | None = node
         while current is not None:
+            if self._is_unlocked(current):
+                self._reclaimable_page_count -= len(current.physical_pages)
             current.prefill_lock_ref += 1
             current = current.parent
 
@@ -365,6 +372,8 @@ class RadixPrefixCache(BasePrefixCache):
         while current is not None:
             assert current.lock_ref > 0, "Lock ref underflow"
             current.lock_ref -= 1
+            if self._is_unlocked(current):
+                self._reclaimable_page_count += len(current.physical_pages)
             current = current.parent
 
         # Add leaf to eviction heap if now evictable
@@ -385,6 +394,8 @@ class RadixPrefixCache(BasePrefixCache):
         while current is not None:
             assert current.prefill_lock_ref > 0, "Prefill lock ref underflow"
             current.prefill_lock_ref -= 1
+            if self._is_unlocked(current):
+                self._reclaimable_page_count += len(current.physical_pages)
             current = current.parent
 
         if node.is_leaf() and self._is_evictable(node) and node.parent is not None:
@@ -420,6 +431,8 @@ class RadixPrefixCache(BasePrefixCache):
             self._total_cached_pages -= len(node_pages)
             # Node was evictable, so subtract from evictable count
             self._evictable_page_count -= len(node_pages)
+            # Candidate is unlocked when selected for eviction.
+            self._reclaimable_page_count -= len(node_pages)
 
             # Send freed pages to sink (e.g., PageTable.free_pages_to_pool)
             if self._free_pages_sink is not None:
@@ -457,6 +470,10 @@ class RadixPrefixCache(BasePrefixCache):
         """
         return self._evictable_page_count
 
+    def reclaimable_page_count(self) -> int:
+        """Return pages reclaimable via cascading eviction in O(1)."""
+        return self._reclaimable_page_count
+
     def _split_node(self, node: TreeNode, split_at: int) -> TreeNode:
         """Split a node into prefix parent and suffix child.
 
@@ -472,6 +489,9 @@ class RadixPrefixCache(BasePrefixCache):
 
         # Check if node was evictable before split (for incremental tracking)
         was_evictable = node.is_leaf() and self._is_evictable(node) and node.parent is not None
+        was_reclaimable = self._is_unlocked(node)
+        if was_reclaimable:
+            self._reclaimable_page_count -= len(node.physical_pages)
 
         # Calculate page split point
         page_split = sum(t.kv_length() for t in node.tokens[:split_at])
@@ -490,11 +510,15 @@ class RadixPrefixCache(BasePrefixCache):
             prefill_lock_ref=node.prefill_lock_ref,
             last_access_time=node.last_access_time,
         )
+        if was_reclaimable:
+            self._reclaimable_page_count += len(new_parent.physical_pages)
 
         # Update original node to be suffix child
         node.tokens = suffix_tokens
         node.physical_pages = suffix_pages
         node.parent = new_parent
+        if was_reclaimable:
+            self._reclaimable_page_count += len(node.physical_pages)
 
         # Move node to be child of new parent
         if suffix_tokens:
@@ -543,4 +567,8 @@ class RadixPrefixCache(BasePrefixCache):
 
     @staticmethod
     def _is_evictable(node: TreeNode) -> bool:
+        return node.lock_ref == 0 and node.prefill_lock_ref == 0
+
+    @staticmethod
+    def _is_unlocked(node: TreeNode) -> bool:
         return node.lock_ref == 0 and node.prefill_lock_ref == 0

@@ -572,7 +572,13 @@ class PageTable:
         # Check if eviction could free enough
         if self.prefix_cache is not None:
             evictable = self.prefix_cache.evictable_page_count()
-            return available + evictable >= pages_needed
+            if available + evictable >= pages_needed:
+                return True
+            # evictable_page_count only tracks unlocked leaves. Internal unlocked
+            # nodes become reclaimable after cascading leaf eviction, so use an
+            # exact fallback before declaring admission impossible.
+            reclaimable = self.prefix_cache.reclaimable_page_count()
+            return available + reclaimable >= pages_needed
         return False
 
     def can_reserve_pages(self, size: int) -> bool:
@@ -595,7 +601,10 @@ class PageTable:
         # Check if eviction could free enough
         if self.prefix_cache is not None:
             evictable = self.prefix_cache.evictable_page_count()
-            return available + evictable >= pages_needed
+            if available + evictable >= pages_needed:
+                return True
+            reclaimable = self.prefix_cache.reclaimable_page_count()
+            return available + reclaimable >= pages_needed
         return False
 
 

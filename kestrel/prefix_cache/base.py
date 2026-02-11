@@ -130,3 +130,15 @@ class BasePrefixCache(ABC):
             Number of pages in unlocked leaf nodes.
         """
         ...
+
+    @abstractmethod
+    def reclaimable_page_count(self) -> int:
+        """Return number of pages that can be reclaimed via eviction.
+
+        Unlike ``evictable_page_count()``, this includes unlocked internal nodes
+        that become reclaimable after cascading leaf eviction.
+
+        Returns:
+            Number of pages reclaimable right now.
+        """
+        ...

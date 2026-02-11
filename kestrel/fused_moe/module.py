@@ -368,6 +368,7 @@ class FusedMoEModule(nn.Module):
         self.num_experts = num_experts
         self.config = config or FusedMoEConfig()
         self._tuned_configs: dict[int, dict[str, int] | None] = {}
+        self._cute_config_available: dict[str, bool] = {}
         self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
         self._lora_activation_event = torch.cuda.Event(enable_timing=False)
         self._lora_up_event = torch.cuda.Event(enable_timing=False)
@@ -1092,15 +1093,43 @@ class FusedMoEModule(nn.Module):
         else:
             return triton_block_m
 
+    def _has_cute_moe_config(self, *, dtype: str) -> bool:
+        cached = self._cute_config_available.get(dtype)
+        if cached is not None:
+            return cached
+        has_config = bool(
+            _MOE.has_cute_moe_config(
+                num_experts=self.num_experts,
+                hidden_size=self.input_size,
+                intermediate_size=self.hidden_size,
+                dtype=dtype,
+            )
+        )
+        self._cute_config_available[dtype] = has_config
+        return has_config
+
     def _resolve_backend(self, *, num_tokens: int, is_fp8: bool = False) -> str:
         device = self.up_experts.weight.device
         # Non-SM90 GPUs run the Triton path from kestrel-kernels.
         if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] != 9:
             return "triton"
-        # On SM90, FP8 uses CuTe backend (tuned configs available for all batch sizes).
-        if is_fp8:
-            return "cute"
         backend = self.config.backend.lower()
-        if backend == "auto":
-            return "triton" if num_tokens >= self.config.auto_backend_token_threshold else "cute"
-        return backend
+        if is_fp8:
+            preferred = "cute"
+            dtype = "fp8"
+        elif backend == "auto":
+            preferred = (
+                "triton"
+                if num_tokens >= self.config.auto_backend_token_threshold
+                else "cute"
+            )
+            dtype = "bf16"
+        else:
+            preferred = backend
+            dtype = "bf16"
+
+        if preferred != "cute":
+            return preferred
+        if self._has_cute_moe_config(dtype=dtype):
+            return "cute"
+        return "triton"
