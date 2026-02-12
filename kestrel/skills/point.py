@@ -54,9 +54,7 @@ class PointSkill(SkillSpec):
         prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(" " + prompt).ids if prompt else []
         ids = [*prefix, *object_tokens, *suffix]
-        tokens = []
-        if runtime.model_name == "moondream2":
-            tokens.append(TextToken(token_id=int(runtime.config.tokenizer.bos_id)))
+        tokens = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
         tokens.extend(TextToken(token_id=int(tid)) for tid in ids)
         return tokens
 
