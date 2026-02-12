@@ -392,12 +392,16 @@ class MoondreamRuntime:
                 stacklevel=2,
             )
 
+        device_cc_major, device_cc_minor = torch.cuda.get_device_capability(self.device)
+        device_sm = device_cc_major * 10 + device_cc_minor
+        fp8_kv_supported_sms = {89, 90}
+
         if (
             self._kv_layer_k_scales is not None
             and self._kv_layer_v_scales is not None
             and self.page_size == 1
             and hasattr(torch, "float8_e4m3fn")
-            and torch.cuda.get_device_capability(self.device)[0] == 9
+            and device_sm in fp8_kv_supported_sms
         ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
@@ -411,10 +415,10 @@ class MoondreamRuntime:
                         "falling back to standard KV cache.",
                         stacklevel=2,
                     )
-                elif torch.cuda.get_device_capability(self.device)[0] != 9:
+                elif device_sm not in fp8_kv_supported_sms:
                     warnings.warn(
-                        "KV scales found in checkpoint but FP8 KV cache currently requires SM90 kernels; "
-                        "falling back to standard KV cache.",
+                        "KV scales found in checkpoint but FP8 KV cache currently requires SM89/SM90 "
+                        "decode kernels; falling back to standard KV cache.",
                         stacklevel=2,
                     )
             self.kv_cache_dtype = self.dtype

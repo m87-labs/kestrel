@@ -18,7 +18,7 @@ Kestrel provides async, micro-batched serving with streaming support, paged KV c
 ## Requirements
 
 - Python 3.10+
-- NVIDIA Hopper GPU or newer (e.g. H100)
+- NVIDIA GPU (tested on L4, L40S, H100). Optimized CUDA kernels are available for SM89 and SM90 architectures. Other GPUs may work but will fall back to non-optimized kernels.
 - `MOONDREAM_API_KEY` environment variable (get this from [moondream.ai](https://moondream.ai))
 
 ## Installation
