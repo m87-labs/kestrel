@@ -12,20 +12,44 @@ configs are compatible - both kernels must use the same block_m in practice.
 RUNNING THE GRID SEARCH
 =======================
 
-1. Sync code to p1:
-   ./sync.sh p1
+1. Sync both repos to the target host:
+   ./sync.sh <host>
+   (cd ../kestrel-proprietary && ./sync.sh <host>)
 
-2. Run grid search for specific token counts:
-   ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 ~/.local/bin/uv run python \\
-     scripts/grid_search_cute_moe.py --num-tokens 8 16 32 --output results.json'
+2. Prepare env + install local kernels from source:
+   ssh <host> 'cd ~/code/kestrel && CUDACXX=/usr/local/cuda/bin/nvcc ~/.local/bin/uv sync --extra dev'
+   ssh <host> 'cd ~/code/kestrel && CUDACXX=/usr/local/cuda/bin/nvcc ~/.local/bin/uv pip install --force-reinstall --no-deps ../kestrel-proprietary/kestrel-kernels'
 
-3. Run full grid search (all token counts):
-   ssh p1 'cd ~/code/kestrel && KESTREL_CUTE_MOE_JIT=1 nohup ~/.local/bin/uv run python \\
-     scripts/grid_search_cute_moe.py --output /tmp/cute_moe_grid_search.json \\
-     > /tmp/cute_moe_grid_search.log 2>&1 &'
+3. If source JIT module import fails (moe_align), hotfix by copying the module:
+   ssh <host> 'cp ~/code/kestrel-proprietary/kestrel-kernels/python/kestrel_kernels/moe_align/kernel.py ~/code/kestrel/.venv/lib/python3.11/site-packages/kestrel_kernels/moe_align/kernel.py'
 
-4. Monitor progress:
-   ssh p1 'tail -f /tmp/cute_moe_grid_search.log'
+4. Launch parallel sweep (example):
+   ssh <host> 'cd ~/code/kestrel && \
+     KESTREL_SM89_BOTH_MAX_TOKENS=1024 \
+     ~/.local/bin/uv run --no-sync python scripts/grid_search_cute_moe.py \
+       --launch-parallel --max-parallel 8 --kernel-dtype fp8 \
+       --output-dir /tmp/cute_moe_grid_search_l40s_full \
+       --num-tokens 1 --num-tokens 2 --num-tokens 4 --num-tokens 8 \
+       --num-tokens 16 --num-tokens 24 --num-tokens 32 --num-tokens 48 \
+       --num-tokens 64 --num-tokens 96 --num-tokens 128 --num-tokens 256 \
+       --num-tokens 512 --num-tokens 768 --num-tokens 1024 --num-tokens 1536 \
+       --num-tokens 2048 --num-tokens 3072 --num-tokens 4096'
+   Note: for --launch-parallel, worker env vars
+   (OMP_NUM_THREADS/MKL_NUM_THREADS/OPENBLAS_NUM_THREADS/NUMEXPR_NUM_THREADS)
+   default to 1 unless explicitly set.
+
+5. Monitor progress:
+   ssh <host> 'ls /tmp/cute_moe_grid_search_l40s_full/tokens*.json 2>/dev/null | wc -l'
+   ssh <host> 'pgrep -af "grid_search_cute_moe.py --num-tokens"'
+   ssh <host> 'grep -n "\\[retry-token\\]" /tmp/cute_moe_grid_search_l40s_full/driver*.log | tail -n 20'
+
+6. Resume after interruptions/crashes:
+   - Re-run the exact same command (completed tokens with tokens<N>.json are skipped).
+   - Each token worker writes variant-level progress to:
+       /tmp/cute_moe_grid_search_l40s_full/tokens<N>.progress.jsonl
+   - Completed variants are reused, so resumed runs continue from the
+     remaining variants instead of restarting token N from scratch.
+   - Retryable token-level LLVM pthread aborts are automatically requeued.
 
 SELECTING THE BEST CONFIG
 =========================
@@ -307,6 +331,10 @@ FP8_SM89_QUICK_SEARCH_SPACE = {
     },
 }
 
+# For SM89 FP8, search both warp+qmma through this token count, then qmma-only.
+# Override for experiments via KESTREL_SM89_BOTH_MAX_TOKENS (default: 512).
+_SM89_BOTH_MAX_TOKENS = int(os.environ.get("KESTREL_SM89_BOTH_MAX_TOKENS", "512"))
+
 
 def _filter_kernel_types(search_space: dict, kernel_types: list[str]) -> dict:
     """Keep only selected kernel types from a search-space dict."""
@@ -335,9 +363,9 @@ def get_fp8_search_space(num_tokens: int, *, arch: str, quick: bool) -> dict:
 
     if arch == "sm89":
         # Minor search-time optimization from manual checks:
-        # - <=512 tokens: keep both warp and qmma in the search.
-        # - >512 tokens: search qmma only.
-        if num_tokens <= 512:
+        # - <=_SM89_BOTH_MAX_TOKENS tokens: keep both warp and qmma in the search.
+        # - >_SM89_BOTH_MAX_TOKENS tokens: search qmma only.
+        if num_tokens <= _SM89_BOTH_MAX_TOKENS:
             return FP8_SM89_QUICK_SEARCH_SPACE if quick else FP8_SM89_FULL_SEARCH_SPACE
         if quick:
             return {
@@ -415,6 +443,12 @@ def is_valid_config(config: CuteMoeConfig, kind: str, num_tokens: int) -> bool:
     if config.block_m > num_threads:
         return False
 
+    # In MoE routing, a given expert can receive at most one row per token
+    # (top-k experts are unique per token), so per-expert M is bounded by
+    # num_tokens. Keep a floor of 16 for tensor-core tile granularity.
+    if config.block_m > max(16, num_tokens):
+        return False
+
     # block_m should be appropriate for token count
     # For very small batches, larger block_m wastes work
     assignments = num_tokens * TOP_K if kind == "up" else num_tokens * TOP_K
@@ -448,6 +482,67 @@ def is_valid_config(config: CuteMoeConfig, kind: str, num_tokens: int) -> bool:
 
 # Global lock file for serializing GPU benchmarks across parallel processes
 _LOCK_FILE = Path("/tmp/cute_moe_grid_search.lock")
+_LLVM_PTHREAD_ERROR = "LLVM ERROR: pthread_create failed"
+
+
+def _is_retryable_error_text(error_text: str | None) -> bool:
+    return bool(error_text) and (_LLVM_PTHREAD_ERROR in error_text)
+
+
+def _log_has_retryable_error(log_file: Path) -> bool:
+    """Check whether a worker log ended due to a known retryable LLVM thread error."""
+    try:
+        with log_file.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            # Read tail only; retry signatures are near process termination.
+            tail = min(size, 256 * 1024)
+            f.seek(size - tail, os.SEEK_SET)
+            text = f.read().decode(errors="ignore")
+        return _LLVM_PTHREAD_ERROR in text
+    except Exception:
+        return False
+
+
+def _variant_result_key(kind: Literal["up", "down"], config: CuteMoeConfig) -> str:
+    """Stable key for a benchmark variant within one token-count run."""
+    return (
+        f"{kind}|{config.kernel_type}|"
+        f"m={config.block_m}|n={config.block_n}|k={config.block_k}|"
+        f"w={config.num_warps}|s={config.num_stages}"
+    )
+
+
+def _load_resume_records(checkpoint_file: Path | None) -> dict[str, dict]:
+    """Load last-known per-variant records from JSONL checkpoint."""
+    if checkpoint_file is None or not checkpoint_file.exists():
+        return {}
+    records: dict[str, dict] = {}
+    with checkpoint_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = rec.get("key")
+            if isinstance(key, str):
+                records[key] = rec
+    return records
+
+
+def _append_resume_record(checkpoint_file: Path | None, record: dict) -> None:
+    """Append one per-variant record to the JSONL checkpoint."""
+    if checkpoint_file is None:
+        return
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    with checkpoint_file.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 class GPUBenchmarkLock:
@@ -651,6 +746,7 @@ def run_combined_grid_search(
     warmup: int,
     iters: int,
     use_lock: bool = False,
+    checkpoint_file: Path | None = None,
 ) -> list[CombinedBenchResult]:
     """Run grid search testing both up and down kernels with shared routing.
 
@@ -694,10 +790,45 @@ def run_combined_grid_search(
     topk_ids = torch.randint(0, NUM_EXPERTS, (num_tokens, TOP_K), device=device, dtype=torch.int32)
 
     combined_results: list[CombinedBenchResult] = []
+    resume_records = _load_resume_records(checkpoint_file)
+    if checkpoint_file is not None:
+        print(
+            f"  Resume checkpoint: {checkpoint_file} "
+            f"({len(resume_records)} cached variants)",
+            flush=True,
+        )
 
     def compile_and_benchmark(config: CuteMoeConfig, kind: Literal["up", "down"],
                                sorted_token_ids, expert_ids, num_tokens_post_padded) -> BenchResult | None:
         """JIT compile a config, then acquire lock and benchmark it."""
+        variant_key = _variant_result_key(kind, config)
+        cached = resume_records.get(variant_key)
+        if cached is not None:
+            if cached.get("status") == "ok":
+                time_us = float(cached.get("time_us", float("inf")))
+                std_us = float(cached.get("std_us", 0.0))
+                print(
+                    f"        RESUME {kind} ({config.kernel_type}): "
+                    f"m={config.block_m} n={config.block_n} k={config.block_k} "
+                    f"w={config.num_warps} s={config.num_stages} -> {time_us:.2f} us",
+                    flush=True,
+                )
+                return BenchResult(
+                    config=config,
+                    kind=kind,
+                    num_tokens=num_tokens,
+                    time_us=time_us,
+                    std_us=std_us,
+                )
+            if cached.get("status") == "error":
+                print(
+                    f"        RESUME SKIP {kind} ({config.kernel_type}): "
+                    f"m={config.block_m} n={config.block_n} k={config.block_k} "
+                    f"w={config.num_warps} s={config.num_stages}",
+                    flush=True,
+                )
+                return None
+
         if is_fp8:
             A = A_up_fp8 if kind == "up" else A_down_fp8
             A_scale = A_up_scale if kind == "up" else A_down_scale
@@ -710,22 +841,65 @@ def run_combined_grid_search(
         C = C_up if kind == "up" else C_down
         tw = None if kind == "up" else topk_weights
 
-        # JIT compile (no lock needed, can run in parallel)
-        error = jit_compile_config(
-            config, kind,
-            A=A, B=B, C=C,
-            A_scale=A_scale, B_scale=B_scale,
-            topk_weights=tw,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-        )
-        if error is not None:
+        compile_attempt = 0
+        while True:
+            compile_attempt += 1
+            # JIT compile (no lock needed, can run in parallel)
+            error = jit_compile_config(
+                config, kind,
+                A=A, B=B, C=C,
+                A_scale=A_scale, B_scale=B_scale,
+                topk_weights=tw,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+            )
+            if error is None:
+                break
+            if _is_retryable_error_text(error):
+                print(
+                    f"          [retry-variant] {kind}: m={config.block_m} n={config.block_n} "
+                    f"k={config.block_k} w={config.num_warps} s={config.num_stages} "
+                    f"t={config.kernel_type} attempt={compile_attempt + 1}",
+                    flush=True,
+                )
+                continue
+            record = {
+                "key": variant_key,
+                "num_tokens": num_tokens,
+                "kind": kind,
+                "status": "error",
+                "phase": "compile",
+                "error": error,
+                "kernel_type": config.kernel_type,
+                "block_m": config.block_m,
+                "block_n": config.block_n,
+                "block_k": config.block_k,
+                "num_warps": config.num_warps,
+                "num_stages": config.num_stages,
+            }
+            resume_records[variant_key] = record
+            _append_resume_record(checkpoint_file, record)
             return None
 
-        # Benchmark (acquire lock if needed)
-        if use_lock:
-            with GPUBenchmarkLock():
+        bench_attempt = 0
+        while True:
+            bench_attempt += 1
+            # Benchmark (acquire lock if needed)
+            if use_lock:
+                with GPUBenchmarkLock():
+                    result = benchmark_compiled_config(
+                        config, kind, num_tokens,
+                        A=A, B=B, C=C,
+                        A_scale=A_scale, B_scale=B_scale,
+                        topk_weights=tw,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=expert_ids,
+                        num_tokens_post_padded=num_tokens_post_padded,
+                        warmup=warmup,
+                        iters=iters,
+                    )
+            else:
                 result = benchmark_compiled_config(
                     config, kind, num_tokens,
                     A=A, B=B, C=C,
@@ -737,21 +911,49 @@ def run_combined_grid_search(
                     warmup=warmup,
                     iters=iters,
                 )
-        else:
-            result = benchmark_compiled_config(
-                config, kind, num_tokens,
-                A=A, B=B, C=C,
-                A_scale=A_scale, B_scale=B_scale,
-                topk_weights=tw,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
-                warmup=warmup,
-                iters=iters,
-            )
-
-        if result.error is not None:
+            if result.error is None:
+                break
+            if _is_retryable_error_text(result.error):
+                print(
+                    f"          [retry-variant-bench] {kind}: m={config.block_m} n={config.block_n} "
+                    f"k={config.block_k} w={config.num_warps} s={config.num_stages} "
+                    f"t={config.kernel_type} attempt={bench_attempt + 1}",
+                    flush=True,
+                )
+                continue
+            record = {
+                "key": variant_key,
+                "num_tokens": num_tokens,
+                "kind": kind,
+                "status": "error",
+                "phase": "bench",
+                "error": result.error,
+                "kernel_type": config.kernel_type,
+                "block_m": config.block_m,
+                "block_n": config.block_n,
+                "block_k": config.block_k,
+                "num_warps": config.num_warps,
+                "num_stages": config.num_stages,
+            }
+            resume_records[variant_key] = record
+            _append_resume_record(checkpoint_file, record)
             return None
+        record = {
+            "key": variant_key,
+            "num_tokens": num_tokens,
+            "kind": kind,
+            "status": "ok",
+            "time_us": result.time_us,
+            "std_us": result.std_us,
+            "kernel_type": config.kernel_type,
+            "block_m": config.block_m,
+            "block_n": config.block_n,
+            "block_k": config.block_k,
+            "num_warps": config.num_warps,
+            "num_stages": config.num_stages,
+        }
+        resume_records[variant_key] = record
+        _append_resume_record(checkpoint_file, record)
         print(f"          -> {result.time_us:.2f} us", flush=True)
         return result
 
@@ -768,10 +970,22 @@ def run_combined_grid_search(
         for block_m in block_m_values:
             print(f"\n  kernel_type={kernel_type}, block_m={block_m}", flush=True)
 
-            # Generate shared routing for this block_m
-            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                topk_ids, block_m, NUM_EXPERTS
-            )
+            # Generate shared routing for this block_m.
+            # Retry transient LLVM pthread failures without abandoning the token run.
+            while True:
+                try:
+                    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                        topk_ids, block_m, NUM_EXPERTS
+                    )
+                    break
+                except Exception as e:
+                    if _is_retryable_error_text(str(e)):
+                        print(
+                            f"    [retry-routing] block_m={block_m} kernel_type={kernel_type}",
+                            flush=True,
+                        )
+                        continue
+                    raise
 
             # Generate all configs for this block_m and kernel_type
             up_configs = []
@@ -913,6 +1127,9 @@ def run_single_token(args) -> None:
     num_tokens = args.token_counts[0]
     kernel_dtype = getattr(args, 'kernel_dtype', 'bf16')
     arch = _current_cuda_arch()
+    checkpoint_file = None
+    if args.output:
+        checkpoint_file = Path(args.output).with_suffix(".progress.jsonl")
 
     # Select search space based on kernel dtype and token count
     if kernel_dtype == "fp8":
@@ -939,6 +1156,7 @@ def run_single_token(args) -> None:
             kernel_dtype=kernel_dtype,
             warmup=args.warmup, iters=args.iters,
             use_lock=True,  # Use lock for parallel runs
+            checkpoint_file=checkpoint_file,
         )
         print(f"[PID {os.getpid()}] run_combined_grid_search returned {len(results)} results", flush=True)
     except Exception as e:
@@ -999,20 +1217,27 @@ def launch_parallel(args) -> None:
         _LOCK_FILE.unlink()
 
     token_counts = args.token_counts or TOKEN_COUNTS
+    done_tokens = [t for t in token_counts if (output_dir / f"tokens{t}.json").exists()]
+    done_set = set(done_tokens)
+    pending = [t for t in token_counts if t not in done_set]
     max_parallel = args.max_parallel
 
     print(f"Launching {len(token_counts)} processes ({max_parallel} at a time)...")
     print(f"  Token counts: {token_counts}")
+    if done_tokens:
+        print(f"  Already complete (skipping): {done_tokens}")
     print(f"  Output dir: {output_dir}")
     print()
 
     # Track running and pending processes
-    pending = list(token_counts)
     running = []  # (num_tokens, proc, log_file)
-    completed_count = 0
+    completed_count = len(done_tokens)
+    attempts: dict[int, int] = {}
 
     def launch_one(num_tokens: int):
         """Launch a single process for a token count."""
+        attempts[num_tokens] = attempts.get(num_tokens, 0) + 1
+        attempt_id = attempts[num_tokens]
         output_file = output_dir / f"tokens{num_tokens}.json"
         log_file = output_dir / f"tokens{num_tokens}.log"
 
@@ -1028,9 +1253,13 @@ def launch_parallel(args) -> None:
         if args.quick:
             cmd.append("--quick")
 
+        child_env = os.environ.copy()
+        for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            child_env.setdefault(name, "1")
+
         log = open(log_file, "w")
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-        print(f"  Started: tokens={num_tokens} (PID {proc.pid})")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=child_env)
+        print(f"  Started: tokens={num_tokens} attempt={attempt_id} (PID {proc.pid})")
         return (num_tokens, proc, log_file, log)
 
     # Initial batch
@@ -1047,13 +1276,31 @@ def launch_parallel(args) -> None:
         for i, (num_tokens, proc, log_file, log_handle) in enumerate(running):
             ret = proc.poll()
             if ret is not None:
-                completed_count += 1
                 log_handle.close()
-                status = "OK" if ret == 0 else f"FAILED (exit {ret})"
-                print(f"  [{completed_count}/{len(token_counts)}] tokens={num_tokens}: {status}")
                 running.pop(i)
 
-                # Launch next one if any pending
+                if ret == 0:
+                    completed_count += 1
+                    print(f"  [{completed_count}/{len(token_counts)}] tokens={num_tokens}: OK")
+                else:
+                    retryable = _log_has_retryable_error(log_file)
+                    if retryable:
+                        next_attempt = attempts.get(num_tokens, 0) + 1
+                        print(
+                            f"  [retry-token] tokens={num_tokens}: FAILED (exit {ret}) "
+                            f"-> requeue attempt={next_attempt}",
+                            flush=True,
+                        )
+                        pending.append(num_tokens)
+                    else:
+                        completed_count += 1
+                        print(
+                            f"  [{completed_count}/{len(token_counts)}] tokens={num_tokens}: "
+                            f"FAILED (exit {ret}, non-retryable)",
+                            flush=True,
+                        )
+
+                # Launch next one if any pending.
                 if pending:
                     next_tokens = pending.pop(0)
                     running.append(launch_one(next_tokens))
