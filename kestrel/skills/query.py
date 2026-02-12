@@ -69,10 +69,6 @@ class QuerySkill(SkillSpec):
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 
         tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
-        # MD2 HF model adds suffix before thinking_id or doubles suffix for non-reasoning
-        is_md2 = runtime.model_name == "moondream2"
-        if is_md2:
-            tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
         if reasoning:
             thinking_id = runtime.config.tokenizer.thinking_id
             tokens.append(TextToken(token_id=int(thinking_id)))
