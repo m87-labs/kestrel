@@ -56,15 +56,10 @@ class QuerySkill(SkillSpec):
         suffix: Sequence[int] = template["suffix"]
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
         reasoning = request_context.reasoning
-        # The runtime's _prepare_full_prefill_inputs treats the first token as BOS
-        # (placed before the image). MD2's HF model prepends BOS (token 0) separately,
-        # so we must include it here. MD3 templates already start with the correct
-        # first-position token.
-        is_md2 = runtime.model_name == "moondream2"
+        # The runtime's _prepare_full_prefill_inputs places the first prompt token
+        # before image tokens, so prepend BOS explicitly.
         bos_id = runtime.config.tokenizer.bos_id
-        tokens: List[Token] = []
-        if is_md2:
-            tokens.append(TextToken(token_id=int(bos_id)))
+        tokens: List[Token] = [TextToken(token_id=int(bos_id))]
         tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 

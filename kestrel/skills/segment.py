@@ -67,10 +67,10 @@ class SegmentSkill(SkillSpec):
         object_tokens = runtime.tokenizer.encode(object_name).ids if object_name else []
 
         # Assemble tokens:
-        # [BOS (MD2 only)] <prefix> <spatial tokens> object <suffix>
-        tokens: List[Token] = []
-        if runtime.model_name == "moondream2":
-            tokens.append(TextToken(token_id=int(runtime.config.tokenizer.bos_id)))
+        # [BOS] <prefix> <spatial tokens> object <suffix>
+        tokens: List[Token] = [
+            TextToken(token_id=int(runtime.config.tokenizer.bos_id))
+        ]
         tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 
