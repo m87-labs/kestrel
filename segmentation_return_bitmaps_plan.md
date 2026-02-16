@@ -424,8 +424,10 @@ Remote test runs (SSH `/workspace/kestrel`):
 - Observed behavior: `ImportError` from `transformers` dynamic module loader stating the model requires `torchvision`.
 - Expected behavior: HQ-SAM weights load and the legacy refiner initializes.
 - Root cause: HQ-SAM model’s remote code depends on `torchvision`, but it was not installed in the venv.
-- Fix: Install a torchvision build compatible with the pinned torch:
-  - `pip install --no-deps torchvision==0.24.0+cu128 --index-url https://download.pytorch.org/whl/cu128`
+- Fix:
+  - Pin `torchvision==0.24.1` in `pyproject.toml` (matches `torch==2.9.1`) and regenerate `uv.lock`.
+  - For the manual pip path on CUDA boxes, install a matching wheel without pulling a different torch:
+    - `pip install --no-deps torchvision==0.24.1+cu128 --index-url https://download.pytorch.org/whl/cu128`
 
 ### 2026-02-16: `pip install torchvision` Tried To Upgrade Torch (Broke Venv)
 - Trigger: Running `pip install torchvision --extra-index-url https://download.pytorch.org/whl/cu128` without pinning versions.
