@@ -438,6 +438,14 @@ Remote test runs (SSH `/workspace/kestrel`):
   - Force reinstall the pinned torch: `pip install --force-reinstall torch==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128`
   - Install pinned torchvision with `--no-deps` (see previous entry).
 
+### 2026-02-16: Fresh-Install Validation (HQ-SAM Default)
+- Trigger: Creating a new venv on the SSH box and installing Kestrel from the repo.
+- Observed behavior:
+  - `pip install -e .` succeeded in a clean venv.
+  - After installing segmentation deps (`opencv-python-headless`, `resvg`, `pypotrace`), the runtime defaulted to `HQSamRefiner`.
+  - With `return_base64=True`, both `coarse_mask_base64` and `refined_mask_base64` were populated (PNG base64), and the refined `svg_path` was returned.
+- Note: Using the default `moondream3-preview` weights, calling segment with only `object=\"dog\"` often produced a bbox but no SVG path (EOS for text tokens). Providing a point prompt via `spatial_refs` produced a valid SVG path and masks; production runs should use the dedicated segmentation checkpoint (see the “Wrong Weights” entry above).
+
 ### 2026-02-16: `flashinfer` JIT Compilation Failed (Missing `ninja`)
 - Trigger: After repairing the venv, engine warmup hit `flashinfer`’s JIT sampling module build path.
 - Observed behavior: `FileNotFoundError: [Errno 2] No such file or directory: 'ninja'`.
