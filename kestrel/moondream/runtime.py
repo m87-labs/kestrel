@@ -66,7 +66,9 @@ DEFAULT_MAX_TOKENS = 768
 # Hardcoded switch for legacy segmentation refinement behavior.
 # False (default): use SegmentRefiner (current path).
 # True: use HQ-SAM (legacy path).
-_USE_HQSAM_REFINER = False
+# Prefer the legacy HQ-SAM refiner for segmentation refinement.
+# Keep a simple hardcoded gate for easy switching during development.
+_USE_HQSAM_REFINER = True
 
 
 class TextToken(NamedTuple):
@@ -493,14 +495,15 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        if _USE_HQSAM_REFINER:
-            self.seg_refiner = HQSamRefiner(device=self.device) if _HAS_HQSAM_DEPS else None
+        # Prefer HQ-SAM when available, but fall back to the current refiner if HQ-SAM
+        # deps are missing. This keeps segmentation refinement functional even when
+        # HQ-SAM can't be loaded.
+        if _USE_HQSAM_REFINER and _HAS_HQSAM_DEPS:
+            self.seg_refiner = HQSamRefiner(device=self.device)
+        elif _HAS_SEG_DEPS:
+            self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
         else:
-            self.seg_refiner = (
-                SegmentRefiner(self.model.vision, self.config.vision, self.device)
-                if _HAS_SEG_DEPS
-                else None
-            )
+            self.seg_refiner = None
 
         # Multi-slot LoRA workspace and slot manager.
         # Slot 0 represents "no LoRA". Active adapters are loaded into slots 1+.
