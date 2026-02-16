@@ -503,10 +503,9 @@ def load_moondream_weights(
             for name, value in all_tensors.items():
                 tensor_hook(name, value)
 
-        converted = {name: convert(value) for name, value in all_tensors.items()}
         assign_weights(
             all_tensors,
-            getter=lambda name: converted[name],
+            getter=lambda name: convert(all_tensors[name]),
             raw_getter=lambda name: all_tensors[name],
         )
 
