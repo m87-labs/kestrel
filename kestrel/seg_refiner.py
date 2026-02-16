@@ -1,10 +1,12 @@
 """Mask refinement and SVG conversion utilities."""
 
+import base64
 import io
 import os
 import re
 import threading
 import traceback
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -261,6 +263,31 @@ class _RefinementHead(nn.Module):
 
 # --- SegmentRefiner ----------------------------------------------------------
 
+@dataclass(slots=True)
+class SegmentRefineBitmapsResult:
+    refined_svg_path: Optional[str]
+    refined_bbox: Optional[dict]
+    coarse_mask_base64: Optional[str]
+    refined_mask_base64: Optional[str]
+
+
+def _encode_mask_png_base64(mask: np.ndarray) -> str:
+    """Encode a binary mask as a base64 PNG (grayscale, 0/255)."""
+
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape {mask.shape}")
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+
+    # Ensure binary 0/255.
+    mask = (mask > 0).astype(np.uint8) * 255
+
+    ok, buf = cv2.imencode(".png", mask)
+    if not ok:  # pragma: no cover - defensive
+        raise RuntimeError("Failed to encode PNG mask")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
 class SegmentRefiner:
     """Refines coarse segmentation masks."""
 
@@ -338,17 +365,24 @@ class SegmentRefiner:
         refined_mask_full = cv2.resize(refined_mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
         return (refined_mask_full > 0.5).astype(np.uint8)
 
-    def __call__(self, image: np.ndarray | bytes, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
-        """Refine a coarse SVG segmentation.
-
-        Args:
-            image: RGB image (numpy array or raw bytes).
-            svg_path: SVG path string from model output.
-            bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
+    def refine_with_bitmaps(
+        self,
+        image: np.ndarray | bytes,
+        svg_path: str,
+        bbox: dict,
+        *,
+        return_base64: bool = False,
+    ) -> SegmentRefineBitmapsResult:
+        """Refine a coarse SVG segmentation, optionally returning bitmap masks.
 
         Returns:
-            (refined_svg_path, refined_bbox) or (None, None) on failure.
+            SegmentRefineBitmapsResult with refined SVG outputs (when available) and
+            base64-encoded PNG masks (when requested).
         """
+
+        coarse_mask_b64: Optional[str] = None
+        refined_mask_b64: Optional[str] = None
+
         try:
             image = _ensure_numpy_rgb(image)
             img_h, img_w = image.shape[:2]
@@ -363,35 +397,81 @@ class SegmentRefiner:
             coarse_soft = render_svg_to_soft_mask(full_svg, img_w, img_h)
             coarse_mask = (coarse_soft > 0.5).astype(np.uint8)
 
-            if coarse_mask.sum() == 0:
-                return None, None
+            if return_base64:
+                coarse_mask_b64 = _encode_mask_png_base64(coarse_mask)
+                # Best-effort default if refinement cannot run.
+                refined_mask_b64 = coarse_mask_b64
 
+        except Exception:
+            traceback.print_exc()
+            return SegmentRefineBitmapsResult(None, None, None, None)
+
+        # Preserve existing behavior for non-base64 callers: no refinement on empty masks.
+        if coarse_mask.sum() == 0 and not return_base64:
+            return SegmentRefineBitmapsResult(None, None, None, None)
+
+        refined_path: Optional[str] = None
+        refined_bbox: Optional[dict] = None
+
+        try:
             crop_xyxy = _expand_bbox(bbox, img_w, img_h, margin=0.25)
             x1, y1, x2, y2 = crop_xyxy
             crop_img = image[y1:y2, x1:x2, :]
             crop_mask = coarse_mask[y1:y2, x1:x2]
 
             if crop_mask.sum() == 0:
-                return None, None
+                if not return_base64:
+                    return SegmentRefineBitmapsResult(None, None, None, None)
+                return SegmentRefineBitmapsResult(
+                    None, None, coarse_mask_b64, refined_mask_b64
+                )
 
             refined_crop = self._refine_mask(crop_img, crop_mask)
 
             refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
             refined_mask = _clean_mask(refined_mask).astype(np.uint8)
 
+            if return_base64:
+                refined_mask_b64 = _encode_mask_png_base64(refined_mask)
+
             if refined_mask.sum() == 0:
-                return None, None
+                if not return_base64:
+                    return SegmentRefineBitmapsResult(None, None, None, None)
+                return SegmentRefineBitmapsResult(
+                    None, None, coarse_mask_b64, refined_mask_b64
+                )
 
             result = bitmap_to_path(refined_mask)
-            if result is None:
-                return None, None
+            if result is not None:
+                refined_path, refined_bbox = result
 
-            refined_path, refined_bbox = result
-            return refined_path, refined_bbox
+            return SegmentRefineBitmapsResult(
+                refined_path, refined_bbox, coarse_mask_b64, refined_mask_b64
+            )
 
         except Exception:
             traceback.print_exc()
+            if not return_base64:
+                return SegmentRefineBitmapsResult(None, None, None, None)
+            return SegmentRefineBitmapsResult(
+                None, None, coarse_mask_b64, refined_mask_b64
+            )
+
+    def __call__(self, image: np.ndarray | bytes, svg_path: str, bbox: dict) -> Tuple[Optional[str], Optional[dict]]:
+        """Refine a coarse SVG segmentation.
+
+        Args:
+            image: RGB image (numpy array or raw bytes).
+            svg_path: SVG path string from model output.
+            bbox: Bbox dict with x_min, y_min, x_max, y_max (normalized 0-1).
+
+        Returns:
+            (refined_svg_path, refined_bbox) or (None, None) on failure.
+        """
+        result = self.refine_with_bitmaps(image, svg_path, bbox, return_base64=False)
+        if result.refined_svg_path is None or result.refined_bbox is None:
             return None, None
+        return result.refined_svg_path, result.refined_bbox
 
 
 # --- SVG Rendering -----------------------------------------------------------

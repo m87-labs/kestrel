@@ -525,6 +525,7 @@ class _ServerState:
         try:
             object_name = _parse_required_str(payload, "object")
             stream = _parse_bool(payload.get("stream", False), "stream")
+            return_base64 = _parse_bool(payload.get("return_base64", False), "return_base64")
             settings_payload = payload.get("settings")
             if settings_payload is None:
                 settings_payload = {}
@@ -559,6 +560,8 @@ class _ServerState:
                 image = load_image_bytes_from_base64(image_data)
             else:
                 raise ValueError("Field 'image_url' must be a string if provided")
+            if return_base64 and image is None:
+                raise ValueError("Field 'image_url' is required when 'return_base64' is true")
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -583,6 +586,7 @@ class _ServerState:
                             max_tokens=max_tokens,
                         ),
                         spatial_refs=spatial_refs,
+                        return_base64=bool(return_base64),
                     ),
                     max_new_tokens=max_tokens,
                     skill="segment",
@@ -636,6 +640,13 @@ class _ServerState:
                     }
                     if parse_error:
                         payload_final["parse_error"] = parse_error
+                    if return_base64:
+                        payload_final["coarse_mask_base64"] = segment.get(
+                            "coarse_mask_base64"
+                        )
+                        payload_final["refined_mask_base64"] = segment.get(
+                            "refined_mask_base64"
+                        )
                     yield _sse_payload(payload_final)
 
                 return StreamingResponse(
@@ -648,6 +659,7 @@ class _ServerState:
                     image=image,
                     object=object_name,
                     spatial_refs=spatial_refs,
+                    return_base64=bool(return_base64),
                     settings=settings_dict,
                 )
         except Exception as exc:  # pragma: no cover
@@ -670,6 +682,9 @@ class _ServerState:
         parse_error = segment.get("parse_error")
         if parse_error:
             response_payload["parse_error"] = parse_error
+        if return_base64:
+            response_payload["coarse_mask_base64"] = segment.get("coarse_mask_base64")
+            response_payload["refined_mask_base64"] = segment.get("refined_mask_base64")
 
         return JSONResponse(response_payload)
 
