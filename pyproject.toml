@@ -15,6 +15,7 @@ dependencies = [
     "uvicorn>=0.30",
     "flashinfer-python>=0.6.0",
     "apache-tvm-ffi>=0.1.5,<0.2",
+    "nvidia-cutlass-dsl==4.3.5",
     "kestrel-native==0.1.1",
     "kestrel-kernels==0.1.2",
     "huggingface-hub>=0.20",
