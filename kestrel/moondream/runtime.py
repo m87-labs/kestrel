@@ -57,10 +57,16 @@ from .region import (
     encode_size,
 )
 from ..seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
+from ..hqsam_refiner import HQSamRefiner, _HAS_HQSAM_DEPS
 from .decode_slot import DecodeSlot, create_decode_slot
 
 
 DEFAULT_MAX_TOKENS = 768
+
+# Hardcoded switch for legacy segmentation refinement behavior.
+# False (default): use SegmentRefiner (current path).
+# True: use HQ-SAM (legacy path).
+_USE_HQSAM_REFINER = False
 
 
 class TextToken(NamedTuple):
@@ -487,10 +493,14 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        self.seg_refiner = (
-            SegmentRefiner(self.model.vision, self.config.vision, self.device)
-            if _HAS_SEG_DEPS else None
-        )
+        if _USE_HQSAM_REFINER:
+            self.seg_refiner = HQSamRefiner(device=self.device) if _HAS_HQSAM_DEPS else None
+        else:
+            self.seg_refiner = (
+                SegmentRefiner(self.model.vision, self.config.vision, self.device)
+                if _HAS_SEG_DEPS
+                else None
+            )
 
         # Multi-slot LoRA workspace and slot manager.
         # Slot 0 represents "no LoRA". Active adapters are loaded into slots 1+.
