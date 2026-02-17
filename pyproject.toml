@@ -17,6 +17,10 @@ dependencies = [
     "apache-tvm-ffi>=0.1.5,<0.2",
     "kestrel-native==0.1.1",
     "kestrel-kernels==0.1.2",
+    # Temporary pin: kestrel-kernels==0.1.2 does not strictly pin cutlass yet.
+    # Keep this pinned to avoid incompatible nvidia-cutlass-dsl 4.4.x runtime changes.
+    # Remove after the next kestrel-kernels release includes its own strict cutlass pin.
+    "nvidia-cutlass-dsl==4.3.5",
     "huggingface-hub>=0.20",
 ]
 
