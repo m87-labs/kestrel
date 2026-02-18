@@ -641,6 +641,7 @@ class _ServerState:
                     if parse_error:
                         payload_final["parse_error"] = parse_error
                     if return_base64:
+                        payload_final["coarse_path"] = segment.get("coarse_path") or path
                         payload_final["coarse_mask_base64"] = segment.get(
                             "coarse_mask_base64"
                         )
@@ -683,6 +684,7 @@ class _ServerState:
         if parse_error:
             response_payload["parse_error"] = parse_error
         if return_base64:
+            response_payload["coarse_path"] = segment.get("coarse_path") or path
             response_payload["coarse_mask_base64"] = segment.get("coarse_mask_base64")
             response_payload["refined_mask_base64"] = segment.get("refined_mask_base64")
 
