@@ -50,8 +50,7 @@ from .spatial import compute_spatial_values
 
 
 _LOGGER = logging.getLogger(__name__)
-# Greedily build a prefill batch until estimated launched query tokens
-# (max_query_len * batch_size) reaches this floor.
+# Greedily build a prefill batch until aggregate query tokens reaches this floor.
 _MIN_PREFILL_LAUNCH_TOKENS = 2048
 
 
@@ -224,21 +223,22 @@ class GenerationScheduler:
         """
         progressed = False
         pipeline = self._pipeline
-        prefill_admissible = self._is_prefill_admissible()
-        has_prepared = len(self._prepared_prefills) > 0
+        with torch.cuda.stream(self.runtime.primary_stream):
+            progressed |= self._eager_prepare_prefills()
+            prefill_admissible = self._is_prefill_admissible()
+            has_prepared = len(self._prepared_prefills) > 0
 
-        has_launch = pipeline.has_launch_in_flight()
-        has_queued = pipeline.queue_depth() > 0
+            has_launch = pipeline.has_launch_in_flight()
+            has_queued = pipeline.queue_depth() > 0
 
-        # Only enter stream context if there's GPU work to do.
-        if (
-            has_launch
-            or has_queued
-            or len(self.running) > 0
-            or prefill_admissible
-            or has_prepared
-        ):
-            with torch.cuda.stream(self.runtime.primary_stream):
+            # Only run pipeline work if there is pending GPU or schedulable work.
+            if (
+                has_launch
+                or has_queued
+                or len(self.running) > 0
+                or prefill_admissible
+                or has_prepared
+            ):
                 # 1. Launch forward if none in-flight (forward doesn't need mask)
                 if pipeline.can_launch():
                     launched_forward = False
@@ -582,6 +582,21 @@ class GenerationScheduler:
         )
         return True
 
+    def _eager_prepare_prefills(self) -> bool:
+        """Top up prepared prefills every advance cycle.
+
+        This breaks the prepare starvation loop where preparation only occurs
+        while a launch is already in flight.
+        """
+        progressed = False
+        target_prepared = self.runtime.max_batch_size
+        while (
+            len(self._prepared_prefills) < target_prepared
+            and self._can_prepare_prefill()
+        ):
+            progressed |= self._prepare_prefill()
+        return progressed
+
     def _maybe_prepare_prefill(self, pipeline: PipelineState) -> bool:
         """Prepare a prefill while a GPU forward is in flight.
 
@@ -748,31 +763,40 @@ class GenerationScheduler:
         first = self._prepared_prefills.popleft()
         launch_batch: list[PreparedPrefill] = [first]
         first_use_prefix_attn = self._prefill_use_prefix_attn(first)
+        first_seq_len = self._prefill_query_len(first)
+        max_seq_len = first_seq_len
 
         can_batch_more = (
             first.request.max_new_tokens > 0
             and first.prepared.state.lora_slot == 0
         )
         if can_batch_more:
-            max_seq_len = self._prefill_query_len(first)
-            launch_tokens = max_seq_len
-            while (
-                len(launch_batch) < capacity_remaining
-                and self._prepared_prefills
-                and launch_tokens < _MIN_PREFILL_LAUNCH_TOKENS
-            ):
-                candidate = self._prepared_prefills[0]
+            launch_tokens = first_seq_len
+            skipped_candidates: Deque[PreparedPrefill] = deque()
+            scan_limit = len(self._prepared_prefills)
+            for _ in range(scan_limit):
+                if (
+                    len(launch_batch) >= capacity_remaining
+                    or launch_tokens >= _MIN_PREFILL_LAUNCH_TOKENS
+                ):
+                    break
+                candidate = self._prepared_prefills.popleft()
                 if (
                     candidate.request.max_new_tokens <= 0
                     or candidate.prepared.state.lora_slot != 0
                     or self._prefill_use_prefix_attn(candidate) != first_use_prefix_attn
                 ):
-                    break
-                launch_batch.append(self._prepared_prefills.popleft())
-                candidate_seq_len = self._prefill_query_len(launch_batch[-1])
+                    skipped_candidates.append(candidate)
+                    continue
+                launch_batch.append(candidate)
+                candidate_seq_len = self._prefill_query_len(candidate)
                 if candidate_seq_len > max_seq_len:
                     max_seq_len = candidate_seq_len
-                launch_tokens = max_seq_len * len(launch_batch)
+                launch_tokens += candidate_seq_len
+            if skipped_candidates:
+                skipped_candidates.extend(self._prepared_prefills)
+                self._prepared_prefills.clear()
+                self._prepared_prefills.extend(skipped_candidates)
 
         requests = [item.request for item in launch_batch]
         lifecycles = [request.lifecycle for request in requests]

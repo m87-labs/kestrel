@@ -86,8 +86,6 @@ from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
-
-
 @dataclass(slots=True)
 class EngineMetrics:
     """Token counts and timing for a single request."""
@@ -1027,7 +1025,7 @@ class InferenceEngine:
 
         def promote_crops() -> bool:
             promoted = False
-            while len(scheduler.waiting) < runtime.max_batch_size * 2:
+            while len(scheduler.waiting) < runtime.max_batch_size * 4:
                 try:
                     rid = ready_crops.get_nowait()
                 except queue.Empty:
