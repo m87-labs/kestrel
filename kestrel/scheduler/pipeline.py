@@ -147,7 +147,7 @@ class PrefillLaunch:
     staging: object
     slot_id: int
     logits: object
-    prepared: object
+    prepared_sequences: object
     prefill_slot: object
 
 
@@ -164,7 +164,7 @@ class PrefillPendingCommit:
 
     staging: object
     slot_id: int
-    prepared: object
+    prepared_sequences: object
     prefill_slot: object
 
 

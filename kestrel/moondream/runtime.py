@@ -175,7 +175,7 @@ class PrefillSlot:
 
 @dataclass
 class _CacheLookupResult:
-    """Result of prefix cache lookup in start_sequence."""
+    """Result of prefix cache lookup during prefill preparation."""
 
     match: MatchResult | None
     skip_positions: int
@@ -194,7 +194,7 @@ class PreparedSequence:
 
     Lifecycle:
     - created by `MoondreamRuntime.prepare_sequence(...)`
-    - consumed by `MoondreamRuntime.launch_prepared_sequence(...)` (GPU enqueue)
+    - consumed by `MoondreamRuntime.launch_prepared_batch(...)` (GPU enqueue)
     - finalized by `MoondreamRuntime.finalize_prepared_sequence_after_prefill(...)`
     - aborted by `MoondreamRuntime.abort_prepared_sequence(...)` on error/pause
 
@@ -477,15 +477,15 @@ class MoondreamRuntime:
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
                 slot_id=slot_id,
-                batch_idx=torch.empty((1,), dtype=torch.int64, device=self.device),
+                batch_idx=torch.empty(
+                    (self.max_batch_size,), dtype=torch.int64, device=self.device
+                ),
                 step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
                 commit_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
             )
             for slot_id in range(2)
         ]
         self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
-
-        self._prefill_fn = self._prefill_impl
 
         self.seg_refiner = (
             SegmentRefiner(self.model.vision, self.config.vision, self.device)
@@ -501,8 +501,6 @@ class MoondreamRuntime:
         self._max_lora_rank: int | None = max_lora_rank
         if max_lora_rank is not None:
             max_slots = self.max_batch_slots
-
-
             self._lora_workspace = TextLoRAWorkspace(
                 text_config=self.config.text,
                 max_slots=max_slots,
@@ -762,7 +760,7 @@ class MoondreamRuntime:
             )
 
     # ------------------------------------------------------------------
-    # start_sequence helpers
+    # Prefill preparation helpers
 
     def check_prefix_cache(
         self,
@@ -1038,37 +1036,6 @@ class MoondreamRuntime:
 
     # ------------------------------------------------------------------
 
-    def start_sequence(
-        self,
-        prompt_tokens: Sequence[Token],
-        *,
-        prefill_slot: PrefillSlot,
-        image: Optional[np.ndarray] = None,
-        image_crops: Optional[OverlapCropOutput] = None,
-        max_new_tokens: Optional[int] = None,
-        lora_slot: int = 0,
-        image_hash: bytes | None = None,
-        adapter_id: str | None = None,
-    ) -> tuple[SequenceState, Tensor]:
-        prepared = self.prepare_sequence(
-            prompt_tokens=prompt_tokens,
-            image=image,
-            image_crops=image_crops,
-            max_new_tokens=max_new_tokens,
-            lora_slot=lora_slot,
-            image_hash=image_hash,
-            adapter_id=adapter_id,
-        )
-        try:
-            logits = self.launch_prepared_sequence(
-                prepared, prefill_slot, image=image, image_crops=image_crops
-            )
-            self.finalize_prepared_sequence_after_prefill(prepared)
-        except Exception:
-            self.abort_prepared_sequence(prepared)
-            raise
-        return prepared.state, logits
-
     def prepare_sequence(
         self,
         prompt_tokens: Sequence[Token],
@@ -1089,7 +1056,7 @@ class MoondreamRuntime:
         - reserve KV capacity up to target_length
 
         The returned PreparedSequence can be launched later via
-        `launch_prepared_sequence` and finalized via
+        `launch_prepared_batch` and finalized via
         `finalize_prepared_sequence_after_prefill`.
 
         Note: This method is decoupled from PrefillSlot. The slot is acquired
@@ -1194,71 +1161,172 @@ class MoondreamRuntime:
             image_hash=image_hash,
         )
 
-    def launch_prepared_sequence(
+    def _build_prefill_inputs_for_prepared(
         self,
         prepared: PreparedSequence,
-        prefill_slot: PrefillSlot,
         *,
-        image: Optional[np.ndarray] = None,
-        image_crops: Optional[OverlapCropOutput] = None,
-    ) -> Tensor:
-        """Launch GPU prefill work for a prepared sequence and return logits.
-
-        Args:
-            prepared: The prepared sequence from prepare_sequence().
-            prefill_slot: The prefill slot to use for this launch. The slot's
-                batch_idx tensor will be filled with the sequence's batch index.
-        """
-
+        image: Optional[np.ndarray],
+        image_crops: Optional[OverlapCropOutput],
+    ) -> tuple[Tensor, Tensor, bool]:
+        """Build per-sequence prefill inputs for a prepared sequence."""
         tokens_list = prepared.tokens_list
         state = prepared.state
         cache_result = prepared.cache_result
         prompt_len = state.prompt_length or state.length
         image_kv_length = state.image_length
-        batch_tensor = prefill_slot.batch_idx
 
-        # Fill the prefill slot's batch_idx tensor with the sequence's batch index.
-        # This must be done on the primary stream to ensure proper ordering with
-        # subsequent GPU operations.
+        if cache_result.can_reuse:
+            inputs_embeds, position_ids, _ = self._prepare_append_prefill_inputs(
+                tokens_list,
+                cache_result.skip_positions,
+                image_kv_length,
+                prompt_len,
+            )
+        else:
+            inputs_embeds, position_ids, _ = self._prepare_full_prefill_inputs(
+                tokens_list,
+                image,
+                image_crops,
+                prompt_len,
+            )
+
+        use_prefix_attn = bool(image_kv_length) and not cache_result.can_reuse
+        return inputs_embeds, position_ids, use_prefix_attn
+
+    def launch_prepared_batch(
+        self,
+        prepared_sequences: Sequence[PreparedSequence],
+        prefill_slot: PrefillSlot,
+        *,
+        images: Sequence[Optional[np.ndarray]] | None = None,
+        image_crops_list: Sequence[Optional[OverlapCropOutput]] | None = None,
+    ) -> Tensor:
+        """Launch GPU prefill for one or more prepared sequences.
+
+        Returns:
+            Logits for the first generated token for each sequence, shape [B, vocab].
+        """
+        batch_size = len(prepared_sequences)
+        if batch_size == 0:
+            raise ValueError("prepared_sequences must be non-empty")
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"Prefill batch size {batch_size} exceeds max_batch_size={self.max_batch_size}"
+            )
+
+        if images is None:
+            images = [None] * batch_size
+        if image_crops_list is None:
+            image_crops_list = [None] * batch_size
+        if len(images) != batch_size:
+            raise ValueError("images length must match prepared_sequences")
+        if len(image_crops_list) != batch_size:
+            raise ValueError("image_crops_list length must match prepared_sequences")
+
+        lora_slots = [prepared.state.lora_slot for prepared in prepared_sequences]
+        if batch_size > 1 and any(slot != 0 for slot in lora_slots):
+            raise NotImplementedError("Batched prefill does not yet support LoRA slots")
+
+        # Keep all GPU work on the primary stream so all callers share identical
+        # ordering semantics.
         with torch.cuda.stream(self._primary_stream):
-            batch_tensor.fill_(state.batch_idx)
-
-        # Commit page table for this batch before forward pass (deferred H2D sync)
-        self.page_table.commit_block_table([state.batch_idx])
-
-        # 8-9. GPU work: embedding, vision encoding, and prefill forward pass.
-        # Use primary stream to ensure ordering with shared buffers.
-        with torch.cuda.stream(self._primary_stream):
-            if cache_result.can_reuse:
-                inputs_embeds, position_ids, fa3_seqused_k = (
-                    self._prepare_append_prefill_inputs(
-                        tokens_list,
-                        cache_result.skip_positions,
-                        image_kv_length,
-                        prompt_len,
+            per_inputs: list[Tensor] = []
+            per_positions: list[Tensor] = []
+            use_prefix_attn: bool | None = None
+            for prepared, image, image_crops in zip(
+                prepared_sequences, images, image_crops_list
+            ):
+                inputs_embeds, position_ids, seq_use_prefix_attn = (
+                    self._build_prefill_inputs_for_prepared(
+                        prepared,
+                        image=image,
+                        image_crops=image_crops,
                     )
                 )
-            else:
-                inputs_embeds, position_ids, fa3_seqused_k = (
-                    self._prepare_full_prefill_inputs(
-                        tokens_list,
-                        image,
-                        image_crops,
-                        prompt_len,
+                if inputs_embeds.shape[1] == 0:
+                    raise RuntimeError("Prefill inputs must contain at least one token")
+                if use_prefix_attn is None:
+                    use_prefix_attn = seq_use_prefix_attn
+                elif use_prefix_attn != seq_use_prefix_attn:
+                    raise ValueError(
+                        "All sequences in a prefill batch must share use_prefix_attn mode"
                     )
-                )
+                per_inputs.append(inputs_embeds)
+                per_positions.append(position_ids)
 
-            hidden, logits = self._prefill(
+            assert use_prefix_attn is not None
+            hidden_dim = self.bos_embed.shape[-1]
+            max_seq_len = max(t.shape[1] for t in per_inputs)
+            inputs_embeds = torch.zeros(
+                (batch_size, max_seq_len, hidden_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            position_ids = torch.zeros(
+                (batch_size, max_seq_len), dtype=torch.long, device=self.device
+            )
+            slot_batch_idx = torch.zeros(
+                (batch_size, max_seq_len), dtype=torch.int64, device=self.device
+            )
+            last_token_positions = torch.empty(
+                (batch_size,), dtype=torch.long, device=self.device
+            )
+            fa3_seqused_q = torch.empty(
+                (batch_size,), dtype=torch.int32, device=self.device
+            )
+            fa3_seqused_k = torch.tensor(
+                [
+                    int(prepared.state.prompt_length or prepared.state.length)
+                    for prepared in prepared_sequences
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+            row_batch_idx = prefill_slot.batch_idx[:batch_size]
+            batch_indices: list[int] = []
+
+            for row, (prepared, embed_row, pos_row) in enumerate(
+                zip(prepared_sequences, per_inputs, per_positions)
+            ):
+                seq_len = int(embed_row.shape[1])
+                prompt_len = int(prepared.state.prompt_length or prepared.state.length)
+                if seq_len > prompt_len:
+                    raise AssertionError(
+                        f"Prefill input length ({seq_len}) exceeds prompt length ({prompt_len})"
+                    )
+                batch_idx = prepared.state.batch_idx
+                batch_indices.append(batch_idx)
+                row_batch_idx[row] = batch_idx
+                inputs_embeds[row, :seq_len, :].copy_(embed_row[0, :, :])
+                position_ids[row, :seq_len].copy_(pos_row[0, :])
+                # Route padded tokens to reserved batch row 0 so they never write
+                # into real sequence KV slots.
+                slot_batch_idx[row, :seq_len].fill_(batch_idx)
+                fa3_seqused_q[row] = seq_len
+                last_token_positions[row] = seq_len - 1
+
+            # Commit page table rows for all batch indices before forward pass.
+            self.page_table.commit_block_table(batch_indices)
+
+            lora_slot = lora_slots[0] if lora_slots else 0
+            hidden, logits = self._prefill_impl(
                 inputs_embeds,
                 None,  # attention_mask
                 position_ids,
-                state.lora_slot,
-                batch_idx=batch_tensor,
-                use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
+                batch_idx=slot_batch_idx,
+                lora_slot=lora_slot,
+                use_prefix_attn=use_prefix_attn,
+                fa3_seqused_q=fa3_seqused_q,
                 fa3_seqused_k=fa3_seqused_k,
+                last_token_positions=last_token_positions,
             )
 
-        state.last_hidden = hidden[:, -1, :].squeeze(0).detach()
+            row_ids = torch.arange(batch_size, device=self.device)
+            hidden_last = hidden[row_ids, last_token_positions]
+            for row, prepared in enumerate(prepared_sequences):
+                prepared.state.last_hidden = hidden_last[row].detach()
+
         return logits
 
     def finalize_prepared_sequence_after_prefill(
@@ -1311,47 +1379,37 @@ class MoondreamRuntime:
     # ------------------------------------------------------------------
     # Core forward paths
 
-    def _prefill(
-        self,
-        inputs_embeds: Tensor,
-        attn_mask: Optional[Tensor],
-        position_ids: Tensor,
-        lora_slot: int = 0,
-        batch_idx: Tensor | None = None,
-        *,
-        use_prefix_attn: bool,
-        fa3_seqused_k: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        hidden, logits = self._prefill_fn(
-            inputs_embeds,
-            attn_mask,
-            position_ids,
-            lora_slot,
-            batch_idx=batch_idx,
-            use_prefix_attn=use_prefix_attn,
-            fa3_seqused_k=fa3_seqused_k,
-        )
-        return hidden, logits
-
     def _prefill_impl(
         self,
         inputs_embeds: Tensor,
         attn_mask: Optional[Tensor],
         position_ids: Tensor,
+        batch_idx: Tensor,
         lora_slot: int = 0,
-        batch_idx: Tensor | None = None,
         *,
         use_prefix_attn: bool,
+        fa3_seqused_q: Tensor,
         fa3_seqused_k: Tensor,
+        last_token_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        if batch_idx is None:
-            raise RuntimeError("Prefill batch index missing during warmup")
+        if batch_idx.ndim != 2:
+            raise ValueError("batch_idx must be rank-2")
+        if batch_idx.shape != position_ids.shape:
+            raise ValueError("batch_idx and position_ids must have matching shape")
+        batch_rows = batch_idx[:, 0].to(dtype=torch.long)
+
+        batch_size = int(inputs_embeds.shape[0])
+        if batch_size > 1 and lora_slot != 0:
+            raise NotImplementedError("Batched prefill does not yet support LoRA slots")
+
         slot_mapping = self.page_table.build_slot_mapping(
             batch_idx=batch_idx, positions=position_ids
         )
 
         # Build FA3 paged attention metadata for prefill
-        fa3_page_table = self.page_table.page_table[batch_idx : batch_idx + 1]
+        fa3_page_table = torch.index_select(
+            self.page_table.page_table, 0, batch_rows
+        )
 
         # For no-adapter prefill, skip LoRA entirely to avoid redundant work
         if lora_slot == 0:
@@ -1360,7 +1418,9 @@ class MoondreamRuntime:
             single_lora_id = None
         else:
             lora_workspace = self._lora_workspace
-            lora_slot_ids = torch.tensor([lora_slot], dtype=torch.int32, device=self.device)
+            lora_slot_ids = torch.tensor(
+                [lora_slot], dtype=torch.int32, device=self.device
+            )
             # Single-LoRA prefill path uses a fixed lora_id (slot N -> lora_id N-1)
             single_lora_id = lora_slot - 1
 
@@ -1374,13 +1434,16 @@ class MoondreamRuntime:
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
             page_table=fa3_page_table,
+            fa3_seqused_q=fa3_seqused_q,
             fa3_seqused_k=fa3_seqused_k,
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
             single_lora_id=single_lora_id,
         )
 
-        logits = lm_head(hidden, self.model.text)
+        row_ids = torch.arange(hidden.shape[0], device=hidden.device)
+        hidden_last = hidden[row_ids, last_token_positions.to(dtype=torch.long)]
+        logits = lm_head(hidden_last.unsqueeze(1), self.model.text)
         return hidden, logits
 
     def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
