@@ -177,6 +177,7 @@ class GenerationScheduler:
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
         self._prepared_prefills: Deque[PreparedPrefill] = deque()
+        self._last_deferred_request_id: int | None = None
 
     # ------------------------------------------------------------------
     # Submission
@@ -746,8 +747,17 @@ class GenerationScheduler:
         if slot_id is None:
             return False
 
-        # Don't launch if decode batch is at capacity.
-        capacity_remaining = self.runtime.max_batch_size - len(self.running)
+        max_active = self.runtime.max_batch_slots - 1
+        if len(self.running) > max_active:
+            raise AssertionError(
+                f"running queue exceeded active slot cap ({len(self.running)} > {max_active})"
+            )
+
+        # Capacity is bounded by both active-slot headroom and per-forward microbatch.
+        capacity_remaining = min(
+            self.runtime.max_batch_size,
+            max_active - len(self.running),
+        )
         if capacity_remaining <= 0:
             return False
 
@@ -940,6 +950,29 @@ class GenerationScheduler:
                 return False
         return True
 
+    def _cap_decode_dispatch(
+        self,
+        dispatchable: List[RequestLifecycle],
+        limit: int,
+    ) -> List[RequestLifecycle]:
+        """Cap decode dispatch size while keeping deterministic, fair ordering."""
+        if len(dispatchable) <= limit:
+            self._last_deferred_request_id = None
+            return dispatchable
+
+        last_deferred = self._last_deferred_request_id
+        defer_idx: int | None = None
+        for idx in range(len(dispatchable) - 1, -1, -1):
+            if dispatchable[idx].request.request_id != last_deferred:
+                defer_idx = idx
+                break
+        if defer_idx is None:
+            defer_idx = len(dispatchable) - 1
+
+        deferred = dispatchable.pop(defer_idx)
+        self._last_deferred_request_id = deferred.request.request_id
+        return dispatchable[:limit]
+
     def schedule_decode_step(self) -> Optional[StepPlan]:
         """Select sequences for the next decode step.
 
@@ -965,6 +998,12 @@ class GenerationScheduler:
 
         if not active:
             return None
+
+        decode_limit = self.runtime.max_batch_size
+        if len(active) > decode_limit:
+            active = self._cap_decode_dispatch(active, decode_limit)
+        else:
+            self._last_deferred_request_id = None
 
         return StepPlan(sequences=active)
 
