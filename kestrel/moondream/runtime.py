@@ -1,6 +1,7 @@
 """Moondream runtime with paged KV cache and optional image prefixes."""
 
 
+import contextlib
 import functools
 import json
 from copy import deepcopy
@@ -61,6 +62,32 @@ from .decode_slot import DecodeSlot, create_decode_slot
 
 
 DEFAULT_MAX_TOKENS = 768
+
+
+@contextlib.contextmanager
+def _disable_parameter_initialization():
+    """Temporarily skip default parameter init during model construction.
+
+    Runtime weights are loaded from checkpoint immediately after construction,
+    so random reset_parameters work is redundant startup overhead.
+    """
+
+    patches = (
+        (torch.nn.Linear, "reset_parameters"),
+        (torch.nn.LayerNorm, "reset_parameters"),
+        (torch.nn.Embedding, "reset_parameters"),
+    )
+    originals: list[tuple[type[torch.nn.Module], str, object]] = []
+    for cls, method_name in patches:
+        original = getattr(cls, method_name, None)
+        if original is not None:
+            originals.append((cls, method_name, original))
+            setattr(cls, method_name, lambda self: None)
+    try:
+        yield
+    finally:
+        for cls, method_name, original in originals:
+            setattr(cls, method_name, original)
 
 
 class TextToken(NamedTuple):
@@ -331,13 +358,25 @@ class MoondreamRuntime:
             h2d_stream=self._primary_stream,
         )
 
-        self.model = MoondreamModel(
-            self.config,
-            dtype=self.dtype,
-            device=self.device,
-            setup_caches=False,
-        ).eval()
-        self.region = build_region_module(self.config.region, self.dtype).to(self.device)
+        construction_device = torch.device("meta")
+        with _disable_parameter_initialization():
+            self.model = MoondreamModel(
+                self.config,
+                dtype=self.dtype,
+                device=construction_device,
+                setup_caches=False,
+            ).eval()
+            self.region = build_region_module(
+                self.config.region,
+                self.dtype,
+                device=construction_device,
+            )
+
+        # Materialize model storage directly on target device without initializing
+        # temporary tensors on CPU.
+        self.model.to_empty(device=self.device)
+        self.region.to_empty(device=self.device)
+
         self.image_prefix_length = self.model.vision.pos_emb.shape[1]
         n_layers = self.config.text.n_layers
         captured_k_scales: list[Optional[float]] = [None] * n_layers

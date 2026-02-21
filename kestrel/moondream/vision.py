@@ -185,30 +185,35 @@ def vision_projection(
     return output
 
 
-def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
+def build_vision_model(
+    config: VisionConfig,
+    dtype: torch.dtype,
+    *,
+    device: torch.device | str | None = None,
+) -> nn.Module:
     patch_dim = config.enc_patch_size * config.enc_patch_size * config.in_channels
     grid_size = config.crop_size // config.enc_patch_size
     num_patches = grid_size * grid_size
 
     model = nn.ModuleDict(
         {
-            "patch_emb": nn.Linear(patch_dim, config.enc_dim, dtype=dtype),
+            "patch_emb": nn.Linear(patch_dim, config.enc_dim, dtype=dtype, device=device),
             "blocks": nn.ModuleList(
                 [
                     nn.ModuleDict(
                         {
-                            "ln1": nn.LayerNorm(config.enc_dim, dtype=dtype),
+                            "ln1": nn.LayerNorm(config.enc_dim, dtype=dtype, device=device),
                             "attn": nn.ModuleDict(
                                 {
-                                    "qkv": nn.Linear(config.enc_dim, 3 * config.enc_dim, dtype=dtype),
-                                    "proj": nn.Linear(config.enc_dim, config.enc_dim, dtype=dtype),
+                                    "qkv": nn.Linear(config.enc_dim, 3 * config.enc_dim, dtype=dtype, device=device),
+                                    "proj": nn.Linear(config.enc_dim, config.enc_dim, dtype=dtype, device=device),
                                 }
                             ),
-                            "ln2": nn.LayerNorm(config.enc_dim, dtype=dtype),
+                            "ln2": nn.LayerNorm(config.enc_dim, dtype=dtype, device=device),
                             "mlp": nn.ModuleDict(
                                 {
-                                    "fc1": nn.Linear(config.enc_dim, config.enc_ff_dim, dtype=dtype),
-                                    "fc2": nn.Linear(config.enc_ff_dim, config.enc_dim, dtype=dtype),
+                                    "fc1": nn.Linear(config.enc_dim, config.enc_ff_dim, dtype=dtype, device=device),
+                                    "fc2": nn.Linear(config.enc_ff_dim, config.enc_dim, dtype=dtype, device=device),
                                 }
                             ),
                         }
@@ -216,16 +221,16 @@ def build_vision_model(config: VisionConfig, dtype: torch.dtype) -> nn.Module:
                     for _ in range(config.enc_n_layers)
                 ]
             ),
-            "post_ln": nn.LayerNorm(config.enc_dim, dtype=dtype),
+            "post_ln": nn.LayerNorm(config.enc_dim, dtype=dtype, device=device),
             "proj_mlp": nn.ModuleDict(
                 {
-                    "fc1": nn.Linear(config.enc_dim * 2, config.proj_inner_dim, dtype=dtype),
-                    "fc2": nn.Linear(config.proj_inner_dim, config.proj_out_dim, dtype=dtype),
+                    "fc1": nn.Linear(config.enc_dim * 2, config.proj_inner_dim, dtype=dtype, device=device),
+                    "fc2": nn.Linear(config.proj_inner_dim, config.proj_out_dim, dtype=dtype, device=device),
                 }
             ),
         }
     )
-    model.pos_emb = nn.Parameter(torch.zeros(1, num_patches, config.enc_dim, dtype=dtype))
+    model.pos_emb = nn.Parameter(torch.zeros(1, num_patches, config.enc_dim, dtype=dtype, device=device))
     return model
 
 

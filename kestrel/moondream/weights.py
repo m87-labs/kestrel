@@ -495,8 +495,14 @@ def load_moondream_weights(
                 raw_getter=lambda name: all_tensors[name],
             )
     else:
-        # Load .pt checkpoints on CPU first to avoid transient GPU OOM during deserialization.
-        tensors_raw = torch.load(path, map_location="cpu", weights_only=True)
+        # Load .pt checkpoints on CPU first to avoid transient GPU OOM during
+        # deserialization. mmap keeps startup fast on repeated local loads.
+        tensors_raw = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
         all_tensors = {k.replace("._orig_mod", ""): v for k, v in tensors_raw.items()}
 
         if tensor_hook is not None:

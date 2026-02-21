@@ -142,36 +142,41 @@ def spatial_bins_to_values(
     return out_coord, out_size
 
 
-def build_region_module(config: RegionConfig, dtype: torch.dtype) -> nn.ModuleDict:
+def build_region_module(
+    config: RegionConfig,
+    dtype: torch.dtype,
+    *,
+    device: torch.device | str | None = None,
+) -> nn.ModuleDict:
     if config.decoder_arch == "linear":
-        coord_decoder = nn.Linear(config.dim, config.coord_out_dim, dtype=dtype)
-        size_decoder = nn.Linear(config.dim, config.size_out_dim, dtype=dtype)
+        coord_decoder = nn.Linear(config.dim, config.coord_out_dim, dtype=dtype, device=device)
+        size_decoder = nn.Linear(config.dim, config.size_out_dim, dtype=dtype, device=device)
     elif config.decoder_arch == "mlp":
         inner_dim = 8192
         coord_decoder = nn.ModuleDict({
-            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype),
-            "fc2": nn.Linear(inner_dim, config.coord_out_dim, dtype=dtype),
+            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype, device=device),
+            "fc2": nn.Linear(inner_dim, config.coord_out_dim, dtype=dtype, device=device),
         })
         size_decoder = nn.ModuleDict({
-            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype),
-            "fc2": nn.Linear(inner_dim, config.size_out_dim, dtype=dtype),
+            "fc1": nn.Linear(config.dim, inner_dim, dtype=dtype, device=device),
+            "fc2": nn.Linear(inner_dim, config.size_out_dim, dtype=dtype, device=device),
         })
     else:
         raise ValueError(f"Unknown decoder_arch: {config.decoder_arch}")
 
     modules: dict = {
-        "coord_encoder": nn.Linear(config.coord_feat_dim, config.dim, dtype=dtype),
+        "coord_encoder": nn.Linear(config.coord_feat_dim, config.dim, dtype=dtype, device=device),
         "coord_decoder": coord_decoder,
-        "size_encoder": nn.Linear(config.size_feat_dim, config.dim, dtype=dtype),
+        "size_encoder": nn.Linear(config.size_feat_dim, config.dim, dtype=dtype, device=device),
         "size_decoder": size_decoder,
     }
     if config.use_ln:
-        modules["ln"] = nn.LayerNorm(config.dim, dtype=dtype)
+        modules["ln"] = nn.LayerNorm(config.dim, dtype=dtype, device=device)
 
     module = nn.ModuleDict(modules)
 
-    coord_feats = torch.empty(config.coord_feat_dim // 2, 1, dtype=dtype).T
-    size_feats = torch.empty(config.size_feat_dim // 2, 2, dtype=dtype).T
+    coord_feats = torch.empty(config.coord_feat_dim // 2, 1, dtype=dtype, device=device).T
+    size_feats = torch.empty(config.size_feat_dim // 2, 2, dtype=dtype, device=device).T
     module.coord_features = nn.Parameter(coord_feats)
     module.size_features = nn.Parameter(size_feats)
     return module
