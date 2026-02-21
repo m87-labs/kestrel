@@ -48,9 +48,8 @@ docker run --gpus all --rm -it \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MOONDREAM_API_KEY` | (required) | Moondream API key for model access |
-| `KESTREL_MODEL_PATH` | (none) | Local path to model weights |
-| `KESTREL_MODEL` | `moondream3-preview` | Model name (for download) |
-| `KESTREL_DEVICE` | `cuda` | Device (`cuda`, `cpu`) |
+| `KESTREL_MODEL` | `moondream3-preview` | Model name — `moondream2` or `moondream3-preview` |
+| `KESTREL_MODEL_PATH` | (none) | Optional local path to model weights. If not set, the model is downloaded automatically |
 | `KESTREL_MAX_BATCH_SIZE` | `4` | Maximum concurrent batch size |
 
 ## Client Examples

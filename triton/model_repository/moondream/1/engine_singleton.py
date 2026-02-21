@@ -56,10 +56,6 @@ def get_or_create_engine() -> "InferenceEngine":
         if model_path:
             kwargs["model_path"] = model_path
 
-        device = os.environ.get("KESTREL_DEVICE")
-        if device:
-            kwargs["device"] = device
-
         model = os.environ.get("KESTREL_MODEL")
         if model:
             kwargs["model"] = model
