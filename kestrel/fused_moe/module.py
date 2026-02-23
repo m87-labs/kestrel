@@ -684,11 +684,13 @@ class FusedMoEModule(nn.Module):
             a_fp8_scale=fp8_up_scale,
         )
 
+        lora_scale = float(self.top_k)
+
         if use_batched_lora:
             if use_lora_stream:
                 compute_stream.wait_event(self._lora_up_event)
             if lora_up_out is not None:
-                up_out.add_(lora_up_out)
+                up_out.add_(lora_up_out, alpha=lora_scale)
 
         if use_single_lora:
             # Single-LoRA path: use separate routing if block_m needs adjustment
@@ -727,7 +729,7 @@ class FusedMoEModule(nn.Module):
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
-            up_out.add_(lora_up_out)
+            up_out.add_(lora_up_out, alpha=lora_scale)
 
         activation_in = up_out.view(num_tokens * self.top_k, -1)
         activation_out = self._workspaces.activation.get(
@@ -795,7 +797,7 @@ class FusedMoEModule(nn.Module):
             if use_lora_stream:
                 compute_stream.wait_event(self._lora_down_event)
             if lora_down_out is not None:
-                down_out.add_(lora_down_out)
+                down_out.add_(lora_down_out, alpha=lora_scale)
 
         if use_single_lora:
             # Single-LoRA path for down projection
@@ -824,7 +826,7 @@ class FusedMoEModule(nn.Module):
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
-            down_out.add_(lora_down_out)
+            down_out.add_(lora_down_out, alpha=lora_scale)
 
         fused = self._workspaces.output.get(
             (num_tokens, self.input_size),

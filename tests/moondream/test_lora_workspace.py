@@ -368,6 +368,13 @@ class TestLoadSlot:
                     adapter_layer.down_b[expert_id],
                 )
 
+    def test_moe_rank_not_divisible_by_experts_per_token_raises(
+        self, moe_config: TextConfig, device: torch.device
+    ):
+        """MoE LoRA rank must be divisible by experts_per_token."""
+        with pytest.raises(ValueError, match="must be divisible by experts_per_token"):
+            create_test_adapter(moe_config, rank=3, device=device)
+
     def test_load_slot_with_smaller_rank_zero_pads(
         self, dense_only_config: TextConfig, device: torch.device
     ):
@@ -601,4 +608,3 @@ class TestAdapterSlotManager:
         manager.release(slot1)
         assert manager.refcount(slot1) == 0
         assert manager.get_adapter_id(slot1) is None
-
