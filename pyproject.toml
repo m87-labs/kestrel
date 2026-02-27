@@ -26,6 +26,12 @@ exclude = ["tests", "tests.*"]
 jetson-jp6 = [
     "kestrel-kernels-jetson-pt24==0.2.0",
 ]
+jetson-jp61 = [
+    "kestrel-kernels-jetson-pt25==0.2.0",
+]
+jetson-jp62 = [
+    "kestrel-kernels-jetson-pt25==0.2.0",
+]
 
 [dependency-groups]
 dev = [
