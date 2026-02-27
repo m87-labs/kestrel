@@ -14,7 +14,7 @@ dependencies = [
     "uvicorn>=0.30",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "kestrel-native==0.1.3",
-    "kestrel-kernels==0.1.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "kestrel-kernels==0.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "huggingface-hub>=0.20",
 ]
 
