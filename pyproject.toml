@@ -14,7 +14,7 @@ dependencies = [
     "uvicorn>=0.30",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "kestrel-native==0.1.3",
-    "kestrel-kernels==0.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "kestrel-kernels==0.1.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "huggingface-hub>=0.20",
 ]
 
@@ -24,13 +24,13 @@ exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
 jetson-jp6 = [
-    "kestrel-kernels-jetson-pt24==0.2.0",
+  #  "kestrel-kernels-jetson-pt24==0.2.0",
 ]
 jetson-jp61 = [
-    "kestrel-kernels-jetson-pt25==0.2.0",
+  #  "kestrel-kernels-jetson-pt25==0.2.0",
 ]
 jetson-jp62 = [
-    "kestrel-kernels-jetson-pt25==0.2.0",
+  #  "kestrel-kernels-jetson-pt25==0.2.0",
 ]
 
 [dependency-groups]
