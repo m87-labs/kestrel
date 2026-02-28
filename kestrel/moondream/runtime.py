@@ -433,7 +433,7 @@ class MoondreamRuntime:
 
         device_cc_major, device_cc_minor = torch.cuda.get_device_capability(self.device)
         device_sm = device_cc_major * 10 + device_cc_minor
-        fp8_kv_supported_sms = {89, 90}
+        fp8_kv_supported_sms = {87, 89, 90}
 
         if (
             self._kv_layer_k_scales is not None
@@ -456,7 +456,7 @@ class MoondreamRuntime:
                     )
                 elif device_sm not in fp8_kv_supported_sms:
                     warnings.warn(
-                        "KV scales found in checkpoint but FP8 KV cache currently requires SM89/SM90 "
+                        "KV scales found in checkpoint but FP8 KV cache currently requires SM87/SM89/SM90 "
                         "decode kernels; falling back to standard KV cache.",
                         stacklevel=2,
                     )
@@ -1880,7 +1880,10 @@ class MoondreamRuntime:
         with self.graph_capture_lock:
             torch.cuda.synchronize(device=self.device)
 
-            for batch_size in range(1, max_batch + 1):
+            # Capture largest batch first, then hint smaller captures to reuse
+            # its graph memory pool. This lowers peak graph-reserved memory.
+            shared_pool = None
+            for batch_size in range(max_batch, 0, -1):
                 graph = torch.cuda.CUDAGraph()
 
                 with torch.inference_mode():
@@ -1894,7 +1897,7 @@ class MoondreamRuntime:
                     torch.cuda.synchronize(device=self.device)
 
                     # Capture
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, pool=shared_pool):
                         out = vision_encoder(
                             self._vision_input[:batch_size],
                             self.model.vision,
@@ -1902,6 +1905,8 @@ class MoondreamRuntime:
                         )
                         self._vision_output[:batch_size].copy_(out)
 
+                if shared_pool is None:
+                    shared_pool = graph.pool()
                 self._vision_graphs[batch_size] = graph
                 torch.cuda.synchronize(device=self.device)
 

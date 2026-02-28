@@ -4,15 +4,23 @@ from typing import Optional
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - optional on aarch64/Jetson
+    triton = None
+    tl = None
 
 from kestrel_kernels import get_runtime
 
 from kestrel.utils import CpuGpuBuffer
 
-_KERNELS = get_runtime()
-reshape_and_cache_flash_cuda = _KERNELS.cache.reshape_and_cache_flash
+try:
+    _KERNELS = get_runtime()
+    reshape_and_cache_flash_cuda = _KERNELS.cache.reshape_and_cache_flash
+except Exception:  # pragma: no cover - runtime compatibility fallback
+    reshape_and_cache_flash_cuda = None
 
 
 def _maybe_stream_context(stream: torch.cuda.Stream | None):
@@ -24,6 +32,33 @@ def _maybe_stream_context(stream: torch.cuda.Stream | None):
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
     return (x + multiple - 1) // multiple
+
+
+def _build_fa3_decode_metadata_torch(
+    *,
+    page_table: torch.Tensor,
+    batch_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    out_page_table: torch.Tensor,
+    out_seqused_k: torch.Tensor,
+    n_pages: int,
+    page_size: int,
+) -> None:
+    """Torch fallback for FA3 decode metadata when Triton is unavailable."""
+    batch_size = batch_idx.shape[0]
+    if batch_size == 0:
+        return
+
+    batch_idx_i64 = batch_idx.to(dtype=torch.long)
+    seqlen = input_pos.to(dtype=torch.long) + 1
+    num_pages = ((seqlen + (page_size - 1)) // page_size).clamp(max=n_pages)
+
+    rows = page_table.index_select(0, batch_idx_i64)
+    row_view = out_page_table[:batch_size]
+    row_view.zero_()
+    valid_mask = torch.arange(n_pages, device=row_view.device).unsqueeze(0) < num_pages.unsqueeze(1)
+    row_view[valid_mask] = rows[valid_mask]
+    out_seqused_k[:batch_size].copy_(seqlen.to(dtype=torch.int32))
 
 
 class PagedKVCache(torch.nn.Module):
@@ -94,16 +129,27 @@ class PagedKVCache(torch.nn.Module):
             key_cache = key_cache.view(torch.uint8)
             value_cache = value_cache.view(torch.uint8)
 
-        reshape_and_cache_flash_cuda(
-            k_view,
-            v_view,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self._kv_cache_dtype,
-            self.k_scale_tensor,
-            self.v_scale_tensor,
-        )
+        if reshape_and_cache_flash_cuda is None:
+            if self._kv_cache_dtype.startswith("fp8"):
+                raise RuntimeError(
+                    "FP8 KV cache update requires a compatible kestrel-kernels build."
+                )
+            page_size = int(self.page_table.page_size)
+            page_idx = torch.div(slot_mapping, page_size, rounding_mode="floor")
+            page_off = torch.remainder(slot_mapping, page_size)
+            key_cache[page_idx, page_off] = k_view
+            value_cache[page_idx, page_off] = v_view
+        else:
+            reshape_and_cache_flash_cuda(
+                k_view,
+                v_view,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self._kv_cache_dtype,
+                self.k_scale_tensor,
+                self.v_scale_tensor,
+            )
 
         return k_val, v_val
 
@@ -344,6 +390,18 @@ class PageTable:
             input_pos = input_pos.contiguous()
 
         if batch_size == 0:
+            return
+
+        if triton is None:
+            _build_fa3_decode_metadata_torch(
+                page_table=self.page_table,
+                batch_idx=batch_idx,
+                input_pos=input_pos,
+                out_page_table=out_page_table,
+                out_seqused_k=out_seqused_k,
+                n_pages=self.n_pages,
+                page_size=self.page_size,
+            )
             return
 
         BLOCK_PAGES = 128
@@ -608,42 +666,44 @@ class PageTable:
         return False
 
 
-@triton.jit
-def _build_fa3_decode_metadata_kernel(
-    page_table_ptr,
-    page_table_stride,
-    batch_idx_ptr,
-    input_pos_ptr,
-    out_page_table_ptr,
-    out_page_table_stride,
-    out_seqused_k_ptr,
-    n_pages,
-    batch_size,
-    BLOCK_PAGES: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-):
-    batch_id = tl.program_id(0)
-    tile_id = tl.program_id(1)
+if triton is not None:
 
-    batch_mask = batch_id < batch_size
-    batch_idx = tl.load(batch_idx_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
-    seqlen = tl.load(input_pos_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
-    seqlen = seqlen + 1
-    num_pages = (seqlen + (PAGE_SIZE - 1)) // PAGE_SIZE
-    n_pages_i64 = tl.full((), n_pages, dtype=tl.int64)
-    num_pages = tl.where(num_pages < n_pages_i64, num_pages, n_pages_i64)
+    @triton.jit
+    def _build_fa3_decode_metadata_kernel(
+        page_table_ptr,
+        page_table_stride,
+        batch_idx_ptr,
+        input_pos_ptr,
+        out_page_table_ptr,
+        out_page_table_stride,
+        out_seqused_k_ptr,
+        n_pages,
+        batch_size,
+        BLOCK_PAGES: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+    ):
+        batch_id = tl.program_id(0)
+        tile_id = tl.program_id(1)
 
-    page_stride = tl.full((), page_table_stride, dtype=tl.int64)
-    out_stride = tl.full((), out_page_table_stride, dtype=tl.int64)
+        batch_mask = batch_id < batch_size
+        batch_idx = tl.load(batch_idx_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
+        seqlen = tl.load(input_pos_ptr + batch_id, mask=batch_mask, other=0).to(tl.int64)
+        seqlen = seqlen + 1
+        num_pages = (seqlen + (PAGE_SIZE - 1)) // PAGE_SIZE
+        n_pages_i64 = tl.full((), n_pages, dtype=tl.int64)
+        num_pages = tl.where(num_pages < n_pages_i64, num_pages, n_pages_i64)
 
-    offs = tile_id * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
-    offs = offs.to(tl.int64)
-    mask = offs < num_pages
+        page_stride = tl.full((), page_table_stride, dtype=tl.int64)
+        out_stride = tl.full((), out_page_table_stride, dtype=tl.int64)
 
-    in_ptr = page_table_ptr + batch_idx * page_stride + offs
-    out_ptr = out_page_table_ptr + batch_id * out_stride + offs
-    values = tl.load(in_ptr, mask=mask & batch_mask, other=0)
-    tl.store(out_ptr, values, mask=mask & batch_mask)
+        offs = tile_id * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
+        offs = offs.to(tl.int64)
+        mask = offs < num_pages
 
-    write_seq = (tile_id == 0) & batch_mask
-    tl.store(out_seqused_k_ptr + batch_id, seqlen, mask=write_seq)
+        in_ptr = page_table_ptr + batch_idx * page_stride + offs
+        out_ptr = out_page_table_ptr + batch_id * out_stride + offs
+        values = tl.load(in_ptr, mask=mask & batch_mask, other=0)
+        tl.store(out_ptr, values, mask=mask & batch_mask)
+
+        write_seq = (tile_id == 0) & batch_mask
+        tl.store(out_seqused_k_ptr + batch_id, seqlen, mask=write_seq)
