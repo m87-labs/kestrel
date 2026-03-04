@@ -66,9 +66,8 @@ DEFAULT_MAX_TOKENS = 768
 # Hardcoded switch for legacy segmentation refinement behavior.
 # False (default): use SegmentRefiner (current path).
 # True: use HQ-SAM (legacy path).
-# Prefer the legacy HQ-SAM refiner for segmentation refinement.
 # Keep a simple hardcoded gate for easy switching during development.
-_USE_HQSAM_REFINER = True
+_USE_HQSAM_REFINER = False
 
 
 class TextToken(NamedTuple):
@@ -495,9 +494,8 @@ class MoondreamRuntime:
 
         self._prefill_fn = self._prefill_impl
 
-        # Prefer HQ-SAM when available, but fall back to the current refiner if HQ-SAM
-        # deps are missing. This keeps segmentation refinement functional even when
-        # HQ-SAM can't be loaded.
+        # Refiner selection is controlled by the hardcoded gate above.
+        # If HQ-SAM is disabled or unavailable, fall back to the current SegmentRefiner.
         if _USE_HQSAM_REFINER and _HAS_HQSAM_DEPS:
             self.seg_refiner = HQSamRefiner(device=self.device)
         elif _HAS_SEG_DEPS:
