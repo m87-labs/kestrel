@@ -740,6 +740,7 @@ class InferenceEngine:
         self._paused_event.clear()
         self._scheduler_event.set()
         self._paused_event.wait(timeout)
+        torch.cuda.synchronize(self._runtime.device)
 
     def resume(self) -> None:
         """Resume scheduler progress after a pause."""
