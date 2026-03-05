@@ -746,6 +746,7 @@ class InferenceEngine:
 
         if self._shutdown:
             return
+        torch.cuda.synchronize(self._runtime.device)
         self._paused_event.clear()
         self._paused_flag.clear()
         self._run_gate.set()
