@@ -30,7 +30,7 @@ from .moondream.config import VisionConfig
 _REFINER_ITERS = 5
 _SEGHEAD_REFINER_REPO_ID = "moondream/SegHeadRefiner"
 _SEGHEAD_REFINER_FILENAME = "model.pt"
-_SEGHEAD_REFINER_REVISION = "d3664cf8d8501b37d9ed8cd222e6d4e876c88621"
+_SEGHEAD_REFINER_REVISION = "c56f84f602dbf77f3cc4d97cc5cabd955f3761e8"
 # Force fresh HF download by default. Set KESTREL_FORCE_REFINER_DOWNLOAD=0/false/no/off
 # to allow using the local cache.
 _SEGHEAD_REFINER_FORCE_DOWNLOAD = os.environ.get(
