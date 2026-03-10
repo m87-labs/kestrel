@@ -58,7 +58,7 @@ from .region import (
     encode_size,
 )
 from ..seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
-from ..hqsam_refiner import HQSamRefiner, _HAS_REFINER_DEPS
+from ..legacy_refiner import LegacyRefiner, _HAS_REFINER_DEPS
 from ..dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
 
@@ -67,7 +67,7 @@ DEFAULT_MAX_TOKENS = 768
 
 # Hardcoded switch for original segmentation refinement behavior.
 # False: use SegmentRefiner (current path).
-# True: use the original HQ-SAM refiner path.
+# True: use the original legacy refiner path.
 # Keep a simple hardcoded gate for easy switching during development.
 _USE_ORIGINAL_REFINER = True
 
@@ -535,9 +535,9 @@ class MoondreamRuntime:
         self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
 
         # Refiner selection is controlled by the hardcoded gate above.
-        # If original HQ-SAM is disabled or unavailable, fall back to SegmentRefiner.
+        # If original legacy refiner is disabled or unavailable, fall back to SegmentRefiner.
         if _USE_ORIGINAL_REFINER and _HAS_REFINER_DEPS:
-            self.seg_refiner = HQSamRefiner(device=self.device)
+            self.seg_refiner = LegacyRefiner(device=self.device)
         elif _HAS_SEG_DEPS:
             self.seg_refiner = SegmentRefiner(self.model.vision, self.config.vision, self.device)
         else:

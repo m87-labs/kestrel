@@ -1,4 +1,4 @@
-"""Legacy HQ-SAM segmentation refiner."""
+"""Legacy segmentation refiner."""
 
 from __future__ import annotations
 
@@ -23,12 +23,12 @@ from .seg_refiner import (
     svg_from_path,
 )
 
-try:  # Optional dependency: OpenCV (used by HQ-SAM prompting utilities)
+try:  # Optional dependency: OpenCV (used by legacy prompting utilities)
     import cv2
 except ImportError:  # pragma: no cover
     cv2 = None
 
-try:  # Optional dependency: transformers (HQ-SAM model loader)
+try:  # Optional dependency: transformers (legacy model loader)
     from transformers import AutoModel
 except ImportError:  # pragma: no cover
     AutoModel = None
@@ -36,8 +36,8 @@ except ImportError:  # pragma: no cover
 
 _HAS_REFINER_DEPS = bool(_HAS_SEG_DEPS and cv2 is not None and AutoModel is not None)
 
-_DEFAULT_MODEL_ID = "moondream/hqsam-vith-meta"
 _DEFAULT_ITERS = 6  # Matches historical Kestrel usage.
+_DEFAULT_MODEL_ID = "moondream/hqsam-vith-meta"
 
 
 def _from_pretrained(model_id: str, *, local_files_only: bool) -> torch.nn.Module:
@@ -55,11 +55,11 @@ def _from_pretrained(model_id: str, *, local_files_only: bool) -> torch.nn.Modul
     return AutoModel.from_pretrained(model_id, **kwargs)  # type: ignore[misc]
 
 
-def build_sam_model(device: torch.device, model_id: str = _DEFAULT_MODEL_ID) -> torch.nn.Module:
-    """Load HQ-SAM (vit_h) from HuggingFace (AutoModel with remote code)."""
+def build_legacy_refiner(device: torch.device, model_id: str = _DEFAULT_MODEL_ID) -> torch.nn.Module:
+    """Load the legacy refiner model from HuggingFace (AutoModel with remote code)."""
 
     if AutoModel is None:  # pragma: no cover
-        raise ImportError("HQ-SAM refiner requires transformers to be installed")
+        raise ImportError("Legacy refiner requires transformers to be installed")
 
     try:
         model = _from_pretrained(model_id, local_files_only=True)
@@ -69,11 +69,11 @@ def build_sam_model(device: torch.device, model_id: str = _DEFAULT_MODEL_ID) -> 
     model = model.to(device)
     model.eval()
 
-    # MetaSamHQModel exposes .sam and .resize.
+    # The legacy model exposes .sam and .resize.
     if not hasattr(model, "sam"):
-        raise AttributeError("Loaded HQ-SAM model is missing required attribute: sam")
+        raise AttributeError("Loaded legacy model is missing required core model attribute")
     if not hasattr(model, "resize"):
-        raise AttributeError("Loaded HQ-SAM model is missing required attribute: resize")
+        raise AttributeError("Loaded legacy model is missing required resize attribute")
     return model
 
 
@@ -83,7 +83,7 @@ def _extract_points_and_mask(
     """Extract prompt points/box and Gaussian mask prompt from the current mask."""
 
     if cv2 is None:  # pragma: no cover
-        raise ImportError("HQ-SAM refiner requires opencv-python to be installed")
+        raise ImportError("Legacy refiner requires opencv-python to be installed")
 
     pred_mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
     device = pred_mask.device
@@ -148,7 +148,7 @@ def _build_mask_inputs(
     target_size: Tuple[int, int],
     strength: float,
 ) -> torch.Tensor:
-    """Build SAM mask input prompt tensor (1, 1, 256, 256)."""
+    """Build legacy mask input prompt tensor (1, 1, 256, 256)."""
 
     pred_masks = pred_mask.float().unsqueeze(0).unsqueeze(0)
     gaus = gaus_dt.float().unsqueeze(0).unsqueeze(0)
@@ -177,19 +177,19 @@ def _build_mask_inputs(
     return pred_masks * gaus
 
 
-def sam_refine(
+def refine_with_legacy_refiner(
     image: np.ndarray,
     coarse_mask: np.ndarray,
-    sam_model: torch.nn.Module,
+    refiner_model: torch.nn.Module,
     *,
     iters: int,
     strength: float = 30.0,
     gamma: float = 4.0,
 ) -> np.ndarray:
-    """Run HQ-SAM iterative refinement on an RGB crop and coarse binary mask."""
+    """Run legacy iterative refinement on an RGB crop and coarse binary mask."""
 
     if cv2 is None:  # pragma: no cover
-        raise ImportError("HQ-SAM refiner requires opencv-python to be installed")
+        raise ImportError("Legacy refiner requires opencv-python to be installed")
 
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"Expected RGB image (H,W,3), got {image.shape}")
@@ -198,11 +198,11 @@ def sam_refine(
     if coarse_mask.ndim != 2:
         raise ValueError(f"Expected 2D mask, got {coarse_mask.shape}")
 
-    sam = sam_model.sam  # type: ignore[attr-defined]
-    resize = getattr(sam_model, "resize", None)
+    core_model = refiner_model.sam  # type: ignore[attr-defined]
+    resize = getattr(refiner_model, "resize", None)
     if resize is None:
-        raise AttributeError("HQ-SAM model is missing required attribute: resize")
-    device = next(sam_model.parameters()).device
+        raise AttributeError("Legacy model is missing required resize attribute")
+    device = next(refiner_model.parameters()).device
 
     img_h, img_w = image.shape[:2]
     if coarse_mask.shape != (img_h, img_w):
@@ -212,10 +212,10 @@ def sam_refine(
 
     resized_img = resize.apply_image(image)
     resized_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).float().to(device)
-    input_images = torch.stack([sam.preprocess(resized_tensor)], dim=0)
+    input_images = torch.stack([core_model.preprocess(resized_tensor)], dim=0)
 
     with torch.no_grad():
-        image_embeddings, interm_embeddings = sam.image_encoder(input_images)
+        image_embeddings, interm_embeddings = core_model.image_encoder(input_images)
     interm_embeddings = interm_embeddings[0]
 
     for _ in range(max(1, int(iters))):
@@ -248,7 +248,7 @@ def sam_refine(
         ]
 
         with torch.no_grad():
-            outputs = sam.forward_with_image_embeddings(
+            outputs = core_model.forward_with_image_embeddings(
                 image_embeddings=image_embeddings,
                 interm_embeddings=interm_embeddings,
                 batched_input=batched_input,
@@ -257,18 +257,18 @@ def sam_refine(
             )
 
         out = outputs[0]
-        sam_ious = out["iou_predictions"]
-        sam_masks = out["masks"]
+        model_ious = out["iou_predictions"]
+        model_masks = out["masks"]
 
-        best_idx = sam_ious[0].argmax()
-        best_mask_logits = sam_masks[0, best_idx : best_idx + 1]
+        best_idx = model_ious[0].argmax()
+        best_mask_logits = model_masks[0, best_idx : best_idx + 1]
         current_mask = (best_mask_logits > 0).squeeze(0).to(torch.uint8)
 
     return current_mask.detach().cpu().numpy()
 
 
-class HQSamRefiner:
-    """Legacy HQ-SAM refiner wrapper matching SegmentRefiner's call surface."""
+class LegacyRefiner:
+    """Legacy refiner wrapper matching SegmentRefiner's call surface."""
 
     def __init__(
         self,
@@ -279,12 +279,12 @@ class HQSamRefiner:
     ) -> None:
         if not _HAS_REFINER_DEPS:
             raise ImportError(
-                "HQ-SAM refinement requires optional dependencies: "
+                "Legacy refinement requires optional dependencies: "
                 "pip install transformers opencv-python-headless pillow resvg pypotrace"
             )
         self._device = device
         self._iters = max(1, int(iters))
-        self._model = build_sam_model(device, model_id=model_id)
+        self._model = build_legacy_refiner(device, model_id=model_id)
 
     def refine_with_bitmaps(
         self,
@@ -337,7 +337,9 @@ class HQSamRefiner:
                     return SegmentRefineBitmapsResult(None, None, None, None)
                 return SegmentRefineBitmapsResult(None, None, coarse_mask_b64, refined_mask_b64)
 
-            refined_crop = sam_refine(crop_img, crop_mask, self._model, iters=self._iters)
+            refined_crop = refine_with_legacy_refiner(
+                crop_img, crop_mask, self._model, iters=self._iters
+            )
 
             refined_mask = _paste_mask(img_h, img_w, refined_crop, crop_xyxy)
             refined_mask = _clean_mask(refined_mask).astype(np.uint8)
@@ -372,6 +374,6 @@ class HQSamRefiner:
 
 
 __all__ = [
-    "HQSamRefiner",
+    "LegacyRefiner",
     "_HAS_REFINER_DEPS",
 ]
