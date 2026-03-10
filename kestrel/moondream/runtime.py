@@ -67,7 +67,7 @@ DEFAULT_MAX_TOKENS = 768
 # False (default): use SegmentRefiner (current path).
 # True: use HQ-SAM (legacy path).
 # Keep a simple hardcoded gate for easy switching during development.
-_USE_HQSAM_REFINER = True
+_USE_HQSAM_REFINER = False
 
 
 class TextToken(NamedTuple):

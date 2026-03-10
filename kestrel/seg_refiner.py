@@ -31,6 +31,11 @@ _REFINER_ITERS = 5
 _SEGHEAD_REFINER_REPO_ID = "moondream/SegHeadRefiner"
 _SEGHEAD_REFINER_FILENAME = "model.pt"
 _SEGHEAD_REFINER_REVISION = "d3664cf8d8501b37d9ed8cd222e6d4e876c88621"
+# Force fresh HF download by default. Set KESTREL_FORCE_REFINER_DOWNLOAD=0/false/no/off
+# to allow using the local cache.
+_SEGHEAD_REFINER_FORCE_DOWNLOAD = os.environ.get(
+    "KESTREL_FORCE_REFINER_DOWNLOAD", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # Lazy imports for optional dependencies
 _potrace = None
@@ -314,6 +319,7 @@ class SegmentRefiner:
             filename=_SEGHEAD_REFINER_FILENAME,
             revision=_SEGHEAD_REFINER_REVISION,
             token=os.environ.get("HF_TOKEN"),
+            force_download=_SEGHEAD_REFINER_FORCE_DOWNLOAD,
         )
         ckpt = torch.load(weights_path, map_location=device, weights_only=True)
         self._head.load_state_dict(ckpt["head"])
