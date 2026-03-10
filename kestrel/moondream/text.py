@@ -78,6 +78,7 @@ def attn(
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
     page_table: torch.Tensor | None = None,
+    fa3_seqused_q: torch.Tensor | None = None,
     fa3_seqused_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
@@ -146,6 +147,7 @@ def attn(
             k_cache,
             v_cache,
             page_table=page_table,
+            seqused_q=fa3_seqused_q,
             seqused_k=fa3_seqused_k,
             paged_kv_non_tma=True,
             causal=causal,
@@ -160,6 +162,7 @@ def attn(
             k_cache,
             v_cache,
             page_table=page_table,
+            seqused_q=fa3_seqused_q,
             seqused_k=fa3_seqused_k,
             paged_kv_non_tma=True,
             causal=True,
@@ -182,6 +185,7 @@ def text_decoder(
     use_prefix_attn: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
     page_table: torch.Tensor | None = None,
+    fa3_seqused_q: torch.Tensor | None = None,
     fa3_seqused_k: torch.Tensor | None = None,
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
@@ -204,6 +208,7 @@ def text_decoder(
             slot_mapping=slot_mapping,
             use_prefix_attn=use_prefix_attn,
             page_table=page_table,
+            fa3_seqused_q=fa3_seqused_q,
             fa3_seqused_k=fa3_seqused_k,
         )
 

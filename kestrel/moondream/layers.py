@@ -11,10 +11,6 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Literal
 
-from ..fused_moe.routing import moe_lora_align_block_size
-
-from ..fused_moe import ExpertWeights, FusedMoEModule
-from ..fused_moe.lora_kernels import apply_moe_lora_batched
 from ..ops.layernorm_cuda import layernorm_bias
 
 # Re-export LoRA for convenience
@@ -93,6 +89,8 @@ def _prepare_dense_lora_routing(
     num_tokens = lora_slot_ids.shape[0]
     topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
 
+    from ..fused_moe.routing import moe_lora_align_block_size
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_lora_align_block_size(
         topk_ids,
         token_lora_mapping,
@@ -126,6 +124,8 @@ def _apply_dense_lora_with_routing(
     Workspace layout: lora_a/lora_b have shape [max_slots, rank, hidden].
     We slice off slot 0 to get [max_loras, rank, hidden] where max_loras = max_slots - 1.
     """
+    from ..fused_moe.lora_kernels import apply_moe_lora_batched
+
     num_tokens = x.shape[0]
 
     # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora_batched.
@@ -253,6 +253,8 @@ def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDi
 def build_moe_mlp(
     d_model: int, d_ffn: int, n_experts: int, dtype: torch.dtype, *, top_k: int
 ) -> nn.ModuleDict:
+    from ..fused_moe import ExpertWeights, FusedMoEModule
+
     router = nn.Linear(d_model, n_experts, dtype=dtype)
     up_experts = ExpertWeights(n_experts, d_model, d_ffn * 2, dtype=dtype)
     down_experts = ExpertWeights(n_experts, d_ffn, d_model, dtype=dtype)

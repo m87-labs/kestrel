@@ -1,30 +1,17 @@
-import torch, flashinfer
-from torch import Tensor
+import torch
+
+from kestrel_kernels.sampling import top_p_sampling_from_probs
 
 
 _EPS = 1e-6
 
-
-@torch.library.custom_op("fi::topp_from_probs", mutates_args=())
-def topp_from_probs(probs: Tensor, top_p: Tensor) -> Tensor:
-    raise NotImplementedError("fi::topp_from_probs CPU path not implemented")
-
-@topp_from_probs.register_fake
-def _(probs, top_p):
-    return probs.new_empty(probs.shape[:-1], dtype=torch.int32)
-
-@topp_from_probs.register_kernel("cuda")
-def _(probs: Tensor, top_p: Tensor) -> Tensor:
-    return flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
-
-
 def sample_tokens(
-    logits: Tensor,
-    temperatures: Tensor,
-    top_ps: Tensor,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
     *,
     generator: torch.Generator | None = None,
-) -> Tensor:
+) -> torch.Tensor:
     if logits.ndim != 2:
         raise ValueError(f"logits must be 2D (batch, vocab); received shape {logits.shape}")
 
@@ -51,6 +38,6 @@ def sample_tokens(
     probs.masked_fill_(force_greedy.unsqueeze(1), 0.)
     probs.scatter_add_(1, greedy_ids.unsqueeze(1), force_greedy.to(probs.dtype).unsqueeze(1))
 
-    return flashinfer.sampling.top_p_sampling_from_probs(
+    return top_p_sampling_from_probs(
         probs, topp, generator=generator
     )

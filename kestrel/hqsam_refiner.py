@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
     AutoModel = None
 
 
-_HAS_HQSAM_DEPS = bool(_HAS_SEG_DEPS and cv2 is not None and AutoModel is not None)
+_HAS_REFINER_DEPS = bool(_HAS_SEG_DEPS and cv2 is not None and AutoModel is not None)
 
 _DEFAULT_MODEL_ID = "moondream/hqsam-vith-meta"
 _DEFAULT_ITERS = 6  # Matches historical Kestrel usage.
@@ -282,7 +282,7 @@ class HQSamRefiner:
         model_id: str = _DEFAULT_MODEL_ID,
         iters: int = _DEFAULT_ITERS,
     ) -> None:
-        if not _HAS_HQSAM_DEPS:
+        if not _HAS_REFINER_DEPS:
             raise ImportError(
                 "HQ-SAM refinement requires optional dependencies: "
                 "pip install transformers opencv-python-headless pillow resvg pypotrace"
@@ -378,6 +378,5 @@ class HQSamRefiner:
 
 __all__ = [
     "HQSamRefiner",
-    "_HAS_HQSAM_DEPS",
+    "_HAS_REFINER_DEPS",
 ]
-

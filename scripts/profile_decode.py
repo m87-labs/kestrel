@@ -112,7 +112,7 @@ def patch_text_decoder_with_nvtx():
     def instrumented_text_decoder(
         x, module, attn_mask, position_ids, config, *,
         slot_mapping, use_prefix_attn=False, mode="decode",
-        page_table=None, fa3_seqused_k=None,
+        page_table=None, fa3_seqused_q=None, fa3_seqused_k=None,
         lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
     ):
         for i, block in enumerate(module.blocks):
@@ -137,6 +137,7 @@ def patch_text_decoder_with_nvtx():
                 slot_mapping=slot_mapping,
                 use_prefix_attn=use_prefix_attn,
                 page_table=page_table,
+                fa3_seqused_q=fa3_seqused_q,
                 fa3_seqused_k=fa3_seqused_k,
             )
             nvtx.range_pop()
@@ -282,19 +283,36 @@ def main():
     )
     seq_states: list[SequenceState] = []
     prefill_ok = True
+
+    def _start_one_sequence() -> SequenceState:
+        prepared = runtime.prepare_sequence(
+            prompt_tokens, max_new_tokens=max_new_tokens
+        )
+        prefill_slot = runtime.acquire_prefill_slot()
+        try:
+            runtime.launch_prepared_batch(
+                [prepared],
+                prefill_slot,
+                images=[None],
+                image_crops_list=[None],
+            )
+            runtime.finalize_prepared_sequence_after_prefill(prepared)
+            return prepared.state
+        except Exception:
+            runtime.abort_prepared_sequence(prepared)
+            raise
+        finally:
+            runtime.release_prefill_slot(prefill_slot)
+
     with torch.inference_mode():
         for _ in range(args.batch_size):
             try:
-                seq_state, _ = runtime.start_sequence(
-                    prompt_tokens, max_new_tokens=max_new_tokens
-                )
+                seq_state = _start_one_sequence()
                 seq_states.append(seq_state)
             except Exception as exc:
                 if _maybe_retry_flash_attn(exc):
                     try:
-                        seq_state, _ = runtime.start_sequence(
-                            prompt_tokens, max_new_tokens=max_new_tokens
-                        )
+                        seq_state = _start_one_sequence()
                         seq_states.append(seq_state)
                         continue
                     except Exception as exc_retry:

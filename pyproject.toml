@@ -1,12 +1,10 @@
 [project]
 name = "kestrel"
-version = "0.1.2"
+version = "0.1.3"
 description = "a fast, efficient inference engine for moondream"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch==2.9.1",
-    "torchvision==0.24.1",
     "tokenizers>=0.15",
     "safetensors>=0.4",
     "transformers>=4.44",
@@ -14,11 +12,9 @@ dependencies = [
     "starlette>=0.37",
     "httpx>=0.27",
     "uvicorn>=0.30",
-    "flashinfer-python>=0.6.0",
     "apache-tvm-ffi>=0.1.5,<0.2",
-    "nvidia-cutlass-dsl==4.3.5",
-    "kestrel-native==0.1.1",
-    "kestrel-kernels==0.1.2",
+    "kestrel-native==0.1.3",
+    "kestrel-kernels==0.1.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "huggingface-hub>=0.20",
 ]
 
@@ -27,6 +23,17 @@ include = ["kestrel", "kestrel.*"]
 exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
+jetson-jp6 = [
+  #  "kestrel-kernels-jetson-pt24==0.2.0",
+]
+jetson-jp61 = [
+  #  "kestrel-kernels-jetson-pt25==0.2.0",
+]
+jetson-jp62 = [
+  #  "kestrel-kernels-jetson-pt25==0.2.0",
+]
+
+[dependency-groups]
 dev = [
     "pytest>=8.0",
 ]

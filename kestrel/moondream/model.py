@@ -23,8 +23,6 @@ class MoondreamTextModel(nn.Module):
         super().__init__()
         self.config = config
         self.text = build_text_model(config.text, dtype, device=device)
-        if device is not None:
-            self.to(device=device)
         if setup_caches:
             self._setup_caches()
 
@@ -50,10 +48,8 @@ class MoondreamModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.vision = build_vision_model(config.vision, dtype)
+        self.vision = build_vision_model(config.vision, dtype, device=device)
         self.text = build_text_model(config.text, dtype, device=device)
-        if device is not None:
-            self.to(device=device)
         if setup_caches:
             self._setup_caches()
 

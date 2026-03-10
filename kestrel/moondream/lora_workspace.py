@@ -260,6 +260,7 @@ class TextLoRAWorkspace:
 
         # Copy MoE layer weights
         adapter_rank_per_expert = text_lora.rank_per_expert
+
         for moe_idx, layer in enumerate(self.moe):
             layer_idx = self.start_layer + moe_idx
             adapter_layer = text_lora.get_moe_lora(layer_idx)

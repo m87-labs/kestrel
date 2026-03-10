@@ -12,13 +12,13 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 ## Relationship to Other Components
 
 - **InferenceEngine**: constructs `GenerationRequest`s, instantiates `SkillState`s (using skill-specific request contexts), and enqueues them via `GenerationScheduler.enqueue_request`. The engine also supplies optional stream callbacks for token updates.
-- **MoondreamRuntime**: executes `start_sequence` and `decode_batch` calls. The scheduler ensures batch sizes and decode steps respect runtime limits.
+- **MoondreamRuntime**: executes `prepare_sequence` + `launch_prepared_batch` for prefill and `decode_with_slot` for decode. The scheduler ensures batch sizes and decode steps respect runtime limits.
 - **Skills**: provide `SkillState` implementations that buffer tokens, perform per-skill logic, and produce final results. The scheduler never inspects skill-specific data.
 
 ## Execution Flow
 
 1. **Submission**: `GenerationScheduler.enqueue_request(...)` pushes a prepared request/skill-state pair into the waiting queue.
-2. **Prefill** (`_launch_prefill_step` + `_finalize_prefill`): whenever capacity allows, the scheduler pops a waiting request, runs `runtime.start_sequence`, and samples token0 into the shared pending buffers. The token is committed later via `commit_step` (pipelined like decode).
+2. **Prefill** (`_prepare_prefill` + `_launch_prefill_step` + `_finalize_prefill`): whenever capacity allows, the scheduler prepares requests on CPU (`runtime.prepare_sequence`), then launches one batched GPU prefill (`runtime.launch_prepared_batch`) and samples token0 into shared pending buffers. Tokens are committed later via `commit_step` (pipelined like decode).
 3. **Decode Loop** (pipelined in `advance`): batches active sequences, feeds pending tokens into `runtime.decode_with_slot`, stages new tokens on each `SkillState`, and re-queues sequences until they finish or hit limits.
 4. **Finalization** (`_finalize_sequence`): once a sequence ends, the scheduler releases runtime resources, asks the `SkillState` to `finalize`, and records a `SchedulerResult`.
 

@@ -17,8 +17,8 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise RuntimeError(
         "`datasets` is required for the ChartQA evaluation. "
-        "Install optional extras via `pip install kestrel[eval]` or "
-        "`uv run --extra eval ...` before running this script."
+        "Install local eval dependencies via `uv sync --group eval` "
+        "or install directly with `pip install datasets`."
     ) from exc
 
 import kestrel_native
@@ -28,8 +28,8 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise RuntimeError(
         "`tqdm` is required for ChartQA evaluation progress reporting. "
-        "Install optional extras via `pip install kestrel[eval]` or "
-        "`uv run --extra eval ...` before running this script."
+        "Install local eval dependencies via `uv sync --group eval` "
+        "or install directly with `pip install tqdm`."
     ) from exc
 
 import numpy as np

@@ -89,7 +89,8 @@ class TextLoRAConfig:
 
     Attributes:
         rank: Total LoRA rank. For MoE layers, this is divided by
-            experts_per_token to get the per-expert rank.
+            experts_per_token to get the per-expert rank and must be
+            divisible by experts_per_token.
     """
 
     rank: int
@@ -215,6 +216,12 @@ class TextLoRA(nn.Module):
 
         # MoE layers: [start_layer, n_layers)
         if moe_cfg is not None:
+            if lora_config.rank % moe_cfg.experts_per_token != 0:
+                raise ValueError(
+                    f"rank ({lora_config.rank}) must be divisible by experts_per_token "
+                    f"({moe_cfg.experts_per_token})"
+                )
+
             rank_per_expert = lora_config.rank // moe_cfg.experts_per_token
             if rank_per_expert < 1:
                 raise ValueError(

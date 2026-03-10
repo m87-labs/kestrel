@@ -86,8 +86,6 @@ from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
-
-
 @dataclass(slots=True)
 class EngineMetrics:
     """Token counts and timing for a single request."""
@@ -746,12 +744,14 @@ class InferenceEngine:
         self._paused_event.clear()
         self._scheduler_event.set()
         self._paused_event.wait(timeout)
+        torch.cuda.synchronize(self._runtime.device)
 
     def resume(self) -> None:
         """Resume scheduler progress after a pause."""
 
         if self._shutdown:
             return
+        torch.cuda.synchronize(self._runtime.device)
         self._paused_event.clear()
         self._paused_flag.clear()
         self._run_gate.set()
@@ -1031,7 +1031,7 @@ class InferenceEngine:
 
         def promote_crops() -> bool:
             promoted = False
-            while len(scheduler.waiting) < runtime.max_batch_size * 2:
+            while len(scheduler.waiting) < runtime.max_batch_size * 4:
                 try:
                     rid = ready_crops.get_nowait()
                 except queue.Empty:
