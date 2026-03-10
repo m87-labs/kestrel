@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Literal
 
+from ..dense_lora import (
+    DenseLoRATorchMLPScratch,
+    apply_dense_lora,
+    prepare_dense_lora_batch,
+)
 from ..ops.layernorm_cuda import layernorm_bias
 
 # Re-export LoRA for convenience
@@ -54,143 +59,13 @@ class MLPWeights:
     act: Literal["gelu_approx"] = "gelu_approx"
 
 
-@dataclass(frozen=True)
-class _DenseLoRARouting:
-    """Batched routing data for dense LoRA using moe_lora_align_block_size."""
-    topk_weights: torch.Tensor
-    sorted_token_ids: torch.Tensor  # [max_loras, EM]
-    expert_ids: torch.Tensor  # [max_loras, num_blocks]
-    num_tokens_post_padded: torch.Tensor  # [max_loras]
-    block_size_m: int
-
-
-def _prepare_dense_lora_routing(
-    lora_slot_ids: torch.Tensor,
-    *,
-    max_slots: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> _DenseLoRARouting:
-    """Prepare batched routing for dense LoRA.
-
-    Uses moe_lora_align_block_size with num_experts=1 (each slot treated as
-    one expert). Slot 0 (no LoRA) is filtered via token_lora_mapping = -1.
-    """
-    # slot 0 -> -1 (no LoRA), slot N -> N-1 (lora_id)
-    token_lora_mapping = (lora_slot_ids - 1).to(torch.int32)
-
-    # For dense LoRA, treat each slot as a separate "LoRA" with num_experts=1
-    # max_loras = max_slots - 1 (slot 0 excluded from workspace)
-    max_loras = max_slots - 1
-    block_size_m = 16
-    num_experts = 1  # Dense LoRA: each slot is one "expert"
-
-    # Shape topk_ids as [num_tokens, 1] with all zeros (single expert per "LoRA")
-    num_tokens = lora_slot_ids.shape[0]
-    topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
-
-    from ..fused_moe.routing import moe_lora_align_block_size
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_lora_align_block_size(
-        topk_ids,
-        token_lora_mapping,
-        block_size_m,
-        num_experts,
-        max_loras,
-    )
-
-    # topk_weights shape [M, top_k] is required by the kernel for shape inference.
-    # Values unused when mul_routed_weight=False but shape must be correct.
-    topk_weights = torch.ones((num_tokens, 1), dtype=dtype, device=device)
-
-    return _DenseLoRARouting(
-        topk_weights=topk_weights,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-        block_size_m=block_size_m,
-    )
-
-
-def _apply_dense_lora_with_routing(
-    x: torch.Tensor,
-    output: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    routing: _DenseLoRARouting,
-) -> None:
-    """Apply dense LoRA using batched kernel.
-
-    Workspace layout: lora_a/lora_b have shape [max_slots, rank, hidden].
-    We slice off slot 0 to get [max_loras, rank, hidden] where max_loras = max_slots - 1.
-    """
-    from ..fused_moe.lora_kernels import apply_moe_lora_batched
-
-    num_tokens = x.shape[0]
-
-    # Output needs shape [num_tokens, top_k, out_dim] for apply_moe_lora_batched.
-    out_dim = output.shape[-1]
-    output_3d = output.view(num_tokens, 1, out_dim)
-
-    # Slice off slot 0 from workspace (slot 0 = no LoRA, always zeros)
-    # This aligns with the lora_id mapping: slot N -> lora_id N-1
-    lora_a_active = lora_a[1:]  # [max_loras, rank, hidden]
-    lora_b_active = lora_b[1:]  # [max_loras, out_dim, rank]
-
-    apply_moe_lora_batched(
-        x=x,
-        topk_weights=routing.topk_weights,
-        output=output_3d,
-        lora_a=lora_a_active,
-        lora_b=lora_b_active,
-        sorted_token_ids=routing.sorted_token_ids,
-        expert_ids=routing.expert_ids,
-        num_tokens_post_padded=routing.num_tokens_post_padded,
-        top_k=1,
-        num_experts=1,  # Dense LoRA: each slot is one "expert"
-        block_size_m=routing.block_size_m,
-        mul_routed_weight=False,
-    )
-
-
-def apply_dense_lora(
-    x: torch.Tensor,
-    output: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    lora_slot_ids: torch.Tensor,
-) -> None:
-    """Apply mixed-slot dense LoRA using the batched kernel.
-
-    Uses moe_lora_align_block_size to route tokens to their LoRA adapters,
-    then applies the batched kernel with num_experts=1.
-
-    Slot 0 tokens are filtered out at routing time (no LoRA applied).
-    Slot N (N >= 1) maps to lora_id N-1 in the workspace.
-
-    Args:
-        x: Input activations, shape [num_tokens, hidden_dim].
-        output: Output tensor to accumulate into, shape [num_tokens, out_dim].
-        lora_a: LoRA A weights, shape [max_slots, rank, hidden_dim].
-        lora_b: LoRA B weights, shape [max_slots, out_dim, rank].
-        lora_slot_ids: Per-token slot indices, shape [num_tokens].
-    """
-    max_slots = lora_a.shape[0]
-    routing = _prepare_dense_lora_routing(
-        lora_slot_ids,
-        max_slots=max_slots,
-        device=x.device,
-        dtype=x.dtype,
-    )
-    _apply_dense_lora_with_routing(x, output, lora_a, lora_b, routing)
-
-
 def mlp(
     x: torch.Tensor,
     w: MLPWeights,
     *,
     lora_workspace: DenseLoRALayerWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
+    lora_scratch: DenseLoRATorchMLPScratch | None = None,
 ) -> torch.Tensor:
     """Dense MLP with optional mixed-slot LoRA.
 
@@ -203,26 +78,25 @@ def mlp(
     B, T, C = x.shape
     use_lora = lora_workspace is not None and lora_slot_ids is not None
 
-    routing = None
+    prepared_batch = None
     if use_lora:
-        # Expand slot IDs for all tokens in each sequence and prepare routing once.
-        slot_ids_expanded = lora_slot_ids.repeat_interleave(T)
-        routing = _prepare_dense_lora_routing(
-            slot_ids_expanded,
-            max_slots=lora_workspace.up_a.shape[0],
-            device=x.device,
-            dtype=x.dtype,
+        prepared_batch = prepare_dense_lora_batch(
+            lora_slot_ids,
+            segment_len=T,
         )
 
     h = linear(x, w.fc1)
     if use_lora:
-        # Flatten for LoRA kernel: [batch * seq_len, dim]
         x_flat = x.view(-1, C)
-        # Use separate buffer for LoRA delta, then add to base output
         lora_delta = torch.zeros_like(h.view(-1, h.shape[-1]))
-        assert routing is not None
-        _apply_dense_lora_with_routing(
-            x_flat, lora_delta, lora_workspace.up_a, lora_workspace.up_b, routing
+        assert prepared_batch is not None
+        apply_dense_lora(
+            x_flat,
+            lora_delta,
+            lora_workspace.up_a,
+            lora_workspace.up_b,
+            prepared_batch=prepared_batch,
+            scratch=lora_scratch.up if lora_scratch is not None else None,
         )
         h = h + lora_delta.view_as(h)
 
@@ -230,11 +104,15 @@ def mlp(
     out = linear(h, w.fc2)
     if use_lora:
         h_flat = h.view(-1, h.shape[-1])
-        # Use separate buffer for LoRA delta, then add to base output
         lora_delta = torch.zeros_like(out.view(-1, out.shape[-1]))
-        assert routing is not None
-        _apply_dense_lora_with_routing(
-            h_flat, lora_delta, lora_workspace.down_a, lora_workspace.down_b, routing
+        assert prepared_batch is not None
+        apply_dense_lora(
+            h_flat,
+            lora_delta,
+            lora_workspace.down_a,
+            lora_workspace.down_b,
+            prepared_batch=prepared_batch,
+            scratch=lora_scratch.down if lora_scratch is not None else None,
         )
         out = out + lora_delta.view_as(out)
 
