@@ -59,6 +59,7 @@ from .region import (
 )
 from ..seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ..hqsam_refiner import HQSamRefiner, _HAS_REFINER_DEPS
+from ..dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
 
 
@@ -548,6 +549,7 @@ class MoondreamRuntime:
         # slots (slot 0 reserved), matching effective batch size.
         self._lora_workspace: TextLoRAWorkspace | None = None
         self._slot_manager: AdapterSlotManager | None = None
+        self._dense_lora_decode_scratch: DenseLoRATorchMLPScratch | None = None
         self._max_lora_rank: int | None = max_lora_rank
         if max_lora_rank is not None:
             max_slots = self.max_batch_slots
@@ -560,6 +562,15 @@ class MoondreamRuntime:
                 lora_stream=self._lora_stream,
             )
             self._slot_manager = AdapterSlotManager(max_slots)
+            self._dense_lora_decode_scratch = create_mlp_scratch(
+                max_segments=max(1, self.max_batch_size),
+                max_segment_len=1,
+                max_rank=max_lora_rank,
+                d_model=self.config.text.dim,
+                d_ffn=self.config.text.ff_dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # Create two ping-pong decode slots for pipelined decoding.
         # Each slot has its own staging buffers, FA3 paged-KV metadata buffers,
@@ -1603,6 +1614,7 @@ class MoondreamRuntime:
             fa3_seqused_k=slot.fa3_seqused_k[:batch_size],
             lora_workspace=self._lora_workspace,
             lora_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
+            dense_lora_scratch=self._dense_lora_decode_scratch,
         )
         logits = lm_head(hidden, self.model.text)
 

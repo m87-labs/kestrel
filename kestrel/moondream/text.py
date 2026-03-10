@@ -23,6 +23,7 @@ from .layers import (
 )
 from .lora_workspace import TextLoRAWorkspace
 from .rope import precompute_freqs_cis
+from ..dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()
@@ -190,6 +191,7 @@ def text_decoder(
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
     single_lora_id: int | None = None,
+    dense_lora_scratch: DenseLoRATorchMLPScratch | None = None,
 ) -> torch.Tensor:
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
@@ -238,6 +240,7 @@ def text_decoder(
                 mlp_weights,
                 lora_workspace=dense_workspace,
                 lora_slot_ids=lora_slot_ids,
+                lora_scratch=dense_lora_scratch,
             )
 
         x = x + attn_out + mlp_out

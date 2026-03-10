@@ -82,10 +82,14 @@ from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.moondream.lora import AdapterProvider
+from kestrel.photon import PhotonReporter
 from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
+_DEFAULT_API_BASE_URL = "https://api.moondream.ai"
+
+
 @dataclass(slots=True)
 class EngineMetrics:
     """Token counts and timing for a single request."""
@@ -195,9 +199,13 @@ class InferenceEngine:
         *,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
+        api_key: Optional[str] = None,
+        api_base_url: str = _DEFAULT_API_BASE_URL,
     ) -> None:
         self._runtime_cfg = runtime_cfg
         self._adapter_provider = adapter_provider
+        self._api_key = api_key
+        self._api_base_url = api_base_url
 
         self._runtime: Optional[MoondreamRuntime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
@@ -209,6 +217,7 @@ class InferenceEngine:
         self._paused_event = threading.Event()  # acknowledgment for callers
         self._scheduler_thread: Optional[threading.Thread] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
+        self._photon_reporter: Optional[PhotonReporter] = None
         self._request_ids = itertools.count()
         self._shutdown = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -256,6 +265,7 @@ class InferenceEngine:
     ) -> "InferenceEngine":
         # Auto-create provider if none provided
         api_key = os.environ.get("MOONDREAM_API_KEY")
+        api_base_url = os.environ.get("MOONDREAM_API_BASE_URL", _DEFAULT_API_BASE_URL)
         if adapter_provider is None and api_key:
             from kestrel.cloud import MoondreamAdapterProvider
             from kestrel.moondream.config import load_config
@@ -264,11 +274,18 @@ class InferenceEngine:
             adapter_provider = MoondreamAdapterProvider(
                 text_config=config.text,
                 api_key=api_key,
+                api_base_url=api_base_url,
                 device=torch.device(runtime_cfg.device),
                 dtype=runtime_cfg.resolved_dtype(),
             )
 
-        engine = cls(runtime_cfg, skills=skills, adapter_provider=adapter_provider)
+        engine = cls(
+            runtime_cfg,
+            skills=skills,
+            adapter_provider=adapter_provider,
+            api_key=api_key,
+            api_base_url=api_base_url,
+        )
         await engine._initialize()
         return engine
 
@@ -294,6 +311,17 @@ class InferenceEngine:
             self._scheduler_thread.start()
         self._worker_task = asyncio.create_task(self._worker_loop())
         await self._warmup_query_pipeline()
+        if self._photon_reporter is None:
+            try:
+                self._photon_reporter = PhotonReporter(
+                    self._runtime_cfg,
+                    self.runtime.device,
+                    api_key=self._api_key,
+                    api_base_url=self._api_base_url,
+                )
+                self._photon_reporter.start()
+            except Exception:
+                _LOGGER.exception("Failed to start Photon reporter")
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
@@ -329,6 +357,13 @@ class InferenceEngine:
             self._scheduler_event.set()
             self._scheduler_thread.join()
             self._scheduler_thread = None
+        if self._photon_reporter is not None:
+            try:
+                await self._photon_reporter.shutdown()
+            except Exception:
+                _LOGGER.exception("Failed to stop Photon reporter")
+            finally:
+                self._photon_reporter = None
         self._image_preprocessor.shutdown(wait=True)
 
     async def submit(
@@ -908,6 +943,11 @@ class InferenceEngine:
             assert self._loop is not None
             self._loop.call_soon_threadsafe(future.set_exception, error)
         self._complete_stream(req, error=error)
+        if self._photon_reporter is not None:
+            try:
+                self._photon_reporter.record_error(finetune=req.adapter)
+            except Exception:
+                _LOGGER.exception("Failed to record Photon error telemetry")
 
     def _release_active_sequences(self) -> None:
         try:
@@ -1068,6 +1108,15 @@ class InferenceEngine:
                     continue
 
                 engine_result = self._to_engine_result(result)
+                if self._photon_reporter is not None:
+                    try:
+                        self._photon_reporter.record_success(
+                            finetune=req.adapter,
+                            input_tokens=engine_result.metrics.input_tokens,
+                            output_tokens=engine_result.metrics.output_tokens,
+                        )
+                    except Exception:
+                        _LOGGER.exception("Failed to record Photon usage telemetry")
                 future = req.future
                 if future and not future.done():
                     loop.call_soon_threadsafe(future.set_result, engine_result)
