@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import torch
 
@@ -10,6 +11,7 @@ import torch
 _SMALL_VRAM_THRESHOLD_BYTES = 24 * 1024**3
 _KV_CACHE_PAGES_SMALL_VRAM = 16384
 _KV_CACHE_PAGES_LARGE_VRAM = 65536
+_SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _default_kv_cache_pages_for_device(device: str) -> int:
@@ -50,8 +52,14 @@ class RuntimeConfig:
     enable_prefix_cache: bool = True
     # Model: "moondream2" or "moondream3-preview"
     model: str = "moondream3-preview"
+    service_name: str = "local"
 
     def __post_init__(self):
+        normalized_service_name = self.service_name.strip()
+        self.service_name = normalized_service_name or "local"
+        if not _SERVICE_NAME_PATTERN.fullmatch(self.service_name):
+            raise ValueError("service_name must match [A-Za-z0-9_-]+")
+
         if self.kv_cache_pages is None:
             self.kv_cache_pages = _default_kv_cache_pages_for_device(self.device)
         elif self.kv_cache_pages <= 0:
