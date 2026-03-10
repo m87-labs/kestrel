@@ -1,9 +1,4 @@
-"""Legacy HQ-SAM segmentation refiner.
-
-This refiner was used prior to the current SegmentRefiner-based pipeline.
-It refines a coarse raster mask derived from the model's SVG output using
-an HQ-SAM model, then vectorizes the refined bitmap back into an SVG path.
-"""
+"""Legacy HQ-SAM segmentation refiner."""
 
 from __future__ import annotations
 
