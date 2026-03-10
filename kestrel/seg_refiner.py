@@ -30,7 +30,7 @@ from .moondream.config import VisionConfig
 _REFINER_ITERS = 5
 _SEGHEAD_REFINER_REPO_ID = "moondream/SegHeadRefiner"
 _SEGHEAD_REFINER_FILENAME = "model.pt"
-_SEGHEAD_REFINER_REVISION = "4b2f12389d20a288e4ba3d7008e3a510c76af6ed"
+_SEGHEAD_REFINER_REVISION = "d3664cf8d8501b37d9ed8cd222e6d4e876c88621"
 
 # Lazy imports for optional dependencies
 _potrace = None
