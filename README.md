@@ -232,30 +232,7 @@ RuntimeConfig(
 
 ## Benchmarks
 
-Throughput and latency for the `query` skill on a single H100 GPU, measured on the [ChartQA](https://huggingface.co/datasets/vikhyatk/chartqa) test split with prefix caching enabled.
-
-- **Direct** — the model generates a short answer (~3 output tokens per request)
-- **CoT** (Chain-of-Thought) — the model reasons step-by-step before answering (~30 output tokens per request), enabled via `reasoning=True`
-
-### Moondream 2
-
-| Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
-|-----------|---------------|----------------|-------------|--------------|
-| 1 | 36.48 | 31.91 | 11.50 | 140.11 |
-| 2 | 41.67 | 44.52 | 17.65 | 134.85 |
-| 4 | 44.41 | 67.31 | 25.46 | 153.46 |
-| 8 | 46.12 | 110.04 | 33.63 | 207.75 |
-| 16 | 46.85 | 209.27 | 37.86 | 347.70 |
-
-### Moondream 3
-
-| Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
-|-----------|---------------|----------------|-------------|--------------|
-| 1 | 27.82 | 41.05 | 9.04 | 177.28 |
-| 2 | 31.24 | 62.41 | 12.98 | 181.56 |
-| 4 | 33.18 | 90.29 | 17.75 | 221.60 |
-| 8 | 34.73 | 149.13 | 22.84 | 312.56 |
-| 16 | 35.11 | 281.28 | 26.95 | 503.55 |
+Throughput and latency for the `query` skill are tracked in [PERFORMANCE.md](./PERFORMANCE.md), with results broken out by GPU.
 
 ## License
 
