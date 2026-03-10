@@ -79,6 +79,24 @@ class PhotonReporter:
         self._license_state: Optional[str] = None
         self._last_telemetry_warning_at = 0.0
 
+    async def initial_license_check(self) -> None:
+        """Run the first license check. Raises SystemExit for fatal states."""
+        await self._refresh_license(log=False)
+        if self._license_state == "missing_api_key":
+            _LOGGER.error(
+                "MOONDREAM_API_KEY is not set. A valid API key is required to "
+                "start the server. See %s",
+                _DEFAULT_PRICING_URL,
+            )
+            raise SystemExit(1)
+        if self._license_state == "invalid_api_key":
+            _LOGGER.error(
+                "The provided MOONDREAM_API_KEY is invalid. A valid API key is "
+                "required to start the server. See %s",
+                _DEFAULT_PRICING_URL,
+            )
+            raise SystemExit(1)
+
     def start(self) -> None:
         if self._telemetry_task is None:
             self._telemetry_task = asyncio.create_task(self._telemetry_loop())
@@ -147,10 +165,10 @@ class PhotonReporter:
             if self._stop_event.is_set():
                 break
 
-    async def _refresh_license(self) -> None:
+    async def _refresh_license(self, *, log: bool = True) -> None:
         if not self._api_key:
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="missing_api_key"),
+                _LicenseSnapshot(state="missing_api_key"), log=log,
             )
             return
 
@@ -164,7 +182,7 @@ class PhotonReporter:
             )
         except httpx.HTTPError as exc:
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"),
+                _LicenseSnapshot(state="verification_error"), log=log,
             )
             _LOGGER.debug("Photon license request failed", exc_info=exc)
             return
@@ -172,13 +190,13 @@ class PhotonReporter:
         if response.status_code == 401:
             self._pending_reports.clear()
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="invalid_api_key"),
+                _LicenseSnapshot(state="invalid_api_key"), log=log,
             )
             return
 
         if response.status_code >= 400:
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"),
+                _LicenseSnapshot(state="verification_error"), log=log,
             )
             return
 
@@ -186,13 +204,13 @@ class PhotonReporter:
             payload = response.json()
         except ValueError:
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"),
+                _LicenseSnapshot(state="verification_error"), log=log,
             )
             return
 
         if not isinstance(payload, dict):
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"),
+                _LicenseSnapshot(state="verification_error"), log=log,
             )
             return
 
@@ -203,7 +221,7 @@ class PhotonReporter:
             instance_limit = int(payload.get("instance_limit", 0))
         except (TypeError, ValueError):
             self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"),
+                _LicenseSnapshot(state="verification_error"), log=log,
             )
             return
         pricing_url = str(payload.get("pricing_url", _DEFAULT_PRICING_URL))
@@ -223,7 +241,8 @@ class PhotonReporter:
                 active_instances=active_instances,
                 instance_limit=instance_limit,
                 pricing_url=pricing_url,
-            )
+            ),
+            log=log,
         )
 
     async def _flush_window(self) -> None:
@@ -298,9 +317,14 @@ class PhotonReporter:
 
         return reports
 
-    def _publish_license_snapshot(self, snapshot: _LicenseSnapshot) -> None:
+    def _publish_license_snapshot(
+        self, snapshot: _LicenseSnapshot, *, log: bool = True,
+    ) -> None:
         previous_state = self._license_state
         self._license_state = snapshot.state
+
+        if not log:
+            return
 
         if snapshot.state == "licensed":
             if previous_state and previous_state != "licensed":
@@ -310,8 +334,8 @@ class PhotonReporter:
         if snapshot.state == "missing_api_key":
             _LOGGER.warning(
                 "Photon license could not be verified because MOONDREAM_API_KEY is not set. "
-                "Startup and inference will continue, but commercial use requires a license. "
-                "See %s",
+                "Inference will continue, but only noncommercial and evaluation use is "
+                "permitted without a valid license. See %s",
                 snapshot.pricing_url,
             )
             return
@@ -319,25 +343,26 @@ class PhotonReporter:
         if snapshot.state == "invalid_api_key":
             _LOGGER.warning(
                 "Photon license could not be verified because the provided API key is invalid. "
-                "Startup and inference will continue, but commercial use requires a license. "
-                "See %s",
+                "Inference will continue, but only noncommercial and evaluation use is "
+                "permitted without a valid license. See %s",
                 snapshot.pricing_url,
             )
             return
 
         if snapshot.state == "verification_error":
             _LOGGER.warning(
-                "Photon license could not be verified. Startup and inference will continue, "
-                "but commercial use requires a license. See %s",
+                "Photon license could not be verified due to a connectivity or server issue. "
+                "Inference will continue, but commercial use requires a valid license. "
+                "See %s",
                 snapshot.pricing_url,
             )
             return
 
         if snapshot.state == "over_limit":
             _LOGGER.warning(
-                "Photon active instance count exceeds the licensed limit (%s active / %s allowed). "
-                "Startup and inference will continue, but commercial use requires a license. "
-                "See %s",
+                "Photon active instance count exceeds the licensed limit "
+                "(%s active / %s allowed). Please reduce active instances or "
+                "upgrade your plan. See %s",
                 snapshot.active_instances,
                 snapshot.instance_limit,
                 snapshot.pricing_url,
@@ -346,8 +371,8 @@ class PhotonReporter:
 
         _LOGGER.warning(
             "Photon commercial license is not active for this API key or account. "
-            "Startup and inference will continue, but commercial use requires a license. "
-            "See %s",
+            "Inference will continue, but only noncommercial and evaluation use is "
+            "permitted without a valid license. See %s",
             snapshot.pricing_url,
         )
 

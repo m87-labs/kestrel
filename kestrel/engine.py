@@ -319,6 +319,7 @@ class InferenceEngine:
                     api_key=self._api_key,
                     api_base_url=self._api_base_url,
                 )
+                await self._photon_reporter.initial_license_check()
                 self._photon_reporter.start()
             except Exception:
                 _LOGGER.exception("Failed to start Photon reporter")
