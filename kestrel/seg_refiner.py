@@ -28,6 +28,9 @@ from .moondream.config import VisionConfig
 
 # Number of refinement iterations
 _REFINER_ITERS = 5
+_SEGHEAD_REFINER_REPO_ID = "moondream/SegHeadRefiner"
+_SEGHEAD_REFINER_FILENAME = "model.pt"
+_SEGHEAD_REFINER_REVISION = "4b2f12389d20a288e4ba3d7008e3a510c76af6ed"
 
 # Lazy imports for optional dependencies
 _potrace = None
@@ -307,8 +310,9 @@ class SegmentRefiner:
 
         self._head = _RefinementHead(enc_dim=1152, embed_dim=256, num_masks=4)
         weights_path = hf_hub_download(
-            repo_id="moondream/SegHeadRefiner",
-            filename="model.pt",
+            repo_id=_SEGHEAD_REFINER_REPO_ID,
+            filename=_SEGHEAD_REFINER_FILENAME,
+            revision=_SEGHEAD_REFINER_REVISION,
             token=os.environ.get("HF_TOKEN"),
         )
         ckpt = torch.load(weights_path, map_location=device, weights_only=True)
