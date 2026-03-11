@@ -685,11 +685,14 @@ class InferenceEngine:
         object: str,
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
+        return_base64: bool = False,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
         normalized_object = object.strip()
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
+        if return_base64 and image is None:
+            raise ValueError("return_base64 requires an image")
 
         adapter = self._extract_adapter_id(settings)
         temperature = 0.0
@@ -722,6 +725,7 @@ class InferenceEngine:
                 max_tokens=max_tokens,
             ),
             spatial_refs=normalized_refs,
+            return_base64=bool(return_base64),
         )
 
         return await self.submit(

@@ -43,6 +43,7 @@ class SegmentRequest:
     stream: bool
     settings: SegmentSettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
+    return_base64: bool = False
 
 
 class SegmentSkill(SkillSpec):
@@ -151,13 +152,35 @@ class SegmentSkillState(SkillState):
         coarse_path = svg_path
         coarse_bbox = bbox
 
-        if svg_path and bbox and not parse_error and self._request.image is not None and runtime.seg_refiner is not None:
-            refined_path, refined_bbox = runtime.seg_refiner(
-                self._request.image, svg_path, bbox
-            )
-            if refined_path is not None and refined_bbox is not None:
-                svg_path = refined_path
-                bbox = refined_bbox
+        coarse_mask_b64: Optional[str] = None
+        refined_mask_b64: Optional[str] = None
+
+        if (
+            svg_path
+            and bbox
+            and not parse_error
+            and self._request.image is not None
+            and runtime.seg_refiner is not None
+        ):
+            if self._request.return_base64:
+                refine_result = runtime.seg_refiner.refine_with_bitmaps(
+                    self._request.image, svg_path, bbox, return_base64=True
+                )
+                if (
+                    refine_result.refined_svg_path is not None
+                    and refine_result.refined_bbox is not None
+                ):
+                    svg_path = refine_result.refined_svg_path
+                    bbox = refine_result.refined_bbox
+                coarse_mask_b64 = refine_result.coarse_mask_base64
+                refined_mask_b64 = refine_result.refined_mask_base64
+            else:
+                refined_path, refined_bbox = runtime.seg_refiner(
+                    self._request.image, svg_path, bbox
+                )
+                if refined_path is not None and refined_bbox is not None:
+                    svg_path = refined_path
+                    bbox = refined_bbox
 
         segment: Dict[str, object] = {
             "object": self._request.object,
@@ -168,6 +191,9 @@ class SegmentSkillState(SkillState):
             "points": points,
             "coarse_path": coarse_path,
         }
+        if self._request.return_base64:
+            segment["coarse_mask_base64"] = coarse_mask_b64
+            segment["refined_mask_base64"] = refined_mask_b64
         if parse_error:
             segment["parse_error"] = parse_error
         if bbox is not None:
