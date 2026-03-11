@@ -355,6 +355,21 @@ class TestEviction:
         assert freed_pages == []
         assert cache.total_cached_pages == 1
 
+    def test_evict_skips_prefill_locked_nodes_with_stale_heap_entry(self) -> None:
+        freed_pages: list[int] = []
+        cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)
+        result = cache.insert([MockToken(0)], [0])
+
+        # The insert adds an evictable heap entry. A later prefill lock must
+        # invalidate that entry for eviction purposes.
+        cache.lock_prefill(result.node)
+
+        freed_count = cache.evict(1)
+
+        assert freed_count == 0
+        assert freed_pages == []
+        assert cache.total_cached_pages == 1
+
     def test_evict_lru_order(self) -> None:
         freed_pages: list[int] = []
         cache = RadixPrefixCache(free_pages_sink=freed_pages.extend)

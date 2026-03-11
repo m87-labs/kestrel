@@ -38,7 +38,12 @@ class LRUEvictionPolicy:
         Args:
             node: Node to potentially add to heap.
         """
-        if node.is_leaf() and node.lock_ref == 0 and node.parent is not None:
+        if (
+            node.is_leaf()
+            and node.lock_ref == 0
+            and node.prefill_lock_ref == 0
+            and node.parent is not None
+        ):
             node.heap_version += 1
             heapq.heappush(
                 self._heap,
@@ -70,7 +75,7 @@ class LRUEvictionPolicy:
         """
         if node.heap_version != version:
             return False
-        if not node.is_leaf() or node.lock_ref != 0:
+        if not node.is_leaf() or node.lock_ref != 0 or node.prefill_lock_ref != 0:
             return False
         if node.parent is None:
             return False
