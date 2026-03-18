@@ -1,6 +1,6 @@
 [project]
 name = "kestrel"
-version = "0.1.3"
+version = "0.2.0"
 description = "a fast, efficient inference engine for moondream"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -24,13 +24,16 @@ exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
 jetson-jp6 = [
-  #  "kestrel-kernels-jetson-pt24==0.2.0",
+    "kestrel-kernels-jetson-pt24==0.2.0",
+    "numpy<2",
 ]
 jetson-jp61 = [
-  #  "kestrel-kernels-jetson-pt25==0.2.0",
+    "kestrel-kernels-jetson-pt25==0.2.0",
+    "numpy<2",
 ]
 jetson-jp62 = [
-  #  "kestrel-kernels-jetson-pt25==0.2.0",
+    "kestrel-kernels-jetson-pt25==0.2.0",
+    "numpy<2",
 ]
 
 [dependency-groups]

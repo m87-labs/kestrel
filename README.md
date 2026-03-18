@@ -18,7 +18,7 @@ Kestrel provides async, micro-batched serving with streaming support, paged KV c
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU (tested on L4, L40S, H100). Optimized CUDA kernels are available for SM89 and SM90 architectures. Other GPUs may work but will fall back to non-optimized kernels.
+- NVIDIA GPU with optimized kernels for SM80 (A100), SM86 (A40, A10, RTX 3090), SM87 (Jetson Orin), SM89 (L4, L40S), and SM90 (H100). Other GPUs may work but have not been tested.
 - `MOONDREAM_API_KEY` environment variable (get this from [moondream.ai](https://moondream.ai))
 
 ## Installation
@@ -26,6 +26,8 @@ Kestrel provides async, micro-batched serving with streaming support, paged KV c
 ```bash
 pip install kestrel
 ```
+
+For Jetson Orin, see the [Jetson setup guide](docs/jetson.md).
 
 ## Model Access
 
@@ -230,10 +232,14 @@ RuntimeConfig(
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
 | `HF_TOKEN` | HuggingFace token for gated models like Moondream 3. Alternatively, run `huggingface-cli login`. |
 
+## Triton Inference Server
+
+Kestrel can be deployed as a [Triton Inference Server](https://github.com/triton-inference-server/server) backend. See the [Triton setup guide](triton/README.md).
+
 ## Benchmarks
 
 Throughput and latency for the `query` skill are tracked in [PERFORMANCE.md](./PERFORMANCE.md), with results broken out by GPU.
 
 ## License
 
-Free for evaluation and non-commercial use. Commercial use requires a [Moondream Station Pro license](https://moondream.ai/pricing).
+Kestrel requires a Moondream API key. See [moondream.ai/pricing](https://moondream.ai/pricing) for plans.
