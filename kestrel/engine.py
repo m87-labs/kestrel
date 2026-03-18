@@ -88,6 +88,10 @@ from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_API_BASE_URL = "https://api.moondream.ai"
+_ALLOWED_API_BASE_URLS = (
+    "https://api-staging.moondream.ai",
+    _DEFAULT_API_BASE_URL,
+)
 
 
 @dataclass(slots=True)
@@ -266,6 +270,9 @@ class InferenceEngine:
         # Auto-create provider if none provided
         api_key = os.environ.get("MOONDREAM_API_KEY")
         api_base_url = os.environ.get("MOONDREAM_API_BASE_URL", _DEFAULT_API_BASE_URL)
+        api_base_url = api_base_url.rstrip("/")
+        if api_base_url not in _ALLOWED_API_BASE_URLS:
+            api_base_url = _DEFAULT_API_BASE_URL
         if adapter_provider is None and api_key:
             from kestrel.cloud import MoondreamAdapterProvider
             from kestrel.moondream.config import load_config
