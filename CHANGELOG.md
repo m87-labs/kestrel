@@ -2,6 +2,30 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.2.0 — 2026-03-18
+
+### New Features
+
+- **A100, A40, A10, and RTX 3090 support** — Kestrel now runs on SM80 and
+  SM86 GPUs with precompiled attention, rotary, KV-cache, and FP8 kernels.
+- **Jetson Orin support** — SM87 kernels for Jetson AGX Orin / Orin NX,
+  with JetPack 6.1 and 6.2 dependency groups (`pip install kestrel[jetson-jp61]`).
+- **Triton Inference Server backend** — deploy Kestrel as a Triton model
+  with streaming support across all skills (query, caption, detect, point).
+
+### Performance
+
+- **~5.4x faster startup** (14.4s → 2.7s on H100).
+- Faster LoRA inference via dense decode backend.
+- Refreshed A100 and A10 benchmark results in PERFORMANCE.md.
+
+### Bug Fixes
+
+- Fixed eviction of prefix cache nodes that were still in use during prefill.
+- Fixed reliability of engine pause/resume under concurrent GPU workloads.
+- Fixed LoRA scaling for MoE expert adapters, improving training stability.
+- Fixed top-p sampling edge case that could read out of bounds.
+
 ## 0.1.3 — 2026-02-20
 
 ### Performance
