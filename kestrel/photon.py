@@ -299,6 +299,7 @@ class PhotonReporter:
         reports: list[dict[str, Any]] = []
         for finetune, bucket in current_buckets.items():
             report: dict[str, Any] = {
+                "report_id": str(uuid.uuid4()),
                 "instance_id": self._instance_id,
                 "service_name": self._service_name,
                 "model": self._model,
