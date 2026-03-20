@@ -32,6 +32,7 @@ _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
 cute_prefix_lm_mask_730 = _KERNELS.attention.prefix_lm_mask_730
 tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
 rotary_embedding = _KERNELS.rotary.rotary_embedding
+_fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -82,6 +83,7 @@ def attn(
     page_table: torch.Tensor | None = None,
     fa3_seqused_q: torch.Tensor | None = None,
     fa3_seqused_k: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -173,6 +175,12 @@ def attn(
         )
 
     out = out.view(bsz, q_len, d_model)
+    if residual is not None:
+        _fused_linear_bias_residual_into(
+            x=out, w=module.proj.weight, b=module.proj.bias,
+            residual=residual, out=residual,
+        )
+        return residual
     return _kestrel_linear(out, module.proj.weight, module.proj.bias)
 
 
@@ -198,7 +206,8 @@ def text_decoder(
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
 
-        attn_out = attn(
+        # O projection fused with residual add: x = x + attn_output @ proj^T + proj_bias
+        x = attn(
             x_norm,
             block.attn,
             module.cos_sin_cache,
@@ -213,6 +222,7 @@ def text_decoder(
             page_table=page_table,
             fa3_seqused_q=fa3_seqused_q,
             fa3_seqused_k=fa3_seqused_k,
+            residual=x,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
@@ -244,7 +254,7 @@ def text_decoder(
                 lora_scratch=dense_lora_scratch,
             )
 
-        x = x + attn_out + mlp_out
+        x = x + mlp_out
 
     return x
 
