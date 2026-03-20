@@ -201,7 +201,13 @@ def text_decoder(
     lora_slot_ids: torch.Tensor | None = None,
     single_lora_id: int | None = None,
     dense_lora_scratch: DenseLoRATorchMLPScratch | None = None,
+    scratch_pool: dict | None = None,
 ) -> torch.Tensor:
+    # Activate scratch pool to avoid per-layer tensor allocations in linear ops.
+    if scratch_pool is not None:
+        from kestrel_kernels.linear_ops import set_scratch_pool, clear_scratch_pool
+        set_scratch_pool(scratch_pool)
+
     for i, block in enumerate(module.blocks):
         ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
         x_norm = layer_norm(x, ln_weights)
@@ -255,6 +261,9 @@ def text_decoder(
             )
 
         x = x + mlp_out
+
+    if scratch_pool is not None:
+        clear_scratch_pool()
 
     return x
 

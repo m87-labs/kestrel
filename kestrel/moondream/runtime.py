@@ -185,6 +185,32 @@ class SequenceState:
         return self.length - (self.prompt_length or 0)
 
 
+class PrefillScratch:
+    """Pre-allocated scratch buffers for prefill to avoid per-layer allocations."""
+
+    def __init__(self, max_tokens: int, config, device: torch.device, dtype: torch.dtype):
+        d = config.dim
+        n_heads = config.n_heads
+        head_dim = d // n_heads
+        qkv_dim = d + 2 * (config.n_kv_heads * head_dim)
+        n_experts = config.moe.num_experts if config.moe else 0
+        tau_out_dim = 2 * n_heads
+
+        self.qkv_out = torch.empty(max_tokens, qkv_dim, dtype=dtype, device=device)
+        self.tok_qv_lin = torch.empty(max_tokens, tau_out_dim, dtype=dtype, device=device)
+        self.router_logits = torch.empty(max_tokens, n_experts, dtype=dtype, device=device) if n_experts else None
+
+    def ensure_size(self, tokens: int):
+        """Grow buffers if needed (rare — only if tokens > initial max_tokens)."""
+        if tokens <= self.qkv_out.size(0):
+            return
+        device, dtype = self.qkv_out.device, self.qkv_out.dtype
+        self.qkv_out = torch.empty(tokens, self.qkv_out.size(1), dtype=dtype, device=device)
+        self.tok_qv_lin = torch.empty(tokens, self.tok_qv_lin.size(1), dtype=dtype, device=device)
+        if self.router_logits is not None:
+            self.router_logits = torch.empty(tokens, self.router_logits.size(1), dtype=dtype, device=device)
+
+
 @dataclass(slots=True)
 class PrefillSlot:
     """Per-prefill slot resources.
@@ -199,6 +225,7 @@ class PrefillSlot:
     batch_idx: Tensor
     step_done_event: torch.cuda.Event
     commit_done_event: torch.cuda.Event
+    scratch: PrefillScratch | None = None
 
 
 @dataclass
@@ -514,6 +541,9 @@ class MoondreamRuntime:
         size_dtype = self.region.size_features.dtype
         # Prefill can be pipelined (CPU committing token0 while GPU runs the next prefill).
         # Keep 2 slots to avoid clobbering per-prefill GPU buffers like `batch_idx`.
+        # Pre-allocate scratch buffers for prefill to avoid per-layer allocations.
+        # Size for typical prefill (1024 tokens). Grows automatically if needed.
+        _prefill_scratch_tokens = 1024
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
                 slot_id=slot_id,
@@ -522,6 +552,9 @@ class MoondreamRuntime:
                 ),
                 step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
                 commit_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
+                scratch=PrefillScratch(
+                    _prefill_scratch_tokens, self.config.text, self.device, self.dtype,
+                ) if self.config.text else None,
             )
             for slot_id in range(2)
         ]
@@ -1474,6 +1507,23 @@ class MoondreamRuntime:
             # Single-LoRA prefill path uses a fixed lora_id (slot N -> lora_id N-1)
             single_lora_id = lora_slot - 1
 
+        # Build scratch buffer pool for prefill to avoid per-layer allocations.
+        M = inputs_embeds.size(0) * inputs_embeds.size(1)
+        tc = self.config.text
+        head_dim = tc.dim // tc.n_heads
+        scratch_pool = {
+            (M, tc.dim + 2 * tc.n_kv_heads * head_dim): torch.empty(
+                M, tc.dim + 2 * tc.n_kv_heads * head_dim,
+                dtype=inputs_embeds.dtype, device=self.device),  # QKV
+            (M, 2 * tc.n_heads): torch.empty(
+                M, 2 * tc.n_heads,
+                dtype=inputs_embeds.dtype, device=self.device),  # tau_wqwv
+        }
+        if tc.moe and tc.moe.num_experts:
+            scratch_pool[(M, tc.moe.num_experts)] = torch.empty(
+                M, tc.moe.num_experts,
+                dtype=inputs_embeds.dtype, device=self.device)  # router
+
         hidden = text_decoder(
             inputs_embeds,
             self.model.text,
@@ -1489,6 +1539,7 @@ class MoondreamRuntime:
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
             single_lora_id=single_lora_id,
+            scratch_pool=scratch_pool,
         )
 
         row_ids = torch.arange(hidden.shape[0], device=hidden.device)
