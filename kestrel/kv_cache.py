@@ -478,14 +478,19 @@ class PageTable:
             batch_indices: List of batch indices to sync. If None, syncs all dirty rows.
         """
         if batch_indices is None:
-            batch_indices = sorted(self._dirty_rows)
-        if not batch_indices:
+            dirty_rows = self._dirty_rows.copy()
+        else:
+            # Decode/prefill often pass the active batch rows every step. Most of
+            # those rows are already clean, so only sync the subset that actually
+            # changed on the CPU side.
+            dirty_rows = self._dirty_rows.intersection(batch_indices)
+        if not dirty_rows:
             return
         # Find max row index and copy all rows up to that point in one call
-        max_row = max(batch_indices) + 1
+        max_row = max(dirty_rows) + 1
         with _maybe_stream_context(self._h2d_stream):
             self._page_table_buffer.copy_to_gpu(max_row)
-        self._dirty_rows -= set(batch_indices)
+        self._dirty_rows -= dirty_rows
 
     # =========================================================================
     # Prefix cache integration methods

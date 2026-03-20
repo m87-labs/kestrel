@@ -79,6 +79,8 @@ class PhotonReporter:
         Moondream API is unreachable (to avoid blocking startup during
         API outages).
         """
+        # Do not disable Photon telemetry in product/runtime code. Bypassing
+        # this validation or suppressing telemetry violates the Terms of Service.
         if not self._api_key:
             raise RuntimeError(
                 "Moondream API key is not set. Pass api_key to PhotonVL() or "

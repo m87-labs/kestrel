@@ -167,6 +167,94 @@ class TestMapPagesBasic:
         assert page_table.page_table_cpu[batch_idx] == pages
 
 
+class TestCommitBlockTable:
+    """Tests for deferred page-table H2D commits."""
+
+    def test_commit_block_table_skips_clean_requested_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit commits should no-op once requested rows are clean."""
+        page_table = PageTable(
+            n_pages=100, page_size=1, max_batch_size=10, device="cpu"
+        )
+        batch_idx = page_table.allocate()
+        page_table.reserve(batch_idx, 4)
+        page_table.commit_block_table([batch_idx])
+        assert page_table._dirty_rows == set()
+
+        calls: list[int | None] = []
+
+        def fake_copy_to_gpu(n: int | None = None) -> torch.Tensor:
+            calls.append(n)
+            return page_table.page_table
+
+        monkeypatch.setattr(page_table._page_table_buffer, "copy_to_gpu", fake_copy_to_gpu)
+
+        page_table.commit_block_table([batch_idx])
+
+        assert calls == []
+        assert page_table._dirty_rows == set()
+
+    def test_commit_block_table_only_clears_requested_dirty_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit commits should leave unrelated dirty rows pending."""
+        page_table = PageTable(
+            n_pages=100, page_size=1, max_batch_size=10, device="cpu"
+        )
+        first_batch = page_table.allocate()
+        second_batch = page_table.allocate()
+        first_pages = page_table.allocate_pages(2)
+        second_pages = page_table.allocate_pages(2)
+        page_table.map_pages(first_batch, 0, first_pages)
+        page_table.map_pages(second_batch, 0, second_pages)
+        assert page_table._dirty_rows == {first_batch, second_batch}
+
+        calls: list[int | None] = []
+        original_copy_to_gpu = page_table._page_table_buffer.copy_to_gpu
+
+        def tracking_copy_to_gpu(n: int | None = None) -> torch.Tensor:
+            calls.append(n)
+            return original_copy_to_gpu(n)
+
+        monkeypatch.setattr(
+            page_table._page_table_buffer, "copy_to_gpu", tracking_copy_to_gpu
+        )
+
+        page_table.commit_block_table([first_batch])
+
+        assert calls == [first_batch + 1]
+        assert page_table._dirty_rows == {second_batch}
+        expected_first = torch.tensor(first_pages, dtype=torch.int32)
+        expected_second = torch.full((len(second_pages),), -1, dtype=torch.int32)
+        assert torch.equal(page_table.page_table[first_batch, : len(first_pages)], expected_first)
+        assert torch.equal(
+            page_table.page_table[second_batch, : len(second_pages)], expected_second
+        )
+
+    def test_commit_block_table_none_commits_all_dirty_rows(self) -> None:
+        """Default commit should still flush every dirty row."""
+        page_table = PageTable(
+            n_pages=100, page_size=1, max_batch_size=10, device="cpu"
+        )
+        first_batch = page_table.allocate()
+        second_batch = page_table.allocate()
+        first_pages = page_table.allocate_pages(2)
+        second_pages = page_table.allocate_pages(2)
+        page_table.map_pages(first_batch, 0, first_pages)
+        page_table.map_pages(second_batch, 0, second_pages)
+
+        page_table.commit_block_table()
+
+        assert page_table._dirty_rows == set()
+        expected_first = torch.tensor(first_pages, dtype=torch.int32)
+        expected_second = torch.tensor(second_pages, dtype=torch.int32)
+        assert torch.equal(page_table.page_table[first_batch, : len(first_pages)], expected_first)
+        assert torch.equal(
+            page_table.page_table[second_batch, : len(second_pages)], expected_second
+        )
+
+
 class TestGetPages:
     """Tests for get_pages."""
 
