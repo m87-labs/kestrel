@@ -1,4 +1,4 @@
-"""Photon license verification and telemetry reporting."""
+"""Photon telemetry reporting and API key validation."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from kestrel.config import RuntimeConfig
 
 
 _LOGGER = logging.getLogger(__name__)
-_DEFAULT_PRICING_URL = "https://moondream.ai/pricing"
+_PRICING_URL = "https://moondream.ai/pricing"
+_DOCS_URL = "https://moondream.ai/docs"
 _TELEMETRY_FLUSH_INTERVAL_SECONDS = 60
-_LICENSE_REFRESH_INTERVAL_SECONDS = 600
 _TELEMETRY_WARNING_INTERVAL_SECONDS = 600
 _MAX_PENDING_REPORTS = 100
 _MAX_REPORTS_PER_UPLOAD = 10
@@ -39,16 +39,8 @@ class _TelemetryBucket:
     output_tokens: int = 0
 
 
-@dataclass(slots=True)
-class _LicenseSnapshot:
-    state: str
-    active_instances: int = 0
-    instance_limit: int = 0
-    pricing_url: str = _DEFAULT_PRICING_URL
-
-
 class PhotonReporter:
-    """Tracks local usage rollups and commercial-license standing."""
+    """Tracks local usage rollups and reports them to the Photon API."""
 
     def __init__(
         self,
@@ -57,7 +49,9 @@ class PhotonReporter:
         *,
         api_key: Optional[str],
         api_base_url: str,
+        engine: Any,
     ) -> None:
+        self._engine = engine
         self._api_key = api_key
         self._api_base_url = api_base_url.rstrip("/")
         self._client = httpx.AsyncClient(
@@ -75,42 +69,54 @@ class PhotonReporter:
         self._pending_reports: list[dict[str, Any]] = []
         self._stop_event = asyncio.Event()
         self._telemetry_task: Optional[asyncio.Task[None]] = None
-        self._license_task: Optional[asyncio.Task[None]] = None
-        self._license_state: Optional[str] = None
         self._last_telemetry_warning_at = 0.0
 
-    async def initial_license_check(self) -> None:
-        """Run the first license check. Raises SystemExit for fatal states."""
-        await self._refresh_license(log=False)
-        if self._license_state == "missing_api_key":
-            _LOGGER.error(
-                "MOONDREAM_API_KEY is not set. A valid API key is required to "
-                "start the server. See %s",
-                _DEFAULT_PRICING_URL,
+    async def validate_api_key(self) -> None:
+        """Validate the API key by sending an initial telemetry flush.
+
+        Raises RuntimeError if the key is missing, invalid, or the
+        account is not in good standing.  Warns and returns if the
+        Moondream API is unreachable (to avoid blocking startup during
+        API outages).
+        """
+        if not self._api_key:
+            raise RuntimeError(
+                "MOONDREAM_API_KEY is not set. Set this environment variable "
+                "to start the Photon inference engine. See %s" % _DOCS_URL
             )
-            raise SystemExit(1)
-        if self._license_state == "invalid_api_key":
-            _LOGGER.error(
-                "The provided MOONDREAM_API_KEY is invalid. A valid API key is "
-                "required to start the server. See %s",
-                _DEFAULT_PRICING_URL,
+
+        standing = await self._flush_window()
+
+        if standing is None:
+            _LOGGER.warning(
+                "Could not reach the Moondream API. The Photon inference "
+                "engine will start, but usage will not be reported and "
+                "finetunes will not be available while the API is "
+                "unreachable.",
             )
-            raise SystemExit(1)
+            return
+
+        if standing == "invalid_api_key":
+            raise RuntimeError(
+                "MOONDREAM_API_KEY is not valid. Check that the key is "
+                "correct and try again. See %s" % _DOCS_URL
+            )
+
+        if standing != "active":
+            raise RuntimeError(
+                "Your account does not have enough credits to start the "
+                "Photon inference engine. Add credits at %s" % _PRICING_URL
+            )
 
     def start(self) -> None:
         if self._telemetry_task is None:
             self._telemetry_task = asyncio.create_task(self._telemetry_loop())
-        if self._license_task is None:
-            self._license_task = asyncio.create_task(self._license_loop())
 
     async def shutdown(self) -> None:
         self._stop_event.set()
         if self._telemetry_task is not None:
             await self._telemetry_task
             self._telemetry_task = None
-        if self._license_task is not None:
-            await self._license_task
-            self._license_task = None
         await self._client.aclose()
 
     def record_success(
@@ -152,108 +158,24 @@ class PhotonReporter:
             if self._stop_event.is_set():
                 break
 
-    async def _license_loop(self) -> None:
-        while True:
-            await self._refresh_license()
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=_LICENSE_REFRESH_INTERVAL_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                continue
-            if self._stop_event.is_set():
-                break
+    async def _flush_window(self) -> Optional[str]:
+        """Flush pending telemetry reports and return account standing.
 
-    async def _refresh_license(self, *, log: bool = True) -> None:
-        if not self._api_key:
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="missing_api_key"), log=log,
-            )
-            return
-
-        try:
-            response = await self._client.post(
-                f"{self._api_base_url}/v1/photon/license",
-                json={
-                    "instance_id": self._instance_id,
-                    "service_name": self._service_name,
-                },
-            )
-        except httpx.HTTPError as exc:
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"), log=log,
-            )
-            _LOGGER.debug("Photon license request failed", exc_info=exc)
-            return
-
-        if response.status_code == 401:
-            self._pending_reports.clear()
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="invalid_api_key"), log=log,
-            )
-            return
-
-        if response.status_code >= 400:
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"), log=log,
-            )
-            return
-
-        try:
-            payload = response.json()
-        except ValueError:
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"), log=log,
-            )
-            return
-
-        if not isinstance(payload, dict):
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"), log=log,
-            )
-            return
-
-        standing_status = payload.get("standing_status")
-        license_status = payload.get("license_status")
-        try:
-            active_instances = int(payload.get("active_instances", 0))
-            instance_limit = int(payload.get("instance_limit", 0))
-        except (TypeError, ValueError):
-            self._publish_license_snapshot(
-                _LicenseSnapshot(state="verification_error"), log=log,
-            )
-            return
-        pricing_url = str(payload.get("pricing_url", _DEFAULT_PRICING_URL))
-
-        if standing_status == "verification_error" or license_status == "verification_error":
-            state = "verification_error"
-        elif license_status == "licensed":
-            state = "licensed"
-        elif license_status == "over_limit":
-            state = "over_limit"
-        else:
-            state = "inactive"
-
-        self._publish_license_snapshot(
-            _LicenseSnapshot(
-                state=state,
-                active_instances=active_instances,
-                instance_limit=instance_limit,
-                pricing_url=pricing_url,
-            ),
-            log=log,
-        )
-
-    async def _flush_window(self) -> None:
+        Returns the standing string from the telemetry response:
+        ``"active"``, ``"key_revoked"``, ``"billing_paused"``,
+        ``"inactive"``, ``"error"``, or ``None`` if the flush could not
+        be completed.
+        """
         reports = self._rotate_window()
 
-        if not self._api_key or self._license_state in {"missing_api_key", "invalid_api_key"}:
-            return
+        if not self._api_key:
+            return None
 
         self._pending_reports.extend(reports)
         if len(self._pending_reports) > _MAX_PENDING_REPORTS:
             self._pending_reports = self._pending_reports[-_MAX_PENDING_REPORTS:]
+
+        standing: Optional[str] = None
 
         while self._pending_reports:
             batch = self._pending_reports[:_MAX_REPORTS_PER_UPLOAD]
@@ -263,27 +185,53 @@ class PhotonReporter:
                     json={"reports": batch},
                 )
             except httpx.HTTPError as exc:
-                self._maybe_log_telemetry_warning(
-                    "Photon telemetry upload failed. Local inference will continue.",
-                    exc,
-                )
-                return
+                _LOGGER.warning("Photon usage reporting failed: %s", exc)
+                return None
 
             if response.status_code == 401:
-                self._pending_reports.clear()
-                self._publish_license_snapshot(
-                    _LicenseSnapshot(state="invalid_api_key"),
-                )
-                return
+                return "invalid_api_key"
 
             if response.status_code >= 400:
-                self._maybe_log_telemetry_warning(
-                    "Photon telemetry upload failed. Local inference will continue.",
-                    None,
-                )
-                return
+                return None
 
             del self._pending_reports[:len(batch)]
+
+            # Read standing from the last successful response.
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    standing = payload.get("standing")
+            except ValueError:
+                pass
+
+            if standing is None:
+                standing = "active"
+
+        if standing == "key_revoked":
+            _LOGGER.error(
+                "MOONDREAM_API_KEY has been revoked. The Photon inference "
+                "engine will stop accepting new requests.",
+            )
+            # Schedule engine shutdown as a separate task to avoid
+            # deadlock (engine.shutdown awaits this telemetry task).
+            asyncio.create_task(self._engine.shutdown())
+
+        elif standing == "invalid_api_key":
+            _LOGGER.error(
+                "MOONDREAM_API_KEY is no longer valid. The Photon inference "
+                "engine will stop accepting new requests.",
+            )
+            asyncio.create_task(self._engine.shutdown())
+
+        elif standing is not None and standing != "active":
+            self._maybe_log_telemetry_warning(
+                "Your account has run out of credits. Inference will "
+                "continue for this process, but new processes will fail "
+                "to start. Add credits at %s" % _PRICING_URL,
+                None,
+            )
+
+        return standing
 
     def _rotate_window(self) -> list[dict[str, Any]]:
         now = self._utc_now()
@@ -317,65 +265,6 @@ class PhotonReporter:
             reports.append(report)
 
         return reports
-
-    def _publish_license_snapshot(
-        self, snapshot: _LicenseSnapshot, *, log: bool = True,
-    ) -> None:
-        previous_state = self._license_state
-        self._license_state = snapshot.state
-
-        if not log:
-            return
-
-        if snapshot.state == "licensed":
-            if previous_state and previous_state != "licensed":
-                _LOGGER.info("Photon license verification succeeded.")
-            return
-
-        if snapshot.state == "missing_api_key":
-            _LOGGER.warning(
-                "Photon license could not be verified because MOONDREAM_API_KEY is not set. "
-                "Inference will continue, but only noncommercial and evaluation use is "
-                "permitted without a valid license. See %s",
-                snapshot.pricing_url,
-            )
-            return
-
-        if snapshot.state == "invalid_api_key":
-            _LOGGER.warning(
-                "Photon license could not be verified because the provided API key is invalid. "
-                "Inference will continue, but only noncommercial and evaluation use is "
-                "permitted without a valid license. See %s",
-                snapshot.pricing_url,
-            )
-            return
-
-        if snapshot.state == "verification_error":
-            _LOGGER.warning(
-                "Photon license could not be verified due to a connectivity or server issue. "
-                "Inference will continue, but commercial use requires a valid license. "
-                "See %s",
-                snapshot.pricing_url,
-            )
-            return
-
-        if snapshot.state == "over_limit":
-            _LOGGER.warning(
-                "Photon active instance count exceeds the licensed limit "
-                "(%s active / %s allowed). Please reduce active instances or "
-                "upgrade your plan. See %s",
-                snapshot.active_instances,
-                snapshot.instance_limit,
-                snapshot.pricing_url,
-            )
-            return
-
-        _LOGGER.warning(
-            "Photon commercial license is not active for this API key or account. "
-            "Inference will continue, but only noncommercial and evaluation use is "
-            "permitted without a valid license. See %s",
-            snapshot.pricing_url,
-        )
 
     def _maybe_log_telemetry_warning(
         self,

@@ -319,17 +319,15 @@ class InferenceEngine:
         self._worker_task = asyncio.create_task(self._worker_loop())
         await self._warmup_query_pipeline()
         if self._photon_reporter is None:
-            try:
-                self._photon_reporter = PhotonReporter(
-                    self._runtime_cfg,
-                    self.runtime.device,
-                    api_key=self._api_key,
-                    api_base_url=self._api_base_url,
-                )
-                await self._photon_reporter.initial_license_check()
-                self._photon_reporter.start()
-            except Exception:
-                _LOGGER.exception("Failed to start Photon reporter")
+            self._photon_reporter = PhotonReporter(
+                self._runtime_cfg,
+                self.runtime.device,
+                api_key=self._api_key,
+                api_base_url=self._api_base_url,
+                engine=self,
+            )
+            await self._photon_reporter.validate_api_key()
+            self._photon_reporter.start()
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
