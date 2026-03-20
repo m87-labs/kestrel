@@ -17,6 +17,9 @@ from ..dense_lora import (
     prepare_dense_lora_batch,
 )
 from ..ops.layernorm_cuda import layernorm_bias
+from kestrel_kernels import get_runtime
+
+_KERNELS = get_runtime()
 
 # Re-export LoRA for convenience
 from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
@@ -49,7 +52,7 @@ class LinearWeights:
 
 
 def linear(x: torch.Tensor, w: LinearWeights) -> torch.Tensor:
-    return F.linear(x, w.weight, w.bias)
+    return _KERNELS.linear.linear(x, w.weight, w.bias)
 
 
 @dataclass

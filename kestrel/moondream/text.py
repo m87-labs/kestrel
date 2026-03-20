@@ -25,6 +25,7 @@ from .lora_workspace import TextLoRAWorkspace
 from .rope import precompute_freqs_cis
 from ..dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
+from kestrel_kernels.linear_ops import linear as _kestrel_linear
 
 _KERNELS = get_runtime()
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
@@ -92,13 +93,13 @@ def attn(
     else:
         raise ValueError(f"Unsupported position_ids shape: {position_ids.shape}")
 
-    qkv_out = module.qkv(x)
+    qkv_out = _kestrel_linear(x, module.qkv.weight, module.qkv.bias)
 
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
     if hasattr(module, "tau") and module.tau is not None:
         tau_wqwv = module.tau["wqwv"]
-        tok_qv_lin = F.linear(F.gelu(qkv_out), tau_wqwv)
+        tok_qv_lin = _kestrel_linear(F.gelu(qkv_out), tau_wqwv)
         # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
         tau_tail_apply_into(
             qkv_out=qkv_out,
@@ -172,7 +173,7 @@ def attn(
         )
 
     out = out.view(bsz, q_len, d_model)
-    return module.proj(out)
+    return _kestrel_linear(out, module.proj.weight, module.proj.bias)
 
 
 def text_decoder(
@@ -257,9 +258,9 @@ def lm_head(
     if indices is not None:
         weights = module.lm_head.weight[indices]
         bias = module.lm_head.bias[indices]
-        logits = F.linear(hidden_norm, weights, bias)
+        logits = _kestrel_linear(hidden_norm, weights, bias)
     else:
-        logits = module.lm_head(hidden_norm)
+        logits = _kestrel_linear(hidden_norm, module.lm_head.weight, module.lm_head.bias)
     return logits
 
 
