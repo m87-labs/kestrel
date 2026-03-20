@@ -81,8 +81,8 @@ class PhotonReporter:
         """
         if not self._api_key:
             raise RuntimeError(
-                "MOONDREAM_API_KEY is not set. Set this environment variable "
-                "to start the Photon inference engine. See %s" % _DOCS_URL
+                "Moondream API key is not set. Pass api_key to PhotonVL() or "
+                "set the MOONDREAM_API_KEY environment variable. See %s" % _DOCS_URL
             )
 
         standing = await self._flush_window()

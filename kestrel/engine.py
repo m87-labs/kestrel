@@ -266,9 +266,11 @@ class InferenceEngine:
         *,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
+        api_key: Optional[str] = None,
     ) -> "InferenceEngine":
         # Auto-create provider if none provided
-        api_key = os.environ.get("MOONDREAM_API_KEY")
+        if api_key is None:
+            api_key = os.environ.get("MOONDREAM_API_KEY")
         api_base_url = os.environ.get("MOONDREAM_API_BASE_URL", _DEFAULT_API_BASE_URL)
         api_base_url = api_base_url.rstrip("/")
         if api_base_url not in _ALLOWED_API_BASE_URLS:
