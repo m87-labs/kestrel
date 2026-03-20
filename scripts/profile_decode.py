@@ -114,70 +114,84 @@ def patch_text_decoder_with_nvtx():
         slot_mapping, use_prefix_attn=False, mode="decode",
         page_table=None, fa3_seqused_q=None, fa3_seqused_k=None,
         lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
+        dense_lora_scratch=None,
+        scratch_pool=None,
     ):
-        for i, block in enumerate(module.blocks):
-            # LayerNorm
-            nvtx.range_push(f"layer{i}_ln")
-            ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
-            x_norm = layer_norm(x, ln_weights)
-            nvtx.range_pop()
+        clear_scratch_pool = None
+        if scratch_pool is not None:
+            from kestrel_kernels.linear_ops import set_scratch_pool, clear_scratch_pool
 
-            # Attention
-            nvtx.range_push(f"layer{i}_attn")
-            attn_out = text_module.attn(
-                x_norm,
-                block.attn,
-                module.cos_sin_cache,
-                block.kv_cache,
-                attn_mask,
-                config.n_heads,
-                config.n_kv_heads,
-                position_ids,
-                mode=mode,
-                slot_mapping=slot_mapping,
-                use_prefix_attn=use_prefix_attn,
-                page_table=page_table,
-                fa3_seqused_q=fa3_seqused_q,
-                fa3_seqused_k=fa3_seqused_k,
-            )
-            nvtx.range_pop()
+            set_scratch_pool(scratch_pool)
 
-            # MLP (dense or MoE)
-            if config.moe is not None and i >= config.moe.start_layer:
-                nvtx.range_push(f"layer{i}_moe")
-                moe_workspace = lora_workspace.moe_layer(i) if lora_workspace else None
-                mlp_out = moe_mlp(
+        try:
+            for i, block in enumerate(module.blocks):
+                # LayerNorm
+                nvtx.range_push(f"layer{i}_ln")
+                ln_weights = LayerNormWeights(weight=block.ln.weight, bias=block.ln.bias)
+                x_norm = layer_norm(x, ln_weights)
+                nvtx.range_pop()
+
+                # Attention (mirrors production residual-fused path)
+                nvtx.range_push(f"layer{i}_attn")
+                x = text_module.attn(
                     x_norm,
-                    block.mlp,
-                    config.moe.experts_per_token,
+                    block.attn,
+                    module.cos_sin_cache,
+                    block.kv_cache,
+                    attn_mask,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    position_ids,
                     mode=mode,
-                    lora_workspace=moe_workspace,
-                    lora_slot_ids=lora_slot_ids,
-                    single_lora_id=single_lora_id,
-                )
-                nvtx.range_pop()
-            else:
-                nvtx.range_push(f"layer{i}_dense_mlp")
-                mlp_weights = MLPWeights(
-                    fc1=LinearWeights(
-                        weight=block.mlp["fc1"].weight, bias=block.mlp["fc1"].bias
-                    ),
-                    fc2=LinearWeights(
-                        weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
-                    ),
-                )
-                dense_workspace = lora_workspace.dense_layer(i) if lora_workspace else None
-                mlp_out = mlp(
-                    x_norm,
-                    mlp_weights,
-                    lora_workspace=dense_workspace,
-                    lora_slot_ids=lora_slot_ids,
+                    slot_mapping=slot_mapping,
+                    use_prefix_attn=use_prefix_attn,
+                    page_table=page_table,
+                    fa3_seqused_q=fa3_seqused_q,
+                    fa3_seqused_k=fa3_seqused_k,
+                    residual=x,
                 )
                 nvtx.range_pop()
 
-            x = x + attn_out + mlp_out
+                # MLP (dense or MoE)
+                if config.moe is not None and i >= config.moe.start_layer:
+                    nvtx.range_push(f"layer{i}_moe")
+                    moe_workspace = lora_workspace.moe_layer(i) if lora_workspace else None
+                    mlp_out = moe_mlp(
+                        x_norm,
+                        block.mlp,
+                        config.moe.experts_per_token,
+                        mode=mode,
+                        lora_workspace=moe_workspace,
+                        lora_slot_ids=lora_slot_ids,
+                        single_lora_id=single_lora_id,
+                    )
+                    nvtx.range_pop()
+                else:
+                    nvtx.range_push(f"layer{i}_dense_mlp")
+                    mlp_weights = MLPWeights(
+                        fc1=LinearWeights(
+                            weight=block.mlp["fc1"].weight, bias=block.mlp["fc1"].bias
+                        ),
+                        fc2=LinearWeights(
+                            weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
+                        ),
+                    )
+                    dense_workspace = lora_workspace.dense_layer(i) if lora_workspace else None
+                    mlp_out = mlp(
+                        x_norm,
+                        mlp_weights,
+                        lora_workspace=dense_workspace,
+                        lora_slot_ids=lora_slot_ids,
+                        lora_scratch=dense_lora_scratch,
+                    )
+                    nvtx.range_pop()
 
-        return x
+                x = x + mlp_out
+
+            return x
+        finally:
+            if clear_scratch_pool is not None:
+                clear_scratch_pool()
 
     text_module.text_decoder = instrumented_text_decoder
     # Ensure runtime module uses the patched symbol (runtime imports text_decoder at module scope).

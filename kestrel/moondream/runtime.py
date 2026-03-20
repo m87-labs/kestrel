@@ -1519,6 +1519,11 @@ class MoondreamRuntime:
                 M, 2 * tc.n_heads,
                 dtype=inputs_embeds.dtype, device=self.device),  # tau_wqwv
         }
+        if tc.tau_attn:
+            qkv_dim = int(tc.dim * (1 + 2 * tc.n_kv_heads / tc.n_heads))
+            scratch_pool["gelu"] = torch.empty(
+                M, qkv_dim,
+                dtype=inputs_embeds.dtype, device=self.device)  # GELU for tau
         if tc.moe and tc.moe.num_experts:
             scratch_pool[(M, tc.moe.num_experts)] = torch.empty(
                 M, tc.moe.num_experts,

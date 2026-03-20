@@ -26,6 +26,7 @@ from .rope import precompute_freqs_cis
 from ..dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
 from kestrel_kernels.linear_ops import linear as _kestrel_linear
+from kestrel_kernels.gelu_residual import gelu_cute as _gelu_cute
 
 _KERNELS = get_runtime()
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
@@ -84,6 +85,7 @@ def attn(
     fa3_seqused_q: torch.Tensor | None = None,
     fa3_seqused_k: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
+    scratch_pool: dict | None = None,
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
@@ -101,7 +103,8 @@ def attn(
     kv_dim = n_kv_heads * head_dim
     if hasattr(module, "tau") and module.tau is not None:
         tau_wqwv = module.tau["wqwv"]
-        tok_qv_lin = _kestrel_linear(F.gelu(qkv_out), tau_wqwv)
+        gelu_out = _gelu_cute(qkv_out, out=scratch_pool.get("gelu") if scratch_pool else None)
+        tok_qv_lin = _kestrel_linear(gelu_out, tau_wqwv)
         # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
         tau_tail_apply_into(
             qkv_out=qkv_out,
@@ -229,6 +232,7 @@ def text_decoder(
             fa3_seqused_q=fa3_seqused_q,
             fa3_seqused_k=fa3_seqused_k,
             residual=x,
+            scratch_pool=scratch_pool,
         )
 
         if config.moe is not None and i >= config.moe.start_layer:
