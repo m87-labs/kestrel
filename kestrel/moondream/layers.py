@@ -166,7 +166,7 @@ def moe_mlp(
     router = mlp_module["router"]
     fused_mlp = mlp_module["mlp"]
 
-    router_logits = router(x_flat)
+    router_logits = _KERNELS.linear.linear(x_flat, router.weight, router.bias)
     topk_weights, topk_idxs = torch.topk(router_logits, experts_per_token, dim=-1)
     topk_weights = F.softmax(topk_weights, dim=-1)
     topk_idxs = topk_idxs.to(torch.int32)
