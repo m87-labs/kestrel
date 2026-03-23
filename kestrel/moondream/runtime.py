@@ -239,6 +239,20 @@ class _CacheLookupResult:
     namespace: CacheNamespace | None
 
 
+@dataclass(frozen=True, slots=True)
+class PrefillClassification:
+    """Read-only classification of how a request would prefill if launched now."""
+
+    prompt_length: int
+    skip_positions: int
+    can_reuse: bool
+    use_prefix_attn: bool
+
+    @property
+    def query_length(self) -> int:
+        return self.prompt_length - self.skip_positions if self.can_reuse else self.prompt_length
+
+
 @dataclass(slots=True)
 class PreparedSequence:
     """Prepared prefill state for a sequence before GPU prefill is launched.
@@ -634,6 +648,17 @@ class MoondreamRuntime:
 
         return self.page_table.can_reserve_with_eviction(total_length)
 
+    def prefill_budget(self) -> tuple[int, int]:
+        """Return `(pages, batch_slots)` available for launch-time prefill binding."""
+
+        reclaimable_pages = (
+            self.prefix_cache.reclaimable_page_count() if self.prefix_cache is not None else 0
+        )
+        return (
+            self.page_table.pages_available + reclaimable_pages,
+            len(self.page_table.free_batch_idx),
+        )
+
     def can_reserve_pages(self, total_length: int) -> bool:
         """Return True if pages are available for ``total_length`` tokens.
 
@@ -878,6 +903,51 @@ class MoondreamRuntime:
         # Cache hit must cover at least BOS + full image prefix
         min_hit_length = 1 + image_kv_length
         return match.matched_kv_length >= min_hit_length
+
+    def classify_prefill(
+        self,
+        prompt_tokens: Sequence[Token],
+        *,
+        has_image: bool,
+        image_hash: bytes | None,
+        adapter_id: str | None,
+    ) -> PrefillClassification:
+        """Return the current prefix-cache classification for a request."""
+
+        tokens_list = list(prompt_tokens)
+        image_kv_length = self.image_prefix_length if has_image else 0
+        prompt_len = len(tokens_list) + image_kv_length
+        can_reuse = False
+        skip_positions = 0
+
+        if self.prefix_cache is not None:
+            if has_image:
+                assert image_hash is not None, (
+                    "image_hash must be provided when prefix cache is enabled for image prompts"
+                )
+            cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
+            namespace = CacheNamespace(
+                lora_id=adapter_id,
+                image_hash=(
+                    int.from_bytes(image_hash[:16], "big") if image_hash is not None else None
+                ),
+            )
+            match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
+            can_reuse = match.matched_kv_length > 0
+            if image_kv_length > 0 and can_reuse:
+                assert match.matched_kv_length >= (1 + image_kv_length), (
+                    f"Invariant violated: image namespace hit ({match.matched_kv_length} KV) "
+                    f"must include BOS+image ({1 + image_kv_length} KV)"
+                )
+            if can_reuse:
+                skip_positions = min(match.matched_kv_length, prompt_len - 1)
+
+        return PrefillClassification(
+            prompt_length=prompt_len,
+            skip_positions=skip_positions,
+            can_reuse=can_reuse,
+            use_prefix_attn=bool(image_kv_length) and not can_reuse,
+        )
 
     def _build_cache_tokens(
         self,
