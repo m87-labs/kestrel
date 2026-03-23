@@ -398,15 +398,7 @@ class GenerationScheduler:
             and not lifecycle.crops_ready
         ):
             return False
-        reserve_length = request.target_length
-        if lifecycle.has_image and lifecycle.prefix_cache_hit:
-            # Prefix-cache hits are guaranteed (by runtime.check_prefix_cache) to cover at
-            # least BOS + the full image prefix, so admission can be less pessimistic
-            # than reserving the entire target length from scratch.
-            reserve_length = max(
-                reserve_length - (1 + self.runtime.image_prefix_length),
-                1,
-            )
+        reserve_length = self._prefill_reserve_length(request)
         if not self.runtime.can_reserve(reserve_length):
             return False
         return True
@@ -438,16 +430,24 @@ class GenerationScheduler:
             and not lifecycle.crops_ready
         ):
             return False
-        reserve_length = request.target_length
-        if lifecycle.has_image and lifecycle.prefix_cache_hit:
-            reserve_length = max(
-                reserve_length - (1 + self.runtime.image_prefix_length),
-                1,
-            )
+        reserve_length = self._prefill_reserve_length(request)
         # Check pages and batch slot availability (slot allocated during prepare)
         if not self.runtime.can_reserve(reserve_length):
             return False
         return True
+
+    def _prefill_reserve_length(self, request: GenerationRequest) -> int:
+        reserve_length = request.target_length
+        lifecycle = request.lifecycle
+        if lifecycle.has_image and lifecycle.prefix_cache_hit:
+            # Prefix-cache hits are guaranteed (by runtime.check_prefix_cache) to cover at
+            # least BOS + the full image prefix, so admission can reserve only the
+            # incremental work beyond the cached image prefix.
+            return max(
+                reserve_length - (1 + self.runtime.image_prefix_length),
+                1,
+            )
+        return reserve_length
 
     def _acquire_prefill_staging(self) -> PrefillStaging:
         """Acquire a prefill staging bundle."""
