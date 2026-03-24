@@ -35,7 +35,6 @@ def _to_power_of_2(x: int) -> int:
     # Round down: find the highest set bit
     return 1 << (x.bit_length() - 1)
 
-
 # FP8 Triton W8A8 path must keep routing block size aligned with kernel BLOCK_SIZE_M.
 _TRITON_FP8_CONFIG: dict[str, int] = {
     "BLOCK_SIZE_M": 64,
@@ -345,6 +344,656 @@ class FusedMoEConfig:
         return config
 
 
+@dataclass(frozen=True)
+class _MoEExecutionContext:
+    top_k: int
+    hidden_size: int
+    input_size: int
+    num_experts: int
+    config: FusedMoEConfig
+    tuned_configs: dict[int, dict[str, int] | None]
+    cute_config_available: dict[str, bool]
+    workspaces: _MoEWorkspaces
+
+
+@dataclass
+class _PreparedMoEForward:
+    hidden_states: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    up_weight: torch.Tensor
+    down_weight: torch.Tensor
+    up_scale: torch.Tensor | None
+    down_scale: torch.Tensor | None
+    num_tokens: int
+    block_size_m: int
+    triton_config: dict[str, int]
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    compute_type: object
+    up_out: torch.Tensor
+    fp8_up_bits: torch.Tensor | None = None
+    fp8_up_scale: torch.Tensor | None = None
+    fp8_down_bits: torch.Tensor | None = None
+    fp8_down_scale: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedSingleLoraRouting:
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    block_size_m: int
+
+
+def _make_execution_context(owner: object) -> _MoEExecutionContext:
+    return _MoEExecutionContext(
+        top_k=owner.top_k,
+        hidden_size=owner.hidden_size,
+        input_size=owner.input_size,
+        num_experts=owner.num_experts,
+        config=owner.config,
+        tuned_configs=owner._tuned_configs,
+        cute_config_available=owner._cute_config_available,
+        workspaces=owner._workspaces,
+    )
+
+
+def _select_block_size(ctx: _MoEExecutionContext, assignments: int) -> int:
+    block_m = ctx.config.block_size_m
+    if assignments <= 16:
+        return min(16, block_m)
+    if assignments <= 32:
+        return min(32, block_m)
+    if assignments <= 64:
+        return min(64, block_m)
+    return block_m
+
+
+def _get_tuned_config(
+    ctx: _MoEExecutionContext,
+    *,
+    num_tokens: int,
+    down_weight: torch.Tensor,
+) -> dict[str, int] | None:
+    if num_tokens in ctx.tuned_configs:
+        return ctx.tuned_configs[num_tokens]
+
+    key = (
+        down_weight.shape[0],
+        down_weight.shape[2],
+    )
+    hardcoded = _HARDCODED_CONFIGS.get(key)
+    if not hardcoded:
+        raise ValueError(
+            f"No hardcoded MoE config for expert shape {key}. "
+            "Add an entry to _HARDCODED_CONFIGS."
+        )
+    nearest = min(hardcoded.keys(), key=lambda m: abs(m - num_tokens))
+    raw = hardcoded[nearest]
+    tuned = {k.upper(): int(v) for k, v in raw.items()}
+    ctx.tuned_configs[num_tokens] = tuned
+    return tuned
+
+
+def _get_triton_config(
+    ctx: _MoEExecutionContext,
+    *,
+    num_tokens: int,
+    assignments: int,
+    down_weight: torch.Tensor,
+) -> dict[str, int]:
+    base = ctx.config.as_triton(
+        block_size_m=_select_block_size(ctx, assignments)
+    ).copy()
+    base.setdefault("NUM_WARPS", ctx.config.num_warps)
+    base.setdefault("NUM_STAGES", ctx.config.num_stages)
+
+    tuned = _get_tuned_config(
+        ctx,
+        num_tokens=num_tokens,
+        down_weight=down_weight,
+    )
+    if tuned is not None:
+        base.update(tuned)
+    return base
+
+
+def _has_cute_moe_config(ctx: _MoEExecutionContext, *, dtype: str) -> bool:
+    cached = ctx.cute_config_available.get(dtype)
+    if cached is not None:
+        return cached
+    has_config = bool(
+        _MOE.has_cute_moe_config(
+            num_experts=ctx.num_experts,
+            hidden_size=ctx.input_size,
+            intermediate_size=ctx.hidden_size,
+            dtype=dtype,
+        )
+    )
+    ctx.cute_config_available[dtype] = has_config
+    return has_config
+
+
+def _resolve_backend(
+    ctx: _MoEExecutionContext,
+    *,
+    device: torch.device,
+    num_tokens: int,
+    is_fp8: bool = False,
+) -> str:
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] != 9:
+        return "triton"
+    backend = ctx.config.backend.lower()
+    if is_fp8:
+        preferred = "cute"
+        dtype = "fp8"
+    elif backend == "auto":
+        preferred = (
+            "triton"
+            if num_tokens >= ctx.config.auto_backend_token_threshold
+            else "cute"
+        )
+        dtype = "bf16"
+    else:
+        preferred = backend
+        dtype = "bf16"
+
+    if preferred != "cute":
+        return preferred
+    if _has_cute_moe_config(ctx, dtype=dtype):
+        return "cute"
+    return "triton"
+
+
+def _get_block_m_for_routing(
+    ctx: _MoEExecutionContext,
+    *,
+    device: torch.device,
+    num_tokens: int,
+    is_fp8_weights: bool,
+    triton_block_m: int,
+) -> int:
+    backend = _resolve_backend(
+        ctx,
+        device=device,
+        num_tokens=num_tokens,
+        is_fp8=is_fp8_weights,
+    )
+    if backend == "cute":
+        return _MOE.get_cute_moe_block_m(
+            num_tokens,
+            num_experts=ctx.num_experts,
+            hidden_size=ctx.input_size,
+            intermediate_size=ctx.hidden_size,
+            dtype="fp8" if is_fp8_weights else "bf16",
+        )
+    if is_fp8_weights:
+        return _TRITON_FP8_CONFIG["BLOCK_SIZE_M"]
+    return triton_block_m
+
+
+def _allocate_fp8_scratch(
+    ctx: _MoEExecutionContext,
+    *,
+    device: torch.device,
+    num_tokens: int,
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    up_bits_shape = (num_tokens, ctx.input_size)
+    down_bits_shape = (num_tokens * ctx.top_k, ctx.hidden_size)
+    if prod(up_bits_shape) >= prod(down_bits_shape):
+        fp8_up_bits = ctx.workspaces.fp8_bits.get(
+            up_bits_shape,
+            device=device,
+            dtype=torch.uint8,
+        )
+        fp8_down_bits = ctx.workspaces.fp8_bits.get(
+            down_bits_shape,
+            device=device,
+            dtype=torch.uint8,
+        )
+    else:
+        fp8_down_bits = ctx.workspaces.fp8_bits.get(
+            down_bits_shape,
+            device=device,
+            dtype=torch.uint8,
+        )
+        fp8_up_bits = ctx.workspaces.fp8_bits.get(
+            up_bits_shape,
+            device=device,
+            dtype=torch.uint8,
+        )
+    fp8_down_scale = ctx.workspaces.fp8_scale.get(
+        (num_tokens * ctx.top_k,),
+        device=device,
+        dtype=torch.float32,
+    )
+    fp8_up_scale = ctx.workspaces.fp8_scale.get(
+        (num_tokens,),
+        device=device,
+        dtype=torch.float32,
+    )
+    return fp8_up_bits, fp8_up_scale, fp8_down_bits, fp8_down_scale
+
+
+def _prepare_moe_forward(
+    ctx: _MoEExecutionContext,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_scale: torch.Tensor | None = None,
+    down_scale: torch.Tensor | None = None,
+    persistent_up_out: bool = False,
+) -> _PreparedMoEForward:
+    if hidden_states.device.type != "cuda":
+        raise ValueError("Fused MoE backend only supports CUDA tensors")
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("Fused MoE backend requires fp16/bf16/fp32 inputs")
+    if up_weight.device != hidden_states.device:
+        raise ValueError("Expert weights must be on the same device as inputs")
+    if down_weight.device != hidden_states.device:
+        raise ValueError("Output expert weights must be on the input device")
+    if topk_weights.dtype != hidden_states.dtype:
+        raise ValueError("Top-k weights must match hidden state dtype")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must be an integer tensor")
+
+    up_weight_kernel, up_is_fp8w = _normalize_expert_weight(up_weight)
+    down_weight_kernel, down_is_fp8w = _normalize_expert_weight(down_weight)
+    if up_is_fp8w != down_is_fp8w:
+        raise ValueError("Up and down expert weights must use the same dtype scheme")
+
+    if up_is_fp8w:
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("FP8-weight MoE currently requires bfloat16 hidden states")
+        if up_scale is None or down_scale is None:
+            raise ValueError("FP8-weight experts must define scale tensors")
+        if up_scale.device != hidden_states.device:
+            raise ValueError("Up expert scales must be on the same device as inputs")
+        if down_scale.device != hidden_states.device:
+            raise ValueError("Down expert scales must be on the same device as inputs")
+    else:
+        if up_weight_kernel.dtype != hidden_states.dtype:
+            raise ValueError("Expert weights must match hidden state dtype")
+        if down_weight_kernel.dtype != hidden_states.dtype:
+            raise ValueError("Output expert weights must match hidden state dtype")
+
+    hidden_states = hidden_states.contiguous()
+    topk_weights = topk_weights.contiguous()
+    topk_ids = topk_ids.contiguous().to(torch.int32)
+
+    num_tokens = hidden_states.size(0)
+    assignments = num_tokens * ctx.top_k
+    triton_config = _get_triton_config(
+        ctx,
+        num_tokens=num_tokens,
+        assignments=assignments,
+        down_weight=down_weight_kernel,
+    )
+    block_size_m = _get_block_m_for_routing(
+        ctx,
+        device=hidden_states.device,
+        num_tokens=num_tokens,
+        is_fp8_weights=up_is_fp8w,
+        triton_block_m=triton_config["BLOCK_SIZE_M"],
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids,
+        block_size_m,
+        ctx.num_experts,
+    )
+
+    if persistent_up_out:
+        up_out = torch.empty(
+            (num_tokens, ctx.top_k, ctx.hidden_size * 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    else:
+        up_out = ctx.workspaces.up.get(
+            (num_tokens, ctx.top_k, ctx.hidden_size * 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    fp8_up_bits = None
+    fp8_up_scale = None
+    fp8_down_bits = None
+    fp8_down_scale = None
+    if up_is_fp8w:
+        (
+            fp8_up_bits,
+            fp8_up_scale,
+            fp8_down_bits,
+            fp8_down_scale,
+        ) = _allocate_fp8_scratch(
+            ctx,
+            device=hidden_states.device,
+            num_tokens=num_tokens,
+        )
+
+    return _PreparedMoEForward(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        up_weight=up_weight_kernel,
+        down_weight=down_weight_kernel,
+        up_scale=up_scale,
+        down_scale=down_scale,
+        num_tokens=num_tokens,
+        block_size_m=block_size_m,
+        triton_config=triton_config,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        compute_type=_MOE.dtype_to_triton(hidden_states.dtype),
+        up_out=up_out,
+        fp8_up_bits=fp8_up_bits,
+        fp8_up_scale=fp8_up_scale,
+        fp8_down_bits=fp8_down_bits,
+        fp8_down_scale=fp8_down_scale,
+    )
+
+
+def _prepare_single_lora_routing(
+    ctx: _MoEExecutionContext,
+    prepared: _PreparedMoEForward,
+) -> _PreparedSingleLoraRouting:
+    lora_block_m = _to_power_of_2(prepared.block_size_m)
+    if lora_block_m == prepared.block_size_m:
+        return _PreparedSingleLoraRouting(
+            sorted_token_ids=prepared.sorted_token_ids,
+            expert_ids=prepared.expert_ids,
+            num_tokens_post_padded=prepared.num_tokens_post_padded,
+            block_size_m=lora_block_m,
+        )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        prepared.topk_ids,
+        lora_block_m,
+        ctx.num_experts,
+    )
+    return _PreparedSingleLoraRouting(
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        block_size_m=lora_block_m,
+    )
+
+
+def _apply_single_lora(
+    ctx: _MoEExecutionContext,
+    *,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    routing: _PreparedSingleLoraRouting,
+    lora_id: int,
+    top_k: int,
+    mul_routed_weight: bool,
+    shrink_config: dict[str, int] | None,
+    expand_config: dict[str, int] | None,
+) -> None:
+    apply_moe_lora_single(
+        x=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output=output,
+        lora_a=lora_a,
+        lora_b=lora_b,
+        sorted_token_ids=routing.sorted_token_ids,
+        expert_ids=routing.expert_ids,
+        num_tokens_post_padded=routing.num_tokens_post_padded,
+        lora_id=lora_id,
+        top_k=top_k,
+        num_experts=ctx.num_experts,
+        block_size_m=routing.block_size_m,
+        mul_routed_weight=mul_routed_weight,
+        shrink_config=shrink_config,
+        expand_config=expand_config,
+    )
+
+
+def _invoke_fused_moe_kernel(
+    ctx: _MoEExecutionContext,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    C: torch.Tensor,
+    *,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    triton_config: dict[str, int],
+    compute_type: object,
+    a_fp8_bits: torch.Tensor | None = None,
+    a_fp8_scale: torch.Tensor | None = None,
+) -> None:
+    b_is_fp8w = B.dtype == torch.uint8
+    backend = _resolve_backend(
+        ctx,
+        device=A.device,
+        num_tokens=int(C.shape[0]),
+        is_fp8=b_is_fp8w,
+    )
+
+    if b_is_fp8w and backend == "triton":
+        if B_scale is None:
+            raise ValueError("B_scale is required for FP8-weight MoE")
+        if a_fp8_bits is None or a_fp8_scale is None:
+            raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
+
+        _MOE.fp8_quant_cute(a_fp8_bits, a_fp8_scale, A)
+        _MOE.invoke_fused_moe_kernel_triton_fp8(
+            a_fp8_bits.view(torch.float8_e4m3fn),
+            a_fp8_scale,
+            B.view(torch.float8_e4m3fn),
+            B_scale,
+            C,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            config=_TRITON_FP8_CONFIG,
+            compute_type=compute_type,
+        )
+        return
+
+    if backend == "cute":
+        if b_is_fp8w:
+            if B_scale is None:
+                raise ValueError("B_scale is required for FP8-weight MoE")
+            if a_fp8_bits is None or a_fp8_scale is None:
+                raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
+
+            _MOE.fp8_quant_cute(a_fp8_bits, a_fp8_scale, A, use_pdl=True)
+            if mul_routed_weight:
+                if int(top_k) != 1:
+                    raise ValueError("CuTe fp8 moe_down expects top_k=1")
+                if topk_weights is None:
+                    raise ValueError("topk_weights is required when mul_routed_weight=True")
+                _MOE.invoke_cute_moe_down_fp8(
+                    a_fp8_bits,
+                    a_fp8_scale,
+                    B,
+                    B_scale,
+                    C,
+                    topk_weights=topk_weights,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    use_pdl=True,
+                )
+            else:
+                if int(top_k) != 8:
+                    raise ValueError("CuTe fp8 moe_up expects top_k=8")
+                _MOE.invoke_cute_moe_up_fp8(
+                    a_fp8_bits,
+                    a_fp8_scale,
+                    B,
+                    B_scale,
+                    C,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    use_pdl=True,
+                )
+            return
+
+        if mul_routed_weight:
+            if int(top_k) != 1:
+                raise ValueError("CuTe moe_down expects top_k=1")
+            if topk_weights is None:
+                raise ValueError("topk_weights is required when mul_routed_weight=True")
+            _MOE.invoke_cute_moe_down(
+                A,
+                B,
+                C,
+                topk_weights=topk_weights,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+            )
+        else:
+            if int(top_k) != 8:
+                raise ValueError("CuTe moe_up expects top_k=8")
+            _MOE.invoke_cute_moe_up(
+                A,
+                B,
+                C,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+            )
+        return
+
+    if b_is_fp8w:
+        if B_scale is None:
+            raise ValueError("B_scale is required for FP8-weight MoE")
+        B = B.view(torch.float8_e4m3fn).to(A.dtype) * B_scale.to(A.dtype).unsqueeze(-1)
+
+    _MOE.invoke_fused_moe_kernel_triton(
+        A,
+        B,
+        C,
+        topk_weights=topk_weights,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        mul_routed_weight=mul_routed_weight,
+        top_k=top_k,
+        config=triton_config,
+        compute_type=compute_type,
+        bias=None,
+        allow_tf32=ctx.config.allow_tf32,
+    )
+
+
+def _run_base_up(
+    ctx: _MoEExecutionContext,
+    prepared: _PreparedMoEForward,
+) -> None:
+    _invoke_fused_moe_kernel(
+        ctx,
+        prepared.hidden_states,
+        prepared.up_weight,
+        prepared.up_scale,
+        prepared.up_out,
+        topk_weights=None,
+        sorted_token_ids=prepared.sorted_token_ids,
+        expert_ids=prepared.expert_ids,
+        num_tokens_post_padded=prepared.num_tokens_post_padded,
+        mul_routed_weight=False,
+        top_k=ctx.top_k,
+        triton_config=prepared.triton_config,
+        compute_type=prepared.compute_type,
+        a_fp8_bits=prepared.fp8_up_bits,
+        a_fp8_scale=prepared.fp8_up_scale,
+    )
+
+
+def _run_moe_activation(
+    ctx: _MoEExecutionContext,
+    prepared: _PreparedMoEForward,
+) -> torch.Tensor:
+    activation_in = prepared.up_out.view(prepared.num_tokens * ctx.top_k, -1)
+    activation_out = ctx.workspaces.activation.get(
+        (prepared.num_tokens * ctx.top_k, ctx.hidden_size),
+        device=prepared.hidden_states.device,
+        dtype=prepared.hidden_states.dtype,
+    )
+    if activation_in.dtype != torch.bfloat16:
+        raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
+    _MOE.gelu_residual_cute(activation_out, activation_in)
+    return activation_out
+
+
+def _run_base_down(
+    ctx: _MoEExecutionContext,
+    prepared: _PreparedMoEForward,
+    down_in: torch.Tensor,
+    *,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    down_out = ctx.workspaces.down.get(
+        (prepared.num_tokens, ctx.top_k, ctx.input_size),
+        device=prepared.hidden_states.device,
+        dtype=prepared.hidden_states.dtype,
+    )
+    _invoke_fused_moe_kernel(
+        ctx,
+        down_in,
+        prepared.down_weight,
+        prepared.down_scale,
+        down_out,
+        topk_weights=topk_weights,
+        sorted_token_ids=prepared.sorted_token_ids,
+        expert_ids=prepared.expert_ids,
+        num_tokens_post_padded=prepared.num_tokens_post_padded,
+        mul_routed_weight=True,
+        top_k=1,
+        triton_config=prepared.triton_config,
+        compute_type=prepared.compute_type,
+        a_fp8_bits=prepared.fp8_down_bits,
+        a_fp8_scale=prepared.fp8_down_scale,
+    )
+    return down_out
+
+
+def _sum_moe_outputs(
+    ctx: _MoEExecutionContext,
+    prepared: _PreparedMoEForward,
+    down_out: torch.Tensor,
+    *,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    fused = output
+    if fused is None:
+        fused = ctx.workspaces.output.get(
+            (prepared.num_tokens, ctx.input_size),
+            device=prepared.hidden_states.device,
+            dtype=prepared.hidden_states.dtype,
+        )
+    _MOE.moe_sum(down_out, fused)
+    return fused
+
+
 class FusedMoEModule(nn.Module):
     """Hybrid MoE backend that wraps vLLM's fused kernels for single-GPU use."""
 
@@ -459,24 +1108,6 @@ class FusedMoEModule(nn.Module):
             expand_config=expand_config,
         )
 
-    def __call__(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        lora_workspace: MoELoRALayerWorkspace | None = None,
-        lora_slot_ids: torch.Tensor | None = None,
-        single_lora_id: int | None = None,
-    ) -> torch.Tensor:
-        return self.forward(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            lora_workspace,
-            lora_slot_ids,
-            single_lora_id,
-        )
-
     @torch_compiler_disable()
     def forward(
         self,
@@ -487,101 +1118,20 @@ class FusedMoEModule(nn.Module):
         lora_slot_ids: torch.Tensor | None = None,
         single_lora_id: int | None = None,
     ) -> torch.Tensor:
-        if hidden_states.device.type != "cuda":
-            raise ValueError("Fused MoE backend only supports CUDA tensors")
-        if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError("Fused MoE backend requires fp16/bf16/fp32 inputs")
-        if self.up_experts.weight.device != hidden_states.device:
-            raise ValueError("Expert weights must be on the same device as inputs")
-        if self.down_experts.weight.device != hidden_states.device:
-            raise ValueError("Output expert weights must be on the input device")
-        if topk_weights.dtype != hidden_states.dtype:
-            raise ValueError("Top-k weights must match hidden state dtype")
-        if topk_ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("topk_ids must be an integer tensor")
-
-        up_is_fp8w = self.up_experts.weight.dtype == torch.uint8
-        down_is_fp8w = self.down_experts.weight.dtype == torch.uint8
-        if up_is_fp8w != down_is_fp8w:
-            raise ValueError("Up and down expert weights must use the same dtype scheme")
-
-        if up_is_fp8w:
-            if hidden_states.dtype != torch.bfloat16:
-                raise ValueError("FP8-weight MoE currently requires bfloat16 hidden states")
-            if not hasattr(self.up_experts, "scale") or not hasattr(self.down_experts, "scale"):
-                raise ValueError("FP8-weight experts must define a `scale` tensor")
-            if self.up_experts.scale.device != hidden_states.device:
-                raise ValueError("Up expert scales must be on the same device as inputs")
-            if self.down_experts.scale.device != hidden_states.device:
-                raise ValueError("Down expert scales must be on the same device as inputs")
-        else:
-            if self.up_experts.weight.dtype != hidden_states.dtype:
-                raise ValueError("Expert weights must match hidden state dtype")
-            if self.down_experts.weight.dtype != hidden_states.dtype:
-                raise ValueError("Output expert weights must match hidden state dtype")
-
-        hidden_states = hidden_states.contiguous()
-        topk_weights = topk_weights.contiguous()
-        topk_ids = topk_ids.contiguous()
-
-        num_tokens = hidden_states.size(0)
-        if num_tokens == 0:
+        if hidden_states.size(0) == 0:
             return hidden_states
 
-        assignments = num_tokens * self.top_k
-        triton_config = self._get_triton_config(
-            num_tokens=num_tokens,
-            assignments=assignments,
-            dtype=hidden_states.dtype,
+        ctx = _make_execution_context(self)
+        prepared = _prepare_moe_forward(
+            ctx,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            up_weight=self.up_experts.weight,
+            down_weight=self.down_experts.weight,
+            up_scale=getattr(self.up_experts, "scale", None),
+            down_scale=getattr(self.down_experts, "scale", None),
         )
-        block_size_m = self._get_block_m_for_routing(
-            num_tokens=num_tokens,
-            is_fp8_weights=up_is_fp8w,
-            triton_block_m=triton_config["BLOCK_SIZE_M"],
-        )
-
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, self.num_experts
-        )
-
-        up_out = self._workspaces.up.get(
-            (num_tokens, self.top_k, self.hidden_size * 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        # Pre-allocate FP8 activation buffers once for both up and down projections.
-        # Up projection: shape (num_tokens, input_size)
-        # Down projection: shape (num_tokens * top_k, hidden_size)
-        # We allocate them here to avoid repeated workspace.get() calls in the hot path.
-        fp8_up_bits: torch.Tensor | None = None
-        fp8_up_scale: torch.Tensor | None = None
-        fp8_down_bits: torch.Tensor | None = None
-        fp8_down_scale: torch.Tensor | None = None
-        if up_is_fp8w:
-            # W8A8: need FP8 activation buffers for both warp and WGMMA kernels
-            fp8_up_bits = self._workspaces.fp8_bits.get(
-                (num_tokens, self.input_size),
-                device=hidden_states.device,
-                dtype=torch.uint8,
-            )
-            fp8_up_scale = self._workspaces.fp8_scale.get(
-                (num_tokens,),
-                device=hidden_states.device,
-                dtype=torch.float32,
-            )
-            fp8_down_bits = self._workspaces.fp8_bits.get(
-                (num_tokens * self.top_k, self.hidden_size),
-                device=hidden_states.device,
-                dtype=torch.uint8,
-            )
-            fp8_down_scale = self._workspaces.fp8_scale.get(
-                (num_tokens * self.top_k,),
-                device=hidden_states.device,
-                dtype=torch.float32,
-            )
-
-        compute_type = _MOE.dtype_to_triton(hidden_states.dtype)
 
         # LoRA handling: dispatch based on call-local mode
         #
@@ -624,10 +1174,10 @@ class FusedMoEModule(nn.Module):
         expert_ids_lora = None
         num_tokens_lora = None
 
-        # LoRA kernels use Triton which requires power-of-2 block sizes for tl.arange.
-        # CuTe MoE configs can return non-power-of-2 values (e.g., 192 for FP8).
-        # Round DOWN to ensure precompiled routing kernels exist (16, 32, 64, 128).
-        lora_block_m = _to_power_of_2(block_size_m)
+        lora_block_m = _to_power_of_2(prepared.block_size_m)
+        lora_routing = None
+        if use_single_lora:
+            lora_routing = _prepare_single_lora_routing(ctx, prepared)
 
         # Launch batched LoRA up before base MoE so it can overlap if we have a
         # dedicated LoRA stream. Always compute into the LoRA buffer and add
@@ -641,105 +1191,65 @@ class FusedMoEModule(nn.Module):
                 if use_lora_stream:
                     target_stream.wait_event(self._lora_inputs_event)
                 sorted_lora, expert_ids_lora, num_tokens_lora = self._compute_lora_routing(
-                    topk_ids=topk_ids,
+                    topk_ids=prepared.topk_ids,
                     lora_slot_ids=lora_slot_ids,
-                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
+                    block_size_m=lora_block_m,
                     lora_workspace=lora_workspace,
                 )
-                lora_up_out = self._workspaces.lora_up.get(
-                    (num_tokens, self.top_k, self.hidden_size * 2),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
+                lora_up_out = ctx.workspaces.lora_up.get(
+                    (prepared.num_tokens, self.top_k, self.hidden_size * 2),
+                    device=prepared.hidden_states.device,
+                    dtype=prepared.hidden_states.dtype,
                 )
                 lora_up_out.zero_()
                 self._run_lora_up(
-                    x=hidden_states,
-                    topk_weights=topk_weights,
+                    x=prepared.hidden_states,
+                    topk_weights=prepared.topk_weights,
                     output=lora_up_out,
                     lora_workspace=lora_workspace,
                     sorted_lora=sorted_lora,
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
-                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
+                    block_size_m=lora_block_m,
                     shrink_config=lora_shrink_cfg,
                     expand_config=lora_expand_cfg,
                 )
                 if use_lora_stream:
                     self._lora_up_event.record(target_stream)
 
-        self._invoke_fused_moe_kernel(
-            hidden_states,
-            self.up_experts.weight,
-            getattr(self.up_experts, "scale", None),
-            up_out,
-            topk_weights=None,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-            mul_routed_weight=False,
-            top_k=self.top_k,
-            triton_config=triton_config,
-            compute_type=compute_type,
-            a_fp8_bits=fp8_up_bits,
-            a_fp8_scale=fp8_up_scale,
-        )
+        _run_base_up(ctx, prepared)
 
         if use_batched_lora:
             if use_lora_stream:
                 compute_stream.wait_event(self._lora_up_event)
             if lora_up_out is not None:
-                up_out.add_(lora_up_out)
+                prepared.up_out.add_(lora_up_out)
 
         if use_single_lora:
-            # Single-LoRA path: use separate routing if block_m needs adjustment
-            # for Triton's power-of-2 constraint.
-            if lora_block_m == block_size_m:
-                # Can reuse main MoE routing
-                lora_sorted = sorted_token_ids
-                lora_expert_ids = expert_ids
-                lora_num_tokens = num_tokens_post_padded
-            else:
-                # Need separate routing with power-of-2 block_m
-                lora_sorted, lora_expert_ids, lora_num_tokens = moe_align_block_size(
-                    topk_ids, lora_block_m, self.num_experts
-                )
-            lora_up_out = self._workspaces.lora_up.get(
-                (num_tokens, self.top_k, self.hidden_size * 2),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
+            lora_up_out = ctx.workspaces.lora_up.get(
+                (prepared.num_tokens, self.top_k, self.hidden_size * 2),
+                device=prepared.hidden_states.device,
+                dtype=prepared.hidden_states.dtype,
             )
             lora_up_out.zero_()
-            apply_moe_lora_single(
-                x=hidden_states,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
+            _apply_single_lora(
+                ctx,
+                x=prepared.hidden_states,
+                topk_ids=prepared.topk_ids,
+                topk_weights=prepared.topk_weights,
                 output=lora_up_out,
                 lora_a=lora_workspace.up_a,
                 lora_b=lora_workspace.up_b,
-                sorted_token_ids=lora_sorted,
-                expert_ids=lora_expert_ids,
-                num_tokens_post_padded=lora_num_tokens,
+                routing=lora_routing,
                 lora_id=single_lora_id,
                 top_k=self.top_k,
-                num_experts=self.num_experts,
-                block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
                 mul_routed_weight=False,
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
-            up_out.add_(lora_up_out)
+            prepared.up_out.add_(lora_up_out)
 
-        activation_in = up_out.view(num_tokens * self.top_k, -1)
-        activation_out = self._workspaces.activation.get(
-            (num_tokens * self.top_k, self.hidden_size),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        if activation_in.dtype != torch.bfloat16:
-            raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
-        _MOE.gelu_residual_cute(activation_out, activation_in)
-
-        down_in = activation_out
+        down_in = _run_moe_activation(ctx, prepared)
         lora_down_out = None
         if use_batched_lora:
             target_stream = lora_stream if use_lora_stream else compute_stream
@@ -748,47 +1258,32 @@ class FusedMoEModule(nn.Module):
             with torch.cuda.stream(target_stream):
                 if use_lora_stream:
                     target_stream.wait_event(self._lora_activation_event)
-                lora_down_out = self._workspaces.lora_down.get(
-                    (num_tokens, self.top_k, self.input_size),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
+                lora_down_out = ctx.workspaces.lora_down.get(
+                    (prepared.num_tokens, self.top_k, self.input_size),
+                    device=prepared.hidden_states.device,
+                    dtype=prepared.hidden_states.dtype,
                 )
                 lora_down_out.zero_()
                 self._run_lora_down(
                     x=down_in,
-                    topk_weights=topk_weights,
+                    topk_weights=prepared.topk_weights,
                     output=lora_down_out,
                     lora_workspace=lora_workspace,
                     sorted_lora=sorted_lora,
                     expert_ids_lora=expert_ids_lora,
                     num_tokens_lora=num_tokens_lora,
-                    block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
+                    block_size_m=lora_block_m,
                     shrink_config=lora_shrink_cfg,
                     expand_config=lora_expand_cfg,
                 )
                 if use_lora_stream:
                     self._lora_down_event.record(target_stream)
 
-        down_out = self._workspaces.down.get(
-            (num_tokens, self.top_k, self.input_size),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        self._invoke_fused_moe_kernel(
+        down_out = _run_base_down(
+            ctx,
+            prepared,
             down_in,
-            self.down_experts.weight,
-            getattr(self.down_experts, "scale", None),
-            down_out,
-            topk_weights=topk_weights.view(-1),
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-            mul_routed_weight=True,
-            top_k=1,
-            triton_config=triton_config,
-            compute_type=compute_type,
-            a_fp8_bits=fp8_down_bits,
-            a_fp8_scale=fp8_down_scale,
+            topk_weights=prepared.topk_weights.view(-1),
         )
 
         if use_batched_lora:
@@ -798,338 +1293,36 @@ class FusedMoEModule(nn.Module):
                 down_out.add_(lora_down_out)
 
         if use_single_lora:
-            # Single-LoRA path for down projection
-            # Reuse lora_sorted/lora_expert_ids/lora_num_tokens from up path
-            lora_down_out = self._workspaces.lora_down.get(
-                (num_tokens, self.top_k, self.input_size),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
+            lora_down_out = ctx.workspaces.lora_down.get(
+                (prepared.num_tokens, self.top_k, self.input_size),
+                device=prepared.hidden_states.device,
+                dtype=prepared.hidden_states.dtype,
             )
             lora_down_out.zero_()
-            apply_moe_lora_single(
+            _apply_single_lora(
+                ctx,
                 x=down_in,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
+                topk_ids=prepared.topk_ids,
+                topk_weights=prepared.topk_weights,
                 output=lora_down_out,
                 lora_a=lora_workspace.down_a,
                 lora_b=lora_workspace.down_b,
-                sorted_token_ids=lora_sorted,
-                expert_ids=lora_expert_ids,
-                num_tokens_post_padded=lora_num_tokens,
+                routing=lora_routing,
                 lora_id=single_lora_id,
-                top_k=1,  # Input is already per-expert [num_tokens * top_k, dim]
-                num_experts=self.num_experts,
-                block_size_m=lora_block_m,  # Power-of-2 for Triton kernels
+                top_k=1,
                 mul_routed_weight=True,
                 shrink_config=lora_shrink_cfg,
                 expand_config=lora_expand_cfg,
             )
             down_out.add_(lora_down_out)
 
-        fused = self._workspaces.output.get(
-            (num_tokens, self.input_size),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        _MOE.moe_sum(down_out, fused)
-        return fused
+        return _sum_moe_outputs(ctx, prepared, down_out)
 
-    def _quantize_fp8_e4m3fn_rowwise(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Row-wise FP8(E4M3FN) quantization returning (uint8 bitview, fp32 scale)."""
-        if x.dtype != torch.bfloat16:
-            raise ValueError(f"FP8 activation quantization expects bf16 (got {x.dtype})")
-        if x.ndim != 2:
-            raise ValueError("Expected 2D activation matrix")
-
-        # Use CuTe DSL kernel to keep this path CUDA-graph-capturable and avoid
-        # per-call allocations.
-        out_bits = self._workspaces.fp8_bits.get(
-            (int(x.shape[0]), int(x.shape[1])),
-            device=x.device,
-            dtype=torch.uint8,
-        )
-        out_scale = self._workspaces.fp8_scale.get(
-            (int(x.shape[0]),),
-            device=x.device,
-            dtype=torch.float32,
-        )
-        _MOE.fp8_quant_cute(out_bits, out_scale, x)
-        return out_bits, out_scale
-
-    def _quantize_fp8_into(
-        self,
-        x: torch.Tensor,
-        out_bits: torch.Tensor,
-        out_scale: torch.Tensor,
-        *,
-        use_pdl: bool = False,
-    ) -> None:
-        """Quantize x into pre-allocated FP8 buffers (fast path, no workspace.get)."""
-        _MOE.fp8_quant_cute(out_bits, out_scale, x, use_pdl=use_pdl)
-
-    def _invoke_fused_moe_kernel(
-        self,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        B_scale: torch.Tensor | None,
-        C: torch.Tensor,
-        *,
-        topk_weights: torch.Tensor | None,
-        sorted_token_ids: torch.Tensor,
-        expert_ids: torch.Tensor,
-        num_tokens_post_padded: torch.Tensor,
-        mul_routed_weight: bool,
-        top_k: int,
-        triton_config: dict[str, int],
-        compute_type,
-        a_fp8_bits: torch.Tensor | None = None,
-        a_fp8_scale: torch.Tensor | None = None,
-    ) -> None:
-        b_is_fp8w = B.dtype == torch.uint8
-        backend = self._resolve_backend(num_tokens=int(C.shape[0]), is_fp8=b_is_fp8w)
-
-        if b_is_fp8w and backend == "triton":
-            # Triton FP8 W8A8 path (SGLang-style): quantize activations per row
-            # and do FP8 dot with per-output-channel weight scales.
-            if B_scale is None:
-                raise ValueError("B_scale is required for FP8-weight MoE")
-            if a_fp8_bits is None or a_fp8_scale is None:
-                raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
-
-            self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale)
-            _MOE.invoke_fused_moe_kernel_triton_fp8(
-                a_fp8_bits.view(torch.float8_e4m3fn),
-                a_fp8_scale,
-                B.view(torch.float8_e4m3fn),
-                B_scale,
-                C,
-                topk_weights=topk_weights,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
-                mul_routed_weight=mul_routed_weight,
-                top_k=top_k,
-                config=_TRITON_FP8_CONFIG,
-                compute_type=compute_type,
-            )
-            return
-
-        if backend == "cute":
-            if b_is_fp8w:
-                if B_scale is None:
-                    raise ValueError("B_scale is required for FP8-weight MoE")
-                if a_fp8_bits is None or a_fp8_scale is None:
-                    raise ValueError("a_fp8_bits and a_fp8_scale are required for FP8 MoE")
-
-                # W8A8 (FP8 activations + FP8 weights) via SM90 WGMMA.
-                # Use PDL (Programmatic Dependent Launch) to overlap quant with MoE prologue.
-                # PDL allows the MoE kernel to start loading weights while quant is still running.
-                self._quantize_fp8_into(A, a_fp8_bits, a_fp8_scale, use_pdl=True)
-                if mul_routed_weight:
-                    if int(top_k) != 1:
-                        raise ValueError("CuTe fp8 moe_down expects top_k=1")
-                    if topk_weights is None:
-                        raise ValueError("topk_weights is required when mul_routed_weight=True")
-                    _MOE.invoke_cute_moe_down_fp8(
-                        a_fp8_bits,
-                        a_fp8_scale,
-                        B,
-                        B_scale,
-                        C,
-                        topk_weights=topk_weights,
-                        sorted_token_ids=sorted_token_ids,
-                        expert_ids=expert_ids,
-                        num_tokens_post_padded=num_tokens_post_padded,
-                        use_pdl=True,
-                    )
-                else:
-                    if int(top_k) != 8:
-                        raise ValueError("CuTe fp8 moe_up expects top_k=8")
-                    _MOE.invoke_cute_moe_up_fp8(
-                        a_fp8_bits,
-                        a_fp8_scale,
-                        B,
-                        B_scale,
-                        C,
-                        sorted_token_ids=sorted_token_ids,
-                        expert_ids=expert_ids,
-                        num_tokens_post_padded=num_tokens_post_padded,
-                        use_pdl=True,
-                    )
-                return
-
-            # Unquantized BF16 CuTe path: use auto-config selection.
-            if mul_routed_weight:
-                if int(top_k) != 1:
-                    raise ValueError("CuTe moe_down expects top_k=1")
-                if topk_weights is None:
-                    raise ValueError("topk_weights is required when mul_routed_weight=True")
-                _MOE.invoke_cute_moe_down(
-                    A,
-                    B,
-                    C,
-                    topk_weights=topk_weights,
-                    sorted_token_ids=sorted_token_ids,
-                    expert_ids=expert_ids,
-                    num_tokens_post_padded=num_tokens_post_padded,
-                    # config=None triggers auto-select from JSON configs
-                )
-            else:
-                if int(top_k) != 8:
-                    raise ValueError("CuTe moe_up expects top_k=8")
-                _MOE.invoke_cute_moe_up(
-                    A,
-                    B,
-                    C,
-                    sorted_token_ids=sorted_token_ids,
-                    expert_ids=expert_ids,
-                    num_tokens_post_padded=num_tokens_post_padded,
-                    # config=None triggers auto-select from JSON configs
-                )
-            return
-
-        if b_is_fp8w:
-            # Safe-but-slower fallback: dequantize weights to match the Triton kernel.
-            if B_scale is None:
-                raise ValueError("B_scale is required for FP8-weight MoE")
-            B_dequant = B.view(torch.float8_e4m3fn).to(A.dtype) * B_scale.to(A.dtype).unsqueeze(-1)
-            B = B_dequant
-
-        _MOE.invoke_fused_moe_kernel_triton(
-            A,
-            B,
-            C,
-            topk_weights=topk_weights,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_post_padded,
-            mul_routed_weight=mul_routed_weight,
-            top_k=top_k,
-            config=triton_config,
-            compute_type=compute_type,
-            bias=None,
-            allow_tf32=self.config.allow_tf32,
-        )
-
-    def _select_block_size(self, assignments: int) -> int:
-        block_m = self.config.block_size_m
-        if assignments <= 16:
-            return min(16, block_m)
-        if assignments <= 32:
-            return min(32, block_m)
-        if assignments <= 64:
-            return min(64, block_m)
-        return block_m
-
-    def _get_triton_config(
-        self,
-        *,
-        num_tokens: int,
-        assignments: int,
-        dtype: torch.dtype,
-    ) -> dict[str, int]:
-        base = self.config.as_triton(
-            block_size_m=self._select_block_size(assignments)
-        ).copy()
-        base.setdefault("NUM_WARPS", self.config.num_warps)
-        base.setdefault("NUM_STAGES", self.config.num_stages)
-
-        tuned = self._get_tuned_config(num_tokens=num_tokens, dtype=dtype)
-        if tuned is not None:
-            base.update(tuned)
-        return base
-
-    def _get_tuned_config(
-        self,
-        *,
-        num_tokens: int,
-        dtype: torch.dtype,
-    ) -> dict[str, int] | None:
-        if num_tokens in self._tuned_configs:
-            return self._tuned_configs[num_tokens]
-
-        key = (
-            self.down_experts.weight.shape[0],
-            self.down_experts.weight.shape[2],
-        )
-        hardcoded = _HARDCODED_CONFIGS.get(key)
-        if not hardcoded:
-            raise ValueError(
-                f"No hardcoded MoE config for expert shape {key}. "
-                "Add an entry to _HARDCODED_CONFIGS."
-            )
-        nearest = min(hardcoded.keys(), key=lambda m: abs(m - num_tokens))
-        raw = hardcoded[nearest]
-        tuned = {k.upper(): int(v) for k, v in raw.items()}
-
-        self._tuned_configs[num_tokens] = tuned
-        return tuned
-
-    def _get_block_m_for_routing(
-        self,
-        *,
-        num_tokens: int,
-        is_fp8_weights: bool,
-        triton_block_m: int,
-    ) -> int:
-        """Get block_m for moe_align_block_size based on backend.
-
-        For both FP8 and BF16 weights with CuTe backend, use auto-selected config.
-        For Triton backend, use Triton block_m.
-        """
-        backend = self._resolve_backend(num_tokens=num_tokens, is_fp8=is_fp8_weights)
-        if backend == "cute":
-            return _MOE.get_cute_moe_block_m(
-                num_tokens,
-                num_experts=self.num_experts,
-                hidden_size=self.input_size,
-                intermediate_size=self.hidden_size,
-                dtype="fp8" if is_fp8_weights else "bf16",
-            )
-        if is_fp8_weights:
-            return _TRITON_FP8_CONFIG["BLOCK_SIZE_M"]
-        else:
-            return triton_block_m
-
-    def _has_cute_moe_config(self, *, dtype: str) -> bool:
-        cached = self._cute_config_available.get(dtype)
-        if cached is not None:
-            return cached
-        has_config = bool(
-            _MOE.has_cute_moe_config(
-                num_experts=self.num_experts,
-                hidden_size=self.input_size,
-                intermediate_size=self.hidden_size,
-                dtype=dtype,
-            )
-        )
-        self._cute_config_available[dtype] = has_config
-        return has_config
-
-    def _resolve_backend(self, *, num_tokens: int, is_fp8: bool = False) -> str:
-        device = self.up_experts.weight.device
-        # Non-SM90 GPUs run the Triton path from kestrel-kernels.
-        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] != 9:
-            return "triton"
-        backend = self.config.backend.lower()
-        if is_fp8:
-            preferred = "cute"
-            dtype = "fp8"
-        elif backend == "auto":
-            preferred = (
-                "triton"
-                if num_tokens >= self.config.auto_backend_token_threshold
-                else "cute"
-            )
-            dtype = "bf16"
-        else:
-            preferred = backend
-            dtype = "bf16"
-
-        if preferred != "cute":
-            return preferred
-        if self._has_cute_moe_config(dtype=dtype):
-            return "cute"
-        return "triton"
+def _normalize_expert_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    if weight.dtype == torch.uint8:
+        return weight, True
+    if weight.dtype == torch.float8_e4m3fn:
+        return weight.view(torch.uint8), True
+    return weight, False
