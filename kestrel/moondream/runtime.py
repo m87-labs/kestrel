@@ -634,11 +634,24 @@ class MoondreamRuntime:
         self._preallocate_workspaces()
 
         if self._use_cuda_graphs:
+            self._maybe_release_cuda_allocator_cache()
             self._ensure_cuda_graphs_ready()
 
         # Allocate vision encoder buffers (always, for consistency)
         self._allocate_vision_buffers()
         self._capture_vision_graphs()
+
+    def _maybe_release_cuda_allocator_cache(self) -> None:
+        """Release cached allocator blocks before CUDA graph capture.
+
+        The runtime allocates large KV caches via PyTorch tensors, while some
+        graph-captured kernels request memory outside the PyTorch allocator. On
+        some systems, PyTorch can keep reclaimed slack in its reserved pool,
+        leaving too little driver-visible memory for those raw CUDA allocations.
+        """
+        if self.device.type != "cuda":
+            return
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Capacity helpers
