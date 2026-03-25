@@ -27,18 +27,18 @@ contain a build identifier that doesn't match the internal metadata.
 
 ## Install Kestrel
 
-Install with the extra matching your JetPack version:
+After PyTorch is installed, install Kestrel itself:
 
 ```bash
-# JetPack 6.2
-pip install "kestrel[jetson-jp62]"
+# pip
+pip install "numpy<2" kestrel
 
-# JetPack 6.1
-pip install "kestrel[jetson-jp61]"
-
-# JetPack 6.0
-pip install "kestrel[jetson-jp6]"
+# uv
+uv pip install "numpy<2" kestrel
 ```
+
+The current Jetson PyTorch wheels are still built against NumPy 1.x, so
+installing `numpy<2` avoids the compatibility warning emitted by `import torch`.
 
 ## Set `LD_LIBRARY_PATH`
 
@@ -48,7 +48,7 @@ path. If `import torch` fails with errors about missing `libnvToolsExt.so.1`,
 library directory:
 
 ```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/targets/aarch64-linux/lib:$LD_LIBRARY_PATH
 ```
 
 If you still see errors about `libcupti.so` or `libnvToolsExt.so`, you may need
@@ -58,14 +58,33 @@ to install additional CUDA packages:
 sudo apt install cuda-cupti-12-6 libnvtoolsext1
 ```
 
+If `import torch` fails with `libcusparseLt.so.0`, install cuSPARSELt for your
+JetPack/CUDA version and add its `lib` directory to `LD_LIBRARY_PATH` as well.
+On some pre-provisioned Jetson machines this may live in a user-local path
+rather than under `/usr/local/cuda`.
+
 You may want to add this to your shell profile (`~/.bashrc` or similar) so it
 persists across sessions.
 
 ## Verify
 
 ```bash
-python3 -c "import torch; print(torch.__version__); import kestrel_kernels; print('kernels OK')"
+python3 -c "import torch; print(torch.__version__); import kestrel; print('kestrel OK')"
 ```
+
+## Benchmarking
+
+For reproducible benchmark numbers on Orin, make sure the board is in its
+uncapped power mode and pin clocks before running benchmarks:
+
+```bash
+sudo nvpmodel -q
+sudo jetson_clocks
+sudo jetson_clocks --show
+```
+
+If `nvpmodel -q` does not report `MAXN`, switch the board to its MAXN mode
+before benchmarking.
 
 ## Notes
 
