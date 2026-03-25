@@ -4,7 +4,6 @@
 import argparse
 import asyncio
 import json
-from functools import partial
 from pathlib import Path
 from typing import List, Optional
 
@@ -84,35 +83,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stream",
         action="store_true",
         help="Stream tokens as they are generated",
-    )
-
-    serve = subparsers.add_parser("serve", help="Run the HTTP inference server")
-    _add_runtime_args(serve)
-    serve.add_argument(
-        "--default-max-new-tokens",
-        type=int,
-        default=768,
-        help="Default max tokens to generate when a request does not specify it",
-    )
-    serve.add_argument(
-        "--default-temperature",
-        type=float,
-        default=0.2,
-        help="Default sampling temperature when a request omits it",
-    )
-    serve.add_argument(
-        "--default-top-p",
-        type=float,
-        default=0.9,
-        help="Default nucleus sampling mass when a request omits it",
-    )
-    serve.add_argument("--host", default="0.0.0.0", help="Host address to bind the HTTP server")
-    serve.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server")
-    serve.add_argument(
-        "--log-level",
-        choices=["critical", "error", "warning", "info", "debug", "trace"],
-        default="info",
-        help="Log level for the HTTP server",
     )
 
     return parser
@@ -210,55 +180,12 @@ async def _handle_schedule(args: argparse.Namespace) -> None:
         )
 
 
-def _handle_serve(args: argparse.Namespace) -> None:
-    if args.default_temperature < 0.0:
-        raise SystemExit("default-temperature must be non-negative")
-    if args.default_top_p <= 0.0 or args.default_top_p > 1.0:
-        raise SystemExit("default-top-p must be in the range (0, 1]")
-    if args.default_max_new_tokens <= 0:
-        raise SystemExit("default-max-new-tokens must be positive")
-    if args.port <= 0 or args.port > 65535:
-        raise SystemExit("port must be between 1 and 65535")
-
-    runtime_cfg = _create_runtime_config(args)
-
-    try:
-        import uvicorn
-    except ImportError as exc:  # pragma: no cover - dependency guard
-        raise SystemExit(
-            "uvicorn is required for server mode. Install it with 'pip install uvicorn'."
-        ) from exc
-
-    try:
-        from kestrel.server import create_app
-    except ImportError as exc:  # pragma: no cover - defensive guard
-        raise SystemExit(f"Unable to import server module: {exc}") from exc
-
-    app_factory = partial(
-        create_app,
-        runtime_cfg=runtime_cfg,
-        default_max_new_tokens=args.default_max_new_tokens,
-        default_temperature=args.default_temperature,
-        default_top_p=args.default_top_p,
-    )
-
-    uvicorn.run(
-        app_factory,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level,
-        factory=True,
-    )
-
-
 def main(argv: Optional[List[str]] = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     if args.command == "schedule":
         asyncio.run(_handle_schedule(args))
-    elif args.command == "serve":
-        _handle_serve(args)
     else:
         parser.print_help()
 
