@@ -4,7 +4,9 @@
 
 High-performance inference engine for the [Moondream](https://moondream.ai) vision-language model.
 
-Kestrel provides async, micro-batched serving with streaming support, paged KV caching, and optimized CUDA kernels. It's designed for production deployments where throughput and latency matter.
+Kestrel is the inference engine behind [Photon](https://moondream.ai/p/photon), Moondream's on-device deployment option. Most users should install via `pip install moondream` — this repo is the internal engine for those who need direct access.
+
+Kestrel provides async, micro-batched inference with streaming support, paged KV caching, and optimized CUDA kernels. It's designed for production deployments where throughput and latency matter.
 
 ## Features
 
@@ -18,8 +20,8 @@ Kestrel provides async, micro-batched serving with streaming support, paged KV c
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU with optimized kernels for SM80 (A100), SM86 (A40, A10, RTX 3090), SM87 (Jetson Orin), SM89 (L4, L40S), and SM90 (H100). Other GPUs may work but have not been tested.
-- `MOONDREAM_API_KEY` environment variable (get this from [moondream.ai](https://moondream.ai))
+- NVIDIA GPU with optimized kernels for SM80 (A100), SM86 (A40, A10, RTX 3090), SM87 (Jetson Orin), SM89 (L4, L40S), SM90 (H100, H200, GH200). Other GPUs may work but have not been tested.
+- `MOONDREAM_API_KEY` environment variable or `api_key` parameter (get a key from [moondream.ai](https://moondream.ai))
 
 ## Installation
 
@@ -55,7 +57,7 @@ async def main():
     cfg = RuntimeConfig(model="moondream2")
 
     # Create the engine (loads model and warms up)
-    engine = await InferenceEngine.create(cfg)
+    engine = await InferenceEngine.create(cfg, api_key="your-key-here")
 
     # Load an image (JPEG, PNG, or WebP bytes)
     image = open("photo.jpg", "rb").read()
@@ -242,4 +244,4 @@ Throughput and latency for the `query` skill are tracked in [PERFORMANCE.md](./P
 
 ## License
 
-Kestrel requires a Moondream API key. See [moondream.ai/pricing](https://moondream.ai/pricing) for plans.
+Kestrel requires a Moondream API key for billing. See [moondream.ai/pricing](https://moondream.ai/pricing) for plans.
