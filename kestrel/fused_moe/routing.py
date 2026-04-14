@@ -69,11 +69,6 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
 
-    if expert_map is None or not ignore_invalid_experts:
-        expert_map_arg = torch.empty((0,), dtype=torch.int32, device=topk_ids.device)
-    else:
-        expert_map_arg = expert_map
-
     moe_align_block_size_cute(
         topk_ids,
         num_experts,
@@ -81,7 +76,6 @@ def moe_align_block_size(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
-        expert_map_arg,
     )
 
     if expert_map is not None and not ignore_invalid_experts:
@@ -172,7 +166,6 @@ def moe_lora_align_block_size(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
-        expert_map=expert_map,
     )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
