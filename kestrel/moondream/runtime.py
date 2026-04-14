@@ -475,7 +475,7 @@ class MoondreamRuntime:
 
         device_cc_major, device_cc_minor = torch.cuda.get_device_capability(self.device)
         device_sm = device_cc_major * 10 + device_cc_minor
-        fp8_kv_supported_sms = {87, 89, 90}
+        fp8_kv_supported_sms = {87, 89, 90, 100}
 
         if (
             self._kv_layer_k_scales is not None
@@ -497,8 +497,9 @@ class MoondreamRuntime:
                         stacklevel=2,
                     )
                 elif device_sm not in fp8_kv_supported_sms:
+                    sm_list = "/".join(f"SM{sm}" for sm in sorted(fp8_kv_supported_sms))
                     warnings.warn(
-                        "KV scales found in checkpoint but FP8 KV cache currently requires SM87/SM89/SM90 "
+                        f"KV scales found in checkpoint but FP8 KV cache currently requires {sm_list} "
                         "decode kernels; falling back to standard KV cache.",
                         stacklevel=2,
                     )
