@@ -351,7 +351,7 @@ class _MoEExecutionContext:
     input_size: int
     num_experts: int
     config: FusedMoEConfig
-    tuned_configs: dict[int, dict[str, int] | None]
+    tuned_configs: dict[tuple[int, bool], dict[str, int] | None]
     cute_config_available: dict[str, bool]
     workspaces: _MoEWorkspaces
 
@@ -416,14 +416,30 @@ def _get_tuned_config(
     *,
     num_tokens: int,
     down_weight: torch.Tensor,
+    is_fp8_weights: bool,
 ) -> dict[str, int] | None:
-    if num_tokens in ctx.tuned_configs:
-        return ctx.tuned_configs[num_tokens]
+    cache_key = (num_tokens, is_fp8_weights)
+    if cache_key in ctx.tuned_configs:
+        return ctx.tuned_configs[cache_key]
+
+    kernel_tuned = _MOE.get_triton_moe_config(
+        ctx.num_experts,
+        ctx.hidden_size,
+        num_tokens,
+        fp8=is_fp8_weights,
+    )
+    if kernel_tuned is not None:
+        ctx.tuned_configs[cache_key] = kernel_tuned
+        return kernel_tuned
 
     key = (
         down_weight.shape[0],
         down_weight.shape[2],
     )
+    if is_fp8_weights:
+        tuned = {k.upper(): int(v) for k, v in _TRITON_FP8_CONFIG.items()}
+        ctx.tuned_configs[cache_key] = tuned
+        return tuned
     hardcoded = _HARDCODED_CONFIGS.get(key)
     if not hardcoded:
         raise ValueError(
@@ -433,7 +449,7 @@ def _get_tuned_config(
     nearest = min(hardcoded.keys(), key=lambda m: abs(m - num_tokens))
     raw = hardcoded[nearest]
     tuned = {k.upper(): int(v) for k, v in raw.items()}
-    ctx.tuned_configs[num_tokens] = tuned
+    ctx.tuned_configs[cache_key] = tuned
     return tuned
 
 
@@ -443,6 +459,7 @@ def _get_triton_config(
     num_tokens: int,
     assignments: int,
     down_weight: torch.Tensor,
+    is_fp8_weights: bool,
 ) -> dict[str, int]:
     base = ctx.config.as_triton(
         block_size_m=_select_block_size(ctx, assignments)
@@ -454,6 +471,7 @@ def _get_triton_config(
         ctx,
         num_tokens=num_tokens,
         down_weight=down_weight,
+        is_fp8_weights=is_fp8_weights,
     )
     if tuned is not None:
         base.update(tuned)
@@ -529,8 +547,6 @@ def _get_block_m_for_routing(
             intermediate_size=ctx.hidden_size,
             dtype="fp8" if is_fp8_weights else "bf16",
         )
-    if is_fp8_weights:
-        return _TRITON_FP8_CONFIG["BLOCK_SIZE_M"]
     return triton_block_m
 
 
@@ -638,6 +654,7 @@ def _prepare_moe_forward(
         num_tokens=num_tokens,
         assignments=assignments,
         down_weight=down_weight_kernel,
+        is_fp8_weights=up_is_fp8w,
     )
     block_size_m = _get_block_m_for_routing(
         ctx,
@@ -1016,7 +1033,7 @@ class FusedMoEModule(nn.Module):
         self.input_size = input_size
         self.num_experts = num_experts
         self.config = config or FusedMoEConfig()
-        self._tuned_configs: dict[int, dict[str, int] | None] = {}
+        self._tuned_configs: dict[tuple[int, bool], dict[str, int] | None] = {}
         self._cute_config_available: dict[str, bool] = {}
         self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
         self._lora_activation_event = torch.cuda.Event(enable_timing=False)
