@@ -827,7 +827,7 @@ def _invoke_fused_moe_kernel(
             num_tokens_post_padded=num_tokens_post_padded,
             mul_routed_weight=mul_routed_weight,
             top_k=top_k,
-            config=_TRITON_FP8_CONFIG,
+            config=triton_config,
             compute_type=compute_type,
         )
         return
