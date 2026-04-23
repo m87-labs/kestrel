@@ -475,7 +475,7 @@ class MoondreamRuntime:
 
         device_cc_major, device_cc_minor = torch.cuda.get_device_capability(self.device)
         device_sm = device_cc_major * 10 + device_cc_minor
-        fp8_kv_supported_sms = {87, 89, 90, 100}
+        fp8_kv_supported_sms = {87, 89, 90, 100, 120}
 
         if (
             self._kv_layer_k_scales is not None
