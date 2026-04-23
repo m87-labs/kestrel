@@ -52,11 +52,15 @@ class PhotonReporter:
         engine: Any,
     ) -> None:
         self._engine = engine
-        self._api_key = api_key
+        # Strip leading/trailing whitespace. Common failure mode: pasting
+        # the key into a .env file leaves a trailing newline, which is an
+        # illegal HTTP header byte and trips httpx.LocalProtocolError —
+        # previously swallowed as "API unreachable" (see _flush_window).
+        self._api_key = api_key.strip() if api_key else api_key
         self._api_base_url = api_base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             timeout=10.0,
-            headers={"X-Moondream-Auth": api_key} if api_key else None,
+            headers={"X-Moondream-Auth": self._api_key} if self._api_key else None,
         )
         self._service_name = runtime_cfg.service_name
         self._model = runtime_cfg.model
@@ -85,6 +89,22 @@ class PhotonReporter:
             raise RuntimeError(
                 "Moondream API key is not set. Pass api_key to PhotonVL() or "
                 "set the MOONDREAM_API_KEY environment variable. See %s" % _DOCS_URL
+            )
+
+        # Pre-validate the key can form a valid HTTP header. Otherwise
+        # `_flush_window`'s broad `except httpx.HTTPError` catches the
+        # client-side LocalProtocolError and returns None — which we treat
+        # as "API unreachable" and silently proceed without auth, bypassing
+        # telemetry. Check explicitly at the one-shot startup path; the
+        # steady-state telemetry loop keeps its permissive catch so an
+        # intermittent outage can't crash it.
+        if not self._api_key.isascii() or any(
+            c.isspace() or not c.isprintable() for c in self._api_key
+        ):
+            raise RuntimeError(
+                "MOONDREAM_API_KEY has non-ASCII or whitespace characters that "
+                "make it unusable as an HTTP header. Check for stray newlines, "
+                "tabs, or pasted control characters in the key. See %s" % _DOCS_URL
             )
 
         standing = await self._flush_window()
