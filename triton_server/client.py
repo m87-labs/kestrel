@@ -6,7 +6,7 @@ and non-streaming modes against the unified ``moondream`` Triton model.
 
 Usage:
     pip install tritonclient[grpc] numpy
-    python triton/client.py [--url localhost:8001] [--image path/to/image.jpg]
+    python triton_server/client.py [--url localhost:8001] [--image path/to/image.jpg]
 """
 
 from __future__ import annotations
