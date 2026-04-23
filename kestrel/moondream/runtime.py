@@ -1900,7 +1900,7 @@ class MoondreamRuntime:
         # Pre-allocate MoE workspaces if MoE is enabled
         if self.config.text.moe is not None:
             from kestrel.fused_moe import preallocate_shared_moe_workspaces
-            from kestrel.fused_moe.lora_kernels import preallocate_lora_buffers
+            from kestrel_kernels.moe_lora import preallocate_lora_buffers
 
             moe_cfg = self.config.text.moe
             preallocate_shared_moe_workspaces(
