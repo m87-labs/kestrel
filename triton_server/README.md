@@ -18,12 +18,12 @@ Deploy Moondream via [NVIDIA Triton Inference Server](https://github.com/triton-
 
 ## Running Triton
 
-The `triton/model_repository/` directory is ready to use directly as a Triton model repository.
+The `triton_server/model_repository/` directory is ready to use directly as a Triton model repository.
 
 ```bash
 docker run --gpus all --rm -it \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-  -v ./triton/model_repository:/models \
+  -v ./triton_server/model_repository:/models \
   -e MOONDREAM_API_KEY=your-api-key \
   -e KESTREL_MODEL=moondream3-preview \
   nvcr.io/nvidia/tritonserver:24.08-py3 \
@@ -35,7 +35,7 @@ To use a local model checkpoint instead of downloading:
 ```bash
 docker run --gpus all --rm -it \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-  -v ./triton/model_repository:/models \
+  -v ./triton_server/model_repository:/models \
   -v /path/to/model/weights:/model_weights \
   -e MOONDREAM_API_KEY=your-api-key \
   -e KESTREL_MODEL_PATH=/model_weights \
@@ -192,5 +192,5 @@ Run the included test client:
 
 ```bash
 pip install tritonclient[grpc] numpy
-python triton/client.py --url localhost:8001 --image path/to/test.jpg
+python triton_server/client.py --url localhost:8001 --image path/to/test.jpg
 ```

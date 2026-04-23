@@ -236,7 +236,7 @@ RuntimeConfig(
 
 ## Triton Inference Server
 
-Kestrel can be deployed as a [Triton Inference Server](https://github.com/triton-inference-server/server) backend. See the [Triton setup guide](triton/README.md).
+Kestrel can be deployed as a [Triton Inference Server](https://github.com/triton-inference-server/server) backend. See the [Triton setup guide](triton_server/README.md).
 
 ## Benchmarks
 
