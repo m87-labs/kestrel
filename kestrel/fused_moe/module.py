@@ -9,8 +9,11 @@ from torch.compiler import disable as torch_compiler_disable
 from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
 from kestrel.utils.buffers import FixedBuffer
 from kestrel_kernels import get_runtime
+from kestrel_kernels.moe_lora import (
+    apply_moe_lora_batched,
+    apply_moe_lora_single,
+)
 
-from .lora_kernels import apply_moe_lora_batched, apply_moe_lora_single
 from .routing import moe_align_block_size, moe_lora_align_block_size
 
 

@@ -405,6 +405,17 @@ class InferenceEngine:
             if self._adapter_provider is not None
             else None
         )
+        if max_lora_rank is not None:
+            from kestrel_kernels.moe_lora import TRITON_AVAILABLE
+
+            if not TRITON_AVAILABLE:
+                _LOGGER.warning(
+                    "MoE LoRA adapters require triton, which is not installed. "
+                    "Disabling LoRA — base model inference will still work, but "
+                    "adapter requests will be rejected. Contact contact@moondream.ai "
+                    "if LoRA support is needed on your platform."
+                )
+                max_lora_rank = None
         self._runtime = await loop.run_in_executor(
             None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
         )
