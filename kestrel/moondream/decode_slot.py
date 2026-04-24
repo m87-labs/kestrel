@@ -249,9 +249,12 @@ def create_decode_slot(
         device=device,
     )
 
-    # Pre-allocated events for decode-step synchronization
-    step_done_event = torch.cuda.Event()
-    commit_done_event = torch.cuda.Event()
+    # Pre-allocated events for decode-step synchronization. ``make_event``
+    # returns a real ``torch.cuda.Event`` on CUDA, a no-op stand-in on MPS
+    # (where the decode path serializes via the single implicit stream).
+    from kestrel.device import make_event
+    step_done_event = make_event(device)
+    commit_done_event = make_event(device)
 
     return DecodeSlot(
         slot_id=slot_id,
