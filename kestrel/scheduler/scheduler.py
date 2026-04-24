@@ -11,6 +11,7 @@ import logging
 import torch
 from torch import Tensor
 
+from kestrel.device import stream_context
 from kestrel.moondream.runtime import (
     MoondreamRuntime,
     PrefillClassification,
