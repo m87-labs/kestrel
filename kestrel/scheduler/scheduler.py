@@ -333,7 +333,7 @@ class GenerationScheduler:
         """
         progressed = False
         pipeline = self._pipeline
-        with torch.cuda.stream(self.runtime.primary_stream):
+        with stream_context(self.runtime.primary_stream):
             has_launch = pipeline.has_launch_in_flight()
             has_queued = pipeline.queue_depth() > 0
 
@@ -727,7 +727,7 @@ class GenerationScheduler:
 
             lifecycle.sequence_state = prepared.state
             batch_idx = prepared.state.batch_idx
-            with torch.cuda.stream(self.runtime.primary_stream):
+            with stream_context(self.runtime.primary_stream):
                 self._sampling_temps_by_batch[batch_idx] = request.temperature
                 self._sampling_top_ps_by_batch[batch_idx] = request.top_p
 
@@ -796,7 +796,7 @@ class GenerationScheduler:
                 )
                 lifecycle.prefill_completed_at = time.perf_counter()
                 # Ensure prefill forward completes before cache finalize + release.
-                with torch.cuda.stream(self.runtime.primary_stream):
+                with stream_context(self.runtime.primary_stream):
                     prefill_slot.commit_done_event.record()
                 prefill_slot.commit_done_event.synchronize()
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
@@ -951,7 +951,7 @@ class GenerationScheduler:
         _launch_forward_on_stream. Use this when calling from outside advance().
         """
         slot = self.runtime.decode_slots[slot_id]
-        with torch.cuda.stream(slot.compute_stream):
+        with stream_context(slot.compute_stream):
             return self._launch_forward_on_stream(plan, slot_id)
 
     def _launch_forward_on_stream(
@@ -1034,12 +1034,12 @@ class GenerationScheduler:
         """
         if handle.kind == "decode":
             slot = self.runtime.decode_slots[handle.slot_id]
-            with torch.cuda.stream(slot.compute_stream):
+            with stream_context(slot.compute_stream):
                 return self._finalize_sampling_on_stream(handle, mask)
         if handle.kind == "prefill":
             if mask is not None:
                 raise AssertionError("Prefill finalize does not support masks")
-            with torch.cuda.stream(self.runtime.primary_stream):
+            with stream_context(self.runtime.primary_stream):
                 return self._finalize_prefill(handle)
         raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 

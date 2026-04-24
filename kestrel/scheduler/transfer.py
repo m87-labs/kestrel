@@ -3,6 +3,8 @@
 import torch
 from torch import Tensor
 
+from kestrel.device import make_event, stream_context
+
 
 class TransferHandle:
     """Handle for an in-flight D2H transfer."""
@@ -46,27 +48,23 @@ class RenderBuffer:
         size_dtype: torch.dtype,
         copy_stream: torch.cuda.Stream,
     ) -> None:
+        # Pinned host memory accelerates async H2D/D2H copies on CUDA but
+        # isn't supported (and triggers ``DispatchStub: missing kernel for
+        # mps``) when an MPS device is active even with ``device="cpu"``.
+        # Drop the hint off CUDA — same allocation, no pinning.
+        pin = device.type == "cuda"
         self._token_ids = torch.empty(
-            (max_batch,),
-            dtype=torch.long,
-            device="cpu",
-            pin_memory=True,
+            (max_batch,), dtype=torch.long, device="cpu", pin_memory=pin,
         )
         self._coord_values = torch.empty(
-            (max_batch, 1),
-            dtype=coord_dtype,
-            device="cpu",
-            pin_memory=True,
+            (max_batch, 1), dtype=coord_dtype, device="cpu", pin_memory=pin,
         )
         self._size_values = torch.empty(
-            (max_batch, 2),
-            dtype=size_dtype,
-            device="cpu",
-            pin_memory=True,
+            (max_batch, 2), dtype=size_dtype, device="cpu", pin_memory=pin,
         )
         self._device = device
         self._stream = copy_stream
-        self._event = torch.cuda.Event(enable_timing=False, blocking=False)
+        self._event = make_event(device, enable_timing=False, blocking=False)
 
     def transfer(
         self,
@@ -97,11 +95,12 @@ class RenderBuffer:
                 0,
             )
 
-        with torch.cuda.stream(self._stream):
+        with stream_context(self._stream):
             # Wait on the specific step's completion event (not wait_stream).
             # This anchors the dependency to exactly this step's GPU writes,
             # independent of any later work enqueued on the compute stream.
-            self._stream.wait_event(ready_event)
+            if self._stream is not None:
+                self._stream.wait_event(ready_event)
             self._token_ids[:count].copy_(token_ids, non_blocking=True)
             self._coord_values[:count].copy_(coord_values, non_blocking=True)
             self._size_values[:count].copy_(size_values, non_blocking=True)
