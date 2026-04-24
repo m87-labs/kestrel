@@ -1426,7 +1426,8 @@ class MoondreamRuntime:
 
             assert use_prefix_attn is not None
             hidden_dim = self.bos_embed.shape[-1]
-            max_seq_len = max(t.shape[1] for t in per_inputs)
+            seq_lens = [int(t.shape[1]) for t in per_inputs]
+            max_seq_len = max(seq_lens)
             inputs_embeds = torch.zeros(
                 (batch_size, max_seq_len, hidden_dim),
                 dtype=self.dtype,
@@ -1441,8 +1442,11 @@ class MoondreamRuntime:
             last_token_positions = torch.empty(
                 (batch_size,), dtype=torch.long, device=self.device
             )
-            fa3_seqused_q = torch.empty(
-                (batch_size,), dtype=torch.int32, device=self.device
+            q_is_padded = any(seq_len != max_seq_len for seq_len in seq_lens)
+            fa3_seqused_q = (
+                torch.empty((batch_size,), dtype=torch.int32, device=self.device)
+                if q_is_padded
+                else None
             )
             fa3_seqused_k = torch.tensor(
                 [
@@ -1456,10 +1460,9 @@ class MoondreamRuntime:
             row_batch_idx = prefill_slot.batch_idx[:batch_size]
             batch_indices: list[int] = []
 
-            for row, (prepared, embed_row, pos_row) in enumerate(
-                zip(prepared_sequences, per_inputs, per_positions)
+            for row, (prepared, embed_row, pos_row, seq_len) in enumerate(
+                zip(prepared_sequences, per_inputs, per_positions, seq_lens)
             ):
-                seq_len = int(embed_row.shape[1])
                 prompt_len = int(prepared.state.prompt_length or prepared.state.length)
                 if seq_len > prompt_len:
                     raise AssertionError(
@@ -1473,7 +1476,8 @@ class MoondreamRuntime:
                 # Route padded tokens to reserved batch row 0 so they never write
                 # into real sequence KV slots.
                 slot_batch_idx[row, :seq_len].fill_(batch_idx)
-                fa3_seqused_q[row] = seq_len
+                if fa3_seqused_q is not None:
+                    fa3_seqused_q[row] = seq_len
                 last_token_positions[row] = seq_len - 1
 
             # Commit page table rows for all batch indices before forward pass.
@@ -1558,7 +1562,7 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool,
-        fa3_seqused_q: Tensor,
+        fa3_seqused_q: Tensor | None,
         fa3_seqused_k: Tensor,
         last_token_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
