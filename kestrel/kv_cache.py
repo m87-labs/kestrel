@@ -25,9 +25,8 @@ except Exception:  # pragma: no cover - runtime compatibility fallback
 
 def _maybe_stream_context(stream: torch.cuda.Stream | None):
     """Return a stream context manager, or nullcontext if stream is None."""
-    if stream is not None:
-        return torch.cuda.stream(stream)
-    return nullcontext()
+    from kestrel.device import stream_context
+    return stream_context(stream)
 
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):

@@ -619,10 +619,21 @@ class FusedMoEModule(nn.Module):
         self.input_size = input_size
         self.num_experts = num_experts
         self.config = config or FusedMoEConfig()
-        self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
-        self._lora_activation_event = torch.cuda.Event(enable_timing=False)
-        self._lora_up_event = torch.cuda.Event(enable_timing=False)
-        self._lora_down_event = torch.cuda.Event(enable_timing=False)
+        # Pipelined-LoRA events; only used when ``use_batched_lora`` or
+        # ``use_single_lora`` is True at forward time. LoRA is disabled in
+        # the v1 MPS path, so these are unreachable there — keep them
+        # ``None`` rather than instantiating CUDA Events that would crash
+        # on non-CUDA hosts.
+        if torch.cuda.is_available():
+            self._lora_inputs_event = torch.cuda.Event(enable_timing=False)
+            self._lora_activation_event = torch.cuda.Event(enable_timing=False)
+            self._lora_up_event = torch.cuda.Event(enable_timing=False)
+            self._lora_down_event = torch.cuda.Event(enable_timing=False)
+        else:
+            self._lora_inputs_event = None
+            self._lora_activation_event = None
+            self._lora_up_event = None
+            self._lora_down_event = None
 
     @property
     def _workspaces(self) -> _MoEWorkspaces:

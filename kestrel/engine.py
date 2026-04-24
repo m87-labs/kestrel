@@ -53,6 +53,7 @@ import numpy as np
 import torch
 
 from kestrel.config import RuntimeConfig
+from kestrel.device import set_device, synchronize
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.scheduler import (
     GenerationScheduler,
@@ -891,14 +892,14 @@ class InferenceEngine:
         self._paused_event.clear()
         self._scheduler_event.set()
         self._paused_event.wait(timeout)
-        torch.cuda.synchronize(self._runtime.device)
+        synchronize(self._runtime.device)
 
     def resume(self) -> None:
         """Resume scheduler progress after a pause."""
 
         if self._shutdown:
             return
-        torch.cuda.synchronize(self._runtime.device)
+        synchronize(self._runtime.device)
         self._paused_event.clear()
         self._paused_flag.clear()
         self._run_gate.set()
@@ -1089,7 +1090,7 @@ class InferenceEngine:
         runtime = self._runtime
         if runtime is None:
             return
-        torch.cuda.set_device(runtime.device)
+        set_device(runtime.device)
 
         adapter_provider = self._adapter_provider
         scheduler = GenerationScheduler(
@@ -1221,7 +1222,7 @@ class InferenceEngine:
                         if drained_results:
                             deliver_results(drained_results)
                         with runtime.graph_capture_lock:
-                            torch.cuda.synchronize(runtime.device)
+                            synchronize(runtime.device)
                         paused_event.set()
                         if should_exit():
                             break

@@ -20,6 +20,7 @@ from torch import Tensor
 from tokenizers import Tokenizer
 
 from kestrel.config import RuntimeConfig
+from kestrel.device import NoopEvent, empty_cache, get_device_capability, make_event, make_stream, set_device, stream_context
 from kestrel.kv_cache import PageTable, PagedKVCache
 from kestrel.prefix_cache import (
     CacheNamespace,
@@ -223,8 +224,10 @@ class PrefillSlot:
 
     slot_id: int
     batch_idx: Tensor
-    step_done_event: torch.cuda.Event
-    commit_done_event: torch.cuda.Event
+    # Type-annotated as the CUDA event for the common case; MPS/CPU paths
+    # store ``NoopEvent`` instances at runtime.
+    step_done_event: "torch.cuda.Event"
+    commit_done_event: "torch.cuda.Event"
     scratch: PrefillScratch | None = None
 
 
@@ -349,7 +352,7 @@ class MoondreamRuntime:
         self._cfg = cfg
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
-        torch.cuda.set_device(self.device)
+        set_device(self.device)
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
         self.graph_capture_lock = threading.RLock()
 
@@ -389,7 +392,7 @@ class MoondreamRuntime:
 
         # Primary stream for all GPU operations. Created early because PageTable
         # needs it for H2D copies that must synchronize with graph replay.
-        self._primary_stream = torch.cuda.Stream(device=self.device)
+        self._primary_stream = make_stream(self.device)
 
         self.page_table = PageTable(
             n_pages=n_pages,
@@ -473,7 +476,7 @@ class MoondreamRuntime:
                 stacklevel=2,
             )
 
-        device_cc_major, device_cc_minor = torch.cuda.get_device_capability(self.device)
+        device_cc_major, device_cc_minor = get_device_capability(self.device)
         device_sm = device_cc_major * 10 + device_cc_minor
         fp8_kv_supported_sms = {87, 89, 90, 100, 120}
 
@@ -541,8 +544,8 @@ class MoondreamRuntime:
 
         # Additional streams: LoRA operations and D2H copies.
         # (Primary stream was created earlier for PageTable H2D sync.)
-        self._lora_stream = torch.cuda.Stream(device=self.device)
-        self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._lora_stream = make_stream(self.device)
+        self._copy_stream = make_stream(self.device)
 
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
@@ -565,8 +568,8 @@ class MoondreamRuntime:
                 batch_idx=torch.empty(
                     (self.max_batch_size,), dtype=torch.int64, device=self.device
                 ),
-                step_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
-                commit_done_event=torch.cuda.Event(enable_timing=False, blocking=False),
+                step_done_event=make_event(self.device, enable_timing=False, blocking=False),
+                commit_done_event=make_event(self.device, enable_timing=False, blocking=False),
                 scratch=PrefillScratch(
                     _prefill_scratch_tokens, self.config.text, self.device, self.dtype,
                 ) if self.config.text else None,
@@ -652,7 +655,7 @@ class MoondreamRuntime:
         """
         if self.device.type != "cuda":
             return
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
 
     # ------------------------------------------------------------------
     # Capacity helpers
@@ -1396,7 +1399,7 @@ class MoondreamRuntime:
 
         # Keep all GPU work on the primary stream so all callers share identical
         # ordering semantics.
-        with torch.cuda.stream(self._primary_stream):
+        with stream_context(self._primary_stream):
             per_inputs: list[Tensor] = []
             per_positions: list[Tensor] = []
             use_prefix_attn: bool | None = None
@@ -1802,7 +1805,7 @@ class MoondreamRuntime:
 
         if is_new:
             try:
-                with torch.cuda.stream(self._primary_stream):
+                with stream_context(self._primary_stream):
                     self._lora_workspace.load_slot_(slot, adapter)
             except Exception:
                 # Rollback on load failure

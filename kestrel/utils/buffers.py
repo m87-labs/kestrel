@@ -74,7 +74,15 @@ class CpuGpuBuffer:
         pin_memory: bool,
         with_numpy: bool = True,
     ) -> None:
-        self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
+        # Pinned memory is a CUDA-specific allocator hint that accelerates
+        # async H2D copies; on MPS torch raises ``DispatchStub: missing
+        # kernel for mps`` even with ``device="cpu"`` because the pin path
+        # is wired through the active device. The hint has no effect off
+        # CUDA, so just drop it.
+        pin_memory_effective = pin_memory and device.type == "cuda"
+        self.cpu = torch.zeros(
+            *size, dtype=dtype, device="cpu", pin_memory=pin_memory_effective,
+        )
         self.gpu = torch.zeros_like(self.cpu, device=device)
         self.np: np.ndarray
 
