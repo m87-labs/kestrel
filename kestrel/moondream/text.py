@@ -124,9 +124,9 @@ def attn(
     rotary_embedding(position_matrix, q, k, head_dim, cos_sin_cache)
 
     if kv_cache is None:
-        raise RuntimeError("FA3 attention requires a KV cache")
+        raise RuntimeError("paged attention requires a KV cache")
     if page_table is None or fa3_seqused_k is None:
-        raise RuntimeError("FA3 attention requires page_table and fa3_seqused_k")
+        raise RuntimeError("paged attention requires page_table and seqused_k")
 
     kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
 
@@ -136,10 +136,8 @@ def attn(
     v_scale = getattr(kv_cache.cache, "v_scale", None)
 
     if mode == "prefill":
-        if not x.is_cuda:
-            raise RuntimeError("FA3 prefill requires CUDA tensors")
         if q.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(f"Unsupported dtype for FA3 prefill: {q.dtype}")
+            raise RuntimeError(f"unsupported dtype for prefill attention: {q.dtype}")
         mask_mod = None
         causal = True
         pack_gqa = False
