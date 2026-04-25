@@ -71,8 +71,20 @@ class RuntimeConfig:
             self.model_path = ensure_model_weights(self.model)
 
     def resolved_dtype(self) -> torch.dtype:
-        """Return the torch dtype to use for the runtime."""
+        """Return the torch dtype to use for the runtime.
 
+        On MPS we override the default ``bfloat16`` to ``float16``:
+        Apple Silicon's matmul + SDPA throughput is consistently
+        higher in fp16, fp16's 10-bit mantissa is a precision
+        *upgrade* over bf16's 7-bit on the activation range Moondream
+        occupies, and Moondream's bf16-trained weights round to fp16
+        without saturating fp16's 65504 dynamic-range cap. Users who
+        explicitly want fp32 on MPS still get fp32 — only the bf16
+        default is overridden.
+        """
+
+        if self.dtype == torch.bfloat16 and self.resolved_device().type == "mps":
+            return torch.float16
         return self.dtype
 
     def resolved_device(self) -> torch.device:
