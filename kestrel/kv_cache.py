@@ -399,7 +399,11 @@ class PageTable:
         if batch_size == 0:
             return
 
-        if triton is None:
+        # The Triton kernel only runs on CUDA. Triton may be importable on
+        # non-CUDA hosts (e.g. a CUDA machine running ``--device cpu`` or a
+        # Mac with a manual triton install), so check the tensor device —
+        # not just ``triton is None``.
+        if triton is None or device.type != "cuda":
             _build_fa3_decode_metadata_torch(
                 page_table=self.page_table,
                 batch_idx=batch_idx,
