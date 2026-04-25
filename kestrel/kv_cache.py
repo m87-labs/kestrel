@@ -346,9 +346,9 @@ class PageTable:
     ) -> None:
         """Populate FA3 paged-KV metadata buffers using a fused Triton kernel."""
         if batch_idx.ndim != 1:
-            raise ValueError("batch_idx must be 1D for FA3 metadata")
+            raise ValueError("batch_idx must be 1D for paged-KV metadata")
         if input_pos.ndim != 1:
-            raise ValueError("input_pos must be 1D for FA3 metadata")
+            raise ValueError("input_pos must be 1D for paged-KV metadata")
         if batch_idx.shape[0] != input_pos.shape[0]:
             raise ValueError("batch_idx and input_pos must have the same length")
         if out_page_table.ndim != 2:
@@ -376,10 +376,18 @@ class PageTable:
             raise ValueError("out_page_table must be contiguous in the last dimension")
 
         device = self.page_table.device
-        if not (batch_idx.is_cuda and input_pos.is_cuda):
-            raise ValueError("batch_idx and input_pos must be CUDA tensors")
-        if not (out_page_table.is_cuda and out_seqused_k.is_cuda):
-            raise ValueError("out_page_table and out_seqused_k must be CUDA tensors")
+        # All buffers must live on the compute device. The torch fallback
+        # path below runs on any backend (CPU / CUDA / MPS); the Triton
+        # kernel path below is guarded by ``triton is None``.
+        if batch_idx.device != device or input_pos.device != device:
+            raise ValueError(
+                f"batch_idx/input_pos must live on {device}, "
+                f"got {batch_idx.device}/{input_pos.device}"
+            )
+        if out_page_table.device != device or out_seqused_k.device != device:
+            raise ValueError(
+                f"out_page_table/out_seqused_k must live on {device}"
+            )
 
         batch_idx = batch_idx.to(device=device)
         input_pos = input_pos.to(device=device)
@@ -391,7 +399,11 @@ class PageTable:
         if batch_size == 0:
             return
 
-        if triton is None:
+        # The Triton kernel only runs on CUDA. Triton may be importable on
+        # non-CUDA hosts (e.g. a CUDA machine running ``--device cpu`` or a
+        # Mac with a manual triton install), so check the tensor device —
+        # not just ``triton is None``.
+        if triton is None or device.type != "cuda":
             _build_fa3_decode_metadata_torch(
                 page_table=self.page_table,
                 batch_idx=batch_idx,

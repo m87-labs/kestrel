@@ -26,9 +26,6 @@ def prepare_crops(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    if device.type != "cuda":
-        raise RuntimeError("Vision preprocessing expects a CUDA device")
-
     overlap = compute_overlap_crops(image, config)
     return prepare_crops_from_overlap(overlap, device, dtype)
 
@@ -39,13 +36,16 @@ def prepare_crops_from_overlap(
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
     crops_cpu = torch.from_numpy(overlap["crops"])
-    crops_cpu = crops_cpu.permute(0, 3, 1, 2).contiguous().pin_memory()
+    crops_cpu = crops_cpu.permute(0, 3, 1, 2).contiguous()
     # NOTE: Use async H2D for performance.
     #
     # Important: non_blocking=True enqueues the H2D copy on the *current* CUDA stream.
     # Ensure the copy is enqueued on the same stream as the consumer (e.g. CUDA graph
     # replay), or add an explicit dependency (wait_stream/event). Otherwise, the
-    # consumer can observe stale/partially-copied inputs.
+    # consumer can observe stale/partially-copied inputs. pin_memory is a
+    # CUDA-only optimization; skip on other backends (MPS DispatchStub raises).
+    if device.type == "cuda":
+        crops_cpu = crops_cpu.pin_memory()
     crops = crops_cpu.to(
         device=device,
         dtype=dtype,
@@ -174,10 +174,20 @@ def vision_projection(
     config: VisionConfig,
 ) -> torch.Tensor:
     reconstructed = local_features.permute(2, 0, 1)
-    reconstructed = F.adaptive_avg_pool2d(
-        reconstructed,
-        output_size=(config.enc_n_layers, config.enc_n_layers),
-    )
+    # MPS has no adaptive-pool implementation for non-divisible input/output
+    # ratios (pytorch#96056). Detour through CPU — the pooled output is small
+    # (enc_n_layers × enc_n_layers × enc_dim) so the round-trip is cheap.
+    if reconstructed.device.type == "mps":
+        pooled = F.adaptive_avg_pool2d(
+            reconstructed.to("cpu"),
+            output_size=(config.enc_n_layers, config.enc_n_layers),
+        )
+        reconstructed = pooled.to(reconstructed.device)
+    else:
+        reconstructed = F.adaptive_avg_pool2d(
+            reconstructed,
+            output_size=(config.enc_n_layers, config.enc_n_layers),
+        )
     reconstructed = reconstructed.permute(1, 2, 0).reshape(-1, config.enc_dim)
     features = torch.cat([global_features, reconstructed], dim=-1)
     hidden = F.gelu(module.proj_mlp["fc1"](features), approximate="tanh")

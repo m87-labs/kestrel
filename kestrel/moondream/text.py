@@ -25,8 +25,6 @@ from .lora_workspace import TextLoRAWorkspace
 from .rope import precompute_freqs_cis
 from ..dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
-from kestrel_kernels.linear_ops import linear as _kestrel_linear
-from kestrel_kernels.gelu_residual import gelu_cute as _gelu_cute
 
 _KERNELS = get_runtime()
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
@@ -34,6 +32,8 @@ cute_prefix_lm_mask_730 = _KERNELS.attention.prefix_lm_mask_730
 tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
 rotary_embedding = _KERNELS.rotary.rotary_embedding
 _fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
+_kestrel_linear = _KERNELS.linear.linear
+_gelu_cute = _KERNELS.gelu.gelu_cute
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -124,9 +124,9 @@ def attn(
     rotary_embedding(position_matrix, q, k, head_dim, cos_sin_cache)
 
     if kv_cache is None:
-        raise RuntimeError("FA3 attention requires a KV cache")
+        raise RuntimeError("paged attention requires a KV cache")
     if page_table is None or fa3_seqused_k is None:
-        raise RuntimeError("FA3 attention requires page_table and fa3_seqused_k")
+        raise RuntimeError("paged attention requires page_table and seqused_k")
 
     kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
 
@@ -136,10 +136,8 @@ def attn(
     v_scale = getattr(kv_cache.cache, "v_scale", None)
 
     if mode == "prefill":
-        if not x.is_cuda:
-            raise RuntimeError("FA3 prefill requires CUDA tensors")
         if q.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(f"Unsupported dtype for FA3 prefill: {q.dtype}")
+            raise RuntimeError(f"unsupported dtype for prefill attention: {q.dtype}")
         mask_mod = None
         causal = True
         pack_gqa = False
