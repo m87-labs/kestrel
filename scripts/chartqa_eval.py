@@ -69,6 +69,7 @@ class EvalConfig:
     enable_prefix_cache: bool
     dump_jsonl: Optional[Path] = None
     concurrency: Optional[int] = None
+    device: str | None = None
 
 
 def decode_image(image_data: Dict[str, Any]) -> np.ndarray:
@@ -211,6 +212,14 @@ async def create_engine(cfg: EvalConfig) -> InferenceEngine:
     )
     if cfg.kv_cache_pages is not None:
         runtime_kwargs["kv_cache_pages"] = cfg.kv_cache_pages
+    if cfg.device is not None:
+        runtime_kwargs["device"] = cfg.device
+    elif not __import__("torch").cuda.is_available():
+        # Mac / non-CUDA fallback: default to MPS if available, else CPU.
+        import torch
+        if torch.backends.mps.is_available():
+            runtime_kwargs["device"] = "mps"
+            runtime_kwargs["enable_cuda_graphs"] = False
     runtime_cfg = RuntimeConfig(**runtime_kwargs)
     return await InferenceEngine.create(runtime_cfg)
 
@@ -660,6 +669,8 @@ def parse_args() -> EvalConfig:
         default=0,
         help="Limit number of concurrent in-flight questions (0 = unlimited).",
     )
+    parser.add_argument("--device", default=None,
+                        help="Override torch device (e.g. cuda, mps). Auto-detects when omitted.")
     args = parser.parse_args()
 
     if args.pot and args.cot:
@@ -682,6 +693,7 @@ def parse_args() -> EvalConfig:
         enable_prefix_cache=not args.disable_prefix_cache,
         dump_jsonl=args.dump_jsonl,
         concurrency=None if int(args.concurrency) <= 0 else int(args.concurrency),
+        device=args.device,
     )
     return cfg
 

@@ -12,12 +12,12 @@ from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
-from kestrel.ops.layernorm_cuda import layernorm_bias_into
 from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()
 fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
+_layernorm_bias_into = _KERNELS.dense.layernorm_bias_into
 
 
 def prepare_crops(
@@ -76,18 +76,14 @@ def vision_encoder(
     x = module.patch_emb(x)
     x = x + module.pos_emb
     early = None
-    use_fast_ln = x.is_cuda and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
-    x_norm_buf: torch.Tensor | None = torch.empty(x.shape, device=x.device, dtype=x.dtype) if use_fast_ln else None
+    # Cross-arch: ``_layernorm_bias_into`` dispatches to the .so kernel
+    # on CUDA / the Metal kernel on MPS, falling through to torch on
+    # any unsupported config.
+    x_norm_buf = torch.empty(x.shape, device=x.device, dtype=x.dtype)
 
     def _layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
-        if x_norm_buf is None:
-            return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, float(ln.eps))
-        layernorm_bias_into(
-            x=x,
-            weight=ln.weight,
-            bias=ln.bias,
-            out=x_norm_buf,
-            eps=float(ln.eps),
+        _layernorm_bias_into(
+            x_norm_buf, x, ln.weight, ln.bias, float(ln.eps),
             fallback_to_torch=True,
         )
         return x_norm_buf

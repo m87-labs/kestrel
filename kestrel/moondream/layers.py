@@ -16,10 +16,10 @@ from ..dense_lora import (
     apply_dense_lora,
     prepare_dense_lora_batch,
 )
-from ..ops.layernorm_cuda import layernorm_bias
 from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()
+_layernorm_bias = _KERNELS.dense.layernorm_bias  # cross-arch (.so on CUDA, Metal on MPS)
 
 # Re-export LoRA for convenience
 from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
@@ -37,12 +37,10 @@ class LayerNormWeights:
 
 
 def layer_norm(x: torch.Tensor, w: LayerNormWeights) -> torch.Tensor:
-    if x.is_cuda and x.dtype == torch.bfloat16:
-        try:
-            return layernorm_bias(x, w.weight, w.bias)
-        except Exception:
-            pass
-    return F.layer_norm(x, w.bias.shape, w.weight, w.bias)
+    # Cross-arch: dispatches to the .so kernel on CUDA, the Metal
+    # kernel on MPS. Anything else (or any unsupported config — fp16 on
+    # CUDA, non-mul-of-8 last dim) falls through to ``F.layer_norm``.
+    return _layernorm_bias(x, w.weight, w.bias, fallback_to_torch=True)
 
 
 @dataclass
