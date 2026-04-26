@@ -5,8 +5,8 @@ import torch
 from kestrel.utils.buffers import FixedBuffer
 from kestrel_kernels import get_runtime
 
-fused_mlp_gelu_bias_residual_cuda = (
-    get_runtime().dense.fused_mlp_gelu_bias_residual_cuda
+fused_mlp_gelu_bias_residual_kernel = (
+    get_runtime().dense.fused_mlp_gelu_bias_residual
 )
 
 
@@ -91,12 +91,12 @@ def fused_mlp_gelu_bias_residual_into(
 
     ws = _WORKSPACES if workspaces is None else workspaces
     hidden = ws.hidden.get((m, hidden_dim), device=x2.device, dtype=x2.dtype)
-    fused_mlp_gelu_bias_residual_cuda(out2, hidden, x2, w1, b1, w2, b2, r2)
+    fused_mlp_gelu_bias_residual_kernel(out2, hidden, x2, w1, b1, w2, b2, r2)
 
 
 __all__ = [
     "FusedMLPWorkspaces",
-    "fused_mlp_gelu_bias_residual_cuda",
+    "fused_mlp_gelu_bias_residual_kernel",
     "fused_mlp_gelu_bias_residual_into",
     "preallocate_fused_mlp_workspaces",
 ]
