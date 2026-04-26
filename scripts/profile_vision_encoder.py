@@ -103,20 +103,15 @@ def patch_vision_encoder_with_nvtx(detailed: bool = True) -> None:
         nvtx.range_pop()
 
         early = None
-        use_fast_ln = x.is_cuda and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
-        x_norm_buf: torch.Tensor | None = (
-            torch.empty(x.shape, device=x.device, dtype=x.dtype) if use_fast_ln else None
-        )
+        # Match the production vision-encoder path: always route through
+        # ``_KERNELS.dense.layernorm_bias_into`` (cross-arch — .so on CUDA,
+        # Metal on MPS), with torch fallback on any unsupported config.
+        x_norm_buf = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+        _layernorm_bias_into = vision_module._layernorm_bias_into
 
         def _layer_norm(x_in: torch.Tensor, ln: torch.nn.LayerNorm) -> torch.Tensor:
-            if x_norm_buf is None:
-                return F.layer_norm(x_in, ln.normalized_shape, ln.weight, ln.bias, float(ln.eps))
-            vision_module.layernorm_bias_into(
-                x=x_in,
-                weight=ln.weight,
-                bias=ln.bias,
-                out=x_norm_buf,
-                eps=float(ln.eps),
+            _layernorm_bias_into(
+                x_norm_buf, x_in, ln.weight, ln.bias, float(ln.eps),
                 fallback_to_torch=True,
             )
             return x_norm_buf
