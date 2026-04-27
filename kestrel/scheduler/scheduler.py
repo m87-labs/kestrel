@@ -43,7 +43,7 @@ from .pipeline import (
     PrefillLaunch,
     PrefillPendingCommit,
 )
-from .sampling import sample_tokens
+from kestrel_kernels.sampling import sample_step_from_logits
 from .transfer import RenderBuffer
 from .tokens import render_tokens_from_packed
 from .spatial import compute_spatial_values
@@ -1277,7 +1277,7 @@ class GenerationScheduler:
         top_ps = self._sampling_top_ps[:batch]
         torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
         torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
-        sampled_raw = sample_tokens(logits, temps, top_ps, generator=self._sampling_rng)
+        sampled_raw = sample_step_from_logits(logits, temps, top_ps, generator=self._sampling_rng)
         out[:batch].copy_(sampled_raw)
         return out[:batch], temps, top_ps
 
