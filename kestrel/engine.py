@@ -1017,8 +1017,15 @@ class InferenceEngine:
     def _warn_if_outside_mps_sampler_envelope(
         self, temperature: float, top_p: float,
     ) -> None:
-        runtime = self._runtime
-        if runtime is None or runtime.device.type != "mps":
+        # _submit_request awaits _ensure_started before calling us, so
+        # _runtime is set by here.
+        if self._runtime.device.type != "mps":
+            return
+        # Greedy decoding (``temperature == 0``) hits the scheduler's
+        # ``torch.argmax`` short-circuit and never reaches the fused
+        # MPS sampler — top_p is irrelevant. ``detect`` / ``point`` /
+        # ``segment`` defaults sit here, so warning would be noise.
+        if temperature <= 0.0:
             return
         if (
             temperature <= self._MPS_SAMPLER_TEMP_MAX
