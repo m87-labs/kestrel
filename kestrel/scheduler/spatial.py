@@ -11,7 +11,7 @@ from kestrel.moondream.region import (
     spatial_decode_logits,
 )
 from kestrel.scheduler.types import GenerationRequest
-from .sampling import sample_tokens
+from kestrel_kernels.sampling import sample_step_from_logits
 
 
 def compute_spatial_values(
@@ -67,7 +67,7 @@ def compute_spatial_values(
         height_bins = torch.argmax(height_logits, dim=-1)
     else:
         assert temperatures is not None and top_ps is not None
-        coord_bins_raw = sample_tokens(
+        coord_bins_raw = sample_step_from_logits(
             coord_logits, temperatures, top_ps, generator=rng
         )
         # Ensure long dtype for indexing
@@ -77,7 +77,7 @@ def compute_spatial_values(
             coord_bins = coord_bins_raw.to(torch.long)
 
         logits_2 = torch.cat((width_logits, height_logits), dim=0)
-        bins_2_raw = sample_tokens(
+        bins_2_raw = sample_step_from_logits(
             logits_2,
             temperatures.repeat(2),
             top_ps.repeat(2),
