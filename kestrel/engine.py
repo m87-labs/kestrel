@@ -88,6 +88,11 @@ from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 
 _LOGGER = logging.getLogger(__name__)
+
+# PR landing this warning + the kernel envelope it documents. Update if
+# the canonical docs move.
+_MPS_SAMPLER_DOCS_URL = "https://github.com/m87-labs/kestrel/pull/33"
+
 _DEFAULT_API_BASE_URL = "https://api.moondream.ai"
 _ALLOWED_API_BASE_URLS = (
     "https://api-staging.moondream.ai",
@@ -942,6 +947,9 @@ class InferenceEngine:
 
         prompt_str = self._extract_prompt_text(skill_spec, request_context)
         tokens = list(skill_spec.build_prompt_tokens(self.runtime, request_context))
+        norm_temperature = self._normalize_temperature(temperature)
+        norm_top_p = self._normalize_top_p(top_p)
+        self._warn_if_outside_mps_sampler_envelope(norm_temperature, norm_top_p)
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt_str,
@@ -949,8 +957,8 @@ class InferenceEngine:
             image=image_obj,
             image_hash=None,  # Computed in scheduler thread if prefix cache enabled
             max_new_tokens=max_new_tokens,
-            temperature=self._normalize_temperature(temperature),
-            top_p=self._normalize_top_p(top_p),
+            temperature=norm_temperature,
+            top_p=norm_top_p,
             submitted_at=time.perf_counter(),
             future=future,
             stream_queue=stream_queue,
@@ -997,6 +1005,41 @@ class InferenceEngine:
         if top_p <= 0.0 or top_p > 1.0:
             raise ValueError("top_p must be in the range (0, 1]")
         return top_p
+
+    # Settings outside this envelope cause the MPS fused sampler to
+    # silently bias outputs (top-K=64 may not span the nucleus). Logged
+    # once per (temperature, top_p) tuple seen so a chat session with
+    # a warm prompt doesn't spam.
+    _MPS_SAMPLER_TOP_P_MAX = 0.95
+    _MPS_SAMPLER_TEMP_MAX = 1.0
+    _mps_sampler_warned: set[Tuple[float, float]] = set()
+
+    def _warn_if_outside_mps_sampler_envelope(
+        self, temperature: float, top_p: float,
+    ) -> None:
+        runtime = self._runtime
+        if runtime is None or runtime.device.type != "mps":
+            return
+        if (
+            temperature <= self._MPS_SAMPLER_TEMP_MAX
+            and top_p <= self._MPS_SAMPLER_TOP_P_MAX
+        ):
+            return
+        key = (temperature, top_p)
+        if key in self._mps_sampler_warned:
+            return
+        self._mps_sampler_warned.add(key)
+        _LOGGER.warning(
+            "MPS sampler may produce biased outputs for "
+            "temperature=%.3g, top_p=%.3g. The fused Metal kernel only "
+            "inspects the top-K=64 candidates and is calibrated for "
+            "top_p ≤ %.2f / temperature ≤ %.1f; settings outside that "
+            "envelope can sample from a truncated nucleus. See %s for "
+            "details.",
+            temperature, top_p,
+            self._MPS_SAMPLER_TOP_P_MAX, self._MPS_SAMPLER_TEMP_MAX,
+            _MPS_SAMPLER_DOCS_URL,
+        )
 
     def _normalize_adapter_id(self, value: Optional[str]) -> Optional[str]:
         if value is None:
