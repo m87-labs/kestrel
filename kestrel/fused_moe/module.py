@@ -315,8 +315,8 @@ def _prepare_moe_forward(
     down_scale: torch.Tensor | None = None,
     persistent_up_out: bool = False,
 ) -> _PreparedMoEForward:
-    if hidden_states.device.type != "cuda":
-        raise ValueError("Fused MoE backend only supports CUDA tensors")
+    if hidden_states.device.type not in ("cuda", "mps"):
+        raise ValueError("Fused MoE backend only supports CUDA or MPS tensors")
     if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("Fused MoE backend requires fp16/bf16/fp32 inputs")
     if up_weight.device != hidden_states.device:
