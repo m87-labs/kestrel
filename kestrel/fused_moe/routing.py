@@ -29,8 +29,8 @@ def moe_align_block_size(
     """
     if not isinstance(topk_ids, torch.Tensor):
         raise TypeError("topk_ids must be a torch.Tensor")
-    if topk_ids.device.type != "cuda":
-        raise ValueError("topk_ids must be a CUDA tensor")
+    if topk_ids.device.type not in ("cuda", "mps"):
+        raise ValueError("topk_ids must be a CUDA or MPS tensor")
     if topk_ids.dtype != torch.int32:
         raise ValueError("topk_ids must be int32")
     if topk_ids.ndim != 2:

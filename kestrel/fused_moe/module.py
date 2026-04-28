@@ -506,6 +506,14 @@ def _invoke_fused_moe_kernel(
     a_fp8_bits: torch.Tensor | None = None,
     a_fp8_scale: torch.Tensor | None = None,
 ) -> None:
+    # MPS doesn't quantize activations — A stays in bf16/fp16. The
+    # CUDA caller pre-quantizes A to FP8 (filling a_fp8_bits and
+    # a_fp8_scale) for the cute / triton fp8 GEMMs, but those buffers
+    # are unused on MPS and the MPS dispatch raises if they're passed
+    # in. Drop them at the boundary.
+    if A.device.type == "mps":
+        a_fp8_bits = None
+        a_fp8_scale = None
     _MOE.invoke_moe_gemm(
         A, B, C,
         B_scale=B_scale,
@@ -557,8 +565,18 @@ def _run_moe_activation(
         device=prepared.hidden_states.device,
         dtype=prepared.hidden_states.dtype,
     )
-    if activation_in.dtype != torch.bfloat16:
-        raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
+    # bf16 is the canonical FP8-MoE activation dtype on CUDA. On MPS we
+    # also accept fp16 (the kernel's fp16 operand path is faster than
+    # bf16 on Apple Silicon).
+    is_mps = activation_in.device.type == "mps"
+    if not (
+        activation_in.dtype == torch.bfloat16
+        or (is_mps and activation_in.dtype == torch.float16)
+    ):
+        raise ValueError(
+            f"MoE activation expects bfloat16 (or float16 on MPS); "
+            f"got {activation_in.dtype}"
+        )
     _MOE.gelu_residual_cute(activation_out, activation_in)
     return activation_out
 
@@ -780,8 +798,15 @@ class FusedMoEModule(nn.Module):
             and single_lora_id is None
         )
         lora_stream = lora_workspace.stream if use_batched_lora else None
-        compute_stream = torch.cuda.current_stream()
-        use_lora_stream = lora_stream is not None and lora_stream != compute_stream
+        # CUDA-only: stream coordination is meaningless on MPS (single
+        # implicit stream). LoRA isn't supported on MPS anyway, so we'd
+        # never enter the LoRA branches here.
+        if hidden_states.device.type == "cuda":
+            compute_stream = torch.cuda.current_stream()
+            use_lora_stream = lora_stream is not None and lora_stream != compute_stream
+        else:
+            compute_stream = None
+            use_lora_stream = False
 
         is_prefill = use_single_lora
         lora_shrink_cfg = (
