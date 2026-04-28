@@ -315,8 +315,8 @@ def _prepare_moe_forward(
     down_scale: torch.Tensor | None = None,
     persistent_up_out: bool = False,
 ) -> _PreparedMoEForward:
-    if hidden_states.device.type != "cuda":
-        raise ValueError("Fused MoE backend only supports CUDA tensors")
+    if hidden_states.device.type not in ("cuda", "mps"):
+        raise ValueError("Fused MoE backend only supports CUDA or MPS tensors")
     if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("Fused MoE backend requires fp16/bf16/fp32 inputs")
     if up_weight.device != hidden_states.device:
@@ -334,8 +334,22 @@ def _prepare_moe_forward(
         raise ValueError("Up and down expert weights must use the same dtype scheme")
 
     if up_is_fp8w:
-        if hidden_states.dtype != torch.bfloat16:
-            raise ValueError("FP8-weight MoE currently requires bfloat16 hidden states")
+        # Allow fp16 hidden states on MPS — the Metal FP8 MoE kernel
+        # ships both bf16 and fp16 operand variants (Apple Silicon's
+        # matmul throughput is consistently higher in fp16, and the
+        # FP8 e4m3 → fp16 decode is the cheaper path). CUDA stays
+        # bf16-only since the cute / triton fp8 kernels don't have
+        # an fp16 dispatch.
+        is_mps = hidden_states.device.type == "mps"
+        if hidden_states.dtype == torch.bfloat16:
+            pass
+        elif is_mps and hidden_states.dtype == torch.float16:
+            pass
+        else:
+            raise ValueError(
+                "FP8-weight MoE requires bfloat16 hidden states (or "
+                "float16 on MPS); got {}".format(hidden_states.dtype)
+            )
         if up_scale is None or down_scale is None:
             raise ValueError("FP8-weight experts must define scale tensors")
         if up_scale.device != hidden_states.device:
@@ -492,6 +506,14 @@ def _invoke_fused_moe_kernel(
     a_fp8_bits: torch.Tensor | None = None,
     a_fp8_scale: torch.Tensor | None = None,
 ) -> None:
+    # MPS doesn't quantize activations — A stays in bf16/fp16. The
+    # CUDA caller pre-quantizes A to FP8 (filling a_fp8_bits and
+    # a_fp8_scale) for the cute / triton fp8 GEMMs, but those buffers
+    # are unused on MPS and the MPS dispatch raises if they're passed
+    # in. Drop them at the boundary.
+    if A.device.type == "mps":
+        a_fp8_bits = None
+        a_fp8_scale = None
     _MOE.invoke_moe_gemm(
         A, B, C,
         B_scale=B_scale,
@@ -543,8 +565,18 @@ def _run_moe_activation(
         device=prepared.hidden_states.device,
         dtype=prepared.hidden_states.dtype,
     )
-    if activation_in.dtype != torch.bfloat16:
-        raise ValueError(f"MoE activation expects bfloat16, got {activation_in.dtype}")
+    # bf16 is the canonical FP8-MoE activation dtype on CUDA. On MPS we
+    # also accept fp16 (the kernel's fp16 operand path is faster than
+    # bf16 on Apple Silicon).
+    is_mps = activation_in.device.type == "mps"
+    if not (
+        activation_in.dtype == torch.bfloat16
+        or (is_mps and activation_in.dtype == torch.float16)
+    ):
+        raise ValueError(
+            f"MoE activation expects bfloat16 (or float16 on MPS); "
+            f"got {activation_in.dtype}"
+        )
     _MOE.gelu_residual_cute(activation_out, activation_in)
     return activation_out
 
@@ -766,8 +798,15 @@ class FusedMoEModule(nn.Module):
             and single_lora_id is None
         )
         lora_stream = lora_workspace.stream if use_batched_lora else None
-        compute_stream = torch.cuda.current_stream()
-        use_lora_stream = lora_stream is not None and lora_stream != compute_stream
+        # CUDA-only: stream coordination is meaningless on MPS (single
+        # implicit stream). LoRA isn't supported on MPS anyway, so we'd
+        # never enter the LoRA branches here.
+        if hidden_states.device.type == "cuda":
+            compute_stream = torch.cuda.current_stream()
+            use_lora_stream = lora_stream is not None and lora_stream != compute_stream
+        else:
+            compute_stream = None
+            use_lora_stream = False
 
         is_prefill = use_single_lora
         lora_shrink_cfg = (
