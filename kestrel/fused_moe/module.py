@@ -334,8 +334,22 @@ def _prepare_moe_forward(
         raise ValueError("Up and down expert weights must use the same dtype scheme")
 
     if up_is_fp8w:
-        if hidden_states.dtype != torch.bfloat16:
-            raise ValueError("FP8-weight MoE currently requires bfloat16 hidden states")
+        # Allow fp16 hidden states on MPS — the Metal FP8 MoE kernel
+        # ships both bf16 and fp16 operand variants (Apple Silicon's
+        # matmul throughput is consistently higher in fp16, and the
+        # FP8 e4m3 → fp16 decode is the cheaper path). CUDA stays
+        # bf16-only since the cute / triton fp8 kernels don't have
+        # an fp16 dispatch.
+        is_mps = hidden_states.device.type == "mps"
+        if hidden_states.dtype == torch.bfloat16:
+            pass
+        elif is_mps and hidden_states.dtype == torch.float16:
+            pass
+        else:
+            raise ValueError(
+                "FP8-weight MoE requires bfloat16 hidden states (or "
+                "float16 on MPS); got {}".format(hidden_states.dtype)
+            )
         if up_scale is None or down_scale is None:
             raise ValueError("FP8-weight experts must define scale tensors")
         if up_scale.device != hidden_states.device:
