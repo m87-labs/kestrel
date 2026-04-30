@@ -16,12 +16,14 @@ _KV_CACHE_PAGES_LARGE_VRAM = 65536
 # upfront; on a 16 GB Mac, 65536 pages is ~12.6 GB at the BF16 MD2 page
 # size — leaves no room for the model + activations and forces every
 # inference into swap. Tier by total system memory (we don't have a
-# separate VRAM number on unified-memory Macs).
+# separate VRAM number on unified-memory Macs). Ceilings are exclusive
+# of the next SKU on either side: 18 covers 16 GB, 34 covers 24/32 GB
+# (excludes 36), 70 covers 36/48/64 GB.
 _MPS_PAGES_BY_TOTAL_GIB = (
     # (total_gib_ceiling, pages)
     (18, 4096),    # base 16 GB Macs (M1/M2/M3/M4)
-    (36, 16384),   # 24 / 32 GB tier (Pro chips)
-    (72, 32768),   # 36 / 48 / 64 GB tier
+    (34, 16384),   # 24 / 32 GB tier (Pro chips)
+    (70, 32768),   # 36 / 48 / 64 GB tier
     (None, 65536), # 96+ GB Ultra
 )
 _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -30,21 +32,21 @@ _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 def _mps_total_memory_bytes() -> int | None:
     """Best-effort total unified memory on Apple Silicon.
 
-    Falls through to ``hw.memsize`` via sysctl if torch's MPS API
-    doesn't expose it. Returns ``None`` if neither is available.
+    Prefers ``sysctl hw.memsize`` because it returns the *physical*
+    memory size, which is what we tier against. Falls back to
+    ``torch.mps.recommended_max_memory()`` (which returns Apple's
+    suggested *working-set* size, typically ~75 % of total — fine for
+    a coarse tier when sysctl is unavailable).
     """
-    try:
-        # Available on PyTorch 2.x on macOS arm64. Returns the
-        # recommended working-set size for the MPS device, which is
-        # tied to total system memory.
-        return int(torch.mps.recommended_max_memory())
-    except (AttributeError, RuntimeError):
-        pass
     try:
         import subprocess
         out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=2)
         return int(out.strip())
     except Exception:
+        pass
+    try:
+        return int(torch.mps.recommended_max_memory())
+    except (AttributeError, RuntimeError):
         return None
 
 
