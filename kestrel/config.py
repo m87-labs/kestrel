@@ -1,9 +1,11 @@
 """Runtime configuration objects for the Kestrel inference engine."""
 
 
+import os
+import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-import re
 
 import torch
 
@@ -109,6 +111,29 @@ class RuntimeConfig:
         self.service_name = normalized_service_name or "local"
         if not _SERVICE_NAME_PATTERN.fullmatch(self.service_name):
             raise ValueError("service_name must match [A-Za-z0-9_-]+")
+
+        # MPS multi-batch is currently unsafe: at max_batch_size > 1 with
+        # 2+ active slots, attention/KV-cache cross-slot interference
+        # produces silently corrupted token streams (verified on M4 base
+        # 16 GB, MD2; B=1 clean, B≥2 garbage from token 0). The bug is
+        # not in any shipped Metal kernel — it lives in the scheduler /
+        # paged-attention fallback layer at B>1. Until that's fixed,
+        # clamp max_batch_size to 1 on MPS so callers don't see corrupted
+        # output. Set ``KESTREL_MPS_ALLOW_BATCH=1`` to opt out (e.g. for
+        # debugging the bug itself).
+        if (
+            self.resolved_device().type == "mps"
+            and self.max_batch_size > 1
+            and os.environ.get("KESTREL_MPS_ALLOW_BATCH") != "1"
+        ):
+            warnings.warn(
+                f"MPS multi-batch (max_batch_size={self.max_batch_size}) "
+                "produces corrupted output at B>1 with 2+ active slots; "
+                "clamping to 1. Set KESTREL_MPS_ALLOW_BATCH=1 to override.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.max_batch_size = 1
 
         if self.kv_cache_pages is None:
             self.kv_cache_pages = _default_kv_cache_pages_for_device(self.device)
