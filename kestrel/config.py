@@ -11,12 +11,58 @@ import torch
 _SMALL_VRAM_THRESHOLD_BYTES = 24 * 1024**3
 _KV_CACHE_PAGES_SMALL_VRAM = 16384
 _KV_CACHE_PAGES_LARGE_VRAM = 65536
+
+# Apple Silicon unified-memory tiers. The KV cache is statically allocated
+# upfront; on a 16 GB Mac, 65536 pages is ~12.6 GB at the BF16 MD2 page
+# size — leaves no room for the model + activations and forces every
+# inference into swap. Tier by total system memory (we don't have a
+# separate VRAM number on unified-memory Macs).
+_MPS_PAGES_BY_TOTAL_GIB = (
+    # (total_gib_ceiling, pages)
+    (18, 4096),    # base 16 GB Macs (M1/M2/M3/M4)
+    (36, 16384),   # 24 / 32 GB tier (Pro chips)
+    (72, 32768),   # 36 / 48 / 64 GB tier
+    (None, 65536), # 96+ GB Ultra
+)
 _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _mps_total_memory_bytes() -> int | None:
+    """Best-effort total unified memory on Apple Silicon.
+
+    Falls through to ``hw.memsize`` via sysctl if torch's MPS API
+    doesn't expose it. Returns ``None`` if neither is available.
+    """
+    try:
+        # Available on PyTorch 2.x on macOS arm64. Returns the
+        # recommended working-set size for the MPS device, which is
+        # tied to total system memory.
+        return int(torch.mps.recommended_max_memory())
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        import subprocess
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=2)
+        return int(out.strip())
+    except Exception:
+        return None
+
+
 def _default_kv_cache_pages_for_device(device: str) -> int:
-    """Choose a KV-cache default from the device's total VRAM size."""
+    """Choose a KV-cache default from the device's total memory."""
     torch_device = torch.device(device)
+    if torch_device.type == "mps":
+        total = _mps_total_memory_bytes()
+        if total is None:
+            # Conservative: any unknown MPS device is treated as the
+            # smallest tier — better to under-allocate than swap-thrash.
+            return _MPS_PAGES_BY_TOTAL_GIB[0][1]
+        total_gib = total / (1024**3)
+        for ceiling, pages in _MPS_PAGES_BY_TOTAL_GIB:
+            if ceiling is None or total_gib <= ceiling:
+                return pages
+        return _MPS_PAGES_BY_TOTAL_GIB[-1][1]
+
     if torch_device.type != "cuda" or not torch.cuda.is_available():
         return _KV_CACHE_PAGES_LARGE_VRAM
 
@@ -45,8 +91,10 @@ class RuntimeConfig:
     # Effective batch size (excluding reserved batch_idx 0).
     max_batch_size: int = 4
     page_size: int = 1
-    # Auto-select based on VRAM when not provided:
-    # <=24 GiB -> 16384 pages, otherwise 65536 pages.
+    # Auto-select based on device memory when not provided.
+    # CUDA: <=24 GiB -> 16384 pages, otherwise 65536 pages.
+    # MPS:  tiered by total unified memory (4096 / 16384 / 32768 / 65536
+    # for 16 / 32 / 64 / 96+ GiB Macs).
     kv_cache_pages: int | None = None
     enable_cuda_graphs: bool = True
     enable_prefix_cache: bool = True
