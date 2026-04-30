@@ -106,8 +106,6 @@ Throughput and latency for the `query` skill, measured on the [ChartQA](https://
 
 ## A10
 
-Moondream 3 is not yet supported on Ampere GPUs and currently requires `sm89+`, so Ampere results below reflect Moondream 2 only.
-
 ### Moondream 2
 
 | Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
@@ -116,6 +114,16 @@ Moondream 3 is not yet supported on Ampere GPUs and currently requires `sm89+`, 
 | 4 | 9.50 | 476.18 | 5.55 | 794.47 |
 | 16 | 9.92 | 968.36 | 7.89 | 1577.98 |
 | 64 | 7.09 | 1773.80 | 5.03 | 2169.64 |
+
+### Moondream 3
+
+| Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
+|-----------|---------------|----------------|-------------|--------------|
+| 1 | 4.45 | 401.75 | 2.12 | 852.00 |
+| 4 | 5.06 | 848.61 | 2.64 | 1704.66 |
+| 16 | 5.55 | 1802.29 | 3.57 | 3586.76 |
+| 64 | 4.12 | 3166.18 | 2.63 | 4228.46 |
+
 ## L4
 
 ### Moondream 2
