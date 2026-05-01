@@ -6,7 +6,7 @@ High-performance inference engine for the [Moondream](https://moondream.ai) visi
 
 Kestrel is the inference engine behind [Photon](https://moondream.ai/p/photon), Moondream's on-device deployment option. Most users should install via `pip install moondream` — this repo is the internal engine for those who need direct access.
 
-Kestrel provides async, micro-batched inference with streaming support, paged KV caching, and optimized CUDA kernels. It's designed for production deployments where throughput and latency matter.
+Kestrel provides async, micro-batched inference with streaming support, paged KV caching, and optimized CUDA and Metal kernels. It's designed for production deployments where throughput and latency matter.
 
 ## Features
 
@@ -19,8 +19,13 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 
 ## Requirements
 
-- Python 3.10+
-- NVIDIA GPU with optimized kernels for SM80 (A100), SM86 (A40, A10, RTX 3090), SM87 (Jetson Orin), SM89 (L4, L40S), SM90 (H100, H200, GH200). Other GPUs may work but have not been tested.
+- Python 3.10+ (3.12 on macOS arm64).
+- One of:
+  - **NVIDIA GPU** on Linux x86_64 / aarch64 or Windows x86_64. Optimized kernels for
+    SM80 (A100), SM86 (A10, RTX 30-series), SM87 (Jetson Orin), SM89 (L4, L40S, RTX 4090),
+    SM90 (H100, H200, GH200), SM100 (B200), SM110 (Jetson Thor), SM120 (RTX PRO 6000).
+    Other CUDA GPUs may work but have not been tested.
+  - **Apple Silicon Mac** (M-series) on macOS 13 (Ventura) or later, with native Metal kernels.
 - `MOONDREAM_API_KEY` environment variable or `api_key` parameter (get a key from [moondream.ai](https://moondream.ai))
 
 ## Installation
@@ -29,7 +34,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 pip install kestrel
 ```
 
-For Jetson Orin, see the [Jetson setup guide](docs/jetson.md).
+For Jetson Orin (JetPack 6) or Jetson Thor (JetPack 7), see the [Jetson setup guide](docs/jetson.md).
 
 ## Model Access
 

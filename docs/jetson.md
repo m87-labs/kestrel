@@ -1,16 +1,29 @@
 # Jetson Setup Guide
 
-Kestrel supports NVIDIA Jetson Orin (AGX Orin, Orin NX) with JetPack 6.0, 6.1, or 6.2.
+Kestrel supports two Jetson families on aarch64 Linux:
 
-## Prerequisites
+- **Jetson AGX Orin / Orin NX** (sm_87) on **JetPack 6** (6.0, 6.1, 6.2).
+- **Jetson AGX Thor** (sm_110) on **JetPack 7**.
 
-- Jetson Orin with JetPack 6.x flashed
-- Python 3.10
-- CUDA runtime (included with JetPack)
+The kestrel-kernels wheel is a single multi-CUDA aarch64 build that
+covers both — a cu12 codepath dispatches on JetPack 6 (Orin) and a
+cu13 codepath dispatches on JetPack 7 (Thor). The `pip install`
+command is the same on either device.
 
-## Install PyTorch
+---
 
-Jetson requires NVIDIA's custom PyTorch wheels. Install the version matching your JetPack release.
+## Jetson AGX Orin / Orin NX (JetPack 6)
+
+### Prerequisites
+
+- Jetson Orin device with JetPack 6.x flashed.
+- Python 3.10 (matches NVIDIA's JetPack 6 PyTorch wheel).
+- CUDA runtime included with JetPack.
+
+### Install PyTorch
+
+JetPack 6 ships an old CUDA 12.x and requires NVIDIA's custom PyTorch
+wheel (PyPI's stock aarch64 torch wheels target newer CUDA):
 
 **JetPack 6.1 / 6.2:**
 ```bash
@@ -22,72 +35,114 @@ pip install https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/
 pip install https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+07cecf4168.nv24.05.14710581-cp310-cp310-linux_aarch64.whl
 ```
 
-If using `uv`, set `UV_SKIP_WHEEL_FILENAME_CHECK=1` — NVIDIA's wheel filenames
-contain a build identifier that doesn't match the internal metadata.
+If using `uv`, set `UV_SKIP_WHEEL_FILENAME_CHECK=1` — NVIDIA's wheel
+filenames contain a build identifier that doesn't match the internal
+metadata.
 
-## Install Kestrel
-
-After PyTorch is installed, install Kestrel itself:
+### Install Kestrel
 
 ```bash
-# pip
 pip install "numpy<2" kestrel
-
-# uv
-uv pip install "numpy<2" kestrel
 ```
 
-The current Jetson PyTorch wheels are still built against NumPy 1.x, so
-installing `numpy<2` avoids the compatibility warning emitted by `import torch`.
+JetPack 6's PyTorch wheel is built against NumPy 1.x, so installing
+`numpy<2` avoids the import-time compatibility warning.
 
-## Set `LD_LIBRARY_PATH`
+### Set `LD_LIBRARY_PATH`
 
-NVIDIA's Jetson PyTorch wheel needs the JetPack CUDA libraries on the library
-path. If `import torch` fails with errors about missing `libnvToolsExt.so.1`,
-`libcublas.so`, or `libcupti.so`, set `LD_LIBRARY_PATH` to include the CUDA
-library directory:
+JetPack 6's PyTorch wheel loads CUDA libraries from the system
+JetPack install. If `import torch` fails with errors about missing
+`libnvToolsExt.so.1`, `libcublas.so`, or `libcupti.so`, add the
+JetPack CUDA library directories to `LD_LIBRARY_PATH`:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/targets/aarch64-linux/lib:$LD_LIBRARY_PATH
 ```
 
-If you still see errors about `libcupti.so` or `libnvToolsExt.so`, you may need
-to install additional CUDA packages:
+If you still see errors about `libcupti.so` or `libnvToolsExt.so`,
+install the missing CUDA packages:
 
 ```bash
 sudo apt install cuda-cupti-12-6 libnvtoolsext1
 ```
 
-If `import torch` fails with `libcusparseLt.so.0`, install cuSPARSELt for your
-JetPack/CUDA version and add its `lib` directory to `LD_LIBRARY_PATH` as well.
-On some pre-provisioned Jetson machines this may live in a user-local path
-rather than under `/usr/local/cuda`.
+If `import torch` fails with `libcusparseLt.so.0`, install cuSPARSELt
+for your JetPack/CUDA version and add its `lib` directory to
+`LD_LIBRARY_PATH` as well. On some pre-provisioned Jetson machines
+this lives in a user-local path rather than under `/usr/local/cuda`.
 
-You may want to add this to your shell profile (`~/.bashrc` or similar) so it
-persists across sessions.
+You may want to add the `LD_LIBRARY_PATH` export to your shell
+profile (`~/.bashrc` or similar) so it persists across sessions.
+
+---
+
+## Jetson AGX Thor (JetPack 7)
+
+### Prerequisites
+
+- Jetson Thor device with JetPack 7 flashed.
+- Python 3.12 (matches JetPack 7's system Python).
+
+### Install Kestrel
+
+JetPack 7 ships CUDA 13, which the standard PyPI PyTorch aarch64
+wheel targets — no custom NVIDIA wheel needed:
+
+```bash
+pip install kestrel
+```
+
+This pulls in PyTorch 2.x for aarch64 along with the `nvidia-*-cu13`
+runtime packages it depends on.
+
+### Set `LD_LIBRARY_PATH`
+
+PyTorch on Thor loads CUDA libraries from the pip-installed
+`nvidia-*-cu13` packages and `nvpl` (NVIDIA Performance Libraries —
+BLAS / LAPACK / FFT for aarch64). Both live under your venv's
+site-packages, not `/usr/local/cuda`. Point `LD_LIBRARY_PATH` at the
+venv directories:
+
+```bash
+SP=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+LIBS=$(find "$SP" -maxdepth 4 -type d -name lib 2>/dev/null \
+       | grep -E '/(nvidia|nvpl)/' | tr '\n' ':' | sed 's/:$//')
+export LD_LIBRARY_PATH="$LIBS:$LD_LIBRARY_PATH"
+```
+
+(Add the export to your shell profile so it persists across sessions.)
+
+If `import torch` then fails with a `libcudnn.so.9` or
+`libnvpl_lapack_lp64_gomp.so.0` error, double-check that the `find`
+command picked up both `nvidia/cudnn/lib/` and `nvpl/lib/`.
+
+---
 
 ## Verify
 
-```bash
-python3 -c "import torch; print(torch.__version__); import kestrel; print('kestrel OK')"
-```
-
-## Benchmarking
-
-For reproducible benchmark numbers on Orin, make sure the board is in its
-uncapped power mode and pin clocks before running benchmarks:
+On either device:
 
 ```bash
-sudo nvpmodel -q
-sudo jetson_clocks
-sudo jetson_clocks --show
+python3 -c "
+import torch
+print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
+print('device', torch.cuda.get_device_name(0))
+import kestrel
+print('kestrel OK')
+"
 ```
 
-If `nvpmodel -q` does not report `MAXN`, switch the board to its MAXN mode
-before benchmarking.
+Expect `cuda True` and `device NVIDIA Thor` (or `Orin`).
+
+---
 
 ## Notes
 
-- Only Python 3.10 is supported on Jetson (matching NVIDIA's torch wheel).
-- `nvcc` is not required at runtime.
-- Triton (the compiler, not Triton Inference Server) is optional and not available on aarch64 — Kestrel automatically falls back to pure PyTorch implementations where needed.
+- **Python**: JetPack 6 (Orin) is Python 3.10 — matches NVIDIA's torch
+  wheel. JetPack 7 (Thor) is Python 3.12 — matches the system Python
+  and the standard PyPI torch wheel.
+- **Triton** (the compiler, not Triton Inference Server) isn't packaged
+  for aarch64. Kestrel detects this at import and proceeds without
+  LoRA support; base inference for Moondream 2 / Moondream 3 is
+  unaffected.
+- **`nvcc`** is not required at runtime on either device.
