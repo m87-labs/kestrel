@@ -19,7 +19,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 
 ## Requirements
 
-- Python 3.10+ (3.12 on macOS arm64).
+- Python 3.10–3.14.
 - One of:
   - **NVIDIA GPU** on Linux x86_64 / aarch64 or Windows x86_64. Optimized kernels for
     SM80 (A100), SM86 (A10, RTX 30-series), SM87 (Jetson Orin), SM89 (L4, L40S, RTX 4090),
