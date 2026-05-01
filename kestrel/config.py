@@ -110,6 +110,8 @@ class RuntimeConfig:
         if not _SERVICE_NAME_PATTERN.fullmatch(self.service_name):
             raise ValueError("service_name must match [A-Za-z0-9_-]+")
 
+        self._validate_device_available()
+
         if self.kv_cache_pages is None:
             self.kv_cache_pages = _default_kv_cache_pages_for_device(self.device)
         elif self.kv_cache_pages <= 0:
@@ -145,6 +147,37 @@ class RuntimeConfig:
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         return device
+
+    def _validate_device_available(self) -> None:
+        """Raise a clear error if the requested device isn't usable.
+
+        The most common pitfall is the default CUDA path on a system
+        where PyTorch was installed without CUDA support (the CPU-only
+        wheel). Without this check, callers see a raw torch traceback
+        ('AssertionError: Torch not compiled with CUDA enabled') from
+        deep inside engine init, with no remediation guidance.
+        """
+        torch_device = torch.device(self.device)
+        if torch_device.type != "cuda":
+            return
+        if torch.cuda.is_available():
+            return
+        if not torch.backends.cuda.is_built():
+            raise RuntimeError(
+                "Photon needs PyTorch built with CUDA support, but the "
+                "installed PyTorch is CPU-only. Reinstall from the "
+                "default PyPI index — its torch wheels include CUDA on "
+                "Linux x86_64 and Windows:\n"
+                "\n"
+                "    pip install --force-reinstall torch\n"
+                "\n"
+                "If your environment is pinned to a CPU-only index "
+                "(e.g., https://download.pytorch.org/whl/cpu in pip.conf "
+                "or a constraints file), see "
+                "https://pytorch.org/get-started/locally/ for the right "
+                "install command. Verify the fix with: "
+                "`python -c 'import torch; print(torch.cuda.is_available())'`."
+            )
 
 
 __all__ = ["RuntimeConfig"]
