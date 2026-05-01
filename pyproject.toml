@@ -18,12 +18,20 @@ dependencies = [
 ]
 
 [tool.uv]
-# kestrel-kernels ships pre-built wheels for Linux x86_64 / aarch64 + Windows
-# x86_64 across Python 3.10–3.13, but only cp312 on macOS arm64 (built against
-# the macos-14 GitHub runner so the wheel tag is ``macosx_14_0_arm64``).
-# Scope uv's environment universe to the combinations that have a wheel —
-# without this, ``uv sync`` on macOS arm64 with Python 3.10/3.11/3.13 (or on
-# macOS x86_64) errors with "no compatible distribution".
+# kestrel-kernels ships wheels for:
+#   Linux x86_64 / aarch64       — Python 3.10–3.13
+#   Windows AMD64                — Python 3.10–3.13
+#   macOS arm64                  — Python 3.12 only (CI builds on the
+#                                  macos-14 runner so the wheel tag is
+#                                  ``macosx_14_0_arm64``)
+# Scope uv's environment universe to those, so unsupported combos
+# (macOS arm64 on Python 3.10/3.11/3.13, macOS x86_64) fail fast at
+# ``uv sync`` with "platform not compatible" instead of late with "no
+# compatible distribution". Marker-level ``platform_machine`` /
+# ``platform_release`` constraints would tighten this further but
+# collide with uv's default ``--python-platform`` glibc and
+# platform-tag conventions in the dry-run, so we accept the OS-level
+# scope as the practical floor.
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'win32'",
