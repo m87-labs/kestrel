@@ -25,6 +25,11 @@ from .lora_workspace import TextLoRAWorkspace
 from .rope import precompute_freqs_cis
 from ..dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
+from kestrel_kernels.fused_mlp import (
+    fused_mlp_gelu_bias_residual_into,
+    FusedMLPWorkspaces,
+    preallocate_fused_mlp_workspaces as _kk_preallocate_fused_mlp_workspaces,
+)
 
 _KERNELS = get_runtime()
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
@@ -34,6 +39,29 @@ rotary_embedding = _KERNELS.rotary.rotary_embedding
 _fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
 _kestrel_linear = _KERNELS.linear.linear
 _gelu_cute = _KERNELS.gelu.gelu_cute
+
+# Dedicated fused-MLP workspace for the text decoder. Distinct from the
+# vision encoder's workspace because the two use different `hidden_dim`
+# (text ff_dim vs vision enc_ff_dim) — pooling them shares storage but
+# wastes peak memory on the smaller call site.
+_TEXT_MLP_WORKSPACES = FusedMLPWorkspaces()
+
+
+def preallocate_text_mlp_workspaces(
+    *, max_num_tokens: int, hidden_dim: int, device, dtype
+) -> None:
+    """Pre-allocate the text-decoder fused-MLP hidden buffer to its
+    worst-case shape. Must be called once during engine setup, before any
+    CUDA-graph capture, with `max_num_tokens` ≥ the largest prefill batch
+    token count the scheduler can admit and `hidden_dim` = `text.ff_dim`.
+    """
+    _kk_preallocate_fused_mlp_workspaces(
+        max_num_tokens=max_num_tokens,
+        hidden_dim=hidden_dim,
+        device=device,
+        dtype=dtype,
+        workspaces=_TEXT_MLP_WORKSPACES,
+    )
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -245,6 +273,27 @@ def text_decoder(
                 single_lora_id=single_lora_id,
             )
         else:
+            dense_workspace = lora_workspace.dense_layer(i) if lora_workspace else None
+            if dense_workspace is None or lora_slot_ids is None:
+                # Fused path: fc1 + bias + GELU + fc2 + bias + residual in
+                # one cuBLAS-Lt call. Eliminates the standalone GELU kernel
+                # (~4% of GPU time on Thor chartqa) and the HBM round-trip
+                # for the fc1 output. LoRA path falls through to the
+                # unfused mlp() because it needs the intermediate fc1
+                # output in registers to add the LoRA delta.
+                fc1 = block.mlp["fc1"]
+                fc2 = block.mlp["fc2"]
+                next_x = torch.empty_like(x)
+                fused_mlp_gelu_bias_residual_into(
+                    x=x_norm,
+                    w1=fc1.weight, b1=fc1.bias,
+                    w2=fc2.weight, b2=fc2.bias,
+                    residual=x,
+                    out=next_x,
+                    workspaces=_TEXT_MLP_WORKSPACES,
+                )
+                x = next_x
+                continue
             mlp_weights = MLPWeights(
                 fc1=LinearWeights(
                     weight=block.mlp["fc1"].weight, bias=block.mlp["fc1"].bias
@@ -253,7 +302,6 @@ def text_decoder(
                     weight=block.mlp["fc2"].weight, bias=block.mlp["fc2"].bias
                 ),
             )
-            dense_workspace = lora_workspace.dense_layer(i) if lora_workspace else None
             mlp_out = mlp(
                 x_norm,
                 mlp_weights,

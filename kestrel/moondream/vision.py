@@ -11,7 +11,7 @@ import numpy as np
 from .config import VisionConfig
 from .image_crops import OverlapCropOutput, overlap_crop_image, reconstruct_from_crops
 from kestrel.utils.image import ensure_srgb
-from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
+from kestrel_kernels.fused_mlp import fused_mlp_gelu_bias_residual_into
 from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()

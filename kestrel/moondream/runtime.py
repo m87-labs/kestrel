@@ -1896,10 +1896,25 @@ class MoondreamRuntime:
         vision_cfg = self.config.vision
         patches_per_crop = (vision_cfg.crop_size // vision_cfg.enc_patch_size) ** 2
         max_vision_tokens = (vision_cfg.max_crops + 1) * patches_per_crop
-        from kestrel.ops.fused_mlp import preallocate_fused_mlp_workspaces
+        from kestrel_kernels.fused_mlp import preallocate_fused_mlp_workspaces
         preallocate_fused_mlp_workspaces(
             max_num_tokens=max_vision_tokens,
             hidden_dim=vision_cfg.enc_ff_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        # Text decoder MLP workspace (separate from vision since
+        # `text.ff_dim` and `vision.enc_ff_dim` differ; we want a tight
+        # pool per call site rather than the worst-case union).
+        from kestrel.moondream.text import preallocate_text_mlp_workspaces
+        # Worst-case prefill batch tokens: max_batch_size sequences each
+        # carrying up to max_seq_length-1 tokens. Capped at 32K to bound
+        # the buffer size on Moondream3 (max_seq_length=32768) — the
+        # `_HiddenBuffer` overflow check fires if a runtime call exceeds.
+        prefill_tokens_cap = min(self.max_batch_size * max_tokens, 32768)
+        preallocate_text_mlp_workspaces(
+            max_num_tokens=prefill_tokens_cap,
+            hidden_dim=self.config.text.ff_dim,
             device=self.device,
             dtype=self.dtype,
         )
