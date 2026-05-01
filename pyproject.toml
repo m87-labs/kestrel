@@ -13,7 +13,7 @@ dependencies = [
     "httpx>=0.27",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "kestrel-native==0.1.4",
-    "kestrel-kernels==0.2.1",
+    "kestrel-kernels==0.3.0",
     "huggingface-hub>=0.20",
 ]
 
