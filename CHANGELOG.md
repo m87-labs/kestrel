@@ -2,6 +2,106 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.3.0 — 2026-05-01
+
+The previous release of kestrel ran on NVIDIA Linux only, Ampere
+through Hopper. This release ships kestrel on four new platforms
+simultaneously — **Apple Silicon**, **Windows (NVIDIA)**, **NVIDIA
+Blackwell** (data-center and workstation), and **NVIDIA Jetson
+Thor** — and it makes every existing target faster.
+
+### Run on Apple Silicon
+
+Kestrel now runs on Apple M-series Macs from macOS 13 (Ventura)
+onward, on Python 3.12. `pip install kestrel` works on a stock
+Apple Silicon Mac with no NVIDIA CUDA and no Triton — full
+inference for both Moondream 2 and Moondream 3 against native
+Metal kernels for the entire decode path (paged attention, rotary,
+KV cache, MoE routing, sampling, layer norm). KV cache size
+auto-tunes to your machine's unified memory.
+
+Reference throughput (ChartQA, batch=4 direct mode):
+
+| Hardware                       | MD2 req/s | MD3 req/s |
+|--------------------------------|-----------|-----------|
+| MacBook Pro (M5 Max, 48 GB)    | 7.26      | 4.58      |
+| Mac mini (M2, 24 GB)           | 0.79      | 0.55      |
+| Mac mini (M4 base, 16 GB)      | 0.84      | —         |
+
+Full breakdown including batch=1/16 and CoT mode in `PERFORMANCE.md`.
+
+### Run on Windows
+
+Windows x86_64 is now a fully supported target — not just a
+packaging change. We rewrote kestrel's kernel-loading runtime to
+be cross-platform (MSVC compatibility, Windows DLL loading
+semantics through the C extension layer, library-naming abstraction
+across kestrel-kernels), so `pip install kestrel` on Python
+3.10–3.13 installs and runs natively on Windows: no Linux
+container, no WSL. Same CUDA kernels as Linux x86_64.
+
+### Run on Blackwell
+
+Both **B200** (data-center, sm_100) and **NVIDIA RTX PRO 6000**
+(workstation, sm_120) are now supported. B200 is the fastest
+hardware kestrel runs on:
+
+| Batch | Moondream 2 (req/s) | Moondream 3 (req/s) |
+|-------|---------------------|---------------------|
+| 1     | 44.16               | 33.38               |
+| 64    | 93.61               | 71.27               |
+
+That's **1.49× H100** at MD2 B=64 and **1.23× H100** at MD3 B=64.
+Behind those numbers: a Blackwell-tuned mixture-of-experts kernel
+running up to **1.77× faster than the prior Triton baseline**, plus
+dedicated Blackwell flash-attention kernels for both decode and
+prefill (no portable-fallback paths).
+
+RTX PRO 6000 hits 39.3 req/s (MD2) / 39.7 req/s (MD3) at B=64 —
+measurably faster than L40S on a workstation card.
+
+### Run on Jetson Thor
+
+NVIDIA Jetson AGX Thor 64 GB (sm_110) is supported on JetPack 7
+(CUDA 13 — required, since CUDA 12 can't target sm_110).
+kestrel-kernels now ships a **multi-CUDA aarch64 wheel** that
+bundles cu12 and cu13 builds, so the same install command works on
+Thor (uses cu13) and on JetPack 6 systems running Jetson Orin or
+GH200 (uses cu12).
+
+| Batch | Moondream 2 (req/s) | Moondream 3 (req/s) |
+|-------|---------------------|---------------------|
+| 1     | 6.58                | 6.80                |
+| 64    | 14.53               | 12.05               |
+
+### Faster on existing NVIDIA hardware
+
+- **Faster FP8 prefill on Ada and Jetson Orin** (the existing arches
+  most users running with FP8 KV cache are on). New native paged
+  flash-attention kernels — dense, paged, paged-varlen, and
+  paged-prefix prefill — replace the previous prefill codepaths,
+  visible end-to-end on L40S, RTX 4090, and Jetson Orin.
+- **MoE inference faster on every GPU**, with new native FP8 MoE
+  microkernels and per-card retunes (A100 SXM4 / 40 GB, A10 /
+  A10G, L4, RTX 6000).
+- **Lower per-call dispatch overhead** across every kestrel kernel
+  (flash attention, MoE, GELU, FP8 quantization, sampling, layer
+  norm). Most visible at low batch sizes, where per-step overhead
+  used to dominate.
+- **More consistent tail latency** on small-to-medium batches on
+  Ada, Blackwell, and RTX 6000.
+
+### Install matrix
+
+Kestrel and its dependencies ship binary wheels for:
+
+- Linux x86_64 — Python 3.10 – 3.13
+- Linux aarch64 — Python 3.10 – 3.13 (single multi-CUDA wheel
+  bundling cu12 + cu13: cu12 covers Jetson Orin / GH200 on
+  JetPack 6, cu13 covers Jetson Thor on JetPack 7)
+- Windows x86_64 — Python 3.10 – 3.13
+- macOS arm64 — Python 3.12
+
 ## 0.2.1 — 2026-03-25
 
 ### Performance
