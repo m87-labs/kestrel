@@ -384,6 +384,9 @@ class MoondreamRuntime:
         self.max_batch_size = cfg.max_batch_size
         self.max_batch_slots = cfg.max_batch_size + 2
         n_pages = cfg.kv_cache_pages
+        # Total in-flight token slots — used by `_preallocate_workspaces`
+        # to size the fused MLP hidden buffer to the scheduler-imposed cap.
+        self._kv_cache_total_tokens = n_pages * cfg.page_size
 
         # Create prefix cache if enabled
         self.prefix_cache: RadixPrefixCache | None = None
@@ -1906,14 +1909,14 @@ class MoondreamRuntime:
         # Text decoder MLP workspace (separate from vision since
         # `text.ff_dim` and `vision.enc_ff_dim` differ; we want a tight
         # pool per call site rather than the worst-case union).
+        # Worst-case prefill batch token count is bounded by total KV
+        # cache slots: the scheduler can't admit more in-flight tokens
+        # than the cache can hold. That gives a tight, model-config-
+        # independent bound (vs `max_batch_size * max_seq_length`, which
+        # blows up on long-context configs like Moondream3).
         from kestrel.moondream.text import preallocate_text_mlp_workspaces
-        # Worst-case prefill batch tokens: max_batch_size sequences each
-        # carrying up to max_seq_length-1 tokens. Capped at 32K to bound
-        # the buffer size on Moondream3 (max_seq_length=32768) — the
-        # `_HiddenBuffer` overflow check fires if a runtime call exceeds.
-        prefill_tokens_cap = min(self.max_batch_size * max_tokens, 32768)
         preallocate_text_mlp_workspaces(
-            max_num_tokens=prefill_tokens_cap,
+            max_num_tokens=self._kv_cache_total_tokens,
             hidden_dim=self.config.text.ff_dim,
             device=self.device,
             dtype=self.dtype,
