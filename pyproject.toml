@@ -17,6 +17,19 @@ dependencies = [
     "huggingface-hub>=0.20",
 ]
 
+[tool.uv]
+# kestrel-kernels ships pre-built wheels for Linux x86_64 / aarch64 + Windows
+# x86_64 across Python 3.10–3.13, but only cp312 on macOS arm64 (built against
+# the macos-14 GitHub runner so the wheel tag is ``macosx_14_0_arm64``).
+# Scope uv's environment universe to the combinations that have a wheel —
+# without this, ``uv sync`` on macOS arm64 with Python 3.10/3.11/3.13 (or on
+# macOS x86_64) errors with "no compatible distribution".
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and python_version == '3.12'",
+]
+
 [tool.setuptools.packages.find]
 include = ["kestrel", "kestrel.*"]
 exclude = ["tests", "tests.*"]
