@@ -87,8 +87,12 @@ def overlap_crop_image(
     # Resize for tiled crops using native Lanczos3
     resized_numpy = kestrel_native.resize_lanczos3(np_image, target_size[0], target_size[1])
 
-    # Resize for global crop using native Lanczos3
-    crops[0] = kestrel_native.resize_lanczos3(np_image, base_size[0], base_size[1])
+    # Resize for global crop using native Lanczos3, writing directly into
+    # the pre-allocated ``crops[0]`` slice to avoid a temporary allocation
+    # plus copy.
+    kestrel_native.resize_lanczos3_into(
+        np_image, base_size[0], base_size[1], crops[0]
+    )
 
     for tile_y in range(tiling[0]):
         for tile_x in range(tiling[1]):
