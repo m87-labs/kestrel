@@ -4,8 +4,8 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## 0.3.1 — 2026-05-01
 
-- **Python 3.14 support** on Linux x86_64 / aarch64 and Windows x86_64.
-  macOS arm64 stays at Python 3.12.
+- **Python 3.14 support** across Linux x86_64 / aarch64, Windows x86_64,
+  and macOS arm64.
 
 ## 0.3.0 — 2026-05-01
 
