@@ -1,39 +1,18 @@
 [project]
 name = "kestrel"
-version = "0.3.0"
+version = "0.3.1"
 description = "a fast, efficient inference engine for moondream"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "torch>=2.4",
     "tokenizers>=0.15",
     "safetensors>=0.4",
     "torch-c-dlpack-ext>=0.1.3",
     "httpx>=0.27",
-    "kestrel-native==0.1.4",
-    "kestrel-kernels==0.3.1",
+    "kestrel-native==0.1.5",
+    "kestrel-kernels==0.3.2",
     "huggingface-hub>=0.20",
-]
-
-[tool.uv]
-# kestrel-kernels ships wheels for:
-#   Linux x86_64 / aarch64       — Python 3.10–3.13
-#   Windows AMD64                — Python 3.10–3.13
-#   macOS arm64                  — Python 3.12 only (CI builds on the
-#                                  macos-14 runner so the wheel tag is
-#                                  ``macosx_14_0_arm64``)
-# Scope uv's environment universe to those, so unsupported combos
-# (macOS arm64 on Python 3.10/3.11/3.13, macOS x86_64) fail fast at
-# ``uv sync`` with "platform not compatible" instead of late with "no
-# compatible distribution". Marker-level ``platform_machine`` /
-# ``platform_release`` constraints would tighten this further but
-# collide with uv's default ``--python-platform`` glibc and
-# platform-tag conventions in the dry-run, so we accept the OS-level
-# scope as the practical floor.
-environments = [
-    "sys_platform == 'linux'",
-    "sys_platform == 'win32'",
-    "sys_platform == 'darwin' and platform_machine == 'arm64' and python_version == '3.12'",
 ]
 
 [tool.setuptools.packages.find]
