@@ -5,8 +5,7 @@ description = "a fast, efficient inference engine for moondream"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    # torch 2.11 excluded: https://github.com/pytorch/pytorch/issues/178255
-    "torch>=2.4,<2.11",
+    "torch>=2.4",
     "tokenizers>=0.15",
     "safetensors>=0.4",
     "torch-c-dlpack-ext>=0.1.3",
