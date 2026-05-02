@@ -39,7 +39,7 @@ class MoondreamAdapterProvider:
         *,
         api_key: str,
         api_base_url: str = "https://api.moondream.ai",
-        max_lora_rank: int = 16,
+        max_lora_rank: int = 32,
         cache_size: int = 32,
         device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.bfloat16,
