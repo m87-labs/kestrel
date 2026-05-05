@@ -7,6 +7,8 @@ import re
 
 import torch
 
+from kestrel.device import resolve_device
+
 
 _SMALL_VRAM_THRESHOLD_BYTES = 24 * 1024**3
 _KV_CACHE_PAGES_SMALL_VRAM = 16384
@@ -142,11 +144,7 @@ class RuntimeConfig:
     def resolved_device(self) -> torch.device:
         """Return the torch device requested for inference."""
 
-        device = torch.device(self.device)
-        # Ensure CUDA devices have an explicit index for torch.cuda.set_device()
-        if device.type == "cuda" and device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        return device
+        return resolve_device(self.device)
 
     def _validate_device_available(self) -> None:
         """Raise a clear error if the requested device isn't usable.

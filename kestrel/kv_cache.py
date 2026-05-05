@@ -1,4 +1,6 @@
 
+import threading
+import weakref
 from contextlib import nullcontext
 from typing import Optional
 
@@ -14,6 +16,7 @@ except ImportError:  # pragma: no cover - optional on aarch64/Jetson
 
 from kestrel_kernels import get_runtime
 
+from kestrel.device import resolve_device
 from kestrel.utils import CpuGpuBuffer
 
 try:
@@ -64,19 +67,37 @@ class KVMemoryPool:
     """Allocator for paged KV cache storage.
 
     Funnels every per-layer K/V buffer allocation through a single
-    accounting layer. Today the pool just allocates each layer's
-    ``(k, v)`` pair on demand via ``torch.zeros``; the abstraction exists
-    so multiple :class:`PagedKVCache` instances — and ultimately multiple
-    runtimes that share the GPU's KV budget — can be backed by one
-    allocation strategy without touching call sites.
+    accounting layer so multiple :class:`PagedKVCache` instances — and
+    multiple runtimes — can share one budget. Today the pool allocates
+    each layer's ``(k, v)`` pair on demand via ``torch.zeros``; the
+    abstraction exists so a future revision can serve allocations from
+    one underlying buffer without touching call sites.
 
-    ``allocated_bytes`` tracks the total K + V bytes handed out for
-    diagnostics and capacity planning.
+    Pass ``budget_bytes`` to cap the total KV memory the pool may hand
+    out across all callers; ``allocate_layer_kv`` raises
+    :class:`MemoryError` when an allocation would exceed it. Without a
+    budget the pool tracks ``allocated_bytes`` for diagnostics only and
+    never refuses an allocation.
     """
 
-    def __init__(self, *, device: torch.device | str):
-        self.device = torch.device(device) if isinstance(device, str) else device
+    def __init__(
+        self,
+        *,
+        device: torch.device | str,
+        budget_bytes: int | None = None,
+    ):
+        if budget_bytes is not None and budget_bytes < 0:
+            raise ValueError(
+                f"budget_bytes must be non-negative, got {budget_bytes}"
+            )
+        self.device = resolve_device(device)
+        self.budget_bytes = budget_bytes
         self.allocated_bytes = 0
+        # Serializes the budget check + reservation + counter update so two
+        # threads sharing one pool can't both pass the precheck and bust
+        # the cap. Also guards the rollback path (weakref finalizer + the
+        # try/except around torch.zeros).
+        self._lock = threading.Lock()
 
     def allocate_layer_kv(
         self,
@@ -88,10 +109,45 @@ class KVMemoryPool:
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cache_shape = (n_pages, n_heads, page_size, head_dim)
-        k = torch.zeros(cache_shape, dtype=dtype, device=self.device)
-        v = torch.zeros(cache_shape, dtype=dtype, device=self.device)
-        self.allocated_bytes += 2 * k.numel() * k.element_size()
+        element_size = torch.empty((), dtype=dtype).element_size()
+        per_tensor_bytes = n_pages * n_heads * page_size * head_dim * element_size
+        layer_bytes = 2 * per_tensor_bytes
+
+        # Reserve the bytes atomically so concurrent callers can't both
+        # pass the precheck against the same counter value.
+        with self._lock:
+            if (
+                self.budget_bytes is not None
+                and self.allocated_bytes + layer_bytes > self.budget_bytes
+            ):
+                raise MemoryError(
+                    f"KVMemoryPool budget exceeded: requested {layer_bytes} "
+                    f"bytes, already used {self.allocated_bytes} of "
+                    f"{self.budget_bytes}"
+                )
+            self.allocated_bytes += layer_bytes
+
+        try:
+            k = torch.zeros(cache_shape, dtype=dtype, device=self.device)
+            v = torch.zeros(cache_shape, dtype=dtype, device=self.device)
+        except Exception:
+            # Release the reservation we just took so a failing
+            # ``torch.zeros`` doesn't leave the pool over-counted.
+            self._release_bytes(layer_bytes)
+            raise
+
+        # Auto-rollback when the tensors are garbage-collected. Covers
+        # the partial-init-failure case: if a runtime allocates layers
+        # 0..N successfully then layer N+1 raises and the runtime is
+        # discarded, GC of the prior layer caches releases their bytes
+        # back to the pool.
+        weakref.finalize(k, self._release_bytes, per_tensor_bytes)
+        weakref.finalize(v, self._release_bytes, per_tensor_bytes)
         return k, v
+
+    def _release_bytes(self, n: int) -> None:
+        with self._lock:
+            self.allocated_bytes = max(0, self.allocated_bytes - n)
 
 
 class PagedKVCache(torch.nn.Module):

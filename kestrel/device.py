@@ -18,6 +18,22 @@ from typing import Optional
 import torch
 
 
+def resolve_device(device: torch.device | str) -> torch.device:
+    """Canonicalize a device spec to a fully-qualified ``torch.device``.
+
+    Strings are parsed via ``torch.device(...)``. CUDA devices without an
+    explicit index resolve to the current CUDA device, so a value
+    constructed as ``"cuda"`` compares equal to one built as ``"cuda:N"``
+    against ``torch.cuda.current_device()``. Other device types
+    (CPU, MPS, …) are returned untouched.
+    """
+
+    out = torch.device(device) if isinstance(device, str) else device
+    if out.type == "cuda" and out.index is None:
+        out = torch.device("cuda", torch.cuda.current_device())
+    return out
+
+
 def set_device(device: torch.device) -> None:
     """``torch.cuda.set_device`` on CUDA; no-op on MPS/CPU."""
     if device.type == "cuda":
