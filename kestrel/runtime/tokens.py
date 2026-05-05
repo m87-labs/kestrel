@@ -22,7 +22,6 @@ class TextToken(NamedTuple):
         return (0, self.token_id)
 
     def kv_length(self) -> int:
-        """Text tokens occupy exactly 1 KV position."""
         return 1
 
 
@@ -36,7 +35,6 @@ class CoordToken(NamedTuple):
         return (1, self.pos)
 
     def kv_length(self) -> int:
-        """Coord tokens occupy exactly 1 KV position."""
         return 1
 
 
@@ -51,7 +49,6 @@ class SizeToken(NamedTuple):
         return (2, self.width, self.height)
 
     def kv_length(self) -> int:
-        """Size tokens occupy exactly 1 KV position."""
         return 1
 
 

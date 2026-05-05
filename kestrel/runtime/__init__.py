@@ -11,7 +11,6 @@ from kestrel.runtime.state import (
     PreparedSequence,
     RuntimeDecodeResult,
     SequenceState,
-    _CacheLookupResult,
 )
 from kestrel.runtime.tokens import (
     CoordToken,
@@ -29,5 +28,4 @@ __all__ = [
     "SizeToken",
     "TextToken",
     "Token",
-    "_CacheLookupResult",
 ]

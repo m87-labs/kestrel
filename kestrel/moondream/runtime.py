@@ -39,8 +39,8 @@ from kestrel.runtime import (
     SizeToken,
     TextToken,
     Token,
-    _CacheLookupResult,
 )
+from kestrel.runtime.state import _CacheLookupResult
 
 from .config import (
     DEFAULT_MOONDREAM2_CONFIG,
