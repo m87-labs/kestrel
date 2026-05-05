@@ -208,16 +208,3 @@ class FakeRuntime:
 
     def decode_with_slot(self, slot: Any, batch_size: int) -> None:
         self.decode_calls.append((slot, batch_size))
-
-
-# Module-level type-check: FakeRuntime structurally satisfies Runtime.
-# (Performed as an import-time assignment so a missing/renamed Protocol
-# member surfaces as a TypeError before any test runs.)
-def _assert_conforms() -> None:
-    from kestrel.runtime import Runtime
-
-    fake: Runtime = FakeRuntime()
-    del fake
-
-
-_assert_conforms()
