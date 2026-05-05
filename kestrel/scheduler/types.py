@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
-from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, Token
+from kestrel.moondream.runtime import SequenceState, Token
+from kestrel.runtime import Runtime
 from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
@@ -98,7 +99,7 @@ class RequestLifecycle:
 
     def stage_token(
         self,
-        runtime: MoondreamRuntime,
+        runtime: Runtime,
         token: Token,
     ) -> None:
         if self.first_token_time is None:

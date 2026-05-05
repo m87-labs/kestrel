@@ -2,10 +2,12 @@
 
 This package collects the model-agnostic dataclasses, named tuples, and
 helper types that the engine and scheduler exchange with a runtime
-implementation. Concrete runtimes (e.g. ``kestrel.moondream.runtime``)
-build on top of these.
+implementation, plus the :class:`Runtime` protocol describing the
+scheduler↔runtime contract. Concrete runtimes (e.g.
+``kestrel.moondream.runtime``) build on top of these.
 """
 
+from kestrel.runtime.protocol import Runtime
 from kestrel.runtime.state import (
     PrefillClassification,
     PreparedSequence,
@@ -23,6 +25,7 @@ __all__ = [
     "CoordToken",
     "PrefillClassification",
     "PreparedSequence",
+    "Runtime",
     "RuntimeDecodeResult",
     "SequenceState",
     "SizeToken",
