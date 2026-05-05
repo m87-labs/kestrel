@@ -481,6 +481,9 @@ class InferenceEngine:
         # construction, warmup, photon) leaves the engine retry-able
         # rather than wedged in a half-initialized state.
         self._initialized = True
+        # Drop the reference to the completed init task so its
+        # captured locals can be garbage-collected.
+        self._init_task = None
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
