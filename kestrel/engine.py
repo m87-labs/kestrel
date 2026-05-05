@@ -305,17 +305,28 @@ class InferenceEngine:
         self,
         runtime_cfg: RuntimeConfig,
         *,
+        runtime: Optional[Runtime] = None,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
         api_base_url: str = _DEFAULT_API_BASE_URL,
     ) -> None:
+        if runtime is not None:
+            cfg_device = runtime_cfg.resolved_device()
+            if runtime.device != cfg_device:
+                raise ValueError(
+                    f"runtime.device ({runtime.device}) does not match "
+                    f"runtime_cfg.resolved_device() ({cfg_device})"
+                )
         self._runtime_cfg = runtime_cfg
         self._adapter_provider = adapter_provider
         self._api_key = api_key
         self._api_base_url = api_base_url
 
-        self._runtime: Optional[Runtime] = None
+        # An externally-built runtime is held from construction; otherwise
+        # ``_initialize`` builds a MoondreamRuntime on first ``create``.
+        self._runtime: Optional[Runtime] = runtime
+        self._initialized = False
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
         self._scheduler_event = threading.Event()
@@ -368,6 +379,7 @@ class InferenceEngine:
         cls,
         runtime_cfg: RuntimeConfig,
         *,
+        runtime: Optional[Runtime] = None,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
@@ -394,6 +406,7 @@ class InferenceEngine:
 
         engine = cls(
             runtime_cfg,
+            runtime=runtime,
             skills=skills,
             adapter_provider=adapter_provider,
             api_key=api_key,
@@ -403,29 +416,31 @@ class InferenceEngine:
         return engine
 
     async def _initialize(self) -> None:
-        if self._runtime is not None:
+        if self._initialized:
             return
+        self._initialized = True
         loop = asyncio.get_running_loop()
         self._loop = loop
-        max_lora_rank = (
-            self._adapter_provider.config()["max_lora_rank"]
-            if self._adapter_provider is not None
-            else None
-        )
-        if max_lora_rank is not None:
-            from kestrel_kernels.moe_lora import TRITON_AVAILABLE
+        if self._runtime is None:
+            max_lora_rank = (
+                self._adapter_provider.config()["max_lora_rank"]
+                if self._adapter_provider is not None
+                else None
+            )
+            if max_lora_rank is not None:
+                from kestrel_kernels.moe_lora import TRITON_AVAILABLE
 
-            if not TRITON_AVAILABLE:
-                _LOGGER.warning(
-                    "MoE LoRA adapters require triton, which is not installed. "
-                    "Disabling LoRA — base model inference will still work, but "
-                    "adapter requests will be rejected. Contact contact@moondream.ai "
-                    "if LoRA support is needed on your platform."
-                )
-                max_lora_rank = None
-        self._runtime = await loop.run_in_executor(
-            None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
-        )
+                if not TRITON_AVAILABLE:
+                    _LOGGER.warning(
+                        "MoE LoRA adapters require triton, which is not installed. "
+                        "Disabling LoRA — base model inference will still work, but "
+                        "adapter requests will be rejected. Contact contact@moondream.ai "
+                        "if LoRA support is needed on your platform."
+                    )
+                    max_lora_rank = None
+            self._runtime = await loop.run_in_executor(
+                None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
+            )
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
