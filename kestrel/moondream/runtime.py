@@ -268,7 +268,7 @@ class MoondreamRuntime:
             prefix_cache=self.prefix_cache,
             h2d_stream=self._primary_stream,
         )
-        self.kv_pool = KVMemoryPool(device=self.device)
+        self._kv_pool = KVMemoryPool(device=self.device)
 
         construction_device = torch.device("meta")
         with _disable_parameter_initialization():
@@ -395,7 +395,7 @@ class MoondreamRuntime:
                 n_kv_heads=self.config.text.n_kv_heads,
                 head_dim=head_dim,
                 dtype=self.kv_cache_dtype,
-                pool=self.kv_pool,
+                pool=self._kv_pool,
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
