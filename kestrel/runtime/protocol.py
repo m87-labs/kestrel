@@ -1,17 +1,18 @@
-"""Protocol describing the scheduler↔runtime contract.
+"""Protocol describing the runtime contract used by engine + scheduler.
 
-The :class:`~kestrel.scheduler.scheduler.GenerationScheduler` is generic
-over runtime implementations: it manages admission, queues, prefill
+The :class:`~kestrel.engine.InferenceEngine` and
+:class:`~kestrel.scheduler.scheduler.GenerationScheduler` are generic
+over runtime implementations: they manage admission, queues, prefill
 batching, and decode pacing without knowing which model is actually
 running. Concrete runtimes (today: ``MoondreamRuntime``) implement the
 methods declared here.
 
 Some attributes are typed as ``Any`` because they expose model-specific
-state the scheduler currently reaches into directly (config, region,
-spatial decoding tables, prefill / decode slot containers). Tightening
-those — or refactoring the scheduler to stop reaching into them — is a
-follow-up; declaring them here keeps the protocol an honest record of
-the surface a runtime must satisfy today.
+state the engine + scheduler currently reach into directly (config,
+region, spatial decoding tables, prefix cache, slot containers).
+Tightening those — or refactoring callers to stop reaching into them —
+is a follow-up; declaring them here keeps the protocol an honest
+record of the surface a runtime must satisfy today.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 
 
 class Runtime(Protocol):
-    """Surface that :class:`GenerationScheduler` calls on a runtime."""
+    """Surface that the engine and scheduler call on a runtime."""
 
     # Capacity / shape
     max_batch_size: int
@@ -50,7 +51,11 @@ class Runtime(Protocol):
     decode_slots: Sequence[Any]
     active_sequences: Mapping[int, SequenceState]
 
-    # Model-specific state the scheduler reaches into today.
+    # Engine + scheduler infrastructure
+    prefix_cache: Any  # ``RadixPrefixCache | None`` on MoondreamRuntime
+    graph_capture_lock: Any  # context manager serializing CUDA-graph capture
+
+    # Model-specific state callers reach into today.
     # Narrowing these is a follow-up.
     config: Any
     region: Any

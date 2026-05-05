@@ -21,6 +21,7 @@ Behaviour:
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -138,6 +139,10 @@ class FakeRuntime:
         self.region: Any = None
         self.spatial_tables: Any = None
         self.page_table = _FakePageTable(page_size=page_size)
+
+        # Engine + scheduler infrastructure
+        self.prefix_cache: Any = None
+        self.graph_capture_lock = contextlib.nullcontext()
 
         # Knobs
         self._prepare_exc = prepare_exc
