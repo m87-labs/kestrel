@@ -326,6 +326,13 @@ class InferenceEngine:
         # An externally-built runtime is held from construction; otherwise
         # ``_initialize`` builds a MoondreamRuntime on first ``create``.
         self._runtime: Optional[Runtime] = runtime
+        # Two-phase init flags. ``_started`` flips once the scheduler
+        # thread + worker task are up so the warmup pipeline (which
+        # re-enters via ``query()`` → ``_ensure_started``) doesn't
+        # recurse back into ``_initialize``. ``_initialized`` flips at
+        # the very end so a partial failure (warmup, photon) can still
+        # be retried by another ``_initialize`` call.
+        self._started = False
         self._initialized = False
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
@@ -448,6 +455,11 @@ class InferenceEngine:
             )
             self._scheduler_thread.start()
         self._worker_task = asyncio.create_task(self._worker_loop())
+        # Scheduler + worker are now up. Flip ``_started`` so the warmup
+        # pipeline (which calls into ``query()`` and re-enters
+        # ``_ensure_started``) sees a started engine and doesn't recurse
+        # into ``_initialize``.
+        self._started = True
         await self._warmup_query_pipeline()
         if self._photon_reporter is None:
             self._photon_reporter = PhotonReporter(
@@ -989,7 +1001,7 @@ class InferenceEngine:
         return future, req_id
 
     async def _ensure_started(self) -> None:
-        if not self._initialized:
+        if not self._started:
             await self._initialize()
 
     async def _worker_loop(self) -> None:
