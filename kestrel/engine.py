@@ -418,7 +418,6 @@ class InferenceEngine:
     async def _initialize(self) -> None:
         if self._initialized:
             return
-        self._initialized = True
         loop = asyncio.get_running_loop()
         self._loop = loop
         if self._runtime is None:
@@ -460,6 +459,10 @@ class InferenceEngine:
             )
             await self._photon_reporter.validate_api_key()
             self._photon_reporter.start()
+        # Flip the guard last so a failure partway through (runtime
+        # construction, warmup, photon) leaves the engine retry-able
+        # rather than wedged in a half-initialized state.
+        self._initialized = True
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
@@ -986,7 +989,7 @@ class InferenceEngine:
         return future, req_id
 
     async def _ensure_started(self) -> None:
-        if self._runtime is None:
+        if not self._initialized:
             await self._initialize()
 
     async def _worker_loop(self) -> None:
