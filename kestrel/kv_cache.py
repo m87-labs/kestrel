@@ -60,6 +60,40 @@ def _build_fa3_decode_metadata_torch(
     out_seqused_k[:batch_size].copy_(seqlen.to(dtype=torch.int32))
 
 
+class KVMemoryPool:
+    """Allocator for paged KV cache storage.
+
+    Funnels every per-layer K/V buffer allocation through a single
+    accounting layer. Today the pool just allocates each layer's
+    ``(k, v)`` pair on demand via ``torch.zeros``; the abstraction exists
+    so multiple :class:`PagedKVCache` instances — and ultimately multiple
+    runtimes that share the GPU's KV budget — can be backed by one
+    allocation strategy without touching call sites.
+
+    ``allocated_bytes`` tracks the total K + V bytes handed out for
+    diagnostics and capacity planning.
+    """
+
+    def __init__(self, *, device: torch.device | str):
+        self.device = torch.device(device) if isinstance(device, str) else device
+        self.allocated_bytes = 0
+
+    def allocate_layer_kv(
+        self,
+        *,
+        n_pages: int,
+        n_heads: int,
+        page_size: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_shape = (n_pages, n_heads, page_size, head_dim)
+        k = torch.zeros(cache_shape, dtype=dtype, device=self.device)
+        v = torch.zeros(cache_shape, dtype=dtype, device=self.device)
+        self.allocated_bytes += 2 * k.numel() * k.element_size()
+        return k, v
+
+
 class PagedKVCache(torch.nn.Module):
     def __init__(
         self,
@@ -67,19 +101,21 @@ class PagedKVCache(torch.nn.Module):
         n_heads,
         head_dim,
         dtype,
+        pool: KVMemoryPool,
         *,
         k_scale: float | None = None,
         v_scale: float | None = None,
     ):
         super().__init__()
-        cache_shape = (
-            page_table.n_pages,
-            n_heads,
-            page_table.page_size,
-            head_dim,
+        k_cache, v_cache = pool.allocate_layer_kv(
+            n_pages=page_table.n_pages,
+            n_heads=n_heads,
+            page_size=page_table.page_size,
+            head_dim=head_dim,
+            dtype=dtype,
         )
-        self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer("k_cache", k_cache)
+        self.register_buffer("v_cache", v_cache)
 
         self.page_table = page_table
         self.quantized = dtype == torch.float8_e4m3fn
