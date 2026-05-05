@@ -11,6 +11,8 @@ from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
 from kestrel.scheduler.types import GenerationRequest, RequestLifecycle, RequestPhase
 
+from tests.scheduler._fake_runtime import FakeRuntime
+
 
 @dataclass
 class _SkillStateStub:
@@ -20,29 +22,6 @@ class _SkillStateStub:
     def __post_init__(self) -> None:
         if self.tokens is None:
             self.tokens = []
-
-
-class _RuntimeStub:
-    def __init__(self, *, prepare_exc: Exception | None = None) -> None:
-        self.max_batch_slots = 2
-        self.max_batch_size = 1
-        self.prepare_exc = prepare_exc
-        self.released_prefill_slots: list[object] = []
-        self.released_adapter_slots: list[int] = []
-
-    def acquire_prefill_slot(self, slot_id: int) -> object:
-        return object()
-
-    def release_prefill_slot(self, slot: object) -> None:
-        self.released_prefill_slots.append(slot)
-
-    def prepare_sequence(self, **_: object) -> object:
-        if self.prepare_exc is not None:
-            raise self.prepare_exc
-        raise AssertionError("prepare_sequence should not succeed in this test")
-
-    def release_adapter_slot(self, slot: int) -> None:
-        self.released_adapter_slots.append(slot)
 
 
 def _make_request(*, request_id: int = 1, max_new_tokens: int = 8) -> GenerationRequest:
@@ -84,7 +63,7 @@ def _make_candidate(request: GenerationRequest) -> _PrefillCandidate:
 
 def _make_scheduler(
     request: GenerationRequest,
-    runtime: _RuntimeStub,
+    runtime: FakeRuntime,
 ) -> GenerationScheduler:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = runtime
@@ -101,7 +80,7 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
     failure_stage: str,
 ) -> None:
     request = _make_request()
-    runtime = _RuntimeStub(
+    runtime = FakeRuntime(
         prepare_exc=RuntimeError("prepare failed") if failure_stage == "prepare" else None
     )
     scheduler = _make_scheduler(request, runtime)
