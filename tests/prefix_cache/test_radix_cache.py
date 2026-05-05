@@ -628,6 +628,30 @@ class TestNamespace:
         assert result1.matched_kv_length == 1
         assert result2.matched_kv_length == 0
 
+    def test_runtime_id_namespace(self) -> None:
+        """Two runtimes sharing one prefix cache must not see each
+        other's entries — same token sequence under different
+        runtime_ids resolves to independent trees."""
+
+        cache = RadixPrefixCache()
+        md = CacheNamespace(runtime_id="moondream2")
+        other = CacheNamespace(runtime_id="other-model")
+
+        tokens = [MockToken(0)]
+        cache.insert(tokens, [0], namespace=md)
+        cache.insert(tokens, [1], namespace=other)
+
+        result_md = cache.match_prefix(tokens, namespace=md)
+        result_other = cache.match_prefix(tokens, namespace=other)
+
+        assert result_md.matched_pages == [0]
+        assert result_other.matched_pages == [1]
+
+        # And a runtime-tagged namespace must not collide with the
+        # default (runtime_id=None) namespace.
+        result_default = cache.match_prefix(tokens, namespace=CacheNamespace())
+        assert result_default.matched_kv_length == 0
+
     def test_match_prefix_does_not_create_namespace_root(self) -> None:
         """match_prefix() should not create namespace roots on miss."""
         cache = RadixPrefixCache()
