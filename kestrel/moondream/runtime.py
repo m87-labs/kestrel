@@ -21,7 +21,7 @@ from tokenizers import Tokenizer
 
 from kestrel.config import RuntimeConfig
 from kestrel.device import NoopEvent, empty_cache, get_device_capability, make_event, make_stream, set_device, stream_context
-from kestrel.kv_cache import PageTable, PagedKVCache
+from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
 from kestrel.prefix_cache import (
     CacheNamespace,
     CacheToken,
@@ -157,7 +157,7 @@ class _LayerPagedCache(torch.nn.Module):
         n_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
-        device: torch.device,
+        pool: KVMemoryPool,
         *,
         k_scale: float | None = None,
         v_scale: float | None = None,
@@ -168,9 +168,10 @@ class _LayerPagedCache(torch.nn.Module):
             n_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
+            pool=pool,
             k_scale=k_scale,
             v_scale=v_scale,
-        ).to(device)
+        )
 
     def update(
         self,
@@ -267,6 +268,7 @@ class MoondreamRuntime:
             prefix_cache=self.prefix_cache,
             h2d_stream=self._primary_stream,
         )
+        self._kv_pool = KVMemoryPool(device=self.device)
 
         construction_device = torch.device("meta")
         with _disable_parameter_initialization():
@@ -393,7 +395,7 @@ class MoondreamRuntime:
                 n_kv_heads=self.config.text.n_kv_heads,
                 head_dim=head_dim,
                 dtype=self.kv_cache_dtype,
-                device=self.device,
+                pool=self._kv_pool,
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
