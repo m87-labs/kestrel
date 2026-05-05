@@ -25,8 +25,12 @@ class SequenceState:
     length: int
     max_length: int
     prompt_length: int | None = None
-    # DEPRECATED: Use image_regions instead. Kept for backward compatibility with
-    # scheduler code. Will be removed once scheduler is migrated to image_regions.
+    # Single contiguous image-prefix region. When multi-image support lands this
+    # will need to become a list of (start, end) KV ranges so bidirectional
+    # attention can address each image independently. The migration touches
+    # engine.py (GenerationRequest construction), scheduler/types.py
+    # (total_length / target_length math), and moondream/runtime.py
+    # (image_kv_length consumers).
     image_length: int = 0
     last_hidden: Tensor | None = None
     lora_slot: int = 0  # 0 = no LoRA, >0 = slot in TextLoRAWorkspace
@@ -36,21 +40,10 @@ class SequenceState:
     cache_lock_node: TreeNode | None = None
     cache_owned_page_count: int = 0  # Pages belonging to cache (not freed on release)
     reused_page_count: int = 0  # Pages reused from cache hit (for metrics)
-    # List of (start, end) KV positions for bidirectional attention (image regions).
-    # For single-image: [(1, 1+image_kv_length)]. Empty for text-only.
-    # This will replace image_length once multi-image is supported.
-    image_regions: list[tuple[int, int]] | None = None
 
     def __post_init__(self) -> None:
         if self.prompt_length is None:
             self.prompt_length = self.length
-        # Validate consistency between image_length and image_regions
-        if self.image_regions:
-            computed_length = sum(end - start for start, end in self.image_regions)
-            assert self.image_length == computed_length, (
-                f"image_length ({self.image_length}) inconsistent with "
-                f"image_regions ({self.image_regions}, computed={computed_length})"
-            )
 
     def advance(self, tokens: int = 1) -> None:
         self.length += tokens
