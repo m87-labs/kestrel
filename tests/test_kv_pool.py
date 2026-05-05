@@ -86,3 +86,60 @@ def test_pool_canonicalizes_indexless_cuda_device() -> None:
     assert pool.device.type == "cuda"
     assert pool.device.index == torch.cuda.current_device()
     assert pool.device == torch.device("cuda", torch.cuda.current_device())
+
+
+def test_pool_releases_bytes_when_tensors_are_collected() -> None:
+    """Discarding a cache must return its bytes to the pool so a
+    partial-init failure of one runtime doesn't permanently shrink the
+    budget for other runtimes sharing the same pool."""
+
+    import gc
+
+    pool = KVMemoryPool(device="cpu")
+    page_table = _make_page_table()
+    cache = PagedKVCache(
+        page_table, n_heads=2, head_dim=8, dtype=torch.float32, pool=pool
+    )
+    assert pool.allocated_bytes > 0
+
+    del cache
+    gc.collect()
+
+    assert pool.allocated_bytes == 0
+
+
+def test_pool_budget_serializes_concurrent_allocations() -> None:
+    """Two threads sharing one pool must not both pass the precheck and
+    bust the cap. Exactly one allocation may succeed when the budget
+    only fits one."""
+
+    import threading
+
+    layer_bytes = 4 * 2 * 1 * 8 * 4  # n_pages=4 n_heads=2 page=1 head_dim=8 fp32
+    layer_total = 2 * layer_bytes  # K + V
+    pool = KVMemoryPool(device="cpu", budget_bytes=layer_total)
+    page_table = _make_page_table()
+
+    successes: list[PagedKVCache] = []
+    failures: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def alloc() -> None:
+        barrier.wait()
+        try:
+            cache = PagedKVCache(
+                page_table, n_heads=2, head_dim=8, dtype=torch.float32, pool=pool
+            )
+            successes.append(cache)
+        except MemoryError as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=alloc) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert pool.allocated_bytes == layer_total
