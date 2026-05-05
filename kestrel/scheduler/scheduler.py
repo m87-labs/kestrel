@@ -13,12 +13,12 @@ from torch import Tensor
 
 from kestrel.device import stream_context
 from kestrel.moondream.runtime import (
-    MoondreamRuntime,
     PrefillClassification,
     PreparedSequence,
     Token,
     TextToken,
 )
+from kestrel.runtime import Runtime
 from kestrel.moondream.lora import AdapterProvider
 from kestrel.skills import (
     QuerySkill,
@@ -195,7 +195,7 @@ class GenerationScheduler:
 
     def __init__(
         self,
-        runtime: MoondreamRuntime,
+        runtime: Runtime,
         *,
         default_temperature: float = 0.2,
         default_top_p: float = 0.9,
