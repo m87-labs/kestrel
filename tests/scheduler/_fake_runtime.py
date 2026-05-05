@@ -25,6 +25,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from kestrel.device import NoopEvent
 from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
@@ -46,6 +47,38 @@ class _FakePageTable:
 
     def commit_block_table(self, batch_indices: list[int] | None = None) -> None:
         self.commit_block_table_calls.append(batch_indices)
+
+
+class _FakePrefillSlot:
+    """Minimal stand-in for a prefill slot.
+
+    Carries the attributes the scheduler reaches into during the
+    success path (``step_done_event`` / ``commit_done_event`` to
+    record + synchronize, ``batch_idx`` to slice). Moondream-specific
+    state like ``scratch`` is left as ``None``.
+    """
+
+    def __init__(self, *, slot_id: int, max_batch_size: int) -> None:
+        self.slot_id = slot_id
+        self.batch_idx = torch.zeros(max_batch_size, dtype=torch.int32)
+        self.step_done_event = NoopEvent()
+        self.commit_done_event = NoopEvent()
+        self.scratch = None
+
+
+class _FakeDecodeSlot:
+    """Minimal stand-in for a decode slot.
+
+    Carries the attributes the scheduler reaches into on the decode
+    success path (``step_done_event`` / ``commit_done_event``). Tests
+    that drive richer DecodeSlot state (``meta``, ``sampled_ids``,
+    etc.) should extend this stub.
+    """
+
+    def __init__(self, *, slot_id: int) -> None:
+        self.slot_id = slot_id
+        self.step_done_event = NoopEvent()
+        self.commit_done_event = NoopEvent()
 
 
 class FakeRuntime:
@@ -90,8 +123,13 @@ class FakeRuntime:
         decode_capacity = (
             n_decode_slots if n_decode_slots is not None else max_batch_slots
         )
-        self.prefill_slots: list[Any] = [object() for _ in range(prefill_capacity)]
-        self.decode_slots: list[Any] = [object() for _ in range(decode_capacity)]
+        self.prefill_slots: list[Any] = [
+            _FakePrefillSlot(slot_id=i, max_batch_size=max_batch_size)
+            for i in range(prefill_capacity)
+        ]
+        self.decode_slots: list[Any] = [
+            _FakeDecodeSlot(slot_id=i) for i in range(decode_capacity)
+        ]
         self.active_sequences: dict[int, SequenceState] = {}
 
         # Model-specific surfaces — left as ``None``/empty for fake purposes;
