@@ -60,6 +60,8 @@ class FakeRuntime:
         image_prefix_length: int = 0,
         device: torch.device | str = "cpu",
         page_size: int = 1,
+        n_prefill_slots: int | None = None,
+        n_decode_slots: int | None = None,
         prepare_exc: Exception | None = None,
         prepare_result: PreparedSequence | None = None,
         launch_logits: torch.Tensor | None = None,
@@ -77,9 +79,19 @@ class FakeRuntime:
         self.primary_stream: Any = None
         self.copy_stream: Any = None
 
-        # Slot containers + sequence registry
-        self.prefill_slots: list[Any] = []
-        self.decode_slots: list[Any] = []
+        # Slot containers + sequence registry. The scheduler treats these
+        # as fixed-capacity arrays — sizing its staging pool from
+        # ``len(prefill_slots)`` and indexing ``decode_slots[slot_id]`` —
+        # so they must be pre-populated for the scheduler to construct
+        # against this fake at all.
+        prefill_capacity = (
+            n_prefill_slots if n_prefill_slots is not None else max_batch_slots
+        )
+        decode_capacity = (
+            n_decode_slots if n_decode_slots is not None else max_batch_slots
+        )
+        self.prefill_slots: list[Any] = [object() for _ in range(prefill_capacity)]
+        self.decode_slots: list[Any] = [object() for _ in range(decode_capacity)]
         self.active_sequences: dict[int, SequenceState] = {}
 
         # Model-specific surfaces — left as ``None``/empty for fake purposes;
@@ -117,9 +129,8 @@ class FakeRuntime:
     # Slot lifecycle ---------------------------------------------------
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
         self.acquired_prefill_slots.append(slot_id)
-        slot = object()
-        self.prefill_slots.append(slot)
-        return slot
+        index = 0 if slot_id is None else slot_id
+        return self.prefill_slots[index]
 
     def release_prefill_slot(self, slot: Any) -> None:
         self.released_prefill_slots.append(slot)
