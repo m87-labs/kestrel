@@ -129,10 +129,12 @@ class PagedKVCache(torch.nn.Module):
             self.k_scale = 1.0
             self.v_scale = 1.0
         self.register_buffer(
-            "k_scale_tensor", torch.tensor(self.k_scale, dtype=torch.float32)
+            "k_scale_tensor",
+            torch.tensor(self.k_scale, dtype=torch.float32, device=pool.device),
         )
         self.register_buffer(
-            "v_scale_tensor", torch.tensor(self.v_scale, dtype=torch.float32)
+            "v_scale_tensor",
+            torch.tensor(self.v_scale, dtype=torch.float32, device=pool.device),
         )
 
     def update(
