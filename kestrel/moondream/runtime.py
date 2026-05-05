@@ -214,6 +214,7 @@ class MoondreamRuntime:
         cfg: RuntimeConfig,
         *,
         max_lora_rank: int | None = None,
+        kv_pool: KVMemoryPool | None = None,
     ) -> None:
         self._cfg = cfg
         self.device = cfg.resolved_device()
@@ -268,7 +269,14 @@ class MoondreamRuntime:
             prefix_cache=self.prefix_cache,
             h2d_stream=self._primary_stream,
         )
-        self._kv_pool = KVMemoryPool(device=self.device)
+        self._kv_pool = kv_pool if kv_pool is not None else KVMemoryPool(
+            device=self.device
+        )
+        if self._kv_pool.device != self.device:
+            raise ValueError(
+                f"kv_pool.device ({self._kv_pool.device}) must match runtime "
+                f"device ({self.device})"
+            )
 
         construction_device = torch.device("meta")
         with _disable_parameter_initialization():

@@ -64,18 +64,31 @@ class KVMemoryPool:
     """Allocator for paged KV cache storage.
 
     Funnels every per-layer K/V buffer allocation through a single
-    accounting layer. Today the pool just allocates each layer's
-    ``(k, v)`` pair on demand via ``torch.zeros``; the abstraction exists
-    so multiple :class:`PagedKVCache` instances — and ultimately multiple
-    runtimes that share the GPU's KV budget — can be backed by one
-    allocation strategy without touching call sites.
+    accounting layer so multiple :class:`PagedKVCache` instances — and
+    multiple runtimes — can share one budget. Today the pool allocates
+    each layer's ``(k, v)`` pair on demand via ``torch.zeros``; the
+    abstraction exists so a future revision can serve allocations from
+    one underlying buffer without touching call sites.
 
-    ``allocated_bytes`` tracks the total K + V bytes handed out for
-    diagnostics and capacity planning.
+    Pass ``budget_bytes`` to cap the total KV memory the pool may hand
+    out across all callers; ``allocate_layer_kv`` raises
+    :class:`MemoryError` when an allocation would exceed it. Without a
+    budget the pool tracks ``allocated_bytes`` for diagnostics only and
+    never refuses an allocation.
     """
 
-    def __init__(self, *, device: torch.device | str):
+    def __init__(
+        self,
+        *,
+        device: torch.device | str,
+        budget_bytes: int | None = None,
+    ):
+        if budget_bytes is not None and budget_bytes < 0:
+            raise ValueError(
+                f"budget_bytes must be non-negative, got {budget_bytes}"
+            )
         self.device = torch.device(device) if isinstance(device, str) else device
+        self.budget_bytes = budget_bytes
         self.allocated_bytes = 0
 
     def allocate_layer_kv(
@@ -88,9 +101,21 @@ class KVMemoryPool:
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cache_shape = (n_pages, n_heads, page_size, head_dim)
+        element_size = torch.empty((), dtype=dtype).element_size()
+        layer_bytes = (
+            2 * n_pages * n_heads * page_size * head_dim * element_size
+        )
+        if (
+            self.budget_bytes is not None
+            and self.allocated_bytes + layer_bytes > self.budget_bytes
+        ):
+            raise MemoryError(
+                f"KVMemoryPool budget exceeded: requested {layer_bytes} bytes, "
+                f"already used {self.allocated_bytes} of {self.budget_bytes}"
+            )
         k = torch.zeros(cache_shape, dtype=dtype, device=self.device)
         v = torch.zeros(cache_shape, dtype=dtype, device=self.device)
-        self.allocated_bytes += 2 * k.numel() * k.element_size()
+        self.allocated_bytes += layer_bytes
         return k, v
 
 
