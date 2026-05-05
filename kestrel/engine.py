@@ -328,13 +328,14 @@ class InferenceEngine:
         self._runtime: Optional[Runtime] = runtime
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
-        # engine retry-able. ``_initializing`` is held while
-        # ``_initialize`` runs so the warmup pipeline — which loops back
-        # through ``query()`` → ``_ensure_started`` — doesn't recurse,
-        # and so concurrent first-request callers don't both kick off
-        # the heavy init path.
+        # engine retry-able. ``_init_task`` is the asyncio task that's
+        # currently running ``_initialize``; concurrent callers await
+        # it instead of racing each other, and the warmup pipeline
+        # (which loops back through ``query()`` → ``_ensure_started``)
+        # detects via ``asyncio.current_task() is self._init_task``
+        # that it's already inside init and bails without recursing.
         self._initialized = False
-        self._initializing = False
+        self._init_task: Optional[asyncio.Task[None]] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
         self._scheduler_event = threading.Event()
@@ -424,62 +425,62 @@ class InferenceEngine:
         return engine
 
     async def _initialize(self) -> None:
-        if self._initialized or self._initializing:
+        if self._initialized:
             return
-        self._initializing = True
-        try:
-            loop = asyncio.get_running_loop()
-            self._loop = loop
-            if self._runtime is None:
-                max_lora_rank = (
-                    self._adapter_provider.config()["max_lora_rank"]
-                    if self._adapter_provider is not None
-                    else None
-                )
-                if max_lora_rank is not None:
-                    from kestrel_kernels.moe_lora import TRITON_AVAILABLE
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        if self._runtime is None:
+            max_lora_rank = (
+                self._adapter_provider.config()["max_lora_rank"]
+                if self._adapter_provider is not None
+                else None
+            )
+            if max_lora_rank is not None:
+                from kestrel_kernels.moe_lora import TRITON_AVAILABLE
 
-                    if not TRITON_AVAILABLE:
-                        _LOGGER.warning(
-                            "MoE LoRA adapters require triton, which is not installed. "
-                            "Disabling LoRA — base model inference will still work, but "
-                            "adapter requests will be rejected. Contact contact@moondream.ai "
-                            "if LoRA support is needed on your platform."
-                        )
-                        max_lora_rank = None
-                self._runtime = await loop.run_in_executor(
-                    None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
-                )
-            if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
-                self._scheduler_thread = threading.Thread(
-                    target=self._scheduler_loop,
-                    name="kestrel-scheduler",
-                    daemon=True,
-                )
-                self._scheduler_thread.start()
-            if self._worker_task is None or self._worker_task.done():
-                self._worker_task = asyncio.create_task(self._worker_loop())
-            # Scheduler + worker are now up. The warmup pipeline below
-            # loops back through ``query()`` → ``_ensure_started``;
-            # ``_initializing`` keeps that recursive call from re-entering
-            # this body.
-            await self._warmup_query_pipeline()
-            if self._photon_reporter is None:
-                self._photon_reporter = PhotonReporter(
-                    self._runtime_cfg,
-                    self.runtime.device,
-                    api_key=self._api_key,
-                    api_base_url=self._api_base_url,
-                    engine=self,
-                )
-                await self._photon_reporter.validate_api_key()
-                self._photon_reporter.start()
-            # Flip the guard last so a failure partway through (runtime
-            # construction, warmup, photon) leaves the engine retry-able
-            # rather than wedged in a half-initialized state.
-            self._initialized = True
-        finally:
-            self._initializing = False
+                if not TRITON_AVAILABLE:
+                    _LOGGER.warning(
+                        "MoE LoRA adapters require triton, which is not installed. "
+                        "Disabling LoRA — base model inference will still work, but "
+                        "adapter requests will be rejected. Contact contact@moondream.ai "
+                        "if LoRA support is needed on your platform."
+                    )
+                    max_lora_rank = None
+            self._runtime = await loop.run_in_executor(
+                None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
+            )
+        if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
+            self._scheduler_thread = threading.Thread(
+                target=self._scheduler_loop,
+                name="kestrel-scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
+        # Scheduler + worker are now up. The warmup pipeline below
+        # loops back through ``query()`` → ``_ensure_started``; the
+        # ``_init_task is current_task`` check there keeps that
+        # recursive call from re-entering this body.
+        await self._warmup_query_pipeline()
+        if self._photon_reporter is None:
+            reporter = PhotonReporter(
+                self._runtime_cfg,
+                self.runtime.device,
+                api_key=self._api_key,
+                api_base_url=self._api_base_url,
+                engine=self,
+            )
+            await reporter.validate_api_key()
+            reporter.start()
+            # Only commit a successfully-validated, started reporter.
+            # If ``validate_api_key`` raises, the next ``_initialize``
+            # call will retry the build + validate.
+            self._photon_reporter = reporter
+        # Flip the guard last so a failure partway through (runtime
+        # construction, warmup, photon) leaves the engine retry-able
+        # rather than wedged in a half-initialized state.
+        self._initialized = True
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
@@ -1006,9 +1007,29 @@ class InferenceEngine:
         return future, req_id
 
     async def _ensure_started(self) -> None:
-        if self._initialized or self._initializing:
+        if self._initialized:
             return
-        await self._initialize()
+
+        # If init is already in flight on the current task (warmup
+        # pipeline calling back through ``query()``), bail without
+        # awaiting — awaiting our own task deadlocks.
+        current = asyncio.current_task()
+        if self._init_task is not None and self._init_task is current:
+            return
+
+        # If another caller has init in flight, wait for it.
+        if self._init_task is not None and not self._init_task.done():
+            await asyncio.shield(self._init_task)
+            if self._initialized:
+                return
+            # Init failed; fall through to retry below.
+
+        if self._init_task is None or self._init_task.done():
+            # Run ``_initialize`` as a Task so concurrent callers can
+            # wait on the same object (and ``current_task() is
+            # self._init_task`` catches the warmup recursion above).
+            self._init_task = asyncio.create_task(self._initialize())
+        await asyncio.shield(self._init_task)
 
     async def _worker_loop(self) -> None:
         shutdown_error = RuntimeError("Engine shut down")
