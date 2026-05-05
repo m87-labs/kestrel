@@ -47,13 +47,27 @@ def test_fake_runtime_implements_every_protocol_member() -> None:
     )
 
 
+def _is_required(param: inspect.Parameter) -> bool:
+    """A param is "required" if it has no default and isn't variadic."""
+
+    if param.default is not inspect.Parameter.empty:
+        return False
+    return param.kind not in (
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+    )
+
+
 def test_fake_runtime_method_signatures_accept_protocol_calls() -> None:
     """Every Protocol method's parameter list is satisfied by the fake.
 
-    ``FakeRuntime`` may add extra optional parameters (Liskov-allowed),
-    but every parameter ``Runtime`` declares must be present on the fake
-    with the same kind and not be more restrictive (impl can't require
-    a parameter the Protocol marks optional).
+    ``FakeRuntime`` may add extra *optional* parameters
+    (Liskov-allowed), but:
+    - every parameter ``Runtime`` declares must be present on the fake
+      with the same kind, and the fake can't require a parameter the
+      Protocol marks optional;
+    - the fake can't add an extra required parameter the Protocol
+      doesn't declare — Protocol-valid calls would raise ``TypeError``.
     """
 
     mismatches: list[str] = []
@@ -79,12 +93,19 @@ def test_fake_runtime_method_signatures_accept_protocol_calls() -> None:
                     f"{name}: parameter {pname!r} kind mismatch "
                     f"(proto={proto_p.kind.name} fake={fake_p.kind.name})"
                 )
-            proto_required = proto_p.default is inspect.Parameter.empty
-            fake_required = fake_p.default is inspect.Parameter.empty
-            if not proto_required and fake_required:
+            if not _is_required(proto_p) and _is_required(fake_p):
                 mismatches.append(
                     f"{name}: parameter {pname!r} is optional in Runtime but "
                     "required in FakeRuntime"
+                )
+
+        for pname, fake_p in fake_params.items():
+            if pname in proto_params:
+                continue
+            if _is_required(fake_p):
+                mismatches.append(
+                    f"{name}: extra required parameter {pname!r} on "
+                    "FakeRuntime that Runtime doesn't declare"
                 )
 
     assert mismatches == [], (
