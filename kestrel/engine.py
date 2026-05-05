@@ -55,6 +55,7 @@ import torch
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
 from kestrel.moondream.runtime import MoondreamRuntime
+from kestrel.runtime import Runtime
 from kestrel.scheduler import (
     GenerationScheduler,
     GenerationRequest,
@@ -210,7 +211,7 @@ class _ReadyAdmission:
 class _AdmissionCoordinator:
     def __init__(
         self,
-        runtime: MoondreamRuntime,
+        runtime: Runtime,
         image_preprocessor: ImagePreprocessor,
         wake_event: threading.Event,
         fail_request: Callable[[_PendingRequest, BaseException], None],
@@ -314,7 +315,7 @@ class InferenceEngine:
         self._api_key = api_key
         self._api_base_url = api_base_url
 
-        self._runtime: Optional[MoondreamRuntime] = None
+        self._runtime: Optional[Runtime] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
         self._scheduler_event = threading.Event()
@@ -343,7 +344,7 @@ class InferenceEngine:
         self._default_top_p = 0.9
 
     @property
-    def runtime(self) -> MoondreamRuntime:
+    def runtime(self) -> Runtime:
         if self._runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
         return self._runtime
@@ -1325,7 +1326,7 @@ class InferenceEngine:
 
     def _build_generation_request(
         self,
-        runtime: MoondreamRuntime,
+        runtime: Runtime,
         req: _PendingRequest,
         image_crops: Optional[OverlapCropOutput],
     ) -> tuple[GenerationRequest, SkillState]:
