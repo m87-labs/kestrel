@@ -72,3 +72,17 @@ def test_pool_rejects_negative_budget() -> None:
 def test_pool_normalizes_string_device() -> None:
     pool = KVMemoryPool(device="cpu")
     assert pool.device == torch.device("cpu")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
+)
+def test_pool_canonicalizes_indexless_cuda_device() -> None:
+    """``KVMemoryPool(device='cuda')`` must compare equal to the same
+    device built from ``RuntimeConfig`` so shared-pool wiring doesn't
+    raise on default single-GPU setups."""
+
+    pool = KVMemoryPool(device="cuda")
+    assert pool.device.type == "cuda"
+    assert pool.device.index == torch.cuda.current_device()
+    assert pool.device == torch.device("cuda", torch.cuda.current_device())

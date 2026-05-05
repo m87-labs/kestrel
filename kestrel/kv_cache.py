@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - optional on aarch64/Jetson
 
 from kestrel_kernels import get_runtime
 
+from kestrel.device import resolve_device
 from kestrel.utils import CpuGpuBuffer
 
 try:
@@ -87,7 +88,7 @@ class KVMemoryPool:
             raise ValueError(
                 f"budget_bytes must be non-negative, got {budget_bytes}"
             )
-        self.device = torch.device(device) if isinstance(device, str) else device
+        self.device = resolve_device(device)
         self.budget_bytes = budget_bytes
         self.allocated_bytes = 0
 
