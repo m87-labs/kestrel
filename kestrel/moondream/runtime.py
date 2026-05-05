@@ -1136,19 +1136,6 @@ class MoondreamRuntime:
         image_kv_length = self.image_prefix_length if has_image else 0
         prompt_len = len(tokens_list) + image_kv_length
 
-        # Build image_regions for attention masking. Until multi-image support,
-        # this must be either [] (no image) or [(1, 1+image_kv_length)] (single image).
-        if has_image:
-            image_regions: list[tuple[int, int]] = [(1, 1 + image_kv_length)]
-            # Validate single-image invariant
-            assert len(image_regions) == 1, "Multi-image not yet supported"
-            expected_region = (1, 1 + self.image_prefix_length)
-            assert image_regions[0] == expected_region, (
-                f"Unexpected image region {image_regions[0]}, expected {expected_region}"
-            )
-        else:
-            image_regions = []
-
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
         target_length = prompt_len + max_new
         if target_length > self.max_seq_length:
@@ -1198,7 +1185,6 @@ class MoondreamRuntime:
             # Treat mapped prefix pages as cache-owned so we never free them by accident.
             cache_owned_page_count=cache_result.skip_positions,
             reused_page_count=cache_result.skip_positions,
-            image_regions=image_regions if image_regions else None,
         )
 
         return PreparedSequence(
