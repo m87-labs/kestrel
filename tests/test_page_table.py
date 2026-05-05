@@ -24,11 +24,18 @@ class MockToken:
         return self._kv_len
 
 
+class _FakeRuntimeCfg:
+    """Minimal RuntimeConfig stub backing MoondreamRuntime.model_name."""
+
+    model = "test-model"
+
+
 def _make_runtime_for_cache(
     cache: RadixPrefixCache, page_table: PageTable
 ) -> runtime_mod.MoondreamRuntime:
     """Construct a minimal runtime instance for cache helper tests."""
     runtime = runtime_mod.MoondreamRuntime.__new__(runtime_mod.MoondreamRuntime)
+    runtime._cfg = _FakeRuntimeCfg()
     runtime.prefix_cache = cache
     runtime.page_table = page_table
     return runtime
@@ -908,7 +915,11 @@ class TestDuplicatePrefill:
         batch_a = page_table.allocate()
         pages_a = page_table.allocate_pages(prompt_len)
         page_table.map_pages(batch_a, 0, pages_a)
-        insert_a = cache.insert(tokens, pages_a)
+        # Insert A under the same runtime_id-scoped namespace
+        # _finalize_cache_after_prefill will use; otherwise B's finalize
+        # looks in a different tree and tries to insert a duplicate.
+        runtime_namespace = CacheNamespace(runtime_id="test-model")
+        insert_a = cache.insert(tokens, pages_a, namespace=runtime_namespace)
         cache.lock(insert_a.node)
         lock_ref_before = insert_a.node.lock_ref
 
@@ -960,17 +971,24 @@ class TestDuplicatePrefill:
         prefix_len = 3
         prefix_tokens = full_tokens[:prefix_len]
 
+        # All cache traffic in this test must use the same runtime_id-scoped
+        # namespace _finalize_cache_after_prefill will use; otherwise the
+        # finalize step looks at a different tree.
+        runtime_namespace = CacheNamespace(runtime_id="test-model")
+
         # Seed cache with prefix.
         batch_prefix = page_table.allocate()
         prefix_pages = page_table.allocate_pages(prefix_len)
         page_table.map_pages(batch_prefix, 0, prefix_pages)
-        prefix_insert = cache.insert(prefix_tokens, prefix_pages)
+        prefix_insert = cache.insert(
+            prefix_tokens, prefix_pages, namespace=runtime_namespace
+        )
         cache.lock(prefix_insert.node)
         cache.unlock(prefix_insert.node)
         page_table.erase(batch_prefix, cached_page_count=prefix_len)
 
         # Sequence B sees a partial hit and locks prefix.
-        match = cache.match_prefix(full_tokens)
+        match = cache.match_prefix(full_tokens, namespace=runtime_namespace)
         assert match.matched_kv_length == prefix_len
         temp_lock_node = match.last_node
         cache.lock_prefill(temp_lock_node)
@@ -988,6 +1006,7 @@ class TestDuplicatePrefill:
         insert_full = cache.insert(
             full_tokens,
             pages_a,
+            namespace=runtime_namespace,
             from_node=temp_lock_node,
             from_token_idx=prefix_len,
             from_page_idx=prefix_len,

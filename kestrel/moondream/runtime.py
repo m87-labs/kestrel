@@ -786,6 +786,7 @@ class MoondreamRuntime:
         # Build namespace
         image_hash_int = int.from_bytes(image_hash[:16], "big")
         namespace = CacheNamespace(
+            runtime_id=self.model_name,
             lora_id=adapter_id,
             image_hash=image_hash_int,
         )
@@ -819,6 +820,7 @@ class MoondreamRuntime:
                 )
             cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
             namespace = CacheNamespace(
+                runtime_id=self.model_name,
                 lora_id=adapter_id,
                 image_hash=(
                     int.from_bytes(image_hash[:16], "big") if image_hash is not None else None
@@ -886,6 +888,7 @@ class MoondreamRuntime:
             int.from_bytes(image_hash[:16], "big") if image_hash else None
         )
         namespace = CacheNamespace(
+            runtime_id=self.model_name,
             lora_id=adapter_id,
             image_hash=image_hash_int,
         )
@@ -1032,6 +1035,7 @@ class MoondreamRuntime:
         # Insert prompt into cache
         prompt_pages = self.page_table.get_pages(batch_idx, 0, prompt_len)
         namespace = CacheNamespace(
+            runtime_id=self.model_name,
             lora_id=adapter_id,
             image_hash=(
                 int.from_bytes(image_hash[:16], "big") if image_hash else None

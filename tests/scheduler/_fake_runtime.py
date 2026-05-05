@@ -88,6 +88,7 @@ class FakeRuntime:
     def __init__(
         self,
         *,
+        model_name: str = "fake",
         max_batch_size: int = 1,
         max_batch_slots: int = 2,
         max_seq_length: int = 1024,
@@ -100,6 +101,9 @@ class FakeRuntime:
         prepare_result: PreparedSequence | None = None,
         launch_logits: torch.Tensor | None = None,
     ) -> None:
+        # Identity
+        self.model_name = model_name
+
         # Capacity / shape
         self.max_batch_size = max_batch_size
         self.max_batch_slots = max_batch_slots

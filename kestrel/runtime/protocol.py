@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 class Runtime(Protocol):
     """Surface that the engine and scheduler call on a runtime."""
 
+    # Identity. Stable across the runtime's lifetime; used to scope
+    # prefix-cache entries and (later) to route requests in a
+    # multi-runtime engine.
+    model_name: str
+
     # Capacity / shape
     max_batch_size: int
     max_batch_slots: int
