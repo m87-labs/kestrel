@@ -6,17 +6,17 @@ batching, and decode pacing without knowing which model is actually
 running. Concrete runtimes (today: ``MoondreamRuntime``) implement the
 methods declared here.
 
-Model-specific parameter types — image crops, adapter objects, prefill
-and decode slots — are typed as ``Any`` so the protocol stays
-model-agnostic. Concrete runtimes narrow them.
+Some attributes are typed as ``Any`` because they expose model-specific
+state the scheduler currently reaches into directly (config, region,
+spatial decoding tables, prefill / decode slot containers). Tightening
+those — or refactoring the scheduler to stop reaching into them — is a
+follow-up; declaring them here keeps the protocol an honest record of
+the surface a runtime must satisfy today.
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence
-
-import numpy as np
-from torch import Tensor
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from kestrel.runtime.state import (
     PrefillClassification,
@@ -25,18 +25,44 @@ from kestrel.runtime.state import (
 )
 from kestrel.runtime.tokens import Token
 
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
+    from torch import Tensor
+
 
 class Runtime(Protocol):
     """Surface that :class:`GenerationScheduler` calls on a runtime."""
 
+    # Capacity / shape
     max_batch_size: int
+    max_batch_slots: int
     max_seq_length: int
     image_prefix_length: int
 
+    # Device + streams
+    device: torch.device
+    primary_stream: Any
+    copy_stream: Any
+
+    # Slot containers + sequence registry
+    prefill_slots: Sequence[Any]
+    decode_slots: Sequence[Any]
+    active_sequences: Mapping[int, SequenceState]
+
+    # Model-specific state the scheduler reaches into today.
+    # Narrowing these is a follow-up.
+    config: Any
+    region: Any
+    spatial_tables: Any
+    page_table: Any
+
+    # Capacity queries
     def can_reserve(self, total_length: int) -> bool: ...
 
     def prefill_budget(self) -> tuple[int, int]: ...
 
+    # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...
 
     def release_prefill_slot(self, slot: Any) -> None: ...
@@ -45,6 +71,7 @@ class Runtime(Protocol):
 
     def release_adapter_slot(self, slot: int) -> None: ...
 
+    # Prefill / decode
     def classify_prefill(
         self,
         prompt_tokens: Sequence[Token],
