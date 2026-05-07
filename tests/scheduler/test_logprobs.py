@@ -75,6 +75,21 @@ def test_scheduler_result_returns_requested_token_logprobs() -> None:
     assert result.logprobs == [-1.25, -0.5]
 
 
+def test_scheduler_result_rejects_misaligned_logprobs() -> None:
+    seq = _make_lifecycle(return_logprobs=True)
+    seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-1.25)
+    seq.logprobs.append(-0.5)
+
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace()
+    result = GenerationScheduler._build_result(scheduler, seq)
+
+    assert result.tokens == []
+    assert result.logprobs is None
+    assert result.finish_reason == "error"
+    assert result.output == {"error": "Internal logprobs/token alignment mismatch"}
+
+
 def test_requested_logprobs_require_sampling_result() -> None:
     seq = _make_lifecycle(return_logprobs=True)
 

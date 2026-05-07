@@ -1418,6 +1418,24 @@ class GenerationScheduler:
             tokens = []
             output = {"error": str(exc)}
 
+        logprobs = None
+        if seq.request.return_logprobs is True:
+            logprobs = list(seq.logprobs)
+            if len(logprobs) != len(tokens):
+                _LOGGER.error(
+                    "Logprob/token count mismatch for request %s: "
+                    "%s logprob(s) for %s token(s)",
+                    seq.request.request_id,
+                    len(logprobs),
+                    len(tokens),
+                )
+                finish_reason = "error"
+                tokens = []
+                output = {
+                    "error": "Internal logprobs/token alignment mismatch"
+                }
+                logprobs = None
+
         decode_tokens = len(tokens) if tokens else len(seq.skill_state.tokens)
         metrics = seq.build_metrics(decode_tokens=decode_tokens)
         return SchedulerResult(
@@ -1426,5 +1444,5 @@ class GenerationScheduler:
             finish_reason=finish_reason,
             metrics=metrics,
             output=output,
-            logprobs=list(seq.logprobs) if seq.request.return_logprobs is True else None,
+            logprobs=logprobs,
         )
