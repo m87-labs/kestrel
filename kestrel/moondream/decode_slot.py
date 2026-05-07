@@ -73,6 +73,7 @@ class DecodeSlot:
 
         # GPU staging buffers for sampled outputs (per-slot to avoid clobbering)
         sampled_ids: GPU buffer for sampled token IDs.
+        sampled_logprobs: GPU buffer for sampled token logprobs.
         coord_staging: GPU buffer for decoded coord values.
         size_staging: GPU buffer for decoded size values.
 
@@ -101,6 +102,7 @@ class DecodeSlot:
 
     # GPU staging for sampled outputs
     sampled_ids: Tensor
+    sampled_logprobs: Tensor
     coord_staging: Tensor
     size_staging: Tensor
 
@@ -210,6 +212,11 @@ def create_decode_slot(
         dtype=torch.long,
         device=device,
     )
+    sampled_logprobs = torch.empty(
+        (max_batch_slots,),
+        dtype=torch.float32,
+        device=device,
+    )
     coord_staging = torch.empty(
         (max_batch_slots, 1),
         dtype=coord_dtype,
@@ -264,6 +271,7 @@ def create_decode_slot(
         fa3_page_table=fa3_page_table,
         fa3_seqused_k=fa3_seqused_k,
         sampled_ids=sampled_ids,
+        sampled_logprobs=sampled_logprobs,
         coord_staging=coord_staging,
         size_staging=size_staging,
         logits=logits,

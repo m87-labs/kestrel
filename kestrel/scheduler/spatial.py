@@ -22,6 +22,9 @@ def compute_spatial_values(
     *,
     temperatures: Tensor | None = None,
     top_ps: Tensor | None = None,
+    token_logprobs: Tensor | None = None,
+    coord_id: int | None = None,
+    size_id: int | None = None,
     out_coord: Tensor,
     out_size: Tensor,
     rng: Optional[torch.Generator] = None,
@@ -35,6 +38,9 @@ def compute_spatial_values(
         spatial_tables: Precomputed spatial decode tables.
         temperatures: Per-request temperatures [batch] (optional).
         top_ps: Per-request top_p values [batch] (optional).
+        token_logprobs: Optional per-token logprob buffer to update in-place.
+        coord_id: Vocabulary id for coord tokens when token_logprobs is provided.
+        size_id: Vocabulary id for size tokens when token_logprobs is provided.
         out_coord: Output buffer for coord values [batch, 1].
         out_size: Output buffer for size values [batch, 2].
         rng: Random generator for sampling (if None, uses greedy decoding).
@@ -50,6 +56,10 @@ def compute_spatial_values(
         coord_decode = torch.empty((0, 1), device=device, dtype=out_coord.dtype)
         size_decode = torch.empty((0, 2), device=device, dtype=out_size.dtype)
         return coord_decode, size_decode
+    if token_logprobs is not None and (coord_id is None or size_id is None):
+        raise AssertionError(
+            "coord_id and size_id are required when token_logprobs is provided"
+        )
 
     hidden = hidden_last.unsqueeze(0) if hidden_last.ndim == 1 else hidden_last
 
@@ -67,8 +77,19 @@ def compute_spatial_values(
         height_bins = torch.argmax(height_logits, dim=-1)
     else:
         assert temperatures is not None and top_ps is not None
+        coord_logprobs = (
+            torch.empty((batch,), dtype=torch.float32, device=hidden.device)
+            if token_logprobs is not None
+            else None
+        )
+        coord_kwargs = {"generator": rng}
+        if coord_logprobs is not None:
+            coord_kwargs["logprobs_out"] = coord_logprobs
         coord_bins_raw = sample_step_from_logits(
-            coord_logits, temperatures, top_ps, generator=rng
+            coord_logits,
+            temperatures,
+            top_ps,
+            **coord_kwargs,
         )
         # Ensure long dtype for indexing
         if coord_bins_raw.dtype == torch.long:
@@ -77,11 +98,19 @@ def compute_spatial_values(
             coord_bins = coord_bins_raw.to(torch.long)
 
         logits_2 = torch.cat((width_logits, height_logits), dim=0)
+        size_logprobs = (
+            torch.empty((batch * 2,), dtype=torch.float32, device=hidden.device)
+            if token_logprobs is not None
+            else None
+        )
+        size_kwargs = {"generator": rng}
+        if size_logprobs is not None:
+            size_kwargs["logprobs_out"] = size_logprobs
         bins_2_raw = sample_step_from_logits(
             logits_2,
             temperatures.repeat(2),
             top_ps.repeat(2),
-            generator=rng,
+            **size_kwargs,
         )
         if bins_2_raw.dtype == torch.long:
             bins_2 = bins_2_raw
@@ -89,6 +118,29 @@ def compute_spatial_values(
             bins_2 = bins_2_raw.to(torch.long)
         width_bins = bins_2[:batch]
         height_bins = bins_2[batch:]
+        if token_logprobs is not None:
+            assert coord_id is not None and size_id is not None
+            assert coord_logprobs is not None and size_logprobs is not None
+            row_token_ids = token_ids.view(-1)[:batch]
+            coord_mask = row_token_ids == int(coord_id)
+            size_mask = row_token_ids == int(size_id)
+            token_logprobs[:batch].add_(
+                torch.where(
+                    coord_mask,
+                    coord_logprobs,
+                    torch.zeros_like(coord_logprobs),
+                )
+            )
+            width_logprobs = size_logprobs[:batch]
+            height_logprobs = size_logprobs[batch:]
+            size_token_logprobs = width_logprobs + height_logprobs
+            token_logprobs[:batch].add_(
+                torch.where(
+                    size_mask,
+                    size_token_logprobs,
+                    torch.zeros_like(size_token_logprobs),
+                )
+            )
 
     coord_out = out_coord[:batch]
     size_out = out_size[:batch]

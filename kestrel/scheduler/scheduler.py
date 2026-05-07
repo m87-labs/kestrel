@@ -62,6 +62,7 @@ class PrefillStaging:
     """Per-prefill staging buffers and RenderBuffer for D2H."""
 
     sampled_ids: Tensor
+    sampled_logprobs: Tensor
     coord_staging: Tensor
     size_staging: Tensor
     render: RenderBuffer
@@ -262,6 +263,11 @@ class GenerationScheduler:
                     sampled_ids=torch.empty(
                         (runtime.max_batch_size,),
                         dtype=torch.long,
+                        device=runtime.device,
+                    ),
+                    sampled_logprobs=torch.empty(
+                        (runtime.max_batch_size,),
+                        dtype=torch.float32,
                         device=runtime.device,
                     ),
                     coord_staging=torch.empty(
@@ -557,11 +563,12 @@ class GenerationScheduler:
         if batch_size == 0:
             raise AssertionError("Prefill finalize requires at least one sequence")
 
-        sampled_ids, temps, top_ps = self._sample_batch(
+        sampled_ids, temps, top_ps, sampled_logprobs = self._sample_batch(
             logits,
             sequences,
             staging.sampled_ids,
             batch_idx=prefill_slot.batch_idx[:batch_size],
+            logprobs_out=staging.sampled_logprobs[:batch_size],
         )
         hidden_rows: list[Tensor] = []
         for seq in sequences:
@@ -579,6 +586,9 @@ class GenerationScheduler:
             self.runtime.spatial_tables,
             temperatures=temps,
             top_ps=top_ps,
+            token_logprobs=sampled_logprobs,
+            coord_id=self._coord_id,
+            size_id=self._size_id,
             out_coord=coord_out,
             out_size=size_out,
             rng=self._sampling_rng,
@@ -596,7 +606,11 @@ class GenerationScheduler:
             self.running.push(seq)
 
         transfer = staging.render.transfer(
-            sampled_ids, coord_decode, size_decode, ready_event=prefill_slot.step_done_event
+            sampled_ids,
+            coord_decode,
+            size_decode,
+            ready_event=prefill_slot.step_done_event,
+            logprobs=sampled_logprobs,
         )
         return PendingCommit(
             kind="prefill",
@@ -610,8 +624,10 @@ class GenerationScheduler:
             ),
         )
 
-    def _commit_prefill(self, step: PendingCommit) -> list[Token]:
-        """Commit a prefill PendingCommit and return the first tokens."""
+    def _commit_prefill(
+        self, step: PendingCommit
+    ) -> tuple[list[Token], Tensor | None]:
+        """Commit a prefill PendingCommit and return first tokens/logprobs."""
         if step.kind != "prefill":
             raise AssertionError("prefill commit requires a prefill pending commit")
         payload = step.payload
@@ -621,7 +637,7 @@ class GenerationScheduler:
         prepared_sequences = payload.prepared_sequences
         prefill_slot = payload.prefill_slot
         try:
-            token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+            token_ids_cpu, coord_cpu, size_cpu, logprobs_cpu = step.transfer.wait()
             prefill_slot.commit_done_event.synchronize()
             for prepared in prepared_sequences:
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared)
@@ -635,7 +651,7 @@ class GenerationScheduler:
         finally:
             self._release_prefill_staging(staging)
             self.runtime.release_prefill_slot(prefill_slot)
-        return tokens
+        return tokens, logprobs_cpu
 
     def _launch_prefill_step(self, pipeline: PipelineState) -> bool:
         """Launch a prefill forward and enqueue it into the shared pipeline.
@@ -1073,8 +1089,12 @@ class GenerationScheduler:
 
         # Sample tokens directly into per-slot staging buffer for D2H.
         # This prevents race with next step's sampling writing to shared buffer.
-        sampled_ids, temps, top_ps = self._sample_batch(
-            logits, sequences, slot.sampled_ids, batch_idx=batch_idx
+        sampled_ids, temps, top_ps, sampled_logprobs = self._sample_batch(
+            logits,
+            sequences,
+            slot.sampled_ids,
+            batch_idx=batch_idx,
+            logprobs_out=slot.sampled_logprobs[:batch_size],
         )
 
         # Compute spatial values into slot's staging buffers
@@ -1087,6 +1107,9 @@ class GenerationScheduler:
             self.runtime.spatial_tables,
             temperatures=temps,
             top_ps=top_ps,
+            token_logprobs=sampled_logprobs,
+            coord_id=self._coord_id,
+            size_id=self._size_id,
             out_coord=coord_staging,
             out_size=size_staging,
             rng=self._sampling_rng,
@@ -1117,6 +1140,7 @@ class GenerationScheduler:
             coord_staging,
             size_staging,
             ready_event=slot.step_done_event,
+            logprobs=sampled_logprobs,
         )
 
         return PendingCommit(
@@ -1138,14 +1162,15 @@ class GenerationScheduler:
         at commit time and released when their last step completes.
         """
         if step.kind == "prefill":
-            tokens = self._commit_prefill(step)
+            tokens, logprobs_cpu = self._commit_prefill(step)
             if len(tokens) != len(step.sequences):
                 raise RuntimeError(
                     "Prefill token count mismatch: "
                     f"{len(tokens)} token(s) for {len(step.sequences)} sequence(s)"
                 )
-            for seq, token in zip(step.sequences, tokens):
-                seq.stage_token(self.runtime, token)
+            logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
+            for seq, token, logprob in zip(step.sequences, tokens, logprobs):
+                seq.stage_token(self.runtime, token, logprob=logprob)
                 seq.uncommitted_prefill_token = False
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
@@ -1161,7 +1186,7 @@ class GenerationScheduler:
             raise AssertionError(f"Unsupported commit kind {step.kind!r}")
 
         # Wait for D2H transfer
-        token_ids_cpu, coord_cpu, size_cpu = step.transfer.wait()
+        token_ids_cpu, coord_cpu, size_cpu, logprobs_cpu = step.transfer.wait()
 
         # Ensure `_pending_*` writes for this step have completed before we release
         # or reuse any batch indices (these writes intentionally do not gate D2H).
@@ -1173,9 +1198,10 @@ class GenerationScheduler:
             token_ids_cpu, coord_cpu, size_cpu,
             coord_id=self._coord_id, size_id=self._size_id,
         )
+        logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
 
         # Commit each sequence
-        for seq, token in zip(step.sequences, tokens):
+        for seq, token, logprob in zip(step.sequences, tokens, logprobs):
             seq.inflight_refs -= 1
 
             # Skip zombies (already finalized in a previous step)
@@ -1186,7 +1212,7 @@ class GenerationScheduler:
                 continue
 
             # Stage token (calls consume_step, emits streaming)
-            seq.stage_token(self.runtime, token)
+            seq.stage_token(self.runtime, token, logprob=logprob)
 
             # Check for termination
             if self._mark_finished_if_needed(seq):
@@ -1214,7 +1240,8 @@ class GenerationScheduler:
         out: Tensor,
         *,
         batch_idx: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        logprobs_out: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
         """Sample tokens from logits into the provided output buffer.
 
         Args:
@@ -1226,12 +1253,14 @@ class GenerationScheduler:
                 shape [batch] or larger, dtype long.
 
         Returns:
-            Tuple of (sampled_ids, temps, top_ps). sampled_ids is a view of
-            out[:batch].
+            Tuple of (sampled_ids, temps, top_ps, logprobs). sampled_ids is a
+            view of out[:batch]. logprobs is a view of logprobs_out[:batch]
+            when at least one sequence requested logprobs, otherwise None.
         """
         batch = len(sequences)
         if batch == 0:
-            return out[:0], None, None
+            empty_logprobs = None if logprobs_out is None else logprobs_out[:0]
+            return out[:0], None, None, empty_logprobs
 
         allowed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
@@ -1266,9 +1295,17 @@ class GenerationScheduler:
                 idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
                 logits[i, idx] = float("-inf")
 
+        want_logprobs = (
+            logprobs_out is not None
+            and any(seq.request.return_logprobs is True for seq in sequences)
+        )
+        logprobs = logprobs_out[:batch] if want_logprobs else None
+
         if all(seq.request.temperature <= 0.0 for seq in sequences):
             torch.argmax(logits, dim=-1, out=out[:batch])
-            return out[:batch], None, None
+            if logprobs is not None:
+                logprobs.zero_()
+            return out[:batch], None, None, logprobs
 
         if batch_idx is None:
             raise AssertionError("batch_idx is required for non-greedy sampling")
@@ -1277,9 +1314,34 @@ class GenerationScheduler:
         top_ps = self._sampling_top_ps[:batch]
         torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
         torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
-        sampled_raw = sample_step_from_logits(logits, temps, top_ps, generator=self._sampling_rng)
-        out[:batch].copy_(sampled_raw)
-        return out[:batch], temps, top_ps
+        out_view = out[:batch]
+        sample_kwargs = {
+            "out": out_view,
+            "generator": self._sampling_rng,
+        }
+        if logprobs is not None:
+            sample_kwargs["logprobs_out"] = logprobs
+        sampled_raw = sample_step_from_logits(
+            logits,
+            temps,
+            top_ps,
+            **sample_kwargs,
+        )
+        if sampled_raw is not out_view:
+            out_view.copy_(sampled_raw)
+        return out_view, temps, top_ps, logprobs
+
+    def _logprobs_for_sequences(
+        self,
+        sequences: Sequence[RequestLifecycle],
+        logprobs_cpu: Tensor | None,
+    ) -> list[float | None]:
+        if logprobs_cpu is None:
+            return [None] * len(sequences)
+        return [
+            float(logprobs_cpu[i].item()) if seq.request.return_logprobs is True else None
+            for i, seq in enumerate(sequences)
+        ]
 
     def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
@@ -1364,4 +1426,5 @@ class GenerationScheduler:
             finish_reason=finish_reason,
             metrics=metrics,
             output=output,
+            logprobs=list(seq.logprobs) if seq.request.return_logprobs is True else None,
         )

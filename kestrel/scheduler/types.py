@@ -54,6 +54,7 @@ class RequestLifecycle:
     # Output
     finish_reason: Optional[str] = None
     error: Optional[BaseException] = None
+    logprobs: List[float] = field(default_factory=list)
 
     def transition(self, phase: RequestPhase) -> None:
         """Update phase with minimal bookkeeping."""
@@ -101,6 +102,8 @@ class RequestLifecycle:
         self,
         runtime: Runtime,
         token: Token,
+        *,
+        logprob: float | None = None,
     ) -> None:
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
@@ -110,6 +113,12 @@ class RequestLifecycle:
             RequestPhase.COMPLETED,
         ):
             self.transition(RequestPhase.RUNNING)
+        if self.request.return_logprobs is True:
+            if logprob is None:
+                raise RuntimeError(
+                    "Missing token logprob for request that asked for logprobs"
+                )
+            self.logprobs.append(float(logprob))
         step = DecodeStep(
             token=token,
             position=self.skill_state.token_count,
@@ -167,6 +176,7 @@ class GenerationRequest:
     lifecycle: RequestLifecycle = field(init=False, repr=False)
     adapter: Optional[str] = None
     lora_slot: int = 0  # Slot in workspace; 0 = no LoRA
+    return_logprobs: Optional[bool] = None
 
     prompt_length: int = field(init=False)
 
@@ -197,6 +207,7 @@ class SchedulerResult:
     finish_reason: str
     metrics: "RequestMetrics"
     output: Dict[str, object]
+    logprobs: Optional[List[float]] = None
 
 
 @dataclass
