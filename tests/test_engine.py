@@ -176,13 +176,13 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     assert str(failures[0][1]) == "crop failed"
 
 
-def test_extract_private_return_logprobs_setting() -> None:
+def test_extract_private_logprobs_setting() -> None:
     engine = object.__new__(InferenceEngine)
 
-    assert engine._extract_return_logprobs(None) is None
-    assert engine._extract_return_logprobs({}) is None
-    assert engine._extract_return_logprobs({"_return_logprobs": None}) is None
-    assert engine._extract_return_logprobs({"_return_logprobs": True}) is True
-    assert engine._extract_return_logprobs({"_return_logprobs": False}) is False
-    with pytest.raises(TypeError, match="settings._return_logprobs"):
-        engine._extract_return_logprobs({"_return_logprobs": 1})
+    assert engine._extract_logprobs(None) is None
+    assert engine._extract_logprobs({}) is None
+    assert engine._extract_logprobs({"_logprobs": None}) is None
+    assert engine._extract_logprobs({"_logprobs": True}) is True
+    assert engine._extract_logprobs({"_logprobs": False}) is False
+    with pytest.raises(TypeError, match="settings._logprobs"):
+        engine._extract_logprobs({"_logprobs": 1})

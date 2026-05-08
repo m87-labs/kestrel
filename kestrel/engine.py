@@ -540,7 +540,7 @@ class InferenceEngine:
         image: Optional[np.ndarray | bytes] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        _return_logprobs: Optional[bool] = None,
+        _logprobs: Optional[bool] = None,
     ) -> EngineResult:
         future, _ = await self._submit_request(
             max_new_tokens=max_new_tokens,
@@ -549,7 +549,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            return_logprobs=_return_logprobs,
+            return_logprobs=_logprobs,
             stream_queue=None,
             skill=skill,
         )
@@ -609,7 +609,7 @@ class InferenceEngine:
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
         adapter: Optional[str] = None
-        return_logprobs = self._extract_return_logprobs(settings)
+        return_logprobs = self._extract_logprobs(settings)
         if settings is not None:
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
@@ -654,7 +654,7 @@ class InferenceEngine:
                 image=image,
                 temperature=temperature,
                 top_p=top_p,
-                _return_logprobs=return_logprobs,
+                _logprobs=return_logprobs,
                 skill="query",
             )
         return await self.submit(
@@ -664,7 +664,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            _return_logprobs=return_logprobs,
+            _logprobs=return_logprobs,
             skill="query",
         )
 
@@ -679,7 +679,7 @@ class InferenceEngine:
             raise ValueError("object must be a non-empty string")
 
         adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_return_logprobs(settings)
+        return_logprobs = self._extract_logprobs(settings)
         max_tokens = self._default_max_new_tokens
         max_objects = None
         temperature = 0.0
@@ -713,7 +713,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            _return_logprobs=return_logprobs,
+            _logprobs=return_logprobs,
             skill="point",
         )
 
@@ -763,7 +763,7 @@ class InferenceEngine:
             raise ValueError(f"length must be one of: {valid}")
 
         adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_return_logprobs(settings)
+        return_logprobs = self._extract_logprobs(settings)
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
@@ -796,7 +796,7 @@ class InferenceEngine:
                 image=image,
                 temperature=temperature,
                 top_p=top_p,
-                _return_logprobs=return_logprobs,
+                _logprobs=return_logprobs,
                 skill="caption",
             )
         return await self.submit(
@@ -806,7 +806,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            _return_logprobs=return_logprobs,
+            _logprobs=return_logprobs,
             skill="caption",
         )
 
@@ -821,7 +821,7 @@ class InferenceEngine:
             raise ValueError("object must be a non-empty string")
 
         adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_return_logprobs(settings)
+        return_logprobs = self._extract_logprobs(settings)
         max_objects = 50
         temperature = 0.0
         top_p = 1.0
@@ -850,7 +850,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            _return_logprobs=return_logprobs,
+            _logprobs=return_logprobs,
             skill="detect",
         )
 
@@ -867,7 +867,7 @@ class InferenceEngine:
             raise ValueError("object must be a non-empty string")
 
         adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_return_logprobs(settings)
+        return_logprobs = self._extract_logprobs(settings)
         temperature = 0.0
         top_p = 1.0
         max_tokens = self._default_max_new_tokens
@@ -907,7 +907,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            _return_logprobs=return_logprobs,
+            _logprobs=return_logprobs,
             skill="segment",
         )
 
@@ -921,7 +921,7 @@ class InferenceEngine:
         image: Optional[np.ndarray | bytes] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        _return_logprobs: Optional[bool] = None,
+        _logprobs: Optional[bool] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         future, request_id = await self._submit_request(
@@ -931,7 +931,7 @@ class InferenceEngine:
             image=image,
             temperature=temperature,
             top_p=top_p,
-            return_logprobs=_return_logprobs,
+            return_logprobs=_logprobs,
             stream_queue=queue,
             skill=skill,
         )
@@ -1149,16 +1149,16 @@ class InferenceEngine:
             raise TypeError("settings.adapter must be a string or None")
         return self._normalize_adapter_id(raw)
 
-    def _extract_return_logprobs(
+    def _extract_logprobs(
         self, settings: Optional[Mapping[str, object]]
     ) -> Optional[bool]:
-        if settings is None or "_return_logprobs" not in settings:
+        if settings is None or "_logprobs" not in settings:
             return None
-        raw = settings["_return_logprobs"]
+        raw = settings["_logprobs"]
         if raw is None:
             return None
         if not isinstance(raw, bool):
-            raise TypeError("settings._return_logprobs must be a bool or None")
+            raise TypeError("settings._logprobs must be a bool or None")
         return raw
 
     def _build_stream_callback(

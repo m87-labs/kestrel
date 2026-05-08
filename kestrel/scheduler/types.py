@@ -113,17 +113,17 @@ class RequestLifecycle:
             RequestPhase.COMPLETED,
         ):
             self.transition(RequestPhase.RUNNING)
+        step = DecodeStep(
+            token=token,
+            position=self.skill_state.token_count,
+        )
+        self.skill_state.consume_step(runtime, step)
         if self.request.return_logprobs is True:
             if logprob is None:
                 raise RuntimeError(
                     "Missing token logprob for request that asked for logprobs"
                 )
             self.logprobs.append(float(logprob))
-        step = DecodeStep(
-            token=token,
-            position=self.skill_state.token_count,
-        )
-        self.skill_state.consume_step(runtime, step)
         callback = self.request.stream_callback
         if callback is not None:
             delta = self.skill_state.pop_stream_delta(runtime)

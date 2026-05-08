@@ -27,11 +27,17 @@ class _SkillStateStub(SkillState):
         self.append_token(step.token)
 
     def finalize(self, runtime: object, *, reason: str) -> SkillFinalizeResult:
-        return SkillFinalizeResult(
-            text="",
-            tokens=list(self.tokens),
-            output={},
-        )
+        return SkillFinalizeResult(text="", tokens=list(self.tokens), output={})
+
+
+class _FailingConsumeSkillState(_SkillStateStub):
+    def consume_step(self, runtime: object, step: DecodeStep) -> None:
+        raise RuntimeError("consume failed")
+
+
+class _FailingFinalizeSkillState(_SkillStateStub):
+    def finalize(self, runtime: object, *, reason: str) -> SkillFinalizeResult:
+        raise RuntimeError("finalize failed")
 
 
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
@@ -50,13 +56,78 @@ def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
     return lifecycle
 
 
+def _make_lifecycle_with_state(
+    state_cls: type[_SkillStateStub],
+    *,
+    return_logprobs: bool | None,
+) -> RequestLifecycle:
+    seq = _make_lifecycle(return_logprobs=return_logprobs)
+    state = state_cls(seq.request)
+    seq.skill_state = state
+    seq.request.skill_state = state
+    return seq
+
+
+def _scheduler(batch: int = 1) -> GenerationScheduler:
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace()
+    scheduler._sampling_rng = torch.Generator()
+    scheduler._sampling_temps = torch.empty((batch,), dtype=torch.float32)
+    scheduler._sampling_top_ps = torch.empty((batch,), dtype=torch.float32)
+    scheduler._sampling_temps_by_batch = torch.full(
+        (batch,), 0.7, dtype=torch.float32
+    )
+    scheduler._sampling_top_ps_by_batch = torch.ones((batch,), dtype=torch.float32)
+    return scheduler
+
+
+def _sequence(*, temperature: float, return_logprobs: bool | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        finalized=False,
+        skill_state=SimpleNamespace(
+            allowed_token_ids=lambda runtime: None,
+            suppressed_token_ids=lambda runtime: None,
+        ),
+        request=SimpleNamespace(
+            temperature=temperature,
+            return_logprobs=return_logprobs,
+        ),
+    )
+
+
+def _spatial_tables(dim: int) -> SpatialDecodeTables:
+    values = torch.arange(dim, dtype=torch.float32)
+    return SpatialDecodeTables(
+        coord_value_lut=values,
+        size_value_lut=values,
+        coord_logits_dim=dim,
+    )
+
+
+def _patch_spatial_logits(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    batch: int,
+    dim: int,
+) -> None:
+    def fake_spatial_decode_logits(
+        hidden: torch.Tensor,
+        tables: SpatialDecodeTables,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        shape = (batch, dim)
+        return torch.zeros(shape), torch.zeros(shape), torch.zeros(shape)
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.spatial.spatial_decode_logits",
+        fake_spatial_decode_logits,
+    )
+
+
 def test_scheduler_result_omits_logprobs_by_default() -> None:
     seq = _make_lifecycle(return_logprobs=None)
     seq.stage_token(SimpleNamespace(), TextToken(10))
 
-    scheduler = object.__new__(GenerationScheduler)
-    scheduler.runtime = SimpleNamespace()
-    result = GenerationScheduler._build_result(scheduler, seq)
+    result = GenerationScheduler._build_result(_scheduler(), seq)
 
     assert result.tokens == [TextToken(10)]
     assert result.logprobs is None
@@ -67,9 +138,7 @@ def test_scheduler_result_returns_requested_token_logprobs() -> None:
     seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-1.25)
     seq.stage_token(SimpleNamespace(), TextToken(11), logprob=-0.5)
 
-    scheduler = object.__new__(GenerationScheduler)
-    scheduler.runtime = SimpleNamespace()
-    result = GenerationScheduler._build_result(scheduler, seq)
+    result = GenerationScheduler._build_result(_scheduler(), seq)
 
     assert result.tokens == [TextToken(10), TextToken(11)]
     assert result.logprobs == [-1.25, -0.5]
@@ -80,9 +149,7 @@ def test_scheduler_result_rejects_misaligned_logprobs() -> None:
     seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-1.25)
     seq.logprobs.append(-0.5)
 
-    scheduler = object.__new__(GenerationScheduler)
-    scheduler.runtime = SimpleNamespace()
-    result = GenerationScheduler._build_result(scheduler, seq)
+    result = GenerationScheduler._build_result(_scheduler(), seq)
 
     assert result.tokens == []
     assert result.logprobs is None
@@ -97,7 +164,35 @@ def test_requested_logprobs_require_sampling_result() -> None:
         seq.stage_token(SimpleNamespace(), TextToken(10))
 
 
-def test_sample_batch_omits_logprob_keyword_without_opt_in(monkeypatch) -> None:
+def test_logprob_is_not_appended_when_token_consume_fails() -> None:
+    seq = _make_lifecycle_with_state(
+        _FailingConsumeSkillState,
+        return_logprobs=True,
+    )
+
+    with pytest.raises(RuntimeError, match="consume failed"):
+        seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-1.25)
+
+    assert seq.logprobs == []
+
+
+def test_logprob_alignment_check_preserves_finalize_error() -> None:
+    seq = _make_lifecycle_with_state(
+        _FailingFinalizeSkillState,
+        return_logprobs=True,
+    )
+    seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-1.25)
+
+    result = GenerationScheduler._build_result(_scheduler(), seq)
+
+    assert result.finish_reason == "error"
+    assert result.output == {"error": "finalize failed"}
+    assert result.logprobs is None
+
+
+def test_sample_batch_omits_logprob_keyword_without_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def fake_sample_step_from_logits(
         logits: torch.Tensor,
         temperatures: torch.Tensor,
@@ -116,28 +211,11 @@ def test_sample_batch_omits_logprob_keyword_without_opt_in(monkeypatch) -> None:
         "kestrel.scheduler.scheduler.sample_step_from_logits",
         fake_sample_step_from_logits,
     )
-    scheduler = object.__new__(GenerationScheduler)
-    scheduler.runtime = SimpleNamespace()
-    scheduler._sampling_rng = torch.Generator()
-    scheduler._sampling_temps_by_batch = torch.tensor([0.7], dtype=torch.float32)
-    scheduler._sampling_top_ps_by_batch = torch.tensor([1.0], dtype=torch.float32)
-    scheduler._sampling_temps = torch.empty((1,), dtype=torch.float32)
-    scheduler._sampling_top_ps = torch.empty((1,), dtype=torch.float32)
-    seqs = [
-        SimpleNamespace(
-            finalized=False,
-            skill_state=SimpleNamespace(
-                allowed_token_ids=lambda runtime: None,
-                suppressed_token_ids=lambda runtime: None,
-            ),
-            request=SimpleNamespace(temperature=0.7, return_logprobs=None),
-        )
-    ]
 
     sampled, _, _, logprobs = GenerationScheduler._sample_batch(
-        scheduler,
+        _scheduler(),
         torch.zeros((1, 8), dtype=torch.float32),
-        seqs,  # type: ignore[arg-type]
+        [_sequence(temperature=0.7, return_logprobs=None)],  # type: ignore[list-item]
         torch.empty((1,), dtype=torch.long),
         batch_idx=torch.tensor([0], dtype=torch.long),
         logprobs_out=torch.empty((1,), dtype=torch.float32),
@@ -147,29 +225,65 @@ def test_sample_batch_omits_logprob_keyword_without_opt_in(monkeypatch) -> None:
     assert logprobs is None
 
 
-def test_spatial_logprobs_are_added_for_coord_and_size_tokens(monkeypatch) -> None:
-    batch = 3
-    coord_id = 90
-    size_id = 91
-    token_ids = torch.tensor([coord_id, size_id, 123], dtype=torch.long)
-    token_logprobs = torch.tensor([-1.0, -2.0, -3.0], dtype=torch.float32)
-    hidden_last = torch.zeros((batch, 2), dtype=torch.float32)
-    requests = [SimpleNamespace(temperature=0.7) for _ in range(batch)]
-    spatial_tables = SpatialDecodeTables(
-        coord_value_lut=torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32),
-        size_value_lut=torch.tensor([0.25, 0.5, 1.0], dtype=torch.float32),
-        coord_logits_dim=3,
+def test_sample_batch_uses_sampler_for_greedy_logprobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
+
+    def fake_sample_step_from_logits(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_p: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        logprobs_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        calls.append((temperatures.clone(), top_p.clone(), logprobs_out is not None))
+        sampled = torch.tensor([4], dtype=torch.long)
+        if logprobs_out is not None:
+            logprobs_out.copy_(torch.tensor([-1.5], dtype=torch.float32))
+        if out is not None:
+            out.copy_(sampled)
+            return out
+        return sampled
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        fake_sample_step_from_logits,
     )
 
-    def fake_spatial_decode_logits(
-        hidden: torch.Tensor,
-        tables: SpatialDecodeTables,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            torch.zeros((batch, 3), dtype=torch.float32),
-            torch.zeros((batch, 3), dtype=torch.float32),
-            torch.zeros((batch, 3), dtype=torch.float32),
-        )
+    sampled, temps, top_ps, logprobs = GenerationScheduler._sample_batch(
+        _scheduler(),
+        torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0]], dtype=torch.float32),
+        [_sequence(temperature=0.0, return_logprobs=True)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        logprobs_out=torch.empty((1,), dtype=torch.float32),
+    )
+
+    assert sampled.tolist() == [4]
+    assert logprobs is not None
+    torch.testing.assert_close(logprobs, torch.tensor([-1.5], dtype=torch.float32))
+    assert temps is not None and top_ps is not None
+    torch.testing.assert_close(temps, torch.zeros((1,), dtype=torch.float32))
+    torch.testing.assert_close(top_ps, torch.ones((1,), dtype=torch.float32))
+    assert len(calls) == 1
+    call_temps, call_top_ps, call_logprobs = calls[0]
+    torch.testing.assert_close(call_temps, torch.zeros((1,), dtype=torch.float32))
+    torch.testing.assert_close(call_top_ps, torch.ones((1,), dtype=torch.float32))
+    assert call_logprobs is True
+
+
+@pytest.mark.parametrize("temperature", [0.7, 0.0])
+def test_spatial_logprobs_are_added_for_coord_and_size_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    temperature: float,
+) -> None:
+    batch = 3
+    dim = 3
+    coord_id = 90
+    size_id = 91
+    calls: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
 
     def fake_sample_step_from_logits(
         logits: torch.Tensor,
@@ -179,6 +293,7 @@ def test_spatial_logprobs_are_added_for_coord_and_size_tokens(monkeypatch) -> No
         generator: torch.Generator | None = None,
         logprobs_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        calls.append((temperatures.clone(), top_p.clone(), logprobs_out is not None))
         if logits.shape[0] == batch:
             if logprobs_out is not None:
                 logprobs_out.copy_(torch.tensor([-0.1, -0.2, -0.3]))
@@ -189,22 +304,25 @@ def test_spatial_logprobs_are_added_for_coord_and_size_tokens(monkeypatch) -> No
             )
         return torch.tensor([0, 1, 2, 1, 2, 0], dtype=torch.long)
 
-    monkeypatch.setattr(
-        "kestrel.scheduler.spatial.spatial_decode_logits",
-        fake_spatial_decode_logits,
-    )
+    _patch_spatial_logits(monkeypatch, batch=batch, dim=dim)
     monkeypatch.setattr(
         "kestrel.scheduler.spatial.sample_step_from_logits",
         fake_sample_step_from_logits,
     )
 
+    sample_kwargs = {}
+    if temperature > 0.0:
+        sample_kwargs = {
+            "temperatures": torch.full((batch,), temperature),
+            "top_ps": torch.ones((batch,), dtype=torch.float32),
+        }
+    token_logprobs = torch.tensor([-1.0, -2.0, -3.0], dtype=torch.float32)
     compute_spatial_values(
-        token_ids,
-        hidden_last,
-        requests,  # type: ignore[arg-type]
-        spatial_tables,
-        temperatures=torch.full((batch,), 0.7),
-        top_ps=torch.ones((batch,), dtype=torch.float32),
+        torch.tensor([coord_id, size_id, 123], dtype=torch.long),
+        torch.zeros((batch, 2), dtype=torch.float32),
+        [SimpleNamespace(temperature=temperature) for _ in range(batch)],  # type: ignore[list-item]
+        _spatial_tables(dim),
+        **sample_kwargs,
         token_logprobs=token_logprobs,
         coord_id=coord_id,
         size_id=size_id,
@@ -216,25 +334,20 @@ def test_spatial_logprobs_are_added_for_coord_and_size_tokens(monkeypatch) -> No
         token_logprobs,
         torch.tensor([-1.1, -3.3, -3.0], dtype=torch.float32),
     )
+    assert [call[2] for call in calls] == [True, True]
+    expected_temp = torch.full((batch,), temperature, dtype=torch.float32)
+    torch.testing.assert_close(calls[0][0], expected_temp)
+    torch.testing.assert_close(calls[1][0], expected_temp.repeat(2))
+    torch.testing.assert_close(calls[0][1], torch.ones((batch,), dtype=torch.float32))
+    torch.testing.assert_close(calls[1][1], torch.ones((batch * 2,), dtype=torch.float32))
 
 
-def test_spatial_decode_omits_logprob_keyword_without_buffer(monkeypatch) -> None:
+def test_spatial_decode_omits_logprob_keyword_without_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     batch = 1
-    spatial_tables = SpatialDecodeTables(
-        coord_value_lut=torch.tensor([0.0, 1.0], dtype=torch.float32),
-        size_value_lut=torch.tensor([0.5, 1.0], dtype=torch.float32),
-        coord_logits_dim=2,
-    )
-
-    def fake_spatial_decode_logits(
-        hidden: torch.Tensor,
-        tables: SpatialDecodeTables,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            torch.zeros((batch, 2), dtype=torch.float32),
-            torch.zeros((batch, 2), dtype=torch.float32),
-            torch.zeros((batch, 2), dtype=torch.float32),
-        )
+    dim = 2
+    _patch_spatial_logits(monkeypatch, batch=batch, dim=dim)
 
     def fake_sample_step_from_logits(
         logits: torch.Tensor,
@@ -242,13 +355,11 @@ def test_spatial_decode_omits_logprob_keyword_without_buffer(monkeypatch) -> Non
         top_p: torch.Tensor,
         *,
         generator: torch.Generator | None = None,
+        **kwargs: object,
     ) -> torch.Tensor:
+        assert "logprobs_out" not in kwargs
         return torch.zeros((logits.shape[0],), dtype=torch.long)
 
-    monkeypatch.setattr(
-        "kestrel.scheduler.spatial.spatial_decode_logits",
-        fake_spatial_decode_logits,
-    )
     monkeypatch.setattr(
         "kestrel.scheduler.spatial.sample_step_from_logits",
         fake_sample_step_from_logits,
@@ -258,7 +369,7 @@ def test_spatial_decode_omits_logprob_keyword_without_buffer(monkeypatch) -> Non
         torch.tensor([123], dtype=torch.long),
         torch.zeros((batch, 2), dtype=torch.float32),
         [SimpleNamespace(temperature=0.7)],  # type: ignore[list-item]
-        spatial_tables,
+        _spatial_tables(dim),
         temperatures=torch.full((batch,), 0.7),
         top_ps=torch.ones((batch,), dtype=torch.float32),
         out_coord=torch.empty((batch, 1), dtype=torch.float32),
@@ -266,4 +377,4 @@ def test_spatial_decode_omits_logprob_keyword_without_buffer(monkeypatch) -> Non
     )
 
     assert coord.tolist() == [[0.0]]
-    assert size.tolist() == [[0.5, 0.5]]
+    assert size.tolist() == [[0.0, 0.0]]

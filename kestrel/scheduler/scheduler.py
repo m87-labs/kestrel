@@ -1259,8 +1259,7 @@ class GenerationScheduler:
         """
         batch = len(sequences)
         if batch == 0:
-            empty_logprobs = None if logprobs_out is None else logprobs_out[:0]
-            return out[:0], None, None, empty_logprobs
+            return out[:0], None, None, None
 
         allowed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
@@ -1300,21 +1299,26 @@ class GenerationScheduler:
             and any(seq.request.return_logprobs is True for seq in sequences)
         )
         logprobs = logprobs_out[:batch] if want_logprobs else None
-
-        if all(seq.request.temperature <= 0.0 for seq in sequences):
-            torch.argmax(logits, dim=-1, out=out[:batch])
-            if logprobs is not None:
-                logprobs.zero_()
-            return out[:batch], None, None, logprobs
-
-        if batch_idx is None:
-            raise AssertionError("batch_idx is required for non-greedy sampling")
-        batch_idx = batch_idx.view(-1)[:batch]
-        temps = self._sampling_temps[:batch]
-        top_ps = self._sampling_top_ps[:batch]
-        torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
-        torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
         out_view = out[:batch]
+
+        all_greedy = all(seq.request.temperature <= 0.0 for seq in sequences)
+        if all_greedy:
+            if logprobs is None:
+                torch.argmax(logits, dim=-1, out=out_view)
+                return out_view, None, None, None
+            temps = self._sampling_temps[:batch]
+            top_ps = self._sampling_top_ps[:batch]
+            temps.zero_()
+            top_ps.fill_(1.0)
+        else:
+            if batch_idx is None:
+                raise AssertionError("batch_idx is required for non-greedy sampling")
+            batch_idx = batch_idx.view(-1)[:batch]
+            temps = self._sampling_temps[:batch]
+            top_ps = self._sampling_top_ps[:batch]
+            torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
+            torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
+
         sample_kwargs = {
             "out": out_view,
             "generator": self._sampling_rng,
@@ -1412,14 +1416,16 @@ class GenerationScheduler:
             )
             tokens = finalize.tokens
             output = finalize.output
+            finalization_failed = False
         except Exception as exc:  # pragma: no cover - defensive
             _LOGGER.exception("Failed to finalize sequence %s", seq.request.request_id)
             finish_reason = "error"
             tokens = []
             output = {"error": str(exc)}
+            finalization_failed = True
 
         logprobs = None
-        if seq.request.return_logprobs is True:
+        if seq.request.return_logprobs is True and not finalization_failed:
             logprobs = list(seq.logprobs)
             if len(logprobs) != len(tokens):
                 _LOGGER.error(
