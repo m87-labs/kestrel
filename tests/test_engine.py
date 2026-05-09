@@ -8,7 +8,9 @@ from typing import Callable
 
 import numpy as np
 
-from kestrel.engine import _AdmissionCoordinator, _PendingRequest
+import pytest
+
+from kestrel.engine import InferenceEngine, _AdmissionCoordinator, _PendingRequest
 
 
 def _make_request(
@@ -172,3 +174,15 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     assert len(failures) == 1
     assert failures[0][0] is failed_req
     assert str(failures[0][1]) == "crop failed"
+
+
+def test_extract_private_logprobs_setting() -> None:
+    engine = object.__new__(InferenceEngine)
+
+    assert engine._extract_logprobs(None) is None
+    assert engine._extract_logprobs({}) is None
+    assert engine._extract_logprobs({"_logprobs": None}) is None
+    assert engine._extract_logprobs({"_logprobs": True}) is True
+    assert engine._extract_logprobs({"_logprobs": False}) is False
+    with pytest.raises(TypeError, match="settings._logprobs"):
+        engine._extract_logprobs({"_logprobs": 1})

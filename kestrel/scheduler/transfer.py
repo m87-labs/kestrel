@@ -15,24 +15,31 @@ class TransferHandle:
         token_ids: Tensor,
         coord_values: Tensor,
         size_values: Tensor,
+        logprobs: Tensor | None,
         count: int,
     ) -> None:
         self._event = event
         self._token_ids = token_ids
         self._coord_values = coord_values
         self._size_values = size_values
+        self._logprobs = logprobs
         self._count = count
 
-    def wait(self) -> tuple[Tensor, Tensor, Tensor]:
+    def wait(self) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         """Block until D2H transfer completes and return the CPU tensors."""
         if self._count == 0:
             empty = self._token_ids[:0]
-            return empty, self._coord_values[:0], self._size_values[:0]
+            logprobs = None if self._logprobs is None else self._logprobs[:0]
+            return empty, self._coord_values[:0], self._size_values[:0], logprobs
         self._event.synchronize()
+        logprobs = None
+        if self._logprobs is not None:
+            logprobs = self._logprobs[: self._count]
         return (
             self._token_ids[: self._count],
             self._coord_values[: self._count],
             self._size_values[: self._count],
+            logprobs,
         )
 
 
@@ -62,6 +69,9 @@ class RenderBuffer:
         self._size_values = torch.empty(
             (max_batch, 2), dtype=size_dtype, device="cpu", pin_memory=pin,
         )
+        self._logprobs = torch.empty(
+            (max_batch,), dtype=torch.float32, device="cpu", pin_memory=pin,
+        )
         self._device = device
         self._stream = copy_stream
         self._event = make_event(device, enable_timing=False, blocking=False)
@@ -73,6 +83,7 @@ class RenderBuffer:
         size_values: Tensor,
         *,
         ready_event: torch.cuda.Event,
+        logprobs: Tensor | None = None,
     ) -> TransferHandle:
         """Start a D2H transfer and return a handle to wait on completion.
 
@@ -80,6 +91,7 @@ class RenderBuffer:
             token_ids: GPU tensor of sampled token IDs (from per-slot staging buffer).
             coord_values: GPU tensor of coord values (from per-slot staging buffer).
             size_values: GPU tensor of size values (from per-slot staging buffer).
+            logprobs: Optional GPU tensor of sampled token logprobs.
             ready_event: Event recorded on compute stream after all GPU writes complete.
                 The copy stream will wait on this event before starting D2H copies.
                 This ensures correct ordering without capturing dependencies on
@@ -92,6 +104,7 @@ class RenderBuffer:
                 self._token_ids,
                 self._coord_values,
                 self._size_values,
+                self._logprobs if logprobs is not None else None,
                 0,
             )
 
@@ -104,7 +117,14 @@ class RenderBuffer:
             self._token_ids[:count].copy_(token_ids, non_blocking=True)
             self._coord_values[:count].copy_(coord_values, non_blocking=True)
             self._size_values[:count].copy_(size_values, non_blocking=True)
+            if logprobs is not None:
+                self._logprobs[:count].copy_(logprobs, non_blocking=True)
             self._event.record(self._stream)
         return TransferHandle(
-            self._event, self._token_ids, self._coord_values, self._size_values, count
+            self._event,
+            self._token_ids,
+            self._coord_values,
+            self._size_values,
+            self._logprobs if logprobs is not None else None,
+            count,
         )
