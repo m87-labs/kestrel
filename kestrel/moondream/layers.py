@@ -184,6 +184,7 @@ def moe_mlp(
         lora_workspace,
         expanded_slot_ids,
         single_lora_id,
+        mode=mode,
     ).view(B, T, C)
     return mlp_out
 

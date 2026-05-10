@@ -1769,22 +1769,13 @@ class MoondreamRuntime:
             dtype=self.dtype,
         )
 
-        # Pre-allocate MoE workspaces if MoE is enabled
+        # Pre-allocate MoE LoRA buffers if MoE LoRA is enabled. Base MoE
+        # workspaces are prepared by kestrel-kernels MoeHandle warmup before
+        # CUDA graph capture.
         if self.config.text.moe is not None:
-            from kestrel.fused_moe import preallocate_shared_moe_workspaces
             from kestrel_kernels.moe_lora import preallocate_lora_buffers
 
             moe_cfg = self.config.text.moe
-            preallocate_shared_moe_workspaces(
-                max_num_tokens=max_tokens,
-                top_k=moe_cfg.experts_per_token,
-                hidden_size=moe_cfg.expert_inner_dim,
-                input_size=self.config.text.dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
-            # Pre-allocate LoRA buffers if LoRA is enabled
             if self._max_lora_rank is not None:
                 preallocate_lora_buffers(
                     max_num_tokens=max_tokens,

@@ -13,22 +13,19 @@ __all__ = [
     "FusedMoEConfig",
     "ExpertWeights",
     "ExpertWeightsFp8E4M3FN",
-    "preallocate_shared_moe_workspaces",
 ]
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"FusedMoEModule", "FusedMoEConfig", "preallocate_shared_moe_workspaces"}:
+    if name in {"FusedMoEModule", "FusedMoEConfig"}:
         from .module import (
             FusedMoEConfig,
             FusedMoEModule,
-            preallocate_shared_moe_workspaces,
         )
 
         exports = {
             "FusedMoEModule": FusedMoEModule,
             "FusedMoEConfig": FusedMoEConfig,
-            "preallocate_shared_moe_workspaces": preallocate_shared_moe_workspaces,
         }
         return exports[name]
 

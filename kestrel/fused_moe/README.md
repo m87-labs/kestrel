@@ -1,10 +1,11 @@
-# Fused MoE (vLLM-derived)
+# Fused MoE wrapper
 
-This directory vendors a minimal subset of the vLLM fused MoE implementation in order to accelerate Moondream decode on single H100 GPUs without taking a dependency on vLLM. Source material was taken from commit `4bf56c79cc252d285d0cb4f5edf323f02af735ca` of the vLLM repository under `ext/vllm`.
+This package holds the Moondream module wrapper and expert-weight containers.
+Kernel execution lives in `kestrel-kernels` behind the `kestrel_kernels.moe`
+runtime API.
 
 Key files:
-- `kernels.py`: Triton kernels derived from `vllm/model_executor/layers/fused_moe/fused_moe.py` with quantization, EP/DP, and auxiliary code paths removed. Only the unquantized single-GPU path remains.
-- `routing.py`: Pure PyTorch reimplementation of `moe_align_block_size` so that we do not depend on `vllm._custom_ops`.
-- `module.py`: Thin wrapper that wires the kernels into simple expert-weight containers and exposes a drop-in backend for decode.
-
-Any further updates to this directory should document the upstream source and justification for deviations so future contributors can re-sync changes if needed.
+- `module.py`: Module wrapper that normalizes expert weights, caches
+  `MoeHandle`s, and calls `kestrel_kernels.moe.forward`.
+- `weights.py`: Expert weight containers used when building Moondream layers.
+- `routing.py`: Compatibility routing helpers used by existing MoE LoRA tests.
