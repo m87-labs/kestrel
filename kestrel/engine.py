@@ -34,7 +34,7 @@ import threading
 import time
 from concurrent.futures import Future
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     AsyncIterator,
     Callable,
@@ -57,6 +57,7 @@ from kestrel.device import set_device, synchronize
 from kestrel.moondream.runtime import MoondreamRuntime
 from kestrel.runtime import Runtime
 from kestrel.scheduler import (
+    GeneratedPrefix,
     GenerationScheduler,
     GenerationRequest,
     RequestLifecycle,
@@ -70,6 +71,7 @@ from kestrel.moondream.vision import compute_overlap_crops
 from kestrel.skills import (
     CaptionSkill,
     DetectSkill,
+    DecodeStep,
     PointSkill,
     QuerySkill,
     SegmentSkill,
@@ -77,7 +79,7 @@ from kestrel.skills import (
     SkillSpec,
     SkillState,
 )
-from kestrel.moondream.runtime import Token
+from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
@@ -201,6 +203,7 @@ class _PendingRequest:
     adapter: Optional[str] = None
     lora_slot: int = 0  # Always 0 here; scheduler assigns actual slot at admission
     return_logprobs: Optional[bool] = None
+    generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
 
 
 @dataclass(slots=True)
@@ -236,8 +239,9 @@ class _AdmissionCoordinator:
 
         if self._runtime.prefix_cache is not None:
             req.image_hash = self._compute_image_hash(req.image)
+            prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
             if self._runtime.check_prefix_cache(
-                list(req.prompt_tokens), req.image_hash, req.adapter
+                prefill_tokens, req.image_hash, req.adapter
             ):
                 return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=True)
 
@@ -541,7 +545,12 @@ class InferenceEngine:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
+        _generated_prefix: Optional[object] = None,
     ) -> EngineResult:
+        generated_prefix = self._normalize_generated_prefix(
+            _generated_prefix,
+            "_generated_prefix",
+        )
         future, _ = await self._submit_request(
             max_new_tokens=max_new_tokens,
             request_context=request_context,
@@ -550,6 +559,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
+            generated_prefix=generated_prefix,
             stream_queue=None,
             skill=skill,
         )
@@ -610,6 +620,7 @@ class InferenceEngine:
         max_tokens = self._default_max_new_tokens
         adapter: Optional[str] = None
         return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
         if settings is not None:
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
@@ -655,6 +666,7 @@ class InferenceEngine:
                 temperature=temperature,
                 top_p=top_p,
                 _logprobs=return_logprobs,
+                _generated_prefix=generated_prefix,
                 skill="query",
             )
         return await self.submit(
@@ -665,6 +677,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
             skill="query",
         )
 
@@ -680,6 +693,7 @@ class InferenceEngine:
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
         max_tokens = self._default_max_new_tokens
         max_objects = None
         temperature = 0.0
@@ -714,6 +728,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
             skill="point",
         )
 
@@ -764,6 +779,7 @@ class InferenceEngine:
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
@@ -797,6 +813,7 @@ class InferenceEngine:
                 temperature=temperature,
                 top_p=top_p,
                 _logprobs=return_logprobs,
+                _generated_prefix=generated_prefix,
                 skill="caption",
             )
         return await self.submit(
@@ -807,6 +824,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
             skill="caption",
         )
 
@@ -822,6 +840,7 @@ class InferenceEngine:
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
         max_objects = 50
         temperature = 0.0
         top_p = 1.0
@@ -851,6 +870,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
             skill="detect",
         )
 
@@ -868,6 +888,7 @@ class InferenceEngine:
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
         temperature = 0.0
         top_p = 1.0
         max_tokens = self._default_max_new_tokens
@@ -908,6 +929,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
             skill="segment",
         )
 
@@ -922,8 +944,13 @@ class InferenceEngine:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
+        _generated_prefix: Optional[object] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
+        generated_prefix = self._normalize_generated_prefix(
+            _generated_prefix,
+            "_generated_prefix",
+        )
         future, request_id = await self._submit_request(
             max_new_tokens=max_new_tokens,
             request_context=request_context,
@@ -932,6 +959,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
+            generated_prefix=generated_prefix,
             stream_queue=queue,
             skill=skill,
         )
@@ -978,6 +1006,7 @@ class InferenceEngine:
         temperature: Optional[float],
         top_p: Optional[float],
         return_logprobs: Optional[bool],
+        generated_prefix: GeneratedPrefix,
         stream_queue: Optional[_StreamQueue],
         skill: str,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
@@ -1009,6 +1038,12 @@ class InferenceEngine:
         norm_temperature = self._normalize_temperature(temperature)
         norm_top_p = self._normalize_top_p(top_p)
         self._warn_if_outside_mps_sampler_envelope(norm_temperature, norm_top_p)
+        self._validate_generated_prefix_for_request(
+            generated_prefix,
+            max_new_tokens=max_new_tokens,
+            return_logprobs=return_logprobs,
+            streaming=stream_queue is not None,
+        )
         payload = _PendingRequest(
             request_id=req_id,
             prompt=prompt_str,
@@ -1025,6 +1060,7 @@ class InferenceEngine:
             request_context=request_context,
             adapter=adapter_id,
             return_logprobs=return_logprobs,
+            generated_prefix=generated_prefix,
         )
         await self._queue.put(payload)
         return future, req_id
@@ -1160,6 +1196,118 @@ class InferenceEngine:
         if not isinstance(raw, bool):
             raise TypeError("settings._logprobs must be a bool or None")
         return raw
+
+    def _extract_generated_prefix(
+        self, settings: Optional[Mapping[str, object]]
+    ) -> GeneratedPrefix:
+        if settings is None or "_generated_prefix" not in settings:
+            return GeneratedPrefix()
+        return self._normalize_generated_prefix(
+            settings["_generated_prefix"],
+            "settings._generated_prefix",
+        )
+
+    def _normalize_generated_prefix(
+        self,
+        raw: Optional[object],
+        field_name: str,
+    ) -> GeneratedPrefix:
+        if raw is None:
+            return GeneratedPrefix()
+        if isinstance(raw, GeneratedPrefix):
+            raw_tokens = raw.tokens
+            raw_logprobs = raw.logprobs
+        else:
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"{field_name} must be a mapping or None")
+
+            allowed_keys = {"tokens", "logprobs"}
+            extra_keys = set(raw) - allowed_keys
+            if extra_keys:
+                names = ", ".join(sorted(str(key) for key in extra_keys))
+                raise TypeError(f"{field_name} has unsupported key(s): {names}")
+
+            if "tokens" not in raw:
+                raise ValueError(f"{field_name}.tokens is required")
+            raw_tokens = raw["tokens"]
+            raw_logprobs = raw.get("logprobs")
+
+        tokens = self._normalize_generated_prefix_tokens(
+            raw_tokens,
+            f"{field_name}.tokens",
+        )
+        logprobs = self._normalize_generated_prefix_logprobs(
+            raw_logprobs,
+            f"{field_name}.logprobs",
+            expected_length=len(tokens),
+        )
+        return GeneratedPrefix(tokens=tokens, logprobs=logprobs)
+
+    def _normalize_generated_prefix_tokens(
+        self,
+        raw: object,
+        field_name: str,
+    ) -> tuple[Token, ...]:
+        if raw is None:
+            return ()
+        if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
+            raise TypeError(
+                f"{field_name} must be a sequence of generated Token objects"
+            )
+        tokens = tuple(raw)
+        for token in tokens:
+            if not isinstance(token, (TextToken, CoordToken, SizeToken)):
+                raise TypeError(
+                    f"{field_name} must contain only generated Token objects"
+                )
+        return tokens
+
+    def _normalize_generated_prefix_logprobs(
+        self,
+        raw: object,
+        field_name: str,
+        *,
+        expected_length: int,
+    ) -> Optional[tuple[float, ...]]:
+        if raw is None:
+            return None
+        if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
+            raise TypeError(f"{field_name} must be a sequence of floats or None")
+        logprobs = tuple(float(value) for value in raw)
+        if len(logprobs) != expected_length:
+            raise ValueError(
+                f"{field_name} must have the same length as generated prefix tokens"
+            )
+        return logprobs
+
+    def _validate_generated_prefix_for_request(
+        self,
+        generated_prefix: GeneratedPrefix,
+        *,
+        max_new_tokens: int,
+        return_logprobs: Optional[bool],
+        streaming: bool,
+    ) -> None:
+        if not generated_prefix.tokens:
+            return
+        if streaming:
+            raise ValueError("settings._generated_prefix is not supported with streaming")
+        if len(generated_prefix.tokens) >= max_new_tokens:
+            raise ValueError(
+                "settings._generated_prefix.tokens must be shorter than max_tokens"
+            )
+        if return_logprobs is True and generated_prefix.logprobs is None:
+            raise ValueError(
+                "settings._generated_prefix.logprobs is required when "
+                "settings._logprobs is true"
+            )
+
+        eos_id = self.runtime.config.tokenizer.eos_id
+        for token in generated_prefix.tokens:
+            if isinstance(token, TextToken) and token.token_id == eos_id:
+                raise ValueError(
+                    "settings._generated_prefix.tokens must not contain EOS"
+                )
 
     def _build_stream_callback(
         self, req: _PendingRequest
@@ -1448,6 +1596,7 @@ class InferenceEngine:
             adapter=adapter,
             lora_slot=req.lora_slot,
             return_logprobs=req.return_logprobs,
+            generated_prefix=req.generated_prefix,
         )
         limit = runtime.max_seq_length
         target_total = request_obj.target_length
@@ -1461,6 +1610,11 @@ class InferenceEngine:
             request_obj,
             request_context=request_obj.request_context,
         )
+        for token in request_obj.generated_prefix.tokens:
+            skill_state.consume_step(
+                runtime,
+                DecodeStep(token=token, position=skill_state.token_count),
+            )
         return request_obj, skill_state
 
     def _to_engine_result(self, result: SchedulerResult) -> EngineResult:

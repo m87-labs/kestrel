@@ -2,6 +2,7 @@
 
 from .scheduler import GenerationScheduler
 from .types import (
+    GeneratedPrefix,
     GenerationRequest,
     RequestLifecycle,
     RequestPhase,
@@ -11,6 +12,7 @@ from .types import (
 
 __all__ = [
     "GenerationScheduler",
+    "GeneratedPrefix",
     "GenerationRequest",
     "RequestLifecycle",
     "RequestPhase",

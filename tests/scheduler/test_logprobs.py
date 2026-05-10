@@ -10,7 +10,7 @@ from kestrel.moondream.region import SpatialDecodeTables
 from kestrel.moondream.runtime import TextToken
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.spatial import compute_spatial_values
-from kestrel.scheduler.types import GenerationRequest, RequestLifecycle
+from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillState
 
 
@@ -142,6 +142,86 @@ def test_scheduler_result_returns_requested_token_logprobs() -> None:
 
     assert result.tokens == [TextToken(10), TextToken(11)]
     assert result.logprobs == [-1.25, -0.5]
+
+
+def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
+    request = GenerationRequest(
+        request_id=7,
+        prompt="prompt",
+        prompt_tokens=[TextToken(1)],
+        max_new_tokens=4,
+        skill=_SkillSpecStub(),  # type: ignore[arg-type]
+        request_context=object(),
+        return_logprobs=True,
+        generated_prefix=GeneratedPrefix(
+            tokens=(TextToken(10), TextToken(11)),
+            logprobs=(-0.1, -0.2),
+        ),
+    )
+    state = _SkillStateStub(request)
+    state.consume_step(SimpleNamespace(), DecodeStep(TextToken(10), 0))
+    state.consume_step(SimpleNamespace(), DecodeStep(TextToken(11), 1))
+    lifecycle = RequestLifecycle(request=request, skill_state=state)
+    request.lifecycle = lifecycle
+
+    lifecycle.stage_token(SimpleNamespace(), TextToken(12), logprob=-0.3)
+    result = GenerationScheduler._build_result(_scheduler(), lifecycle)
+
+    assert result.tokens == [TextToken(10), TextToken(11), TextToken(12)]
+    assert result.logprobs == [-0.1, -0.2, -0.3]
+    assert result.metrics.decode_tokens == 1
+
+
+def test_generation_request_tracks_generated_prefix_prefill_shape() -> None:
+    request = GenerationRequest(
+        request_id=7,
+        prompt="prompt",
+        prompt_tokens=[TextToken(1)],
+        max_new_tokens=4,
+        skill=_SkillSpecStub(),  # type: ignore[arg-type]
+        request_context=object(),
+        generated_prefix=GeneratedPrefix(tokens=(TextToken(10), TextToken(11))),
+    )
+
+    assert request.prompt_length == 1
+    assert request.generated_prefix_length == 2
+    assert request.remaining_new_tokens == 2
+    assert request.prefill_tokens == [TextToken(1), TextToken(10), TextToken(11)]
+    assert request.target_length == 5
+
+
+def test_generation_request_validates_generated_prefix() -> None:
+    with pytest.raises(ValueError, match="shorter"):
+        GenerationRequest(
+            request_id=7,
+            prompt="prompt",
+            prompt_tokens=[TextToken(1)],
+            max_new_tokens=2,
+            skill=_SkillSpecStub(),  # type: ignore[arg-type]
+            request_context=object(),
+            generated_prefix=GeneratedPrefix(tokens=(TextToken(10), TextToken(11))),
+        )
+    with pytest.raises(ValueError, match="same length"):
+        GenerationRequest(
+            request_id=7,
+            prompt="prompt",
+            prompt_tokens=[TextToken(1)],
+            max_new_tokens=4,
+            skill=_SkillSpecStub(),  # type: ignore[arg-type]
+            request_context=object(),
+            generated_prefix=GeneratedPrefix(tokens=(TextToken(10),), logprobs=()),
+        )
+    with pytest.raises(ValueError, match="return_logprobs"):
+        GenerationRequest(
+            request_id=7,
+            prompt="prompt",
+            prompt_tokens=[TextToken(1)],
+            max_new_tokens=4,
+            skill=_SkillSpecStub(),  # type: ignore[arg-type]
+            request_context=object(),
+            return_logprobs=True,
+            generated_prefix=GeneratedPrefix(tokens=(TextToken(10),)),
+        )
 
 
 def test_scheduler_result_rejects_misaligned_logprobs() -> None:

@@ -493,7 +493,7 @@ class GenerationScheduler:
 
         lifecycle = request.lifecycle
         classification = self.runtime.classify_prefill(
-            request.prompt_tokens,
+            request.prefill_tokens,
             has_image=lifecycle.has_image,
             image_hash=request.image_hash,
             adapter_id=request.adapter,
@@ -715,10 +715,10 @@ class GenerationScheduler:
                 lifecycle.prefill_started_at = prefill_start
                 lifecycle.transition(RequestPhase.PREFILLING)
                 prepared = self.runtime.prepare_sequence(
-                    prompt_tokens=request.prompt_tokens,
+                    prompt_tokens=request.prefill_tokens,
                     image=request.image,
                     image_crops=request.image_crops,
-                    max_new_tokens=request.max_new_tokens,
+                    max_new_tokens=request.remaining_new_tokens,
                     lora_slot=request.lora_slot,
                     image_hash=request.image_hash,
                     adapter_id=request.adapter,
@@ -1232,9 +1232,14 @@ class GenerationScheduler:
         """
         if seq.state.batch_idx in self.runtime.active_sequences:
             try:
+                # The generated prefix was part of prefill, so only tokens
+                # decoded after prefill should be retained as generated suffix.
+                generated_tokens = seq.skill_state.tokens[
+                    seq.request.generated_prefix_length:
+                ]
                 self.runtime.retain_sequence_prefix(
                     seq.state,
-                    seq.skill_state.tokens,
+                    generated_tokens,
                     adapter_id=seq.request.adapter,
                     image_hash=seq.request.image_hash,
                 )
@@ -1453,7 +1458,10 @@ class GenerationScheduler:
                 }
                 logprobs = None
 
-        decode_tokens = len(tokens) if tokens else len(seq.skill_state.tokens)
+        decode_tokens = max(
+            0,
+            seq.skill_state.token_count - seq.request.generated_prefix_length,
+        )
         metrics = seq.build_metrics(decode_tokens=decode_tokens)
         return SchedulerResult(
             request_id=seq.request.request_id,
