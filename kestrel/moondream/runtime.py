@@ -1424,10 +1424,7 @@ class MoondreamRuntime:
             namespace=namespace,
         )
         if insert_result.inserted_pages == 0:
-            match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
-            if match.matched_kv_length >= target_len:
-                return
-            raise RuntimeError("Failed to retain decoded prefix in prefix cache")
+            return
 
         old_lock_node = state.cache_lock_node
         if insert_result.node is not old_lock_node:

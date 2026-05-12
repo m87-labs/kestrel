@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -1182,61 +1180,65 @@ class TestDecodedPrefixRetention:
         for page in private_generated_pages:
             assert page in page_table.free_pages
 
-    def test_retain_sequence_prefix_raises_when_insert_is_refused(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A refused insert must not silently drop generated-prefix reuse."""
+    def test_retain_sequence_prefix_skips_divergent_cached_prefix(self) -> None:
+        """Divergent generated prefixes release private pages normally."""
         cache = RadixPrefixCache()
         page_table = PageTable(
-            n_pages=50, page_size=1, max_batch_size=5, device="cpu",
+            n_pages=80, page_size=1, max_batch_size=6, device="cpu",
             prefix_cache=cache,
         )
         runtime = _make_runtime_for_cache(cache, page_table)
 
         prompt_tokens = [MockToken(1), MockToken(2)]
-        generated = [MockToken(10), MockToken(11)]
-        prompt_len = len(prompt_tokens)
-        batch = page_table.allocate()
-        page_table.reserve(batch, prompt_len + len(generated))
+        cached_prefix = prompt_tokens + [MockToken(10)]
+        generated = [MockToken(10), MockToken(12)]
+        full_tokens = prompt_tokens + generated
+        namespace = CacheNamespace(runtime_id="test-model")
 
-        cache_result = runtime_mod._CacheLookupResult(
-            match=None,
-            skip_positions=0,
-            temp_lock_node=None,
-            can_reuse=False,
-            namespace=None,
+        batch_a = page_table.allocate()
+        pages_a = page_table.allocate_pages(len(cached_prefix))
+        page_table.map_pages(batch_a, 0, pages_a)
+        insert_a = cache.insert(cached_prefix, pages_a, namespace=namespace)
+        cache.lock(insert_a.node)
+        cache.unlock(insert_a.node)
+        page_table.erase(batch_a, cached_page_count=len(cached_prefix))
+
+        match_prompt = cache.match_prefix(prompt_tokens, namespace=namespace)
+        assert match_prompt.matched_kv_length == len(prompt_tokens)
+        cache.lock(match_prompt.last_node)
+
+        batch_b = page_table.allocate()
+        page_table.map_pages(batch_b, 0, match_prompt.matched_pages)
+        private_generated_pages = page_table.allocate_pages(len(generated))
+        page_table.map_pages(
+            batch_b,
+            len(prompt_tokens),
+            private_generated_pages,
         )
-        cache_lock_node, cache_owned_page_count = runtime._finalize_cache_after_prefill(
+        state = runtime_mod.SequenceState(
+            batch_idx=batch_b,
+            length=len(full_tokens),
+            max_length=len(full_tokens),
+            prompt_length=len(prompt_tokens),
             cache_tokens=prompt_tokens,
-            cache_result=cache_result,
-            prompt_len=prompt_len,
-            batch_idx=batch,
+            cache_lock_node=match_prompt.last_node,
+            cache_owned_page_count=len(prompt_tokens),
+        )
+        runtime.active_sequences = {batch_b: state}
+
+        runtime.retain_sequence_prefix(
+            state,
+            generated,
             adapter_id=None,
             image_hash=None,
         )
-        state = runtime_mod.SequenceState(
-            batch_idx=batch,
-            length=prompt_len + len(generated),
-            max_length=prompt_len + len(generated),
-            prompt_length=prompt_len,
-            cache_tokens=prompt_tokens,
-            cache_lock_node=cache_lock_node,
-            cache_owned_page_count=cache_owned_page_count,
-        )
-        monkeypatch.setattr(
-            cache,
-            "insert",
-            lambda *args, **kwargs: SimpleNamespace(inserted_pages=0),
-        )
 
-        with pytest.raises(RuntimeError, match="Failed to retain decoded prefix"):
-            runtime.retain_sequence_prefix(
-                state,
-                generated,
-                adapter_id=None,
-                image_hash=None,
-            )
+        assert state.cache_owned_page_count == len(prompt_tokens)
+        assert state.cache_lock_node is match_prompt.last_node
+
+        runtime.release_sequence(state)
+        for page in private_generated_pages:
+            assert page in page_table.free_pages
 
 
 # =============================================================================
