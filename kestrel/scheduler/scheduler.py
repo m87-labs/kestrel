@@ -1231,15 +1231,13 @@ class GenerationScheduler:
         but resource release was deferred because inflight_refs > 0.
         """
         if seq.state.batch_idx in self.runtime.active_sequences:
-            try:
-                self.runtime.retain_sequence_prefix(
-                    seq.state,
-                    seq.skill_state.tokens,
-                    adapter_id=seq.request.adapter,
-                    image_hash=seq.request.image_hash,
-                )
-            finally:
-                self.runtime.release_sequence(seq.state)
+            self.runtime.retain_sequence_prefix(
+                seq.state,
+                seq.skill_state.tokens,
+                adapter_id=seq.request.adapter,
+                image_hash=seq.request.image_hash,
+            )
+            self.runtime.release_sequence(seq.state)
 
     def _sample_batch(
         self,

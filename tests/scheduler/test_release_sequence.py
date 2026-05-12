@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Sequence
 
-from kestrel.runtime import SequenceState, TextToken
+import pytest
+
+from kestrel.runtime import SequenceState, TextToken, Token
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.types import GenerationRequest, RequestLifecycle
 
@@ -19,8 +22,23 @@ class _SkillStateStub:
         return len(self.tokens)
 
 
-def test_finalize_sequence_retains_prefix_before_release() -> None:
-    runtime = FakeRuntime()
+class _FailingRetainRuntime(FakeRuntime):
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
+        raise RuntimeError("retain failed")
+
+
+def _make_lifecycle(
+    runtime: FakeRuntime,
+    *,
+    request_id: int = 7,
+) -> RequestLifecycle:
     state = SequenceState(
         batch_idx=0,
         length=2,
@@ -30,7 +48,7 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
     runtime.active_sequences[state.batch_idx] = state
 
     request = GenerationRequest(
-        request_id=7,
+        request_id=request_id,
         prompt="prompt",
         prompt_tokens=[TextToken(1)],
         max_new_tokens=4,
@@ -45,6 +63,13 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
         sequence_state=state,
     )
     request.lifecycle = lifecycle
+    return lifecycle
+
+
+def test_finalize_sequence_retains_prefix_before_release() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    state = lifecycle.state
 
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = runtime
@@ -60,3 +85,17 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
     assert retain_call["adapter_id"] == "adapter-a"
     assert retain_call["image_hash"] == b"0123456789abcdef"
     assert runtime.released_sequences == [state]
+
+
+def test_release_sequence_does_not_release_when_retention_fails() -> None:
+    runtime = _FailingRetainRuntime()
+    lifecycle = _make_lifecycle(runtime)
+
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    with pytest.raises(RuntimeError, match="retain failed"):
+        GenerationScheduler._release_sequence(scheduler, lifecycle)
+
+    assert runtime.released_sequences == []
+    assert lifecycle.state.batch_idx in runtime.active_sequences
