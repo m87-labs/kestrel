@@ -1401,6 +1401,67 @@ class MoondreamRuntime:
         # Release batch slot; do NOT free cache-owned mapped prefix pages.
         self.page_table.erase(batch_idx, prepared.cache_result.skip_positions)
 
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
+        """Make decoded generated KV pages eligible for prefix-cache reuse."""
+        if self.prefix_cache is None or not state.cache_tokens:
+            return
+
+        prompt_len = state.prompt_length or state.length
+        available_generated_kv = max(0, state.length - prompt_len)
+        if available_generated_kv <= 0:
+            return
+
+        retained_generated: list[CacheToken] = []
+        retained_kv = 0
+        for token in generated_tokens:
+            token_kv = token.kv_length()
+            if retained_kv + token_kv > available_generated_kv:
+                break
+            retained_generated.append(token)
+            retained_kv += token_kv
+
+        target_len = prompt_len + retained_kv
+        if retained_kv <= 0 or target_len <= state.cache_owned_page_count:
+            return
+
+        cache_tokens = list(state.cache_tokens) + retained_generated
+        pages = self.page_table.get_pages(state.batch_idx, 0, target_len)
+        namespace = CacheNamespace(
+            runtime_id=self.model_name,
+            lora_id=adapter_id,
+            image_hash=(
+                int.from_bytes(image_hash[:16], "big") if image_hash else None
+            ),
+        )
+        insert_result = self.prefix_cache.insert(
+            cache_tokens,
+            pages,
+            namespace=namespace,
+        )
+
+        new_lock_node = insert_result.node
+        if insert_result.inserted_pages == 0:
+            match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
+            if match.matched_kv_length < target_len:
+                return
+            if match.matched_pages[:target_len] != pages:
+                return
+            new_lock_node = match.last_node
+
+        old_lock_node = state.cache_lock_node
+        if new_lock_node is not old_lock_node:
+            self.prefix_cache.lock(new_lock_node)
+            self.prefix_cache.unlock(old_lock_node)
+            state.cache_lock_node = new_lock_node
+        state.cache_owned_page_count = target_len
+
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)
 

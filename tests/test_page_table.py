@@ -1047,6 +1047,141 @@ class TestDuplicatePrefill:
 
 
 # =============================================================================
+# Decoded Prefix Retention Tests
+# =============================================================================
+
+
+class TestDecodedPrefixRetention:
+    """Tests for retaining decoded generated KV in prefix cache."""
+
+    def test_retain_sequence_prefix_extends_cache_to_processed_generated_tokens(
+        self,
+    ) -> None:
+        """Only generated tokens with KV pages are retained."""
+        cache = RadixPrefixCache()
+        page_table = PageTable(
+            n_pages=50, page_size=1, max_batch_size=5, device="cpu",
+            prefix_cache=cache,
+        )
+        runtime = _make_runtime_for_cache(cache, page_table)
+
+        prompt_tokens = [MockToken(1), MockToken(2)]
+        generated = [MockToken(10), MockToken(11), MockToken(12), MockToken(13)]
+        prompt_len = len(prompt_tokens)
+        batch = page_table.allocate()
+        page_table.reserve(batch, prompt_len + len(generated))
+
+        cache_result = runtime_mod._CacheLookupResult(
+            match=None,
+            skip_positions=0,
+            temp_lock_node=None,
+            can_reuse=False,
+            namespace=None,
+        )
+        cache_lock_node, cache_owned_page_count = runtime._finalize_cache_after_prefill(
+            cache_tokens=prompt_tokens,
+            cache_result=cache_result,
+            prompt_len=prompt_len,
+            batch_idx=batch,
+            adapter_id=None,
+            image_hash=None,
+        )
+        state = runtime_mod.SequenceState(
+            batch_idx=batch,
+            length=prompt_len + 3,
+            max_length=prompt_len + len(generated),
+            prompt_length=prompt_len,
+            cache_tokens=prompt_tokens,
+            cache_lock_node=cache_lock_node,
+            cache_owned_page_count=cache_owned_page_count,
+        )
+        runtime.active_sequences = {batch: state}
+        retained_pages = page_table.get_pages(batch, 0, prompt_len + 3)
+        final_private_page = page_table.get_pages(
+            batch, prompt_len + 3, prompt_len + 4
+        )[0]
+
+        runtime.retain_sequence_prefix(
+            state,
+            generated,
+            adapter_id=None,
+            image_hash=None,
+        )
+
+        namespace = CacheNamespace(runtime_id="test-model")
+        match = cache.match_prefix(prompt_tokens + generated, namespace=namespace)
+        assert match.matched_kv_length == prompt_len + 3
+        assert state.cache_owned_page_count == prompt_len + 3
+        assert state.cache_lock_node is match.last_node
+
+        runtime.release_sequence(state)
+        for page in retained_pages:
+            assert page not in page_table.free_pages
+        assert final_private_page in page_table.free_pages
+
+    def test_retain_sequence_prefix_does_not_claim_duplicate_private_pages(
+        self,
+    ) -> None:
+        """Duplicate generated prefixes keep private pages private."""
+        cache = RadixPrefixCache()
+        page_table = PageTable(
+            n_pages=80, page_size=1, max_batch_size=6, device="cpu",
+            prefix_cache=cache,
+        )
+        runtime = _make_runtime_for_cache(cache, page_table)
+
+        prompt_tokens = [MockToken(1), MockToken(2)]
+        generated = [MockToken(10), MockToken(11)]
+        full_tokens = prompt_tokens + generated
+        namespace = CacheNamespace(runtime_id="test-model")
+
+        batch_a = page_table.allocate()
+        pages_a = page_table.allocate_pages(len(full_tokens))
+        page_table.map_pages(batch_a, 0, pages_a)
+        insert_a = cache.insert(full_tokens, pages_a, namespace=namespace)
+        cache.lock(insert_a.node)
+        cache.unlock(insert_a.node)
+        page_table.erase(batch_a, cached_page_count=len(full_tokens))
+
+        match_prompt = cache.match_prefix(prompt_tokens, namespace=namespace)
+        assert match_prompt.matched_kv_length == len(prompt_tokens)
+        cache.lock(match_prompt.last_node)
+
+        batch_b = page_table.allocate()
+        page_table.map_pages(batch_b, 0, match_prompt.matched_pages)
+        private_generated_pages = page_table.allocate_pages(len(generated))
+        page_table.map_pages(
+            batch_b,
+            len(prompt_tokens),
+            private_generated_pages,
+        )
+        state = runtime_mod.SequenceState(
+            batch_idx=batch_b,
+            length=len(full_tokens),
+            max_length=len(full_tokens),
+            prompt_length=len(prompt_tokens),
+            cache_tokens=prompt_tokens,
+            cache_lock_node=match_prompt.last_node,
+            cache_owned_page_count=len(prompt_tokens),
+        )
+        runtime.active_sequences = {batch_b: state}
+
+        runtime.retain_sequence_prefix(
+            state,
+            generated,
+            adapter_id=None,
+            image_hash=None,
+        )
+
+        assert state.cache_owned_page_count == len(prompt_tokens)
+        assert state.cache_lock_node is match_prompt.last_node
+
+        runtime.release_sequence(state)
+        for page in private_generated_pages:
+            assert page in page_table.free_pages
+
+
+# =============================================================================
 # Backward Compatibility Tests
 # =============================================================================
 

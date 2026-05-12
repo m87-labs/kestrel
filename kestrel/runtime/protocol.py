@@ -118,6 +118,15 @@ class Runtime(Protocol):
 
     def abort_prepared_sequence(self, prepared: PreparedSequence) -> None: ...
 
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None: ...
+
     def release_sequence(self, state: SequenceState) -> None: ...
 
     def decode_with_slot(self, slot: Any, batch_size: int) -> None: ...
