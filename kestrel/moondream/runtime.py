@@ -1414,24 +1414,20 @@ class MoondreamRuntime:
             return
 
         prompt_len = state.prompt_length or state.length
-        available_generated_kv = max(0, state.length - prompt_len)
-        if available_generated_kv <= 0:
+        processed_generated = min(
+            len(generated_tokens),
+            max(0, state.length - prompt_len),
+        )
+        if processed_generated <= 0:
             return
 
-        retained_generated: list[CacheToken] = []
-        retained_kv = 0
-        for token in generated_tokens:
-            token_kv = token.kv_length()
-            if retained_kv + token_kv > available_generated_kv:
-                break
-            retained_generated.append(token)
-            retained_kv += token_kv
-
-        target_len = prompt_len + retained_kv
-        if retained_kv <= 0 or target_len <= state.cache_owned_page_count:
+        target_len = prompt_len + processed_generated
+        if target_len <= state.cache_owned_page_count:
             return
 
-        cache_tokens = list(state.cache_tokens) + retained_generated
+        cache_tokens: list[CacheToken] = (
+            list(state.cache_tokens) + list(generated_tokens[:processed_generated])
+        )
         pages = self.page_table.get_pages(state.batch_idx, 0, target_len)
         namespace = CacheNamespace(
             runtime_id=self.model_name,
@@ -1445,21 +1441,14 @@ class MoondreamRuntime:
             pages,
             namespace=namespace,
         )
-
-        new_lock_node = insert_result.node
         if insert_result.inserted_pages == 0:
-            match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
-            if match.matched_kv_length < target_len:
-                return
-            if match.matched_pages[:target_len] != pages:
-                return
-            new_lock_node = match.last_node
+            return
 
         old_lock_node = state.cache_lock_node
-        if new_lock_node is not old_lock_node:
-            self.prefix_cache.lock(new_lock_node)
+        if insert_result.node is not old_lock_node:
+            self.prefix_cache.lock(insert_result.node)
             self.prefix_cache.unlock(old_lock_node)
-            state.cache_lock_node = new_lock_node
+            state.cache_lock_node = insert_result.node
         state.cache_owned_page_count = target_len
 
     def release_sequence(self, state: SequenceState) -> None:
