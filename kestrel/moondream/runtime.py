@@ -783,14 +783,7 @@ class MoondreamRuntime:
         image_kv_length = self.image_prefix_length
         cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
 
-        # Build namespace
-        image_hash_int = int.from_bytes(image_hash[:16], "big")
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=image_hash_int,
-        )
-
+        namespace = self._cache_namespace(adapter_id, image_hash)
         match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
 
         # Cache hit must cover at least BOS + full image prefix
@@ -819,13 +812,7 @@ class MoondreamRuntime:
                     "image_hash must be provided when prefix cache is enabled for image prompts"
                 )
             cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
-            namespace = CacheNamespace(
-                runtime_id=self.model_name,
-                lora_id=adapter_id,
-                image_hash=(
-                    int.from_bytes(image_hash[:16], "big") if image_hash is not None else None
-                ),
-            )
+            namespace = self._cache_namespace(adapter_id, image_hash)
             match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
             can_reuse = match.matched_kv_length > 0
             if image_kv_length > 0 and can_reuse:
@@ -864,6 +851,21 @@ class MoondreamRuntime:
             cache_tokens.extend(tokens_list[1:])
         return cache_tokens
 
+    def _cache_namespace(
+        self,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> CacheNamespace:
+        return CacheNamespace(
+            runtime_id=self.model_name,
+            lora_id=adapter_id,
+            image_hash=(
+                int.from_bytes(image_hash[:16], "big")
+                if image_hash is not None
+                else None
+            ),
+        )
+
     def _lookup_prefix_cache(
         self,
         cache_tokens: list[CacheToken],
@@ -883,15 +885,7 @@ class MoondreamRuntime:
                 namespace=None,
             )
 
-        # Build namespace from adapter identity and image hash
-        image_hash_int = (
-            int.from_bytes(image_hash[:16], "big") if image_hash else None
-        )
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=image_hash_int,
-        )
+        namespace = self._cache_namespace(adapter_id, image_hash)
         match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
         can_reuse = match.matched_kv_length > 0
 
@@ -1034,13 +1028,7 @@ class MoondreamRuntime:
 
         # Insert prompt into cache
         prompt_pages = self.page_table.get_pages(batch_idx, 0, prompt_len)
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=(
-                int.from_bytes(image_hash[:16], "big") if image_hash else None
-            ),
-        )
+        namespace = self._cache_namespace(adapter_id, image_hash)
         insert_result = self.prefix_cache.insert(
             cache_tokens,
             prompt_pages,
@@ -1429,13 +1417,7 @@ class MoondreamRuntime:
             list(state.cache_tokens) + list(generated_tokens[:processed_generated])
         )
         pages = self.page_table.get_pages(state.batch_idx, 0, target_len)
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=(
-                int.from_bytes(image_hash[:16], "big") if image_hash else None
-            ),
-        )
+        namespace = self._cache_namespace(adapter_id, image_hash)
         insert_result = self.prefix_cache.insert(
             cache_tokens,
             pages,
