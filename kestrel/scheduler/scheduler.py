@@ -1231,13 +1231,19 @@ class GenerationScheduler:
         but resource release was deferred because inflight_refs > 0.
         """
         if seq.state.batch_idx in self.runtime.active_sequences:
-            self.runtime.retain_sequence_prefix(
-                seq.state,
-                seq.skill_state.tokens,
-                adapter_id=seq.request.adapter,
-                image_hash=seq.request.image_hash,
-            )
-            self.runtime.release_sequence(seq.state)
+            try:
+                self.runtime.retain_sequence_prefix(
+                    seq.state,
+                    seq.skill_state.tokens,
+                    adapter_id=seq.request.adapter,
+                    image_hash=seq.request.image_hash,
+                )
+            finally:
+                # Retention is part of the cache path, but release is resource
+                # ownership. If retention hits an invariant bug, still release
+                # the batch slot/pages/adapter, then let the original exception
+                # propagate through the scheduler-fatal path.
+                self.runtime.release_sequence(seq.state)
 
     def _sample_batch(
         self,

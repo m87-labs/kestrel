@@ -87,7 +87,7 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
     assert runtime.released_sequences == [state]
 
 
-def test_release_sequence_does_not_release_when_retention_fails() -> None:
+def test_release_sequence_releases_and_propagates_when_retention_fails() -> None:
     runtime = _FailingRetainRuntime()
     lifecycle = _make_lifecycle(runtime)
 
@@ -97,5 +97,5 @@ def test_release_sequence_does_not_release_when_retention_fails() -> None:
     with pytest.raises(RuntimeError, match="retain failed"):
         GenerationScheduler._release_sequence(scheduler, lifecycle)
 
-    assert runtime.released_sequences == []
-    assert lifecycle.state.batch_idx in runtime.active_sequences
+    assert runtime.released_sequences == [lifecycle.state]
+    assert lifecycle.state.batch_idx not in runtime.active_sequences
