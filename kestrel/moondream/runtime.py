@@ -1424,6 +1424,11 @@ class MoondreamRuntime:
             namespace=namespace,
         )
         if insert_result.inserted_pages == 0:
+            # Normal non-retainable case: the token path may already exist with
+            # different physical pages. This happens after append-prefill
+            # recomputes the last prompt token, or when another branch cached a
+            # shared generated prefix first. Keep this sequence's private pages
+            # private so release_sequence() frees them normally.
             return
 
         old_lock_node = state.cache_lock_node
