@@ -10,7 +10,14 @@ import numpy as np
 
 import pytest
 
-from kestrel.engine import InferenceEngine, _AdmissionCoordinator, _PendingRequest
+from kestrel.engine import (
+    InferenceEngine,
+    _AdmissionCoordinator,
+    _PendingRequest,
+)
+from kestrel.moondream.runtime import TextToken
+from kestrel.scheduler import GeneratedPrefix
+from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 
 def _make_request(
@@ -32,6 +39,37 @@ def _make_request(
         request_context=object(),
         adapter=None,
     )
+
+
+class _PrefixSkillState(SkillState):
+    def __init__(self, spec: SkillSpec, request: object) -> None:
+        super().__init__(spec, request)
+        self.positions: list[int] = []
+
+    def consume_step(self, runtime: object, step: DecodeStep) -> None:
+        self.positions.append(step.position)
+        self.append_token(step.token)
+
+    def finalize(self, runtime: object, *, reason: str) -> SkillFinalizeResult:
+        return SkillFinalizeResult(text="", tokens=list(self.tokens), output={})
+
+
+class _PrefixSkill(SkillSpec):
+    def __init__(self) -> None:
+        super().__init__(name="prefix")
+
+    def build_prompt_tokens(
+        self, runtime: object, request_context: object
+    ) -> list[object]:
+        return []
+
+    def create_state(
+        self,
+        runtime: object,
+        request: object,
+        request_context: object,
+    ) -> _PrefixSkillState:
+        return _PrefixSkillState(self, request)
 
 
 class _FakeRuntime:
@@ -114,6 +152,30 @@ def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
     assert failures == []
 
 
+def test_admission_coordinator_checks_prefix_cache_with_generated_prefix() -> None:
+    image = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    runtime = _FakeRuntime(prefix_cache=object(), prefix_hit=True)
+    preprocessor = _FakeImagePreprocessor()
+    failures: list[tuple[_PendingRequest, BaseException]] = []
+    coordinator = _AdmissionCoordinator(
+        runtime=runtime,
+        image_preprocessor=preprocessor,
+        wake_event=threading.Event(),
+        fail_request=_record_failure(failures),
+    )
+    req = _make_request(image=image)
+    req.prompt_tokens = [TextToken(1)]
+    req.generated_prefix = GeneratedPrefix(tokens=(TextToken(10), TextToken(11)))
+
+    ready = coordinator.submit(req)
+
+    assert ready is not None
+    assert len(runtime.cache_checks) == 1
+    assert runtime.cache_checks[0][0] == [TextToken(1), TextToken(10), TextToken(11)]
+    assert preprocessor.submissions == []
+    assert failures == []
+
+
 def test_admission_coordinator_promotes_completed_crops() -> None:
     image = np.zeros((4, 4, 3), dtype=np.uint8)
     crop_future: Future[object] = Future()
@@ -186,3 +248,108 @@ def test_extract_private_logprobs_setting() -> None:
     assert engine._extract_logprobs({"_logprobs": False}) is False
     with pytest.raises(TypeError, match="settings._logprobs"):
         engine._extract_logprobs({"_logprobs": 1})
+
+
+def test_extract_private_generated_prefix_setting() -> None:
+    engine = object.__new__(InferenceEngine)
+
+    assert engine._extract_generated_prefix(None) == GeneratedPrefix()
+    assert engine._extract_generated_prefix({}) == GeneratedPrefix()
+
+    prefix = engine._extract_generated_prefix(
+        {
+            "_generated_prefix": {
+                "tokens": [TextToken(10), TextToken(11)],
+                "logprobs": [-1, -2.5],
+            }
+        }
+    )
+
+    assert prefix.tokens == (TextToken(10), TextToken(11))
+    assert prefix.logprobs == (-1.0, -2.5)
+
+    prefix = engine._normalize_generated_prefix(
+        GeneratedPrefix(tokens=(TextToken(10),), logprobs=("-1",)),
+        "_generated_prefix",
+    )
+    assert prefix.tokens == (TextToken(10),)
+    assert prefix.logprobs == (-1.0,)
+
+    with pytest.raises(TypeError, match="settings._generated_prefix"):
+        engine._extract_generated_prefix({"_generated_prefix": []})
+    with pytest.raises(TypeError, match="unsupported key"):
+        engine._extract_generated_prefix(
+            {"_generated_prefix": {"tokens": [], "text": "answer"}}
+        )
+    with pytest.raises(ValueError, match="tokens is required"):
+        engine._extract_generated_prefix({"_generated_prefix": {}})
+    with pytest.raises(TypeError, match="generated Token"):
+        engine._extract_generated_prefix({"_generated_prefix": {"tokens": [10]}})
+    with pytest.raises(TypeError, match="generated Token"):
+        engine._normalize_generated_prefix(
+            GeneratedPrefix(tokens=(10,)),
+            "_generated_prefix",
+        )
+    with pytest.raises(ValueError, match="same length"):
+        engine._extract_generated_prefix(
+            {"_generated_prefix": {"tokens": [TextToken(10)], "logprobs": []}}
+        )
+
+
+def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
+    engine = object.__new__(InferenceEngine)
+    engine._runtime = SimpleNamespace(
+        config=SimpleNamespace(tokenizer=SimpleNamespace(eos_id=2))
+    )
+
+    prefix = GeneratedPrefix(tokens=(TextToken(10),))
+
+    with pytest.raises(ValueError, match="streaming"):
+        engine._validate_generated_prefix_for_request(
+            prefix,
+            max_new_tokens=4,
+            return_logprobs=None,
+            streaming=True,
+        )
+    with pytest.raises(ValueError, match="shorter"):
+        engine._validate_generated_prefix_for_request(
+            prefix,
+            max_new_tokens=1,
+            return_logprobs=None,
+            streaming=False,
+        )
+    with pytest.raises(ValueError, match="logprobs is required"):
+        engine._validate_generated_prefix_for_request(
+            prefix,
+            max_new_tokens=4,
+            return_logprobs=True,
+            streaming=False,
+        )
+    with pytest.raises(ValueError, match="must not contain EOS"):
+        engine._validate_generated_prefix_for_request(
+            GeneratedPrefix(tokens=(TextToken(2),), logprobs=(-0.1,)),
+            max_new_tokens=4,
+            return_logprobs=True,
+            streaming=False,
+        )
+
+
+def test_build_generation_request_consumes_generated_prefix() -> None:
+    engine = object.__new__(InferenceEngine)
+    req = _make_request()
+    req.prompt_tokens = [TextToken(1)]
+    req.max_new_tokens = 4
+    req.skill = _PrefixSkill()
+    req.generated_prefix = GeneratedPrefix(
+        tokens=(TextToken(10), TextToken(11)),
+        logprobs=(-0.1, -0.2),
+    )
+    runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
+
+    generation_req, skill_state = engine._build_generation_request(runtime, req, None)
+
+    assert generation_req.prompt_tokens == [TextToken(1)]
+    assert generation_req.prefill_tokens == [TextToken(1), TextToken(10), TextToken(11)]
+    assert generation_req.remaining_new_tokens == 2
+    assert list(skill_state.tokens) == [TextToken(10), TextToken(11)]
+    assert skill_state.positions == [0, 1]

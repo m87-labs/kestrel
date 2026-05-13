@@ -12,6 +12,14 @@ from kestrel.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedPrefix:
+    """Generated tokens that should be treated as already decoded."""
+
+    tokens: tuple[Token, ...] = ()
+    logprobs: Optional[tuple[float, ...]] = None
+
+
 class RequestPhase(str, Enum):
     NEW = "new"
     WAITING_RESOURCES = "waiting_resources"
@@ -55,6 +63,11 @@ class RequestLifecycle:
     finish_reason: Optional[str] = None
     error: Optional[BaseException] = None
     logprobs: List[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        prefix_logprobs = self.request.generated_prefix.logprobs
+        if self.request.return_logprobs is True and prefix_logprobs is not None:
+            self.logprobs.extend(float(value) for value in prefix_logprobs)
 
     def transition(self, phase: RequestPhase) -> None:
         """Update phase with minimal bookkeeping."""
@@ -177,12 +190,32 @@ class GenerationRequest:
     adapter: Optional[str] = None
     lora_slot: int = 0  # Slot in workspace; 0 = no LoRA
     return_logprobs: Optional[bool] = None
+    generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
 
     prompt_length: int = field(init=False)
 
     def __post_init__(self) -> None:
         tokens = list(self.prompt_tokens)
         self.prompt_tokens = tokens
+        prefix_tokens = self.generated_prefix.tokens
+        prefix_logprobs = self.generated_prefix.logprobs
+        if prefix_logprobs is not None and len(prefix_logprobs) != len(prefix_tokens):
+            raise ValueError(
+                "generated_prefix.logprobs must have the same length as "
+                "generated_prefix.tokens"
+            )
+        if prefix_tokens and len(prefix_tokens) >= self.max_new_tokens:
+            raise ValueError(
+                "generated_prefix.tokens must be shorter than max_new_tokens"
+            )
+        if (
+            prefix_tokens
+            and self.return_logprobs is True
+            and prefix_logprobs is None
+        ):
+            raise ValueError(
+                "generated_prefix.logprobs is required when return_logprobs is true"
+            )
         # Prompt tokens are already materialized (including BOS if required by
         # the template), so prompt_length is the list length.
         self.prompt_length = len(tokens)
@@ -196,6 +229,18 @@ class GenerationRequest:
     @property
     def target_length(self) -> int:
         return self.prompt_length + self.image_length + self.max_new_tokens
+
+    @property
+    def generated_prefix_length(self) -> int:
+        return len(self.generated_prefix.tokens)
+
+    @property
+    def remaining_new_tokens(self) -> int:
+        return self.max_new_tokens - self.generated_prefix_length
+
+    @property
+    def prefill_tokens(self) -> List[Token]:
+        return list(self.prompt_tokens) + list(self.generated_prefix.tokens)
 
 
 @dataclass

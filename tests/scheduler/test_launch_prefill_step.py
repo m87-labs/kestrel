@@ -9,7 +9,12 @@ from kestrel.moondream.runtime import PrefillClassification, TextToken
 from kestrel.scheduler.pipeline import PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
-from kestrel.scheduler.types import GenerationRequest, RequestLifecycle, RequestPhase
+from kestrel.scheduler.types import (
+    GeneratedPrefix,
+    GenerationRequest,
+    RequestLifecycle,
+    RequestPhase,
+)
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -24,7 +29,12 @@ class _SkillStateStub:
             self.tokens = []
 
 
-def _make_request(*, request_id: int = 1, max_new_tokens: int = 8) -> GenerationRequest:
+def _make_request(
+    *,
+    request_id: int = 1,
+    max_new_tokens: int = 8,
+    generated_prefix_tokens: list[TextToken] | None = None,
+) -> GenerationRequest:
     request = GenerationRequest(
         request_id=request_id,
         prompt="prompt",
@@ -32,6 +42,7 @@ def _make_request(*, request_id: int = 1, max_new_tokens: int = 8) -> Generation
         max_new_tokens=max_new_tokens,
         skill=object(),
         request_context=object(),
+        generated_prefix=GeneratedPrefix(tokens=tuple(generated_prefix_tokens or [])),
     )
     lifecycle = RequestLifecycle(
         request=request,
@@ -73,6 +84,41 @@ def _make_scheduler(
     scheduler._completed = deque()
     scheduler._select_prefill_batch = lambda capacity_remaining: [_make_candidate(request)]
     return scheduler
+
+
+def test_make_prefill_candidate_classifies_prompt_and_generated_prefix() -> None:
+    request = _make_request(generated_prefix_tokens=[TextToken(10), TextToken(11)])
+    runtime = FakeRuntime()
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    candidate = GenerationScheduler._make_prefill_candidate(scheduler, request)
+
+    assert candidate is not None
+    assert runtime.classify_calls == [[TextToken(1), TextToken(10), TextToken(11)]]
+    assert candidate.reserve_length == request.target_length
+
+
+def test_launch_prefill_step_prefills_generated_prefix_then_remaining_tokens() -> None:
+    request = _make_request(
+        max_new_tokens=5,
+        generated_prefix_tokens=[TextToken(10), TextToken(11)],
+    )
+    request.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(prepare_exc=RuntimeError("prepare failed"))
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._acquire_adapter_slot = lambda adapter_id: 0
+    pipeline = PipelineState()
+
+    GenerationScheduler._launch_prefill_step(scheduler, pipeline)
+
+    assert len(runtime.prepare_calls) == 1
+    assert runtime.prepare_calls[0]["prompt_tokens"] == [
+        TextToken(1),
+        TextToken(10),
+        TextToken(11),
+    ]
+    assert runtime.prepare_calls[0]["max_new_tokens"] == 3
 
 
 @pytest.mark.parametrize("failure_stage", ["adapter", "prepare"])

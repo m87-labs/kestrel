@@ -8,7 +8,7 @@ import pytest
 
 from kestrel.runtime import SequenceState, TextToken, Token
 from kestrel.scheduler.scheduler import GenerationScheduler
-from kestrel.scheduler.types import GenerationRequest, RequestLifecycle
+from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -85,6 +85,25 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
     assert retain_call["adapter_id"] == "adapter-a"
     assert retain_call["image_hash"] == b"0123456789abcdef"
     assert runtime.released_sequences == [state]
+
+
+def test_release_sequence_retains_only_decoded_suffix_after_generated_prefix() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    lifecycle.state.length = 4
+    lifecycle.state.prompt_length = 2
+    lifecycle.request.generated_prefix = GeneratedPrefix(tokens=(TextToken(10),))
+    lifecycle.skill_state.tokens = [TextToken(10), TextToken(11), TextToken(12)]
+
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    GenerationScheduler._release_sequence(scheduler, lifecycle)
+
+    assert len(runtime.retained_prefixes) == 1
+    retain_call = runtime.retained_prefixes[0]
+    assert retain_call["generated_tokens"] == [TextToken(11), TextToken(12)]
+    assert runtime.released_sequences == [lifecycle.state]
 
 
 def test_release_sequence_releases_and_propagates_when_retention_fails() -> None:
