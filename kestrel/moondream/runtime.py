@@ -783,14 +783,7 @@ class MoondreamRuntime:
         image_kv_length = self.image_prefix_length
         cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
 
-        # Build namespace
-        image_hash_int = int.from_bytes(image_hash[:16], "big")
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=image_hash_int,
-        )
-
+        namespace = self._cache_namespace(adapter_id, image_hash)
         match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
 
         # Cache hit must cover at least BOS + full image prefix
@@ -819,13 +812,7 @@ class MoondreamRuntime:
                     "image_hash must be provided when prefix cache is enabled for image prompts"
                 )
             cache_tokens = self._build_cache_tokens(tokens_list, image_hash, image_kv_length)
-            namespace = CacheNamespace(
-                runtime_id=self.model_name,
-                lora_id=adapter_id,
-                image_hash=(
-                    int.from_bytes(image_hash[:16], "big") if image_hash is not None else None
-                ),
-            )
+            namespace = self._cache_namespace(adapter_id, image_hash)
             match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
             can_reuse = match.matched_kv_length > 0
             if image_kv_length > 0 and can_reuse:
@@ -864,6 +851,21 @@ class MoondreamRuntime:
             cache_tokens.extend(tokens_list[1:])
         return cache_tokens
 
+    def _cache_namespace(
+        self,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> CacheNamespace:
+        return CacheNamespace(
+            runtime_id=self.model_name,
+            lora_id=adapter_id,
+            image_hash=(
+                int.from_bytes(image_hash[:16], "big")
+                if image_hash is not None
+                else None
+            ),
+        )
+
     def _lookup_prefix_cache(
         self,
         cache_tokens: list[CacheToken],
@@ -883,15 +885,7 @@ class MoondreamRuntime:
                 namespace=None,
             )
 
-        # Build namespace from adapter identity and image hash
-        image_hash_int = (
-            int.from_bytes(image_hash[:16], "big") if image_hash else None
-        )
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=image_hash_int,
-        )
+        namespace = self._cache_namespace(adapter_id, image_hash)
         match = self.prefix_cache.match_prefix(cache_tokens, namespace=namespace)
         can_reuse = match.matched_kv_length > 0
 
@@ -1034,13 +1028,7 @@ class MoondreamRuntime:
 
         # Insert prompt into cache
         prompt_pages = self.page_table.get_pages(batch_idx, 0, prompt_len)
-        namespace = CacheNamespace(
-            runtime_id=self.model_name,
-            lora_id=adapter_id,
-            image_hash=(
-                int.from_bytes(image_hash[:16], "big") if image_hash else None
-            ),
-        )
+        namespace = self._cache_namespace(adapter_id, image_hash)
         insert_result = self.prefix_cache.insert(
             cache_tokens,
             prompt_pages,
@@ -1400,6 +1388,55 @@ class MoondreamRuntime:
 
         # Release batch slot; do NOT free cache-owned mapped prefix pages.
         self.page_table.erase(batch_idx, prepared.cache_result.skip_positions)
+
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
+        """Make decoded generated KV pages eligible for prefix-cache reuse."""
+        if self.prefix_cache is None or not state.cache_tokens:
+            return
+
+        prompt_len = state.prompt_length or state.length
+        processed_generated = min(
+            len(generated_tokens),
+            max(0, state.length - prompt_len),
+        )
+        if processed_generated <= 0:
+            return
+
+        target_len = prompt_len + processed_generated
+        if target_len <= state.cache_owned_page_count:
+            return
+
+        cache_tokens: list[CacheToken] = (
+            list(state.cache_tokens) + list(generated_tokens[:processed_generated])
+        )
+        pages = self.page_table.get_pages(state.batch_idx, 0, target_len)
+        namespace = self._cache_namespace(adapter_id, image_hash)
+        insert_result = self.prefix_cache.insert(
+            cache_tokens,
+            pages,
+            namespace=namespace,
+        )
+        if insert_result.inserted_pages == 0:
+            # Normal non-retainable case: the token path may already exist with
+            # different physical pages. This happens after append-prefill
+            # recomputes the last prompt token, or when another branch cached a
+            # shared generated prefix first. Keep this sequence's private pages
+            # private so release_sequence() frees them normally.
+            return
+
+        old_lock_node = state.cache_lock_node
+        if insert_result.node is not old_lock_node:
+            self.prefix_cache.lock(insert_result.node)
+            self.prefix_cache.unlock(old_lock_node)
+            state.cache_lock_node = insert_result.node
+        state.cache_owned_page_count = target_len
 
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)

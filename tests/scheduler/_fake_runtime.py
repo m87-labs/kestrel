@@ -163,6 +163,7 @@ class FakeRuntime:
         self.launch_calls: list[Sequence[PreparedSequence]] = []
         self.finalized_prepared: list[PreparedSequence] = []
         self.aborted_prepared: list[PreparedSequence] = []
+        self.retained_prefixes: list[dict[str, Any]] = []
         self.released_sequences: list[SequenceState] = []
         self.decode_calls: list[tuple[Any, int]] = []
 
@@ -259,6 +260,23 @@ class FakeRuntime:
 
     def abort_prepared_sequence(self, prepared: PreparedSequence) -> None:
         self.aborted_prepared.append(prepared)
+
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
+        self.retained_prefixes.append(
+            {
+                "state": state,
+                "generated_tokens": list(generated_tokens),
+                "adapter_id": adapter_id,
+                "image_hash": image_hash,
+            }
+        )
 
     def release_sequence(self, state: SequenceState) -> None:
         self.released_sequences.append(state)
