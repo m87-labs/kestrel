@@ -191,6 +191,7 @@ class GenerationRequest:
     lora_slot: int = 0  # Slot in workspace; 0 = no LoRA
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
+    suppress_next_token_ids: Optional[tuple[int, ...]] = None
 
     prompt_length: int = field(init=False)
 

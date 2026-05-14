@@ -81,16 +81,26 @@ def _scheduler(batch: int = 1) -> GenerationScheduler:
     return scheduler
 
 
-def _sequence(*, temperature: float, return_logprobs: bool | None) -> SimpleNamespace:
+def _sequence(
+    *,
+    temperature: float,
+    return_logprobs: bool | None,
+    suppress_next_token_ids: tuple[int, ...] | None = None,
+    token_count: int = 0,
+    allowed_token_ids: list[int] | None = None,
+    suppressed_token_ids: list[int] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         finalized=False,
         skill_state=SimpleNamespace(
-            allowed_token_ids=lambda runtime: None,
-            suppressed_token_ids=lambda runtime: None,
+            token_count=token_count,
+            allowed_token_ids=lambda runtime: allowed_token_ids,
+            suppressed_token_ids=lambda runtime: suppressed_token_ids,
         ),
         request=SimpleNamespace(
             temperature=temperature,
             return_logprobs=return_logprobs,
+            suppress_next_token_ids=suppress_next_token_ids,
         ),
     )
 
@@ -352,6 +362,173 @@ def test_sample_batch_uses_sampler_for_greedy_logprobs(
     torch.testing.assert_close(call_temps, torch.zeros((1,), dtype=torch.float32))
     torch.testing.assert_close(call_top_ps, torch.ones((1,), dtype=torch.float32))
     assert call_logprobs is True
+
+
+def test_sample_batch_suppresses_next_token_only() -> None:
+    logits = torch.tensor([[5.0, 4.0, 0.0]], dtype=torch.float32)
+
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        logits.clone(),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppress_next_token_ids=(0,),
+                token_count=0,
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+    )
+    assert sampled.tolist() == [1]
+
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        logits.clone(),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppress_next_token_ids=(0,),
+                token_count=1,
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+    )
+    assert sampled.tolist() == [0]
+
+
+def test_sample_batch_suppression_preserves_baseline_logprob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_sample_step_from_logits(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_p: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        logprobs_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert torch.isneginf(logits[0, 0])
+        sampled = torch.tensor([1], dtype=torch.long)
+        if logprobs_out is not None:
+            logprobs_out.copy_(torch.tensor([-999.0], dtype=torch.float32))
+        if out is not None:
+            out.copy_(sampled)
+            return out
+        return sampled
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        fake_sample_step_from_logits,
+    )
+
+    scheduler = _scheduler()
+    scheduler._sampling_temps_by_batch.fill_(1.0)
+    logits = torch.tensor([[10.0, 0.0, -10.0]], dtype=torch.float32)
+    sampled, _, _, logprobs = GenerationScheduler._sample_batch(
+        scheduler,
+        logits,
+        [
+            _sequence(
+                temperature=1.0,
+                return_logprobs=True,
+                suppress_next_token_ids=(0,),
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
+        logprobs_out=torch.empty((1,), dtype=torch.float32),
+    )
+
+    expected = torch.log_softmax(
+        torch.tensor([[10.0, 0.0, -10.0]], dtype=torch.float32), dim=-1
+    )[0, 1]
+    assert sampled.tolist() == [1]
+    assert logprobs is not None
+    torch.testing.assert_close(logprobs, expected.view(1))
+
+
+def test_sample_batch_suppression_logprob_overwrite_is_row_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_sample_step_from_logits(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_p: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        logprobs_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert torch.isneginf(logits[0, 0])
+        assert logits[1, 0] == 1.0
+        sampled = torch.tensor([1, 2], dtype=torch.long)
+        if logprobs_out is not None:
+            logprobs_out.copy_(torch.tensor([-999.0, -2.0], dtype=torch.float32))
+        if out is not None:
+            out.copy_(sampled)
+            return out
+        return sampled
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        fake_sample_step_from_logits,
+    )
+
+    scheduler = _scheduler(batch=2)
+    scheduler._sampling_temps_by_batch.fill_(1.0)
+    logits = torch.tensor(
+        [
+            [10.0, 0.0, -10.0],
+            [1.0, 2.0, 3.0],
+        ],
+        dtype=torch.float32,
+    )
+    sampled, _, _, logprobs = GenerationScheduler._sample_batch(
+        scheduler,
+        logits,
+        [
+            _sequence(
+                temperature=1.0,
+                return_logprobs=True,
+                suppress_next_token_ids=(0,),
+            ),
+            _sequence(temperature=1.0, return_logprobs=True),
+        ],  # type: ignore[list-item]
+        torch.empty((2,), dtype=torch.long),
+        batch_idx=torch.tensor([0, 1], dtype=torch.long),
+        logprobs_out=torch.empty((2,), dtype=torch.float32),
+    )
+
+    expected_row0 = torch.log_softmax(
+        torch.tensor([[10.0, 0.0, -10.0]], dtype=torch.float32), dim=-1
+    )[0, 1]
+    assert sampled.tolist() == [1, 2]
+    assert logprobs is not None
+    torch.testing.assert_close(
+        logprobs,
+        torch.tensor([float(expected_row0), -2.0], dtype=torch.float32),
+    )
+
+
+def test_sample_batch_suppression_composes_with_allowed_tokens() -> None:
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        torch.tensor([[5.0, 4.0, 3.0]], dtype=torch.float32),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppress_next_token_ids=(0,),
+                allowed_token_ids=[0, 1],
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+    )
+
+    assert sampled.tolist() == [1]
 
 
 @pytest.mark.parametrize("temperature", [0.7, 0.0])
