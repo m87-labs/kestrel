@@ -52,6 +52,7 @@ from typing import (
 import numpy as np
 import torch
 
+from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
 from kestrel.moondream.runtime import MoondreamRuntime
@@ -443,11 +444,9 @@ class InferenceEngine:
                 else None
             )
             if max_lora_rank is not None:
-                from kestrel_kernels.moe.lora.triton import TRITON_AVAILABLE
-
-                if not TRITON_AVAILABLE:
+                if not get_runtime().moe.supports_lora(self._runtime_cfg.device):
                     _LOGGER.warning(
-                        "MoE LoRA adapters require triton, which is not installed. "
+                        "MoE LoRA adapters are unavailable in this kernel runtime. "
                         "Disabling LoRA — base model inference will still work, but "
                         "adapter requests will be rejected. Contact contact@moondream.ai "
                         "if LoRA support is needed on your platform."

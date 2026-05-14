@@ -128,12 +128,14 @@ class MoEModule(nn.Module):
         weight_format: _MOE_API.MoeWeightFormat,
         max_loras: int,
         mode: Literal["prefill", "decode"],
+        max_lora_rank: int = 0,
     ) -> _MOE_API.MoeHandle:
         spec = self._spec_for_weights(dtype=hidden_states.dtype, weight_format=weight_format)
         max_tokens = self._capacity_tokens_for_mode(int(hidden_states.shape[0]), mode)
         capacity = _MOE_API.MoeCapacity(
             max_tokens=max_tokens,
             max_loras=max_loras,
+            max_lora_rank=max_lora_rank,
             mode=mode,
         )
         key = (
@@ -142,6 +144,7 @@ class MoEModule(nn.Module):
             weight_format,
             capacity.max_tokens,
             capacity.max_loras,
+            capacity.max_lora_rank,
             capacity.mode,
             self.num_experts,
             self.top_k,
@@ -191,13 +194,16 @@ class MoEModule(nn.Module):
             weight_format = "bf16"
 
         max_loras = 0
+        max_lora_rank = 0
         if lora_workspace is not None:
             max_loras = int(lora_workspace.up_a.shape[0]) // self.num_experts
+            max_lora_rank = int(lora_workspace.up_a.shape[1])
 
         handle = self._get_moe_handle(
             hidden_states=hidden_states,
             weight_format=weight_format,
             max_loras=max_loras,
+            max_lora_rank=max_lora_rank,
             mode=mode,
         )
         weights = _MOE_API.pack_weights(
