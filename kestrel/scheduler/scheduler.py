@@ -1325,7 +1325,7 @@ class GenerationScheduler:
             if (
                 seq.finalized
                 or not suppress
-                or seq.skill_state.token_count != 0
+                or seq.skill_state.token_count != seq.request.generated_prefix_length
             ):
                 continue
             suppress_rows.append((i, suppress))

@@ -87,6 +87,7 @@ def _sequence(
     return_logprobs: bool | None,
     suppress_next_token_ids: tuple[int, ...] | None = None,
     token_count: int = 0,
+    generated_prefix_length: int = 0,
     allowed_token_ids: list[int] | None = None,
     suppressed_token_ids: list[int] | None = None,
 ) -> SimpleNamespace:
@@ -100,6 +101,7 @@ def _sequence(
         request=SimpleNamespace(
             temperature=temperature,
             return_logprobs=return_logprobs,
+            generated_prefix_length=generated_prefix_length,
             suppress_next_token_ids=suppress_next_token_ids,
         ),
     )
@@ -391,6 +393,42 @@ def test_sample_batch_suppresses_next_token_only() -> None:
                 return_logprobs=None,
                 suppress_next_token_ids=(0,),
                 token_count=1,
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+    )
+    assert sampled.tolist() == [0]
+
+
+def test_sample_batch_suppresses_first_token_after_generated_prefix() -> None:
+    logits = torch.tensor([[5.0, 4.0, 0.0]], dtype=torch.float32)
+
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        logits.clone(),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppress_next_token_ids=(0,),
+                token_count=2,
+                generated_prefix_length=2,
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+    )
+    assert sampled.tolist() == [1]
+
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        logits.clone(),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppress_next_token_ids=(0,),
+                token_count=3,
+                generated_prefix_length=2,
             )
         ],  # type: ignore[list-item]
         torch.empty((1,), dtype=torch.long),
