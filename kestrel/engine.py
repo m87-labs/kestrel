@@ -443,7 +443,7 @@ class InferenceEngine:
                 else None
             )
             if max_lora_rank is not None:
-                from kestrel_kernels.moe_lora import TRITON_AVAILABLE
+                from kestrel_kernels.moe.lora.triton import TRITON_AVAILABLE
 
                 if not TRITON_AVAILABLE:
                     _LOGGER.warning(

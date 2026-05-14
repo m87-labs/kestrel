@@ -1810,7 +1810,7 @@ class MoondreamRuntime:
         # workspaces are prepared by kestrel-kernels MoeHandle warmup before
         # CUDA graph capture.
         if self.config.text.moe is not None:
-            from kestrel_kernels.moe_lora import preallocate_lora_buffers
+            from kestrel_kernels.moe.lora.triton import preallocate_lora_buffers
 
             moe_cfg = self.config.text.moe
             if self._max_lora_rank is not None:
