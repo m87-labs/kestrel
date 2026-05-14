@@ -513,6 +513,30 @@ def test_sample_batch_suppression_logprob_overwrite_is_row_scoped(
     )
 
 
+def test_selected_logprobs_follow_sampling_epsilon_boundary() -> None:
+    logits = torch.tensor(
+        [
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [0.0, -1e-6, -2e-6],
+        ],
+        dtype=torch.float32,
+    )
+    sampled_ids = torch.tensor([0, 1, 1], dtype=torch.long)
+    temperatures = torch.tensor([0.0, 5e-7, 2e-6], dtype=torch.float32)
+
+    logprobs = GenerationScheduler._selected_logprobs_from_logits(
+        logits,
+        sampled_ids,
+        temperatures,
+    )
+
+    expected_temp_scaled = torch.log_softmax(logits[2] / temperatures[2], dim=-1)[1]
+    assert logprobs[0].item() == 0.0
+    assert torch.isneginf(logprobs[1]).item()
+    torch.testing.assert_close(logprobs[2], expected_temp_scaled)
+
+
 def test_sample_batch_suppression_composes_with_allowed_tokens() -> None:
     sampled, _, _, _ = GenerationScheduler._sample_batch(
         _scheduler(),

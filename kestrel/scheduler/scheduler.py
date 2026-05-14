@@ -1404,8 +1404,17 @@ class GenerationScheduler:
             torch.ones_like(temps),
         ).unsqueeze(-1)
         scaled = logits.to(dtype=torch.float32) / effective_temp
+        normalizer = torch.logsumexp(scaled, dim=-1)
+        force_greedy = (temps <= _SAMPLING_EPS) | ~torch.isfinite(normalizer)
+        greedy_ids = logits.argmax(dim=-1)
         selected = scaled.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
-        return selected - torch.logsumexp(scaled, dim=-1)
+        softmax_logprobs = selected - normalizer
+        greedy_logprobs = torch.where(
+            sampled_ids == greedy_ids,
+            torch.zeros_like(softmax_logprobs),
+            torch.full_like(softmax_logprobs, float("-inf")),
+        )
+        return torch.where(force_greedy, greedy_logprobs, softmax_logprobs)
 
     def _logprobs_for_sequences(
         self,

@@ -110,6 +110,17 @@ class MoEModule(nn.Module):
             auto_backend_token_threshold=self.config.auto_backend_token_threshold,
         )
 
+    @staticmethod
+    def _capacity_tokens_for_mode(
+        num_tokens: int,
+        mode: Literal["prefill", "decode"],
+    ) -> int:
+        if num_tokens <= 0:
+            raise ValueError("num_tokens must be positive")
+        if mode == "decode":
+            return num_tokens
+        return 1 << (num_tokens - 1).bit_length()
+
     def _get_moe_handle(
         self,
         *,
@@ -119,8 +130,9 @@ class MoEModule(nn.Module):
         mode: Literal["prefill", "decode"],
     ) -> _MOE_API.MoeHandle:
         spec = self._spec_for_weights(dtype=hidden_states.dtype, weight_format=weight_format)
+        max_tokens = self._capacity_tokens_for_mode(int(hidden_states.shape[0]), mode)
         capacity = _MOE_API.MoeCapacity(
-            max_tokens=int(hidden_states.shape[0]),
+            max_tokens=max_tokens,
             max_loras=max_loras,
             mode=mode,
         )
