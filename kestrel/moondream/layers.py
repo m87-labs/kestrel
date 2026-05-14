@@ -133,12 +133,12 @@ def build_dense_mlp(d_model: int, d_ffn: int, dtype: torch.dtype) -> nn.ModuleDi
 def build_moe_mlp(
     d_model: int, d_ffn: int, n_experts: int, dtype: torch.dtype, *, top_k: int
 ) -> nn.ModuleDict:
-    from ..fused_moe import ExpertWeights, FusedMoEModule
+    from .moe import ExpertWeights, MoEModule
 
     router = nn.Linear(d_model, n_experts, dtype=dtype)
     up_experts = ExpertWeights(n_experts, d_model, d_ffn * 2, dtype=dtype)
     down_experts = ExpertWeights(n_experts, d_ffn, d_model, dtype=dtype)
-    fused = FusedMoEModule(
+    moe = MoEModule(
         up_experts,
         down_experts,
         top_k=top_k,
@@ -146,7 +146,7 @@ def build_moe_mlp(
         input_size=d_model,
         num_experts=n_experts,
     )
-    return nn.ModuleDict({"router": router, "mlp": fused})
+    return nn.ModuleDict({"router": router, "mlp": moe})
 
 
 def moe_mlp(
@@ -184,6 +184,7 @@ def moe_mlp(
         lora_workspace,
         expanded_slot_ids,
         single_lora_id,
+        mode=mode,
     ).view(B, T, C)
     return mlp_out
 

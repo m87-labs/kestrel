@@ -52,6 +52,7 @@ from typing import (
 import numpy as np
 import torch
 
+from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
 from kestrel.moondream.runtime import MoondreamRuntime
@@ -204,6 +205,7 @@ class _PendingRequest:
     lora_slot: int = 0  # Always 0 here; scheduler assigns actual slot at admission
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
+    suppress_next_token_ids: Optional[tuple[int, ...]] = None
 
 
 @dataclass(slots=True)
@@ -442,11 +444,9 @@ class InferenceEngine:
                 else None
             )
             if max_lora_rank is not None:
-                from kestrel_kernels.moe_lora import TRITON_AVAILABLE
-
-                if not TRITON_AVAILABLE:
+                if not get_runtime().moe.supports_lora(self._runtime_cfg.device):
                     _LOGGER.warning(
-                        "MoE LoRA adapters require triton, which is not installed. "
+                        "MoE LoRA adapters are unavailable in this kernel runtime. "
                         "Disabling LoRA — base model inference will still work, but "
                         "adapter requests will be rejected. Contact contact@moondream.ai "
                         "if LoRA support is needed on your platform."
@@ -546,10 +546,15 @@ class InferenceEngine:
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
+        _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineResult:
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
+        )
+        suppress_next_token_ids = self._normalize_suppress_next_token_ids(
+            _suppress_next_token_ids,
+            field_name="_suppress_next_token_ids",
         )
         future, _ = await self._submit_request(
             max_new_tokens=max_new_tokens,
@@ -560,6 +565,7 @@ class InferenceEngine:
             top_p=top_p,
             return_logprobs=_logprobs,
             generated_prefix=generated_prefix,
+            suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=None,
             skill=skill,
         )
@@ -621,6 +627,7 @@ class InferenceEngine:
         adapter: Optional[str] = None
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         if settings is not None:
             if "temperature" in settings:
                 temperature = float(settings["temperature"])
@@ -667,6 +674,7 @@ class InferenceEngine:
                 top_p=top_p,
                 _logprobs=return_logprobs,
                 _generated_prefix=generated_prefix,
+                _suppress_next_token_ids=suppress_next_token_ids,
                 skill="query",
             )
         return await self.submit(
@@ -678,6 +686,7 @@ class InferenceEngine:
             top_p=top_p,
             _logprobs=return_logprobs,
             _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
             skill="query",
         )
 
@@ -694,6 +703,7 @@ class InferenceEngine:
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         max_tokens = self._default_max_new_tokens
         max_objects = None
         temperature = 0.0
@@ -729,6 +739,7 @@ class InferenceEngine:
             top_p=top_p,
             _logprobs=return_logprobs,
             _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
             skill="point",
         )
 
@@ -780,6 +791,7 @@ class InferenceEngine:
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         temperature = self._default_temperature
         top_p = self._default_top_p
         max_tokens = self._default_max_new_tokens
@@ -814,6 +826,7 @@ class InferenceEngine:
                 top_p=top_p,
                 _logprobs=return_logprobs,
                 _generated_prefix=generated_prefix,
+                _suppress_next_token_ids=suppress_next_token_ids,
                 skill="caption",
             )
         return await self.submit(
@@ -825,6 +838,7 @@ class InferenceEngine:
             top_p=top_p,
             _logprobs=return_logprobs,
             _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
             skill="caption",
         )
 
@@ -841,6 +855,7 @@ class InferenceEngine:
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         max_objects = 50
         temperature = 0.0
         top_p = 1.0
@@ -871,6 +886,7 @@ class InferenceEngine:
             top_p=top_p,
             _logprobs=return_logprobs,
             _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
             skill="detect",
         )
 
@@ -889,6 +905,7 @@ class InferenceEngine:
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         temperature = 0.0
         top_p = 1.0
         max_tokens = self._default_max_new_tokens
@@ -930,6 +947,7 @@ class InferenceEngine:
             top_p=top_p,
             _logprobs=return_logprobs,
             _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
             skill="segment",
         )
 
@@ -945,11 +963,16 @@ class InferenceEngine:
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
+        _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
+        )
+        suppress_next_token_ids = self._normalize_suppress_next_token_ids(
+            _suppress_next_token_ids,
+            field_name="_suppress_next_token_ids",
         )
         future, request_id = await self._submit_request(
             max_new_tokens=max_new_tokens,
@@ -960,6 +983,7 @@ class InferenceEngine:
             top_p=top_p,
             return_logprobs=_logprobs,
             generated_prefix=generated_prefix,
+            suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=queue,
             skill=skill,
         )
@@ -1007,6 +1031,7 @@ class InferenceEngine:
         top_p: Optional[float],
         return_logprobs: Optional[bool],
         generated_prefix: GeneratedPrefix,
+        suppress_next_token_ids: Optional[tuple[int, ...]],
         stream_queue: Optional[_StreamQueue],
         skill: str,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
@@ -1061,6 +1086,7 @@ class InferenceEngine:
             adapter=adapter_id,
             return_logprobs=return_logprobs,
             generated_prefix=generated_prefix,
+            suppress_next_token_ids=suppress_next_token_ids,
         )
         await self._queue.put(payload)
         return future, req_id
@@ -1308,6 +1334,43 @@ class InferenceEngine:
                 raise ValueError(
                     "settings._generated_prefix.tokens must not contain EOS"
                 )
+
+    def _extract_suppress_next_token_ids(
+        self, settings: Optional[Mapping[str, object]]
+    ) -> Optional[tuple[int, ...]]:
+        if settings is None or "_suppress_next_token_ids" not in settings:
+            return None
+        return self._normalize_suppress_next_token_ids(
+            settings["_suppress_next_token_ids"],
+            field_name="settings._suppress_next_token_ids",
+        )
+
+    def _normalize_suppress_next_token_ids(
+        self,
+        raw: object,
+        *,
+        field_name: str,
+    ) -> Optional[tuple[int, ...]]:
+        if raw is None:
+            return None
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+            raise TypeError(
+                f"{field_name} must be a sequence of non-negative token ids or None"
+            )
+
+        seen: set[int] = set()
+        token_ids: list[int] = []
+        for idx, value in enumerate(raw):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name}[{idx}] must be an int token id")
+            if value < 0:
+                raise ValueError(f"{field_name}[{idx}] must be non-negative")
+            if value not in seen:
+                seen.add(value)
+                token_ids.append(value)
+        if not token_ids:
+            return None
+        return tuple(token_ids)
 
     def _build_stream_callback(
         self, req: _PendingRequest
@@ -1597,6 +1660,7 @@ class InferenceEngine:
             lora_slot=req.lora_slot,
             return_logprobs=req.return_logprobs,
             generated_prefix=req.generated_prefix,
+            suppress_next_token_ids=req.suppress_next_token_ids,
         )
         limit = runtime.max_seq_length
         target_total = request_obj.target_length
@@ -1615,7 +1679,48 @@ class InferenceEngine:
                 runtime,
                 DecodeStep(token=token, position=skill_state.token_count),
             )
+        self._validate_suppress_next_token_ids(
+            runtime,
+            request_obj,
+            skill_state,
+        )
         return request_obj, skill_state
+
+    def _validate_suppress_next_token_ids(
+        self,
+        runtime: Runtime,
+        request: GenerationRequest,
+        skill_state: SkillState,
+    ) -> None:
+        suppress = request.suppress_next_token_ids
+        if not suppress:
+            return
+
+        vocab_size = int(runtime.config.text.vocab_size)
+        for token_id in suppress:
+            if token_id >= vocab_size:
+                raise ValueError(
+                    "_suppress_next_token_ids contains token id "
+                    f"{token_id}, but vocab size is {vocab_size}"
+                )
+
+        allowed = skill_state.allowed_token_ids(runtime)
+        skill_suppressed = skill_state.suppressed_token_ids(runtime) or ()
+        if allowed:
+            remaining = (
+                set(int(token_id) for token_id in allowed)
+                - set(int(token_id) for token_id in skill_suppressed)
+                - set(suppress)
+            )
+            if not remaining:
+                raise ValueError(
+                    "_suppress_next_token_ids removed every allowed next token"
+                )
+        else:
+            banned = set(int(token_id) for token_id in skill_suppressed)
+            banned.update(suppress)
+            if len(banned) >= vocab_size:
+                raise ValueError("_suppress_next_token_ids removed every next token")
 
     def _to_engine_result(self, result: SchedulerResult) -> EngineResult:
         sched_metrics = result.metrics

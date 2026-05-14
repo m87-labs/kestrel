@@ -52,6 +52,7 @@ from .spatial import compute_spatial_values
 _LOGGER = logging.getLogger(__name__)
 # Greedily build a prefill batch until aggregate query tokens reaches this floor.
 _MIN_PREFILL_LAUNCH_TOKENS = 2048
+_SAMPLING_EPS = 1e-6
 # Prefer seeding miss-frontier work only when launch capacity is large enough to
 # absorb the short-term hit latency tradeoff.
 _MISS_FRONTIER_MIN_CAPACITY = 32
@@ -1279,6 +1280,7 @@ class GenerationScheduler:
             return out[:0], None, None, None
 
         allowed_tokens: list[Optional[Sequence[int]]] = []
+        suppressed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
         for seq in sequences:
             # Skip constraint queries for finalized sequences (zombies).
@@ -1286,11 +1288,13 @@ class GenerationScheduler:
             # use-after-finalization bugs.
             if seq.finalized:
                 allowed_tokens.append(None)
+                suppressed_tokens.append(None)
                 continue
             allowed = seq.skill_state.allowed_token_ids(self.runtime)
             allowed_tokens.append(allowed)
             if allowed:
                 restrict = True
+            suppressed_tokens.append(seq.skill_state.suppressed_token_ids(self.runtime))
 
         if restrict:
             for i, allowed in enumerate(allowed_tokens):
@@ -1303,10 +1307,7 @@ class GenerationScheduler:
                 logits[i] = pruned
 
         # Apply per-skill token suppression (blacklist).
-        for i, seq in enumerate(sequences):
-            if seq.finalized:
-                continue
-            suppressed = seq.skill_state.suppressed_token_ids(self.runtime)
+        for i, suppressed in enumerate(suppressed_tokens):
             if suppressed:
                 idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
                 logits[i, idx] = float("-inf")
@@ -1317,6 +1318,35 @@ class GenerationScheduler:
         )
         logprobs = logprobs_out[:batch] if want_logprobs else None
         out_view = out[:batch]
+
+        suppress_rows: list[tuple[int, tuple[int, ...]]] = []
+        for i, seq in enumerate(sequences):
+            suppress = seq.request.suppress_next_token_ids
+            if (
+                seq.finalized
+                or not suppress
+                or seq.skill_state.token_count != seq.request.generated_prefix_length
+            ):
+                continue
+            suppress_rows.append((i, suppress))
+
+        baseline_row_idx: Tensor | None = None
+        baseline_logits: Tensor | None = None
+        if logprobs is not None and suppress_rows:
+            rows = [
+                i
+                for i, _ in suppress_rows
+                if sequences[i].request.return_logprobs is True
+            ]
+            if rows:
+                baseline_row_idx = torch.tensor(
+                    rows, device=logits.device, dtype=torch.long
+                )
+                baseline_logits = logits.index_select(0, baseline_row_idx)
+
+        for i, suppress in suppress_rows:
+            idx = torch.tensor(suppress, device=logits.device, dtype=torch.long)
+            logits[i, idx] = float("-inf")
 
         all_greedy = all(seq.request.temperature <= 0.0 for seq in sequences)
         if all_greedy:
@@ -1350,7 +1380,41 @@ class GenerationScheduler:
         )
         if sampled_raw is not out_view:
             out_view.copy_(sampled_raw)
+        if baseline_logits is not None and baseline_row_idx is not None:
+            if temps is None:
+                raise AssertionError("sampling temperatures are required for logprobs")
+            base_logprobs = self._selected_logprobs_from_logits(
+                baseline_logits,
+                out_view.index_select(0, baseline_row_idx),
+                temps.index_select(0, baseline_row_idx),
+            )
+            logprobs.index_copy_(0, baseline_row_idx, base_logprobs)
         return out_view, temps, top_ps, logprobs
+
+    @staticmethod
+    def _selected_logprobs_from_logits(
+        logits: Tensor,
+        sampled_ids: Tensor,
+        temperatures: Tensor,
+    ) -> Tensor:
+        temps = torch.clamp(temperatures, min=0.0)
+        effective_temp = torch.where(
+            temps > _SAMPLING_EPS,
+            temps,
+            torch.ones_like(temps),
+        ).unsqueeze(-1)
+        scaled = logits.to(dtype=torch.float32) / effective_temp
+        normalizer = torch.logsumexp(scaled, dim=-1)
+        force_greedy = (temps <= _SAMPLING_EPS) | ~torch.isfinite(normalizer)
+        greedy_ids = logits.argmax(dim=-1)
+        selected = scaled.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
+        softmax_logprobs = selected - normalizer
+        greedy_logprobs = torch.where(
+            sampled_ids == greedy_ids,
+            torch.zeros_like(softmax_logprobs),
+            torch.full_like(softmax_logprobs, float("-inf")),
+        )
+        return torch.where(force_greedy, greedy_logprobs, softmax_logprobs)
 
     def _logprobs_for_sequences(
         self,

@@ -19,6 +19,7 @@ from torch import Tensor
 
 from tokenizers import Tokenizer
 
+from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import NoopEvent, empty_cache, get_device_capability, make_event, make_stream, set_device, stream_context
 from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
@@ -486,6 +487,14 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.dtype,
             )
+            if self.config.text.moe is not None:
+                get_runtime().moe.reserve_lora_scratch(
+                    max_tokens=self.max_seq_length - 1,
+                    top_k=self.config.text.moe.experts_per_token,
+                    max_lora_rank=self._lora_workspace.max_rank_per_expert,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
 
         # Create two ping-pong decode slots for pipelined decoding.
         # Each slot has its own staging buffers, FA3 paged-KV metadata buffers,
@@ -1790,8 +1799,6 @@ class MoondreamRuntime:
         sequentially. This reduces memory from O(num_layers * workspace) to O(workspace).
         The buffers are fixed-size; requesting more tokens than allocated raises an error.
         """
-        max_tokens = self.max_seq_length - 1
-
         # Pre-allocate vision fused MLP workspace
         # max_tokens = (max_crops + 1) * patches_per_crop
         # The +1 accounts for the global/overview crop added by overlap_crop_image
@@ -1806,30 +1813,9 @@ class MoondreamRuntime:
             dtype=self.dtype,
         )
 
-        # Pre-allocate MoE workspaces if MoE is enabled
-        if self.config.text.moe is not None:
-            from kestrel.fused_moe import preallocate_shared_moe_workspaces
-            from kestrel_kernels.moe_lora import preallocate_lora_buffers
-
-            moe_cfg = self.config.text.moe
-            preallocate_shared_moe_workspaces(
-                max_num_tokens=max_tokens,
-                top_k=moe_cfg.experts_per_token,
-                hidden_size=moe_cfg.expert_inner_dim,
-                input_size=self.config.text.dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
-            # Pre-allocate LoRA buffers if LoRA is enabled
-            if self._max_lora_rank is not None:
-                preallocate_lora_buffers(
-                    max_num_tokens=max_tokens,
-                    top_k=moe_cfg.experts_per_token,
-                    max_lora_rank=self._max_lora_rank,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
+        # Base MoE workspaces are owned by kestrel-kernels MoeHandle
+        # preparation. MoE LoRA scratch is reserved when the LoRA workspace is
+        # created so CUDA graph capture sees stable intermediate buffers.
 
     def _make_graph_batch_sizes(self, max_batch: int) -> list[int]:
         seeds = [size for size in (1, 2, 4, 8) if size <= max_batch]
