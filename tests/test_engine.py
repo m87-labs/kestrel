@@ -186,3 +186,67 @@ def test_extract_private_logprobs_setting() -> None:
     assert engine._extract_logprobs({"_logprobs": False}) is False
     with pytest.raises(TypeError, match="settings._logprobs"):
         engine._extract_logprobs({"_logprobs": 1})
+
+
+def test_extract_private_suppress_next_token_ids_setting() -> None:
+    engine = object.__new__(InferenceEngine)
+
+    assert engine._extract_suppress_next_token_ids(None) is None
+    assert engine._extract_suppress_next_token_ids({}) is None
+    assert engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": None}) is None
+    assert engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": []}) is None
+    assert engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": [3, 5, 3]}) == (3, 5)
+
+    with pytest.raises(TypeError, match="settings._suppress_next_token_ids"):
+        engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": 3})
+    with pytest.raises(TypeError, match="settings._suppress_next_token_ids"):
+        engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": ["3"]})
+    with pytest.raises(TypeError, match="settings._suppress_next_token_ids"):
+        engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": [True]})
+    with pytest.raises(ValueError, match="settings._suppress_next_token_ids"):
+        engine._extract_suppress_next_token_ids({"_suppress_next_token_ids": [-1]})
+
+
+def test_validate_suppress_next_token_ids_rejects_bad_request_scope() -> None:
+    engine = object.__new__(InferenceEngine)
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(text=SimpleNamespace(vocab_size=4))
+    )
+
+    def skill_state(
+        *,
+        allowed: list[int] | None = None,
+        suppressed: list[int] | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            allowed_token_ids=lambda runtime: allowed,
+            suppressed_token_ids=lambda runtime: suppressed,
+        )
+
+    valid_request = SimpleNamespace(suppress_next_token_ids=(1,))
+    engine._validate_suppress_next_token_ids(
+        runtime,
+        valid_request,
+        skill_state(allowed=[0, 1], suppressed=None),
+    )
+
+    with pytest.raises(ValueError, match="vocab size"):
+        engine._validate_suppress_next_token_ids(
+            runtime,
+            SimpleNamespace(suppress_next_token_ids=(4,)),
+            skill_state(),
+        )
+
+    with pytest.raises(ValueError, match="removed every allowed next token"):
+        engine._validate_suppress_next_token_ids(
+            runtime,
+            SimpleNamespace(suppress_next_token_ids=(0, 1)),
+            skill_state(allowed=[0, 1]),
+        )
+
+    with pytest.raises(ValueError, match="removed every next token"):
+        engine._validate_suppress_next_token_ids(
+            runtime,
+            SimpleNamespace(suppress_next_token_ids=(0, 1)),
+            skill_state(suppressed=[2, 3]),
+        )
