@@ -2,6 +2,32 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.4.0 — 2026-05-18
+
+This release fixes Apple Silicon installs breaking after PyTorch upgrades,
+improves prefix-cache reuse and startup recovery, and adds rank-32 LoRA adapter
+support.
+
+### Apple Silicon install compatibility
+
+- Apple Silicon installs now work across supported PyTorch 2.9–2.12 builds.
+  Previously, the native MPS extension was tied to a single PyTorch minor
+  version and could fail to import after a PyTorch upgrade.
+
+### Prefix-cache and startup reliability
+
+- Completed responses are now retained in the prefix cache, so follow-up
+  requests that repeat or continue an earlier prompt start faster.
+- A failed engine start, such as a warmup or API-key validation failure, no
+  longer leaves the engine half-initialized. Starting again retries from a clean
+  state.
+
+### LoRA and MoE
+
+- LoRA adapters now support rank 32, up from rank 16.
+- MoE execution, including LoRA warmup and prefill, now runs through the shared
+  `kestrel-kernels` runtime path used by the CUDA and Metal kernel backends.
+
 ## 0.3.1 — 2026-05-01
 
 - **Python 3.14 support** across Linux x86_64 / aarch64, Windows x86_64,
