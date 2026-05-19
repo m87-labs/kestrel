@@ -1498,15 +1498,17 @@ class MoondreamRuntime:
         if lora_slot == 0:
             lora_workspace = None
             lora_slot_ids = None
-            single_lora_id = None
+            active_lora_ids = None
+            active_lora_token_counts = None
             active_lora_max_rank = None
         else:
             lora_workspace = self._lora_workspace
             lora_slot_ids = torch.tensor(
                 [lora_slot], dtype=torch.int32, device=self.device
             )
-            # Single-LoRA prefill path uses a fixed lora_id (slot N -> lora_id N-1)
-            single_lora_id = lora_slot - 1
+            active_lora_ids = torch.tensor(
+                [lora_slot - 1], dtype=torch.int32, device=self.device
+            )
             active_lora_max_rank = (
                 lora_workspace.moe_lora_rank_for_slot(lora_slot)
                 if lora_workspace is not None
@@ -1515,6 +1517,8 @@ class MoondreamRuntime:
 
         # Build scratch buffer pool for prefill to avoid per-layer allocations.
         M = inputs_embeds.size(0) * inputs_embeds.size(1)
+        if lora_slot != 0:
+            active_lora_token_counts = (int(M),)
         tc = self.config.text
         head_dim = tc.dim // tc.n_heads
         scratch_pool = {
@@ -1549,7 +1553,8 @@ class MoondreamRuntime:
             fa3_seqused_k=fa3_seqused_k,
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
-            single_lora_id=single_lora_id,
+            active_lora_ids=active_lora_ids,
+            active_lora_token_counts=active_lora_token_counts,
             active_lora_max_rank=active_lora_max_rank,
             scratch_pool=scratch_pool,
         )
