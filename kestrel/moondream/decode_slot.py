@@ -45,6 +45,7 @@ class DecodeMetaBuffers:
     batch_idx: CpuGpuBuffer  # int64 [max_batch] - sequence batch indices
     input_pos: CpuGpuBuffer  # int32 [max_batch] - token positions
     lora_slot_ids: CpuGpuBuffer  # int32 [max_batch] - LoRA slot assignments
+    active_lora_ids: CpuGpuBuffer  # int32 [max_batch] - active MoE LoRA ids
 
 
 @dataclass
@@ -179,6 +180,12 @@ def create_decode_slot(
             pin_memory=True,
         ),
         lora_slot_ids=CpuGpuBuffer(
+            max_batch_slots,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=True,
+        ),
+        active_lora_ids=CpuGpuBuffer(
             max_batch_slots,
             dtype=torch.int32,
             device=device,

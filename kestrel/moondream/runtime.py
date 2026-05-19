@@ -418,9 +418,8 @@ class MoondreamRuntime:
             and self.device.type == "cuda"
         )
 
-        # Additional streams: LoRA operations and D2H copies.
+        # Additional stream for D2H copies.
         # (Primary stream was created earlier for PageTable H2D sync.)
-        self._lora_stream = make_stream(self.device)
         self._copy_stream = make_stream(self.device)
 
         # CUDA graph batch sizes for decode (same for all slots).
@@ -475,7 +474,6 @@ class MoondreamRuntime:
                 max_rank=max_lora_rank,
                 device=self.device,
                 dtype=self.dtype,
-                lora_stream=self._lora_stream,
             )
             self._slot_manager = AdapterSlotManager(max_slots)
             self._dense_lora_decode_scratch = create_mlp_scratch(
@@ -1501,6 +1499,7 @@ class MoondreamRuntime:
             lora_workspace = None
             lora_slot_ids = None
             single_lora_id = None
+            active_lora_max_rank = None
         else:
             lora_workspace = self._lora_workspace
             lora_slot_ids = torch.tensor(
@@ -1508,6 +1507,11 @@ class MoondreamRuntime:
             )
             # Single-LoRA prefill path uses a fixed lora_id (slot N -> lora_id N-1)
             single_lora_id = lora_slot - 1
+            active_lora_max_rank = (
+                lora_workspace.moe_lora_rank_for_slot(lora_slot)
+                if lora_workspace is not None
+                else None
+            )
 
         # Build scratch buffer pool for prefill to avoid per-layer allocations.
         M = inputs_embeds.size(0) * inputs_embeds.size(1)
@@ -1546,6 +1550,7 @@ class MoondreamRuntime:
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
             single_lora_id=single_lora_id,
+            active_lora_max_rank=active_lora_max_rank,
             scratch_pool=scratch_pool,
         )
 
@@ -1623,12 +1628,54 @@ class MoondreamRuntime:
         if use_graph:
             slot.cuda_graphs[graph_batch_size].replay()
         else:
-            self._run_decode_forward(slot, graph_batch_size)
+            self._run_decode_forward(slot, graph_batch_size, compact_lora=True)
+
+    def _prepare_decode_lora_metadata(
+        self,
+        slot: DecodeSlot,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, tuple[int, ...], int]:
+        workspace = self._lora_workspace
+        if workspace is None:
+            return slot.meta.active_lora_ids.gpu[:0], (), 0
+
+        counts = [0] * max(0, workspace.max_slots - 1)
+        for slot_id in slot.meta.lora_slot_ids.np[:batch_size]:
+            slot_int = int(slot_id)
+            if slot_int <= 0:
+                continue
+            lora_id = slot_int - 1
+            if lora_id < len(counts):
+                counts[lora_id] += 1
+
+        active_count = 0
+        active_max_rank = 0
+        active_counts: list[int] = []
+        active_ids = slot.meta.active_lora_ids.np
+        for lora_id, token_count in enumerate(counts):
+            if token_count == 0:
+                continue
+            active_ids[active_count] = lora_id
+            active_count += 1
+            active_counts.append(token_count)
+            active_max_rank = max(active_max_rank, workspace.moe_lora_rank_for_id(lora_id))
+
+        if active_count == 0:
+            return slot.meta.active_lora_ids.gpu[:0], (), 0
+
+        slot.meta.active_lora_ids.copy_to_gpu(active_count)
+        return (
+            slot.meta.active_lora_ids.gpu[:active_count],
+            tuple(active_counts),
+            active_max_rank,
+        )
 
     def _run_decode_forward(
         self,
         slot: DecodeSlot,
         batch_size: int,
+        *,
+        compact_lora: bool = False,
     ) -> None:
         """Run decode forward pass and write results to slot output buffers.
 
@@ -1649,6 +1696,23 @@ class MoondreamRuntime:
             batch_idx=slot.meta.batch_idx.gpu[:batch_size].view(-1, 1),
             positions=position_ids,
         )
+        lora_workspace = self._lora_workspace
+        lora_slot_ids = None
+        active_lora_ids = None
+        active_lora_token_counts = None
+        active_lora_max_rank = None
+        if lora_workspace is not None:
+            lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
+            if compact_lora:
+                (
+                    active_lora_ids,
+                    active_lora_token_counts,
+                    active_lora_max_rank,
+                ) = self._prepare_decode_lora_metadata(slot, batch_size)
+                if active_lora_ids.numel() == 0:
+                    lora_workspace = None
+                    lora_slot_ids = None
+
         hidden = text_decoder(
             embeds,
             self.model.text,
@@ -1659,8 +1723,11 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             page_table=slot.fa3_page_table[:batch_size],
             fa3_seqused_k=slot.fa3_seqused_k[:batch_size],
-            lora_workspace=self._lora_workspace,
-            lora_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
+            lora_workspace=lora_workspace,
+            lora_slot_ids=lora_slot_ids,
+            active_lora_ids=active_lora_ids,
+            active_lora_token_counts=active_lora_token_counts,
+            active_lora_max_rank=active_lora_max_rank,
             dense_lora_scratch=self._dense_lora_decode_scratch,
         )
         logits = lm_head(hidden, self.model.text)

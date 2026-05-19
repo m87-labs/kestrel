@@ -163,7 +163,7 @@ def _preallocate_lora_intermediate_buffers() -> None:
     Use a suite-wide upper bound so this module composes with test_dense_lora,
     which shares the same global buffers.
     """
-    from kestrel_kernels.moe.lora.triton import preallocate_lora_buffers
+    from kestrel_kernels.moe.lora import preallocate_lora_buffers
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -207,7 +207,7 @@ class TestMoELoRA:
         )
 
         # Actual: use batched kernel with moe_lora_align_block_size
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         # Convert slot IDs to lora mapping: slot 0 -> -1, slot N -> N-1
         token_lora_mapping = torch.where(
@@ -244,7 +244,6 @@ class TestMoELoRA:
         )
 
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
-
     def test_slot_zero_no_lora(self, device, dtype):
         """Test that slot 0 produces zero delta."""
         max_slots = 4
@@ -264,7 +263,7 @@ class TestMoELoRA:
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
         lora_slot_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -326,7 +325,7 @@ class TestMoELoRA:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -386,7 +385,7 @@ class TestMoELoRA:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts, mul_routed_weight=True
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -441,7 +440,7 @@ class TestMoELoRA:
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         block_size_m = 16
         lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
@@ -519,7 +518,7 @@ class TestMoELoRA:
         x = torch.randn(1, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (1, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(1, top_k, dtype=dtype, device=device)
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         block_size_m = 16
         lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
@@ -580,7 +579,7 @@ class TestMoELoRA:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -648,7 +647,7 @@ class TestSingleLoRA:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_single
+        from kestrel_kernels.moe.lora import apply_moe_lora_single
 
         block_size_m = 16
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -698,7 +697,7 @@ class TestSingleLoRA:
         lora_slot = 3
         lora_id = lora_slot - 1
         lora_slot_ids = torch.full((num_tokens,), lora_slot, dtype=torch.int32, device=device)
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_single, apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_single, apply_moe_lora_batched
 
         block_size_m = 16
 
@@ -774,7 +773,7 @@ class TestSingleLoRA:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_single
+        from kestrel_kernels.moe.lora import apply_moe_lora_single
 
         block_size_m = 16
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -819,7 +818,7 @@ class TestSingleLoRA:
         x = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
         topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
         topk_weights = torch.ones(num_tokens, top_k, dtype=dtype, device=device)
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_single
+        from kestrel_kernels.moe.lora import apply_moe_lora_single
 
         block_size_m = 16
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -859,7 +858,7 @@ class TestMoELoRACudaGraph:
 
     def test_moe_lora_cudagraph(self, device, dtype):
         """Test that MoE LoRA batched kernel can be captured in a CUDA graph."""
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         max_slots = 4
         num_experts = 8
@@ -1058,7 +1057,7 @@ class TestNonPowerOf2BlockSize:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -1122,7 +1121,7 @@ class TestNonPowerOf2BlockSize:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_single
+        from kestrel_kernels.moe.lora import apply_moe_lora_single
 
         # Round DOWN to power-of-2 for BOTH routing and kernel
         lora_block_m = _to_power_of_2(block_size_m)
@@ -1175,7 +1174,7 @@ class TestNonPowerOf2BlockSize:
         expected = naive_moe_lora_batched(
             x, topk_ids, topk_weights, lora_a, lora_b, lora_slot_ids, num_experts
         )
-        from kestrel_kernels.moe.lora.triton import apply_moe_lora_batched
+        from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
         token_lora_mapping = torch.where(
             lora_slot_ids > 0,
@@ -1212,84 +1211,3 @@ class TestNonPowerOf2BlockSize:
         )
 
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
-
-
-class TestLoRAStream:
-    """Validate batched LoRA path with a dedicated stream."""
-
-    def test_batched_stream_matches_default(self, device, dtype):
-        torch.manual_seed(0)
-
-        from kestrel.moondream.lora_workspace import MoELoRALayerWorkspace
-        from kestrel.moondream.moe import MoEModule
-
-        num_experts = 64
-        top_k = 8
-        d_model = 2048
-        d_expert = 1024
-        rank = 8
-        max_slots = 3
-        max_loras = max_slots - 1
-        num_tokens = 8
-
-        up_experts = DummyExperts(
-            num_experts=num_experts,
-            in_features=d_model,
-            out_features=d_expert * 2,
-            dtype=dtype,
-            device=device,
-        )
-        down_experts = DummyExperts(
-            num_experts=num_experts,
-            in_features=d_expert,
-            out_features=d_model,
-            dtype=dtype,
-            device=device,
-        )
-        moe = MoEModule(
-            up_experts=up_experts,
-            down_experts=down_experts,
-            top_k=top_k,
-            hidden_size=d_expert,
-            input_size=d_model,
-            num_experts=num_experts,
-        )
-
-        hidden_states = torch.randn(num_tokens, d_model, dtype=dtype, device=device)
-        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
-        topk_weights = torch.softmax(
-            torch.randn(num_tokens, top_k, dtype=dtype, device=device), dim=-1
-        )
-
-        num_super_experts = max_loras * num_experts
-        lora_workspace = MoELoRALayerWorkspace(
-            up_a=torch.randn(num_super_experts, rank, d_model, dtype=dtype, device=device) * 0.1,
-            up_b=torch.randn(num_super_experts, d_expert * 2, rank, dtype=dtype, device=device) * 0.1,
-            down_a=torch.randn(num_super_experts, rank, d_expert, dtype=dtype, device=device) * 0.1,
-            down_b=torch.randn(num_super_experts, d_model, rank, dtype=dtype, device=device) * 0.1,
-            num_experts=num_experts,
-        )
-
-        lora_slot_ids = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0], dtype=torch.int32, device=device)
-
-        lora_workspace.stream = None
-        out_default = moe(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            lora_workspace=lora_workspace,
-            lora_slot_ids=lora_slot_ids,
-        )
-        torch.cuda.synchronize()
-
-        lora_workspace.stream = torch.cuda.Stream(device=device)
-        out_stream = moe(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            lora_workspace=lora_workspace,
-            lora_slot_ids=lora_slot_ids,
-        )
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(out_stream, out_default, rtol=2e-2, atol=2e-2)

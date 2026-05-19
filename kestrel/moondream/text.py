@@ -201,6 +201,9 @@ def text_decoder(
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
     single_lora_id: int | None = None,
+    active_lora_ids: torch.Tensor | None = None,
+    active_lora_token_counts: tuple[int, ...] | None = None,
+    active_lora_max_rank: int | None = None,
     dense_lora_scratch: DenseLoRATorchMLPScratch | None = None,
     scratch_pool: dict | None = None,
 ) -> torch.Tensor:
@@ -243,6 +246,9 @@ def text_decoder(
                 lora_workspace=moe_workspace,
                 lora_slot_ids=lora_slot_ids,
                 single_lora_id=single_lora_id,
+                active_lora_ids=active_lora_ids,
+                active_lora_token_counts=active_lora_token_counts,
+                active_lora_max_rank=active_lora_max_rank,
             )
         else:
             mlp_weights = MLPWeights(

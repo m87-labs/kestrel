@@ -158,6 +158,9 @@ def moe_mlp(
     lora_workspace: MoELoRALayerWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
     single_lora_id: int | None = None,
+    active_lora_ids: torch.Tensor | None = None,
+    active_lora_token_counts: tuple[int, ...] | None = None,
+    active_lora_max_rank: int | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
     x_flat = x.view(-1, C)
@@ -184,6 +187,9 @@ def moe_mlp(
         lora_workspace,
         expanded_slot_ids,
         single_lora_id,
+        active_lora_ids,
+        active_lora_token_counts,
+        active_lora_max_rank,
         mode=mode,
     ).view(B, T, C)
     return mlp_out
