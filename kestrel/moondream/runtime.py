@@ -1495,6 +1495,7 @@ class MoondreamRuntime:
         )
 
         # For no-adapter prefill, skip LoRA entirely to avoid redundant work
+        M = inputs_embeds.size(0) * inputs_embeds.size(1)
         if lora_slot == 0:
             lora_workspace = None
             lora_slot_ids = None
@@ -1502,38 +1503,38 @@ class MoondreamRuntime:
         else:
             lora_workspace = self._lora_workspace
             moe_runtime = get_runtime().moe
-            lora_slot_ids = torch.tensor(
-                [lora_slot], dtype=torch.int32, device=self.device
-            )
+            max_loras = max(0, lora_workspace.max_slots - 1) if lora_workspace else 0
             active_lora_max_rank = (
                 lora_workspace.moe_lora_rank_for_slot(lora_slot)
                 if lora_workspace is not None
                 else None
             )
-            active_lora_meta = torch.tensor(
-                [1, active_lora_max_rank or 0],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            moe_lora_metadata = moe_runtime.lora_metadata(
-                lora_route_ids=torch.tensor([0], dtype=torch.int32, device=self.device),
-                active_lora_ids=torch.tensor(
-                    [lora_slot - 1], dtype=torch.int32, device=self.device
+            lora_slot_ids_cpu = torch.tensor([lora_slot], dtype=torch.int32)
+            lora_slot_ids = lora_slot_ids_cpu.to(self.device)
+            moe_lora_metadata = moe_runtime.prepare_lora_metadata(
+                lora_slot_ids_cpu=lora_slot_ids_cpu,
+                lora_route_ids_cpu=torch.empty((1,), dtype=torch.int32),
+                lora_route_ids_gpu=torch.empty(
+                    (1,), dtype=torch.int32, device=self.device
                 ),
-                active_lora_meta=active_lora_meta,
+                active_lora_ids_cpu=torch.empty((1,), dtype=torch.int32),
+                active_lora_ids_gpu=torch.empty(
+                    (1,), dtype=torch.int32, device=self.device
+                ),
+                active_lora_meta_cpu=torch.empty((2,), dtype=torch.int32),
+                active_lora_meta_gpu=torch.empty(
+                    (2,), dtype=torch.int32, device=self.device
+                ),
+                batch_size=1,
+                max_loras=max_loras,
+                lora_ranks_host=[
+                    lora_workspace.moe_lora_rank_for_id(i) for i in range(max_loras)
+                ] if lora_workspace else None,
+                active_lora_token_counts=(int(M),),
                 active_lora_max_rank=active_lora_max_rank,
             )
 
         # Build scratch buffer pool for prefill to avoid per-layer allocations.
-        M = inputs_embeds.size(0) * inputs_embeds.size(1)
-        if moe_lora_metadata is not None:
-            moe_lora_metadata = moe_runtime.lora_metadata(
-                lora_route_ids=moe_lora_metadata.lora_route_ids,
-                active_lora_ids=moe_lora_metadata.active_lora_ids,
-                active_lora_meta=moe_lora_metadata.active_lora_meta,
-                active_lora_token_counts=(int(M),),
-                active_lora_max_rank=moe_lora_metadata.active_lora_max_rank,
-            )
         tc = self.config.text
         head_dim = tc.dim // tc.n_heads
         scratch_pool = {
@@ -1663,10 +1664,11 @@ class MoondreamRuntime:
             slot.meta.active_lora_meta.np[:] = 0
             slot.meta.lora_route_ids.copy_to_gpu(batch_size)
             slot.meta.active_lora_meta.copy_to_gpu()
+            slot.meta.moe_lora_metadata = None
             return
 
         max_loras = max(0, workspace.max_slots - 1)
-        get_runtime().moe.prepare_lora_metadata(
+        slot.meta.moe_lora_metadata = get_runtime().moe.prepare_lora_metadata(
             lora_slot_ids_cpu=slot.meta.lora_slot_ids.cpu,
             lora_route_ids_cpu=slot.meta.lora_route_ids.cpu,
             lora_route_ids_gpu=slot.meta.lora_route_ids.gpu,
@@ -1679,6 +1681,7 @@ class MoondreamRuntime:
             lora_ranks_host=[
                 workspace.moe_lora_rank_for_id(i) for i in range(max_loras)
             ],
+            fixed_capacity=True,
         )
 
     def _run_decode_forward(
@@ -1709,14 +1712,8 @@ class MoondreamRuntime:
         lora_slot_ids = None
         moe_lora_metadata = None
         if lora_workspace is not None:
-            moe_runtime = get_runtime().moe
-            max_loras = max(0, lora_workspace.max_slots - 1)
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
-            moe_lora_metadata = moe_runtime.lora_metadata(
-                lora_route_ids=slot.meta.lora_route_ids.gpu[:batch_size],
-                active_lora_ids=slot.meta.active_lora_ids.gpu[:max_loras],
-                active_lora_meta=slot.meta.active_lora_meta.gpu,
-            )
+            moe_lora_metadata = slot.meta.moe_lora_metadata
 
         hidden = text_decoder(
             embeds,
@@ -1941,6 +1938,9 @@ class MoondreamRuntime:
                     for bs in reversed(self._graph_batch_sizes):
                         graph = torch.cuda.CUDAGraph()
                         with torch.inference_mode():
+                            if self._lora_workspace is not None:
+                                self._prepare_decode_lora_metadata(slot, bs)
+
                             # Build FA3 per-step metadata buffers
                             batch_idx = slot.meta.batch_idx.gpu[:bs]
                             self.page_table.populate_fa3_decode_metadata(

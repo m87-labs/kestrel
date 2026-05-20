@@ -20,7 +20,7 @@ Ownership model:
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -48,6 +48,7 @@ class DecodeMetaBuffers:
     lora_route_ids: CpuGpuBuffer  # int32 [max_batch] - compact MoE LoRA route ids
     active_lora_ids: CpuGpuBuffer  # int32 [max_batch] - active MoE LoRA ids
     active_lora_meta: CpuGpuBuffer  # int32 [2] - active count and max rank
+    moe_lora_metadata: Any | None = None
 
 
 @dataclass
