@@ -1500,7 +1500,6 @@ class MoondreamRuntime:
             lora_slot_ids = None
             lora_route_ids = None
             active_lora_ids = None
-            active_lora_route_ids = None
             active_lora_meta = None
             active_lora_token_counts = None
             active_lora_max_rank = None
@@ -1514,9 +1513,6 @@ class MoondreamRuntime:
             )
             active_lora_ids = torch.tensor(
                 [lora_slot - 1], dtype=torch.int32, device=self.device
-            )
-            active_lora_route_ids = torch.tensor(
-                [0], dtype=torch.int32, device=self.device
             )
             active_lora_max_rank = (
                 lora_workspace.moe_lora_rank_for_slot(lora_slot)
@@ -1569,7 +1565,6 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             lora_route_ids=lora_route_ids,
             active_lora_ids=active_lora_ids,
-            active_lora_route_ids=active_lora_route_ids,
             active_lora_meta=active_lora_meta,
             active_lora_token_counts=active_lora_token_counts,
             active_lora_max_rank=active_lora_max_rank,
@@ -1673,7 +1668,6 @@ class MoondreamRuntime:
         active_count = 0
         active_max_rank = 0
         active_ids = slot.meta.active_lora_ids.np
-        active_route_ids = slot.meta.active_lora_route_ids.np
         route_ids = slot.meta.lora_route_ids.np
         for token_idx, slot_id in enumerate(slot.meta.lora_slot_ids.np[:batch_size]):
             slot_int = int(slot_id)
@@ -1686,7 +1680,6 @@ class MoondreamRuntime:
                     route_id = active_count
                     lora_to_route[lora_id] = route_id
                     active_ids[active_count] = lora_id
-                    active_route_ids[active_count] = route_id
                     active_count += 1
                     active_max_rank = max(
                         active_max_rank,
@@ -1701,7 +1694,6 @@ class MoondreamRuntime:
 
         if active_count != 0:
             slot.meta.active_lora_ids.copy_to_gpu(active_count)
-            slot.meta.active_lora_route_ids.copy_to_gpu(active_count)
 
     def _run_decode_forward(
         self,
@@ -1731,7 +1723,6 @@ class MoondreamRuntime:
         lora_slot_ids = None
         lora_route_ids = None
         active_lora_ids = None
-        active_lora_route_ids = None
         active_lora_meta = None
         active_lora_token_counts = None
         active_lora_max_rank = None
@@ -1740,7 +1731,6 @@ class MoondreamRuntime:
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
             lora_route_ids = slot.meta.lora_route_ids.gpu[:batch_size]
             active_lora_ids = slot.meta.active_lora_ids.gpu[:max_loras]
-            active_lora_route_ids = slot.meta.active_lora_route_ids.gpu[:max_loras]
             active_lora_meta = slot.meta.active_lora_meta.gpu
 
         hidden = text_decoder(
@@ -1757,7 +1747,6 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             lora_route_ids=lora_route_ids,
             active_lora_ids=active_lora_ids,
-            active_lora_route_ids=active_lora_route_ids,
             active_lora_meta=active_lora_meta,
             active_lora_token_counts=active_lora_token_counts,
             active_lora_max_rank=active_lora_max_rank,
@@ -1961,8 +1950,6 @@ class MoondreamRuntime:
                 slot.meta.lora_route_ids.cpu.fill_(-1)
                 slot.meta.active_lora_ids.gpu.zero_()
                 slot.meta.active_lora_ids.cpu.zero_()
-                slot.meta.active_lora_route_ids.gpu.zero_()
-                slot.meta.active_lora_route_ids.cpu.zero_()
                 slot.meta.active_lora_meta.gpu.zero_()
                 slot.meta.active_lora_meta.cpu.zero_()
                 slot.fa3_page_table.zero_()
@@ -2000,7 +1987,6 @@ class MoondreamRuntime:
                     slot.meta.lora_slot_ids.gpu.zero_()
                     slot.meta.lora_route_ids.gpu.fill_(-1)
                     slot.meta.active_lora_ids.gpu.zero_()
-                    slot.meta.active_lora_route_ids.gpu.zero_()
                     slot.meta.active_lora_meta.gpu.zero_()
                     slot.fa3_page_table.zero_()
                     slot.fa3_seqused_k.zero_()

@@ -133,9 +133,6 @@ def _make_decode_meta(max_batch: int) -> SimpleNamespace:
         active_lora_ids=CpuGpuBuffer(
             max_batch, dtype=torch.int32, device=device, pin_memory=False
         ),
-        active_lora_route_ids=CpuGpuBuffer(
-            max_batch, dtype=torch.int32, device=device, pin_memory=False
-        ),
         active_lora_meta=CpuGpuBuffer(
             2, dtype=torch.int32, device=device, pin_memory=False
         ),
@@ -158,10 +155,6 @@ def test_decode_lora_metadata_uses_compact_graph_stable_buffers() -> None:
     torch.testing.assert_close(
         slot.meta.active_lora_ids.gpu[:3],
         torch.tensor([2, 0, 1], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        slot.meta.active_lora_route_ids.gpu[:3],
-        torch.tensor([0, 1, 2], dtype=torch.int32),
     )
     torch.testing.assert_close(
         slot.meta.lora_route_ids.gpu[:6],

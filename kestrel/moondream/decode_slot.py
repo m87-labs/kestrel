@@ -47,7 +47,6 @@ class DecodeMetaBuffers:
     lora_slot_ids: CpuGpuBuffer  # int32 [max_batch] - LoRA slot assignments
     lora_route_ids: CpuGpuBuffer  # int32 [max_batch] - compact MoE LoRA route ids
     active_lora_ids: CpuGpuBuffer  # int32 [max_batch] - active MoE LoRA ids
-    active_lora_route_ids: CpuGpuBuffer  # int32 [max_batch] - compact active route ids
     active_lora_meta: CpuGpuBuffer  # int32 [2] - active count and max rank
 
 
@@ -195,12 +194,6 @@ def create_decode_slot(
             pin_memory=True,
         ),
         active_lora_ids=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-        active_lora_route_ids=CpuGpuBuffer(
             max_batch_slots,
             dtype=torch.int32,
             device=device,
