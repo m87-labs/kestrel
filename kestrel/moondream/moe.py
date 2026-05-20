@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -33,38 +33,6 @@ class MoEConfig:
     allow_tf32: bool = True
     backend: str = "auto"  # "auto" | "cute" | "triton"
     auto_backend_token_threshold: int = 256
-    lora_decode_shrink: dict[str, int] | None = field(
-        default_factory=lambda: {
-            "BLOCK_SIZE_N": 16,
-            "BLOCK_SIZE_K": 128,
-            "NUM_WARPS": 4,
-            "NUM_STAGES": 3,
-        }
-    )
-    lora_decode_expand: dict[str, int] | None = field(
-        default_factory=lambda: {
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 16,
-            "NUM_WARPS": 4,
-            "NUM_STAGES": 2,
-        }
-    )
-    lora_prefill_shrink: dict[str, int] | None = field(
-        default_factory=lambda: {
-            "BLOCK_SIZE_N": 16,
-            "BLOCK_SIZE_K": 64,
-            "NUM_WARPS": 4,
-            "NUM_STAGES": 3,
-        }
-    )
-    lora_prefill_expand: dict[str, int] | None = field(
-        default_factory=lambda: {
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 16,
-            "NUM_WARPS": 4,
-            "NUM_STAGES": 3,
-        }
-    )
 
 
 class MoEModule(nn.Module):
@@ -172,7 +140,7 @@ class MoEModule(nn.Module):
         topk_ids: torch.Tensor,
         lora_workspace: MoELoRALayerWorkspace | None = None,
         lora_slot_ids: torch.Tensor | None = None,
-        single_lora_id: int | None = None,
+        moe_lora_metadata: _MOE_API.MoeLoraMetadata | None = None,
         mode: Literal["prefill", "decode"] = "decode",
     ) -> torch.Tensor:
         if hidden_states.size(0) == 0:
@@ -216,25 +184,14 @@ class MoEModule(nn.Module):
 
         lora_state = None
         if lora_workspace is not None and lora_slot_ids is not None:
-            is_prefill = single_lora_id is not None
             lora_state = _MOE_API.MoeLoraState(
                 lora_slot_ids=lora_slot_ids,
                 up_a=lora_workspace.up_a,
                 up_b=lora_workspace.up_b,
                 down_a=lora_workspace.down_a,
                 down_b=lora_workspace.down_b,
-                stream=None if is_prefill else lora_workspace.stream,
-                single_lora_id=single_lora_id,
-                shrink_config=(
-                    self.config.lora_prefill_shrink
-                    if is_prefill
-                    else self.config.lora_decode_shrink
-                ),
-                expand_config=(
-                    self.config.lora_prefill_expand
-                    if is_prefill
-                    else self.config.lora_decode_expand
-                ),
+                lora_ranks=lora_workspace.lora_ranks,
+                metadata=moe_lora_metadata,
             )
 
         return self._moe_runtime.forward(

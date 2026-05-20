@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import torch
 
 from kestrel.moondream.moe import MoEConfig, MoEModule, _SHARED_MOE_HANDLES
+from kestrel.moondream import runtime as runtime_mod
+from kestrel.utils import CpuGpuBuffer
 
 
 class _FakeMoeRuntime:
@@ -107,3 +109,63 @@ def test_lora_rank_is_part_of_moe_handle_capacity() -> None:
         assert [capacity.max_lora_rank for capacity in runtime.capacities] == [4, 8]
     finally:
         _SHARED_MOE_HANDLES.clear()
+
+
+class _FakeLoraWorkspace:
+    max_slots = 4
+
+    def __init__(self) -> None:
+        self._ranks = [3, 7, 5]
+
+    def moe_lora_rank_for_id(self, lora_id: int) -> int:
+        return self._ranks[lora_id]
+
+
+def _make_decode_meta(max_batch: int) -> SimpleNamespace:
+    device = torch.device("cpu")
+    return SimpleNamespace(
+        lora_slot_ids=CpuGpuBuffer(
+            max_batch, dtype=torch.int32, device=device, pin_memory=False
+        ),
+        lora_route_ids=CpuGpuBuffer(
+            max_batch, dtype=torch.int32, device=device, pin_memory=False
+        ),
+        active_lora_ids=CpuGpuBuffer(
+            max_batch, dtype=torch.int32, device=device, pin_memory=False
+        ),
+        active_lora_meta=CpuGpuBuffer(
+            2, dtype=torch.int32, device=device, pin_memory=False
+        ),
+    )
+
+
+def test_decode_lora_metadata_uses_compact_graph_stable_buffers() -> None:
+    runtime = runtime_mod.MoondreamRuntime.__new__(runtime_mod.MoondreamRuntime)
+    runtime._lora_workspace = _FakeLoraWorkspace()
+    slot = SimpleNamespace(meta=_make_decode_meta(8))
+
+    slot.meta.lora_slot_ids.np[:6] = [0, 3, 1, 3, 2, 0]
+
+    runtime._prepare_decode_lora_metadata(slot, 6)
+
+    torch.testing.assert_close(
+        slot.meta.active_lora_meta.gpu,
+        torch.tensor([3, 7], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        slot.meta.active_lora_ids.gpu[:3],
+        torch.tensor([2, 0, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        slot.meta.lora_route_ids.gpu[:6],
+        torch.tensor([-1, 0, 1, 0, 2, -1], dtype=torch.int32),
+    )
+
+    slot.meta.lora_slot_ids.np[:6] = 0
+    runtime._prepare_decode_lora_metadata(slot, 6)
+
+    torch.testing.assert_close(
+        slot.meta.lora_route_ids.gpu[:6],
+        torch.full((6,), -1, dtype=torch.int32),
+    )
+    torch.testing.assert_close(slot.meta.active_lora_meta.gpu, torch.zeros((2,), dtype=torch.int32))

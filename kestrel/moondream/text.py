@@ -4,7 +4,7 @@ Adapted from the Moondream project (Apache-2.0).
 """
 
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -200,7 +200,7 @@ def text_decoder(
     fa3_seqused_k: torch.Tensor | None = None,
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
-    single_lora_id: int | None = None,
+    moe_lora_metadata: Any | None = None,
     dense_lora_scratch: DenseLoRATorchMLPScratch | None = None,
     scratch_pool: dict | None = None,
 ) -> torch.Tensor:
@@ -242,7 +242,7 @@ def text_decoder(
                 mode=mode,
                 lora_workspace=moe_workspace,
                 lora_slot_ids=lora_slot_ids,
-                single_lora_id=single_lora_id,
+                moe_lora_metadata=moe_lora_metadata,
             )
         else:
             mlp_weights = MLPWeights(

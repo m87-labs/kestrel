@@ -71,8 +71,8 @@ class MoELoRALayerWorkspace:
     up_b: torch.Tensor
     down_a: torch.Tensor
     down_b: torch.Tensor
+    lora_ranks: torch.Tensor
     num_experts: int
-    stream: torch.cuda.Stream | None = None
 
 
 class TextLoRAWorkspace:
@@ -97,7 +97,6 @@ class TextLoRAWorkspace:
         max_rank: int,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
-        lora_stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Allocate workspace tensors.
 
@@ -112,7 +111,6 @@ class TextLoRAWorkspace:
         self.max_rank = max_rank
         self.device = device
         self.dtype = dtype
-        self.lora_stream = lora_stream
 
         moe_cfg = text_config.moe
         self.start_layer = moe_cfg.start_layer if moe_cfg else text_config.n_layers
@@ -127,6 +125,11 @@ class TextLoRAWorkspace:
                 )
         else:
             self.max_rank_per_expert = 0
+
+        self.moe_lora_ranks = torch.zeros(
+            max(0, max_slots - 1), dtype=torch.int32, device=device
+        )
+        self._moe_lora_ranks_host = [0] * max(0, max_slots - 1)
 
         d_model = text_config.dim
         d_ffn = text_config.ff_dim
@@ -168,8 +171,8 @@ class TextLoRAWorkspace:
                         total_super_experts, d_model, self.max_rank_per_expert,
                         device=device, dtype=dtype
                     ),
+                    lora_ranks=self.moe_lora_ranks,
                     num_experts=num_experts,
-                    stream=lora_stream,
                 )
                 self.moe.append(workspace)
 
@@ -185,6 +188,19 @@ class TextLoRAWorkspace:
         if 0 <= moe_idx < len(self.moe):
             return self.moe[moe_idx]
         return None
+
+    def moe_lora_rank_for_slot(self, slot: int) -> int:
+        if slot <= 0:
+            return 0
+        lora_id = slot - 1
+        if lora_id >= len(self._moe_lora_ranks_host):
+            return 0
+        return self._moe_lora_ranks_host[lora_id]
+
+    def moe_lora_rank_for_id(self, lora_id: int) -> int:
+        if lora_id < 0 or lora_id >= len(self._moe_lora_ranks_host):
+            return 0
+        return self._moe_lora_ranks_host[lora_id]
 
     def clear_slot_(self, slot: int) -> None:
         """Zero out all weights in a slot.
@@ -214,6 +230,9 @@ class TextLoRAWorkspace:
             layer.up_b[start:end].zero_()
             layer.down_a[start:end].zero_()
             layer.down_b[start:end].zero_()
+
+        self._moe_lora_ranks_host[slot - 1] = 0
+        self.moe_lora_ranks[slot - 1].zero_()
 
     def load_slot_(self, slot: int, adapter: LoRA) -> None:
         """Load adapter weights into a slot.
@@ -286,6 +305,9 @@ class TextLoRAWorkspace:
                 layer.down_b[ws_idx, :, :adapter_rank_per_expert].copy_(
                     adapter_layer.down_b[expert_id]
                 )
+
+        self._moe_lora_ranks_host[slot - 1] = adapter_rank_per_expert
+        self.moe_lora_ranks[slot - 1] = adapter_rank_per_expert
 
 
 # -----------------------------------------------------------------------------
