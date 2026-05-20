@@ -140,11 +140,7 @@ class MoEModule(nn.Module):
         topk_ids: torch.Tensor,
         lora_workspace: MoELoRALayerWorkspace | None = None,
         lora_slot_ids: torch.Tensor | None = None,
-        lora_route_ids: torch.Tensor | None = None,
-        active_lora_ids: torch.Tensor | None = None,
-        active_lora_meta: torch.Tensor | None = None,
-        active_lora_token_counts: tuple[int, ...] | None = None,
-        active_lora_max_rank: int | None = None,
+        moe_lora_metadata: _MOE_API.MoeLoraMetadata | None = None,
         mode: Literal["prefill", "decode"] = "decode",
     ) -> torch.Tensor:
         if hidden_states.size(0) == 0:
@@ -195,11 +191,7 @@ class MoEModule(nn.Module):
                 down_a=lora_workspace.down_a,
                 down_b=lora_workspace.down_b,
                 lora_ranks=lora_workspace.lora_ranks,
-                lora_route_ids=lora_route_ids,
-                active_lora_ids=active_lora_ids,
-                active_lora_meta=active_lora_meta,
-                active_lora_token_counts=active_lora_token_counts,
-                active_lora_max_rank=active_lora_max_rank,
+                metadata=moe_lora_metadata,
             )
 
         return self._moe_runtime.forward(

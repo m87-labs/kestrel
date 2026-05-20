@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
 from ..dense_lora import (
     DenseLoRATorchMLPScratch,
@@ -157,11 +157,7 @@ def moe_mlp(
     mode: Literal["prefill", "decode"] = "decode",
     lora_workspace: MoELoRALayerWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
-    lora_route_ids: torch.Tensor | None = None,
-    active_lora_ids: torch.Tensor | None = None,
-    active_lora_meta: torch.Tensor | None = None,
-    active_lora_token_counts: tuple[int, ...] | None = None,
-    active_lora_max_rank: int | None = None,
+    moe_lora_metadata: Any | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
     x_flat = x.view(-1, C)
@@ -178,11 +174,14 @@ def moe_mlp(
 
     # Expand slot IDs for all tokens if we have a sequence length > 1
     expanded_slot_ids = None
-    expanded_route_ids = None
+    expanded_metadata = moe_lora_metadata
     if lora_workspace is not None and lora_slot_ids is not None:
         expanded_slot_ids = lora_slot_ids.repeat_interleave(T)
-        if lora_route_ids is not None:
-            expanded_route_ids = lora_route_ids.repeat_interleave(T)
+        if moe_lora_metadata is not None and moe_lora_metadata.lora_route_ids is not None:
+            expanded_metadata = replace(
+                moe_lora_metadata,
+                lora_route_ids=moe_lora_metadata.lora_route_ids.repeat_interleave(T),
+            )
 
     mlp_out = fused_mlp(
         x_flat,
@@ -190,11 +189,7 @@ def moe_mlp(
         topk_idxs,
         lora_workspace,
         expanded_slot_ids,
-        expanded_route_ids,
-        active_lora_ids,
-        active_lora_meta,
-        active_lora_token_counts,
-        active_lora_max_rank,
+        expanded_metadata,
         mode=mode,
     ).view(B, T, C)
     return mlp_out
