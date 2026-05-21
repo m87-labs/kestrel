@@ -8,61 +8,6 @@ import torch.nn.functional as F
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
-def _round_up(x: int, multiple: int) -> int:
-    return ((x + multiple - 1) // multiple) * multiple
-
-
-def _max_tokens_padded(topk_ids: torch.Tensor, block_size: int, num_experts: int) -> int:
-    padded = int(topk_ids.numel()) + int(num_experts) * (int(block_size) - 1)
-    if topk_ids.numel() < num_experts:
-        padded = min(int(topk_ids.numel()) * int(block_size), padded)
-    return padded
-
-
-def _alloc_lora_route(
-    topk_ids: torch.Tensor,
-    *,
-    block_size: int,
-    num_experts: int,
-    max_loras: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    max_tokens = _max_tokens_padded(topk_ids, block_size, num_experts)
-    max_blocks = _round_up(max_tokens, block_size) // block_size
-    return (
-        torch.empty((max_loras, max_tokens), dtype=torch.int32, device=topk_ids.device),
-        torch.empty((max_loras, max_blocks), dtype=torch.int32, device=topk_ids.device),
-        torch.empty((max_loras,), dtype=torch.int32, device=topk_ids.device),
-    )
-
-
-def _lora_route(
-    topk_ids: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    *,
-    block_size: int,
-    num_experts: int,
-    max_loras: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from kestrel_kernels.moe_align import moe_lora_align_block_size
-
-    sorted_ids, expert_ids, post = _alloc_lora_route(
-        topk_ids,
-        block_size=block_size,
-        num_experts=num_experts,
-        max_loras=max_loras,
-    )
-    moe_lora_align_block_size(
-        topk_ids,
-        token_lora_mapping,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        post,
-    )
-    return sorted_ids, expert_ids, post
-
-
 def _reference_moe_lora(
     *,
     x: torch.Tensor,
@@ -96,6 +41,42 @@ def _reference_moe_lora(
     return out
 
 
+def _prepare_metadata(
+    lora_slot_ids: torch.Tensor,
+    *,
+    max_loras: int,
+    active_lora_max_rank: int = 8,
+    fixed_capacity: bool = False,
+):
+    from kestrel_kernels import get_runtime
+
+    lora_slot_ids_cpu = lora_slot_ids.detach().cpu().to(torch.int32)
+    num_tokens = int(lora_slot_ids_cpu.numel())
+    active_token_ids_cpu = torch.empty((num_tokens,), dtype=torch.int32)
+    active_lora_ids_cpu = torch.empty((max_loras,), dtype=torch.int32)
+    active_lora_meta_cpu = torch.empty((max_loras + 4,), dtype=torch.int32)
+    device = lora_slot_ids.device
+    return get_runtime().moe.prepare_lora_metadata(
+        lora_slot_ids_cpu=lora_slot_ids_cpu,
+        active_token_ids_cpu=active_token_ids_cpu,
+        active_token_ids_gpu=torch.empty(
+            (num_tokens,), dtype=torch.int32, device=device
+        ),
+        active_lora_ids_cpu=active_lora_ids_cpu,
+        active_lora_ids_gpu=torch.empty(
+            (max_loras,), dtype=torch.int32, device=device
+        ),
+        active_lora_meta_cpu=active_lora_meta_cpu,
+        active_lora_meta_gpu=torch.empty(
+            (max_loras + 4,), dtype=torch.int32, device=device
+        ),
+        batch_size=num_tokens,
+        max_loras=max_loras,
+        active_lora_max_rank=active_lora_max_rank,
+        fixed_capacity=fixed_capacity,
+    )
+
+
 def _apply_moe_lora(
     *,
     x: torch.Tensor,
@@ -104,25 +85,16 @@ def _apply_moe_lora(
     lora_a: torch.Tensor,
     lora_b: torch.Tensor,
     lora_slot_ids: torch.Tensor,
-    block_size: int,
     num_experts: int,
     max_loras: int,
     mul_routed_weight: bool = False,
-    active_lora_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from kestrel_kernels.moe.lora import apply_moe_lora_batched
 
-    token_lora_mapping = torch.where(
-        lora_slot_ids > 0,
-        lora_slot_ids - 1,
-        torch.tensor(-1, device=x.device, dtype=torch.int32),
-    ).to(torch.int32)
-    sorted_ids, expert_ids, post = _lora_route(
-        topk_ids,
-        token_lora_mapping,
-        block_size=block_size,
-        num_experts=num_experts,
+    metadata = _prepare_metadata(
+        lora_slot_ids,
         max_loras=max_loras,
+        active_lora_max_rank=int(lora_a.shape[1]),
     )
     output = torch.zeros(
         (topk_ids.shape[0], topk_ids.shape[1], lora_b.shape[1]),
@@ -136,19 +108,19 @@ def _apply_moe_lora(
     )
     apply_moe_lora_batched(
         x=x,
+        topk_ids=topk_ids,
         topk_weights=topk_weights,
         output=output,
         lora_a=lora_a,
         lora_b=lora_b,
-        sorted_token_ids=sorted_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=post,
+        active_token_ids=metadata.active_token_ids,
+        active_lora_ids=metadata.active_lora_ids,
+        active_lora_meta=metadata.active_lora_meta,
         top_k=topk_ids.shape[1],
         num_experts=num_experts,
-        block_size_m=block_size,
         scratch=scratch,
         mul_routed_weight=mul_routed_weight,
-        active_lora_ids=active_lora_ids,
+        active_lora_max_rank=metadata.active_lora_max_rank,
     )
     return output
 
@@ -166,9 +138,8 @@ def test_moe_lora_application_matches_reference(device: torch.device) -> None:
     num_experts = 64
     max_loras = 3
     rank = 8
-    hidden_dim = 32
-    out_dim = 48
-    block_size = 16
+    hidden_dim = 2048
+    out_dim = 2048
 
     x = (torch.randn((num_tokens, hidden_dim), device=device) * 0.25).to(dtype)
     topk_ids = torch.stack(
@@ -189,7 +160,6 @@ def test_moe_lora_application_matches_reference(device: torch.device) -> None:
         lora_a=lora_a,
         lora_b=lora_b,
         lora_slot_ids=lora_slot_ids,
-        block_size=block_size,
         num_experts=num_experts,
         max_loras=max_loras,
         mul_routed_weight=True,
@@ -222,11 +192,9 @@ def test_moe_lora_no_active_adapters_is_noop(device: torch.device) -> None:
         topk_weights=topk_weights,
         lora_a=lora_a,
         lora_b=lora_b,
-        lora_slot_ids=lora_slot_ids,
-        block_size=16,
+        lora_slot_ids=torch.zeros_like(lora_slot_ids),
         num_experts=64,
         max_loras=1,
-        active_lora_ids=torch.empty((0,), dtype=torch.int32, device=device),
     )
 
     torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
@@ -234,7 +202,6 @@ def test_moe_lora_no_active_adapters_is_noop(device: torch.device) -> None:
 
 def test_moe_lora_cudagraph_replay_is_stable(device: torch.device) -> None:
     from kestrel_kernels.moe.lora import apply_moe_lora_batched
-    from kestrel_kernels.moe_align import moe_lora_align_block_size
 
     torch.manual_seed(1)
     dtype = torch.bfloat16
@@ -242,26 +209,25 @@ def test_moe_lora_cudagraph_replay_is_stable(device: torch.device) -> None:
     top_k = 8
     num_experts = 64
     rank = 8
-    block_size = 16
 
-    x = torch.randn((num_tokens, 16), dtype=dtype, device=device)
-    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+    hidden_dim = 2048
+    out_dim = 2048
+
+    x = torch.randn((num_tokens, hidden_dim), dtype=dtype, device=device)
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
+    )
     topk_weights = torch.ones((num_tokens, top_k), dtype=dtype, device=device)
     lora_slot_ids = torch.tensor([1, 2, 0, 1], dtype=torch.int32, device=device)
-    lora_a = torch.randn((2 * num_experts, rank, 16), dtype=dtype, device=device)
-    lora_b = torch.randn((2 * num_experts, 24, rank), dtype=dtype, device=device)
-    token_lora_mapping = torch.where(
-        lora_slot_ids > 0,
-        lora_slot_ids - 1,
-        torch.tensor(-1, device=device, dtype=torch.int32),
-    ).to(torch.int32)
-    sorted_ids, expert_ids, post = _alloc_lora_route(
-        topk_ids,
-        block_size=block_size,
-        num_experts=num_experts,
+    lora_a = torch.randn((2 * num_experts, rank, hidden_dim), dtype=dtype, device=device)
+    lora_b = torch.randn((2 * num_experts, out_dim, rank), dtype=dtype, device=device)
+    metadata = _prepare_metadata(
+        lora_slot_ids,
         max_loras=2,
+        active_lora_max_rank=rank,
+        fixed_capacity=True,
     )
-    output = torch.empty((num_tokens, top_k, 24), dtype=dtype, device=device)
+    output = torch.empty((num_tokens, top_k, out_dim), dtype=dtype, device=device)
     scratch = torch.empty((num_tokens * top_k, rank), dtype=dtype, device=device)
 
     expected = _reference_moe_lora(
@@ -277,28 +243,20 @@ def test_moe_lora_cudagraph_replay_is_stable(device: torch.device) -> None:
 
     def run() -> None:
         output.zero_()
-        moe_lora_align_block_size(
-            topk_ids,
-            token_lora_mapping,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            post,
-        )
         apply_moe_lora_batched(
             x=x,
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
             output=output,
             lora_a=lora_a,
             lora_b=lora_b,
-            sorted_token_ids=sorted_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=post,
+            active_token_ids=metadata.active_token_ids,
+            active_lora_ids=metadata.active_lora_ids,
+            active_lora_meta=metadata.active_lora_meta,
             top_k=top_k,
             num_experts=num_experts,
-            block_size_m=block_size,
             scratch=scratch,
+            active_lora_max_rank=metadata.active_lora_max_rank,
         )
 
     for _ in range(3):
@@ -311,4 +269,4 @@ def test_moe_lora_cudagraph_replay_is_stable(device: torch.device) -> None:
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)

@@ -1511,26 +1511,30 @@ class MoondreamRuntime:
             )
             lora_slot_ids_cpu = torch.tensor([lora_slot], dtype=torch.int32)
             lora_slot_ids = lora_slot_ids_cpu.to(self.device)
+            token_lora_slot_ids_cpu = torch.full(
+                (int(M),), int(lora_slot), dtype=torch.int32
+            )
             moe_lora_metadata = moe_runtime.prepare_lora_metadata(
-                lora_slot_ids_cpu=lora_slot_ids_cpu,
-                lora_route_ids_cpu=torch.empty((1,), dtype=torch.int32),
-                lora_route_ids_gpu=torch.empty(
-                    (1,), dtype=torch.int32, device=self.device
+                lora_slot_ids_cpu=token_lora_slot_ids_cpu,
+                active_token_ids_cpu=torch.empty((int(M),), dtype=torch.int32),
+                active_token_ids_gpu=torch.empty(
+                    (int(M),), dtype=torch.int32, device=self.device
                 ),
-                active_lora_ids_cpu=torch.empty((1,), dtype=torch.int32),
+                active_lora_ids_cpu=torch.empty((max_loras,), dtype=torch.int32),
                 active_lora_ids_gpu=torch.empty(
-                    (1,), dtype=torch.int32, device=self.device
+                    (max_loras,), dtype=torch.int32, device=self.device
                 ),
-                active_lora_meta_cpu=torch.empty((2,), dtype=torch.int32),
+                # 3 header ints + one start offset per active LoRA + one sentinel
+                # end offset, so kernels can read route i as meta[3+i]..meta[4+i].
+                active_lora_meta_cpu=torch.empty((max_loras + 4,), dtype=torch.int32),
                 active_lora_meta_gpu=torch.empty(
-                    (2,), dtype=torch.int32, device=self.device
+                    (max_loras + 4,), dtype=torch.int32, device=self.device
                 ),
-                batch_size=1,
+                batch_size=int(M),
                 max_loras=max_loras,
                 lora_ranks_host=[
                     lora_workspace.moe_lora_rank_for_id(i) for i in range(max_loras)
                 ] if lora_workspace else None,
-                active_lora_token_counts=(int(M),),
                 active_lora_max_rank=active_lora_max_rank,
             )
 
@@ -1660,9 +1664,11 @@ class MoondreamRuntime:
     ) -> None:
         workspace = self._lora_workspace
         if workspace is None:
-            slot.meta.lora_route_ids.np[:batch_size] = -1
+            slot.meta.active_token_ids.np[:batch_size] = 0
+            slot.meta.active_lora_ids.np[:batch_size] = 0
             slot.meta.active_lora_meta.np[:] = 0
-            slot.meta.lora_route_ids.copy_to_gpu(batch_size)
+            slot.meta.active_token_ids.copy_to_gpu(batch_size)
+            slot.meta.active_lora_ids.copy_to_gpu(batch_size)
             slot.meta.active_lora_meta.copy_to_gpu()
             slot.meta.moe_lora_metadata = None
             return
@@ -1670,8 +1676,8 @@ class MoondreamRuntime:
         max_loras = max(0, workspace.max_slots - 1)
         slot.meta.moe_lora_metadata = get_runtime().moe.prepare_lora_metadata(
             lora_slot_ids_cpu=slot.meta.lora_slot_ids.cpu,
-            lora_route_ids_cpu=slot.meta.lora_route_ids.cpu,
-            lora_route_ids_gpu=slot.meta.lora_route_ids.gpu,
+            active_token_ids_cpu=slot.meta.active_token_ids.cpu,
+            active_token_ids_gpu=slot.meta.active_token_ids.gpu,
             active_lora_ids_cpu=slot.meta.active_lora_ids.cpu,
             active_lora_ids_gpu=slot.meta.active_lora_ids.gpu,
             active_lora_meta_cpu=slot.meta.active_lora_meta.cpu,
@@ -1924,8 +1930,8 @@ class MoondreamRuntime:
                 slot.meta.input_pos.gpu.zero_()
                 slot.meta.input_pos.cpu.zero_()
                 slot.meta.lora_slot_ids.gpu.zero_()
-                slot.meta.lora_route_ids.gpu.fill_(-1)
-                slot.meta.lora_route_ids.cpu.fill_(-1)
+                slot.meta.active_token_ids.gpu.zero_()
+                slot.meta.active_token_ids.cpu.zero_()
                 slot.meta.active_lora_ids.gpu.zero_()
                 slot.meta.active_lora_ids.cpu.zero_()
                 slot.meta.active_lora_meta.gpu.zero_()
@@ -1966,7 +1972,7 @@ class MoondreamRuntime:
                     slot.meta.batch_idx.gpu.zero_()
                     slot.meta.input_pos.gpu.zero_()
                     slot.meta.lora_slot_ids.gpu.zero_()
-                    slot.meta.lora_route_ids.gpu.fill_(-1)
+                    slot.meta.active_token_ids.gpu.zero_()
                     slot.meta.active_lora_ids.gpu.zero_()
                     slot.meta.active_lora_meta.gpu.zero_()
                     slot.fa3_page_table.zero_()

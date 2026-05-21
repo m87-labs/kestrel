@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..dense_lora import (
@@ -156,7 +156,6 @@ def moe_mlp(
     *,
     mode: Literal["prefill", "decode"] = "decode",
     lora_workspace: MoELoRALayerWorkspace | None = None,
-    lora_slot_ids: torch.Tensor | None = None,
     moe_lora_metadata: Any | None = None,
 ) -> torch.Tensor:
     B, T, C = x.shape
@@ -172,24 +171,12 @@ def moe_mlp(
         softmax=True,
     )
 
-    # Expand slot IDs for all tokens if we have a sequence length > 1
-    expanded_slot_ids = None
-    expanded_metadata = moe_lora_metadata
-    if lora_workspace is not None and lora_slot_ids is not None:
-        expanded_slot_ids = lora_slot_ids.repeat_interleave(T)
-        if moe_lora_metadata is not None and moe_lora_metadata.lora_route_ids is not None:
-            expanded_metadata = replace(
-                moe_lora_metadata,
-                lora_route_ids=moe_lora_metadata.lora_route_ids.repeat_interleave(T),
-            )
-
     mlp_out = fused_mlp(
         x_flat,
         topk_weights,
         topk_idxs,
         lora_workspace,
-        expanded_slot_ids,
-        expanded_metadata,
+        moe_lora_metadata,
         mode=mode,
     ).view(B, T, C)
     return mlp_out
