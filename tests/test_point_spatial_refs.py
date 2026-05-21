@@ -104,8 +104,28 @@ def test_engine_point_keeps_positional_settings_compatibility() -> None:
     assert kwargs["max_new_tokens"] == 12
 
 
-def test_engine_point_rejects_spatial_refs_without_image() -> None:
+def test_engine_point_requires_image_before_spatial_ref_validation() -> None:
     engine = object.__new__(InferenceEngine)
 
-    with pytest.raises(ValueError, match="spatial_refs can only be used with an image"):
+    with pytest.raises(ValueError, match="image must be provided for pointing"):
         asyncio.run(engine.point(None, "gaze", spatial_refs=[[0.2, 0.3]]))
+
+    refs = np.array([[0.2, 0.3]], dtype=np.float32)
+    with pytest.raises(ValueError, match="image must be provided for pointing"):
+        asyncio.run(engine.point(None, "gaze", spatial_refs=refs))
+
+
+def test_engine_query_rejects_array_spatial_refs_without_image() -> None:
+    engine = object.__new__(InferenceEngine)
+
+    refs = np.array([[0.2, 0.3]], dtype=np.float32)
+    with pytest.raises(ValueError, match="spatial_refs can only be used with an image"):
+        asyncio.run(engine.query(question="Where?", spatial_refs=refs))
+
+
+def test_engine_segment_requires_image_before_spatial_ref_validation() -> None:
+    engine = object.__new__(InferenceEngine)
+
+    refs = np.array([[0.2, 0.3]], dtype=np.float32)
+    with pytest.raises(ValueError, match="image must be provided for segmentation"):
+        asyncio.run(engine.segment(None, "person", spatial_refs=refs))

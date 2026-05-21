@@ -618,7 +618,7 @@ class InferenceEngine:
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("question must be a non-empty string")
-        if spatial_refs and image is None:
+        if spatial_refs is not None and image is None:
             raise ValueError("spatial_refs can only be used with an image")
 
         temperature = self._default_temperature
@@ -701,8 +701,8 @@ class InferenceEngine:
         normalized_object = object.strip()
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
-        if spatial_refs and image is None:
-            raise ValueError("spatial_refs can only be used with an image")
+        if image is None:
+            raise ValueError("image must be provided for pointing")
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
@@ -907,6 +907,8 @@ class InferenceEngine:
         normalized_object = object.strip()
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
+        if image is None:
+            raise ValueError("image must be provided for segmentation")
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
