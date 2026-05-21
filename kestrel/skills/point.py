@@ -2,11 +2,12 @@
 
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -31,6 +32,7 @@ class PointRequest:
     image: Optional[np.ndarray | bytes]
     stream: bool
     settings: PointSettings
+    spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
 class PointSkill(SkillSpec):
@@ -53,9 +55,11 @@ class PointSkill(SkillSpec):
         suffix: Sequence[int] = template["suffix"]
         prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(" " + prompt).ids if prompt else []
-        ids = [*prefix, *object_tokens, *suffix]
-        tokens = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
-        tokens.extend(TextToken(token_id=int(tid)) for tid in ids)
+        tokens: List[Token] = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
+        tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
+        tokens.extend(build_spatial_tokens(request_context.spatial_refs))
+        tokens.extend(TextToken(token_id=int(tid)) for tid in object_tokens)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
         return tokens
 
     def create_state(
