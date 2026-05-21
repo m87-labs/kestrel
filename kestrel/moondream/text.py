@@ -241,7 +241,6 @@ def text_decoder(
                 config.moe.experts_per_token,
                 mode=mode,
                 lora_workspace=moe_workspace,
-                lora_slot_ids=lora_slot_ids,
                 moe_lora_metadata=moe_lora_metadata,
             )
         else:

@@ -45,9 +45,16 @@ class DecodeMetaBuffers:
     batch_idx: CpuGpuBuffer  # int64 [max_batch] - sequence batch indices
     input_pos: CpuGpuBuffer  # int32 [max_batch] - token positions
     lora_slot_ids: CpuGpuBuffer  # int32 [max_batch] - LoRA slot assignments
-    lora_route_ids: CpuGpuBuffer  # int32 [max_batch] - compact MoE LoRA route ids
+    active_token_ids: CpuGpuBuffer  # int32 [max_batch] - token-major MoE LoRA ids
     active_lora_ids: CpuGpuBuffer  # int32 [max_batch] - active MoE LoRA ids
-    active_lora_meta: CpuGpuBuffer  # int32 [2] - active count and max rank
+    # int32 [max_loras + 4]. Layout:
+    #   [0] active LoRA count
+    #   [1] active max rank
+    #   [2] active token count
+    #   [3:] per-active-LoRA token-start offsets, plus one sentinel end offset
+    # The sentinel lets kernels read each range as meta[3 + i]..meta[4 + i]
+    # without a last-route special case.
+    active_lora_meta: CpuGpuBuffer
     moe_lora_metadata: Any | None = None
 
 
@@ -188,7 +195,7 @@ def create_decode_slot(
             device=device,
             pin_memory=True,
         ),
-        lora_route_ids=CpuGpuBuffer(
+        active_token_ids=CpuGpuBuffer(
             max_batch_slots,
             dtype=torch.int32,
             device=device,
@@ -201,7 +208,9 @@ def create_decode_slot(
             pin_memory=True,
         ),
         active_lora_meta=CpuGpuBuffer(
-            2,
+            # max_loras == max_batch_slots - 1 because LoRA slot 0 means no LoRA.
+            # The +4 layout above therefore becomes max_batch_slots + 3 here.
+            max_batch_slots + 3,
             dtype=torch.int32,
             device=device,
             pin_memory=True,

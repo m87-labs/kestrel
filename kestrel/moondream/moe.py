@@ -139,7 +139,6 @@ class MoEModule(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         lora_workspace: MoELoRALayerWorkspace | None = None,
-        lora_slot_ids: torch.Tensor | None = None,
         moe_lora_metadata: _MOE_API.MoeLoraMetadata | None = None,
         mode: Literal["prefill", "decode"] = "decode",
     ) -> torch.Tensor:
@@ -183,15 +182,16 @@ class MoEModule(nn.Module):
         )
 
         lora_state = None
-        if lora_workspace is not None and lora_slot_ids is not None:
+        if lora_workspace is not None:
+            if moe_lora_metadata is None:
+                raise RuntimeError("MoE LoRA requires prepared token-major metadata")
             lora_state = _MOE_API.MoeLoraState(
-                lora_slot_ids=lora_slot_ids,
                 up_a=lora_workspace.up_a,
                 up_b=lora_workspace.up_b,
                 down_a=lora_workspace.down_a,
                 down_b=lora_workspace.down_b,
-                lora_ranks=lora_workspace.lora_ranks,
                 metadata=moe_lora_metadata,
+                lora_ranks=lora_workspace.lora_ranks,
             )
 
         return self._moe_runtime.forward(

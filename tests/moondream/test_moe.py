@@ -127,14 +127,14 @@ def _make_decode_meta(max_batch: int) -> SimpleNamespace:
         lora_slot_ids=CpuGpuBuffer(
             max_batch, dtype=torch.int32, device=device, pin_memory=False
         ),
-        lora_route_ids=CpuGpuBuffer(
+        active_token_ids=CpuGpuBuffer(
             max_batch, dtype=torch.int32, device=device, pin_memory=False
         ),
         active_lora_ids=CpuGpuBuffer(
             max_batch, dtype=torch.int32, device=device, pin_memory=False
         ),
         active_lora_meta=CpuGpuBuffer(
-            2, dtype=torch.int32, device=device, pin_memory=False
+            max_batch + 3, dtype=torch.int32, device=device, pin_memory=False
         ),
     )
 
@@ -149,23 +149,25 @@ def test_decode_lora_metadata_uses_compact_graph_stable_buffers() -> None:
     runtime._prepare_decode_lora_metadata(slot, 6)
 
     torch.testing.assert_close(
-        slot.meta.active_lora_meta.gpu,
-        torch.tensor([3, 7], dtype=torch.int32),
+        slot.meta.active_lora_meta.gpu[:7],
+        torch.tensor([3, 7, 4, 0, 2, 3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        slot.meta.active_token_ids.gpu[:4],
+        torch.tensor([1, 3, 2, 4], dtype=torch.int32),
     )
     torch.testing.assert_close(
         slot.meta.active_lora_ids.gpu[:3],
         torch.tensor([2, 0, 1], dtype=torch.int32),
     )
-    torch.testing.assert_close(
-        slot.meta.lora_route_ids.gpu[:6],
-        torch.tensor([-1, 0, 1, 0, 2, -1], dtype=torch.int32),
-    )
+    assert slot.meta.moe_lora_metadata.active_token_ids.numel() == 6
+    assert slot.meta.moe_lora_metadata.active_lora_ids.numel() == 3
+    assert slot.meta.moe_lora_metadata.active_lora_meta.numel() == 7
 
     slot.meta.lora_slot_ids.np[:6] = 0
     runtime._prepare_decode_lora_metadata(slot, 6)
 
     torch.testing.assert_close(
-        slot.meta.lora_route_ids.gpu[:6],
-        torch.full((6,), -1, dtype=torch.int32),
+        slot.meta.active_lora_meta.gpu[:7],
+        torch.zeros((7,), dtype=torch.int32),
     )
-    torch.testing.assert_close(slot.meta.active_lora_meta.gpu, torch.zeros((2,), dtype=torch.int32))
