@@ -695,10 +695,14 @@ class InferenceEngine:
         image: Optional[np.ndarray | bytes],
         object: str,
         settings: Optional[Mapping[str, object]] = None,
+        *,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
     ) -> EngineResult:
         normalized_object = object.strip()
         if not normalized_object:
             raise ValueError("object must be a non-empty string")
+        if spatial_refs and image is None:
+            raise ValueError("spatial_refs can only be used with an image")
 
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
@@ -724,11 +728,13 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
+        normalized_refs = normalize_spatial_refs(spatial_refs)
         request = PointRequest(
             object=normalized_object,
             image=image,
             stream=False,
             settings=PointSettings(temperature=temperature, top_p=top_p),
+            spatial_refs=normalized_refs,
         )
         return await self.submit(
             request,

@@ -127,6 +127,15 @@ print(result.output["points"])
 ```
 
 Coordinates are normalized to [0, 1] where (0, 0) is top-left.
+Point prompts can also include normalized spatial references:
+
+```python
+result = await engine.point(
+    image,
+    "gaze",
+    spatial_refs=[[0.42, 0.18]],  # e.g. the subject's head or eye location
+)
+```
 
 ### Detect
 
