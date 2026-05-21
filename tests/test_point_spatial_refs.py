@@ -9,6 +9,7 @@ import pytest
 from kestrel.engine import InferenceEngine
 from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken
 from kestrel.skills.point import PointRequest, PointSettings, PointSkill
+from kestrel.skills.query import QueryRequest
 
 
 class _FakeTokenizer:
@@ -121,6 +122,28 @@ def test_engine_query_rejects_array_spatial_refs_without_image() -> None:
     refs = np.array([[0.2, 0.3]], dtype=np.float32)
     with pytest.raises(ValueError, match="spatial_refs can only be used with an image"):
         asyncio.run(engine.query(question="Where?", spatial_refs=refs))
+
+
+def test_engine_query_treats_empty_spatial_refs_as_unset_without_image() -> None:
+    engine = object.__new__(InferenceEngine)
+    engine._default_temperature = 0.0
+    engine._default_top_p = 1.0
+    engine._default_max_new_tokens = 128
+    captured: dict[str, object] = {}
+
+    async def fake_submit(request_context: object, **kwargs: object) -> SimpleNamespace:
+        captured["request_context"] = request_context
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(output={})
+
+    engine.submit = fake_submit  # type: ignore[method-assign]
+
+    asyncio.run(engine.query(question="Where?", spatial_refs=[]))
+
+    request = captured["request_context"]
+    assert isinstance(request, QueryRequest)
+    assert request.image is None
+    assert request.spatial_refs is None
 
 
 def test_engine_segment_requires_image_before_spatial_ref_validation() -> None:

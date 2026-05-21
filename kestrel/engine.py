@@ -618,7 +618,8 @@ class InferenceEngine:
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("question must be a non-empty string")
-        if spatial_refs is not None and image is None:
+        normalized_refs = normalize_spatial_refs(spatial_refs)
+        if normalized_refs is not None and image is None:
             raise ValueError("spatial_refs can only be used with an image")
 
         temperature = self._default_temperature
@@ -651,7 +652,6 @@ class InferenceEngine:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
 
-        normalized_refs = normalize_spatial_refs(spatial_refs)
         request = QueryRequest(
             question=normalized_question,
             image=image,
