@@ -51,7 +51,12 @@ class TokenizerConfig:
                 "normal": [1, 32708, 2, 6382, 3],
                 "long": [1, 32708, 2, 4059, 3],
             },
-            "query": {"prefix": [1, 15381, 2], "suffix": [3]},
+            "query": {
+                "prefix": [1, 15381, 2],
+                "answer_prefix": [3],
+                "reasoning_prefix": [4],
+                "post_reasoning_prefix": [],
+            },
             "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
             "point": {"prefix": [1, 2581, 2], "suffix": [3]},
             "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
@@ -133,7 +138,12 @@ _TOKENIZER_CONFIG = {
             "normal": [1, 32708, 2, 6382, 3],
             "long": [1, 32708, 2, 4059, 3],
         },
-        "query": {"prefix": [1, 15381, 2], "suffix": [3]},
+        "query": {
+            "prefix": [1, 15381, 2],          # tokens before the question
+            "answer_prefix": [3],             # question -> answer (non-reasoning)
+            "reasoning_prefix": [4],          # question -> reasoning (4 = thinking_id)
+            "post_reasoning_prefix": [],      # injected after generated answer_id
+        },
         "detect": {"prefix": [1, 7235, 476, 2], "suffix": [3]},
         "point": {"prefix": [1, 2581, 2], "suffix": [3]},
         "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
@@ -196,6 +206,14 @@ DEFAULT_MOONDREAM2_CONFIG = {
         "templates": {
             **_TOKENIZER_CONFIG["templates"],
             "segment": None,  # MD2 doesn't support segment
+            # MD2 was trained with a doubled answer_id at the question boundary
+            # (an HF tokenizer-pipeline artifact); inference must reproduce it.
+            "query": {
+                "prefix": [1, 15381, 2],
+                "answer_prefix": [3, 3],
+                "reasoning_prefix": [3, 4],
+                "post_reasoning_prefix": [3],
+            },
         },
     },
     "region": {

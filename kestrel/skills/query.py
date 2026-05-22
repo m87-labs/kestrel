@@ -53,26 +53,24 @@ class QuerySkill(SkillSpec):
         prompt = request_context.question
         template = runtime.config.tokenizer.templates["query"]
         prefix: Sequence[int] = template["prefix"]
-        suffix: Sequence[int] = template["suffix"]
+        # Token sequence between the question and what follows it. Each model
+        # declares its own opener, so per-model tokenization quirks — e.g. MD2's
+        # doubled answer_id, an artifact baked into its training — stay in that
+        # model's config rather than as branches in this skill.
+        opener: Sequence[int] = (
+            template["reasoning_prefix"]
+            if request_context.reasoning
+            else template["answer_prefix"]
+        )
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
-        reasoning = request_context.reasoning
         # The runtime's _prepare_full_prefill_inputs places the first prompt token
         # before image tokens, so prepend BOS explicitly.
         bos_id = runtime.config.tokenizer.bos_id
         tokens: List[Token] = [TextToken(token_id=int(bos_id))]
         tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
-
         tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
-        # MD2 HF model adds suffix before thinking_id or doubles suffix for non-reasoning
-        is_md2 = runtime.model_name == "moondream2"
-        if is_md2:
-            tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
-        if reasoning:
-            thinking_id = runtime.config.tokenizer.thinking_id
-            tokens.append(TextToken(token_id=int(thinking_id)))
-        else:
-            tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in opener)
         return tokens
 
     def create_state(
@@ -110,20 +108,19 @@ class QuerySkillState(SkillState):
         self._end_ground_id: Optional[int] = None
         self._streaming = bool(query_request.stream)
         self._answer_stream_offset = 0
-        # After reasoning completes (answer_id generated), HF force-feeds suffix
-        # tokens before answer generation. We replicate this by constraining
-        # allowed_token_ids to force suffix tokens one at a time.
-        self._suffix_tokens: Optional[List[int]] = None
-        self._suffix_inject_idx: int = 0
+        # After reasoning ends (answer_id generated), replay the model's
+        # post_reasoning_prefix one token at a time via allowed_token_ids.
+        self._post_reasoning_tokens: Optional[List[int]] = None
+        self._post_reasoning_idx: int = 0
 
     def allowed_token_ids(
         self, runtime: "MoondreamRuntime"
     ) -> Optional[Sequence[int]]:
         if (
-            self._suffix_tokens is not None
-            and self._suffix_inject_idx < len(self._suffix_tokens)
+            self._post_reasoning_tokens is not None
+            and self._post_reasoning_idx < len(self._post_reasoning_tokens)
         ):
-            return [self._suffix_tokens[self._suffix_inject_idx]]
+            return [self._post_reasoning_tokens[self._post_reasoning_idx]]
         return None
 
     def suppressed_token_ids(
@@ -135,10 +132,10 @@ class QuerySkillState(SkillState):
         if self._reasoning_enabled and self._collecting_reasoning:
             # During reasoning: suppress eos and size tokens (matching HF).
             return [tcfg.eos_id, tcfg.size_id]
-        # Don't suppress during suffix injection (allowed_token_ids handles that).
+        # Don't suppress during post-reasoning injection (allowed_token_ids does it).
         if (
-            self._suffix_tokens is not None
-            and self._suffix_inject_idx < len(self._suffix_tokens)
+            self._post_reasoning_tokens is not None
+            and self._post_reasoning_idx < len(self._post_reasoning_tokens)
         ):
             return None
         # During answer generation: suppress answer_id (matching HF).
@@ -153,13 +150,13 @@ class QuerySkillState(SkillState):
             self._ensure_token_ids(runtime)
         self.append_token(step.token)
 
-        # Track suffix injection progress
+        # Track post-reasoning injection progress
         if (
-            self._suffix_tokens is not None
-            and self._suffix_inject_idx < len(self._suffix_tokens)
+            self._post_reasoning_tokens is not None
+            and self._post_reasoning_idx < len(self._post_reasoning_tokens)
         ):
-            self._suffix_inject_idx += 1
-            # Don't collect suffix tokens as answer tokens
+            self._post_reasoning_idx += 1
+            # Don't collect injected tokens as answer tokens
             return None
 
         if not self._reasoning_enabled:
@@ -176,11 +173,14 @@ class QuerySkillState(SkillState):
                     self._flush_current_chunk()
                     self._pending_coord = None
                     self._answer_stream_offset = 0
-                    # Force-feed suffix tokens before answer generation,
-                    # matching HF's behavior of prefilling suffix after reasoning.
-                    suffix = runtime.config.tokenizer.templates["query"]["suffix"]
-                    self._suffix_tokens = list(suffix)
-                    self._suffix_inject_idx = 0
+                    # Replay the model's post-reasoning opener before the answer.
+                    # Empty for models without the trained-in answer_id artifact
+                    # (e.g. MD3); MD2 declares [answer_id] here.
+                    template = runtime.config.tokenizer.templates["query"]
+                    self._post_reasoning_tokens = list(
+                        template["post_reasoning_prefix"]
+                    )
+                    self._post_reasoning_idx = 0
                     return None
                 if token_id == self._start_ground_id or token_id == self._end_ground_id:
                     self._flush_current_chunk()
