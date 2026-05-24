@@ -2,6 +2,37 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.4.1 — 2026-05-23
+
+This release lifts FP8 MoE performance on NVIDIA B200 through the
+`kestrel-kernels` 0.4.1 bump, finishes the MoE LoRA migration onto
+bundled CuTe kernels, and adds spatial references to point prompts.
+
+### FP8 MoE performance on B200
+
+- Decode FP8 MoE routes through a new warp-GEMV path that consumes
+  top-k routing directly — roughly 3× faster at decode batch sizes than
+  the previous CuTe MoE path.
+- Prefill and high-batch decode FP8 MoE route through a new
+  compact-route GEMM that drops expert-padded buffers — 1.15–2.40×
+  faster at batches of 256–1024 routed tokens, lifting ChartQA
+  end-to-end throughput by ~8% with ~16% lower P99 latency.
+
+### MoE LoRA
+
+- MoE LoRA execution moved end-to-end onto bundled CuTe kernels for
+  both prefill and decode. The decode path is now CUDA-graph-stable
+  through compact and token-major metadata writes into fixed-capacity
+  slot buffers, and the legacy single-LoRA prefill / route-ID decode
+  paths are removed. Triton is no longer pulled in transitively.
+
+### Point prompts
+
+- `InferenceEngine.point` accepts an optional `spatial_refs=` keyword
+  argument to anchor point prompts to a referenced region (e.g.
+  identifying which subject's gaze to follow). Mirrors the existing
+  behavior in `query` and `segment`.
+
 ## 0.4.0 — 2026-05-18
 
 This release fixes Apple Silicon installs breaking after PyTorch upgrades,
