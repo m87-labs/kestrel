@@ -8,8 +8,6 @@ from torch.compiler import disable as torch_compiler_disable
 from .lora_workspace import MoELoRALayerWorkspace
 from kestrel_kernels import get_runtime, moe as _MOE_API
 
-_SHARED_MOE_HANDLES: dict[tuple, _MOE_API.MoeHandle] = {}
-
 
 class ExpertWeights(nn.Module):
     """Container for per-expert weight tensors."""
@@ -106,31 +104,11 @@ class MoEModule(nn.Module):
             max_lora_rank=max_lora_rank,
             mode=mode,
         )
-        key = (
-            str(hidden_states.device),
-            hidden_states.dtype,
-            weight_format,
-            capacity.max_tokens,
-            capacity.max_loras,
-            capacity.max_lora_rank,
-            capacity.mode,
-            self.num_experts,
-            self.top_k,
-            self.input_size,
-            self.hidden_size,
-            self.config.allow_tf32,
-            self.config.backend,
-            self.config.auto_backend_token_threshold,
+        return self._moe_runtime.prepare(
+            spec,
+            capacity,
+            device=hidden_states.device,
         )
-        handle = _SHARED_MOE_HANDLES.get(key)
-        if handle is None:
-            handle = self._moe_runtime.prepare(
-                spec,
-                capacity,
-                device=hidden_states.device,
-            )
-            _SHARED_MOE_HANDLES[key] = handle
-        return handle
 
     @torch_compiler_disable()
     def forward(
