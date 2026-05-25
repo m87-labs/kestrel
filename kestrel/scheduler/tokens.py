@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
-from kestrel.moondream.runtime import (
+from kestrel.models.moondream.runtime import (
     CoordToken,
     SizeToken,
     TextToken,

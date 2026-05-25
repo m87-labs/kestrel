@@ -8,8 +8,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import kestrel_native
 import numpy as np
 
-from kestrel.moondream.config import VisionConfig
-from kestrel.moondream.image_crops import OverlapCropOutput, overlap_crop_image
+from kestrel.models.moondream.config import VisionConfig
+from kestrel.models.moondream.image_crops import OverlapCropOutput, overlap_crop_image
 from kestrel.utils.image import ensure_srgb
 
 

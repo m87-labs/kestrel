@@ -106,8 +106,8 @@ def _maybe_retry_flash_attn(exc: Exception) -> bool:
 
 def patch_text_decoder_with_nvtx():
     """Monkey-patch text_decoder to add NVTX markers around each component."""
-    from kestrel.moondream import text as text_module
-    from kestrel.moondream.layers import layer_norm, mlp, moe_mlp, LayerNormWeights, MLPWeights, LinearWeights
+    from kestrel.models.moondream import text as text_module
+    from kestrel.models.moondream.layers import layer_norm, mlp, moe_mlp, LayerNormWeights, MLPWeights, LinearWeights
 
     def instrumented_text_decoder(
         x, module, attn_mask, position_ids, config, *,
@@ -196,7 +196,7 @@ def patch_text_decoder_with_nvtx():
     text_module.text_decoder = instrumented_text_decoder
     # Ensure runtime module uses the patched symbol (runtime imports text_decoder at module scope).
     try:
-        from kestrel.moondream import runtime as runtime_module
+        from kestrel.models.moondream import runtime as runtime_module
         runtime_module.text_decoder = instrumented_text_decoder
     except Exception:
         pass
@@ -204,8 +204,8 @@ def patch_text_decoder_with_nvtx():
 
 def patch_lm_head_with_nvtx():
     """Monkey-patch lm_head to add NVTX markers."""
-    from kestrel.moondream import text as text_module
-    from kestrel.moondream.layers import layer_norm, LayerNormWeights
+    from kestrel.models.moondream import text as text_module
+    from kestrel.models.moondream.layers import layer_norm, LayerNormWeights
     import torch.nn.functional as F
 
     def instrumented_lm_head(hidden, module, indices=None):
@@ -232,7 +232,7 @@ def patch_lm_head_with_nvtx():
     text_module.lm_head = instrumented_lm_head
     # Ensure runtime module uses the patched symbol (runtime imports lm_head at module scope).
     try:
-        from kestrel.moondream import runtime as runtime_module
+        from kestrel.models.moondream import runtime as runtime_module
         runtime_module.lm_head = instrumented_lm_head
     except Exception:
         pass
@@ -258,7 +258,7 @@ def main():
     patch_lm_head_with_nvtx()
 
     from kestrel.config import RuntimeConfig
-    from kestrel.moondream.runtime import MoondreamRuntime, SequenceState, TextToken
+    from kestrel.models.moondream.runtime import MoondreamRuntime, SequenceState, TextToken
 
     device = torch.device("cuda")
 
@@ -283,7 +283,7 @@ def main():
     )
 
     # Create prompt tokens (BOS + some tokens)
-    bos_id = runtime.config.tokenizer.bos_id
+    bos_id = runtime.prompt_template.bos_id
     prompt_tokens = [TextToken(bos_id)] + [
         TextToken(100 + i) for i in range(max(0, args.prompt_len - 1))
     ]

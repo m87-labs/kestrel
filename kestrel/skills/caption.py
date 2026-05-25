@@ -6,12 +6,12 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from kestrel.moondream.runtime import TextToken, Token
+from kestrel.models.moondream.runtime import TextToken, Token
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -48,17 +48,11 @@ class CaptionSkill(SkillSpec):
     ) -> Sequence["Token"]:
         if not isinstance(request_context, CaptionRequest):
             raise ValueError("CaptionSkill.build_prompt_tokens requires a CaptionRequest")
-        templates = runtime.config.tokenizer.templates["caption"]
-        if templates is None:
-            raise ValueError("Model configuration does not include caption templates")
-        length_key = request_context.length
-        if length_key not in templates:
-            valid = ", ".join(sorted(templates.keys()))
-            raise ValueError(
-                f"Unsupported caption length '{length_key}'. Expected one of: {valid}"
-            )
-        token_ids = templates[length_key]
-        tokens = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
+        pt = runtime.prompt_template
+        token_ids = pt.caption(request_context.length)
+        if token_ids is None:
+            raise ValueError("Model does not include caption templates")
+        tokens = [TextToken(token_id=int(pt.bos_id))]
         tokens.extend(TextToken(token_id=int(tid)) for tid in token_ids)
         return tokens
 
@@ -92,7 +86,7 @@ class CaptionSkillState(SkillState):
     ) -> Optional[Sequence[int]]:
         if runtime.model_name != "moondream2":
             return None
-        return [runtime.config.tokenizer.answer_id]
+        return [runtime.prompt_template.answer_id]
 
     def consume_step(
         self,

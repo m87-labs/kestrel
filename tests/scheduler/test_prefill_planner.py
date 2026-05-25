@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from kestrel.moondream.runtime import PrefillClassification
+from kestrel.models.moondream.runtime import PrefillClassification
 from kestrel.scheduler.scheduler import _PrefillCandidate, _plan_prefill_launch_batch
 
 

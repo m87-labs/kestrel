@@ -64,7 +64,7 @@ class TestRuntimeTokens:
 
     def test_text_token_cache_key(self) -> None:
         """TextToken uses type discriminator 0."""
-        from kestrel.moondream.runtime import TextToken
+        from kestrel.models.moondream.runtime import TextToken
 
         token = TextToken(token_id=42)
         key = token.cache_key()
@@ -74,21 +74,21 @@ class TestRuntimeTokens:
 
     def test_text_token_kv_length(self) -> None:
         """TextToken occupies 1 KV position."""
-        from kestrel.moondream.runtime import TextToken
+        from kestrel.models.moondream.runtime import TextToken
 
         token = TextToken(token_id=42)
         assert token.kv_length() == 1
 
     def test_text_token_implements_cache_token(self) -> None:
         """TextToken implements CacheToken protocol."""
-        from kestrel.moondream.runtime import TextToken
+        from kestrel.models.moondream.runtime import TextToken
 
         token = TextToken(token_id=42)
         assert isinstance(token, CacheToken)
 
     def test_coord_token_cache_key(self) -> None:
         """CoordToken uses type discriminator 1."""
-        from kestrel.moondream.runtime import CoordToken
+        from kestrel.models.moondream.runtime import CoordToken
 
         token = CoordToken(pos=0.5)
         key = token.cache_key()
@@ -98,14 +98,14 @@ class TestRuntimeTokens:
 
     def test_coord_token_kv_length(self) -> None:
         """CoordToken occupies 1 KV position."""
-        from kestrel.moondream.runtime import CoordToken
+        from kestrel.models.moondream.runtime import CoordToken
 
         token = CoordToken(pos=0.5)
         assert token.kv_length() == 1
 
     def test_size_token_cache_key(self) -> None:
         """SizeToken uses type discriminator 2."""
-        from kestrel.moondream.runtime import SizeToken
+        from kestrel.models.moondream.runtime import SizeToken
 
         token = SizeToken(width=0.3, height=0.4)
         key = token.cache_key()
@@ -115,14 +115,14 @@ class TestRuntimeTokens:
 
     def test_size_token_kv_length(self) -> None:
         """SizeToken occupies 1 KV position."""
-        from kestrel.moondream.runtime import SizeToken
+        from kestrel.models.moondream.runtime import SizeToken
 
         token = SizeToken(width=0.3, height=0.4)
         assert token.kv_length() == 1
 
     def test_all_tokens_have_distinct_discriminators(self) -> None:
         """All token types use distinct type discriminators."""
-        from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken
+        from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
 
         text_key = TextToken(token_id=1).cache_key()
         coord_key = CoordToken(pos=0.5).cache_key()
@@ -138,7 +138,7 @@ class TestTokenCacheKeyUniqueness:
 
     def test_different_types_never_collide(self) -> None:
         """Different token types never produce the same cache key."""
-        from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken
+        from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
 
         # Same "value" but different types
         text_token = TextToken(token_id=1)
@@ -157,7 +157,7 @@ class TestTokenCacheKeyUniqueness:
 
     def test_text_tokens_with_same_id_match(self) -> None:
         """Text tokens with the same ID have the same cache key."""
-        from kestrel.moondream.runtime import TextToken
+        from kestrel.models.moondream.runtime import TextToken
 
         token1 = TextToken(token_id=42)
         token2 = TextToken(token_id=42)

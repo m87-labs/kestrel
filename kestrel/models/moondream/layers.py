@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from ..dense_lora import (
+from ...dense_lora import (
     DenseLoRATorchMLPScratch,
     apply_dense_lora,
     prepare_dense_lora_batch,

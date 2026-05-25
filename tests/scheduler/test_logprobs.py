@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from kestrel.moondream.region import SpatialDecodeTables
-from kestrel.moondream.runtime import TextToken
+from kestrel.models.moondream.region import SpatialDecodeTables
+from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle

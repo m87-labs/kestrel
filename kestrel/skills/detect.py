@@ -6,12 +6,12 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -47,15 +47,14 @@ class DetectSkill(SkillSpec):
     ) -> Sequence["Token"]:
         if not isinstance(request_context, DetectRequest):
             raise ValueError("DetectSkill.build_prompt_tokens requires a DetectRequest")
-        template = runtime.config.tokenizer.templates["detect"]
+        pt = runtime.prompt_template
+        template = pt.detect()
         if template is None:
-            raise ValueError("Model configuration does not include detect templates")
-        prefix: Sequence[int] = template["prefix"]
-        suffix: Sequence[int] = template["suffix"]
+            raise ValueError("Model does not include a detect template")
         prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(" " + prompt).ids if prompt else []
-        ids = [*prefix, *object_tokens, *suffix]
-        tokens = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
+        ids = [*template.prefix, *object_tokens, *template.suffix]
+        tokens = [TextToken(token_id=int(pt.bos_id))]
         tokens.extend(TextToken(token_id=int(tid)) for tid in ids)
         return tokens
 
@@ -116,12 +115,12 @@ class DetectSkillState(SkillState):
         )
 
     def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Sequence[int]:
-        tokenizer = runtime.config.tokenizer
+        pt = runtime.prompt_template
         if self._stage == "x":
-            return [tokenizer.coord_id, tokenizer.eos_id]
+            return [pt.coord_id, pt.eos_id]
         if self._stage == "y":
-            return [tokenizer.coord_id]
-        return [tokenizer.size_id]
+            return [pt.coord_id]
+        return [pt.size_id]
 
 
 def _extract_objects(tokens: Sequence[Token]) -> list[Dict[str, float]]:

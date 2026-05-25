@@ -1,6 +1,6 @@
 # Scheduler Overview
 
-The scheduler owns batched prefill/decode for Moondream inference. It sits between the high-level engine (`kestrel.engine.InferenceEngine`) and the low-level runtime (`kestrel.moondream.runtime.MoondreamRuntime`). The engine prepares validated `GenerationRequest` objects and corresponding `SkillState` instances, then hands them to the scheduler, which multiplexes work on a shared runtime instance.
+The scheduler owns batched prefill/decode for Moondream inference. It sits between the high-level engine (`kestrel.engine.InferenceEngine`) and the low-level runtime (`kestrel.models.moondream.runtime.MoondreamRuntime`). The engine prepares validated `GenerationRequest` objects and corresponding `SkillState` instances, then hands them to the scheduler, which multiplexes work on a shared runtime instance.
 
 ## Responsibilities
 

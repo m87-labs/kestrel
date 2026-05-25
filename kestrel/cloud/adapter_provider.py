@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 import httpx
 import torch
 
-from kestrel.moondream.config import TextConfig
-from kestrel.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
+from kestrel.models.moondream.config import TextConfig
+from kestrel.models.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
 
 if TYPE_CHECKING:
     pass

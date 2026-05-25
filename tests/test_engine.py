@@ -15,7 +15,7 @@ from kestrel.engine import (
     _AdmissionCoordinator,
     _PendingRequest,
 )
-from kestrel.moondream.runtime import TextToken
+from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
@@ -299,7 +299,7 @@ def test_extract_private_generated_prefix_setting() -> None:
 def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
     engine = object.__new__(InferenceEngine)
     engine._runtime = SimpleNamespace(
-        config=SimpleNamespace(tokenizer=SimpleNamespace(eos_id=2))
+        prompt_template=SimpleNamespace(eos_id=2),
     )
 
     prefix = GeneratedPrefix(tokens=(TextToken(10),))

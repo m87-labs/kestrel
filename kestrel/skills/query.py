@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from kestrel.moondream.runtime import CoordToken, TextToken, Token
+from kestrel.models.moondream.runtime import CoordToken, TextToken, Token
 from kestrel.utils.spatial_refs import build_spatial_tokens
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -51,23 +51,24 @@ class QuerySkill(SkillSpec):
         if not isinstance(request_context, QueryRequest):
             raise ValueError("QuerySkill.build_prompt_tokens requires a QueryRequest")
         prompt = request_context.question
-        template = runtime.config.tokenizer.templates["query"]
-        prefix: Sequence[int] = template["prefix"]
+        pt = runtime.prompt_template
+        template = pt.query()
+        if template is None:
+            raise ValueError("Model does not include a query template")
         # Token sequence between the question and what follows it. Each model
         # declares its own opener, so per-model tokenization quirks — e.g. MD2's
         # doubled answer_id, an artifact baked into its training — stay in that
         # model's config rather than as branches in this skill.
         opener: Sequence[int] = (
-            template["reasoning_prefix"]
+            template.reasoning_prefix
             if request_context.reasoning
-            else template["answer_prefix"]
+            else template.answer_prefix
         )
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
         # The runtime's _prepare_full_prefill_inputs places the first prompt token
         # before image tokens, so prepend BOS explicitly.
-        bos_id = runtime.config.tokenizer.bos_id
-        tokens: List[Token] = [TextToken(token_id=int(bos_id))]
-        tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
+        tokens: List[Token] = [TextToken(token_id=int(pt.bos_id))]
+        tokens.extend(TextToken(token_id=int(tid)) for tid in template.prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
         tokens.extend(TextToken(token_id=int(tid)) for tid in encoded)
         tokens.extend(TextToken(token_id=int(tid)) for tid in opener)
@@ -128,10 +129,10 @@ class QuerySkillState(SkillState):
     ) -> Optional[Sequence[int]]:
         if runtime.model_name != "moondream2":
             return None
-        tcfg = runtime.config.tokenizer
+        pt = runtime.prompt_template
         if self._reasoning_enabled and self._collecting_reasoning:
             # During reasoning: suppress eos and size tokens (matching HF).
-            return [tcfg.eos_id, tcfg.size_id]
+            return [pt.eos_id, pt.size_id]
         # Don't suppress during post-reasoning injection (allowed_token_ids does it).
         if (
             self._post_reasoning_tokens is not None
@@ -139,7 +140,7 @@ class QuerySkillState(SkillState):
         ):
             return None
         # During answer generation: suppress answer_id (matching HF).
-        return [tcfg.answer_id]
+        return [pt.answer_id]
 
     def consume_step(
         self,
@@ -176,9 +177,9 @@ class QuerySkillState(SkillState):
                     # Replay the model's post-reasoning opener before the answer.
                     # Empty for models without the trained-in answer_id artifact
                     # (e.g. MD3); MD2 declares [answer_id] here.
-                    template = runtime.config.tokenizer.templates["query"]
-                    self._post_reasoning_tokens = list(
-                        template["post_reasoning_prefix"]
+                    template = runtime.prompt_template.query()
+                    self._post_reasoning_tokens = (
+                        list(template.post_reasoning_prefix) if template else []
                     )
                     self._post_reasoning_idx = 0
                     return None
@@ -288,7 +289,7 @@ class QuerySkillState(SkillState):
     def _ensure_token_ids(self, runtime: "MoondreamRuntime") -> None:
         if self._answer_id is not None:
             return
-        tokenizer_cfg = runtime.config.tokenizer
-        self._answer_id = tokenizer_cfg.answer_id
-        self._start_ground_id = tokenizer_cfg.start_ground_points_id
-        self._end_ground_id = tokenizer_cfg.end_ground_id
+        pt = runtime.prompt_template
+        self._answer_id = pt.answer_id
+        self._start_ground_id = pt.start_ground_points_id
+        self._end_ground_id = pt.end_ground_id

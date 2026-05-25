@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.spatial_refs import build_spatial_tokens
 from kestrel.utils.svg import (
     decode_svg_token_strings,
@@ -21,7 +21,7 @@ from kestrel.utils.svg import (
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -58,24 +58,21 @@ class SegmentSkill(SkillSpec):
     ) -> Sequence["Token"]:
         if not isinstance(request_context, SegmentRequest):
             raise ValueError("SegmentSkill.build_prompt_tokens requires a SegmentRequest")
-        template = runtime.config.tokenizer.templates.get("segment")
+        pt = runtime.prompt_template
+        template = pt.segment()
         if template is None:
-            raise ValueError("Model configuration does not include segment templates")
-        prefix: Sequence[int] = template.get("prefix", [])
-        suffix: Sequence[int] = template.get("suffix", [])
+            raise ValueError("Model does not include a segment template")
         object_name = request_context.object
         object_tokens = runtime.tokenizer.encode(object_name).ids if object_name else []
 
         # Assemble tokens:
         # [BOS] <prefix> <spatial tokens> object <suffix>
-        tokens: List[Token] = [
-            TextToken(token_id=int(runtime.config.tokenizer.bos_id))
-        ]
-        tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
+        tokens: List[Token] = [TextToken(token_id=int(pt.bos_id))]
+        tokens.extend(TextToken(token_id=int(tid)) for tid in template.prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
 
         tokens.extend(TextToken(token_id=int(tid)) for tid in object_tokens)
-        tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in template.suffix)
         return tokens
 
     def create_state(

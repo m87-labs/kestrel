@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from kestrel.moondream import runtime as runtime_mod
+from kestrel.models.moondream import runtime as runtime_mod
 
 
 class _FakePageTable:

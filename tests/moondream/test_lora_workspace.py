@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from kestrel.moondream.config import TextConfig, TextMoeConfig
-from kestrel.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
-from kestrel.moondream.lora_workspace import (
+from kestrel.models.moondream.config import TextConfig, TextMoeConfig
+from kestrel.models.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
+from kestrel.models.moondream.lora_workspace import (
     AdapterSlotManager,
     DenseLoRALayerWorkspace,
     MoELoRALayerWorkspace,
