@@ -3,14 +3,18 @@
 A ``ModelSpec`` carries the small handful of facts the engine needs to
 bootstrap a model: the HuggingFace download coordinates, the default
 config dict, the checkpoint format tag (consumed by the weight loader),
-and the HF tokenizer hub id.
+the HF tokenizer hub id, and the runtime constructor.
 
 New model families register themselves at import time from their
 package's ``__init__.py`` (see ``kestrel/models/moondream/__init__.py``).
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List
+
+if TYPE_CHECKING:
+    from kestrel.config import RuntimeConfig
+    from kestrel.runtime import Runtime
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,11 @@ class ModelSpec:
     checkpoint_format: str
     default_config: Dict[str, Any]
     tokenizer_id: str
+    # Constructor invoked as ``runtime(cfg, **kwargs)`` by the engine to
+    # produce a concrete :class:`~kestrel.runtime.Runtime` for this
+    # model. Kwargs (e.g. ``max_lora_rank``) are forwarded from the
+    # engine's runtime-construction path.
+    runtime: Callable[..., "Runtime"]
 
 
 _REGISTRY: Dict[str, ModelSpec] = {}

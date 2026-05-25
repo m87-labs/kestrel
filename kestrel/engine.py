@@ -55,7 +55,6 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.models.moondream.runtime import MoondreamRuntime
 from kestrel.runtime import Runtime
 from kestrel.scheduler import (
     GeneratedPrefix,
@@ -332,7 +331,8 @@ class InferenceEngine:
         self._api_base_url = api_base_url
 
         # An externally-built runtime is held from construction; otherwise
-        # ``_initialize`` builds a MoondreamRuntime on first ``create``.
+        # ``_initialize`` builds one via the spec's ``runtime`` factory
+        # on first ``create``.
         self._runtime: Optional[Runtime] = runtime
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
@@ -452,8 +452,11 @@ class InferenceEngine:
                         "if LoRA support is needed on your platform."
                     )
                     max_lora_rank = None
+            from kestrel.models import get_spec
+
+            runtime_cls = get_spec(self._runtime_cfg.model).runtime
             self._runtime = await loop.run_in_executor(
-                None, lambda: MoondreamRuntime(self._runtime_cfg, max_lora_rank=max_lora_rank)
+                None, lambda: runtime_cls(self._runtime_cfg, max_lora_rank=max_lora_rank)
             )
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(

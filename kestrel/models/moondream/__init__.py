@@ -26,6 +26,7 @@ register(
         checkpoint_format="md2",
         default_config=DEFAULT_MOONDREAM2_CONFIG,
         tokenizer_id="moondream/starmie-v1",
+        runtime=MoondreamRuntime,
     )
 )
 register(
@@ -36,6 +37,7 @@ register(
         checkpoint_format="md3",
         default_config=DEFAULT_MOONDREAM3_CONFIG,
         tokenizer_id="moondream/starmie-v1",
+        runtime=MoondreamRuntime,
     )
 )
 
