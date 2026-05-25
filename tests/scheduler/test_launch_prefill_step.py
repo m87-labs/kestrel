@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from kestrel.moondream.runtime import PrefillClassification, TextToken
+from kestrel.models.moondream.runtime import PrefillClassification, TextToken
 from kestrel.scheduler.pipeline import PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate

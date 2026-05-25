@@ -6,13 +6,13 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.spatial_refs import build_spatial_tokens
 
 from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -48,18 +48,17 @@ class PointSkill(SkillSpec):
     ) -> Sequence["Token"]:
         if not isinstance(request_context, PointRequest):
             raise ValueError("PointSkill.build_prompt_tokens requires a PointRequest")
-        template = runtime.config.tokenizer.templates["point"]
+        pt = runtime.prompt_template
+        template = pt.point()
         if template is None:
-            raise ValueError("Model configuration does not include point templates")
-        prefix: Sequence[int] = template["prefix"]
-        suffix: Sequence[int] = template["suffix"]
+            raise ValueError("Model does not include a point template")
         prompt = request_context.object
         object_tokens = runtime.tokenizer.encode(" " + prompt).ids if prompt else []
-        tokens: List[Token] = [TextToken(token_id=int(runtime.config.tokenizer.bos_id))]
-        tokens.extend(TextToken(token_id=int(tid)) for tid in prefix)
+        tokens: List[Token] = [TextToken(token_id=int(pt.bos_id))]
+        tokens.extend(TextToken(token_id=int(tid)) for tid in template.prefix)
         tokens.extend(build_spatial_tokens(request_context.spatial_refs))
         tokens.extend(TextToken(token_id=int(tid)) for tid in object_tokens)
-        tokens.extend(TextToken(token_id=int(tid)) for tid in suffix)
+        tokens.extend(TextToken(token_id=int(tid)) for tid in template.suffix)
         return tokens
 
     def create_state(
@@ -115,10 +114,10 @@ class PointSkillState(SkillState):
         )
 
     def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Sequence[int]:
-        tokenizer = runtime.config.tokenizer
+        pt = runtime.prompt_template
         if self._awaiting_y:
-            return [tokenizer.coord_id]
-        return [tokenizer.coord_id, tokenizer.eos_id]
+            return [pt.coord_id]
+        return [pt.coord_id, pt.eos_id]
 
 
 def _extract_points(tokens: Sequence[Token]) -> list[Dict[str, float]]:

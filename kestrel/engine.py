@@ -2,7 +2,7 @@
 
 The engine is the high-level entry point for clients. It owns:
 
-- Lifecycle of the shared :class:`~kestrel.moondream.runtime.MoondreamRuntime`, including warmup and shutdown.
+- Lifecycle of the shared :class:`~kestrel.models.moondream.runtime.MoondreamRuntime`, including warmup and shutdown.
 - A micro-batching worker that pulls pending requests, prepares image crops, and runs the scheduler.
 - Skill orchestration — resolving the active :class:`~kestrel.skills.base.SkillSpec`, building prompt tokens when necessary, instantiating :class:`~kestrel.skills.base.SkillState` with skill-specific request contexts, and bridging streaming callbacks back to callers.
 - Conversion between scheduler outputs (``SchedulerResult``) and user-facing ``EngineResult`` objects augmented with metrics and per-skill output payloads.
@@ -11,7 +11,7 @@ Relationship to other components:
 
 - Receives raw prompts or structured skill requests from clients (CLI, HTTP, etc.).
 - Uses :class:`GenerationScheduler` to multiplex work across the runtime while keeping the scheduler skill-agnostic.
-- Delegates low-level execution to :class:`MoondreamRuntime` for prefill/decode and to :mod:`kestrel.moondream.vision` for optional image preprocessing.
+- Delegates low-level execution to :class:`MoondreamRuntime` for prefill/decode and to :mod:`kestrel.models.moondream.vision` for optional image preprocessing.
 
 Internal API overview:
 
@@ -55,7 +55,7 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.moondream.runtime import MoondreamRuntime
+from kestrel.models.moondream.runtime import MoondreamRuntime
 from kestrel.runtime import Runtime
 from kestrel.scheduler import (
     GeneratedPrefix,
@@ -66,9 +66,9 @@ from kestrel.scheduler import (
     SchedulerResult,
     StreamUpdate,
 )
-from kestrel.moondream.image_crops import OverlapCropOutput
-from kestrel.moondream.image_preprocessor import ImagePreprocessor
-from kestrel.moondream.vision import compute_overlap_crops
+from kestrel.models.moondream.image_crops import OverlapCropOutput
+from kestrel.models.moondream.image_preprocessor import ImagePreprocessor
+from kestrel.models.moondream.vision import compute_overlap_crops
 from kestrel.skills import (
     CaptionSkill,
     DetectSkill,
@@ -80,13 +80,13 @@ from kestrel.skills import (
     SkillSpec,
     SkillState,
 )
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.skills.caption import CaptionRequest, CaptionSettings
 from kestrel.skills.detect import DetectRequest, DetectSettings
 from kestrel.skills.point import PointRequest, PointSettings
 from kestrel.skills.query import QueryRequest, QuerySettings
 from kestrel.skills.segment import SegmentRequest, SegmentSettings
-from kestrel.moondream.lora import AdapterProvider
+from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
 from kestrel.utils.spatial_refs import normalize_spatial_refs
 
@@ -410,7 +410,7 @@ class InferenceEngine:
             api_base_url = _DEFAULT_API_BASE_URL
         if adapter_provider is None and api_key:
             from kestrel.cloud import MoondreamAdapterProvider
-            from kestrel.moondream.config import load_config
+            from kestrel.models.moondream.config import load_config
 
             config = load_config()
             adapter_provider = MoondreamAdapterProvider(
@@ -1336,7 +1336,7 @@ class InferenceEngine:
                 "settings._logprobs is true"
             )
 
-        eos_id = self.runtime.config.tokenizer.eos_id
+        eos_id = self.runtime.prompt_template.eos_id
         for token in generated_prefix.tokens:
             if isinstance(token, TextToken) and token.token_id == eos_id:
                 raise ValueError(

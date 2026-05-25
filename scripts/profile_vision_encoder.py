@@ -51,7 +51,7 @@ if str(REPO_ROOT) not in sys.path:
 def patch_vision_encoder_with_nvtx(detailed: bool = True) -> None:
     """Monkey-patch vision_encoder to add NVTX markers."""
     import torch.nn.functional as F
-    from kestrel.moondream import vision as vision_module
+    from kestrel.models.moondream import vision as vision_module
 
     def _vision_attn_detail(x: torch.Tensor, attn: torch.nn.ModuleDict, n_heads: int, prefix: str) -> torch.Tensor:
         nvtx.range_push(f"{prefix}_qkv")
@@ -250,8 +250,8 @@ def main() -> None:
     patch_vision_encoder_with_nvtx(detailed=not args.compact)
 
     from kestrel.config import RuntimeConfig
-    from kestrel.moondream.runtime import MoondreamRuntime
-    from kestrel.moondream import vision as vision_module
+    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream import vision as vision_module
 
     device = torch.device("cuda")
     dtype = _parse_dtype(args.dtype)

@@ -21,8 +21,8 @@ try:
 except ImportError:
     _HAS_SEG_DEPS = False
 
-from .moondream.vision import vision_encoder
-from .moondream.config import VisionConfig
+from .models.moondream.vision import vision_encoder
+from .models.moondream.config import VisionConfig
 
 # Number of refinement iterations
 _REFINER_ITERS = 5

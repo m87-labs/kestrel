@@ -46,10 +46,12 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
         help="Effective max sequences per decode step (excludes reserved batch_idx 0)",
     )
     parser.add_argument("--page-size", type=int, default=1, help="KV cache page size")
+    from kestrel.models import known_models
+
     parser.add_argument(
         "--model",
         default="moondream3-preview",
-        choices=["moondream2", "moondream3-preview"],
+        choices=known_models(),
         help="Model version to use",
     )
     parser.add_argument(

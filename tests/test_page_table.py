@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from kestrel.kv_cache import PageTable
-from kestrel.moondream import runtime as runtime_mod
+from kestrel.models.moondream import runtime as runtime_mod
 from kestrel.prefix_cache import CacheNamespace, RadixPrefixCache
 
 

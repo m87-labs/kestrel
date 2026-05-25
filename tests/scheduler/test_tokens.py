@@ -6,7 +6,7 @@ These tests do not require CUDA - they only use CPU tensors.
 import pytest
 import torch
 
-from kestrel.moondream.runtime import TextToken, CoordToken, SizeToken
+from kestrel.models.moondream.runtime import TextToken, CoordToken, SizeToken
 from kestrel.scheduler.tokens import (
     prompt_with_spatial_tokens,
     render_tokens_from_packed,

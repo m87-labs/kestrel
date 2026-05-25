@@ -43,11 +43,9 @@ from kestrel.runtime import (
 )
 from kestrel.runtime.state import _CacheLookupResult
 
-from .config import (
-    DEFAULT_MOONDREAM2_CONFIG,
-    DEFAULT_MOONDREAM3_CONFIG,
-    MoondreamConfig,
-)
+from kestrel.models.registry import get_spec
+
+from .config import MoondreamConfig
 from .model import MoondreamModel
 from .weights import load_moondream_weights
 from .text import (
@@ -70,8 +68,8 @@ from .region import (
     encode_coordinate,
     encode_size,
 )
-from ..seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
-from ..dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
+from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
+from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
 
 
@@ -224,13 +222,8 @@ class MoondreamRuntime:
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
         self.graph_capture_lock = threading.RLock()
 
-        # Select config based on model version
-        if cfg.model == "moondream2":
-            raw_config = deepcopy(DEFAULT_MOONDREAM2_CONFIG)
-        else:
-            raw_config = deepcopy(DEFAULT_MOONDREAM3_CONFIG)
-
-        self.config = MoondreamConfig.from_dict(raw_config)
+        self._spec = get_spec(cfg.model)
+        self.config = MoondreamConfig.from_dict(deepcopy(self._spec.default_config))
 
         self._kv_layer_k_scales: list[float] | None = None
         self._kv_layer_v_scales: list[float] | None = None
@@ -332,6 +325,7 @@ class MoondreamRuntime:
             self.model,
             tensor_hook=_capture_kv_scale,
             region=self.region,
+            checkpoint_format=self._spec.checkpoint_format,
         )
 
         # Build spatial decode tables after region weight loading; otherwise the
@@ -384,7 +378,9 @@ class MoondreamRuntime:
                     )
             self.kv_cache_dtype = self.dtype
 
-        self.tokenizer = Tokenizer.from_pretrained("moondream/starmie-v1")
+        self.tokenizer = Tokenizer.from_pretrained(self._spec.tokenizer_id)
+        # TokenizerConfig satisfies the PromptTemplate protocol directly.
+        self.prompt_template = self.config.tokenizer
 
         head_dim = self.config.text.dim // self.config.text.n_heads
         self.head_dim = head_dim

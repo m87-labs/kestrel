@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from kestrel.engine import InferenceEngine
-from kestrel.moondream.runtime import CoordToken, SizeToken, TextToken
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
 from kestrel.skills.point import PointRequest, PointSettings, PointSkill
 from kestrel.skills.query import QueryRequest
 
@@ -19,13 +19,14 @@ class _FakeTokenizer:
 
 
 def _fake_runtime() -> SimpleNamespace:
+    from kestrel.models.protocols import PrefixSuffix
+
+    prompt_template = SimpleNamespace(
+        bos_id=1,
+        point=lambda: PrefixSuffix(prefix=[10, 11], suffix=[12]),
+    )
     return SimpleNamespace(
-        config=SimpleNamespace(
-            tokenizer=SimpleNamespace(
-                bos_id=1,
-                templates={"point": {"prefix": [10, 11], "suffix": [12]}},
-            )
-        ),
+        prompt_template=prompt_template,
         tokenizer=_FakeTokenizer(),
     )
 

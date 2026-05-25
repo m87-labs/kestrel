@@ -23,7 +23,7 @@ from .layers import (
 )
 from .lora_workspace import TextLoRAWorkspace
 from .rope import precompute_freqs_cis
-from ..dense_lora import DenseLoRATorchMLPScratch
+from ...dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()

@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.moondream.runtime import MoondreamRuntime
+    from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
-    from kestrel.moondream.runtime import Token
+    from kestrel.models.moondream.runtime import Token
 
 
 @dataclass(frozen=True)

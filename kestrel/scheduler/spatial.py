@@ -5,7 +5,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from kestrel.moondream.region import (
+from kestrel.models.moondream.region import (
     SpatialDecodeTables,
     spatial_bins_to_values,
     spatial_decode_logits,

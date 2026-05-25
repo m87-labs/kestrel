@@ -9,6 +9,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from kestrel.models.protocols import PrefixSuffix, QueryTemplate
+
 
 @dataclass(frozen=True)
 class TextMoeConfig:
@@ -36,6 +38,12 @@ class TextConfig:
 
 @dataclass(frozen=True)
 class TokenizerConfig:
+    """Moondream's token-id catalog + per-skill prompt templates.
+
+    Also satisfies :class:`kestrel.models.protocols.PromptTemplate` so
+    skills consume it directly without an extra wrapper layer.
+    """
+
     bos_id: int = 0
     eos_id: int = 0
     answer_id: int = 3
@@ -62,6 +70,47 @@ class TokenizerConfig:
             "segment": {"prefix": [1, 17374, 2], "suffix": [3]},
         }
     )
+
+    # --- PromptTemplate protocol ---
+    def caption(self, length: str) -> Optional[List[int]]:
+        templates = self.templates.get("caption")
+        if templates is None:
+            return None
+        if length not in templates:
+            valid = ", ".join(sorted(templates.keys()))
+            raise ValueError(
+                f"Unsupported caption length '{length}'. Expected one of: {valid}"
+            )
+        return list(templates[length])
+
+    def query(self) -> Optional[QueryTemplate]:
+        template = self.templates.get("query")
+        if template is None:
+            return None
+        return QueryTemplate(
+            prefix=list(template["prefix"]),
+            answer_prefix=list(template["answer_prefix"]),
+            reasoning_prefix=list(template["reasoning_prefix"]),
+            post_reasoning_prefix=list(template["post_reasoning_prefix"]),
+        )
+
+    def detect(self) -> Optional[PrefixSuffix]:
+        return self._prefix_suffix("detect")
+
+    def point(self) -> Optional[PrefixSuffix]:
+        return self._prefix_suffix("point")
+
+    def segment(self) -> Optional[PrefixSuffix]:
+        return self._prefix_suffix("segment")
+
+    def _prefix_suffix(self, skill: str) -> Optional[PrefixSuffix]:
+        template = self.templates.get(skill)
+        if template is None:
+            return None
+        return PrefixSuffix(
+            prefix=list(template["prefix"]),
+            suffix=list(template["suffix"]),
+        )
 
 
 @dataclass(frozen=True)

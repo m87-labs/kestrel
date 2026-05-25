@@ -599,10 +599,12 @@ def parse_args() -> EvalConfig:
     parser = argparse.ArgumentParser(
         description="Evaluate Kestrel on the ChartQA benchmark."
     )
+    from kestrel.models import known_models
+
     parser.add_argument(
         "--model",
         default="moondream3-preview",
-        choices=["moondream2", "moondream3-preview"],
+        choices=known_models(),
         help="Model to evaluate (default: moondream3-preview).",
     )
     parser.add_argument(

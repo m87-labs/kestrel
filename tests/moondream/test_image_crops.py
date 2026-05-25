@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from kestrel.moondream.config import VisionConfig
-from kestrel.moondream.image_crops import (
+from kestrel.models.moondream.config import VisionConfig
+from kestrel.models.moondream.image_crops import (
     OverlapCropOutput,
     overlap_crop_image,
     select_tiling,

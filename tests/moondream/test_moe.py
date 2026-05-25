@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from kestrel.moondream.moe import MoEConfig, MoEModule
-from kestrel.moondream import runtime as runtime_mod
+from kestrel.models.moondream.moe import MoEConfig, MoEModule
+from kestrel.models.moondream import runtime as runtime_mod
 from kestrel.utils import CpuGpuBuffer
 
 

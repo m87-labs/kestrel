@@ -9,7 +9,7 @@ from kestrel.dense_lora import (
     create_mlp_scratch,
     prepare_dense_lora_batch,
 )
-from kestrel.moondream.lora_workspace import DenseLoRALayerWorkspace
+from kestrel.models.moondream.lora_workspace import DenseLoRALayerWorkspace
 
 
 def naive_dense_lora(
@@ -320,7 +320,7 @@ class TestMlpCudaGraph:
     def test_mlp_with_lora_scratch_matches_eager(
         self, device: torch.device, dtype: torch.dtype
     ) -> None:
-        from kestrel.moondream.layers import LinearWeights, MLPWeights, mlp
+        from kestrel.models.moondream.layers import LinearWeights, MLPWeights, mlp
 
         batch = 2
         seq_len = 4
@@ -380,7 +380,7 @@ class TestMlpCudaGraph:
     def test_mlp_with_lora_cudagraph_dynamic_slot_values(
         self, device: torch.device, dtype: torch.dtype
     ) -> None:
-        from kestrel.moondream.layers import LinearWeights, MLPWeights, mlp
+        from kestrel.models.moondream.layers import LinearWeights, MLPWeights, mlp
 
         batch = 2
         seq_len = 4

@@ -12,14 +12,14 @@ import torch
 from torch import Tensor
 
 from kestrel.device import stream_context
-from kestrel.moondream.runtime import (
+from kestrel.models.moondream.runtime import (
     PrefillClassification,
     PreparedSequence,
     Token,
     TextToken,
 )
 from kestrel.runtime import Runtime
-from kestrel.moondream.lora import AdapterProvider
+from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.skills import (
     QuerySkill,
     SkillRegistry,
@@ -215,8 +215,8 @@ class GenerationScheduler:
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
-        self._coord_id = runtime.config.tokenizer.coord_id
-        self._size_id = runtime.config.tokenizer.size_id
+        self._coord_id = runtime.prompt_template.coord_id
+        self._size_id = runtime.prompt_template.size_id
         coord_dtype = runtime.region.coord_features.dtype
         size_dtype = runtime.region.size_features.dtype
         self._pending_token_ids = torch.zeros(
@@ -1430,7 +1430,7 @@ class GenerationScheduler:
 
     def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
-        eos_id = self.runtime.config.tokenizer.eos_id
+        eos_id = self.runtime.prompt_template.eos_id
         eos_hit = isinstance(last_token, TextToken) and last_token.token_id == eos_id
         max_new_hit = seq.skill_state.token_count >= seq.request.max_new_tokens
         max_len_hit = seq.total_length >= seq.state.max_length

@@ -3,7 +3,7 @@
 import math
 from typing import List, Optional, Sequence, Tuple
 
-from kestrel.moondream.runtime import CoordToken, SizeToken, Token
+from kestrel.models.moondream.runtime import CoordToken, SizeToken, Token
 
 
 def normalize_spatial_refs(

@@ -58,7 +58,9 @@ def _detect_checkpoint_format(keys: List[str]) -> str:
     """Detect checkpoint format from key names.
 
     Returns 'md3' for Moondream 3 format (text_model.transformer.h.*)
-    or 'md2' for Moondream 2 format (model.text.blocks.*).
+    or 'md2' for Moondream 2 format (model.text.blocks.*). Used as a
+    fallback when the caller doesn't pass an explicit format hint from
+    the model registry.
     """
     for key in keys:
         if key.startswith("text_model.transformer."):
@@ -397,6 +399,7 @@ def load_text_weights(
     model: nn.Module,
     *,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    checkpoint_format: Optional[str] = None,
 ) -> None:
     load_moondream_weights(
         path,
@@ -404,6 +407,7 @@ def load_text_weights(
         load_vision=False,
         tensor_hook=tensor_hook,
         region=None,
+        checkpoint_format=checkpoint_format,
     )
 
 
@@ -444,6 +448,7 @@ def load_moondream_weights(
     load_vision: bool = True,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
     region: Optional[nn.Module] = None,
+    checkpoint_format: Optional[str] = None,
 ) -> None:
     target_param = next(model.text.parameters())
     target_dtype = target_param.dtype
@@ -460,10 +465,10 @@ def load_moondream_weights(
         getter: Callable[[str], torch.Tensor],
         raw_getter: Callable[[str], torch.Tensor],
     ) -> None:
-        checkpoint_format = _detect_checkpoint_format(list(all_tensors.keys()))
+        fmt = checkpoint_format or _detect_checkpoint_format(list(all_tensors.keys()))
         moe_scales = _capture_moe_scales(all_tensors, n_layers)
 
-        if checkpoint_format == "md2":
+        if fmt == "md2":
             _assign_md2_text_weights(getter, model)
             if load_vision:
                 _assign_md2_vision_weights(getter, model)

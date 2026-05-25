@@ -102,7 +102,7 @@ class RuntimeConfig:
     kv_cache_pages: int | None = None
     enable_cuda_graphs: bool = True
     enable_prefix_cache: bool = True
-    # Model: "moondream2" or "moondream3-preview"
+    # Model name registered in kestrel.models (see kestrel.models.known_models()).
     model: str = "moondream3-preview"
     service_name: str = "local"
 
