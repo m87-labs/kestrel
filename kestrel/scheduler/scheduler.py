@@ -12,13 +12,13 @@ import torch
 from torch import Tensor
 
 from kestrel.device import stream_context
-from kestrel.models.moondream.runtime import (
+from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
-    Token,
+    Runtime,
     TextToken,
+    Token,
 )
-from kestrel.runtime import Runtime
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.skills import (
     QuerySkill,
@@ -45,8 +45,7 @@ from .pipeline import (
 )
 from kestrel_kernels.sampling import sample_step_from_logits
 from .transfer import RenderBuffer
-from .tokens import render_tokens_from_packed
-from .spatial import compute_spatial_values
+from kestrel.runtime.sampling import SamplingHooks
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,12 +59,16 @@ _MISS_FRONTIER_MIN_CAPACITY = 32
 
 @dataclass(slots=True)
 class PrefillStaging:
-    """Per-prefill staging buffers and RenderBuffer for D2H."""
+    """Per-prefill staging buffers and RenderBuffer for D2H.
+
+    ``aux_staging`` is one buffer per :class:`AuxBufferSpec` declared by
+    the runtime's sampling hooks; the list is empty for runtimes that
+    don't need per-step auxiliary values.
+    """
 
     sampled_ids: Tensor
     sampled_logprobs: Tensor
-    coord_staging: Tensor
-    size_staging: Tensor
+    aux_staging: list[Tensor]
     render: RenderBuffer
 
 
@@ -215,25 +218,26 @@ class GenerationScheduler:
         if not (0.0 < self._default_top_p <= 1.0):
             raise ValueError("default_top_p must be in the range (0, 1]")
         self._skills = skill_registry or SkillRegistry([QuerySkill()])
-        self._coord_id = runtime.prompt_template.coord_id
-        self._size_id = runtime.prompt_template.size_id
-        coord_dtype = runtime.region.coord_features.dtype
-        size_dtype = runtime.region.size_features.dtype
+        # Per-step sampling contract — runtime declares any auxiliary
+        # buffers it needs (Moondream: coord + size; text-only models:
+        # none) plus the hooks that populate + interpret them. When
+        # the runtime doesn't opt in, the default hooks are no-ops and
+        # the aux-buffer lists below stay empty (no allocations, no
+        # transfers, no per-step work).
+        self._hooks: SamplingHooks = getattr(runtime, "sampling_hooks", None) or SamplingHooks()
         self._pending_token_ids = torch.zeros(
             (runtime.max_batch_slots,),
             dtype=torch.long,
             device=runtime.device,
         )
-        self._pending_coord_values = torch.zeros(
-            (runtime.max_batch_slots, 1),
-            dtype=coord_dtype,
-            device=runtime.device,
-        )
-        self._pending_size_values = torch.zeros(
-            (runtime.max_batch_slots, 2),
-            dtype=size_dtype,
-            device=runtime.device,
-        )
+        self._pending_aux_values: list[Tensor] = [
+            torch.zeros(
+                (runtime.max_batch_slots, spec.width),
+                dtype=spec.dtype,
+                device=runtime.device,
+            )
+            for spec in self._hooks.aux_buffers
+        ]
         # Persistent per-batch sampling parameters on GPU to avoid per-step
         # CPU->GPU copies during sampling/spatial decode.
         self._sampling_temps_by_batch = torch.zeros(
@@ -271,21 +275,18 @@ class GenerationScheduler:
                         dtype=torch.float32,
                         device=runtime.device,
                     ),
-                    coord_staging=torch.empty(
-                        (runtime.max_batch_size, 1),
-                        dtype=coord_dtype,
-                        device=runtime.device,
-                    ),
-                    size_staging=torch.empty(
-                        (runtime.max_batch_size, 2),
-                        dtype=size_dtype,
-                        device=runtime.device,
-                    ),
+                    aux_staging=[
+                        torch.empty(
+                            (runtime.max_batch_size, spec.width),
+                            dtype=spec.dtype,
+                            device=runtime.device,
+                        )
+                        for spec in self._hooks.aux_buffers
+                    ],
                     render=RenderBuffer(
                         runtime.max_batch_size,
                         runtime.device,
-                        coord_dtype=coord_dtype,
-                        size_dtype=size_dtype,
+                        aux_specs=self._hooks.aux_buffers,
                         copy_stream=runtime.copy_stream,
                     ),
                 )
@@ -578,27 +579,21 @@ class GenerationScheduler:
                 raise RuntimeError("Missing last_hidden after prefill")
             hidden_rows.append(hidden_last)
         hidden_last = torch.stack(hidden_rows, dim=0)
-        coord_out = staging.coord_staging[:batch_size]
-        size_out = staging.size_staging[:batch_size]
-        coord_decode, size_decode = compute_spatial_values(
-            sampled_ids.view(-1),
-            hidden_last,
-            [seq.request for seq in sequences],
-            self.runtime.spatial_tables,
+        aux_out = [buf[:batch_size] for buf in staging.aux_staging]
+        self._hooks.post_sample(
+            sampled_ids=sampled_ids.view(-1),
+            hidden_last=hidden_last,
+            sequences=sequences,
             temperatures=temps,
             top_ps=top_ps,
             token_logprobs=sampled_logprobs,
-            coord_id=self._coord_id,
-            size_id=self._size_id,
-            out_coord=coord_out,
-            out_size=size_out,
-            rng=self._sampling_rng,
+            aux_buffers=aux_out,
         )
         prefill_slot.step_done_event.record()
         batch_idx = prefill_slot.batch_idx[:batch_size].view(-1)
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids.view(-1))
-        self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
-        self._pending_size_values.index_copy_(0, batch_idx, size_decode)
+        for pending, aux in zip(self._pending_aux_values, aux_out):
+            pending.index_copy_(0, batch_idx, aux)
         prefill_slot.commit_done_event.record()
         for seq in sequences:
             seq.packed_pending_ready = True
@@ -608,8 +603,7 @@ class GenerationScheduler:
 
         transfer = staging.render.transfer(
             sampled_ids,
-            coord_decode,
-            size_decode,
+            aux_out,
             ready_event=prefill_slot.step_done_event,
             logprobs=sampled_logprobs,
         )
@@ -638,17 +632,11 @@ class GenerationScheduler:
         prepared_sequences = payload.prepared_sequences
         prefill_slot = payload.prefill_slot
         try:
-            token_ids_cpu, coord_cpu, size_cpu, logprobs_cpu = step.transfer.wait()
+            token_ids_cpu, aux_cpu, logprobs_cpu = step.transfer.wait()
             prefill_slot.commit_done_event.synchronize()
             for prepared in prepared_sequences:
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared)
-            tokens = render_tokens_from_packed(
-                token_ids_cpu,
-                coord_cpu,
-                size_cpu,
-                coord_id=self._coord_id,
-                size_id=self._size_id,
-            )
+            tokens = self._hooks.materialize_tokens(token_ids_cpu, aux_cpu)
         finally:
             self._release_prefill_staging(staging)
             self.runtime.release_prefill_slot(prefill_slot)
@@ -1012,11 +1000,9 @@ class GenerationScheduler:
 
             # Gather decode inputs from _pending_* into slot staging buffers
             token_ids = slot.decode_token_ids[:batch_size]
-            coord_values = slot.decode_coord_values[:batch_size]
-            size_values = slot.decode_size_values[:batch_size]
             torch.index_select(self._pending_token_ids, 0, batch_idx, out=token_ids)
-            torch.index_select(self._pending_coord_values, 0, batch_idx, out=coord_values)
-            torch.index_select(self._pending_size_values, 0, batch_idx, out=size_values)
+            for pending, slot_input in zip(self._pending_aux_values, slot.decode_aux_inputs):
+                torch.index_select(pending, 0, batch_idx, out=slot_input[:batch_size])
 
             # Commit page table for all batch indices before forward pass (deferred H2D sync)
             batch_indices_list = [seq.state.batch_idx for seq in sequences]
@@ -1069,8 +1055,10 @@ class GenerationScheduler:
         IMPORTANT: Caller must already be on the compute stream.
 
         Takes the forward outputs from the DecodeSlot's buffers, applies optional
-        token mask, samples tokens, computes spatial values, writes to pending
-        buffers, and kicks off async D2H via the slot's RenderBuffer.
+        token mask, samples tokens, runs the runtime's post-sample hook
+        (Moondream uses it for coord/size decode; default is a no-op),
+        writes to pending buffers, and kicks off async D2H via the slot's
+        RenderBuffer.
 
         The mask parameter is for future constrained decoding support. Currently
         masking is computed inline from skill_state.allowed_token_ids.
@@ -1098,22 +1086,15 @@ class GenerationScheduler:
             logprobs_out=slot.sampled_logprobs[:batch_size],
         )
 
-        # Compute spatial values into slot's staging buffers
-        coord_staging = slot.coord_staging[:batch_size]
-        size_staging = slot.size_staging[:batch_size]
-        coord_decode, size_decode = compute_spatial_values(
-            sampled_ids,
-            hidden_last,
-            [seq.request for seq in sequences],
-            self.runtime.spatial_tables,
+        aux_staging = [buf[:batch_size] for buf in slot.aux_staging]
+        self._hooks.post_sample(
+            sampled_ids=sampled_ids,
+            hidden_last=hidden_last,
+            sequences=sequences,
             temperatures=temps,
             top_ps=top_ps,
             token_logprobs=sampled_logprobs,
-            coord_id=self._coord_id,
-            size_id=self._size_id,
-            out_coord=coord_staging,
-            out_size=size_staging,
-            rng=self._sampling_rng,
+            aux_buffers=aux_staging,
         )
 
         # Record event after staging buffers are ready.
@@ -1124,8 +1105,8 @@ class GenerationScheduler:
 
         # Write to shared pending buffers for next step's input gathering.
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
-        self._pending_coord_values.index_copy_(0, batch_idx, coord_decode)
-        self._pending_size_values.index_copy_(0, batch_idx, size_decode)
+        for pending, aux in zip(self._pending_aux_values, aux_staging):
+            pending.index_copy_(0, batch_idx, aux)
 
         # Record a second event after pending writes so we can safely release/reuse
         # batch indices (e.g. finalize a sequence and admit a new one into the same
@@ -1138,8 +1119,7 @@ class GenerationScheduler:
         # Pass the step_done_event so copy stream waits only on staging writes.
         transfer = slot.render.transfer(
             slot.sampled_ids[:batch_size],
-            coord_staging,
-            size_staging,
+            aux_staging,
             ready_event=slot.step_done_event,
             logprobs=sampled_logprobs,
         )
@@ -1187,18 +1167,16 @@ class GenerationScheduler:
             raise AssertionError(f"Unsupported commit kind {step.kind!r}")
 
         # Wait for D2H transfer
-        token_ids_cpu, coord_cpu, size_cpu, logprobs_cpu = step.transfer.wait()
+        token_ids_cpu, aux_cpu, logprobs_cpu = step.transfer.wait()
 
         # Ensure `_pending_*` writes for this step have completed before we release
         # or reuse any batch indices (these writes intentionally do not gate D2H).
         slot = self.runtime.decode_slots[step.slot_id]
         slot.commit_done_event.synchronize()
 
-        # Render typed tokens from packed tensors
-        tokens = render_tokens_from_packed(
-            token_ids_cpu, coord_cpu, size_cpu,
-            coord_id=self._coord_id, size_id=self._size_id,
-        )
+        # Render typed tokens from packed tensors (runtime decides
+        # whether to interpret aux values).
+        tokens = self._hooks.materialize_tokens(token_ids_cpu, aux_cpu)
         logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
 
         # Commit each sequence

@@ -26,6 +26,7 @@ import torch
 from torch import Tensor
 
 from kestrel.device import make_event
+from kestrel.runtime.sampling import AuxBufferSpec
 from kestrel.utils import CpuGpuBuffer
 
 
@@ -114,17 +115,22 @@ class DecodeSlot:
     # GPU staging for sampled outputs
     sampled_ids: Tensor
     sampled_logprobs: Tensor
-    coord_staging: Tensor
-    size_staging: Tensor
+    # One buffer per :class:`SamplingHooks.aux_buffers` spec the runtime
+    # declares (Moondream: index 0 = coord, index 1 = size). The
+    # scheduler consumes the list generically; the runtime knows what
+    # each index means.
+    aux_staging: list[Tensor]
 
     # Forward outputs (also used as graph output buffers)
     logits: Tensor
     hidden_last: Tensor
 
-    # Decode input staging (also used as graph input buffers)
+    # Decode input staging (also used as graph input buffers). The
+    # token ids are model-agnostic; ``decode_aux_inputs`` is the
+    # per-aux-spec companion fed back into the runtime's decode
+    # forward on the next step.
     decode_token_ids: Tensor
-    decode_coord_values: Tensor
-    decode_size_values: Tensor
+    decode_aux_inputs: list[Tensor]
 
     # CUDA graphs (optional) - captured using this slot's buffers
     cuda_graphs: Optional[dict[int, torch.cuda.CUDAGraph]] = None
@@ -217,12 +223,16 @@ def create_decode_slot(
         ),
     )
 
-    # Per-slot RenderBuffer for D2H copies (shares the copy stream)
+    # Per-slot RenderBuffer for D2H copies (shares the copy stream).
+    # AuxBufferSpec list mirrors Moondream's SamplingHooks: coord first
+    # (width 1), then size (width 2).
     render = RenderBuffer(
         max_batch_slots,
         device,
-        coord_dtype=coord_dtype,
-        size_dtype=size_dtype,
+        aux_specs=(
+            AuxBufferSpec(dtype=coord_dtype, width=1),
+            AuxBufferSpec(dtype=size_dtype, width=2),
+        ),
         copy_stream=copy_stream,
     )
 
@@ -303,13 +313,11 @@ def create_decode_slot(
         fa3_seqused_k=fa3_seqused_k,
         sampled_ids=sampled_ids,
         sampled_logprobs=sampled_logprobs,
-        coord_staging=coord_staging,
-        size_staging=size_staging,
+        aux_staging=[coord_staging, size_staging],
         logits=logits,
         hidden_last=hidden_last,
         decode_token_ids=decode_token_ids,
-        decode_coord_values=decode_coord_values,
-        decode_size_values=decode_size_values,
+        decode_aux_inputs=[decode_coord_values, decode_size_values],
         cuda_graphs=None,  # Captured separately after slot creation
         step_done_event=step_done_event,
         commit_done_event=commit_done_event,

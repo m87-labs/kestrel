@@ -41,7 +41,10 @@ from kestrel.runtime import (
     TextToken,
     Token,
 )
+from kestrel.runtime.sampling import AuxBufferSpec, SamplingHooks
 from kestrel.runtime.state import _CacheLookupResult
+from kestrel.scheduler.spatial import compute_spatial_values
+from kestrel.scheduler.tokens import render_tokens_from_packed
 
 from kestrel.models.registry import get_spec
 
@@ -580,6 +583,70 @@ class MoondreamRuntime:
     def model_name(self) -> str:
         """Return the model name (e.g., 'moondream2', 'moondream3-preview')."""
         return self._cfg.model
+
+    # --- Sampling hooks (kestrel.runtime.sampling.SamplingHooks) ----
+    # Moondream's per-step post-sample work is a coord/size decode from
+    # hidden states (Moondream-specific); we declare two aux buffers
+    # (coord + size) for the scheduler to manage and provide the
+    # populate/materialise callbacks that consume them. Other runtimes
+    # leave ``sampling_hooks`` unset to opt out entirely.
+    @functools.cached_property
+    def sampling_hooks(self) -> SamplingHooks:
+        coord_dtype = self.region.coord_features.dtype
+        size_dtype = self.region.size_features.dtype
+        coord_id = self.config.tokenizer.coord_id
+        size_id = self.config.tokenizer.size_id
+        spatial_tables = self.spatial_tables
+
+        def post_sample(
+            *,
+            sampled_ids: Tensor,
+            hidden_last: Tensor | None,
+            sequences: Sequence,
+            temperatures: Tensor | None,
+            top_ps: Tensor | None,
+            token_logprobs: Tensor | None,
+            aux_buffers: list[Tensor],
+        ) -> None:
+            if hidden_last is None:
+                raise RuntimeError(
+                    "Moondream post_sample requires hidden_last for spatial decode"
+                )
+            compute_spatial_values(
+                sampled_ids.view(-1),
+                hidden_last,
+                [seq.request for seq in sequences],
+                spatial_tables,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                token_logprobs=token_logprobs,
+                coord_id=coord_id,
+                size_id=size_id,
+                out_coord=aux_buffers[0],
+                out_size=aux_buffers[1],
+                rng=None,
+            )
+
+        def materialize_tokens(
+            token_ids_cpu: Tensor,
+            aux_values_cpu: list[Tensor],
+        ) -> list[Token]:
+            return render_tokens_from_packed(
+                token_ids_cpu,
+                aux_values_cpu[0],
+                aux_values_cpu[1],
+                coord_id=coord_id,
+                size_id=size_id,
+            )
+
+        return SamplingHooks(
+            aux_buffers=(
+                AuxBufferSpec(dtype=coord_dtype, width=1),
+                AuxBufferSpec(dtype=size_dtype, width=2),
+            ),
+            post_sample=post_sample,
+            materialize_tokens=materialize_tokens,
+        )
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:
@@ -1623,11 +1690,14 @@ class MoondreamRuntime:
         else:
             graph_batch_size = batch_size
 
-        # Clear padding region for deterministic graph behavior
+        # Clear padding region for deterministic graph behavior.
+        # ``decode_aux_inputs[0]`` is the coord input, ``[1]`` the
+        # size input (in the order Moondream's sampling_hooks declares
+        # aux buffers).
         if graph_batch_size > batch_size:
             slot.decode_token_ids[batch_size:graph_batch_size].zero_()
-            slot.decode_coord_values[batch_size:graph_batch_size].zero_()
-            slot.decode_size_values[batch_size:graph_batch_size].zero_()
+            for aux in slot.decode_aux_inputs:
+                aux[batch_size:graph_batch_size].zero_()
             slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
             slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
             slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
@@ -1700,10 +1770,11 @@ class MoondreamRuntime:
             slot: DecodeSlot with inputs in its buffers.
             batch_size: Batch size (may be padded for graph capture).
         """
+        decode_coord, decode_size = slot.decode_aux_inputs
         embeds = self._embed_packed_token_batch(
             slot.decode_token_ids[:batch_size],
-            slot.decode_coord_values[:batch_size],
-            slot.decode_size_values[:batch_size],
+            decode_coord[:batch_size],
+            decode_size[:batch_size],
         )
         position_ids = slot.meta.input_pos.gpu[:batch_size].to(torch.long).view(-1, 1)
         slot_mapping = self.page_table.build_slot_mapping(
@@ -1920,8 +1991,8 @@ class MoondreamRuntime:
                 # Use batch index 0 for all entries - row 0 in the page table is
                 # pre-initialized and provides valid memory access patterns.
                 slot.decode_token_ids.zero_()
-                slot.decode_coord_values.zero_()
-                slot.decode_size_values.zero_()
+                for aux in slot.decode_aux_inputs:
+                    aux.zero_()
                 slot.meta.batch_idx.gpu.zero_()
                 slot.meta.input_pos.gpu.zero_()
                 slot.meta.input_pos.cpu.zero_()

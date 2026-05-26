@@ -1,9 +1,12 @@
 """Async D2H transfer management for decode outputs."""
 
+from typing import Sequence
+
 import torch
 from torch import Tensor
 
 from kestrel.device import make_event, stream_context
+from kestrel.runtime.sampling import AuxBufferSpec
 
 
 class TransferHandle:
@@ -13,46 +16,42 @@ class TransferHandle:
         self,
         event: torch.cuda.Event,
         token_ids: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
+        aux_values: list[Tensor],
         logprobs: Tensor | None,
         count: int,
     ) -> None:
         self._event = event
         self._token_ids = token_ids
-        self._coord_values = coord_values
-        self._size_values = size_values
+        self._aux_values = aux_values
         self._logprobs = logprobs
         self._count = count
 
-    def wait(self) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    def wait(self) -> tuple[Tensor, list[Tensor], Tensor | None]:
         """Block until D2H transfer completes and return the CPU tensors."""
         if self._count == 0:
-            empty = self._token_ids[:0]
+            empty_aux = [a[:0] for a in self._aux_values]
             logprobs = None if self._logprobs is None else self._logprobs[:0]
-            return empty, self._coord_values[:0], self._size_values[:0], logprobs
+            return self._token_ids[:0], empty_aux, logprobs
         self._event.synchronize()
         logprobs = None
         if self._logprobs is not None:
             logprobs = self._logprobs[: self._count]
         return (
             self._token_ids[: self._count],
-            self._coord_values[: self._count],
-            self._size_values[: self._count],
+            [a[: self._count] for a in self._aux_values],
             logprobs,
         )
 
 
 class RenderBuffer:
-    """Pinned host buffers for sampled ids + decoded coord/size values."""
+    """Pinned host buffers for sampled ids + runtime-declared aux values."""
 
     def __init__(
         self,
         max_batch: int,
         device: torch.device,
         *,
-        coord_dtype: torch.dtype,
-        size_dtype: torch.dtype,
+        aux_specs: Sequence[AuxBufferSpec],
         copy_stream: torch.cuda.Stream,
     ) -> None:
         # Pinned host memory accelerates async H2D/D2H copies on CUDA but
@@ -63,12 +62,10 @@ class RenderBuffer:
         self._token_ids = torch.empty(
             (max_batch,), dtype=torch.long, device="cpu", pin_memory=pin,
         )
-        self._coord_values = torch.empty(
-            (max_batch, 1), dtype=coord_dtype, device="cpu", pin_memory=pin,
-        )
-        self._size_values = torch.empty(
-            (max_batch, 2), dtype=size_dtype, device="cpu", pin_memory=pin,
-        )
+        self._aux_values: list[Tensor] = [
+            torch.empty((max_batch, spec.width), dtype=spec.dtype, device="cpu", pin_memory=pin)
+            for spec in aux_specs
+        ]
         self._logprobs = torch.empty(
             (max_batch,), dtype=torch.float32, device="cpu", pin_memory=pin,
         )
@@ -79,31 +76,27 @@ class RenderBuffer:
     def transfer(
         self,
         token_ids: Tensor,
-        coord_values: Tensor,
-        size_values: Tensor,
+        aux_tensors: Sequence[Tensor],
         *,
         ready_event: torch.cuda.Event,
         logprobs: Tensor | None = None,
     ) -> TransferHandle:
         """Start a D2H transfer and return a handle to wait on completion.
 
-        Args:
-            token_ids: GPU tensor of sampled token IDs (from per-slot staging buffer).
-            coord_values: GPU tensor of coord values (from per-slot staging buffer).
-            size_values: GPU tensor of size values (from per-slot staging buffer).
-            logprobs: Optional GPU tensor of sampled token logprobs.
-            ready_event: Event recorded on compute stream after all GPU writes complete.
-                The copy stream will wait on this event before starting D2H copies.
-                This ensures correct ordering without capturing dependencies on
-                later compute stream work (which would happen with wait_stream).
+        ``aux_tensors`` must match (in order, dtype, and width) the
+        ``aux_specs`` this buffer was constructed with — pass an empty
+        sequence when the runtime declares no aux buffers.
         """
+        if len(aux_tensors) != len(self._aux_values):
+            raise AssertionError(
+                f"transfer expected {len(self._aux_values)} aux tensors, got {len(aux_tensors)}"
+            )
         count = int(token_ids.shape[0])
         if count == 0:
             return TransferHandle(
                 self._event,
                 self._token_ids,
-                self._coord_values,
-                self._size_values,
+                self._aux_values,
                 self._logprobs if logprobs is not None else None,
                 0,
             )
@@ -115,16 +108,15 @@ class RenderBuffer:
             if self._stream is not None:
                 self._stream.wait_event(ready_event)
             self._token_ids[:count].copy_(token_ids, non_blocking=True)
-            self._coord_values[:count].copy_(coord_values, non_blocking=True)
-            self._size_values[:count].copy_(size_values, non_blocking=True)
+            for host_buf, dev_buf in zip(self._aux_values, aux_tensors):
+                host_buf[:count].copy_(dev_buf, non_blocking=True)
             if logprobs is not None:
                 self._logprobs[:count].copy_(logprobs, non_blocking=True)
             self._event.record(self._stream)
         return TransferHandle(
             self._event,
             self._token_ids,
-            self._coord_values,
-            self._size_values,
+            self._aux_values,
             self._logprobs if logprobs is not None else None,
             count,
         )
