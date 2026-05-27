@@ -26,7 +26,6 @@ import torch
 from torch import Tensor
 
 from kestrel.device import make_event
-from kestrel.runtime.sampling import AuxBufferSpec
 from kestrel.utils import CpuGpuBuffer
 
 
@@ -115,22 +114,23 @@ class DecodeSlot:
     # GPU staging for sampled outputs
     sampled_ids: Tensor
     sampled_logprobs: Tensor
-    # One buffer per :class:`SamplingHooks.aux_buffers` spec the runtime
-    # declares (Moondream: index 0 = coord, index 1 = size). The
-    # scheduler consumes the list generically; the runtime knows what
-    # each index means.
-    aux_staging: list[Tensor]
+    # GPU staging for Moondream's per-step spatial decode (post_sample
+    # writes here, then a D2H copy lands in coord_cpu/size_cpu). Owned
+    # by the runtime; the scheduler never touches them.
+    coord_staging: Tensor  # [max_batch_slots, 1]
+    size_staging: Tensor   # [max_batch_slots, 2]
+    coord_cpu: Tensor      # pinned host [max_batch_slots, 1]
+    size_cpu: Tensor       # pinned host [max_batch_slots, 2]
+    aux_done_event: torch.cuda.Event  # signals coord/size D2H complete
 
     # Forward outputs (also used as graph output buffers)
     logits: Tensor
     hidden_last: Tensor
 
-    # Decode input staging (also used as graph input buffers). The
-    # token ids are model-agnostic; ``decode_aux_inputs`` is the
-    # per-aux-spec companion fed back into the runtime's decode
-    # forward on the next step.
+    # Decode input staging (also used as graph input buffers).
     decode_token_ids: Tensor
-    decode_aux_inputs: list[Tensor]
+    decode_coord_values: Tensor  # [max_batch_slots, 1]
+    decode_size_values: Tensor   # [max_batch_slots, 2]
 
     # CUDA graphs (optional) - captured using this slot's buffers
     cuda_graphs: Optional[dict[int, torch.cuda.CUDAGraph]] = None
@@ -223,16 +223,12 @@ def create_decode_slot(
         ),
     )
 
-    # Per-slot RenderBuffer for D2H copies (shares the copy stream).
-    # AuxBufferSpec list mirrors Moondream's SamplingHooks: coord first
-    # (width 1), then size (width 2).
+    # Per-slot RenderBuffer for D2H copies of sampled ids + logprobs.
+    # Moondream's coord/size aux values use a separate runtime-owned
+    # D2H pipeline (coord_cpu/size_cpu + aux_done_event below).
     render = RenderBuffer(
         max_batch_slots,
         device,
-        aux_specs=(
-            AuxBufferSpec(dtype=coord_dtype, width=1),
-            AuxBufferSpec(dtype=size_dtype, width=2),
-        ),
         copy_stream=copy_stream,
     )
 
@@ -268,6 +264,23 @@ def create_decode_slot(
         dtype=size_dtype,
         device=device,
     )
+    # Pinned host buffers for the runtime-owned coord/size D2H copy.
+    # Pinned-memory hint is CUDA-only (MPS hits a dispatch stub even
+    # with device='cpu').
+    pin = device.type == "cuda"
+    coord_cpu = torch.empty(
+        (max_batch_slots, 1),
+        dtype=coord_dtype,
+        device="cpu",
+        pin_memory=pin,
+    )
+    size_cpu = torch.empty(
+        (max_batch_slots, 2),
+        dtype=size_dtype,
+        device="cpu",
+        pin_memory=pin,
+    )
+    aux_done_event = make_event(device, enable_timing=False, blocking=False)
 
     # Forward output buffers
     logits = torch.empty(
@@ -313,11 +326,16 @@ def create_decode_slot(
         fa3_seqused_k=fa3_seqused_k,
         sampled_ids=sampled_ids,
         sampled_logprobs=sampled_logprobs,
-        aux_staging=[coord_staging, size_staging],
+        coord_staging=coord_staging,
+        size_staging=size_staging,
+        coord_cpu=coord_cpu,
+        size_cpu=size_cpu,
+        aux_done_event=aux_done_event,
         logits=logits,
         hidden_last=hidden_last,
         decode_token_ids=decode_token_ids,
-        decode_aux_inputs=[decode_coord_values, decode_size_values],
+        decode_coord_values=decode_coord_values,
+        decode_size_values=decode_size_values,
         cuda_graphs=None,  # Captured separately after slot creation
         step_done_event=step_done_event,
         commit_done_event=commit_done_event,
