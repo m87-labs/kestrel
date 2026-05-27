@@ -41,7 +41,14 @@ from kestrel.runtime import (
     TextToken,
     Token,
 )
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.runtime.state import _CacheLookupResult
+from kestrel.scheduler.spatial import compute_spatial_values
+
+# ``kestrel.scheduler.tokens`` imports CoordToken/SizeToken/TextToken
+# back from this module, so importing ``render_tokens_from_packed`` at
+# top level here creates a partial-init cycle when ``tokens`` is loaded
+# first. Imported lazily inside ``materialize_tokens`` below.
 
 from kestrel.models.registry import get_spec
 
@@ -140,10 +147,22 @@ class PrefillSlot:
 
     slot_id: int
     batch_idx: Tensor
+    # GPU staging + pinned host buffers for Moondream's spatial decode of
+    # the first sampled token. Prefill's first token is text for plain
+    # query, but skills like point/detect constrain it to coord/size, so
+    # the spatial pipeline has to run for prefill too.
+    coord_staging: Tensor       # [max_batch_size, 1]
+    size_staging: Tensor        # [max_batch_size, 2]
+    coord_cpu: Tensor           # pinned host [max_batch_size, 1]
+    size_cpu: Tensor            # pinned host [max_batch_size, 2]
     # Type-annotated as the CUDA event for the common case; MPS/CPU paths
     # store ``NoopEvent`` instances at runtime.
+    # ``step_done_event`` fires after sampled-id staging AND any post_sample
+    # work (spatial decode + pending-pool updates). It's re-recorded
+    # inside post_sample so the copy stream waits on the spatial writes.
     step_done_event: "torch.cuda.Event"
     commit_done_event: "torch.cuda.Event"
+    aux_done_event: "torch.cuda.Event"   # signals coord/size D2H complete
     scratch: PrefillScratch | None = None
 
 
@@ -418,6 +437,13 @@ class MoondreamRuntime:
         # (Primary stream was created earlier for PageTable H2D sync.)
         self._copy_stream = make_stream(self.device)
 
+        # Spatial decode RNG. Pre-refactor the scheduler's sampling RNG
+        # was reused; now that spatial decode is runtime-owned we keep
+        # our own generator so stochastic point/detect requests don't
+        # silently collapse to greedy.
+        self._spatial_rng = torch.Generator(device=self.device)
+        self._spatial_rng.manual_seed(torch.seed())
+
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
 
@@ -433,14 +459,30 @@ class MoondreamRuntime:
         # Pre-allocate scratch buffers for prefill to avoid per-layer allocations.
         # Size for typical prefill (1024 tokens). Grows automatically if needed.
         _prefill_scratch_tokens = 1024
+        pin = self.device.type == "cuda"
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
                 slot_id=slot_id,
                 batch_idx=torch.empty(
                     (self.max_batch_size,), dtype=torch.int64, device=self.device
                 ),
+                coord_staging=torch.empty(
+                    (self.max_batch_size, 1), dtype=coord_dtype, device=self.device,
+                ),
+                size_staging=torch.empty(
+                    (self.max_batch_size, 2), dtype=size_dtype, device=self.device,
+                ),
+                coord_cpu=torch.empty(
+                    (self.max_batch_size, 1), dtype=coord_dtype,
+                    device="cpu", pin_memory=pin,
+                ),
+                size_cpu=torch.empty(
+                    (self.max_batch_size, 2), dtype=size_dtype,
+                    device="cpu", pin_memory=pin,
+                ),
                 step_done_event=make_event(self.device, enable_timing=False, blocking=False),
                 commit_done_event=make_event(self.device, enable_timing=False, blocking=False),
+                aux_done_event=make_event(self.device, enable_timing=False, blocking=False),
                 scratch=PrefillScratch(
                     _prefill_scratch_tokens, self.config.text, self.device, self.dtype,
                 ) if self.config.text else None,
@@ -512,6 +554,23 @@ class MoondreamRuntime:
             for slot_id in range(2)
         ]
 
+        # Shared pending coord/size values, indexed by batch_idx. These
+        # are the runtime-side equivalent of the scheduler's
+        # ``_pending_token_ids`` — written by ``post_sample`` after each
+        # decode step and gathered into the next step's slot via
+        # ``prepare_decode_inputs``. Owned here (not per-slot) because
+        # batch indices outlive any single slot's ping-pong cycle.
+        self._pending_coord_values = torch.zeros(
+            (self.max_batch_slots, 1),
+            dtype=coord_dtype,
+            device=self.device,
+        )
+        self._pending_size_values = torch.zeros(
+            (self.max_batch_slots, 2),
+            dtype=size_dtype,
+            device=self.device,
+        )
+
         # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
         self._preallocate_workspaces()
 
@@ -580,6 +639,119 @@ class MoondreamRuntime:
     def model_name(self) -> str:
         """Return the model name (e.g., 'moondream2', 'moondream3-preview')."""
         return self._cfg.model
+
+    # --- Sampling hooks (kestrel.runtime.sampling.SamplingHooks) ----
+    # Moondream's per-step "post-sample" work is a coord/size decode
+    # from hidden states. We own all the bytes (per-slot GPU staging +
+    # pinned CPU buffers + a shared pending pool indexed by batch_idx)
+    # and the D2H pipeline; the scheduler just threads the opaque
+    # ``StepHandle`` returned here back into ``materialize_tokens``.
+    @functools.cached_property
+    def sampling_hooks(self) -> SamplingHooks:
+        coord_id = self.config.tokenizer.coord_id
+        size_id = self.config.tokenizer.size_id
+        spatial_tables = self.spatial_tables
+        pending_coord = self._pending_coord_values
+        pending_size = self._pending_size_values
+        copy_stream = self._copy_stream
+        spatial_rng = self._spatial_rng
+
+        def post_sample(
+            slot,
+            *,
+            sampled_ids: Tensor,
+            hidden_last: Tensor | None,
+            sequences: Sequence,
+            batch_idx: Tensor,
+            temperatures: Tensor | None,
+            top_ps: Tensor | None,
+            token_logprobs: Tensor | None,
+            ready_event: "torch.cuda.Event",
+        ) -> tuple[object, int]:
+            if hidden_last is None:
+                raise RuntimeError(
+                    "Moondream post_sample requires hidden_last for spatial decode"
+                )
+            batch_size = int(sampled_ids.shape[0])
+            coord_out = slot.coord_staging[:batch_size]
+            size_out = slot.size_staging[:batch_size]
+            compute_spatial_values(
+                sampled_ids.view(-1),
+                hidden_last,
+                [seq.request for seq in sequences],
+                spatial_tables,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                token_logprobs=token_logprobs,
+                coord_id=coord_id,
+                size_id=size_id,
+                out_coord=coord_out,
+                out_size=size_out,
+                rng=spatial_rng,
+            )
+            # Update the shared pending pool so the next decode step
+            # gathers fresh coord/size values for these batch indices.
+            pending_coord.index_copy_(0, batch_idx, coord_out)
+            pending_size.index_copy_(0, batch_idx, size_out)
+
+            # Re-record ``step_done_event`` on the compute stream after
+            # the spatial writes. ``ready_event`` from the scheduler only
+            # fenced sampled-id staging; the copy stream is separate from
+            # the compute stream, so without this re-record the D2H below
+            # can race with ``compute_spatial_values``. The sampled-id
+            # D2H the scheduler kicks later anchors on the same event and
+            # so picks up the post-spatial fence for free.
+            slot.step_done_event.record()
+            with stream_context(copy_stream):
+                if copy_stream is not None:
+                    copy_stream.wait_event(slot.step_done_event)
+                slot.coord_cpu[:batch_size].copy_(coord_out, non_blocking=True)
+                slot.size_cpu[:batch_size].copy_(size_out, non_blocking=True)
+                slot.aux_done_event.record(copy_stream)
+            return slot, batch_size
+
+        def materialize_tokens(
+            token_ids_cpu: Tensor,
+            sequences: Sequence,
+            batch_idx: Tensor,
+            step_handle: tuple[object, int] | None,
+        ) -> list[Token]:
+            if step_handle is None:
+                # No post_sample ran (e.g., a runtime that opted out).
+                # Token can't be coord/size in that case — pure text path.
+                return [
+                    TextToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()
+                ]
+            slot, batch_size = step_handle
+            slot.aux_done_event.synchronize()
+            from kestrel.scheduler.tokens import render_tokens_from_packed
+            return render_tokens_from_packed(
+                token_ids_cpu,
+                slot.coord_cpu[:batch_size],
+                slot.size_cpu[:batch_size],
+                coord_id=coord_id,
+                size_id=size_id,
+            )
+
+        def prepare_decode_inputs(
+            slot: DecodeSlot,
+            batch_idx: Tensor,
+            batch_size: int,
+        ) -> None:
+            torch.index_select(
+                pending_coord, 0, batch_idx,
+                out=slot.decode_coord_values[:batch_size],
+            )
+            torch.index_select(
+                pending_size, 0, batch_idx,
+                out=slot.decode_size_values[:batch_size],
+            )
+
+        return SamplingHooks(
+            post_sample=post_sample,
+            materialize_tokens=materialize_tokens,
+            prepare_decode_inputs=prepare_decode_inputs,
+        )
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:
@@ -1623,7 +1795,7 @@ class MoondreamRuntime:
         else:
             graph_batch_size = batch_size
 
-        # Clear padding region for deterministic graph behavior
+        # Clear padding region for deterministic graph behavior.
         if graph_batch_size > batch_size:
             slot.decode_token_ids[batch_size:graph_batch_size].zero_()
             slot.decode_coord_values[batch_size:graph_batch_size].zero_()

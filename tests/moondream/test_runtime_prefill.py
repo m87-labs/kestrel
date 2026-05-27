@@ -78,6 +78,11 @@ def test_launch_prepared_batch_omits_seqused_q_for_uniform_q_lengths() -> None:
         batch_idx=torch.zeros(2, dtype=torch.int64),
         step_done_event=None,  # type: ignore[arg-type]
         commit_done_event=None,  # type: ignore[arg-type]
+        aux_done_event=None,  # type: ignore[arg-type]
+        coord_staging=torch.empty(0),
+        size_staging=torch.empty(0),
+        coord_cpu=torch.empty(0),
+        size_cpu=torch.empty(0),
     )
 
     logits = runtime.launch_prepared_batch(
@@ -104,6 +109,11 @@ def test_launch_prepared_batch_omits_seqused_q_for_single_token_append() -> None
         batch_idx=torch.zeros(2, dtype=torch.int64),
         step_done_event=None,  # type: ignore[arg-type]
         commit_done_event=None,  # type: ignore[arg-type]
+        aux_done_event=None,  # type: ignore[arg-type]
+        coord_staging=torch.empty(0),
+        size_staging=torch.empty(0),
+        coord_cpu=torch.empty(0),
+        size_cpu=torch.empty(0),
     )
 
     logits = runtime.launch_prepared_batch(
@@ -126,6 +136,11 @@ def test_launch_prepared_batch_keeps_seqused_q_for_padded_q_lengths() -> None:
         batch_idx=torch.zeros(2, dtype=torch.int64),
         step_done_event=None,  # type: ignore[arg-type]
         commit_done_event=None,  # type: ignore[arg-type]
+        aux_done_event=None,  # type: ignore[arg-type]
+        coord_staging=torch.empty(0),
+        size_staging=torch.empty(0),
+        coord_cpu=torch.empty(0),
+        size_cpu=torch.empty(0),
     )
 
     logits = runtime.launch_prepared_batch(

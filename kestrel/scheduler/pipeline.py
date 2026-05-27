@@ -156,6 +156,10 @@ class DecodePendingCommit:
     """Payload for decode pending commits."""
 
     slot_id: int
+    # Opaque value returned by the runtime's post_sample hook (or None
+    # if no hook was registered). Threaded back into the runtime's
+    # materialize_tokens hook on commit.
+    runtime_step: object = None
 
 
 @dataclass(slots=True)
@@ -166,6 +170,8 @@ class PrefillPendingCommit:
     slot_id: int
     prepared_sequences: object
     prefill_slot: object
+    # See ``DecodePendingCommit.runtime_step``.
+    runtime_step: object = None
 
 
 @dataclass(slots=True)
