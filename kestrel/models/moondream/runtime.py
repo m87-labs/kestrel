@@ -433,6 +433,13 @@ class MoondreamRuntime:
         # (Primary stream was created earlier for PageTable H2D sync.)
         self._copy_stream = make_stream(self.device)
 
+        # Spatial decode RNG. Pre-refactor the scheduler's sampling RNG
+        # was reused; now that spatial decode is runtime-owned we keep
+        # our own generator so stochastic point/detect requests don't
+        # silently collapse to greedy.
+        self._spatial_rng = torch.Generator(device=self.device)
+        self._spatial_rng.manual_seed(torch.seed())
+
         # CUDA graph batch sizes for decode (same for all slots).
         self._graph_batch_sizes: list[int] = []
 
@@ -643,6 +650,7 @@ class MoondreamRuntime:
         pending_coord = self._pending_coord_values
         pending_size = self._pending_size_values
         copy_stream = self._copy_stream
+        spatial_rng = self._spatial_rng
 
         def post_sample(
             slot,
@@ -675,7 +683,7 @@ class MoondreamRuntime:
                 size_id=size_id,
                 out_coord=coord_out,
                 out_size=size_out,
-                rng=None,
+                rng=spatial_rng,
             )
             # Update the shared pending pool so the next decode step
             # gathers fresh coord/size values for these batch indices.
