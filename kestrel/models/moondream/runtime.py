@@ -44,7 +44,11 @@ from kestrel.runtime import (
 from kestrel.runtime.sampling import SamplingHooks
 from kestrel.runtime.state import _CacheLookupResult
 from kestrel.scheduler.spatial import compute_spatial_values
-from kestrel.scheduler.tokens import render_tokens_from_packed
+
+# ``kestrel.scheduler.tokens`` imports CoordToken/SizeToken/TextToken
+# back from this module, so importing ``render_tokens_from_packed`` at
+# top level here creates a partial-init cycle when ``tokens`` is loaded
+# first. Imported lazily inside ``materialize_tokens`` below.
 
 from kestrel.models.registry import get_spec
 
@@ -720,6 +724,7 @@ class MoondreamRuntime:
                 ]
             slot, batch_size = step_handle
             slot.aux_done_event.synchronize()
+            from kestrel.scheduler.tokens import render_tokens_from_packed
             return render_tokens_from_packed(
                 token_ids_cpu,
                 slot.coord_cpu[:batch_size],
