@@ -143,10 +143,22 @@ class PrefillSlot:
 
     slot_id: int
     batch_idx: Tensor
+    # GPU staging + pinned host buffers for Moondream's spatial decode of
+    # the first sampled token. Prefill's first token is text for plain
+    # query, but skills like point/detect constrain it to coord/size, so
+    # the spatial pipeline has to run for prefill too.
+    coord_staging: Tensor       # [max_batch_size, 1]
+    size_staging: Tensor        # [max_batch_size, 2]
+    coord_cpu: Tensor           # pinned host [max_batch_size, 1]
+    size_cpu: Tensor            # pinned host [max_batch_size, 2]
     # Type-annotated as the CUDA event for the common case; MPS/CPU paths
     # store ``NoopEvent`` instances at runtime.
+    # ``step_done_event`` fires after sampled-id staging AND any post_sample
+    # work (spatial decode + pending-pool updates). It's re-recorded
+    # inside post_sample so the copy stream waits on the spatial writes.
     step_done_event: "torch.cuda.Event"
     commit_done_event: "torch.cuda.Event"
+    aux_done_event: "torch.cuda.Event"   # signals coord/size D2H complete
     scratch: PrefillScratch | None = None
 
 
@@ -436,14 +448,30 @@ class MoondreamRuntime:
         # Pre-allocate scratch buffers for prefill to avoid per-layer allocations.
         # Size for typical prefill (1024 tokens). Grows automatically if needed.
         _prefill_scratch_tokens = 1024
+        pin = self.device.type == "cuda"
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
                 slot_id=slot_id,
                 batch_idx=torch.empty(
                     (self.max_batch_size,), dtype=torch.int64, device=self.device
                 ),
+                coord_staging=torch.empty(
+                    (self.max_batch_size, 1), dtype=coord_dtype, device=self.device,
+                ),
+                size_staging=torch.empty(
+                    (self.max_batch_size, 2), dtype=size_dtype, device=self.device,
+                ),
+                coord_cpu=torch.empty(
+                    (self.max_batch_size, 1), dtype=coord_dtype,
+                    device="cpu", pin_memory=pin,
+                ),
+                size_cpu=torch.empty(
+                    (self.max_batch_size, 2), dtype=size_dtype,
+                    device="cpu", pin_memory=pin,
+                ),
                 step_done_event=make_event(self.device, enable_timing=False, blocking=False),
                 commit_done_event=make_event(self.device, enable_timing=False, blocking=False),
+                aux_done_event=make_event(self.device, enable_timing=False, blocking=False),
                 scratch=PrefillScratch(
                     _prefill_scratch_tokens, self.config.text, self.device, self.dtype,
                 ) if self.config.text else None,
@@ -617,7 +645,7 @@ class MoondreamRuntime:
         copy_stream = self._copy_stream
 
         def post_sample(
-            slot: DecodeSlot,
+            slot,
             *,
             sampled_ids: Tensor,
             hidden_last: Tensor | None,
@@ -627,7 +655,7 @@ class MoondreamRuntime:
             top_ps: Tensor | None,
             token_logprobs: Tensor | None,
             ready_event: "torch.cuda.Event",
-        ) -> tuple[int, int]:
+        ) -> tuple[object, int]:
             if hidden_last is None:
                 raise RuntimeError(
                     "Moondream post_sample requires hidden_last for spatial decode"
@@ -654,31 +682,35 @@ class MoondreamRuntime:
             pending_coord.index_copy_(0, batch_idx, coord_out)
             pending_size.index_copy_(0, batch_idx, size_out)
 
-            # D2H of coord/size to pinned host. Anchor on ``ready_event``
-            # so the copy stream only waits on the sampled-ids staging
-            # write; the spatial compute above is on the same compute
-            # stream and therefore implicitly ordered before this point.
+            # Re-record ``step_done_event`` on the compute stream after
+            # the spatial writes. ``ready_event`` from the scheduler only
+            # fenced sampled-id staging; the copy stream is separate from
+            # the compute stream, so without this re-record the D2H below
+            # can race with ``compute_spatial_values``. The sampled-id
+            # D2H the scheduler kicks later anchors on the same event and
+            # so picks up the post-spatial fence for free.
+            slot.step_done_event.record()
             with stream_context(copy_stream):
                 if copy_stream is not None:
-                    copy_stream.wait_event(ready_event)
+                    copy_stream.wait_event(slot.step_done_event)
                 slot.coord_cpu[:batch_size].copy_(coord_out, non_blocking=True)
                 slot.size_cpu[:batch_size].copy_(size_out, non_blocking=True)
                 slot.aux_done_event.record(copy_stream)
-            return slot.slot_id, batch_size
+            return slot, batch_size
 
         def materialize_tokens(
             token_ids_cpu: Tensor,
             sequences: Sequence,
             batch_idx: Tensor,
-            step_handle: tuple[int, int] | None,
+            step_handle: tuple[object, int] | None,
         ) -> list[Token]:
             if step_handle is None:
-                # Prefill (no spatial decode performed): all text tokens.
+                # No post_sample ran (e.g., a runtime that opted out).
+                # Token can't be coord/size in that case — pure text path.
                 return [
                     TextToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()
                 ]
-            slot_id, batch_size = step_handle
-            slot = self._decode_slots[slot_id]
+            slot, batch_size = step_handle
             slot.aux_done_event.synchronize()
             return render_tokens_from_packed(
                 token_ids_cpu,

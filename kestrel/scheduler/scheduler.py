@@ -577,11 +577,23 @@ class GenerationScheduler:
             hidden_rows.append(hidden_last)
         hidden_last = torch.stack(hidden_rows, dim=0)
         prefill_slot.step_done_event.record()
-        # Prefill's first token is always text — no per-step aux work
-        # needed. ``runtime_step=None`` signals the materialiser to take
-        # the text-only path.
         batch_idx = prefill_slot.batch_idx[:batch_size].view(-1)
+        # Prefill's first token is text for plain query, but skills like
+        # point/detect can constrain it to coord/size — so post_sample
+        # has to run for prefill too. The runtime owns the staging.
         runtime_step = None
+        if self._hooks.post_sample is not None:
+            runtime_step = self._hooks.post_sample(
+                prefill_slot,
+                sampled_ids=sampled_ids.view(-1),
+                hidden_last=hidden_last,
+                sequences=sequences,
+                batch_idx=batch_idx,
+                temperatures=temps,
+                top_ps=top_ps,
+                token_logprobs=sampled_logprobs,
+                ready_event=prefill_slot.step_done_event,
+            )
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids.view(-1))
         prefill_slot.commit_done_event.record()
         for seq in sequences:
