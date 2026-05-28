@@ -26,7 +26,6 @@ Callers provide raw questions/objects; the engine derives skill-specific context
 
 
 import asyncio
-import hashlib
 import itertools
 import logging
 import queue
@@ -36,6 +35,7 @@ from concurrent.futures import Future
 import os
 from dataclasses import dataclass, field
 from typing import (
+    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -65,8 +65,6 @@ from kestrel.scheduler import (
     SchedulerResult,
     StreamUpdate,
 )
-from kestrel.models.moondream.image_crops import OverlapCropOutput
-from kestrel.models.moondream.image_preprocessor import ImagePreprocessor
 from kestrel.models.moondream.vision import compute_overlap_crops
 from kestrel.skills import (
     CaptionSkill,
@@ -210,7 +208,7 @@ class _PendingRequest:
 @dataclass(slots=True)
 class _ReadyAdmission:
     req: _PendingRequest
-    crops: Optional[OverlapCropOutput]
+    crops: Any
     prefix_cache_hit: bool
 
 
@@ -218,16 +216,18 @@ class _AdmissionCoordinator:
     def __init__(
         self,
         runtime: Runtime,
-        image_preprocessor: ImagePreprocessor,
         wake_event: threading.Event,
         fail_request: Callable[[_PendingRequest, BaseException], None],
     ) -> None:
         self._runtime = runtime
-        self._image_preprocessor = image_preprocessor
         self._wake_event = wake_event
         self._fail_request = fail_request
+        # Image preprocessing payloads are opaque — the runtime decides
+        # what they contain (Moondream's ``OverlapCropOutput``,
+        # Gemma 4's pixel_values bundle, etc.) and threads them back
+        # into ``launch_prepared_batch``.
         self._pending_crops: Dict[
-            int, tuple[_PendingRequest, Future[OverlapCropOutput]]
+            int, tuple[_PendingRequest, "Future[Any]"]
         ] = {}
         self._ready_crops: queue.Queue[int] = queue.Queue()
 
@@ -239,7 +239,7 @@ class _AdmissionCoordinator:
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
 
         if self._runtime.prefix_cache is not None:
-            req.image_hash = self._compute_image_hash(req.image)
+            req.image_hash = self._runtime.image_hash(req.image)
             prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
             if self._runtime.check_prefix_cache(
                 prefill_tokens, req.image_hash, req.adapter
@@ -247,9 +247,7 @@ class _AdmissionCoordinator:
                 return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=True)
 
         try:
-            future = self._image_preprocessor.submit(
-                req.image, self._runtime.config.vision
-            )
+            future = self._runtime.preprocess_image_async(req.image)
         except Exception as exc:
             self._fail_request(req, exc)
             return None
@@ -288,10 +286,6 @@ class _AdmissionCoordinator:
             self._fail_request(req, exc)
         self._pending_crops.clear()
         self._drain_ready_notifications()
-
-    def _compute_image_hash(self, image: np.ndarray | bytes) -> bytes:
-        raw_bytes = image.tobytes() if isinstance(image, np.ndarray) else image
-        return hashlib.sha256(raw_bytes).digest()
 
     def _on_crops_ready(self, request_id: int) -> None:
         self._ready_crops.put(request_id)
@@ -357,7 +351,6 @@ class InferenceEngine:
         self._request_ids = itertools.count()
         self._shutdown = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._image_preprocessor = ImagePreprocessor()
         self._skills = skills or SkillRegistry(
             [
                 QuerySkill(),
@@ -535,7 +528,8 @@ class InferenceEngine:
                 _LOGGER.exception("Failed to stop Photon reporter")
             finally:
                 self._photon_reporter = None
-        self._image_preprocessor.shutdown(wait=True)
+        if self._runtime is not None:
+            self._runtime.shutdown_image_preprocessor()
 
     async def submit(
         self,
@@ -1474,14 +1468,13 @@ class InferenceEngine:
         paused_event = self._paused_event
         admission = _AdmissionCoordinator(
             runtime=runtime,
-            image_preprocessor=self._image_preprocessor,
             wake_event=wake_event,
             fail_request=self._fail_request,
         )
 
         def admit_request(
             req: _PendingRequest,
-            crops: Optional[OverlapCropOutput],
+            crops: Any,
             *,
             prefix_cache_hit: bool = False,
         ) -> None:
@@ -1642,7 +1635,7 @@ class InferenceEngine:
         self,
         runtime: Runtime,
         req: _PendingRequest,
-        image_crops: Optional[OverlapCropOutput],
+        image_crops: Any,
     ) -> tuple[GenerationRequest, SkillState]:
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)

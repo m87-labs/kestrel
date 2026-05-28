@@ -437,6 +437,11 @@ class MoondreamRuntime:
         # (Primary stream was created earlier for PageTable H2D sync.)
         self._copy_stream = make_stream(self.device)
 
+        # Image preprocessing pool — owned here so other runtimes can
+        # plug in their own preprocessing without the engine knowing.
+        from kestrel.models.moondream.image_preprocessor import ImagePreprocessor
+        self._image_preprocessor = ImagePreprocessor()
+
         # Spatial decode RNG. Pre-refactor the scheduler's sampling RNG
         # was reused; now that spatial decode is runtime-owned we keep
         # our own generator so stochastic point/detect requests don't
@@ -752,6 +757,20 @@ class MoondreamRuntime:
             materialize_tokens=materialize_tokens,
             prepare_decode_inputs=prepare_decode_inputs,
         )
+
+    # --- Image preprocessing (Runtime protocol) ----------------------
+    def preprocess_image_async(self, image):
+        """Return a Future for Moondream's overlap-crop preprocessing."""
+        return self._image_preprocessor.submit(image, self.config.vision)
+
+    def shutdown_image_preprocessor(self) -> None:
+        self._image_preprocessor.shutdown(wait=True)
+
+    def image_hash(self, image) -> bytes:
+        import hashlib
+        import numpy as _np
+        raw = image.tobytes() if isinstance(image, _np.ndarray) else image
+        return hashlib.sha256(raw).digest()
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:

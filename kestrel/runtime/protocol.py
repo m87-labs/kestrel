@@ -17,6 +17,7 @@ record of the surface a runtime must satisfy today.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from kestrel.runtime.state import (
@@ -71,6 +72,27 @@ class Runtime(Protocol):
     def can_reserve(self, total_length: int) -> bool: ...
 
     def prefill_budget(self) -> tuple[int, int]: ...
+
+    # Image preprocessing. The engine receives raw images (np.ndarray
+    # or bytes) and needs them converted to whatever opaque payload the
+    # runtime threads through ``GenerationRequest.image_crops`` and
+    # back into ``launch_prepared_batch``. Different runtimes need
+    # different preprocessing (Moondream's overlap-crop pipeline vs.
+    # Gemma's resize+normalize), so the dispatch lives here. Async so
+    # the engine can hide preprocessing latency behind admission /
+    # other work.
+    def preprocess_image_async(
+        self, image: np.ndarray | bytes
+    ) -> Future[Any]: ...
+
+    # Called once when the engine is shutting down so the runtime can
+    # tear down its preprocessing thread pool (if any).
+    def shutdown_image_preprocessor(self) -> None: ...
+
+    # Hash an image into the bytes used as the prefix-cache key. Lets
+    # runtimes pick a hashing scheme that matches how their preprocessor
+    # canonicalises the input.
+    def image_hash(self, image: np.ndarray | bytes) -> bytes: ...
 
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...

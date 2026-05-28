@@ -72,12 +72,36 @@ class _PrefixSkill(SkillSpec):
         return _PrefixSkillState(self, request)
 
 
+class _FakeImagePreprocessor:
+    """Stand-in for a runtime's image-preprocessing executor.
+
+    The engine now dispatches image preprocessing through
+    ``runtime.preprocess_image_async``; tests attach one of these to a
+    ``_FakeRuntime`` to control the future returned per call.
+    """
+
+    def __init__(self, futures: list[Future[object]] | None = None) -> None:
+        self.futures = futures or [Future()]
+        self.submissions: list[np.ndarray | bytes] = []
+
+    def submit(self, image: np.ndarray | bytes) -> Future[object]:
+        self.submissions.append(image)
+        return self.futures.pop(0)
+
+
 class _FakeRuntime:
-    def __init__(self, *, prefix_cache: object | None, prefix_hit: bool) -> None:
+    def __init__(
+        self,
+        *,
+        prefix_cache: object | None,
+        prefix_hit: bool,
+        image_preprocessor: _FakeImagePreprocessor | None = None,
+    ) -> None:
         self.prefix_cache = prefix_cache
         self.config = SimpleNamespace(vision=object())
         self._prefix_hit = prefix_hit
         self.cache_checks: list[tuple[list[object], bytes | None, str | None]] = []
+        self._image_preprocessor = image_preprocessor or _FakeImagePreprocessor()
 
     def check_prefix_cache(
         self, tokens_list: list[object], image_hash: bytes | None, adapter: str | None
@@ -85,17 +109,15 @@ class _FakeRuntime:
         self.cache_checks.append((tokens_list, image_hash, adapter))
         return self._prefix_hit
 
+    def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[object]:
+        return self._image_preprocessor.submit(image)
 
-class _FakeImagePreprocessor:
-    def __init__(self, futures: list[Future[object]] | None = None) -> None:
-        self.futures = futures or [Future()]
-        self.submissions: list[tuple[np.ndarray | bytes, object]] = []
+    def shutdown_image_preprocessor(self) -> None:  # pragma: no cover
+        pass
 
-    def submit(
-        self, image: np.ndarray | bytes, vision_config: object
-    ) -> Future[object]:
-        self.submissions.append((image, vision_config))
-        return self.futures.pop(0)
+    def image_hash(self, image: np.ndarray | bytes) -> bytes:
+        raw = image.tobytes() if isinstance(image, np.ndarray) else image
+        return hashlib.sha256(raw).digest()
 
 
 def _record_failure(
@@ -108,12 +130,13 @@ def _record_failure(
 
 
 def test_admission_coordinator_immediately_admits_text_only_request() -> None:
-    runtime = _FakeRuntime(prefix_cache=None, prefix_hit=False)
     preprocessor = _FakeImagePreprocessor()
+    runtime = _FakeRuntime(
+        prefix_cache=None, prefix_hit=False, image_preprocessor=preprocessor,
+    )
     failures: list[tuple[_PendingRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
-        image_preprocessor=preprocessor,
         wake_event=threading.Event(),
         fail_request=_record_failure(failures),
     )
@@ -130,12 +153,13 @@ def test_admission_coordinator_immediately_admits_text_only_request() -> None:
 
 def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
     image = np.arange(12, dtype=np.uint8).reshape(3, 4)
-    runtime = _FakeRuntime(prefix_cache=object(), prefix_hit=True)
     preprocessor = _FakeImagePreprocessor()
+    runtime = _FakeRuntime(
+        prefix_cache=object(), prefix_hit=True, image_preprocessor=preprocessor,
+    )
     failures: list[tuple[_PendingRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
-        image_preprocessor=preprocessor,
         wake_event=threading.Event(),
         fail_request=_record_failure(failures),
     )
@@ -154,12 +178,13 @@ def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
 
 def test_admission_coordinator_checks_prefix_cache_with_generated_prefix() -> None:
     image = np.arange(12, dtype=np.uint8).reshape(3, 4)
-    runtime = _FakeRuntime(prefix_cache=object(), prefix_hit=True)
     preprocessor = _FakeImagePreprocessor()
+    runtime = _FakeRuntime(
+        prefix_cache=object(), prefix_hit=True, image_preprocessor=preprocessor,
+    )
     failures: list[tuple[_PendingRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
-        image_preprocessor=preprocessor,
         wake_event=threading.Event(),
         fail_request=_record_failure(failures),
     )
@@ -183,8 +208,10 @@ def test_admission_coordinator_promotes_completed_crops() -> None:
     wake_event = threading.Event()
     failures: list[tuple[_PendingRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
-        runtime=_FakeRuntime(prefix_cache=object(), prefix_hit=False),
-        image_preprocessor=preprocessor,
+        runtime=_FakeRuntime(
+            prefix_cache=object(), prefix_hit=False,
+            image_preprocessor=preprocessor,
+        ),
         wake_event=wake_event,
         fail_request=_record_failure(failures),
     )
@@ -215,8 +242,10 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     preprocessor = _FakeImagePreprocessor([failed_future, ready_future])
     failures: list[tuple[_PendingRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
-        runtime=_FakeRuntime(prefix_cache=None, prefix_hit=False),
-        image_preprocessor=preprocessor,
+        runtime=_FakeRuntime(
+            prefix_cache=None, prefix_hit=False,
+            image_preprocessor=preprocessor,
+        ),
         wake_event=threading.Event(),
         fail_request=_record_failure(failures),
     )

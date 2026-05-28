@@ -174,6 +174,21 @@ class FakeRuntime:
     def prefill_budget(self) -> tuple[int, int]:
         return (self.max_seq_length, self.max_batch_slots)
 
+    # Image preprocessing ----------------------------------------------
+    def preprocess_image_async(self, image: Any) -> Any:
+        from concurrent.futures import Future
+        fut: Future = Future()
+        fut.set_result(image)
+        return fut
+
+    def shutdown_image_preprocessor(self) -> None:
+        pass
+
+    def image_hash(self, image: Any) -> bytes:
+        import hashlib
+        raw = image.tobytes() if hasattr(image, "tobytes") else bytes(image)
+        return hashlib.sha256(raw).digest()
+
     # Slot lifecycle ---------------------------------------------------
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
         self.acquired_prefill_slots.append(slot_id)
