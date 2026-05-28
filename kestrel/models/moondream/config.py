@@ -87,11 +87,19 @@ class TokenizerConfig:
         template = self.templates.get("query")
         if template is None:
             return None
+        # ``prefix_when_reasoning`` is optional; configs that don't set
+        # it (Moondream today) fall through to ``prefix`` for both modes.
+        prefix_when_reasoning = template.get("prefix_when_reasoning")
         return QueryTemplate(
             prefix=list(template["prefix"]),
             answer_prefix=list(template["answer_prefix"]),
             reasoning_prefix=list(template["reasoning_prefix"]),
             post_reasoning_prefix=list(template["post_reasoning_prefix"]),
+            prefix_when_reasoning=(
+                list(prefix_when_reasoning)
+                if prefix_when_reasoning is not None
+                else None
+            ),
         )
 
     def detect(self) -> Optional[PrefixSuffix]:

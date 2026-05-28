@@ -50,7 +50,7 @@ PREFIX = (
     "and provide a precise answer without any additional explanation or formatting. "
 )
 POT_PREFIX = "Write a Python program to answer the following question: "
-COT_MAX_TOKENS = 512
+COT_MAX_TOKENS = 1536  # bumped for Gemma 4's verbose CoT channel
 DEFAULT_MAX_TOKENS = 10
 POT_MAX_TOKENS = 200
 

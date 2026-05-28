@@ -22,6 +22,7 @@ Behaviour:
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import Future
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -173,6 +174,15 @@ class FakeRuntime:
 
     def prefill_budget(self) -> tuple[int, int]:
         return (self.max_seq_length, self.max_batch_slots)
+
+    # Image preprocessing ----------------------------------------------
+    def preprocess_image_async(self, image: Any) -> Future:
+        fut: Future = Future()
+        fut.set_result(image)
+        return fut
+
+    def shutdown_image_preprocessor(self) -> None:
+        pass
 
     # Slot lifecycle ---------------------------------------------------
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
