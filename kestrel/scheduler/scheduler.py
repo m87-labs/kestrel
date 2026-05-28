@@ -800,12 +800,13 @@ class GenerationScheduler:
             seq = lifecycle
             prepared_seq = prepared_sequences[0]
             try:
-                self.runtime.launch_prepared_batch(
-                    [prepared_seq],
-                    prefill_slot,
-                    images=[request.image],
-                    image_crops_list=[request.image_crops],
-                )
+                with torch.inference_mode():
+                    self.runtime.launch_prepared_batch(
+                        [prepared_seq],
+                        prefill_slot,
+                        images=[request.image],
+                        image_crops_list=[request.image_crops],
+                    )
                 lifecycle.prefill_completed_at = time.perf_counter()
                 # Ensure prefill forward completes before cache finalize + release.
                 with stream_context(self.runtime.primary_stream):
@@ -834,12 +835,13 @@ class GenerationScheduler:
             raise
 
         try:
-            logits = self.runtime.launch_prepared_batch(
-                prepared_sequences,
-                prefill_slot,
-                images=[request.image for request in requests],
-                image_crops_list=[request.image_crops for request in requests],
-            )
+            with torch.inference_mode():
+                logits = self.runtime.launch_prepared_batch(
+                    prepared_sequences,
+                    prefill_slot,
+                    images=[request.image for request in requests],
+                    image_crops_list=[request.image_crops for request in requests],
+                )
             prefill_completed = time.perf_counter()
             for lifecycle in lifecycles:
                 lifecycle.prefill_completed_at = prefill_completed
@@ -1016,8 +1018,12 @@ class GenerationScheduler:
             batch_indices_list = [seq.state.batch_idx for seq in sequences]
             self.runtime.page_table.commit_block_table(batch_indices_list)
 
-            # Run forward pass - writes to slot.logits and slot.hidden_last
-            self.runtime.decode_with_slot(slot, batch_size)
+            # Run forward pass - writes to slot.logits and slot.hidden_last.
+            # ``inference_mode`` is applied centrally here (not left to each
+            # runtime) so eager model paths can't accidentally retain
+            # autograd graphs in their KV caches across decode steps.
+            with torch.inference_mode():
+                self.runtime.decode_with_slot(slot, batch_size)
         except Exception:
             # Rollback inflight_refs on failure
             for seq in sequences:
