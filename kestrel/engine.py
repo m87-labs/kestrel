@@ -333,8 +333,11 @@ class InferenceEngine:
 
         # An externally-built runtime is held from construction; otherwise
         # ``_initialize`` builds one via the spec's ``runtime`` factory
-        # on first ``create``.
+        # on first ``create``. ``_owns_runtime`` lets shutdown skip the
+        # preprocessor-shutdown call when the runtime came from the
+        # caller (they own its lifecycle).
         self._runtime: Optional[Runtime] = runtime
+        self._owns_runtime: bool = runtime is None
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
         # engine retry-able. ``_init_task`` is the asyncio task that's
@@ -535,7 +538,7 @@ class InferenceEngine:
                 _LOGGER.exception("Failed to stop Photon reporter")
             finally:
                 self._photon_reporter = None
-        if self._runtime is not None:
+        if self._runtime is not None and self._owns_runtime:
             self._runtime.shutdown_image_preprocessor()
 
     async def submit(
