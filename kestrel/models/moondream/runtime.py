@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.models.registry import get_spec
 
 from .config import MoondreamConfig
+from .image_preprocessor import ImagePreprocessor
 from .model import MoondreamModel
 from .weights import load_moondream_weights
 from .text import (
@@ -439,7 +441,6 @@ class MoondreamRuntime:
 
         # Image preprocessing pool — owned here so other runtimes can
         # plug in their own preprocessing without the engine knowing.
-        from kestrel.models.moondream.image_preprocessor import ImagePreprocessor
         self._image_preprocessor = ImagePreprocessor()
 
         # Spatial decode RNG. Pre-refactor the scheduler's sampling RNG
@@ -767,9 +768,7 @@ class MoondreamRuntime:
         self._image_preprocessor.shutdown(wait=True)
 
     def image_hash(self, image) -> bytes:
-        import hashlib
-        import numpy as _np
-        raw = image.tobytes() if isinstance(image, _np.ndarray) else image
+        raw = image.tobytes() if isinstance(image, np.ndarray) else image
         return hashlib.sha256(raw).digest()
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:

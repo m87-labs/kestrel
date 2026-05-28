@@ -22,6 +22,8 @@ Behaviour:
 from __future__ import annotations
 
 import contextlib
+import hashlib
+from concurrent.futures import Future
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -175,8 +177,7 @@ class FakeRuntime:
         return (self.max_seq_length, self.max_batch_slots)
 
     # Image preprocessing ----------------------------------------------
-    def preprocess_image_async(self, image: Any) -> Any:
-        from concurrent.futures import Future
+    def preprocess_image_async(self, image: Any) -> Future:
         fut: Future = Future()
         fut.set_result(image)
         return fut
@@ -185,7 +186,6 @@ class FakeRuntime:
         pass
 
     def image_hash(self, image: Any) -> bytes:
-        import hashlib
         raw = image.tobytes() if hasattr(image, "tobytes") else bytes(image)
         return hashlib.sha256(raw).digest()
 

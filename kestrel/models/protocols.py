@@ -29,7 +29,7 @@ class QueryTemplate:
     # (e.g. Gemma 4 emits an extra ``<|turn>system\n<|think|>`` block to
     # activate thinking). ``None`` (default) keeps ``prefix`` for both
     # modes — Moondream's pre-question layout is reasoning-independent.
-    prefix_reasoning: Optional[List[int]] = None
+    prefix_when_reasoning: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)

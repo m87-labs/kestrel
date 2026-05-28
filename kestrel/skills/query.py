@@ -64,12 +64,12 @@ class QuerySkill(SkillSpec):
             if request_context.reasoning
             else template.answer_prefix
         )
-        # ``prefix_reasoning`` lets a model swap in a different pre-question
+        # ``prefix_when_reasoning`` lets a model swap in a different pre-question
         # structure for CoT (Gemma 4: extra ``<|turn>system\n<|think|>`` block
         # to activate thinking). When None, the same ``prefix`` covers both.
         pre_question: Sequence[int] = (
-            template.prefix_reasoning
-            if request_context.reasoning and template.prefix_reasoning is not None
+            template.prefix_when_reasoning
+            if request_context.reasoning and template.prefix_when_reasoning is not None
             else template.prefix
         )
         encoded = runtime.tokenizer.encode(prompt).ids if prompt else []
