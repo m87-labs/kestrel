@@ -17,7 +17,6 @@ record of the surface a runtime must satisfy today.
 
 from __future__ import annotations
 
-from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from kestrel.runtime.state import (
@@ -28,6 +27,7 @@ from kestrel.runtime.state import (
 from kestrel.runtime.tokens import Token
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
     import numpy as np
     import torch
     from torch import Tensor
@@ -88,11 +88,6 @@ class Runtime(Protocol):
     # Called once when the engine is shutting down so the runtime can
     # tear down its preprocessing thread pool (if any).
     def shutdown_image_preprocessor(self) -> None: ...
-
-    # Hash an image into the bytes used as the prefix-cache key. Lets
-    # runtimes pick a hashing scheme that matches how their preprocessor
-    # canonicalises the input.
-    def image_hash(self, image: np.ndarray | bytes) -> bytes: ...
 
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...

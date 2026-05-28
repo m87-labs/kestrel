@@ -26,6 +26,7 @@ Callers provide raw questions/objects; the engine derives skill-specific context
 
 
 import asyncio
+import hashlib
 import itertools
 import logging
 import queue
@@ -212,6 +213,12 @@ class _ReadyAdmission:
     prefix_cache_hit: bool
 
 
+def _hash_image(image: np.ndarray | bytes) -> bytes:
+    """SHA-256 over the raw image input for prefix-cache keying."""
+    raw = image.tobytes() if isinstance(image, np.ndarray) else image
+    return hashlib.sha256(raw).digest()
+
+
 class _AdmissionCoordinator:
     def __init__(
         self,
@@ -239,7 +246,7 @@ class _AdmissionCoordinator:
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
 
         if self._runtime.prefix_cache is not None:
-            req.image_hash = self._runtime.image_hash(req.image)
+            req.image_hash = _hash_image(req.image)
             prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
             if self._runtime.check_prefix_cache(
                 prefill_tokens, req.image_hash, req.adapter

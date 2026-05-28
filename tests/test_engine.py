@@ -115,10 +115,6 @@ class _FakeRuntime:
     def shutdown_image_preprocessor(self) -> None:  # pragma: no cover
         pass
 
-    def image_hash(self, image: np.ndarray | bytes) -> bytes:
-        raw = image.tobytes() if isinstance(image, np.ndarray) else image
-        return hashlib.sha256(raw).digest()
-
 
 def _record_failure(
     failures: list[tuple[_PendingRequest, BaseException]]

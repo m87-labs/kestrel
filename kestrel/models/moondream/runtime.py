@@ -3,7 +3,6 @@
 
 import contextlib
 import functools
-import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass
@@ -766,10 +765,6 @@ class MoondreamRuntime:
 
     def shutdown_image_preprocessor(self) -> None:
         self._image_preprocessor.shutdown(wait=True)
-
-    def image_hash(self, image) -> bytes:
-        raw = image.tobytes() if isinstance(image, np.ndarray) else image
-        return hashlib.sha256(raw).digest()
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:

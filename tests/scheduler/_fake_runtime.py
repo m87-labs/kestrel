@@ -22,7 +22,6 @@ Behaviour:
 from __future__ import annotations
 
 import contextlib
-import hashlib
 from concurrent.futures import Future
 from typing import Any, Mapping, Sequence
 
@@ -184,10 +183,6 @@ class FakeRuntime:
 
     def shutdown_image_preprocessor(self) -> None:
         pass
-
-    def image_hash(self, image: Any) -> bytes:
-        raw = image.tobytes() if hasattr(image, "tobytes") else bytes(image)
-        return hashlib.sha256(raw).digest()
 
     # Slot lifecycle ---------------------------------------------------
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
