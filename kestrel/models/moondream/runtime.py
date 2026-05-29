@@ -528,14 +528,6 @@ class MoondreamRuntime:
                 device=self.device,
                 dtype=self.dtype,
             )
-            if self.config.text.moe is not None:
-                get_runtime().moe.reserve_lora_scratch(
-                    max_tokens=self.max_seq_length - 1,
-                    top_k=self.config.text.moe.experts_per_token,
-                    max_lora_rank=self._lora_workspace.max_rank_per_expert,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
 
         # Create two ping-pong decode slots for pipelined decoding.
         # Each slot has its own staging buffers, FA3 paged-KV metadata buffers,
