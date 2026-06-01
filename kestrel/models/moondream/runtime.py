@@ -32,6 +32,7 @@ from kestrel.prefix_cache import (
     TreeNode,
 )
 from kestrel.runtime import (
+    ExecutionShape,
     CoordToken,
     PrefillClassification,
     PreparedSequence,
@@ -237,6 +238,7 @@ class MoondreamRuntime:
     ) -> None:
         self._cfg = cfg
         self.device = cfg.resolved_device()
+        self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.dtype = cfg.resolved_dtype()
         set_device(self.device)
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.

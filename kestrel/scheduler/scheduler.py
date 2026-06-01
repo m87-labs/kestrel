@@ -15,7 +15,7 @@ from kestrel.device import stream_context
 from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
-    Runtime,
+    AutoregressiveRuntime,
     TextToken,
     Token,
 )
@@ -194,7 +194,7 @@ class GenerationScheduler:
 
     def __init__(
         self,
-        runtime: Runtime,
+        runtime: AutoregressiveRuntime,
         *,
         default_temperature: float = 0.2,
         default_top_p: float = 0.9,

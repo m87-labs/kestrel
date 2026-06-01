@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 
-from kestrel.runtime import Runtime
+from kestrel.runtime import AutoregressiveRuntime
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -19,7 +19,9 @@ from tests.scheduler._fake_runtime import FakeRuntime
 def _protocol_members(protocol: type) -> set[str]:
     """Names declared on ``protocol`` — annotations + non-special methods."""
 
-    members = set(getattr(protocol, "__annotations__", {}))
+    members: set[str] = set()
+    for klass in getattr(protocol, "__mro__", [protocol]):
+        members.update(getattr(klass, "__annotations__", {}))
     for name in dir(protocol):
         if name.startswith("_"):
             continue
@@ -39,7 +41,7 @@ def _params_excluding_self(func: object) -> list[inspect.Parameter]:
 def test_fake_runtime_implements_every_protocol_member() -> None:
     fake = FakeRuntime()
     missing = sorted(
-        name for name in _protocol_members(Runtime) if not hasattr(fake, name)
+        name for name in _protocol_members(AutoregressiveRuntime) if not hasattr(fake, name)
     )
     assert missing == [], (
         f"FakeRuntime is missing Runtime members: {missing}. "
@@ -71,8 +73,8 @@ def test_fake_runtime_method_signatures_accept_protocol_calls() -> None:
     """
 
     mismatches: list[str] = []
-    for name in _protocol_members(Runtime):
-        proto_member = getattr(Runtime, name, None)
+    for name in _protocol_members(AutoregressiveRuntime):
+        proto_member = getattr(AutoregressiveRuntime, name, None)
         if not callable(proto_member):
             continue
         fake_member = getattr(FakeRuntime, name, None)

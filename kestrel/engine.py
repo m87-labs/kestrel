@@ -56,7 +56,7 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.runtime import Runtime
+from kestrel.runtime import AutoregressiveRuntime
 from kestrel.scheduler import (
     GeneratedPrefix,
     GenerationScheduler,
@@ -222,7 +222,7 @@ def _hash_image(image: np.ndarray | bytes) -> bytes:
 class _AdmissionCoordinator:
     def __init__(
         self,
-        runtime: Runtime,
+        runtime: AutoregressiveRuntime,
         wake_event: threading.Event,
         fail_request: Callable[[_PendingRequest, BaseException], None],
     ) -> None:
@@ -313,7 +313,7 @@ class InferenceEngine:
         self,
         runtime_cfg: RuntimeConfig,
         *,
-        runtime: Optional[Runtime] = None,
+        runtime: Optional[AutoregressiveRuntime] = None,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
@@ -336,7 +336,7 @@ class InferenceEngine:
         # on first ``create``. ``_owns_runtime`` lets shutdown skip the
         # preprocessor-shutdown call when the runtime came from the
         # caller (they own its lifecycle).
-        self._runtime: Optional[Runtime] = runtime
+        self._runtime: Optional[AutoregressiveRuntime] = runtime
         self._owns_runtime: bool = runtime is None
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
@@ -375,7 +375,7 @@ class InferenceEngine:
         self._default_top_p = 0.9
 
     @property
-    def runtime(self) -> Runtime:
+    def runtime(self) -> AutoregressiveRuntime:
         if self._runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
         return self._runtime
@@ -399,7 +399,7 @@ class InferenceEngine:
         cls,
         runtime_cfg: RuntimeConfig,
         *,
-        runtime: Optional[Runtime] = None,
+        runtime: Optional[AutoregressiveRuntime] = None,
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
@@ -1643,7 +1643,7 @@ class InferenceEngine:
 
     def _build_generation_request(
         self,
-        runtime: Runtime,
+        runtime: AutoregressiveRuntime,
         req: _PendingRequest,
         image_crops: Any,
     ) -> tuple[GenerationRequest, SkillState]:
@@ -1702,7 +1702,7 @@ class InferenceEngine:
 
     def _validate_suppress_next_token_ids(
         self,
-        runtime: Runtime,
+        runtime: AutoregressiveRuntime,
         request: GenerationRequest,
         skill_state: SkillState,
     ) -> None:
