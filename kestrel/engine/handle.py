@@ -104,8 +104,8 @@ class ModelHandle:
 
     async def query(
         self,
-        image: Optional[np.ndarray | bytes],
-        question: str,
+        image: Optional[np.ndarray | bytes] = None,
+        question: Optional[str] = None,
         *,
         reasoning: bool = True,  # match InferenceEngine.query — see note below
         stream: bool = False,

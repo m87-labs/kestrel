@@ -101,6 +101,24 @@ def test_default_ar_verb_forwards_to_engine() -> None:
     assert captured["reasoning"] is True
 
 
+def test_text_only_query_through_handle() -> None:
+    """A text-only query (no image) must work through the handle, matching
+    engine.query's optional image — regression for image being required."""
+    eng = _engine()
+    captured: dict[str, Any] = {}
+
+    async def fake_query(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "RESULT"
+
+    eng.query = fake_query  # type: ignore[method-assign]
+    h = eng.model("ar-model")
+    out = asyncio.run(h.query(question="just text?"))  # no image
+    assert out == "RESULT"
+    assert captured["image"] is None
+    assert captured["question"] == "just text?"
+
+
 def test_ar_verb_on_non_default_model_fails_loud() -> None:
     """The AR verbs don't route by model id yet, so a non-default AR
     handle must refuse rather than silently hit the default model."""
@@ -119,25 +137,37 @@ def test_ar_verb_on_non_default_model_fails_loud() -> None:
         asyncio.run(h.query(None, "hi?"))
 
 
-def test_handle_verb_defaults_match_engine() -> None:
-    """A handle verb is a thin forwarder; its keyword defaults must match
-    InferenceEngine's, or the same call drifts behavior through the handle
-    (e.g. query's reasoning default). Introspect both, compare shared
-    keyword params — guards all verbs, not just the one Codex caught."""
+def test_handle_verb_signatures_match_engine() -> None:
+    """A handle verb is a thin forwarder; its signature must not diverge
+    from InferenceEngine's, or binding a model silently changes behavior:
+      - a default drift changes outcomes (e.g. query reasoning), and
+      - making an engine-optional param required breaks valid calls
+        (e.g. text-only query(question=...) with no image).
+    Introspect both and assert, for every shared param, same default AND
+    same required-ness. Guards all verbs, not just the ones Codex caught."""
     import inspect
 
+    empty = inspect.Parameter.empty
     for verb in ("query", "caption", "detect", "point", "segment"):
         eng_params = inspect.signature(getattr(InferenceEngine, verb)).parameters
         h_params = inspect.signature(getattr(ModelHandle, verb)).parameters
         for name, h_p in h_params.items():
-            if name == "self" or h_p.default is inspect.Parameter.empty:
+            if name == "self":
                 continue
             eng_p = eng_params.get(name)
             assert eng_p is not None, f"{verb}: handle has param {name!r} engine lacks"
-            assert h_p.default == eng_p.default, (
-                f"{verb}: default for {name!r} drifted — "
-                f"handle={h_p.default!r} engine={eng_p.default!r}"
+            # Required-ness must match: an engine-optional param must not be
+            # required on the handle (that breaks otherwise-valid calls).
+            assert (h_p.default is empty) == (eng_p.default is empty), (
+                f"{verb}: required-ness for {name!r} drifted — "
+                f"handle {'required' if h_p.default is empty else 'optional'}, "
+                f"engine {'required' if eng_p.default is empty else 'optional'}"
             )
+            if h_p.default is not empty:
+                assert h_p.default == eng_p.default, (
+                    f"{verb}: default for {name!r} drifted — "
+                    f"handle={h_p.default!r} engine={eng_p.default!r}"
+                )
 
 
 def test_run_on_ar_model_rejected_with_clear_message() -> None:
