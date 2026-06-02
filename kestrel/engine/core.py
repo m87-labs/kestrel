@@ -1412,23 +1412,38 @@ class InferenceEngine:
                             lane.submit(req)
                         progressed = True
 
+                    # Advance the autoregressive lane. Its pipeline is the
+                    # shared device state, so a failure here is fatal to the
+                    # kernel — tear everything down.
                     try:
                         tick = ar_executor.advance()
-                        if tick.completed:
-                            deliver(tick.completed)
-                        progressed = tick.progressed or progressed
-                        for lane in single_pass.values():
-                            sp_tick = lane.advance()
-                            if sp_tick.completed:
-                                deliver(sp_tick.completed)
-                            progressed = sp_tick.progressed or progressed
                     except Exception as exc:
-                        _LOGGER.exception("Executor advance failed", exc_info=exc)
+                        _LOGGER.exception("Autoregressive advance failed", exc_info=exc)
                         deliver(ar_executor.shutdown(exc))
                         for lane in single_pass.values():
                             deliver(lane.shutdown(exc))
                         self._fail_all_pending(exc)
                         return
+                    if tick.completed:
+                        deliver(tick.completed)
+                    progressed = tick.progressed or progressed
+
+                    # Advance each single-pass lane in isolation: a single
+                    # forward blowing up must fail only that lane's in-flight
+                    # work, never take down the kernel or the other lanes.
+                    for name, lane in single_pass.items():
+                        try:
+                            sp_tick = lane.advance()
+                        except Exception as exc:
+                            _LOGGER.exception(
+                                "Single-pass advance failed for %s", name, exc_info=exc
+                            )
+                            deliver(lane.shutdown(exc))
+                            progressed = True
+                            continue
+                        if sp_tick.completed:
+                            deliver(sp_tick.completed)
+                        progressed = sp_tick.progressed or progressed
 
                     if shutdown_requested and not any_work():
                         break

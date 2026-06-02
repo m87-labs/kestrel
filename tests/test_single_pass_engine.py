@@ -117,3 +117,68 @@ def test_run_rejects_autoregressive_model() -> None:
             await engine.run("ar-default", "segment", {})
 
     asyncio.run(go())
+
+
+def test_single_pass_lane_crash_does_not_kill_the_kernel() -> None:
+    """A single-pass lane whose advance() raises is isolated.
+
+    The broken lane's in-flight request is failed, but the kernel keeps
+    running and other lanes still serve — one bad single-pass request
+    must not take down autoregressive decode or sibling lanes.
+    """
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        good = _StubSinglePass("good-sp")
+        bad = _StubSinglePass("bad-sp")
+        engine = _engine_with(ar, good)
+        engine._runtimes[bad.model_name] = bad
+        engine._loop = asyncio.get_running_loop()
+        engine._initialized = True
+        engine._init_task = None
+
+        # Make the bad lane's executor.advance() raise (a bug escaping the
+        # executor's own forward() try/except). Patch after the loop builds
+        # its executors, so wrap _scheduler_loop's lane construction by
+        # poisoning the runtime's forward to raise a BaseException-free
+        # error path: simplest is to monkeypatch SinglePassExecutor.advance
+        # for the bad runtime via a sentinel task.
+        import kestrel.engine.single_pass as sp_mod
+
+        orig_advance = sp_mod.SinglePassExecutor.advance
+
+        def advance(self):  # type: ignore[no-untyped-def]
+            # The bad lane explodes whenever it has a request to service,
+            # before it can produce a completion — simulating a bug that
+            # escapes the executor's own forward() try/except.
+            if self._runtime.model_name == "bad-sp" and (
+                self._in_flight or not self._queue.empty()
+            ):
+                raise RuntimeError("lane exploded")
+            return orig_advance(self)
+
+        sp_mod.SinglePassExecutor.advance = advance
+        try:
+            thread = threading.Thread(
+                target=engine._scheduler_loop, name="kernel", daemon=True
+            )
+            thread.start()
+            try:
+                # The bad lane crashes on its request; the good lane still works.
+                with pytest.raises(RuntimeError, match="Engine shut down|lane exploded"):
+                    await asyncio.wait_for(
+                        engine.run("bad-sp", "segment", {}), timeout=5.0
+                    )
+                good_result = await asyncio.wait_for(
+                    engine.run("good-sp", "segment", {"ok": 1}), timeout=5.0
+                )
+                assert good_result.output == {"task": "segment", "inputs": {"ok": 1}}
+            finally:
+                engine._shutdown = True
+                engine._scheduler_queue.put(None)
+                engine._scheduler_event.set()
+                thread.join(timeout=5.0)
+        finally:
+            sp_mod.SinglePassExecutor.advance = orig_advance
+
+    asyncio.run(go())

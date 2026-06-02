@@ -205,6 +205,13 @@ class SinglePassRuntime(Runtime, Protocol):
     returning.
     """
 
+    # Stream the executor launches forwards on, so a single-pass forward
+    # and autoregressive decode share one ordered stream (the device's
+    # serialize-on-stream invariant). Declared here — not discovered via
+    # getattr — so a runtime that omits it fails loudly rather than
+    # silently running on the default stream with no interleaving.
+    primary_stream: Any
+
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...

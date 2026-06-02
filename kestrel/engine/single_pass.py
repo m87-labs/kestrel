@@ -65,8 +65,17 @@ def _single_pass_result(request_id: int, output: Any) -> EngineResult:
     """Wrap a driver forward's output as an EngineResult.
 
     Single-pass tasks produce structured output (e.g. masks + scores),
-    not tokens, so token fields are empty/zero. Keeping one result type
-    lets the kernel deliver every lane through the same path.
+    not tokens. We deliberately reuse the one ``EngineResult`` type so the
+    kernel delivers every lane through a single path (a second result type
+    would force the delivery code to branch); the token fields are
+    zero-filled because they don't apply.
+
+    KNOWN GAP (usage metering): the zero token counts mean a single-pass
+    request is counted by Photon (request_count++) but contributes no
+    billable token usage. Token-based billing therefore undercounts
+    single-pass work. Picking the right unit for single-pass (images /
+    pixels / forwards) and wiring it into telemetry is deferred — tracked
+    for when single-pass models are actually metered.
     """
     return EngineResult(
         request_id=request_id,
@@ -110,7 +119,9 @@ class SinglePassExecutor:
     ) -> None:
         self._runtime = runtime
         self._device = runtime.device
-        self._stream = getattr(runtime, "primary_stream", None)
+        # Declared on SinglePassRuntime — access directly so a runtime that
+        # forgets it fails loudly instead of silently losing interleaving.
+        self._stream = runtime.primary_stream
         self._max_in_flight = max_in_flight
         self._queue: "queue.Queue[_SinglePassRequest]" = queue.Queue()
         self._in_flight: List[_InFlight] = []

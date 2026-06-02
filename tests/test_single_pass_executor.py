@@ -15,6 +15,7 @@ from typing import Any
 import torch
 
 from kestrel.engine import SinglePassExecutor
+import kestrel.engine.single_pass as single_pass_mod
 from kestrel.engine.single_pass import _SinglePassRequest
 from kestrel.runtime import ExecutionShape
 
@@ -103,6 +104,54 @@ def test_idle_executor_reports_no_work() -> None:
     tick = ex.advance()
     assert tick.completed == ()
     assert tick.has_work is False
+    assert ex.has_work is False
+
+
+class _PendingEvent:
+    """Fake completion event: reports not-done for the first ``n`` polls.
+
+    Lets a CPU test exercise the deferred-collect path that NoopEvent
+    (always done) can't reach.
+    """
+
+    def __init__(self, not_done_polls: int) -> None:
+        self._remaining = not_done_polls
+
+    def record(self, *_a: Any, **_k: Any) -> None:
+        pass
+
+    def query(self) -> bool:
+        if self._remaining > 0:
+            self._remaining -= 1
+            return False
+        return True
+
+
+def test_forward_stays_in_flight_until_event_fires(monkeypatch) -> None:
+    """The result is held back until its completion event reports done."""
+    event = _PendingEvent(not_done_polls=2)
+    monkeypatch.setattr(single_pass_mod, "make_event", lambda device: event)
+
+    ex = SinglePassExecutor(_StubDriver())
+    ex.submit(_req(7, "segment", {"k": "v"}))
+
+    # Tick 1: forward launched, but the event reports not-done — nothing
+    # delivered yet, work still pending.
+    tick1 = ex.advance()
+    assert tick1.completed == ()
+    assert tick1.progressed is True  # a launch is progress
+    assert ex.has_work is True
+    assert len(ex._in_flight) == 1
+
+    # Tick 2: event still not done — still held.
+    tick2 = ex.advance()
+    assert tick2.completed == ()
+    assert ex.has_work is True
+
+    # Tick 3: event fires — the result is finally delivered.
+    tick3 = ex.advance()
+    assert [c.request.request_id for c in tick3.completed] == [7]
+    assert tick3.completed[0].result is not None
     assert ex.has_work is False
 
 
