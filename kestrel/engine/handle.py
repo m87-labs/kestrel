@@ -54,17 +54,48 @@ class ModelHandle:
                 f"(supports: {', '.join(self.tasks) or 'none'})"
             )
 
+    def _require_default_ar(self, task: str) -> None:
+        """Guard the autoregressive verbs.
+
+        The engine's typed verbs (query/caption/...) currently route only
+        to the default autoregressive model — they take no model id. So a
+        handle for any *other* model must not silently misroute through
+        them. Until per-model AR routing exists, fail loud instead.
+        """
+        self._require(task)
+        if self._model != self._engine._default_model:
+            raise NotImplementedError(
+                f"{task!r} on {self._model!r} is not yet routable: the "
+                "autoregressive verbs target the default model "
+                f"({self._engine._default_model!r}). Per-model AR routing "
+                "is a future step."
+            )
+
     # -- generic escape hatch -----------------------------------------
 
     async def run(self, task: str, inputs: Any) -> "EngineResult":
-        """Run an arbitrary ``task`` on this model (single-pass lane)."""
+        """Run an arbitrary ``task`` on this model's single-pass lane.
+
+        The escape hatch for single-pass models. Autoregressive models use
+        the typed verbs (``query`` etc.), not ``run`` — ``engine.run``
+        would reject them, so reject here with a clearer message.
+        """
         self._require(task)
+        runtime = self._engine._runtimes.get(self._model)
+        if runtime is not None and runtime.execution_shape is not (
+            ExecutionShape.SINGLE_PASS
+        ):
+            raise ValueError(
+                f"run() is for single-pass models; {self._model!r} is "
+                f"{runtime.execution_shape.value} — use its typed verbs."
+            )
         return await self._engine.run(self._model, task, inputs)
 
     # -- autoregressive capability vocabulary -------------------------
     #
-    # Thin, model-pinned forwarders to the engine's typed verbs. Each
-    # gates on the model actually serving the capability, then delegates.
+    # Thin forwarders to the engine's typed verbs. Each gates on the model
+    # serving the capability AND on it being the default AR model (the
+    # verbs don't yet route by model id), then delegates.
 
     async def query(
         self,
@@ -76,7 +107,7 @@ class ModelHandle:
         settings: Optional[Mapping[str, object]] = None,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
     ) -> "EngineResult | EngineStream":
-        self._require("query")
+        self._require_default_ar("query")
         return await self._engine.query(
             image=image,
             question=question,
@@ -94,7 +125,7 @@ class ModelHandle:
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
     ) -> "EngineResult | EngineStream":
-        self._require("caption")
+        self._require_default_ar("caption")
         return await self._engine.caption(
             image=image, length=length, stream=stream, settings=settings
         )
@@ -106,7 +137,7 @@ class ModelHandle:
         *,
         settings: Optional[Mapping[str, object]] = None,
     ) -> "EngineResult":
-        self._require("detect")
+        self._require_default_ar("detect")
         return await self._engine.detect(image, object, settings=settings)
 
     async def point(
@@ -117,7 +148,7 @@ class ModelHandle:
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
     ) -> "EngineResult":
-        self._require("point")
+        self._require_default_ar("point")
         return await self._engine.point(
             image, object, settings, spatial_refs=spatial_refs
         )
@@ -130,7 +161,7 @@ class ModelHandle:
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         settings: Optional[Mapping[str, object]] = None,
     ) -> "EngineResult":
-        self._require("segment")
+        self._require_default_ar("segment")
         return await self._engine.segment(
             image, object, spatial_refs=spatial_refs, settings=settings
         )

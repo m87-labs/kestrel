@@ -85,7 +85,7 @@ def test_unsupported_capability_raises_clearly() -> None:
         asyncio.run(sp.query(None, "hi?"))
 
 
-def test_ar_verb_forwards_to_engine_pinned_to_model() -> None:
+def test_default_ar_verb_forwards_to_engine() -> None:
     eng = _engine()
     captured: dict[str, Any] = {}
 
@@ -94,11 +94,38 @@ def test_ar_verb_forwards_to_engine_pinned_to_model() -> None:
         return "RESULT"
 
     eng.query = fake_query  # type: ignore[method-assign]
-    h = eng.model("ar-model")
+    h = eng.model("ar-model")  # the default AR model
     out = asyncio.run(h.query(None, "what is this?", reasoning=True))
     assert out == "RESULT"
     assert captured["question"] == "what is this?"
     assert captured["reasoning"] is True
+
+
+def test_ar_verb_on_non_default_model_fails_loud() -> None:
+    """The AR verbs don't route by model id yet, so a non-default AR
+    handle must refuse rather than silently hit the default model."""
+    eng = _engine()
+    # Register a second AR model; the verbs can't route to it.
+    eng._runtimes["ar-other"] = SimpleNamespace(
+        model_name="ar-other", execution_shape=ExecutionShape.AUTOREGRESSIVE
+    )
+
+    async def fake_query(**kwargs: Any) -> str:  # pragma: no cover - must not run
+        raise AssertionError("should not forward for a non-default AR model")
+
+    eng.query = fake_query  # type: ignore[method-assign]
+    h = eng.model("ar-other")
+    with pytest.raises(NotImplementedError, match="not yet routable"):
+        asyncio.run(h.query(None, "hi?"))
+
+
+def test_run_on_ar_model_rejected_with_clear_message() -> None:
+    """run() is the single-pass escape hatch; on an AR model it should say
+    so, not die downstream in engine.run()."""
+    eng = _engine()
+    h = eng.model("ar-model")
+    with pytest.raises(ValueError, match="run\\(\\) is for single-pass"):
+        asyncio.run(h.run("query", {}))
 
 
 def test_run_gates_on_task_then_forwards() -> None:
