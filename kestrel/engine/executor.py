@@ -238,12 +238,17 @@ class AutoregressiveExecutor:
 
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")
-        completions = [c for c in self._admission_failures]
-        self._admission_failures = []
+        # Fail in-flight admission first: fail_all() synchronously routes
+        # any request still in async preprocessing through
+        # _fail_via_admission, which appends to _admission_failures — so
+        # collect that list *after*, or those requests' futures never get
+        # resolved and callers hang.
         self._admission.fail_all(exc)
         for req in self._active.values():
-            completions.append(Completion(request=req, error=exc))
+            self._admission_failures.append(Completion(request=req, error=exc))
         self._active.clear()
+        completions = self._admission_failures
+        self._admission_failures = []
         self._release_active_sequences()
         return tuple(completions)
 

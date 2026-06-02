@@ -185,3 +185,25 @@ def test_admission_failure_surfaces_as_completion() -> None:
     assert len(tick.completed) == 1
     assert isinstance(tick.completed[0].error, ValueError)
     assert ex.has_work is False
+
+
+def test_shutdown_returns_requests_failed_during_fail_all() -> None:
+    """Regression: a request still in async preprocessing at shutdown.
+
+    The real admission coordinator's fail_all() synchronously routes
+    in-flight preprocessing requests through _fail_via_admission, which
+    appends to _admission_failures. shutdown() must collect that list
+    *after* fail_all() runs, or those requests' completions are dropped
+    and their callers hang forever.
+    """
+    ex = _executor()
+    stuck = _pending(5)
+    # Mimic the real coordinator: fail_all routes the stuck request back
+    # through the executor's admission-failure path.
+    ex._admission.fail_all = lambda exc: ex._fail_via_admission(stuck, exc)
+
+    completions = ex.shutdown(RuntimeError("stop"))
+
+    assert [c.request for c in completions] == [stuck]
+    assert isinstance(completions[0].error, RuntimeError)
+    assert ex._admission_failures == []
