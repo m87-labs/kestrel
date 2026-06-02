@@ -323,9 +323,10 @@ def test_extract_private_generated_prefix_setting() -> None:
 
 def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
     engine = object.__new__(InferenceEngine)
-    engine._runtime = SimpleNamespace(
-        prompt_template=SimpleNamespace(eos_id=2),
-    )
+    engine._default_model = "fake"
+    engine._runtimes = {
+        "fake": SimpleNamespace(prompt_template=SimpleNamespace(eos_id=2)),
+    }
 
     prefix = GeneratedPrefix(tokens=(TextToken(10),))
 
