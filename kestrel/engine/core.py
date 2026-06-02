@@ -26,24 +26,19 @@ Callers provide raw questions/objects; the engine derives skill-specific context
 
 
 import asyncio
-import hashlib
 import itertools
 import logging
 import queue
 import threading
 import time
-from concurrent.futures import Future
 import os
-from dataclasses import dataclass, field
 from typing import (
     Any,
-    AsyncIterator,
     Callable,
     Dict,
     List,
     Mapping,
     Optional,
-    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -60,14 +55,10 @@ from kestrel.device import set_device, synchronize
 from kestrel.runtime import AutoregressiveRuntime
 from kestrel.scheduler import (
     GeneratedPrefix,
-    GenerationScheduler,
     GenerationRequest,
-    RequestLifecycle,
-    RequestPhase,
     SchedulerResult,
     StreamUpdate,
 )
-from kestrel.models.moondream.vision import compute_overlap_crops
 from kestrel.skills import (
     CaptionSkill,
     DetectSkill,
@@ -89,6 +80,19 @@ from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
 from kestrel.utils.spatial_refs import normalize_spatial_refs
 
+from kestrel.engine._types import (
+    Completion,
+    EngineMetrics,
+    EngineResult,
+    EngineStream,
+    TickResult,
+    _PendingRequest,
+    _StreamCompletion,
+    _StreamQueue,
+    _StreamQueueItem,
+)
+from kestrel.engine.executor import AutoregressiveExecutor
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,448 +105,6 @@ _ALLOWED_API_BASE_URLS = (
     "https://api-staging.moondream.ai",
     _DEFAULT_API_BASE_URL,
 )
-
-
-@dataclass(slots=True)
-class EngineMetrics:
-    """Token counts and timing for a single request."""
-
-    input_tokens: int
-    output_tokens: int
-    prefill_time_ms: float
-    decode_time_ms: float
-    ttft_ms: float
-    cached_tokens: int = 0  # KV positions reused from prefix cache
-
-
-@dataclass(slots=True)
-class EngineResult:
-    """Inference output returned to callers."""
-
-    request_id: int
-    tokens: List[Token]
-    finish_reason: str
-    metrics: EngineMetrics
-    output: Dict[str, object]
-    logprobs: Optional[List[float]] = None
-
-
-@dataclass(slots=True)
-class _StreamCompletion:
-    result: Optional[EngineResult] = None
-    error: Optional[BaseException] = None
-
-
-_StreamQueueItem = Union[StreamUpdate, _StreamCompletion]
-_StreamQueue = asyncio.Queue[_StreamQueueItem]
-
-
-class EngineStream(AsyncIterator[StreamUpdate]):
-    """Asynchronous iterator that yields incremental generation updates."""
-
-    __slots__ = (
-        "request_id",
-        "_queue",
-        "_result_future",
-        "_final_result",
-        "_error",
-    )
-
-    def __init__(
-        self,
-        request_id: int,
-        queue: _StreamQueue,
-        result_future: asyncio.Future[EngineResult],
-    ) -> None:
-        self.request_id = request_id
-        self._queue = queue
-        self._result_future = result_future
-        self._final_result: Optional[EngineResult] = None
-        self._error: Optional[BaseException] = None
-
-    def __aiter__(self) -> "EngineStream":
-        return self
-
-    async def __anext__(self) -> StreamUpdate:
-        while True:
-            item = await self._queue.get()
-            if isinstance(item, _StreamCompletion):
-                if item.error is not None:
-                    self._error = item.error
-                    raise item.error
-                if item.result is not None:
-                    self._final_result = item.result
-                raise StopAsyncIteration
-            return item
-
-    async def result(self) -> EngineResult:
-        if self._final_result is not None:
-            return self._final_result
-        if self._error is not None:
-            raise self._error
-        result = await self._result_future
-        self._final_result = result
-        return result
-
-
-@dataclass(slots=True)
-class _PendingRequest:
-    request_id: int
-    prompt: str
-    prompt_tokens: Sequence[Token]
-    image: Optional[np.ndarray | bytes]
-    image_hash: Optional[bytes]  # SHA256 hash for prefix caching
-    max_new_tokens: int
-    temperature: float
-    top_p: float
-    submitted_at: float
-    future: asyncio.Future[EngineResult]
-    stream_queue: Optional["_StreamQueue"]
-    skill: SkillSpec
-    request_context: object
-    adapter: Optional[str] = None
-    lora_slot: int = 0  # Always 0 here; scheduler assigns actual slot at admission
-    return_logprobs: Optional[bool] = None
-    generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
-    suppress_next_token_ids: Optional[tuple[int, ...]] = None
-
-
-@dataclass(slots=True)
-class _ReadyAdmission:
-    req: _PendingRequest
-    crops: Any
-    prefix_cache_hit: bool
-
-
-def _hash_image(image: np.ndarray | bytes) -> bytes:
-    """SHA-256 over the raw image input for prefix-cache keying."""
-    raw = image.tobytes() if isinstance(image, np.ndarray) else image
-    return hashlib.sha256(raw).digest()
-
-
-class _AdmissionCoordinator:
-    def __init__(
-        self,
-        runtime: AutoregressiveRuntime,
-        wake_event: threading.Event,
-        fail_request: Callable[[_PendingRequest, BaseException], None],
-    ) -> None:
-        self._runtime = runtime
-        self._wake_event = wake_event
-        self._fail_request = fail_request
-        # Image preprocessing payloads are opaque — the runtime decides
-        # what they contain (Moondream's ``OverlapCropOutput``,
-        # Gemma 4's pixel_values bundle, etc.) and threads them back
-        # into ``launch_prepared_batch``.
-        self._pending_crops: Dict[
-            int, tuple[_PendingRequest, "Future[Any]"]
-        ] = {}
-        self._ready_crops: queue.Queue[int] = queue.Queue()
-
-    def has_pending(self) -> bool:
-        return bool(self._pending_crops)
-
-    def submit(self, req: _PendingRequest) -> Optional[_ReadyAdmission]:
-        if req.image is None:
-            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
-
-        if self._runtime.prefix_cache is not None:
-            req.image_hash = _hash_image(req.image)
-            prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
-            if self._runtime.check_prefix_cache(
-                prefill_tokens, req.image_hash, req.adapter
-            ):
-                return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=True)
-
-        try:
-            future = self._runtime.preprocess_image_async(req.image)
-        except Exception as exc:
-            self._fail_request(req, exc)
-            return None
-
-        req_id = req.request_id
-        self._pending_crops[req_id] = (req, future)
-        future.add_done_callback(
-            lambda _future, rid=req_id: self._on_crops_ready(rid)
-        )
-        return None
-
-    def take_ready(self) -> Optional[_ReadyAdmission]:
-        while True:
-            try:
-                req_id = self._ready_crops.get_nowait()
-            except queue.Empty:
-                return None
-
-            pending = self._pending_crops.pop(req_id, None)
-            if pending is None:
-                continue
-
-            req, future = pending
-            try:
-                crops = future.result()
-            except Exception as exc:
-                self._fail_request(req, exc)
-                continue
-            return _ReadyAdmission(req=req, crops=crops, prefix_cache_hit=False)
-
-    def fail_all(self, error: Optional[BaseException] = None) -> None:
-        exc = error or RuntimeError("Engine shut down")
-        for req, future in list(self._pending_crops.values()):
-            if future and not future.done():
-                future.cancel()
-            self._fail_request(req, exc)
-        self._pending_crops.clear()
-        self._drain_ready_notifications()
-
-    def _on_crops_ready(self, request_id: int) -> None:
-        self._ready_crops.put(request_id)
-        self._wake_event.set()
-
-    def _drain_ready_notifications(self) -> None:
-        while True:
-            try:
-                self._ready_crops.get_nowait()
-            except queue.Empty:
-                break
-
-
-@dataclass(slots=True)
-class Completion:
-    """A terminal result from an executor, for the kernel to deliver.
-
-    Executors emit these as plain values and never touch the event loop
-    or telemetry; the kernel maps each ``Completion`` to its effects
-    (resolve the request future, record usage, finish the stream). This
-    keeps executors pure-compute and directly testable.
-
-    Exactly one of ``result`` / ``error`` is set.
-    """
-
-    request: "_PendingRequest"
-    result: Optional[EngineResult] = None
-    error: Optional[BaseException] = None
-
-
-@dataclass(frozen=True, slots=True)
-class TickResult:
-    """Immutable summary of one executor ``advance`` step."""
-
-    progressed: bool = False
-    completed: tuple[Completion, ...] = ()
-    in_flight: bool = False  # GPU work outstanding (gates pause drain)
-    has_work: bool = False   # queued or in flight (gates shutdown exit)
-
-
-class Executor(Protocol):
-    """A kernel-side lane wrapping one driver behind a uniform face.
-
-    The kernel loop folds ``advance`` over its executors without knowing
-    the execution shape. ``submit`` runs on the event-loop thread
-    (thread-safe ingress); ``advance`` / ``shutdown`` run on the kernel
-    thread. ``advance`` returns an immutable :class:`TickResult`; the
-    kernel performs the effects for any ``completed`` entries.
-    """
-
-    def submit(self, request: "_PendingRequest") -> None: ...
-
-    def advance(self) -> TickResult: ...
-
-    def shutdown(self, error: Optional[BaseException] = ...) -> None: ...
-
-
-class AutoregressiveExecutor:
-    """Executor lane wrapping the autoregressive prefill/decode scheduler.
-
-    Owns the :class:`GenerationScheduler`, the image-crop admission
-    coordinator, and the in-flight request map. The pipelined-decode
-    internals (``PipelineState``, ``launch_forward_async``,
-    ``commit_step``, ping-pong slots) are untouched — this is a
-    lift-and-wrap of the engine's former scheduler loop into the uniform
-    :class:`Executor` face, with delivery turned into :class:`Completion`
-    values the kernel acts on.
-    """
-
-    def __init__(
-        self,
-        runtime: AutoregressiveRuntime,
-        *,
-        skills: "SkillRegistry",
-        adapter_provider: Optional[AdapterProvider],
-        default_temperature: float,
-        default_top_p: float,
-        build_generation_request: Callable[
-            [AutoregressiveRuntime, "_PendingRequest", Any],
-            "tuple[GenerationRequest, SkillState]",
-        ],
-        to_engine_result: Callable[[SchedulerResult], EngineResult],
-        wake_event: threading.Event,
-    ) -> None:
-        self._runtime = runtime
-        self._build_generation_request = build_generation_request
-        self._to_engine_result = to_engine_result
-        self._scheduler = GenerationScheduler(
-            runtime,
-            default_temperature=default_temperature,
-            default_top_p=default_top_p,
-            skill_registry=skills,
-            adapter_provider=adapter_provider,
-        )
-        # Admission wakes the kernel loop when async crop work completes.
-        self._admission = _AdmissionCoordinator(
-            runtime=runtime,
-            wake_event=wake_event,
-            fail_request=self._fail_via_admission,
-        )
-        self._active: Dict[int, _PendingRequest] = {}
-        # Admission-time failures surface as completions the kernel delivers.
-        self._admission_failures: List[Completion] = []
-
-    # -- ingress (event-loop thread) ----------------------------------
-
-    def submit(self, request: _PendingRequest) -> None:
-        ready = self._admission.submit(request)
-        if ready is not None:
-            self._admit_ready(ready)
-
-    # -- step (kernel thread) -----------------------------------------
-
-    @property
-    def has_work(self) -> bool:
-        """Queued, admitting, or in-flight work remains (read-only)."""
-        return (
-            self._scheduler.has_pending_work()
-            or self._admission.has_pending()
-            or bool(self._active)
-            or bool(self._admission_failures)
-        )
-
-    def advance(self) -> TickResult:
-        scheduler = self._scheduler
-        progressed = False
-        completed: List[Completion] = []
-
-        if self._admission_failures:
-            completed.extend(self._admission_failures)
-            self._admission_failures = []
-            progressed = True
-
-        progressed = self._promote_ready() or progressed
-
-        if scheduler.has_pending_work():
-            progressed = scheduler.advance() or progressed
-
-        for result in scheduler.pop_completed():
-            completion = self._completion_for(result)
-            if completion is not None:
-                completed.append(completion)
-            progressed = True
-
-        return TickResult(
-            progressed=progressed,
-            completed=tuple(completed),
-            in_flight=scheduler.has_pending_work(),
-            has_work=(
-                scheduler.has_pending_work()
-                or self._admission.has_pending()
-                or bool(self._active)
-            ),
-        )
-
-    def drain(self) -> tuple[Completion, ...]:
-        """Complete in-flight pipeline work (used before a pause)."""
-        self._scheduler._drain_pipeline()
-        completed: List[Completion] = []
-        for result in self._scheduler.pop_completed():
-            completion = self._completion_for(result)
-            if completion is not None:
-                completed.append(completion)
-        return tuple(completed)
-
-    def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
-        exc = error or RuntimeError("Engine shut down")
-        completions = [c for c in self._admission_failures]
-        self._admission_failures = []
-        self._admission.fail_all(exc)
-        for req in self._active.values():
-            completions.append(Completion(request=req, error=exc))
-        self._active.clear()
-        self._release_active_sequences()
-        return tuple(completions)
-
-    # -- internals ----------------------------------------------------
-
-    def _fail_via_admission(
-        self, req: _PendingRequest, error: BaseException
-    ) -> None:
-        self._admission_failures.append(Completion(request=req, error=error))
-
-    def _admit_ready(self, ready: _ReadyAdmission) -> None:
-        req = ready.req
-        try:
-            generation_req, skill_state = self._build_generation_request(
-                self._runtime, req, ready.crops
-            )
-        except Exception as exc:
-            self._admission_failures.append(Completion(request=req, error=exc))
-            return
-        crops_ready = (
-            req.image is None or ready.prefix_cache_hit or (ready.crops is not None)
-        )
-        lora_slot_ready = req.adapter is None
-        phase = (
-            RequestPhase.READY_FOR_PREFILL
-            if (crops_ready and lora_slot_ready)
-            else RequestPhase.WAITING_RESOURCES
-        )
-        lifecycle = RequestLifecycle(
-            request=generation_req,
-            skill_state=skill_state,
-            phase=phase,
-            has_image=req.image is not None,
-            crops_ready=crops_ready,
-            lora_slot_ready=lora_slot_ready,
-            prefix_cache_hit=ready.prefix_cache_hit,
-            submitted_at=req.submitted_at,
-        )
-        generation_req.lifecycle = lifecycle
-        self._scheduler.enqueue_request(generation_req, skill_state)
-        self._active[req.request_id] = req
-
-    def _promote_ready(self) -> bool:
-        promoted = False
-        cap = self._runtime.max_batch_size * 4
-        while len(self._scheduler.waiting) < cap:
-            ready = self._admission.take_ready()
-            if ready is None:
-                break
-            self._admit_ready(ready)
-            promoted = True
-        return promoted
-
-    def _completion_for(self, result: SchedulerResult) -> Optional[Completion]:
-        req = self._active.pop(result.request_id, None)
-        if req is None:
-            _LOGGER.error(
-                "Scheduler produced unknown request_id %s", result.request_id
-            )
-            return None
-        if result.finish_reason == "error" and "error" in result.output:
-            return Completion(
-                request=req, error=RuntimeError(result.output["error"])
-            )
-        return Completion(request=req, result=self._to_engine_result(result))
-
-    def _release_active_sequences(self) -> None:
-        try:
-            runtime_sequences = list(self._runtime.active_sequences.values())
-        except Exception:  # pragma: no cover - defensive cleanup
-            return
-        for state in runtime_sequences:
-            try:
-                self._runtime.release_sequence(state)
-            except Exception:
-                pass
 
 
 class InferenceEngine:
@@ -1938,13 +1500,3 @@ class InferenceEngine:
             self._fail_request(pending, exc)
 
 
-__all__ = [
-    "InferenceEngine",
-    "EngineResult",
-    "EngineMetrics",
-    "EngineStream",
-    "Executor",
-    "AutoregressiveExecutor",
-    "Completion",
-    "TickResult",
-]
