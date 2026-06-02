@@ -82,6 +82,21 @@ def test_single_pass_handle_advertises_runtime_tasks() -> None:
     assert h.supports("query") is False
 
 
+def test_default_handle_tasks_honor_skill_override() -> None:
+    """The default model reports the registry that actually executes its
+    verbs. With a ``_skills_override`` set, ``tasks``/``supports`` must
+    reflect the override — not the built runtime's own skills — so the
+    handle never hides or rejects a skill the engine would run."""
+    eng = _engine()
+    # Override the default model's skills; the built runtime still advertises
+    # its own ("query", "caption", "segment") via its skills= lambda.
+    eng._skills_override = SkillRegistry([QuerySkill()])
+    h = eng.model("ar-model")
+    assert h.tasks == ("query",)
+    assert h.supports("query") is True
+    assert h.supports("caption") is False
+
+
 def test_unsupported_capability_raises_clearly() -> None:
     eng = _engine()
     sp = eng.model("sp-model")

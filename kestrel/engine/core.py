@@ -734,19 +734,20 @@ class InferenceEngine:
     def _tasks_for(self, model_id: str) -> tuple[str, ...]:
         """Capability names a registered model serves.
 
-        Every runtime advertises its own tasks via ``runtime.tasks()``.
-        For the default model taken before startup (runtime not built
-        yet), fall back to the active skill registry so the handle works
-        pre-init; unbuilt non-default models can't report tasks until
-        startup.
+        The default model reports exactly what its autoregressive verbs
+        will run — ``_skill_registry()`` (the test override, the built
+        runtime's skills, or the spec's). This keeps reported capabilities
+        consistent with execution, works before startup, and does not
+        require ``tasks()`` on the autoregressive runtime protocol. Every
+        other (single-pass) model advertises its own ``runtime.tasks()``
+        once built.
         """
+        if model_id == self._default_model:
+            return self._skill_registry().names()
         runtime = self._runtimes.get(model_id)
         if runtime is not None:
             return tuple(runtime.tasks())
-        if model_id != self._default_model:
-            raise ValueError(f"Unknown model {model_id!r}")
-        # Default model not built yet: its skills are known pre-init.
-        return self._skill_registry().names()
+        raise ValueError(f"Unknown model {model_id!r}")
 
     async def _submit_request(
         self,

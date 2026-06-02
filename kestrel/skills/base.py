@@ -228,26 +228,18 @@ class SkillState:
         return None
 
 class SkillRegistry:
-    """Lookup table for skills with a default entry."""
+    """Maps a model's capability names to their skills.
+
+    May be empty: a model with no autoregressive skills (e.g. a single-pass
+    model) registers none and advertises its tasks via the runtime instead.
+    """
 
     def __init__(self, skills: Iterable[SkillSpec]) -> None:
         self._skills: Dict[str, SkillSpec] = {}
-        self._default: Optional[str] = None
         for spec in skills:
-            name = spec.name
-            if name in self._skills:
-                raise ValueError(f"Duplicate skill registered: {name}")
-            self._skills[name] = spec
-            if self._default is None:
-                self._default = name
-        if self._default is None:
-            raise ValueError("SkillRegistry requires at least one skill")
-
-    # ------------------------------------------------------------------
-
-    @property
-    def default(self) -> SkillSpec:
-        return self._skills[self._default]  # type: ignore[index]
+            if spec.name in self._skills:
+                raise ValueError(f"Duplicate skill registered: {spec.name}")
+            self._skills[spec.name] = spec
 
     def names(self) -> tuple[str, ...]:
         """Registered skill names, in registration order."""
@@ -258,8 +250,3 @@ class SkillRegistry:
             return self._skills[skill]
         except KeyError as exc:  # pragma: no cover - defensive guard
             raise ValueError(f"Unknown skill '{skill}'") from exc
-
-    def add(self, spec: SkillSpec) -> None:
-        if spec.name in self._skills:
-            raise ValueError(f"Skill '{spec.name}' already registered")
-        self._skills[spec.name] = spec
