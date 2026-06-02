@@ -191,13 +191,22 @@ class AutoregressiveRuntime(Runtime, Protocol):
 class SinglePassRuntime(Runtime, Protocol):
     """Runtime that fulfills a request with a single forward.
 
-    No KV cache, no decode loop. The engine's single-pass executor hands
-    it a task name + inputs and returns the result. ``run`` is the whole
-    contract beyond image preprocessing.
+    No KV cache, no decode loop. The driver is pure compute: ``forward``
+    enqueues the kernels for one forward and returns the result tensors
+    *without* a host sync, so the engine's single-pass executor can let
+    that work overlap autoregressive decode on the shared stream. The
+    executor owns the completion event, slot, and result delivery (the
+    driver↔executor split mirrors the autoregressive path, where the
+    model computes and the scheduler owns the pipeline).
+
+    A synchronous ``forward`` (one that blocks on its own result) would
+    stall the kernel loop and defeat interleaving — implementations must
+    not call ``.item()`` / ``.cpu()`` / ``torch.cuda.synchronize`` before
+    returning.
     """
 
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...
 
-    def run(self, task: str, inputs: Any) -> Any: ...
+    def forward(self, task: str, inputs: Any) -> Any: ...
