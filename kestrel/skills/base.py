@@ -133,6 +133,10 @@ class SkillRegistry:
     def default(self) -> SkillSpec:
         return self._skills[self._default]  # type: ignore[index]
 
+    def names(self) -> tuple[str, ...]:
+        """Registered skill names, in registration order."""
+        return tuple(self._skills)
+
     def resolve(self, skill: str) -> SkillSpec:
         try:
             return self._skills[skill]

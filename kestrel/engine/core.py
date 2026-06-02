@@ -93,6 +93,7 @@ from kestrel.engine._types import (
 )
 from kestrel.engine.executor import AutoregressiveExecutor
 from kestrel.engine.single_pass import SinglePassExecutor, _SinglePassRequest
+from kestrel.engine.handle import ModelHandle
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -900,6 +901,49 @@ class InferenceEngine:
         self._single_pass_queue.put((model, req))
         self._scheduler_event.set()
         return await future
+
+    def model(self, model_id: Optional[str] = None) -> "ModelHandle":
+        """Return a :class:`ModelHandle` bound to ``model_id``.
+
+        The primary surface: bind a model once, then call its capability
+        methods (``query`` / ``segment_masks`` / ...) or ``run``. Defaults
+        to the configured default model.
+
+        Validates against the *configured* models, so a handle can be taken
+        before the engine is started (runtimes are built lazily in
+        ``_initialize``); the handle's async methods trigger startup. Raises
+        if the id isn't a configured model.
+        """
+        target = model_id or self._default_model
+        if target not in self._configured_models():
+            known = ", ".join(sorted(self._configured_models())) or "none"
+            raise ValueError(f"Unknown model {target!r} (configured: {known})")
+        return ModelHandle(self, target)
+
+    def _configured_models(self) -> set[str]:
+        """Model ids this engine serves — built or pending build.
+
+        Built runtimes plus the configured default, so model() works both
+        before and after ``_initialize`` populates ``_runtimes``.
+        """
+        return set(self._runtimes) | {self._default_model}
+
+    def _tasks_for(self, model_id: str) -> tuple[str, ...]:
+        """Capability names a registered model serves.
+
+        Single-pass models advertise the tasks their runtime declares;
+        autoregressive models advertise the engine's skill vocabulary
+        (known without the runtime built, so this works pre-init for the
+        default model). Unbuilt non-default models can't report tasks
+        until startup.
+        """
+        runtime = self._runtimes.get(model_id)
+        if runtime is not None and runtime.execution_shape is ExecutionShape.SINGLE_PASS:
+            return tuple(runtime.tasks())
+        if runtime is None and model_id != self._default_model:
+            raise ValueError(f"Unknown model {model_id!r}")
+        # Built AR runtime, or the default AR model not yet built.
+        return self._skills.names()
 
     async def _submit_request(
         self,
