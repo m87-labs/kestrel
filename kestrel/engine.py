@@ -43,6 +43,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -304,6 +305,244 @@ class _AdmissionCoordinator:
                 self._ready_crops.get_nowait()
             except queue.Empty:
                 break
+
+
+@dataclass(slots=True)
+class Completion:
+    """A terminal result from an executor, for the kernel to deliver.
+
+    Executors emit these as plain values and never touch the event loop
+    or telemetry; the kernel maps each ``Completion`` to its effects
+    (resolve the request future, record usage, finish the stream). This
+    keeps executors pure-compute and directly testable.
+
+    Exactly one of ``result`` / ``error`` is set.
+    """
+
+    request: "_PendingRequest"
+    result: Optional[EngineResult] = None
+    error: Optional[BaseException] = None
+
+
+@dataclass(frozen=True, slots=True)
+class TickResult:
+    """Immutable summary of one executor ``advance`` step."""
+
+    progressed: bool = False
+    completed: tuple[Completion, ...] = ()
+    in_flight: bool = False  # GPU work outstanding (gates pause drain)
+    has_work: bool = False   # queued or in flight (gates shutdown exit)
+
+
+class Executor(Protocol):
+    """A kernel-side lane wrapping one driver behind a uniform face.
+
+    The kernel loop folds ``advance`` over its executors without knowing
+    the execution shape. ``submit`` runs on the event-loop thread
+    (thread-safe ingress); ``advance`` / ``shutdown`` run on the kernel
+    thread. ``advance`` returns an immutable :class:`TickResult`; the
+    kernel performs the effects for any ``completed`` entries.
+    """
+
+    def submit(self, request: "_PendingRequest") -> None: ...
+
+    def advance(self) -> TickResult: ...
+
+    def shutdown(self, error: Optional[BaseException] = ...) -> None: ...
+
+
+class AutoregressiveExecutor:
+    """Executor lane wrapping the autoregressive prefill/decode scheduler.
+
+    Owns the :class:`GenerationScheduler`, the image-crop admission
+    coordinator, and the in-flight request map. The pipelined-decode
+    internals (``PipelineState``, ``launch_forward_async``,
+    ``commit_step``, ping-pong slots) are untouched — this is a
+    lift-and-wrap of the engine's former scheduler loop into the uniform
+    :class:`Executor` face, with delivery turned into :class:`Completion`
+    values the kernel acts on.
+    """
+
+    def __init__(
+        self,
+        runtime: AutoregressiveRuntime,
+        *,
+        skills: "SkillRegistry",
+        adapter_provider: Optional[AdapterProvider],
+        default_temperature: float,
+        default_top_p: float,
+        build_generation_request: Callable[
+            [AutoregressiveRuntime, "_PendingRequest", Any],
+            "tuple[GenerationRequest, SkillState]",
+        ],
+        to_engine_result: Callable[[SchedulerResult], EngineResult],
+        wake_event: threading.Event,
+    ) -> None:
+        self._runtime = runtime
+        self._build_generation_request = build_generation_request
+        self._to_engine_result = to_engine_result
+        self._scheduler = GenerationScheduler(
+            runtime,
+            default_temperature=default_temperature,
+            default_top_p=default_top_p,
+            skill_registry=skills,
+            adapter_provider=adapter_provider,
+        )
+        # Admission wakes the kernel loop when async crop work completes.
+        self._admission = _AdmissionCoordinator(
+            runtime=runtime,
+            wake_event=wake_event,
+            fail_request=self._fail_via_admission,
+        )
+        self._active: Dict[int, _PendingRequest] = {}
+        # Admission-time failures surface as completions the kernel delivers.
+        self._admission_failures: List[Completion] = []
+
+    # -- ingress (event-loop thread) ----------------------------------
+
+    def submit(self, request: _PendingRequest) -> None:
+        ready = self._admission.submit(request)
+        if ready is not None:
+            self._admit_ready(ready)
+
+    # -- step (kernel thread) -----------------------------------------
+
+    @property
+    def has_work(self) -> bool:
+        """Queued, admitting, or in-flight work remains (read-only)."""
+        return (
+            self._scheduler.has_pending_work()
+            or self._admission.has_pending()
+            or bool(self._active)
+            or bool(self._admission_failures)
+        )
+
+    def advance(self) -> TickResult:
+        scheduler = self._scheduler
+        progressed = False
+        completed: List[Completion] = []
+
+        if self._admission_failures:
+            completed.extend(self._admission_failures)
+            self._admission_failures = []
+            progressed = True
+
+        progressed = self._promote_ready() or progressed
+
+        if scheduler.has_pending_work():
+            progressed = scheduler.advance() or progressed
+
+        for result in scheduler.pop_completed():
+            completion = self._completion_for(result)
+            if completion is not None:
+                completed.append(completion)
+            progressed = True
+
+        return TickResult(
+            progressed=progressed,
+            completed=tuple(completed),
+            in_flight=scheduler.has_pending_work(),
+            has_work=(
+                scheduler.has_pending_work()
+                or self._admission.has_pending()
+                or bool(self._active)
+            ),
+        )
+
+    def drain(self) -> tuple[Completion, ...]:
+        """Complete in-flight pipeline work (used before a pause)."""
+        self._scheduler._drain_pipeline()
+        completed: List[Completion] = []
+        for result in self._scheduler.pop_completed():
+            completion = self._completion_for(result)
+            if completion is not None:
+                completed.append(completion)
+        return tuple(completed)
+
+    def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
+        exc = error or RuntimeError("Engine shut down")
+        completions = [c for c in self._admission_failures]
+        self._admission_failures = []
+        self._admission.fail_all(exc)
+        for req in self._active.values():
+            completions.append(Completion(request=req, error=exc))
+        self._active.clear()
+        self._release_active_sequences()
+        return tuple(completions)
+
+    # -- internals ----------------------------------------------------
+
+    def _fail_via_admission(
+        self, req: _PendingRequest, error: BaseException
+    ) -> None:
+        self._admission_failures.append(Completion(request=req, error=error))
+
+    def _admit_ready(self, ready: _ReadyAdmission) -> None:
+        req = ready.req
+        try:
+            generation_req, skill_state = self._build_generation_request(
+                self._runtime, req, ready.crops
+            )
+        except Exception as exc:
+            self._admission_failures.append(Completion(request=req, error=exc))
+            return
+        crops_ready = (
+            req.image is None or ready.prefix_cache_hit or (ready.crops is not None)
+        )
+        lora_slot_ready = req.adapter is None
+        phase = (
+            RequestPhase.READY_FOR_PREFILL
+            if (crops_ready and lora_slot_ready)
+            else RequestPhase.WAITING_RESOURCES
+        )
+        lifecycle = RequestLifecycle(
+            request=generation_req,
+            skill_state=skill_state,
+            phase=phase,
+            has_image=req.image is not None,
+            crops_ready=crops_ready,
+            lora_slot_ready=lora_slot_ready,
+            prefix_cache_hit=ready.prefix_cache_hit,
+            submitted_at=req.submitted_at,
+        )
+        generation_req.lifecycle = lifecycle
+        self._scheduler.enqueue_request(generation_req, skill_state)
+        self._active[req.request_id] = req
+
+    def _promote_ready(self) -> bool:
+        promoted = False
+        cap = self._runtime.max_batch_size * 4
+        while len(self._scheduler.waiting) < cap:
+            ready = self._admission.take_ready()
+            if ready is None:
+                break
+            self._admit_ready(ready)
+            promoted = True
+        return promoted
+
+    def _completion_for(self, result: SchedulerResult) -> Optional[Completion]:
+        req = self._active.pop(result.request_id, None)
+        if req is None:
+            _LOGGER.error(
+                "Scheduler produced unknown request_id %s", result.request_id
+            )
+            return None
+        if result.finish_reason == "error" and "error" in result.output:
+            return Completion(
+                request=req, error=RuntimeError(result.output["error"])
+            )
+        return Completion(request=req, result=self._to_engine_result(result))
+
+    def _release_active_sequences(self) -> None:
+        try:
+            runtime_sequences = list(self._runtime.active_sequences.values())
+        except Exception:  # pragma: no cover - defensive cleanup
+            return
+        for state in runtime_sequences:
+            try:
+                self._runtime.release_sequence(state)
+            except Exception:
+                pass
 
 
 class InferenceEngine:
@@ -1448,17 +1687,6 @@ class InferenceEngine:
             except Exception:
                 _LOGGER.exception("Failed to record Photon error telemetry")
 
-    def _release_active_sequences(self) -> None:
-        try:
-            runtime_sequences = list(self.runtime.active_sequences.values())
-        except Exception:  # pragma: no cover - defensive cleanup
-            return
-        for state in runtime_sequences:
-            try:
-                self.runtime.release_sequence(state)
-            except Exception:
-                pass
-
     def _extract_prompt_text(self, skill: SkillSpec, request_context: object) -> str:
         if isinstance(request_context, QueryRequest):
             return request_context.question
@@ -1478,99 +1706,33 @@ class InferenceEngine:
             return
         set_device(runtime.device)
 
-        adapter_provider = self._adapter_provider
-        scheduler = GenerationScheduler(
+        executor = AutoregressiveExecutor(
             runtime,
+            skills=self._skills,
+            adapter_provider=self._adapter_provider,
             default_temperature=self._default_temperature,
             default_top_p=self._default_top_p,
-            skill_registry=self._skills,
-            adapter_provider=adapter_provider,
+            build_generation_request=self._build_generation_request,
+            to_engine_result=self._to_engine_result,
+            wake_event=self._scheduler_event,
         )
 
-        active_requests: Dict[int, _PendingRequest] = {}
         shutdown_requested = False
         wake_event = self._scheduler_event
         run_gate = self._run_gate
         paused_flag = self._paused_flag
         paused_event = self._paused_event
-        admission = _AdmissionCoordinator(
-            runtime=runtime,
-            wake_event=wake_event,
-            fail_request=self._fail_request,
-        )
 
-        def admit_request(
-            req: _PendingRequest,
-            crops: Any,
-            *,
-            prefix_cache_hit: bool = False,
-        ) -> None:
-            try:
-                generation_req, skill_state = self._build_generation_request(
-                    runtime, req, crops
-                )
-            except Exception as exc:
-                self._fail_request(req, exc)
-                return
-            crops_ready = (
-                req.image is None or prefix_cache_hit or (crops is not None)
-            )
-            lora_slot_ready = req.adapter is None
-            phase = (
-                RequestPhase.READY_FOR_PREFILL
-                if (crops_ready and lora_slot_ready)
-                else RequestPhase.WAITING_RESOURCES
-            )
-            lifecycle = RequestLifecycle(
-                request=generation_req,
-                skill_state=skill_state,
-                phase=phase,
-                has_image=req.image is not None,
-                crops_ready=crops_ready,
-                lora_slot_ready=lora_slot_ready,
-                prefix_cache_hit=prefix_cache_hit,
-                submitted_at=req.submitted_at,
-            )
-            generation_req.lifecycle = lifecycle
-            scheduler.enqueue_request(generation_req, skill_state)
-            active_requests[req.request_id] = req
-
-        def admit_ready(ready: _ReadyAdmission) -> None:
-            admit_request(
-                ready.req,
-                ready.crops,
-                prefix_cache_hit=ready.prefix_cache_hit,
-            )
-
-        def promote_ready_requests() -> bool:
-            promoted = False
-            while len(scheduler.waiting) < runtime.max_batch_size * 4:
-                ready = admission.take_ready()
-                if ready is None:
-                    break
-                admit_ready(ready)
-                promoted = True
-            return promoted
-
-        def deliver_results(results: List[SchedulerResult]) -> None:
-            if not results:
-                return
+        def deliver(completions: tuple[Completion, ...]) -> None:
             loop = self._loop
             assert loop is not None
-            for result in results:
-                req = active_requests.pop(result.request_id, None)
-                if req is None:
-                    _LOGGER.error(
-                        "Scheduler produced unknown request_id %s",
-                        result.request_id,
-                    )
+            for c in completions:
+                req = c.request
+                if c.error is not None:
+                    self._fail_request(req, c.error)
                     continue
-                if result.finish_reason == "error" and "error" in result.output:
-                    # Fail only the offending request while keeping the engine running.
-                    self._fail_request(req, RuntimeError(result.output["error"]))
-                    continue
-
-                engine_result = self._to_engine_result(result)
+                engine_result = c.result
+                assert engine_result is not None
                 if self._photon_reporter is not None:
                     try:
                         self._photon_reporter.record_success(
@@ -1585,31 +1747,19 @@ class InferenceEngine:
                     loop.call_soon_threadsafe(future.set_result, engine_result)
                 self._complete_stream(req, result=engine_result)
 
-        def should_exit() -> bool:
-            return (
-                shutdown_requested
-                and not scheduler.has_pending_work()
-                and not admission.has_pending()
-                and not active_requests
-            )
-
         try:
             with torch.inference_mode():
                 while True:
                     # If paused, wait until resumed or shutdown completes.
                     if paused_flag.is_set():
-                        # Drain pipeline before pause - complete all in-flight work.
-                        # Required per design doc §4.5a: callers may mutate runtime
-                        # state while paused (e.g. rebuild CUDA graphs).
-                        scheduler._drain_pipeline()
-                        # Deliver any results from drained steps before pausing.
-                        drained_results = scheduler.pop_completed()
-                        if drained_results:
-                            deliver_results(drained_results)
+                        # Drain in-flight work before pause — callers may
+                        # mutate runtime state while paused (e.g. rebuild
+                        # CUDA graphs).
+                        deliver(executor.drain())
                         with runtime.graph_capture_lock:
                             synchronize(runtime.device)
                         paused_event.set()
-                        if should_exit():
+                        if shutdown_requested and not executor.has_work:
                             break
                         run_gate.wait(timeout=0.1)
                         continue
@@ -1623,30 +1773,22 @@ class InferenceEngine:
                         if item is None:
                             shutdown_requested = True
                             continue
-                        ready = admission.submit(item)
-                        if ready is not None:
-                            admit_ready(ready)
-                        progressed = True
-
-                    if promote_ready_requests():
+                        executor.submit(item)
                         progressed = True
 
                     try:
-                        if scheduler.has_pending_work():
-                            progressed = scheduler.advance() or progressed
+                        tick = executor.advance()
                     except Exception as exc:
-                        _LOGGER.exception("Scheduler advance failed", exc_info=exc)
-                        admission.fail_all(exc)
-                        self._fail_all_pending(active_requests, exc)
-                        self._release_active_sequences()
+                        _LOGGER.exception("Executor advance failed", exc_info=exc)
+                        deliver(executor.shutdown(exc))
+                        self._fail_all_pending(exc)
                         return
 
-                    results = scheduler.pop_completed()
-                    if results:
-                        deliver_results(results)
-                        progressed = True
+                    if tick.completed:
+                        deliver(tick.completed)
+                    progressed = tick.progressed or progressed
 
-                    if should_exit():
+                    if shutdown_requested and not tick.has_work:
                         break
 
                     if not progressed:
@@ -1655,8 +1797,8 @@ class InferenceEngine:
                         wake_event.wait()
                         wake_event.clear()
         finally:
-            admission.fail_all()
-            self._fail_all_pending(active_requests)
+            deliver(executor.shutdown())
+            self._fail_all_pending()
 
     def _build_generation_request(
         self,
@@ -1777,14 +1919,15 @@ class InferenceEngine:
 
     def _fail_all_pending(
         self,
-        active_requests: Dict[int, _PendingRequest],
         error: Optional[BaseException] = None,
     ) -> None:
+        """Fail any requests still sitting in the ingress queue.
+
+        In-flight requests are owned by the executor (failed via its
+        ``shutdown``); this drains only what the kernel hasn't handed off
+        yet.
+        """
         exc = error or RuntimeError("Engine shut down")
-        if active_requests:
-            for req in list(active_requests.values()):
-                self._fail_request(req, exc)
-            active_requests.clear()
         while True:
             try:
                 pending = self._scheduler_queue.get_nowait()
@@ -1795,4 +1938,13 @@ class InferenceEngine:
             self._fail_request(pending, exc)
 
 
-__all__ = ["InferenceEngine", "EngineResult", "EngineMetrics", "EngineStream"]
+__all__ = [
+    "InferenceEngine",
+    "EngineResult",
+    "EngineMetrics",
+    "EngineStream",
+    "Executor",
+    "AutoregressiveExecutor",
+    "Completion",
+    "TickResult",
+]
