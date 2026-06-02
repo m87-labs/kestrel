@@ -96,13 +96,18 @@ class ModelHandle:
     # Thin forwarders to the engine's typed verbs. Each gates on the model
     # serving the capability AND on it being the default AR model (the
     # verbs don't yet route by model id), then delegates.
+    #
+    # These re-declare the verbs' keyword defaults, so they must stay in
+    # sync with InferenceEngine's — a mismatch silently changes behavior
+    # for the same call through the handle (e.g. query's reasoning=True).
+    # test_model_handle::test_handle_verb_defaults_match_engine guards this.
 
     async def query(
         self,
         image: Optional[np.ndarray | bytes],
         question: str,
         *,
-        reasoning: bool = False,
+        reasoning: bool = True,  # match InferenceEngine.query — see note below
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,

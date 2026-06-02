@@ -119,6 +119,27 @@ def test_ar_verb_on_non_default_model_fails_loud() -> None:
         asyncio.run(h.query(None, "hi?"))
 
 
+def test_handle_verb_defaults_match_engine() -> None:
+    """A handle verb is a thin forwarder; its keyword defaults must match
+    InferenceEngine's, or the same call drifts behavior through the handle
+    (e.g. query's reasoning default). Introspect both, compare shared
+    keyword params — guards all verbs, not just the one Codex caught."""
+    import inspect
+
+    for verb in ("query", "caption", "detect", "point", "segment"):
+        eng_params = inspect.signature(getattr(InferenceEngine, verb)).parameters
+        h_params = inspect.signature(getattr(ModelHandle, verb)).parameters
+        for name, h_p in h_params.items():
+            if name == "self" or h_p.default is inspect.Parameter.empty:
+                continue
+            eng_p = eng_params.get(name)
+            assert eng_p is not None, f"{verb}: handle has param {name!r} engine lacks"
+            assert h_p.default == eng_p.default, (
+                f"{verb}: default for {name!r} drifted — "
+                f"handle={h_p.default!r} engine={eng_p.default!r}"
+            )
+
+
 def test_run_on_ar_model_rejected_with_clear_message() -> None:
     """run() is the single-pass escape hatch; on an AR model it should say
     so, not die downstream in engine.run()."""
