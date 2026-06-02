@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Sequence, Union
 
 import numpy as np
 
@@ -103,7 +103,7 @@ class EngineStream(AsyncIterator[StreamUpdate]):
 
 
 @dataclass(slots=True)
-class _PendingRequest:
+class _AutoregressiveRequest:
     request_id: int
     prompt: str
     prompt_tokens: Sequence[Token]
@@ -126,7 +126,7 @@ class _PendingRequest:
 
 @dataclass(slots=True)
 class _ReadyAdmission:
-    req: _PendingRequest
+    req: _AutoregressiveRequest
     crops: Any
     prefix_cache_hit: bool
 
@@ -135,6 +135,30 @@ def _hash_image(image: np.ndarray | bytes) -> bytes:
     """SHA-256 over the raw image input for prefix-cache keying."""
     raw = image.tobytes() if isinstance(image, np.ndarray) else image
     return hashlib.sha256(raw).digest()
+
+
+class EngineRequest(Protocol):
+    """The envelope the kernel needs to return an answer to a caller.
+
+    Every execution shape submits a concrete request carrying its own
+    lane-specific payload (``_AutoregressiveRequest`` holds prompt/tokens/skill
+    for the autoregressive lane; the single-pass lane holds task/inputs).
+    What the kernel's delivery path actually touches is only this common
+    envelope: the identity, the future to resolve, the optional stream
+    sink, and the finetune id. Typing ``Completion.request`` as this
+    protocol keeps the kernel's return path independent of any one lane's
+    request type — a new lane defines its own request satisfying this and
+    nothing in delivery changes.
+
+    ``adapter`` is the finetune id (``None`` when no finetune is
+    selected); it is reported to telemetry and, for lanes that support
+    finetunes, selects the weights.
+    """
+
+    request_id: int
+    future: "asyncio.Future[EngineResult]"
+    stream_queue: "Optional[_StreamQueue]"
+    adapter: Optional[str]
 
 
 @dataclass(slots=True)
@@ -149,7 +173,7 @@ class Completion:
     Exactly one of ``result`` / ``error`` is set.
     """
 
-    request: "_PendingRequest"
+    request: EngineRequest
     result: Optional[EngineResult] = None
     error: Optional[BaseException] = None
 

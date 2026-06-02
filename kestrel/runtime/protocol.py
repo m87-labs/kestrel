@@ -71,6 +71,12 @@ class Runtime(Protocol):
     # Which executor drives this runtime.
     execution_shape: ExecutionShape
 
+    # Release the runtime's resources. Called once by the engine on
+    # shutdown for every registered runtime, regardless of shape, so
+    # teardown lives on the universal surface (the AR runtime tears down
+    # its image preprocessor here; a single-pass runtime may be a no-op).
+    def shutdown(self) -> None: ...
+
 
 class AutoregressiveRuntime(Runtime, Protocol):
     """Surface the scheduler calls on a prefill/decode runtime.
@@ -123,10 +129,6 @@ class AutoregressiveRuntime(Runtime, Protocol):
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...
-
-    # Called once when the engine is shutting down so the runtime can
-    # tear down its preprocessing thread pool (if any).
-    def shutdown_image_preprocessor(self) -> None: ...
 
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...
@@ -191,13 +193,29 @@ class AutoregressiveRuntime(Runtime, Protocol):
 class SinglePassRuntime(Runtime, Protocol):
     """Runtime that fulfills a request with a single forward.
 
-    No KV cache, no decode loop. The engine's single-pass executor hands
-    it a task name + inputs and returns the result. ``run`` is the whole
-    contract beyond image preprocessing.
+    No KV cache, no decode loop. The driver is pure compute: ``forward``
+    enqueues the kernels for one forward and returns the result tensors
+    *without* a host sync, so the engine's single-pass executor can let
+    that work overlap autoregressive decode on the shared stream. The
+    executor owns the completion event, slot, and result delivery (the
+    driver↔executor split mirrors the autoregressive path, where the
+    model computes and the scheduler owns the pipeline).
+
+    A synchronous ``forward`` (one that blocks on its own result) would
+    stall the kernel loop and defeat interleaving — implementations must
+    not call ``.item()`` / ``.cpu()`` / ``torch.cuda.synchronize`` before
+    returning.
     """
+
+    # Stream the executor launches forwards on, so a single-pass forward
+    # and autoregressive decode share one ordered stream (the device's
+    # serialize-on-stream invariant). Declared here — not discovered via
+    # getattr — so a runtime that omits it fails loudly rather than
+    # silently running on the default stream with no interleaving.
+    primary_stream: Any
 
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...
 
-    def run(self, task: str, inputs: Any) -> Any: ...
+    def forward(self, task: str, inputs: Any) -> Any: ...

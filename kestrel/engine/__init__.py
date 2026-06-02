@@ -16,7 +16,8 @@ from kestrel.engine.executor import (
     Executor,
     _AdmissionCoordinator,
 )
-from kestrel.engine._types import _PendingRequest
+from kestrel.engine.single_pass import SinglePassExecutor
+from kestrel.engine._types import _AutoregressiveRequest
 from kestrel.engine.core import InferenceEngine
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "EngineStream",
     "Executor",
     "AutoregressiveExecutor",
+    "SinglePassExecutor",
     "Completion",
     "TickResult",
 ]

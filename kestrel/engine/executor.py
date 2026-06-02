@@ -32,7 +32,7 @@ from kestrel.engine._types import (
     Completion,
     EngineResult,
     TickResult,
-    _PendingRequest,
+    _AutoregressiveRequest,
     _ReadyAdmission,
     _hash_image,
 )
@@ -45,7 +45,7 @@ class _AdmissionCoordinator:
         self,
         runtime: AutoregressiveRuntime,
         wake_event: threading.Event,
-        fail_request: Callable[[_PendingRequest, BaseException], None],
+        fail_request: Callable[[_AutoregressiveRequest, BaseException], None],
     ) -> None:
         self._runtime = runtime
         self._wake_event = wake_event
@@ -55,14 +55,14 @@ class _AdmissionCoordinator:
         # Gemma 4's pixel_values bundle, etc.) and threads them back
         # into ``launch_prepared_batch``.
         self._pending_crops: Dict[
-            int, tuple[_PendingRequest, "Future[Any]"]
+            int, tuple[_AutoregressiveRequest, "Future[Any]"]
         ] = {}
         self._ready_crops: queue.Queue[int] = queue.Queue()
 
     def has_pending(self) -> bool:
         return bool(self._pending_crops)
 
-    def submit(self, req: _PendingRequest) -> Optional[_ReadyAdmission]:
+    def submit(self, req: _AutoregressiveRequest) -> Optional[_ReadyAdmission]:
         if req.image is None:
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
 
@@ -137,7 +137,7 @@ class Executor(Protocol):
     kernel performs the effects for any ``completed`` entries.
     """
 
-    def submit(self, request: "_PendingRequest") -> None: ...
+    def submit(self, request: "_AutoregressiveRequest") -> None: ...
 
     def advance(self) -> TickResult: ...
 
@@ -165,7 +165,7 @@ class AutoregressiveExecutor:
         default_temperature: float,
         default_top_p: float,
         build_generation_request: Callable[
-            [AutoregressiveRuntime, "_PendingRequest", Any],
+            [AutoregressiveRuntime, "_AutoregressiveRequest", Any],
             "tuple[GenerationRequest, SkillState]",
         ],
         to_engine_result: Callable[[SchedulerResult], EngineResult],
@@ -187,13 +187,13 @@ class AutoregressiveExecutor:
             wake_event=wake_event,
             fail_request=self._fail_via_admission,
         )
-        self._active: Dict[int, _PendingRequest] = {}
+        self._active: Dict[int, _AutoregressiveRequest] = {}
         # Admission-time failures surface as completions the kernel delivers.
         self._admission_failures: List[Completion] = []
 
     # -- ingress (event-loop thread) ----------------------------------
 
-    def submit(self, request: _PendingRequest) -> None:
+    def submit(self, request: _AutoregressiveRequest) -> None:
         ready = self._admission.submit(request)
         if ready is not None:
             self._admit_ready(ready)
@@ -259,7 +259,7 @@ class AutoregressiveExecutor:
     # -- internals ----------------------------------------------------
 
     def _fail_via_admission(
-        self, req: _PendingRequest, error: BaseException
+        self, req: _AutoregressiveRequest, error: BaseException
     ) -> None:
         self._admission_failures.append(Completion(request=req, error=error))
 

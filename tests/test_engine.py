@@ -13,7 +13,7 @@ import pytest
 from kestrel.engine import (
     InferenceEngine,
     _AdmissionCoordinator,
-    _PendingRequest,
+    _AutoregressiveRequest,
 )
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
@@ -22,8 +22,8 @@ from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillStat
 
 def _make_request(
     *, request_id: int = 1, image: np.ndarray | bytes | None = None
-) -> _PendingRequest:
-    return _PendingRequest(
+) -> _AutoregressiveRequest:
+    return _AutoregressiveRequest(
         request_id=request_id,
         prompt="prompt",
         prompt_tokens=[object(), object()],
@@ -112,14 +112,14 @@ class _FakeRuntime:
     def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[object]:
         return self._image_preprocessor.submit(image)
 
-    def shutdown_image_preprocessor(self) -> None:  # pragma: no cover
+    def shutdown(self) -> None:  # pragma: no cover
         pass
 
 
 def _record_failure(
-    failures: list[tuple[_PendingRequest, BaseException]]
-) -> Callable[[_PendingRequest, BaseException], None]:
-    def _fail(req: _PendingRequest, exc: BaseException) -> None:
+    failures: list[tuple[_AutoregressiveRequest, BaseException]]
+) -> Callable[[_AutoregressiveRequest, BaseException], None]:
+    def _fail(req: _AutoregressiveRequest, exc: BaseException) -> None:
         failures.append((req, exc))
 
     return _fail
@@ -130,7 +130,7 @@ def test_admission_coordinator_immediately_admits_text_only_request() -> None:
     runtime = _FakeRuntime(
         prefix_cache=None, prefix_hit=False, image_preprocessor=preprocessor,
     )
-    failures: list[tuple[_PendingRequest, BaseException]] = []
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
         wake_event=threading.Event(),
@@ -153,7 +153,7 @@ def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
     runtime = _FakeRuntime(
         prefix_cache=object(), prefix_hit=True, image_preprocessor=preprocessor,
     )
-    failures: list[tuple[_PendingRequest, BaseException]] = []
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
         wake_event=threading.Event(),
@@ -178,7 +178,7 @@ def test_admission_coordinator_checks_prefix_cache_with_generated_prefix() -> No
     runtime = _FakeRuntime(
         prefix_cache=object(), prefix_hit=True, image_preprocessor=preprocessor,
     )
-    failures: list[tuple[_PendingRequest, BaseException]] = []
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=runtime,
         wake_event=threading.Event(),
@@ -202,7 +202,7 @@ def test_admission_coordinator_promotes_completed_crops() -> None:
     crop_future: Future[object] = Future()
     preprocessor = _FakeImagePreprocessor([crop_future])
     wake_event = threading.Event()
-    failures: list[tuple[_PendingRequest, BaseException]] = []
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=_FakeRuntime(
             prefix_cache=object(), prefix_hit=False,
@@ -236,7 +236,7 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     failed_future: Future[object] = Future()
     ready_future: Future[object] = Future()
     preprocessor = _FakeImagePreprocessor([failed_future, ready_future])
-    failures: list[tuple[_PendingRequest, BaseException]] = []
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
     coordinator = _AdmissionCoordinator(
         runtime=_FakeRuntime(
             prefix_cache=None, prefix_hit=False,

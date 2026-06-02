@@ -20,19 +20,19 @@ from kestrel.engine import (
     Completion,
     EngineResult,
     EngineMetrics,
-    _PendingRequest,
+    _AutoregressiveRequest,
 )
 from kestrel.scheduler import SchedulerResult
 from kestrel.scheduler.types import RequestMetrics
 
 
-def _pending(request_id: int) -> _PendingRequest:
+def _pending(request_id: int) -> _AutoregressiveRequest:
     loop = asyncio.new_event_loop()
     try:
         fut: asyncio.Future = loop.create_future()
     finally:
         loop.close()
-    return _PendingRequest(
+    return _AutoregressiveRequest(
         request_id=request_id,
         prompt="p",
         prompt_tokens=[],

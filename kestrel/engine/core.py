@@ -52,7 +52,7 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.runtime import AutoregressiveRuntime
+from kestrel.runtime import AutoregressiveRuntime, ExecutionShape, SinglePassRuntime
 from kestrel.scheduler import (
     GeneratedPrefix,
     GenerationRequest,
@@ -83,14 +83,16 @@ from kestrel.utils.spatial_refs import normalize_spatial_refs
 from kestrel.engine._types import (
     Completion,
     EngineMetrics,
+    EngineRequest,
     EngineResult,
     EngineStream,
-    _PendingRequest,
+    _AutoregressiveRequest,
     _StreamCompletion,
     _StreamQueue,
     _StreamQueueItem,
 )
 from kestrel.engine.executor import AutoregressiveExecutor
+from kestrel.engine.single_pass import SinglePassExecutor, _SinglePassRequest
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -104,6 +106,12 @@ _ALLOWED_API_BASE_URLS = (
     "https://api-staging.moondream.ai",
     _DEFAULT_API_BASE_URL,
 )
+
+# How long the kernel parks between polls while a single-pass forward is
+# in flight. A single forward is a few ms and its GPU completion event
+# sets no host event, so the kernel re-checks on this cadence; ~1ms keeps
+# completion latency low without busy-spinning a core.
+_SINGLE_PASS_POLL_INTERVAL_S = 0.001
 
 
 class InferenceEngine:
@@ -163,8 +171,15 @@ class InferenceEngine:
         # that it's already inside init and bails without recursing.
         self._initialized = False
         self._init_task: Optional[asyncio.Task[None]] = None
-        self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
-        self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
+        self._queue: asyncio.Queue[Optional[_AutoregressiveRequest]] = asyncio.Queue()
+        self._scheduler_queue: queue.Queue[_AutoregressiveRequest | None] = queue.Queue()
+        # Single-pass ingress: (model_id, request) tagged so the kernel
+        # routes to that model's single-pass lane. Separate from the AR
+        # queue, which has no model tag (it always targets the default
+        # autoregressive model).
+        self._single_pass_queue: "queue.Queue[tuple[str, _SinglePassRequest]]" = (
+            queue.Queue()
+        )
         self._scheduler_event = threading.Event()
         self._run_gate = threading.Event()
         self._run_gate.set()  # set == running
@@ -356,7 +371,7 @@ class InferenceEngine:
             finally:
                 self._photon_reporter = None
         for runtime in self._runtimes.values():
-            runtime.shutdown_image_preprocessor()
+            runtime.shutdown()
 
     async def submit(
         self,
@@ -852,6 +867,40 @@ class InferenceEngine:
         self._run_gate.set()
         self._scheduler_event.set()
 
+    async def run(self, model: str, task: str, inputs: Any) -> EngineResult:
+        """Run a single-pass ``task`` on ``model`` and await its result.
+
+        The low-level multi-model entry point: routes to the model's
+        single-pass lane, which runs one ``forward`` and returns the
+        structured result. (Autoregressive models keep using ``submit`` /
+        the typed verbs.)
+        """
+        if self._shutdown:
+            raise RuntimeError("InferenceEngine is shut down")
+        await self._ensure_started()
+
+        runtime = self._runtimes.get(model)
+        if runtime is None:
+            raise ValueError(f"Unknown model {model!r}")
+        if runtime.execution_shape is not ExecutionShape.SINGLE_PASS:
+            raise ValueError(
+                f"Model {model!r} is not a single-pass model "
+                f"(execution_shape={runtime.execution_shape.value})"
+            )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[EngineResult] = loop.create_future()
+        req = _SinglePassRequest(
+            request_id=next(self._request_ids),
+            future=future,
+            task=task,
+            inputs=inputs,
+            submitted_at=time.perf_counter(),
+        )
+        self._single_pass_queue.put((model, req))
+        self._scheduler_event.set()
+        return await future
+
     async def _submit_request(
         self,
         *,
@@ -901,7 +950,7 @@ class InferenceEngine:
             return_logprobs=return_logprobs,
             streaming=stream_queue is not None,
         )
-        payload = _PendingRequest(
+        payload = _AutoregressiveRequest(
             request_id=req_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
@@ -1205,7 +1254,7 @@ class InferenceEngine:
         return tuple(token_ids)
 
     def _build_stream_callback(
-        self, req: _PendingRequest
+        self, req: _AutoregressiveRequest
     ) -> Optional[Callable[[StreamUpdate], None]]:
         queue = req.stream_queue
         if queue is None:
@@ -1224,7 +1273,7 @@ class InferenceEngine:
 
     def _complete_stream(
         self,
-        req: _PendingRequest,
+        req: EngineRequest,
         *,
         result: Optional[EngineResult] = None,
         error: Optional[BaseException] = None,
@@ -1236,7 +1285,7 @@ class InferenceEngine:
         completion = _StreamCompletion(result=result, error=error)
         self._loop.call_soon_threadsafe(queue.put_nowait, completion)
 
-    def _fail_request(self, req: _PendingRequest, error: BaseException) -> None:
+    def _fail_request(self, req: EngineRequest, error: BaseException) -> None:
         future = req.future
         if future and not future.done():
             assert self._loop is not None
@@ -1267,7 +1316,9 @@ class InferenceEngine:
             return
         set_device(runtime.device)
 
-        executor = AutoregressiveExecutor(
+        # The default (autoregressive) lane. Its pipeline owns the device's
+        # CUDA-graph capture, so pause/drain is handled specially below.
+        ar_executor = AutoregressiveExecutor(
             runtime,
             skills=self._skills,
             adapter_provider=self._adapter_provider,
@@ -1277,6 +1328,14 @@ class InferenceEngine:
             to_engine_result=self._to_engine_result,
             wake_event=self._scheduler_event,
         )
+        # One single-pass lane per registered single-pass model. The kernel
+        # folds advance() over every lane; single-pass forwards interleave
+        # with autoregressive decode on the shared stream.
+        single_pass: Dict[str, SinglePassExecutor] = {
+            name: SinglePassExecutor(rt)
+            for name, rt in self._runtimes.items()
+            if rt.execution_shape is ExecutionShape.SINGLE_PASS
+        }
 
         shutdown_requested = False
         wake_event = self._scheduler_event
@@ -1308,6 +1367,11 @@ class InferenceEngine:
                     loop.call_soon_threadsafe(future.set_result, engine_result)
                 self._complete_stream(req, result=engine_result)
 
+        def any_work() -> bool:
+            return ar_executor.has_work or any(
+                sp.has_work for sp in single_pass.values()
+            )
+
         try:
             with torch.inference_mode():
                 while True:
@@ -1315,17 +1379,20 @@ class InferenceEngine:
                     if paused_flag.is_set():
                         # Drain in-flight work before pause — callers may
                         # mutate runtime state while paused (e.g. rebuild
-                        # CUDA graphs).
-                        deliver(executor.drain())
+                        # CUDA graphs). Only the AR lane has graph state;
+                        # single-pass forwards are one-shot, so draining the
+                        # AR pipeline is sufficient.
+                        deliver(ar_executor.drain())
                         with runtime.graph_capture_lock:
                             synchronize(runtime.device)
                         paused_event.set()
-                        if shutdown_requested and not executor.has_work:
+                        if shutdown_requested and not any_work():
                             break
                         run_gate.wait(timeout=0.1)
                         continue
 
                     progressed = False
+                    # AR ingress (untagged — always the default model).
                     while True:
                         try:
                             item = self._scheduler_queue.get_nowait()
@@ -1334,37 +1401,84 @@ class InferenceEngine:
                         if item is None:
                             shutdown_requested = True
                             continue
-                        executor.submit(item)
+                        ar_executor.submit(item)
+                        progressed = True
+                    # Single-pass ingress (model-tagged).
+                    while True:
+                        try:
+                            model, req = self._single_pass_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        lane = single_pass.get(model)
+                        if lane is None:  # pragma: no cover - guarded in run()
+                            self._fail_request(
+                                req, ValueError(f"No single-pass lane for {model!r}")
+                            )
+                        else:
+                            lane.submit(req)
                         progressed = True
 
+                    # Advance the autoregressive lane. Its pipeline is the
+                    # shared device state, so a failure here is fatal to the
+                    # kernel — tear everything down.
                     try:
-                        tick = executor.advance()
+                        tick = ar_executor.advance()
                     except Exception as exc:
-                        _LOGGER.exception("Executor advance failed", exc_info=exc)
-                        deliver(executor.shutdown(exc))
+                        _LOGGER.exception("Autoregressive advance failed", exc_info=exc)
+                        deliver(ar_executor.shutdown(exc))
+                        for lane in single_pass.values():
+                            deliver(lane.shutdown(exc))
                         self._fail_all_pending(exc)
                         return
-
                     if tick.completed:
                         deliver(tick.completed)
                     progressed = tick.progressed or progressed
 
-                    if shutdown_requested and not tick.has_work:
+                    # Advance each single-pass lane in isolation: a single
+                    # forward blowing up must fail only that lane's in-flight
+                    # work, never take down the kernel or the other lanes.
+                    for name, lane in single_pass.items():
+                        try:
+                            sp_tick = lane.advance()
+                        except Exception as exc:
+                            _LOGGER.exception(
+                                "Single-pass advance failed for %s", name, exc_info=exc
+                            )
+                            deliver(lane.shutdown(exc))
+                            progressed = True
+                            continue
+                        if sp_tick.completed:
+                            deliver(sp_tick.completed)
+                        progressed = sp_tick.progressed or progressed
+
+                    if shutdown_requested and not any_work():
                         break
 
                     if not progressed:
                         if shutdown_requested:
                             break
-                        wake_event.wait()
+                        # A launched single-pass forward signals completion
+                        # via a CUDA event, which sets no host event — so if
+                        # any lane has in-flight event-backed work, poll on a
+                        # short timeout instead of blocking, or the kernel
+                        # could sleep past the GPU finishing and leave
+                        # engine.run() unresolved until an unrelated request
+                        # happens to wake the loop.
+                        if any(sp.has_in_flight for sp in single_pass.values()):
+                            wake_event.wait(timeout=_SINGLE_PASS_POLL_INTERVAL_S)
+                        else:
+                            wake_event.wait()
                         wake_event.clear()
         finally:
-            deliver(executor.shutdown())
+            deliver(ar_executor.shutdown())
+            for lane in single_pass.values():
+                deliver(lane.shutdown())
             self._fail_all_pending()
 
     def _build_generation_request(
         self,
         runtime: AutoregressiveRuntime,
-        req: _PendingRequest,
+        req: _AutoregressiveRequest,
         image_crops: Any,
     ) -> tuple[GenerationRequest, SkillState]:
         prompt_tokens = req.prompt_tokens
@@ -1497,5 +1611,11 @@ class InferenceEngine:
             if pending is None:
                 continue
             self._fail_request(pending, exc)
+        while True:
+            try:
+                _model, req = self._single_pass_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._fail_request(req, exc)
 
 
