@@ -85,7 +85,6 @@ from kestrel.engine._types import (
     EngineMetrics,
     EngineResult,
     EngineStream,
-    TickResult,
     _PendingRequest,
     _StreamCompletion,
     _StreamQueue,

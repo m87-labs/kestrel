@@ -39,6 +39,7 @@ from kestrel.engine._types import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class _AdmissionCoordinator:
     def __init__(
         self,
@@ -126,8 +127,6 @@ class _AdmissionCoordinator:
                 break
 
 
-
-
 class Executor(Protocol):
     """A kernel-side lane wrapping one driver behind a uniform face.
 
@@ -213,45 +212,29 @@ class AutoregressiveExecutor:
 
     def advance(self) -> TickResult:
         scheduler = self._scheduler
-        progressed = False
-        completed: List[Completion] = []
-
-        if self._admission_failures:
-            completed.extend(self._admission_failures)
-            self._admission_failures = []
-            progressed = True
+        completed = self._admission_failures
+        self._admission_failures = []
+        progressed = bool(completed)
 
         progressed = self._promote_ready() or progressed
 
         if scheduler.has_pending_work():
             progressed = scheduler.advance() or progressed
 
-        for result in scheduler.pop_completed():
-            completion = self._completion_for(result)
-            if completion is not None:
-                completed.append(completion)
-            progressed = True
+        new_completions = self._collect()
+        completed.extend(new_completions)
+        progressed = progressed or bool(new_completions)
 
         return TickResult(
             progressed=progressed,
             completed=tuple(completed),
-            in_flight=scheduler.has_pending_work(),
-            has_work=(
-                scheduler.has_pending_work()
-                or self._admission.has_pending()
-                or bool(self._active)
-            ),
+            has_work=self.has_work,
         )
 
     def drain(self) -> tuple[Completion, ...]:
         """Complete in-flight pipeline work (used before a pause)."""
         self._scheduler._drain_pipeline()
-        completed: List[Completion] = []
-        for result in self._scheduler.pop_completed():
-            completion = self._completion_for(result)
-            if completion is not None:
-                completed.append(completion)
-        return tuple(completed)
+        return tuple(self._collect())
 
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")
@@ -313,6 +296,15 @@ class AutoregressiveExecutor:
             self._admit_ready(ready)
             promoted = True
         return promoted
+
+    def _collect(self) -> List[Completion]:
+        """Drain finished scheduler results into Completion values."""
+        completions: List[Completion] = []
+        for result in self._scheduler.pop_completed():
+            completion = self._completion_for(result)
+            if completion is not None:
+                completions.append(completion)
+        return completions
 
     def _completion_for(self, result: SchedulerResult) -> Optional[Completion]:
         req = self._active.pop(result.request_id, None)

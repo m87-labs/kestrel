@@ -137,8 +137,6 @@ def _hash_image(image: np.ndarray | bytes) -> bytes:
     return hashlib.sha256(raw).digest()
 
 
-
-
 @dataclass(slots=True)
 class Completion:
     """A terminal result from an executor, for the kernel to deliver.
@@ -162,7 +160,6 @@ class TickResult:
 
     progressed: bool = False
     completed: tuple[Completion, ...] = ()
-    in_flight: bool = False  # GPU work outstanding (gates pause drain)
-    has_work: bool = False   # queued or in flight (gates shutdown exit)
+    has_work: bool = False  # queued or in flight (gates shutdown exit)
 
 
