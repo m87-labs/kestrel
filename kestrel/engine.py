@@ -331,13 +331,28 @@ class InferenceEngine:
         self._api_key = api_key
         self._api_base_url = api_base_url
 
-        # An externally-built runtime is held from construction; otherwise
-        # ``_initialize`` builds one via the spec's ``runtime`` factory
-        # on first ``create``. ``_owns_runtime`` lets shutdown skip the
-        # preprocessor-shutdown call when the runtime came from the
-        # caller (they own its lifecycle).
-        self._runtime: Optional[AutoregressiveRuntime] = runtime
-        self._owns_runtime: bool = runtime is None
+        # Runtimes keyed by model id. The engine is a model-agnostic
+        # kernel: it holds a registry rather than a single runtime, and
+        # addresses runtimes by model id (data from ``runtime_cfg`` / the
+        # model registry), never by execution shape and never by
+        # interrogating the runtime object. ``_default_model`` is the id
+        # the single-model surface (the ``runtime`` property and
+        # ``query``/``caption``/...) targets; it is the foundation the
+        # multi-model ``run`` surface builds on.
+        #
+        # An externally-built runtime is registered from construction;
+        # otherwise ``_initialize`` builds one via the spec's ``runtime``
+        # factory on first ``create`` and registers it under the same id.
+        # The engine owns the lifecycle of every runtime it holds and
+        # tears them down on ``shutdown``.
+        #
+        # Typed autoregressive-only for now since every registered model is
+        # autoregressive; broadens to ``Runtime`` when a second execution
+        # shape lands.
+        self._default_model: str = runtime_cfg.model
+        self._runtimes: Dict[str, AutoregressiveRuntime] = {}
+        if runtime is not None:
+            self._runtimes[self._default_model] = runtime
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
         # engine retry-able. ``_init_task`` is the asyncio task that's
@@ -376,9 +391,10 @@ class InferenceEngine:
 
     @property
     def runtime(self) -> AutoregressiveRuntime:
-        if self._runtime is None:
+        runtime = self._runtimes.get(self._default_model)
+        if runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
-        return self._runtime
+        return runtime
 
     @property
     def skills(self) -> SkillRegistry:
@@ -440,7 +456,7 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
-        if self._runtime is None:
+        if self._default_model not in self._runtimes:
             max_lora_rank = (
                 self._adapter_provider.config()["max_lora_rank"]
                 if self._adapter_provider is not None
@@ -458,9 +474,10 @@ class InferenceEngine:
             from kestrel.models import get_spec
 
             runtime_cls = get_spec(self._runtime_cfg.model).runtime
-            self._runtime = await loop.run_in_executor(
+            built = await loop.run_in_executor(
                 None, lambda: runtime_cls(self._runtime_cfg, max_lora_rank=max_lora_rank)
             )
+            self._runtimes[self._default_model] = built
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
@@ -538,8 +555,8 @@ class InferenceEngine:
                 _LOGGER.exception("Failed to stop Photon reporter")
             finally:
                 self._photon_reporter = None
-        if self._runtime is not None and self._owns_runtime:
-            self._runtime.shutdown_image_preprocessor()
+        for runtime in self._runtimes.values():
+            runtime.shutdown_image_preprocessor()
 
     async def submit(
         self,
@@ -1022,14 +1039,14 @@ class InferenceEngine:
         self._paused_event.clear()
         self._scheduler_event.set()
         self._paused_event.wait(timeout)
-        synchronize(self._runtime.device)
+        synchronize(self.runtime.device)
 
     def resume(self) -> None:
         """Resume scheduler progress after a pause."""
 
         if self._shutdown:
             return
-        synchronize(self._runtime.device)
+        synchronize(self.runtime.device)
         self._paused_event.clear()
         self._paused_flag.clear()
         self._run_gate.set()
@@ -1176,8 +1193,8 @@ class InferenceEngine:
         self, temperature: float, top_p: float,
     ) -> None:
         # _submit_request awaits _ensure_started before calling us, so
-        # _runtime is set by here.
-        if self._runtime.device.type != "mps":
+        # the default runtime is set by here.
+        if self.runtime.device.type != "mps":
             return
         # Greedy decoding (``temperature == 0``) hits the scheduler's
         # ``torch.argmax`` short-circuit and never reaches the fused
@@ -1456,7 +1473,7 @@ class InferenceEngine:
         return str(request_context)
 
     def _scheduler_loop(self) -> None:
-        runtime = self._runtime
+        runtime = self._runtimes.get(self._default_model)
         if runtime is None:
             return
         set_device(runtime.device)

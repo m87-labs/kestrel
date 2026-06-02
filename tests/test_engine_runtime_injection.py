@@ -1,9 +1,12 @@
 """Verify ``InferenceEngine`` accepts an externally-built runtime.
 
-Lets two engines (e.g., different model variants) coexist behind one
-``KVMemoryPool``: the caller builds each runtime with the shared pool,
-then hands the runtime to its engine instead of letting the engine
-construct ``MoondreamRuntime`` internally.
+The ``runtime=`` seam lets a caller (today: tests) build a runtime and
+hand it to the engine instead of having the engine construct one via the
+model registry. The engine *adopts* an injected runtime: it registers it
+under the config's model id and owns its lifecycle, tearing it down on
+``shutdown`` like any engine-built runtime. There is no caller-owned
+shared-runtime contract — nothing in the codebase shares a runtime across
+engines.
 """
 
 from __future__ import annotations
@@ -45,3 +48,17 @@ def test_engine_without_runtime_still_unbuilt_at_construction() -> None:
     engine = InferenceEngine(_cpu_cfg())
     with pytest.raises(RuntimeError, match="not been started"):
         _ = engine.runtime
+
+
+def test_engine_registers_injected_runtime_under_config_model_id() -> None:
+    """The engine is a registry keyed by model id (data from the config),
+    not by interrogating the runtime object. An injected runtime lands
+    under ``runtime_cfg.model`` and is reachable as the default."""
+
+    runtime = FakeRuntime(model_name="anything", device="cpu")
+    engine = InferenceEngine(_cpu_cfg(), runtime=runtime)
+    # Keyed by the config's model id ("moondream2"), regardless of what
+    # the runtime reports as its own model_name.
+    assert engine._default_model == "moondream2"
+    assert engine._runtimes == {"moondream2": runtime}
+    assert engine.runtime is runtime
