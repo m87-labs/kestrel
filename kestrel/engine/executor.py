@@ -212,18 +212,22 @@ class AutoregressiveExecutor:
 
     def advance(self) -> TickResult:
         scheduler = self._scheduler
-        completed = self._admission_failures
-        self._admission_failures = []
-        progressed = bool(completed)
-
-        progressed = self._promote_ready() or progressed
+        progressed = self._promote_ready()
 
         if scheduler.has_pending_work():
             progressed = scheduler.advance() or progressed
 
-        new_completions = self._collect()
-        completed.extend(new_completions)
-        progressed = progressed or bool(new_completions)
+        new = self._collect()
+
+        # Drain the admission-failure buffer LAST. _admission_failures is
+        # the durable home for not-yet-delivered failures; clearing it
+        # only here (after the work above that can raise) means that if
+        # scheduler.advance() raises, the buffer stays intact and the
+        # kernel's shutdown(exc) path still delivers those callers'
+        # completions instead of leaving their futures unresolved.
+        completed = self._admission_failures + new
+        self._admission_failures = []
+        progressed = progressed or bool(completed)
 
         return TickResult(
             progressed=progressed,

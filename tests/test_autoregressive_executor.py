@@ -187,6 +187,37 @@ def test_admission_failure_surfaces_as_completion() -> None:
     assert ex.has_work is False
 
 
+def test_advance_raising_preserves_queued_admission_failures() -> None:
+    """Regression: a buffered admission failure must survive advance() raising.
+
+    advance() must not move _admission_failures into a local that's lost
+    if scheduler.advance() raises mid-tick. The kernel responds to the
+    exception by calling shutdown(exc); that must still see the buffered
+    failure and return it, or the failed-admission caller hangs.
+    """
+    ex = _executor()
+    failed = _pending(6)
+    ex._fail_via_admission(failed, ValueError("bad image"))
+
+    def boom() -> bool:
+        raise RuntimeError("advance blew up")
+
+    ex._scheduler.has_pending_work = lambda: True
+    ex._scheduler.advance = boom
+
+    # Mirror the kernel loop: advance() raises, then shutdown(exc) runs.
+    import pytest
+
+    with pytest.raises(RuntimeError, match="advance blew up"):
+        ex.advance()
+
+    completions = ex.shutdown(RuntimeError("stop"))
+    assert failed in [c.request for c in completions]
+    assert isinstance(
+        next(c for c in completions if c.request is failed).error, ValueError
+    )
+
+
 def test_shutdown_returns_requests_failed_during_fail_all() -> None:
     """Regression: a request still in async preprocessing at shutdown.
 
