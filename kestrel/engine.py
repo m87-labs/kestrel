@@ -56,7 +56,7 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.runtime import AutoregressiveRuntime
+from kestrel.runtime import AutoregressiveRuntime, ExecutionShape
 from kestrel.scheduler import (
     GeneratedPrefix,
     GenerationScheduler,
@@ -213,6 +213,24 @@ class _ReadyAdmission:
     prefix_cache_hit: bool
 
 
+@dataclass(slots=True)
+class _SinglePassJob:
+    """A single-forward request serviced by the owner thread.
+
+    Single-pass runtimes (no decode loop) fulfill a request in one
+    forward. The owner thread runs that forward between autoregressive
+    decode steps — never overlapping an in-flight AR launch — so all
+    CUDA work stays on one thread (the single-owner invariant) without a
+    scheduler, KV cache, or slots.
+    """
+
+    model: str
+    task: str
+    inputs: object
+    future: asyncio.Future[object]
+    submitted_at: float
+
+
 def _hash_image(image: np.ndarray | bytes) -> bytes:
     """SHA-256 over the raw image input for prefix-cache keying."""
     raw = image.tobytes() if isinstance(image, np.ndarray) else image
@@ -365,6 +383,10 @@ class InferenceEngine:
         self._init_task: Optional[asyncio.Task[None]] = None
         self._queue: asyncio.Queue[Optional[_PendingRequest]] = asyncio.Queue()
         self._scheduler_queue: queue.Queue[_PendingRequest | None] = queue.Queue()
+        # Single-pass jobs (single-forward models) serviced by the owner
+        # thread between AR decode steps. Separate from the AR request
+        # queue: no admission, KV reservation, or prefill batching.
+        self._single_pass_queue: "queue.Queue[_SinglePassJob]" = queue.Queue()
         self._scheduler_event = threading.Event()
         self._run_gate = threading.Event()
         self._run_gate.set()  # set == running
@@ -1052,6 +1074,41 @@ class InferenceEngine:
         self._run_gate.set()
         self._scheduler_event.set()
 
+    async def _submit_single_pass(
+        self, model: str, task: str, inputs: object
+    ) -> object:
+        """Run a single-forward request and await its result.
+
+        The owner thread services the job between AR decode steps; this
+        is the internal seam the multi-model ``run`` surface will call.
+        """
+        if self._shutdown:
+            raise RuntimeError("InferenceEngine is shut down")
+        await self._ensure_started()
+
+        runtime = self._runtimes.get(model)
+        if runtime is None:
+            raise ValueError(f"Unknown model {model!r}")
+        if runtime.execution_shape is not ExecutionShape.SINGLE_PASS:
+            raise ValueError(
+                f"Model {model!r} is not a single-pass model "
+                f"(execution_shape={runtime.execution_shape.value})"
+            )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[object] = loop.create_future()
+        self._single_pass_queue.put(
+            _SinglePassJob(
+                model=model,
+                task=task,
+                inputs=inputs,
+                future=future,
+                submitted_at=time.perf_counter(),
+            )
+        )
+        self._scheduler_event.set()
+        return await future
+
     async def _submit_request(
         self,
         *,
@@ -1585,12 +1642,49 @@ class InferenceEngine:
                     loop.call_soon_threadsafe(future.set_result, engine_result)
                 self._complete_stream(req, result=engine_result)
 
+        def deliver_single_pass(job: _SinglePassJob, result: object) -> None:
+            loop = self._loop
+            assert loop is not None
+            future = job.future
+            if not future.done():
+                loop.call_soon_threadsafe(future.set_result, result)
+
+        def fail_single_pass(job: _SinglePassJob, error: BaseException) -> None:
+            loop = self._loop
+            assert loop is not None
+            future = job.future
+            if not future.done():
+                loop.call_soon_threadsafe(future.set_exception, error)
+
+        def service_single_pass() -> bool:
+            """Run one queued single-pass job, if any.
+
+            Called only at a safe point — no AR launch in flight — so the
+            single forward never overlaps autoregressive GPU work. One job
+            per call keeps AR decode latency bounded.
+            """
+            try:
+                job = self._single_pass_queue.get_nowait()
+            except queue.Empty:
+                return False
+            runtime = self._runtimes.get(job.model)
+            try:
+                if runtime is None:
+                    raise ValueError(f"Unknown model {job.model!r}")
+                result = runtime.run(job.task, job.inputs)
+            except Exception as exc:
+                fail_single_pass(job, exc)
+            else:
+                deliver_single_pass(job, result)
+            return True
+
         def should_exit() -> bool:
             return (
                 shutdown_requested
                 and not scheduler.has_pending_work()
                 and not admission.has_pending()
                 and not active_requests
+                and self._single_pass_queue.empty()
             )
 
         try:
@@ -1646,6 +1740,13 @@ class InferenceEngine:
                         deliver_results(results)
                         progressed = True
 
+                    # Service one single-pass job at a safe point: only
+                    # when no AR forward is in flight, so the single
+                    # forward never overlaps autoregressive GPU work.
+                    if not scheduler._pipeline.has_launch_in_flight():
+                        if service_single_pass():
+                            progressed = True
+
                     if should_exit():
                         break
 
@@ -1657,6 +1758,12 @@ class InferenceEngine:
         finally:
             admission.fail_all()
             self._fail_all_pending(active_requests)
+            while True:
+                try:
+                    job = self._single_pass_queue.get_nowait()
+                except queue.Empty:
+                    break
+                fail_single_pass(job, RuntimeError("Engine shut down"))
 
     def _build_generation_request(
         self,
