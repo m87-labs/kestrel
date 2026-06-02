@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
 from kestrel.models.moondream.runtime import SequenceState, Token
-from kestrel.runtime import Runtime
+from kestrel.runtime import AutoregressiveRuntime
 from kestrel.models.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
@@ -113,7 +113,7 @@ class RequestLifecycle:
 
     def stage_token(
         self,
-        runtime: Runtime,
+        runtime: AutoregressiveRuntime,
         token: Token,
         *,
         logprob: float | None = None,

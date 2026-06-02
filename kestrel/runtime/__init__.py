@@ -7,7 +7,12 @@ scheduler↔runtime contract. Concrete runtimes (e.g.
 ``kestrel.models.moondream.runtime``) build on top of these.
 """
 
-from kestrel.runtime.protocol import Runtime
+from kestrel.runtime.protocol import (
+    AutoregressiveRuntime,
+    ExecutionShape,
+    Runtime,
+    SinglePassRuntime,
+)
 from kestrel.runtime.state import (
     PrefillClassification,
     PreparedSequence,
@@ -22,12 +27,15 @@ from kestrel.runtime.tokens import (
 )
 
 __all__ = [
+    "AutoregressiveRuntime",
     "CoordToken",
+    "ExecutionShape",
     "PrefillClassification",
     "PreparedSequence",
     "Runtime",
     "RuntimeDecodeResult",
     "SequenceState",
+    "SinglePassRuntime",
     "SizeToken",
     "TextToken",
     "Token",

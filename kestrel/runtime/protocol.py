@@ -1,11 +1,18 @@
-"""Protocol describing the runtime contract used by engine + scheduler.
+"""Protocols describing the runtime contract used by engine + scheduler.
 
-The :class:`~kestrel.engine.InferenceEngine` and
-:class:`~kestrel.scheduler.scheduler.GenerationScheduler` are generic
-over runtime implementations: they manage admission, queues, prefill
-batching, and decode pacing without knowing which model is actually
-running. Concrete runtimes (today: ``MoondreamRuntime``) implement the
-methods declared here.
+The runtime contract is a three-layer stack so the engine can host
+runtimes with different *execution shapes* behind one model-agnostic
+kernel:
+
+- :class:`Runtime` — the minimal surface every runtime exposes
+  (identity, device, and which execution shape it is). The engine uses
+  it to route work without caring how a model runs.
+- :class:`AutoregressiveRuntime` — runtimes that drive a prefill/decode
+  loop (KV cache, slots, prefix cache, per-token decode). This is the
+  surface the :class:`~kestrel.scheduler.scheduler.GenerationScheduler`
+  consumes; ``MoondreamRuntime`` implements it.
+- :class:`SinglePassRuntime` — runtimes that fulfill a request with one
+  forward (no decode loop).
 
 Some attributes are typed as ``Any`` because they expose model-specific
 state the engine + scheduler currently reach into directly (config,
@@ -17,6 +24,7 @@ record of the surface a runtime must satisfy today.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from kestrel.runtime.state import (
@@ -33,13 +41,45 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
+class ExecutionShape(Enum):
+    """How a runtime turns a request into a result.
+
+    The engine owns one executor per shape and routes by this tag, so a
+    new shape is an additive change rather than an ``isinstance`` ladder.
+    """
+
+    AUTOREGRESSIVE = "autoregressive"
+    SINGLE_PASS = "single_pass"
+    # STREAMING = "streaming"  # video / memory-bank models, later
+
+
 class Runtime(Protocol):
-    """Surface that the engine and scheduler call on a runtime."""
+    """Minimal surface every runtime exposes, regardless of shape.
+
+    The engine uses this to route work and scope prefix-cache entries
+    without committing to a particular execution shape.
+    """
 
     # Identity. Stable across the runtime's lifetime; used to scope
-    # prefix-cache entries and (later) to route requests in a
-    # multi-runtime engine.
+    # prefix-cache entries and to route requests in a multi-runtime
+    # engine.
     model_name: str
+
+    # Device the runtime executes on.
+    device: torch.device
+
+    # Which executor drives this runtime.
+    execution_shape: ExecutionShape
+
+
+class AutoregressiveRuntime(Runtime, Protocol):
+    """Surface the scheduler calls on a prefill/decode runtime.
+
+    This is the full contract the
+    :class:`~kestrel.scheduler.scheduler.GenerationScheduler` consumes:
+    KV-cache capacity, prefill slots, prefix cache, and the
+    plan/prefill/decode/commit calls. ``MoondreamRuntime`` implements it.
+    """
 
     # Capacity / shape
     max_batch_size: int
@@ -47,8 +87,7 @@ class Runtime(Protocol):
     max_seq_length: int
     image_prefix_length: int
 
-    # Device + streams
-    device: torch.device
+    # Streams
     primary_stream: Any
     copy_stream: Any
 
@@ -147,3 +186,18 @@ class Runtime(Protocol):
     def release_sequence(self, state: SequenceState) -> None: ...
 
     def decode_with_slot(self, slot: Any, batch_size: int) -> None: ...
+
+
+class SinglePassRuntime(Runtime, Protocol):
+    """Runtime that fulfills a request with a single forward.
+
+    No KV cache, no decode loop. The engine's single-pass executor hands
+    it a task name + inputs and returns the result. ``run`` is the whole
+    contract beyond image preprocessing.
+    """
+
+    def preprocess_image_async(
+        self, image: np.ndarray | bytes
+    ) -> Future[Any]: ...
+
+    def run(self, task: str, inputs: Any) -> Any: ...

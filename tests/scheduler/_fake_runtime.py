@@ -29,6 +29,7 @@ import torch
 
 from kestrel.device import NoopEvent
 from kestrel.runtime import (
+    ExecutionShape,
     PrefillClassification,
     PreparedSequence,
     SequenceState,
@@ -104,6 +105,7 @@ class FakeRuntime:
     ) -> None:
         # Identity
         self.model_name = model_name
+        self.execution_shape = ExecutionShape.AUTOREGRESSIVE
 
         # Capacity / shape
         self.max_batch_size = max_batch_size
