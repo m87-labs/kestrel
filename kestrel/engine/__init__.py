@@ -17,6 +17,7 @@ from kestrel.engine.executor import (
     _AdmissionCoordinator,
 )
 from kestrel.engine.single_pass import SinglePassExecutor
+from kestrel.engine.handle import ModelHandle
 from kestrel.engine._types import _AutoregressiveRequest
 from kestrel.engine.core import InferenceEngine
 
@@ -28,6 +29,7 @@ __all__ = [
     "Executor",
     "AutoregressiveExecutor",
     "SinglePassExecutor",
+    "ModelHandle",
     "Completion",
     "TickResult",
 ]
