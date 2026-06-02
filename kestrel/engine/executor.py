@@ -162,8 +162,6 @@ class AutoregressiveExecutor:
         *,
         skills: "SkillRegistry",
         adapter_provider: Optional[AdapterProvider],
-        default_temperature: float,
-        default_top_p: float,
         build_generation_request: Callable[
             [AutoregressiveRuntime, "_AutoregressiveRequest", Any],
             "tuple[GenerationRequest, SkillState]",
@@ -176,8 +174,6 @@ class AutoregressiveExecutor:
         self._to_engine_result = to_engine_result
         self._scheduler = GenerationScheduler(
             runtime,
-            default_temperature=default_temperature,
-            default_top_p=default_top_p,
             skill_registry=skills,
             adapter_provider=adapter_provider,
         )

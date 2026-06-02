@@ -60,25 +60,17 @@ from kestrel.scheduler import (
     StreamUpdate,
 )
 from kestrel.skills import (
-    CaptionSkill,
-    DetectSkill,
+    AR_DEFAULT_MAX_NEW_TOKENS,
+    AR_DEFAULT_TEMPERATURE,
+    AR_DEFAULT_TOP_P,
     DecodeStep,
-    PointSkill,
-    QuerySkill,
-    SegmentSkill,
     SkillRegistry,
     SkillSpec,
     SkillState,
 )
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
-from kestrel.skills.caption import CaptionRequest, CaptionSettings
-from kestrel.skills.detect import DetectRequest, DetectSettings
-from kestrel.skills.point import PointRequest, PointSettings
-from kestrel.skills.query import QueryRequest, QuerySettings
-from kestrel.skills.segment import SegmentRequest, SegmentSettings
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
-from kestrel.utils.spatial_refs import normalize_spatial_refs
 
 from kestrel.engine._types import (
     Completion,
@@ -192,18 +184,16 @@ class InferenceEngine:
         self._request_ids = itertools.count()
         self._shutdown = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._skills = skills or SkillRegistry(
-            [
-                QuerySkill(),
-                PointSkill(),
-                DetectSkill(),
-                CaptionSkill(),
-                SegmentSkill(),
-            ]
-        )
-        self._default_max_new_tokens = 768
-        self._default_temperature = 0.2
-        self._default_top_p = 0.9
+        # Skills are owned by the model (the runtime supplies them via
+        # runtime.skills()). ``skills=`` is an optional override, mainly
+        # for tests; when None the default model's registry is used.
+        self._skills_override = skills
+        # AR serving defaults live with the AR skills (sampling config, not
+        # kernel config); the engine only needs them to seed the warmup
+        # query. Sourced from the skill-layer constants, not redefined here.
+        self._default_max_new_tokens = AR_DEFAULT_MAX_NEW_TOKENS
+        self._default_temperature = AR_DEFAULT_TEMPERATURE
+        self._default_top_p = AR_DEFAULT_TOP_P
 
     @property
     def runtime(self) -> AutoregressiveRuntime:
@@ -212,9 +202,28 @@ class InferenceEngine:
             raise RuntimeError("InferenceEngine has not been started")
         return runtime
 
+    def _skill_registry(self) -> SkillRegistry:
+        """The active skill registry for the default model.
+
+        Resolution order: the test ``_skills_override``; else the built
+        runtime's declared skills; else the default model's
+        :class:`~kestrel.models.registry.ModelSpec` skills. The spec path is
+        what lets input validation and ``tasks`` work *before* startup —
+        skills are static model metadata, so resolving them must not require
+        loading model weights.
+        """
+        if self._skills_override is not None:
+            return self._skills_override
+        runtime = self._runtimes.get(self._default_model)
+        if runtime is not None:
+            return runtime.skills()
+        from kestrel.models.registry import get_spec
+
+        return get_spec(self._default_model).skills()
+
     @property
     def skills(self) -> SkillRegistry:
-        return self._skills
+        return self._skill_registry()
 
     @property
     def is_running(self) -> bool:
@@ -374,6 +383,44 @@ class InferenceEngine:
         for runtime in self._runtimes.values():
             runtime.shutdown()
 
+    async def _run_skill(
+        self,
+        skill_name: str,
+        *,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+        stream: bool = False,
+    ) -> "EngineResult | EngineStream":
+        """Validate + build via the model's skill, then submit.
+
+        The skill (model-owned) validates the raw ``prompt``/``settings``
+        and assembles its request + sampling params; the engine adds the
+        decode-pipeline concerns it owns (adapter, logprobs, generated
+        prefix, suppressed tokens) and submits. The kernel never builds or
+        inspects a model's request type.
+        """
+        built = self._skill_registry().resolve(skill_name).build_request(
+            image, prompt, settings
+        )
+        adapter = self._extract_adapter_id(settings)
+        return_logprobs = self._extract_logprobs(settings)
+        generated_prefix = self._extract_generated_prefix(settings)
+        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
+        submit_fn = self.submit_streaming if stream else self.submit
+        return await submit_fn(
+            built.request_context,
+            max_new_tokens=built.max_new_tokens,
+            adapter=adapter,
+            image=image,
+            temperature=built.temperature,
+            top_p=built.top_p,
+            _logprobs=return_logprobs,
+            _generated_prefix=generated_prefix,
+            _suppress_next_token_ids=suppress_next_token_ids,
+            skill=skill_name,
+        )
+
     async def submit(
         self,
         request_context: object,
@@ -453,81 +500,17 @@ class InferenceEngine:
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
     ) -> Union[EngineResult, EngineStream]:
-        if question is None:
-            raise ValueError("question must be provided")
-        normalized_question = question.strip()
-        if not normalized_question:
-            raise ValueError("question must be a non-empty string")
-        normalized_refs = normalize_spatial_refs(spatial_refs)
-        if normalized_refs is not None and image is None:
-            raise ValueError("spatial_refs can only be used with an image")
-
-        temperature = self._default_temperature
-        top_p = self._default_top_p
-        max_tokens = self._default_max_new_tokens
-        adapter: Optional[str] = None
-        return_logprobs = self._extract_logprobs(settings)
-        generated_prefix = self._extract_generated_prefix(settings)
-        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        if settings is not None:
-            if "temperature" in settings:
-                temperature = float(settings["temperature"])
-            if "top_p" in settings:
-                top_p = float(settings["top_p"])
-            if "max_tokens" in settings:
-                max_tokens = int(settings["max_tokens"])
-            if "adapter" in settings:
-                maybe_adapter = settings["adapter"]
-                if maybe_adapter is None:
-                    adapter = None
-                elif not isinstance(maybe_adapter, str):
-                    raise TypeError("settings.adapter must be a string or None")
-                else:
-                    adapter = maybe_adapter
-
-        if temperature < 0.0:
-            raise ValueError("temperature must be non-negative")
-        if not (0.0 < top_p <= 1.0):
-            raise ValueError("top_p must be in the range (0, 1]")
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-
-        request = QueryRequest(
-            question=normalized_question,
+        return await self._run_skill(
+            "query",
             image=image,
-            reasoning=reasoning,
+            prompt={
+                "question": question,
+                "reasoning": reasoning,
+                "stream": stream,
+                "spatial_refs": spatial_refs,
+            },
+            settings=settings,
             stream=stream,
-            settings=QuerySettings(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            ),
-            spatial_refs=normalized_refs,
-        )
-        if stream:
-            return await self.submit_streaming(
-                request,
-                max_new_tokens=max_tokens,
-                adapter=adapter,
-                image=image,
-                temperature=temperature,
-                top_p=top_p,
-                _logprobs=return_logprobs,
-                _generated_prefix=generated_prefix,
-                _suppress_next_token_ids=suppress_next_token_ids,
-                skill="query",
-            )
-        return await self.submit(
-            request,
-            max_new_tokens=max_tokens,
-            adapter=adapter,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            _logprobs=return_logprobs,
-            _generated_prefix=generated_prefix,
-            _suppress_next_token_ids=suppress_next_token_ids,
-            skill="query",
         )
 
     async def point(
@@ -538,55 +521,11 @@ class InferenceEngine:
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
     ) -> EngineResult:
-        normalized_object = object.strip()
-        if not normalized_object:
-            raise ValueError("object must be a non-empty string")
-        if image is None:
-            raise ValueError("image must be provided for pointing")
-
-        adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_logprobs(settings)
-        generated_prefix = self._extract_generated_prefix(settings)
-        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        max_tokens = self._default_max_new_tokens
-        max_objects = None
-        temperature = 0.0
-        top_p = 1.0
-        if settings is not None:
-            if "max_objects" in settings:
-                max_objects = max(1, int(settings["max_objects"]))
-            if "max_tokens" in settings:
-                max_tokens = int(settings["max_tokens"])
-            if "temperature" in settings:
-                temperature = float(settings["temperature"])
-            if "top_p" in settings:
-                top_p = float(settings["top_p"])
-
-        if max_objects is not None:
-            max_tokens = max(2 * max_objects + 1, 2)
-
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-
-        normalized_refs = normalize_spatial_refs(spatial_refs)
-        request = PointRequest(
-            object=normalized_object,
+        return await self._run_skill(
+            "point",
             image=image,
-            stream=False,
-            settings=PointSettings(temperature=temperature, top_p=top_p),
-            spatial_refs=normalized_refs,
-        )
-        return await self.submit(
-            request,
-            max_new_tokens=max_tokens,
-            adapter=adapter,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            _logprobs=return_logprobs,
-            _generated_prefix=generated_prefix,
-            _suppress_next_token_ids=suppress_next_token_ids,
-            skill="point",
+            prompt={"object": object, "spatial_refs": spatial_refs},
+            settings=settings,
         )
 
     @overload
@@ -627,65 +566,12 @@ class InferenceEngine:
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
     ) -> Union[EngineResult, EngineStream]:
-        if image is None:
-            raise ValueError("image must be provided for captioning")
-        normalized_length = length.strip().lower() or "normal"
-        if normalized_length not in CaptionSkill.VALID_LENGTHS:
-            valid = ", ".join(sorted(CaptionSkill.VALID_LENGTHS))
-            raise ValueError(f"length must be one of: {valid}")
-
-        adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_logprobs(settings)
-        generated_prefix = self._extract_generated_prefix(settings)
-        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        temperature = self._default_temperature
-        top_p = self._default_top_p
-        max_tokens = self._default_max_new_tokens
-        if settings is not None:
-            if "temperature" in settings:
-                temperature = float(settings["temperature"])
-            if "top_p" in settings:
-                top_p = float(settings["top_p"])
-            if "max_tokens" in settings:
-                max_tokens = int(settings["max_tokens"])
-
-        if temperature < 0.0:
-            raise ValueError("temperature must be non-negative")
-        if not (0.0 < top_p <= 1.0):
-            raise ValueError("top_p must be in the range (0, 1]")
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-
-        request = CaptionRequest(
-            length=normalized_length,
+        return await self._run_skill(
+            "caption",
             image=image,
+            prompt={"length": length, "stream": stream},
+            settings=settings,
             stream=stream,
-            settings=CaptionSettings(temperature=temperature, top_p=top_p),
-        )
-        if stream:
-            return await self.submit_streaming(
-                request,
-                max_new_tokens=max_tokens,
-                adapter=adapter,
-                image=image,
-                temperature=temperature,
-                top_p=top_p,
-                _logprobs=return_logprobs,
-                _generated_prefix=generated_prefix,
-                _suppress_next_token_ids=suppress_next_token_ids,
-                skill="caption",
-            )
-        return await self.submit(
-            request,
-            max_new_tokens=max_tokens,
-            adapter=adapter,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            _logprobs=return_logprobs,
-            _generated_prefix=generated_prefix,
-            _suppress_next_token_ids=suppress_next_token_ids,
-            skill="caption",
         )
 
     async def detect(
@@ -694,46 +580,11 @@ class InferenceEngine:
         object: str,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
-        normalized_object = object.strip()
-        if not normalized_object:
-            raise ValueError("object must be a non-empty string")
-
-        adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_logprobs(settings)
-        generated_prefix = self._extract_generated_prefix(settings)
-        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        max_objects = 50
-        temperature = 0.0
-        top_p = 1.0
-        if settings is not None:
-            if "max_objects" in settings:
-                max_objects = max(1, int(settings["max_objects"]))
-            if "temperature" in settings:
-                temperature = float(settings["temperature"])
-            if "top_p" in settings:
-                top_p = float(settings["top_p"])
-
-        # Each object consumes up to 3 tokens (x, y, size); allow one extra for EOS.
-        max_tokens = max(3 * max_objects + 1, 3)
-
-        request = DetectRequest(
-            object=normalized_object,
+        return await self._run_skill(
+            "detect",
             image=image,
-            stream=False,
-            settings=DetectSettings(temperature=temperature, top_p=top_p),
-            max_objects=max_objects,
-        )
-        return await self.submit(
-            request,
-            max_new_tokens=max_tokens,
-            adapter=adapter,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            _logprobs=return_logprobs,
-            _generated_prefix=generated_prefix,
-            _suppress_next_token_ids=suppress_next_token_ids,
-            skill="detect",
+            prompt={"object": object},
+            settings=settings,
         )
 
     async def segment(
@@ -744,59 +595,11 @@ class InferenceEngine:
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         settings: Optional[Mapping[str, object]] = None,
     ) -> EngineResult:
-        normalized_object = object.strip()
-        if not normalized_object:
-            raise ValueError("object must be a non-empty string")
-        if image is None:
-            raise ValueError("image must be provided for segmentation")
-
-        adapter = self._extract_adapter_id(settings)
-        return_logprobs = self._extract_logprobs(settings)
-        generated_prefix = self._extract_generated_prefix(settings)
-        suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        temperature = 0.0
-        top_p = 1.0
-        max_tokens = self._default_max_new_tokens
-        if settings is not None:
-            if "temperature" in settings:
-                temperature = float(settings["temperature"])
-            if "top_p" in settings:
-                top_p = float(settings["top_p"])
-            if "max_tokens" in settings:
-                max_tokens = int(settings["max_tokens"])
-
-        if temperature < 0.0:
-            raise ValueError("temperature must be non-negative")
-        if not (0.0 < top_p <= 1.0):
-            raise ValueError("top_p must be in the range (0, 1]")
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-
-        normalized_refs = normalize_spatial_refs(spatial_refs)
-
-        request = SegmentRequest(
-            object=normalized_object,
+        return await self._run_skill(
+            "segment",
             image=image,
-            stream=False,
-            settings=SegmentSettings(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            ),
-            spatial_refs=normalized_refs,
-        )
-
-        return await self.submit(
-            request,
-            max_new_tokens=max_tokens,
-            adapter=adapter,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            _logprobs=return_logprobs,
-            _generated_prefix=generated_prefix,
-            _suppress_next_token_ids=suppress_next_token_ids,
-            skill="segment",
+            prompt={"object": object, "spatial_refs": spatial_refs},
+            settings=settings,
         )
 
     async def submit_streaming(
@@ -931,19 +734,19 @@ class InferenceEngine:
     def _tasks_for(self, model_id: str) -> tuple[str, ...]:
         """Capability names a registered model serves.
 
-        Single-pass models advertise the tasks their runtime declares;
-        autoregressive models advertise the engine's skill vocabulary
-        (known without the runtime built, so this works pre-init for the
-        default model). Unbuilt non-default models can't report tasks
-        until startup.
+        Every runtime advertises its own tasks via ``runtime.tasks()``.
+        For the default model taken before startup (runtime not built
+        yet), fall back to the active skill registry so the handle works
+        pre-init; unbuilt non-default models can't report tasks until
+        startup.
         """
         runtime = self._runtimes.get(model_id)
-        if runtime is not None and runtime.execution_shape is ExecutionShape.SINGLE_PASS:
+        if runtime is not None:
             return tuple(runtime.tasks())
-        if runtime is None and model_id != self._default_model:
+        if model_id != self._default_model:
             raise ValueError(f"Unknown model {model_id!r}")
-        # Built AR runtime, or the default AR model not yet built.
-        return self._skills.names()
+        # Default model not built yet: its skills are known pre-init.
+        return self._skill_registry().names()
 
     async def _submit_request(
         self,
@@ -968,7 +771,7 @@ class InferenceEngine:
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
 
-        skill_spec = self._skills.resolve(skill)
+        skill_spec = self._skill_registry().resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
         if self._adapter_provider is None and adapter_id is not None:
             raise NotImplementedError(
@@ -983,7 +786,7 @@ class InferenceEngine:
                 raise TypeError("image must be np.ndarray or bytes")
             image_obj = image
 
-        prompt_str = self._extract_prompt_text(skill_spec, request_context)
+        prompt_str = skill_spec.prompt_text(request_context)
         tokens = list(skill_spec.build_prompt_tokens(self.runtime, request_context))
         norm_temperature = self._normalize_temperature(temperature)
         norm_top_p = self._normalize_top_p(top_p)
@@ -1341,18 +1144,6 @@ class InferenceEngine:
             except Exception:
                 _LOGGER.exception("Failed to record Photon error telemetry")
 
-    def _extract_prompt_text(self, skill: SkillSpec, request_context: object) -> str:
-        if isinstance(request_context, QueryRequest):
-            return request_context.question
-        if isinstance(request_context, PointRequest):
-            return request_context.object
-        if isinstance(request_context, DetectRequest):
-            return request_context.object
-        if isinstance(request_context, SegmentRequest):
-            return request_context.object
-        if isinstance(request_context, CaptionRequest):
-            return request_context.length
-        return str(request_context)
 
     def _scheduler_loop(self) -> None:
         runtime = self._runtimes.get(self._default_model)
@@ -1364,10 +1155,8 @@ class InferenceEngine:
         # CUDA-graph capture, so pause/drain is handled specially below.
         ar_executor = AutoregressiveExecutor(
             runtime,
-            skills=self._skills,
+            skills=self._skill_registry(),
             adapter_provider=self._adapter_provider,
-            default_temperature=self._default_temperature,
-            default_top_p=self._default_top_p,
             build_generation_request=self._build_generation_request,
             to_engine_result=self._to_engine_result,
             wake_event=self._scheduler_event,

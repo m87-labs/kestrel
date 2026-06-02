@@ -6,39 +6,78 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from kestrel.models.moondream.runtime import CoordToken, TextToken, Token
-from kestrel.utils.spatial_refs import build_spatial_tokens
+from ..runtime import CoordToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
-from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills.base import (
+    AR_DEFAULT_MAX_NEW_TOKENS,
+    AR_DEFAULT_TEMPERATURE,
+    AR_DEFAULT_TOP_P,
+    BuiltRequest,
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillSpec,
+    SkillState,
+    parse_settings,
+)
+from typing import Mapping
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from ..runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
 @dataclass(slots=True)
-class QuerySettings:
-    """Sampling parameters supplied with a query invocation."""
-
-    temperature: float
-    top_p: float
-    max_tokens: int
-
-
-@dataclass(slots=True)
 class QueryRequest:
-    """Validated query payload aligned with the fal_inference API."""
+    """Validated query payload — the carrier read by this skill's decode."""
 
     question: str
     image: Optional[np.ndarray | bytes]
     reasoning: bool
     stream: bool
-    settings: QuerySettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
 class QuerySkill(SkillSpec):
     """Default skill emitting plain text answers."""
+
+    def build_request(
+        self,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> BuiltRequest:
+        question = prompt.get("question")
+        if question is None:
+            raise ValueError("question must be provided")
+        question = str(question).strip()
+        if not question:
+            raise ValueError("question must be a non-empty string")
+        refs = normalize_spatial_refs(prompt.get("spatial_refs"))
+        if refs is not None and image is None:
+            raise ValueError("spatial_refs can only be used with an image")
+        s = parse_settings(
+            settings,
+            temperature=AR_DEFAULT_TEMPERATURE,
+            top_p=AR_DEFAULT_TOP_P,
+            max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
+        )
+        request = QueryRequest(
+            question=question,
+            image=image,
+            reasoning=bool(prompt.get("reasoning", True)),
+            stream=bool(prompt.get("stream", False)),
+            spatial_refs=refs,
+        )
+        return BuiltRequest(
+            request_context=request,
+            max_new_tokens=s.max_tokens,
+            temperature=s.temperature,
+            top_p=s.top_p,
+        )
+
+    def prompt_text(self, request_context: object) -> str:
+        return getattr(request_context, "question", "")
 
     def __init__(self) -> None:
         super().__init__(name="query")

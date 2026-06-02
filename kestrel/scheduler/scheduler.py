@@ -21,7 +21,6 @@ from kestrel.runtime import (
 )
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.skills import (
-    QuerySkill,
     SkillRegistry,
     SkillState,
 )
@@ -196,9 +195,7 @@ class GenerationScheduler:
         self,
         runtime: AutoregressiveRuntime,
         *,
-        default_temperature: float = 0.2,
-        default_top_p: float = 0.9,
-        skill_registry: Optional[SkillRegistry] = None,
+        skill_registry: SkillRegistry,
         adapter_provider: Optional[AdapterProvider] = None,
     ) -> None:
         self.runtime = runtime
@@ -207,11 +204,9 @@ class GenerationScheduler:
         self.running: RunningQueue[RequestLifecycle] = RunningQueue()
         self._completed: Deque[SchedulerResult] = deque()
         self._next_request_id = 0
-        self._default_temperature = max(float(default_temperature), 0.0)
-        self._default_top_p = float(default_top_p)
-        if not (0.0 < self._default_top_p <= 1.0):
-            raise ValueError("default_top_p must be in the range (0, 1]")
-        self._skills = skill_registry or SkillRegistry([QuerySkill()])
+        # The model's skills, supplied by the engine. Required: the kernel
+        # holds no model-specific default.
+        self._skills = skill_registry
         # Per-step sampling contract. Three optional hooks the runtime
         # can implement:
         #   * post_sample — run any model-specific GPU work alongside
@@ -1476,17 +1471,6 @@ class GenerationScheduler:
             seq.transition(RequestPhase.FINALIZING)
 
         self._completed.append(self._build_result(seq))
-
-    def _resolve_temperature(self, temperature: Optional[float]) -> float:
-        if temperature is None:
-            return self._default_temperature
-        return max(float(temperature), 0.0)
-
-    def _resolve_top_p(self, top_p: Optional[float]) -> float:
-        value = self._default_top_p if top_p is None else float(top_p)
-        if value <= 0.0 or value > 1.0:
-            raise ValueError("top_p must be in the range (0, 1]")
-        return value
 
     def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"

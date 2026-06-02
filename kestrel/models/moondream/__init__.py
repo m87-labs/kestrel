@@ -16,6 +16,10 @@ from .model import MoondreamModel, MoondreamTextModel
 from .runtime import MoondreamRuntime, SequenceState, DEFAULT_MAX_TOKENS
 from .weights import load_moondream_weights, load_text_weights
 
+# Imported after ``.runtime``: the skill modules pull Moondream's token
+# types from it, so the runtime module must be fully initialized first.
+from .skills import build_skill_registry
+
 # Both MD2 and MD3 share the Starmie tokenizer; the checkpoint_format tag
 # is what the weight loader keys off to pick the right key-name layout.
 register(
@@ -27,6 +31,7 @@ register(
         default_config=DEFAULT_MOONDREAM2_CONFIG,
         tokenizer_id="moondream/starmie-v1",
         runtime=MoondreamRuntime,
+        skills=build_skill_registry,
     )
 )
 register(
@@ -38,6 +43,7 @@ register(
         default_config=DEFAULT_MOONDREAM3_CONFIG,
         tokenizer_id="moondream/starmie-v1",
         runtime=MoondreamRuntime,
+        skills=build_skill_registry,
     )
 )
 

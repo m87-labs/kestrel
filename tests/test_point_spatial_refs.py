@@ -8,8 +8,16 @@ import pytest
 
 from kestrel.engine import InferenceEngine
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
-from kestrel.skills.point import PointRequest, PointSettings, PointSkill
-from kestrel.skills.query import QueryRequest
+from kestrel.skills import SkillRegistry
+from kestrel.models.moondream.skills import (
+    CaptionSkill, DetectSkill, PointSkill, QuerySkill, SegmentSkill,
+)
+from kestrel.models.moondream.skills.point import PointRequest
+from kestrel.models.moondream.skills.query import QueryRequest
+
+
+def _ALL_SKILLS() -> SkillRegistry:
+    return SkillRegistry([QuerySkill(), PointSkill(), DetectSkill(), CaptionSkill(), SegmentSkill()])
 
 
 class _FakeTokenizer:
@@ -36,7 +44,6 @@ def test_point_prompt_tokens_include_spatial_refs_before_object_text() -> None:
         object="gaze",
         image=None,
         stream=False,
-        settings=PointSettings(temperature=0.0, top_p=1.0),
         spatial_refs=((0.2, 0.3), (0.1, 0.2, 0.5, 0.6)),
     )
 
@@ -53,7 +60,9 @@ def test_point_prompt_tokens_include_spatial_refs_before_object_text() -> None:
 
 def test_engine_point_normalizes_spatial_refs_for_request() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
     engine._default_max_new_tokens = 128
+    engine._skills_override = _ALL_SKILLS()
     captured: dict[str, object] = {}
 
     async def fake_submit(request_context: object, **kwargs: object) -> SimpleNamespace:
@@ -85,7 +94,9 @@ def test_engine_point_normalizes_spatial_refs_for_request() -> None:
 
 def test_engine_point_keeps_positional_settings_compatibility() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
     engine._default_max_new_tokens = 128
+    engine._skills_override = _ALL_SKILLS()
     captured: dict[str, object] = {}
 
     async def fake_submit(request_context: object, **kwargs: object) -> SimpleNamespace:
@@ -108,6 +119,7 @@ def test_engine_point_keeps_positional_settings_compatibility() -> None:
 
 def test_engine_point_requires_image_before_spatial_ref_validation() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
 
     with pytest.raises(ValueError, match="image must be provided for pointing"):
         asyncio.run(engine.point(None, "gaze", spatial_refs=[[0.2, 0.3]]))
@@ -119,6 +131,7 @@ def test_engine_point_requires_image_before_spatial_ref_validation() -> None:
 
 def test_engine_query_rejects_array_spatial_refs_without_image() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
 
     refs = np.array([[0.2, 0.3]], dtype=np.float32)
     with pytest.raises(ValueError, match="spatial_refs can only be used with an image"):
@@ -127,6 +140,7 @@ def test_engine_query_rejects_array_spatial_refs_without_image() -> None:
 
 def test_engine_query_treats_empty_spatial_refs_as_unset_without_image() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
     engine._default_temperature = 0.0
     engine._default_top_p = 1.0
     engine._default_max_new_tokens = 128
@@ -149,6 +163,7 @@ def test_engine_query_treats_empty_spatial_refs_as_unset_without_image() -> None
 
 def test_engine_segment_requires_image_before_spatial_ref_validation() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
 
     refs = np.array([[0.2, 0.3]], dtype=np.float32)
     with pytest.raises(ValueError, match="image must be provided for segmentation"):
