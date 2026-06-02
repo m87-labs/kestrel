@@ -214,6 +214,12 @@ class SinglePassRuntime(Runtime, Protocol):
     # silently running on the default stream with no interleaving.
     primary_stream: Any
 
+    # Capability names this runtime serves, e.g. ("segment_masks",). The
+    # engine advertises these through ModelHandle.tasks / supports() and
+    # validates run(model, task, ...) against them, so it's part of the
+    # contract — declared here, not discovered via getattr.
+    def tasks(self) -> Sequence[str]: ...
+
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...

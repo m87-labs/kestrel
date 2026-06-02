@@ -106,20 +106,21 @@ class ModelHandle:
         self,
         image: Optional[np.ndarray | bytes] = None,
         question: Optional[str] = None,
-        *,
-        reasoning: bool = True,  # match InferenceEngine.query — see note below
+        reasoning: bool = True,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
         stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
-        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
     ) -> "EngineResult | EngineStream":
+        # Parameter order/kind mirrors InferenceEngine.query exactly so a
+        # positional call (img, q, reasoning, refs, ...) forwards unchanged.
         self._require_default_ar("query")
         return await self._engine.query(
             image=image,
             question=question,
             reasoning=reasoning,
+            spatial_refs=spatial_refs,
             stream=stream,
             settings=settings,
-            spatial_refs=spatial_refs,
         )
 
     async def caption(
@@ -139,7 +140,6 @@ class ModelHandle:
         self,
         image: Optional[np.ndarray | bytes],
         object: str,
-        *,
         settings: Optional[Mapping[str, object]] = None,
     ) -> "EngineResult":
         self._require_default_ar("detect")

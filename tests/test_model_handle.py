@@ -138,36 +138,30 @@ def test_ar_verb_on_non_default_model_fails_loud() -> None:
 
 
 def test_handle_verb_signatures_match_engine() -> None:
-    """A handle verb is a thin forwarder; its signature must not diverge
-    from InferenceEngine's, or binding a model silently changes behavior:
-      - a default drift changes outcomes (e.g. query reasoning), and
-      - making an engine-optional param required breaks valid calls
-        (e.g. text-only query(question=...) with no image).
-    Introspect both and assert, for every shared param, same default AND
-    same required-ness. Guards all verbs, not just the ones Codex caught."""
+    """A handle verb is a thin forwarder; its signature must match
+    InferenceEngine's, or binding a model silently breaks or changes a
+    valid call. The ways it can drift, each seen in review:
+      - default drift changes outcomes (query reasoning),
+      - an engine-optional param made required breaks calls (text-only
+        query), and
+      - reordering / making positional params keyword-only breaks
+        positional calls (query(img, q, reasoning, refs); detect settings).
+    So compare the full ordered parameter list — (name, kind, default) —
+    for every param the handle declares beyond self. Guards all verbs.
+    """
     import inspect
 
-    empty = inspect.Parameter.empty
     for verb in ("query", "caption", "detect", "point", "segment"):
-        eng_params = inspect.signature(getattr(InferenceEngine, verb)).parameters
-        h_params = inspect.signature(getattr(ModelHandle, verb)).parameters
-        for name, h_p in h_params.items():
-            if name == "self":
-                continue
-            eng_p = eng_params.get(name)
-            assert eng_p is not None, f"{verb}: handle has param {name!r} engine lacks"
-            # Required-ness must match: an engine-optional param must not be
-            # required on the handle (that breaks otherwise-valid calls).
-            assert (h_p.default is empty) == (eng_p.default is empty), (
-                f"{verb}: required-ness for {name!r} drifted — "
-                f"handle {'required' if h_p.default is empty else 'optional'}, "
-                f"engine {'required' if eng_p.default is empty else 'optional'}"
-            )
-            if h_p.default is not empty:
-                assert h_p.default == eng_p.default, (
-                    f"{verb}: default for {name!r} drifted — "
-                    f"handle={h_p.default!r} engine={eng_p.default!r}"
-                )
+        eng = inspect.signature(getattr(InferenceEngine, verb)).parameters
+        hnd = inspect.signature(getattr(ModelHandle, verb)).parameters
+        eng_list = [(n, p.kind, p.default) for n, p in eng.items() if n != "self"]
+        hnd_list = [(n, p.kind, p.default) for n, p in hnd.items() if n != "self"]
+        # The handle forwards exactly the engine verb's parameters, so the
+        # ordered (name, kind, default) lists must be identical.
+        assert hnd_list == eng_list, (
+            f"{verb}: handle signature drifted from engine.\n"
+            f"  handle: {hnd_list}\n  engine: {eng_list}"
+        )
 
 
 def test_run_on_ar_model_rejected_with_clear_message() -> None:
