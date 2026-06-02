@@ -71,6 +71,12 @@ class Runtime(Protocol):
     # Which executor drives this runtime.
     execution_shape: ExecutionShape
 
+    # Release the runtime's resources. Called once by the engine on
+    # shutdown for every registered runtime, regardless of shape, so
+    # teardown lives on the universal surface (the AR runtime tears down
+    # its image preprocessor here; a single-pass runtime may be a no-op).
+    def shutdown(self) -> None: ...
+
 
 class AutoregressiveRuntime(Runtime, Protocol):
     """Surface the scheduler calls on a prefill/decode runtime.
@@ -123,10 +129,6 @@ class AutoregressiveRuntime(Runtime, Protocol):
     def preprocess_image_async(
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...
-
-    # Called once when the engine is shutting down so the runtime can
-    # tear down its preprocessing thread pool (if any).
-    def shutdown_image_preprocessor(self) -> None: ...
 
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...

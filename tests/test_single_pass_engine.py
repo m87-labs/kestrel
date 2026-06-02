@@ -39,6 +39,9 @@ class _StubSinglePass:
             raise ValueError("forward failed")
         return {"task": task, "inputs": inputs}
 
+    def shutdown(self) -> None:
+        pass
+
 
 def _engine_with(ar: FakeRuntime, sp: _StubSinglePass) -> InferenceEngine:
     """Wire an engine for the loop without create() (no Moondream/warmup)."""
@@ -172,6 +175,40 @@ def test_run_resolves_when_event_pending_with_no_other_traffic() -> None:
                 thread.join(timeout=5.0)
         finally:
             sp_mod.make_event = orig_make_event
+
+    asyncio.run(go())
+
+
+def test_engine_shutdown_tears_down_single_pass_runtime() -> None:
+    """Regression (P2): engine.shutdown() must not AttributeError on a
+    single-pass runtime.
+
+    shutdown() iterates every registered runtime and calls runtime.shutdown();
+    a conformant single-pass runtime implements that, so a co-hosted
+    Moondream + single-pass engine tears down cleanly.
+    """
+
+    class _RecordingSinglePass(_StubSinglePass):
+        def __init__(self) -> None:
+            super().__init__("recording-sp")
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        sp = _RecordingSinglePass()
+        engine = _engine_with(ar, sp)
+        # Minimal lifecycle state shutdown() touches; no loop/worker started.
+        engine._queue = asyncio.Queue()
+        engine._worker_task = None
+        engine._scheduler_thread = None
+
+        await engine.shutdown()
+
+        assert engine._shutdown is True
+        assert sp.shutdown_called is True
 
     asyncio.run(go())
 

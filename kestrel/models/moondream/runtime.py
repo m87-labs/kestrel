@@ -757,7 +757,12 @@ class MoondreamRuntime:
         """Return a Future for Moondream's overlap-crop preprocessing."""
         return self._image_preprocessor.submit(image, self.config.vision)
 
-    def shutdown_image_preprocessor(self) -> None:
+    def shutdown(self) -> None:
+        """Release runtime resources (Runtime protocol).
+
+        The engine calls this once per runtime on shutdown; for Moondream
+        that means tearing down the image-preprocessor thread pool.
+        """
         self._image_preprocessor.shutdown(wait=True)
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:

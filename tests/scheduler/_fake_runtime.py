@@ -183,7 +183,7 @@ class FakeRuntime:
         fut.set_result(image)
         return fut
 
-    def shutdown_image_preprocessor(self) -> None:
+    def shutdown(self) -> None:
         pass
 
     # Slot lifecycle ---------------------------------------------------

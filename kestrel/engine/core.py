@@ -371,7 +371,7 @@ class InferenceEngine:
             finally:
                 self._photon_reporter = None
         for runtime in self._runtimes.values():
-            runtime.shutdown_image_preprocessor()
+            runtime.shutdown()
 
     async def submit(
         self,

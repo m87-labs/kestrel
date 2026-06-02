@@ -112,7 +112,7 @@ class _FakeRuntime:
     def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[object]:
         return self._image_preprocessor.submit(image)
 
-    def shutdown_image_preprocessor(self) -> None:  # pragma: no cover
+    def shutdown(self) -> None:  # pragma: no cover
         pass
 
 

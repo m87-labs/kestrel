@@ -38,6 +38,9 @@ class _StubDriver:
             raise ValueError("forward failed")
         return {"task": task, "inputs": inputs}
 
+    def shutdown(self) -> None:
+        pass
+
 
 def _req(request_id: int, task: str, inputs: Any) -> _SinglePassRequest:
     loop = asyncio.new_event_loop()
