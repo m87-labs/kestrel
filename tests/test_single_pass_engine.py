@@ -119,6 +119,63 @@ def test_run_rejects_autoregressive_model() -> None:
     asyncio.run(go())
 
 
+def test_run_resolves_when_event_pending_with_no_other_traffic() -> None:
+    """Regression (P1): a pending GPU event must not hang the kernel.
+
+    A launched single-pass forward signals completion via a CUDA event,
+    which sets no host event. If the kernel blocks on wake_event.wait()
+    while the only in-flight work is that pending event, it sleeps past
+    GPU completion and engine.run() never resolves. With nothing else in
+    flight to wake the loop, run() must still complete on its own.
+    """
+    import kestrel.engine.single_pass as sp_mod
+
+    class _PendingEvent:
+        def __init__(self) -> None:
+            self._polls = 0
+
+        def record(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def query(self) -> bool:
+            # Not done for the first few polls — forces the kernel to park
+            # with a pending event and nothing else to wake it.
+            self._polls += 1
+            return self._polls > 3
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        sp = _StubSinglePass()
+        engine = _engine_with(ar, sp)
+        engine._loop = asyncio.get_running_loop()
+        engine._initialized = True
+        engine._init_task = None
+
+        orig_make_event = sp_mod.make_event
+        sp_mod.make_event = lambda device: _PendingEvent()
+        try:
+            thread = threading.Thread(
+                target=engine._scheduler_loop, name="kernel", daemon=True
+            )
+            thread.start()
+            try:
+                # No other traffic: only this single-pass request is in
+                # flight. It must resolve via the kernel's poll, not hang.
+                result = await asyncio.wait_for(
+                    engine.run(sp.model_name, "segment", {"k": 1}), timeout=5.0
+                )
+                assert result.output == {"task": "segment", "inputs": {"k": 1}}
+            finally:
+                engine._shutdown = True
+                engine._scheduler_queue.put(None)
+                engine._scheduler_event.set()
+                thread.join(timeout=5.0)
+        finally:
+            sp_mod.make_event = orig_make_event
+
+    asyncio.run(go())
+
+
 def test_single_pass_lane_crash_does_not_kill_the_kernel() -> None:
     """A single-pass lane whose advance() raises is isolated.
 

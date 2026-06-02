@@ -107,6 +107,12 @@ _ALLOWED_API_BASE_URLS = (
     _DEFAULT_API_BASE_URL,
 )
 
+# How long the kernel parks between polls while a single-pass forward is
+# in flight. A single forward is a few ms and its GPU completion event
+# sets no host event, so the kernel re-checks on this cadence; ~1ms keeps
+# completion latency low without busy-spinning a core.
+_SINGLE_PASS_POLL_INTERVAL_S = 0.001
+
 
 class InferenceEngine:
     """Orchestrates batched inference over a shared runtime and scheduler."""
@@ -1451,7 +1457,17 @@ class InferenceEngine:
                     if not progressed:
                         if shutdown_requested:
                             break
-                        wake_event.wait()
+                        # A launched single-pass forward signals completion
+                        # via a CUDA event, which sets no host event — so if
+                        # any lane has in-flight event-backed work, poll on a
+                        # short timeout instead of blocking, or the kernel
+                        # could sleep past the GPU finishing and leave
+                        # engine.run() unresolved until an unrelated request
+                        # happens to wake the loop.
+                        if any(sp.has_in_flight for sp in single_pass.values()):
+                            wake_event.wait(timeout=_SINGLE_PASS_POLL_INTERVAL_S)
+                        else:
+                            wake_event.wait()
                         wake_event.clear()
         finally:
             deliver(ar_executor.shutdown())

@@ -137,6 +137,16 @@ class SinglePassExecutor:
     def has_work(self) -> bool:
         return bool(self._in_flight) or not self._queue.empty()
 
+    @property
+    def has_in_flight(self) -> bool:
+        """A launched forward is awaiting its GPU completion event.
+
+        Distinct from ``has_work``: queued requests wake the kernel via the
+        submit event, but a pending GPU event sets no host event, so the
+        kernel must keep polling (timed wait, not block) while this holds.
+        """
+        return bool(self._in_flight)
+
     def advance(self) -> TickResult:
         progressed = self._launch()
         completed = self._collect()
