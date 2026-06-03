@@ -6,31 +6,33 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from kestrel.models.moondream.runtime import TextToken, Token
+from ..runtime import TextToken, Token
 
-from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills.base import (
+    AR_DEFAULT_MAX_NEW_TOKENS,
+    AR_DEFAULT_TEMPERATURE,
+    AR_DEFAULT_TOP_P,
+    BuiltRequest,
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillSpec,
+    SkillState,
+    parse_settings,
+)
+from typing import Mapping
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from ..runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
 @dataclass(slots=True)
-class CaptionSettings:
-    """Sampling parameters for caption generation."""
-
-    temperature: float
-    top_p: float
-
-
-@dataclass(slots=True)
 class CaptionRequest:
-    """Caption payload carried through the scheduler."""
+    """Caption payload — the carrier read by this skill's decode."""
 
     length: str
     image: Optional[np.ndarray | bytes]
     stream: bool
-    settings: CaptionSettings
 
 
 class CaptionSkill(SkillSpec):
@@ -40,6 +42,39 @@ class CaptionSkill(SkillSpec):
 
     def __init__(self) -> None:
         super().__init__(name="caption")
+
+    def build_request(
+        self,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> BuiltRequest:
+        if image is None:
+            raise ValueError("image must be provided for captioning")
+        length = str(prompt.get("length", "normal")).strip().lower() or "normal"
+        if length not in self.VALID_LENGTHS:
+            valid = ", ".join(sorted(self.VALID_LENGTHS))
+            raise ValueError(f"length must be one of: {valid}")
+        s = parse_settings(
+            settings,
+            temperature=AR_DEFAULT_TEMPERATURE,
+            top_p=AR_DEFAULT_TOP_P,
+            max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
+        )
+        request = CaptionRequest(
+            length=length,
+            image=image,
+            stream=bool(prompt.get("stream", False)),
+        )
+        return BuiltRequest(
+            request_context=request,
+            max_new_tokens=s.max_tokens,
+            temperature=s.temperature,
+            top_p=s.top_p,
+        )
+
+    def prompt_text(self, request_context: object) -> str:
+        return getattr(request_context, "length", "")
 
     def build_prompt_tokens(
         self,
@@ -132,6 +167,5 @@ class CaptionSkillState(SkillState):
 
 __all__ = [
     "CaptionRequest",
-    "CaptionSettings",
     "CaptionSkill",
 ]

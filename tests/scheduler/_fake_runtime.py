@@ -186,6 +186,15 @@ class FakeRuntime:
     def shutdown(self) -> None:
         pass
 
+    def skills(self) -> Any:
+        from kestrel.skills import SkillRegistry
+        from kestrel.models.moondream.skills import QuerySkill
+
+        return SkillRegistry([QuerySkill()])
+
+    def tasks(self) -> tuple[str, ...]:
+        return self.skills().names()
+
     # Slot lifecycle ---------------------------------------------------
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
         self.acquired_prefill_slots.append(slot_id)

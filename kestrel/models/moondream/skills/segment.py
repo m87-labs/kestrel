@@ -2,14 +2,13 @@
 
 
 from dataclasses import dataclass
-from typing import Iterable
 import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
-from kestrel.utils.spatial_refs import build_spatial_tokens
+from ..runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 from kestrel.utils.svg import (
     decode_svg_token_strings,
     parse_svg_tokens,
@@ -18,30 +17,29 @@ from kestrel.utils.svg import (
     PATH_COMMANDS,
 )
 
-from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills.base import (
+    AR_DEFAULT_MAX_NEW_TOKENS,
+    BuiltRequest,
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillSpec,
+    SkillState,
+    parse_settings,
+)
+from typing import Mapping
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from ..runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
 @dataclass(slots=True)
-class SegmentSettings:
-    """Sampling parameters supplied with a segment invocation."""
-
-    temperature: float
-    top_p: float
-    max_tokens: int
-
-
-@dataclass(slots=True)
 class SegmentRequest:
-    """Segment payload used internally by the scheduler."""
+    """Segment payload — the carrier read by this skill's decode."""
 
     object: str
     image: Optional[np.ndarray | bytes]
     stream: bool
-    settings: SegmentSettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
@@ -50,6 +48,37 @@ class SegmentSkill(SkillSpec):
 
     def __init__(self) -> None:
         super().__init__(name="segment")
+
+    def build_request(
+        self,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> BuiltRequest:
+        obj = str(prompt.get("object", "")).strip()
+        if not obj:
+            raise ValueError("object must be a non-empty string")
+        if image is None:
+            raise ValueError("image must be provided for segmentation")
+        s = parse_settings(
+            settings, temperature=0.0, top_p=1.0,
+            max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
+        )
+        request = SegmentRequest(
+            object=obj,
+            image=image,
+            stream=False,
+            spatial_refs=normalize_spatial_refs(prompt.get("spatial_refs")),
+        )
+        return BuiltRequest(
+            request_context=request,
+            max_new_tokens=s.max_tokens,
+            temperature=s.temperature,
+            top_p=s.top_p,
+        )
+
+    def prompt_text(self, request_context: object) -> str:
+        return getattr(request_context, "object", "")
 
     def build_prompt_tokens(
         self,
@@ -298,6 +327,5 @@ def _format_chunk(chunk: str, *, first: bool) -> str:
 
 __all__ = [
     "SegmentRequest",
-    "SegmentSettings",
     "SegmentSkill",
 ]

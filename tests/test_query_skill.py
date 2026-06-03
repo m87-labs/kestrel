@@ -7,9 +7,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
 
-from kestrel.models.moondream.runtime import TextToken
 from kestrel.models.protocols import QueryTemplate
-from kestrel.skills.query import QueryRequest, QuerySkill
+from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
 
 
 @dataclass
@@ -56,7 +55,7 @@ def _ids(tokens) -> List[int]:
 def test_query_skill_uses_prefix_when_reasoning_override() -> None:
     runtime = _Runtime(prefix_when_reasoning=[30, 31, 32])
     req = QueryRequest(
-        question="hi", image=None, reasoning=True, stream=False, settings=None,
+        question="hi", image=None, reasoning=True, stream=False,
     )
     skill = QuerySkill()
     tokens = skill.build_prompt_tokens(runtime, req)
@@ -67,7 +66,7 @@ def test_query_skill_uses_prefix_when_reasoning_override() -> None:
 def test_query_skill_falls_back_to_prefix_when_override_unset() -> None:
     runtime = _Runtime(prefix_when_reasoning=None)
     req = QueryRequest(
-        question="hi", image=None, reasoning=True, stream=False, settings=None,
+        question="hi", image=None, reasoning=True, stream=False,
     )
     skill = QuerySkill()
     tokens = skill.build_prompt_tokens(runtime, req)
@@ -78,7 +77,7 @@ def test_query_skill_falls_back_to_prefix_when_override_unset() -> None:
 def test_query_skill_non_reasoning_ignores_override() -> None:
     runtime = _Runtime(prefix_when_reasoning=[30, 31, 32])
     req = QueryRequest(
-        question="hi", image=None, reasoning=False, stream=False, settings=None,
+        question="hi", image=None, reasoning=False, stream=False,
     )
     skill = QuerySkill()
     tokens = skill.build_prompt_tokens(runtime, req)

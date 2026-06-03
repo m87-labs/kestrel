@@ -1,20 +1,136 @@
-"""Core skill interfaces shared across inference flows."""
+"""The model-agnostic skill contract used by the Kestrel kernel.
+
+Defines what a *skill* is — independent of any model: the ``SkillSpec``
+behavior, per-request ``SkillState``, the ``SkillRegistry``, and the value
+types they exchange with the kernel. Concrete skills live with their model.
+"""
 
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 if False:  # pragma: no cover - type-checking imports
+    import numpy as np
     from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
     from kestrel.models.moondream.runtime import Token
 
 
+# Moondream's autoregressive serving defaults. These are AR sampling
+# config (token sampling), not kernel config — they live with the AR
+# skills, which are the model's per-capability units. query/caption use
+# AR_DEFAULT_TEMPERATURE; detect/point/segment override to greedy (0.0).
+AR_DEFAULT_TEMPERATURE = 0.2
+AR_DEFAULT_TOP_P = 0.9
+AR_DEFAULT_MAX_NEW_TOKENS = 768
+
+
+@dataclass(frozen=True, slots=True)
+class SkillSettings:
+    """Sampling params shared by **autoregressive** skills.
+
+    Temperature / top_p / max_tokens are token-sampling knobs — they apply
+    to AR decoding, not to single-pass models (a segmentation forward has
+    no temperature). So this is an AR-skill helper, not a universal
+    contract: AR skills call :func:`parse_settings` inside their own
+    ``build_request`` with their per-capability defaults. Single-pass
+    capabilities read whatever their model defines from the raw payload
+    and ignore this entirely.
+    """
+
+    temperature: float
+    top_p: float
+    max_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltRequest:
+    """What a skill's ``build_request`` hands back to the engine.
+
+    Carries the assembled per-capability ``request_context`` plus the
+    sampling params the skill resolved (the engine threads these into the
+    scheduler). The skill owns all of it — token budget included
+    (detect/point derive ``max_new_tokens`` from ``max_objects``).
+    """
+
+    request_context: object
+    max_new_tokens: int
+    temperature: float
+    top_p: float
+
+
+def parse_settings(
+    settings: Optional[Mapping[str, object]],
+    *,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+) -> SkillSettings:
+    """Extract + validate AR sampling params from a raw settings map.
+
+    Helper for autoregressive skills. The skill supplies its own
+    per-capability defaults (e.g. greedy ``temperature=0.0`` for
+    detect/point/segment, ``0.2`` for query/caption); this applies any
+    overrides from ``settings`` and validates the AR sampling envelope.
+    """
+    if settings is not None:
+        if "temperature" in settings:
+            temperature = float(settings["temperature"])  # type: ignore[arg-type]
+        if "top_p" in settings:
+            top_p = float(settings["top_p"])  # type: ignore[arg-type]
+        if "max_tokens" in settings:
+            max_tokens = int(settings["max_tokens"])  # type: ignore[arg-type]
+    if temperature < 0.0:
+        raise ValueError("temperature must be non-negative")
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError("top_p must be in the range (0, 1]")
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    return SkillSettings(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+
+
 @dataclass(frozen=True)
 class SkillSpec:
-    """Declarative description of a skill's prompt and decoding behaviour."""
+    """Declarative description of a skill's prompt and decoding behaviour.
+
+    The skill is the model's implementation of one capability. It owns
+    that capability's *input contract*: ``build_request`` validates the
+    raw call inputs and assembles the request object the scheduler runs.
+    The kernel stays model-agnostic — it never builds or imports a
+    model's request types; it just calls ``build_request`` and forwards
+    the result.
+    """
 
     name: str
+
+    def build_request(
+        self,
+        image: "Optional[np.ndarray | bytes]",
+        prompt: "Mapping[str, object]",
+        settings: "Optional[Mapping[str, object]]",
+    ) -> "BuiltRequest":
+        """Validate raw inputs and build this capability's request.
+
+        Both ``prompt`` and ``settings`` are raw, model-defined maps — the
+        seam carries no model assumptions. ``prompt`` is the per-capability
+        payload (e.g. ``{"object": ...}`` for detect/point/segment,
+        ``{"question": ..., "reasoning": ...}`` for query, ``{"length":
+        ...}`` for caption). AR skills parse ``settings`` with
+        :func:`parse_settings`; a single-pass capability reads whatever its
+        model defines. Returns a :class:`BuiltRequest` (the request_context
+        plus resolved sampling params). Raises ``ValueError`` on invalid
+        input.
+        """
+        raise NotImplementedError
+
+    def prompt_text(self, request_context: object) -> str:
+        """A human-readable label for this request (logs/metrics).
+
+        Defaults to empty; skills override to surface the salient input
+        (the question, the object name, …). Not behavior-bearing — the
+        kernel only stores it on the request as a label.
+        """
+        return ""
 
     def build_prompt_tokens(
         self,
@@ -112,26 +228,18 @@ class SkillState:
         return None
 
 class SkillRegistry:
-    """Lookup table for skills with a default entry."""
+    """Maps a model's capability names to their skills.
+
+    May be empty: a model with no autoregressive skills (e.g. a single-pass
+    model) registers none and advertises its tasks via the runtime instead.
+    """
 
     def __init__(self, skills: Iterable[SkillSpec]) -> None:
         self._skills: Dict[str, SkillSpec] = {}
-        self._default: Optional[str] = None
         for spec in skills:
-            name = spec.name
-            if name in self._skills:
-                raise ValueError(f"Duplicate skill registered: {name}")
-            self._skills[name] = spec
-            if self._default is None:
-                self._default = name
-        if self._default is None:
-            raise ValueError("SkillRegistry requires at least one skill")
-
-    # ------------------------------------------------------------------
-
-    @property
-    def default(self) -> SkillSpec:
-        return self._skills[self._default]  # type: ignore[index]
+            if spec.name in self._skills:
+                raise ValueError(f"Duplicate skill registered: {spec.name}")
+            self._skills[spec.name] = spec
 
     def names(self) -> tuple[str, ...]:
         """Registered skill names, in registration order."""
@@ -142,8 +250,3 @@ class SkillRegistry:
             return self._skills[skill]
         except KeyError as exc:  # pragma: no cover - defensive guard
             raise ValueError(f"Unknown skill '{skill}'") from exc
-
-    def add(self, spec: SkillSpec) -> None:
-        if spec.name in self._skills:
-            raise ValueError(f"Skill '{spec.name}' already registered")
-        self._skills[spec.name] = spec

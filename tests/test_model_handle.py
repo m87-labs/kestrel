@@ -16,7 +16,8 @@ import pytest
 
 from kestrel.engine import InferenceEngine, ModelHandle
 from kestrel.runtime import ExecutionShape
-from kestrel.skills import SkillRegistry, QuerySkill, CaptionSkill, SegmentSkill
+from kestrel.skills import SkillRegistry
+from kestrel.models.moondream.skills import QuerySkill, CaptionSkill, SegmentSkill
 
 
 class _StubSinglePass:
@@ -31,15 +32,19 @@ class _StubSinglePass:
 
 def _engine() -> InferenceEngine:
     """Minimal engine with an AR default + a single-pass model registered."""
+    ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
     eng = object.__new__(InferenceEngine)
     eng._default_model = "ar-model"
     eng._runtimes = {
         "ar-model": SimpleNamespace(
-            model_name="ar-model", execution_shape=ExecutionShape.AUTOREGRESSIVE
+            model_name="ar-model",
+            execution_shape=ExecutionShape.AUTOREGRESSIVE,
+            skills=lambda: ar_skills,
+            tasks=lambda: ar_skills.names(),
         ),
         "sp-model": _StubSinglePass("sp-model", ("segment_masks",)),
     }
-    eng._skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
+    eng._skills_override = None  # AR runtime owns its skills
     return eng
 
 
@@ -77,12 +82,30 @@ def test_single_pass_handle_advertises_runtime_tasks() -> None:
     assert h.supports("query") is False
 
 
+def test_default_handle_tasks_honor_skill_override() -> None:
+    """The default model reports the registry that actually executes its
+    verbs. With a ``_skills_override`` set, ``tasks``/``supports`` must
+    reflect the override — not the built runtime's own skills — so the
+    handle never hides or rejects a skill the engine would run."""
+    eng = _engine()
+    # Override the default model's skills; the built runtime still advertises
+    # its own ("query", "caption", "segment") via its skills= lambda.
+    eng._skills_override = SkillRegistry([QuerySkill()])
+    h = eng.model("ar-model")
+    assert h.tasks == ("query",)
+    assert h.supports("query") is True
+    assert h.supports("caption") is False
+
+
 def test_unsupported_capability_raises_clearly() -> None:
     eng = _engine()
     sp = eng.model("sp-model")
-    # query is an AR skill; the single-pass model doesn't serve it.
-    with pytest.raises(ValueError, match="does not support 'query'"):
+    # An AR verb on a non-default model fails loud (not routable).
+    with pytest.raises(NotImplementedError, match="not yet routable"):
         asyncio.run(sp.query(None, "hi?"))
+    # A task the model doesn't serve, via the generic escape hatch, names it.
+    with pytest.raises(ValueError, match="does not support 'query'"):
+        asyncio.run(sp.run("query", {}))
 
 
 def test_default_ar_verb_forwards_to_engine() -> None:
@@ -124,8 +147,12 @@ def test_ar_verb_on_non_default_model_fails_loud() -> None:
     handle must refuse rather than silently hit the default model."""
     eng = _engine()
     # Register a second AR model; the verbs can't route to it.
+    ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
     eng._runtimes["ar-other"] = SimpleNamespace(
-        model_name="ar-other", execution_shape=ExecutionShape.AUTOREGRESSIVE
+        model_name="ar-other",
+        execution_shape=ExecutionShape.AUTOREGRESSIVE,
+        skills=lambda: ar_skills,
+        tasks=lambda: ar_skills.names(),
     )
 
     async def fake_query(**kwargs: Any) -> str:  # pragma: no cover - must not run

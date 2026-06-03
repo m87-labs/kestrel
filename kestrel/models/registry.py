@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List
 if TYPE_CHECKING:
     from kestrel.config import RuntimeConfig
     from kestrel.runtime import Runtime
+    from kestrel.skills import SkillRegistry
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,24 @@ class ModelSpec:
     # model. Kwargs (e.g. ``max_lora_rank``) are forwarded from the
     # engine's runtime-construction path.
     runtime: Callable[..., "Runtime"]
+    # Factory for the model's capabilities. Returns the
+    # :class:`~kestrel.skills.SkillRegistry` this model serves. Static
+    # metadata — callable without building the (GPU) runtime — so the
+    # engine can validate inputs and report ``tasks`` before startup.
+    # Models with no autoregressive skills (e.g. single-pass) leave this
+    # at the default empty registry and advertise tasks via the runtime.
+    skills: Callable[[], "SkillRegistry"] = lambda: _empty_skill_registry()
+
+
+def _empty_skill_registry() -> "SkillRegistry":
+    """Default ``ModelSpec.skills`` factory: a model with no skills.
+
+    Imported lazily so the registry module stays free of a hard
+    dependency on the skill package.
+    """
+    from kestrel.skills import SkillRegistry
+
+    return SkillRegistry([])
 
 
 _REGISTRY: Dict[str, ModelSpec] = {}

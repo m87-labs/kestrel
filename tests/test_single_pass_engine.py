@@ -62,7 +62,7 @@ def _engine_with(ar: FakeRuntime, sp: _StubSinglePass) -> InferenceEngine:
     engine._adapter_provider = None
     engine._default_temperature = 0.2
     engine._default_top_p = 0.9
-    engine._skills = None
+    engine._skills_override = None
     engine._request_ids = iter(range(1, 1_000_000))
     return engine
 

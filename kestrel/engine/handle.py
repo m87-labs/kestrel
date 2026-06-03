@@ -61,8 +61,11 @@ class ModelHandle:
         to the default autoregressive model — they take no model id. So a
         handle for any *other* model must not silently misroute through
         them. Until per-model AR routing exists, fail loud instead.
+
+        Only the default-model gate is checked here (it needs no started
+        engine); the engine verb + the model's skill validate that the
+        model actually serves ``task``.
         """
-        self._require(task)
         if self._model != self._engine._default_model:
             raise NotImplementedError(
                 f"{task!r} on {self._model!r} is not yet routable: the "

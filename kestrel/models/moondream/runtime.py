@@ -639,6 +639,19 @@ class MoondreamRuntime:
         """Return the model name (e.g., 'moondream2', 'moondream3-preview')."""
         return self._cfg.model
 
+    def skills(self) -> "SkillRegistry":
+        """The capabilities this model serves (Runtime protocol).
+
+        Sourced from the model's :class:`~kestrel.models.registry.ModelSpec`
+        (``skills=``), the single declaration of the model's skill set, so
+        the live runtime and the pre-start engine resolve the same registry.
+        """
+        return get_spec(self.model_name).skills()
+
+    def tasks(self) -> tuple[str, ...]:
+        """Capability names this model serves (Runtime protocol)."""
+        return self.skills().names()
+
     # --- Sampling hooks (kestrel.runtime.sampling.SamplingHooks) ----
     # Moondream's per-step "post-sample" work is a coord/size decode
     # from hidden states. We own all the bytes (per-slot GPU staging +

@@ -6,31 +6,34 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
+from ..runtime import CoordToken, SizeToken, TextToken, Token
 
-from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills.base import (
+    BuiltRequest,
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillSpec,
+    SkillState,
+    parse_settings,
+)
+from typing import Mapping
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from ..runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
-@dataclass(slots=True)
-class DetectSettings:
-    """Sampling parameters supplied with a detect invocation."""
-
-    temperature: float
-    top_p: float
+# Default object cap when the caller doesn't specify one.
+_DETECT_DEFAULT_MAX_OBJECTS = 50
 
 
 @dataclass(slots=True)
 class DetectRequest:
-    """Detect payload used internally by the scheduler."""
+    """Detect payload — the carrier read by this skill's decode."""
 
     object: str
     image: Optional[np.ndarray | bytes]
     stream: bool
-    settings: DetectSettings
     max_objects: int
 
 
@@ -39,6 +42,40 @@ class DetectSkill(SkillSpec):
 
     def __init__(self) -> None:
         super().__init__(name="detect")
+
+    def build_request(
+        self,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> BuiltRequest:
+        obj = str(prompt.get("object", "")).strip()
+        if not obj:
+            raise ValueError("object must be a non-empty string")
+        max_objects = _DETECT_DEFAULT_MAX_OBJECTS
+        if settings is not None and "max_objects" in settings:
+            max_objects = max(1, int(settings["max_objects"]))  # type: ignore[arg-type]
+        # detect derives its token budget from max_objects and ignores any
+        # settings["max_tokens"] (matching the original engine behavior), so
+        # parse only the sampling knobs. Each object consumes up to 3 tokens
+        # (x, y, size); one extra for EOS.
+        max_tokens = max(3 * max_objects + 1, 3)
+        s = parse_settings(
+            {k: v for k, v in (settings or {}).items() if k != "max_tokens"},
+            temperature=0.0, top_p=1.0, max_tokens=max_tokens,
+        )
+        request = DetectRequest(
+            object=obj, image=image, stream=False, max_objects=max_objects,
+        )
+        return BuiltRequest(
+            request_context=request,
+            max_new_tokens=max_tokens,
+            temperature=s.temperature,
+            top_p=s.top_p,
+        )
+
+    def prompt_text(self, request_context: object) -> str:
+        return getattr(request_context, "object", "")
 
     def build_prompt_tokens(
         self,
@@ -163,6 +200,5 @@ def _extract_objects(tokens: Sequence[Token]) -> list[Dict[str, float]]:
 
 __all__ = [
     "DetectRequest",
-    "DetectSettings",
     "DetectSkill",
 ]

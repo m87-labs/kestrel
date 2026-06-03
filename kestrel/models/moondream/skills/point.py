@@ -6,32 +6,32 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
-from kestrel.utils.spatial_refs import build_spatial_tokens
+from ..runtime import CoordToken, SizeToken, TextToken, Token
+from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
-from .base import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills.base import (
+    AR_DEFAULT_MAX_NEW_TOKENS,
+    BuiltRequest,
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillSpec,
+    SkillState,
+    parse_settings,
+)
+from typing import Mapping
 
 if False:  # pragma: no cover - type-checking imports
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from ..runtime import MoondreamRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
 @dataclass(slots=True)
-class PointSettings:
-    """Sampling parameters supplied with a point invocation."""
-
-    temperature: float
-    top_p: float
-
-
-@dataclass(slots=True)
 class PointRequest:
-    """Validated point payload aligned with the planned API."""
+    """Validated point payload — the carrier read by this skill's decode."""
 
     object: str
     image: Optional[np.ndarray | bytes]
     stream: bool
-    settings: PointSettings
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
@@ -40,6 +40,42 @@ class PointSkill(SkillSpec):
 
     def __init__(self) -> None:
         super().__init__(name="point")
+
+    def build_request(
+        self,
+        image: Optional[np.ndarray | bytes],
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> BuiltRequest:
+        obj = str(prompt.get("object", "")).strip()
+        if not obj:
+            raise ValueError("object must be a non-empty string")
+        if image is None:
+            raise ValueError("image must be provided for pointing")
+        # point decodes greedily; max_objects (if given) caps the budget.
+        s = parse_settings(
+            settings, temperature=0.0, top_p=1.0,
+            max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
+        )
+        max_tokens = s.max_tokens
+        if settings is not None and "max_objects" in settings:
+            max_objects = max(1, int(settings["max_objects"]))  # type: ignore[arg-type]
+            max_tokens = max(2 * max_objects + 1, 2)
+        request = PointRequest(
+            object=obj,
+            image=image,
+            stream=False,
+            spatial_refs=normalize_spatial_refs(prompt.get("spatial_refs")),
+        )
+        return BuiltRequest(
+            request_context=request,
+            max_new_tokens=max_tokens,
+            temperature=s.temperature,
+            top_p=s.top_p,
+        )
+
+    def prompt_text(self, request_context: object) -> str:
+        return getattr(request_context, "object", "")
 
     def build_prompt_tokens(
         self,
@@ -141,6 +177,5 @@ def _extract_points(tokens: Sequence[Token]) -> list[Dict[str, float]]:
 
 __all__ = [
     "PointRequest",
-    "PointSettings",
     "PointSkill",
 ]
