@@ -118,9 +118,10 @@ class ModelHandle:
 
         A single-pass model interprets the prompt in its forward pass (via
         ``run``); an autoregressive model validates and builds it through
-        the model's skill. ``settings`` (sampling) and ``stream`` are
-        engine-level concerns, lifted out of the model prompt for the
-        autoregressive path.
+        the model's skill. ``settings`` (sampling) is lifted out as its own
+        argument; ``stream`` is read here to select streaming delivery but
+        left in the prompt, since the skill reads it to configure its
+        streaming state.
         """
         runtime = self._engine._runtimes.get(self._model)
         if runtime is not None and (
@@ -129,7 +130,7 @@ class ModelHandle:
             return await self.run(task, {"image": image, **prompt})
         self._require_default_ar(task)
         settings = prompt.pop("settings", None)
-        stream = bool(prompt.pop("stream", False))
+        stream = bool(prompt.get("stream", False))
         return await self._engine._run_skill(
             task, image=image, prompt=prompt, settings=settings, stream=stream
         )

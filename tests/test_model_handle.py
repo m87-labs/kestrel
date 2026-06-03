@@ -149,9 +149,11 @@ def test_text_only_query_through_handle() -> None:
     assert captured["prompt"] == {"question": "just text?"}
 
 
-def test_capability_lifts_settings_and_stream_from_prompt() -> None:
-    """settings (sampling) and stream are engine concerns: lifted out of the
-    model prompt before it reaches the skill."""
+def test_capability_lifts_settings_and_mirrors_stream() -> None:
+    """settings (sampling) is lifted out of the model prompt as its own arg.
+    stream is passed to the engine to select streaming delivery AND left in
+    the prompt — the skill reads it to enable incremental token deltas
+    (popping it would yield a stream object that never emits)."""
     eng = _engine()
     captured: dict[str, Any] = {}
     eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
@@ -160,9 +162,10 @@ def test_capability_lifts_settings_and_stream_from_prompt() -> None:
         h.caption(None, length="short", stream=True, settings={"temperature": 0.5})
     )
     assert captured["task"] == "caption"
-    assert captured["prompt"] == {"length": "short"}  # stream + settings removed
-    assert captured["settings"] == {"temperature": 0.5}
-    assert captured["stream"] is True
+    assert captured["settings"] == {"temperature": 0.5}  # lifted out
+    assert captured["stream"] is True  # selects streaming delivery
+    # stream stays in the prompt so the skill builds a streaming request:
+    assert captured["prompt"] == {"length": "short", "stream": True}
 
 
 def test_ar_verb_on_non_default_model_fails_loud() -> None:
