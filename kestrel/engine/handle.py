@@ -2,12 +2,14 @@
 
 ``engine.model(id)`` returns a ``ModelHandle`` bound to one model. It is
 the primary customer surface: one generic class (no per-model subclass)
-exposing the capability vocabulary as typed methods plus a
-``run(task, inputs)`` escape hatch and ``tasks`` / ``supports``
-introspection. Capability availability is a runtime check — every method
-exists on the class, but calling one a model doesn't serve raises a clear
-error (the deliberate "models are data, capabilities are the typed
-surface" trade: type count scales with capabilities, not models).
+exposing the capability vocabulary as uniform ``verb(image, **prompt)``
+methods plus a ``run(task, inputs)`` escape hatch and ``tasks`` /
+``supports`` introspection. The method names are the typed surface; their
+inputs are model-defined (the bound model validates the prompt). Capability
+availability is a runtime check — every method exists on the class, but
+calling one a model doesn't serve raises a clear error (the deliberate
+"models are data, capabilities are the typed surface" trade: type count
+scales with capabilities, not models).
 
 The handle holds no resources; it forwards to the engine, pinning the
 model id so callers bind a model once instead of repeating ``model=``.
@@ -15,7 +17,7 @@ model id so callers bind a model once instead of repeating ``model=``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -79,9 +81,10 @@ class ModelHandle:
     async def run(self, task: str, inputs: Any) -> "EngineResult":
         """Run an arbitrary ``task`` on this model's single-pass lane.
 
-        The escape hatch for single-pass models. Autoregressive models use
-        the typed verbs (``query`` etc.), not ``run`` — ``engine.run``
-        would reject them, so reject here with a clearer message.
+        The escape hatch for single-pass models, and what the capability
+        verbs dispatch to for that shape. Autoregressive models go through
+        the skill path instead — ``engine.run`` would reject them, so reject
+        here with a clearer message.
         """
         self._require(task)
         runtime = self._engine._runtimes.get(self._model)
@@ -94,85 +97,67 @@ class ModelHandle:
             )
         return await self._engine.run(self._model, task, inputs)
 
-    # -- autoregressive capability vocabulary -------------------------
+    # -- capability vocabulary ----------------------------------------
     #
-    # Thin forwarders to the engine's typed verbs. Each gates on the model
-    # serving the capability AND on it being the default AR model (the
-    # verbs don't yet route by model id), then delegates.
-    #
-    # These re-declare the verbs' keyword defaults, so they must stay in
-    # sync with InferenceEngine's — a mismatch silently changes behavior
-    # for the same call through the handle (e.g. query's reasoning=True).
-    # test_model_handle::test_handle_verb_defaults_match_engine guards this.
+    # One task is one method; its inputs are model-defined. Every verb is
+    # therefore uniform — ``verb(image, **prompt)`` — and the raw prompt is
+    # interpreted and validated by the bound model: its skill for an
+    # autoregressive model, its runtime for a single-pass one. The handle
+    # stays model-agnostic and only forwards. The method *names* are the
+    # typed surface (autocomplete + ``tasks``/``supports``); the inputs are
+    # not, by design — a model serving the same capability may accept
+    # different inputs, so a fixed signature couldn't capture them.
+
+    async def _capability(
+        self,
+        task: str,
+        image: Optional[np.ndarray | bytes],
+        prompt: dict[str, Any],
+    ) -> "EngineResult | EngineStream":
+        """Route one capability call by the bound model's execution shape.
+
+        A single-pass model interprets the prompt in its forward pass (via
+        ``run``); an autoregressive model validates and builds it through
+        the model's skill. ``settings`` (sampling) and ``stream`` are
+        engine-level concerns, lifted out of the model prompt for the
+        autoregressive path.
+        """
+        runtime = self._engine._runtimes.get(self._model)
+        if runtime is not None and (
+            runtime.execution_shape is ExecutionShape.SINGLE_PASS
+        ):
+            return await self.run(task, {"image": image, **prompt})
+        self._require_default_ar(task)
+        settings = prompt.pop("settings", None)
+        stream = bool(prompt.pop("stream", False))
+        return await self._engine._run_skill(
+            task, image=image, prompt=prompt, settings=settings, stream=stream
+        )
 
     async def query(
-        self,
-        image: Optional[np.ndarray | bytes] = None,
-        question: Optional[str] = None,
-        reasoning: bool = True,
-        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
-        stream: bool = False,
-        settings: Optional[Mapping[str, object]] = None,
+        self, image: Optional[np.ndarray | bytes] = None, **prompt: Any
     ) -> "EngineResult | EngineStream":
-        # Parameter order/kind mirrors InferenceEngine.query exactly so a
-        # positional call (img, q, reasoning, refs, ...) forwards unchanged.
-        self._require_default_ar("query")
-        return await self._engine.query(
-            image=image,
-            question=question,
-            reasoning=reasoning,
-            spatial_refs=spatial_refs,
-            stream=stream,
-            settings=settings,
-        )
+        return await self._capability("query", image, prompt)
 
     async def caption(
-        self,
-        image: Optional[np.ndarray | bytes],
-        *,
-        length: str = "normal",
-        stream: bool = False,
-        settings: Optional[Mapping[str, object]] = None,
+        self, image: Optional[np.ndarray | bytes] = None, **prompt: Any
     ) -> "EngineResult | EngineStream":
-        self._require_default_ar("caption")
-        return await self._engine.caption(
-            image=image, length=length, stream=stream, settings=settings
-        )
+        return await self._capability("caption", image, prompt)
 
     async def detect(
-        self,
-        image: Optional[np.ndarray | bytes],
-        object: str,
-        settings: Optional[Mapping[str, object]] = None,
-    ) -> "EngineResult":
-        self._require_default_ar("detect")
-        return await self._engine.detect(image, object, settings=settings)
+        self, image: Optional[np.ndarray | bytes] = None, **prompt: Any
+    ) -> "EngineResult | EngineStream":
+        return await self._capability("detect", image, prompt)
 
     async def point(
-        self,
-        image: Optional[np.ndarray | bytes],
-        object: str,
-        settings: Optional[Mapping[str, object]] = None,
-        *,
-        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
-    ) -> "EngineResult":
-        self._require_default_ar("point")
-        return await self._engine.point(
-            image, object, settings, spatial_refs=spatial_refs
-        )
+        self, image: Optional[np.ndarray | bytes] = None, **prompt: Any
+    ) -> "EngineResult | EngineStream":
+        return await self._capability("point", image, prompt)
 
     async def segment(
-        self,
-        image: Optional[np.ndarray | bytes],
-        object: str,
-        *,
-        spatial_refs: Optional[Sequence[Sequence[float]]] = None,
-        settings: Optional[Mapping[str, object]] = None,
-    ) -> "EngineResult":
-        self._require_default_ar("segment")
-        return await self._engine.segment(
-            image, object, spatial_refs=spatial_refs, settings=settings
-        )
+        self, image: Optional[np.ndarray | bytes] = None, **prompt: Any
+    ) -> "EngineResult | EngineStream":
+        return await self._capability("segment", image, prompt)
 
     def __repr__(self) -> str:
         return f"ModelHandle(model_id={self._model!r}, tasks={self.tasks})"

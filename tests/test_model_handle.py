@@ -100,46 +100,69 @@ def test_default_handle_tasks_honor_skill_override() -> None:
 def test_unsupported_capability_raises_clearly() -> None:
     eng = _engine()
     sp = eng.model("sp-model")
-    # An AR verb on a non-default model fails loud (not routable).
-    with pytest.raises(NotImplementedError, match="not yet routable"):
-        asyncio.run(sp.query(None, "hi?"))
-    # A task the model doesn't serve, via the generic escape hatch, names it.
+    # A capability verb on a single-pass model dispatches to its run() lane,
+    # which names the task the model doesn't serve.
+    with pytest.raises(ValueError, match="does not support 'query'"):
+        asyncio.run(sp.query(None, question="hi?"))
+    # Same task, via the generic escape hatch.
     with pytest.raises(ValueError, match="does not support 'query'"):
         asyncio.run(sp.run("query", {}))
 
 
-def test_default_ar_verb_forwards_to_engine() -> None:
-    eng = _engine()
-    captured: dict[str, Any] = {}
+def _capture_run_skill(captured: dict[str, Any]):
+    """Return a stub ``_run_skill`` that records how the handle called it."""
 
-    async def fake_query(**kwargs: Any) -> str:
-        captured.update(kwargs)
+    async def run_skill(task: str, *, image: Any, prompt: Any,
+                        settings: Any, stream: Any) -> str:
+        captured.update(
+            task=task, image=image, prompt=prompt, settings=settings, stream=stream
+        )
         return "RESULT"
 
-    eng.query = fake_query  # type: ignore[method-assign]
+    return run_skill
+
+
+def test_default_ar_verb_routes_through_skill() -> None:
+    """A default-AR capability passes its raw prompt to the model's skill
+    via the engine's skill path — the handle adds no model knowledge."""
+    eng = _engine()
+    captured: dict[str, Any] = {}
+    eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
     h = eng.model("ar-model")  # the default AR model
-    out = asyncio.run(h.query(None, "what is this?", reasoning=True))
+    out = asyncio.run(h.query(None, question="what is this?", reasoning=True))
     assert out == "RESULT"
-    assert captured["question"] == "what is this?"
-    assert captured["reasoning"] is True
+    assert captured["task"] == "query"
+    assert captured["image"] is None
+    assert captured["prompt"] == {"question": "what is this?", "reasoning": True}
 
 
 def test_text_only_query_through_handle() -> None:
-    """A text-only query (no image) must work through the handle, matching
-    engine.query's optional image — regression for image being required."""
+    """A text-only query (no image) must work through the handle — image is
+    optional and defaults to None."""
     eng = _engine()
     captured: dict[str, Any] = {}
-
-    async def fake_query(**kwargs: Any) -> str:
-        captured.update(kwargs)
-        return "RESULT"
-
-    eng.query = fake_query  # type: ignore[method-assign]
+    eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
     h = eng.model("ar-model")
     out = asyncio.run(h.query(question="just text?"))  # no image
     assert out == "RESULT"
     assert captured["image"] is None
-    assert captured["question"] == "just text?"
+    assert captured["prompt"] == {"question": "just text?"}
+
+
+def test_capability_lifts_settings_and_stream_from_prompt() -> None:
+    """settings (sampling) and stream are engine concerns: lifted out of the
+    model prompt before it reaches the skill."""
+    eng = _engine()
+    captured: dict[str, Any] = {}
+    eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
+    h = eng.model("ar-model")
+    asyncio.run(
+        h.caption(None, length="short", stream=True, settings={"temperature": 0.5})
+    )
+    assert captured["task"] == "caption"
+    assert captured["prompt"] == {"length": "short"}  # stream + settings removed
+    assert captured["settings"] == {"temperature": 0.5}
+    assert captured["stream"] is True
 
 
 def test_ar_verb_on_non_default_model_fails_loud() -> None:
@@ -155,40 +178,52 @@ def test_ar_verb_on_non_default_model_fails_loud() -> None:
         tasks=lambda: ar_skills.names(),
     )
 
-    async def fake_query(**kwargs: Any) -> str:  # pragma: no cover - must not run
-        raise AssertionError("should not forward for a non-default AR model")
+    async def fake_run_skill(*a: Any, **k: Any) -> str:  # pragma: no cover
+        raise AssertionError("should not route a non-default AR model")
 
-    eng.query = fake_query  # type: ignore[method-assign]
+    eng._run_skill = fake_run_skill  # type: ignore[method-assign]
     h = eng.model("ar-other")
     with pytest.raises(NotImplementedError, match="not yet routable"):
-        asyncio.run(h.query(None, "hi?"))
+        asyncio.run(h.query(None, question="hi?"))
 
 
-def test_handle_verb_signatures_match_engine() -> None:
-    """A handle verb is a thin forwarder; its signature must match
-    InferenceEngine's, or binding a model silently breaks or changes a
-    valid call. The ways it can drift, each seen in review:
-      - default drift changes outcomes (query reasoning),
-      - an engine-optional param made required breaks calls (text-only
-        query), and
-      - reordering / making positional params keyword-only breaks
-        positional calls (query(img, q, reasoning, refs); detect settings).
-    So compare the full ordered parameter list — (name, kind, default) —
-    for every param the handle declares beyond self. Guards all verbs.
+def test_capability_verbs_are_uniform_kwargs() -> None:
+    """Every capability verb is uniform — ``verb(image, **prompt)``. Inputs
+    are model-defined, so the handle declares no per-task typed params. This
+    is the contract that replaces the old handle/engine signature drift
+    guard: there is nothing to drift because the handle no longer mirrors
+    the engine's typed verbs.
     """
     import inspect
 
     for verb in ("query", "caption", "detect", "point", "segment"):
-        eng = inspect.signature(getattr(InferenceEngine, verb)).parameters
-        hnd = inspect.signature(getattr(ModelHandle, verb)).parameters
-        eng_list = [(n, p.kind, p.default) for n, p in eng.items() if n != "self"]
-        hnd_list = [(n, p.kind, p.default) for n, p in hnd.items() if n != "self"]
-        # The handle forwards exactly the engine verb's parameters, so the
-        # ordered (name, kind, default) lists must be identical.
-        assert hnd_list == eng_list, (
-            f"{verb}: handle signature drifted from engine.\n"
-            f"  handle: {hnd_list}\n  engine: {eng_list}"
+        params = list(inspect.signature(getattr(ModelHandle, verb)).parameters.values())
+        assert [p.name for p in params] == ["self", "image", "prompt"], verb
+        assert params[1].default is None, f"{verb}: image must default to None"
+        assert params[2].kind is inspect.Parameter.VAR_KEYWORD, (
+            f"{verb}: prompt must be **kwargs"
         )
+
+
+def test_capability_dispatches_to_run_for_single_pass() -> None:
+    """A single-pass model interprets a capability's prompt in its forward
+    pass: the handle folds the image into the inputs and routes to run()."""
+    eng = _engine()
+    eng._runtimes["sp-seg"] = _StubSinglePass("sp-seg", ("segment",))
+    captured: dict[str, Any] = {}
+
+    async def fake_run(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "MASKS"
+
+    eng.run = fake_run  # type: ignore[method-assign]
+    h = eng.model("sp-seg")
+    img = object()
+    out = asyncio.run(h.segment(img, points=[[1, 2]], labels=[1]))
+    assert out == "MASKS"
+    assert captured["model"] == "sp-seg"
+    assert captured["task"] == "segment"
+    assert captured["inputs"] == {"image": img, "points": [[1, 2]], "labels": [1]}
 
 
 def test_run_on_ar_model_rejected_with_clear_message() -> None:
