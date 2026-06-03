@@ -1,6 +1,7 @@
 """Automatic model weight downloading via HuggingFace Hub."""
 
 from pathlib import Path
+from typing import Optional
 
 
 def ensure_model_weights(
@@ -9,7 +10,7 @@ def ensure_model_weights(
     repo_id: str | None = None,
     filename: str | None = None,
     revision: str | None = None,
-) -> Path:
+) -> Optional[Path]:
     """Download model weights if not already cached, returning the local path.
 
     By default, looks up the HuggingFace repo and filename for the given
@@ -17,11 +18,14 @@ def ensure_model_weights(
     filename, and revision for custom checkpoints (e.g. pinned revisions
     in production).
 
+    Returns ``None`` when the model declares no single weight file — a
+    single-pass model whose runtime factory owns its own loading (e.g. via
+    ``snapshot_download``) registers no ``filename``, so there is nothing for
+    this autoregressive-style downloader to fetch.
+
     The cache location is controlled by the standard HF_HOME environment
     variable (defaults to ~/.cache/huggingface).
     """
-    from huggingface_hub import hf_hub_download
-
     if repo_id is None or filename is None:
         from kestrel.models import get_spec
 
@@ -30,6 +34,11 @@ def ensure_model_weights(
             repo_id = spec.repo_id
         if filename is None:
             filename = spec.filename
+
+    if repo_id is None or filename is None:
+        return None
+
+    from huggingface_hub import hf_hub_download
 
     kwargs = {}
     if revision is not None:

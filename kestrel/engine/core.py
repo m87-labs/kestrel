@@ -42,6 +42,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    cast,
     overload,
     Literal,
 )
@@ -49,10 +50,16 @@ from typing import (
 import numpy as np
 import torch
 
+from dataclasses import replace
+
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
 from kestrel.device import set_device, synchronize
-from kestrel.runtime import AutoregressiveRuntime, ExecutionShape, SinglePassRuntime
+from kestrel.runtime import (
+    AutoregressiveRuntime,
+    ExecutionShape,
+    Runtime,
+)
 from kestrel.scheduler import (
     GeneratedPrefix,
     GenerationRequest,
@@ -119,6 +126,7 @@ class InferenceEngine:
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
         api_base_url: str = _DEFAULT_API_BASE_URL,
+        models: Optional[Sequence[str]] = None,
     ) -> None:
         if runtime is not None:
             cfg_device = runtime_cfg.resolved_device()
@@ -147,11 +155,22 @@ class InferenceEngine:
         # The engine owns the lifecycle of every runtime it holds and
         # tears them down on ``shutdown``.
         #
-        # Typed autoregressive-only for now since every registered model is
-        # autoregressive; broadens to ``Runtime`` when a second execution
-        # shape lands.
         self._default_model: str = runtime_cfg.model
-        self._runtimes: Dict[str, AutoregressiveRuntime] = {}
+        # Every model this engine co-hosts. The default (``runtime_cfg.model``,
+        # autoregressive) is always hosted and is what the single-model verbs
+        # target; ``models`` adds co-hosted models (e.g. single-pass), each
+        # built from its registered spec at startup. Order-preserving with the
+        # default first; deduplicated.
+        model_ids: list[str] = [self._default_model]
+        for model_id in models or ():
+            if model_id not in model_ids:
+                model_ids.append(model_id)
+        self._model_ids: list[str] = model_ids
+        # Keyed by model id, mixed execution shapes: the default is
+        # autoregressive, co-hosted models may be single-pass. The kernel
+        # addresses runtimes by id and routes by ``execution_shape``, never by
+        # interrogating the object.
+        self._runtimes: Dict[str, Runtime] = {}
         if runtime is not None:
             self._runtimes[self._default_model] = runtime
         # ``_initialized`` flips at the very end of ``_initialize`` so
@@ -200,7 +219,9 @@ class InferenceEngine:
         runtime = self._runtimes.get(self._default_model)
         if runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
-        return runtime
+        # The default model is always autoregressive; co-hosted models are
+        # reached via ``run`` / their single-pass lane, never this property.
+        return cast(AutoregressiveRuntime, runtime)
 
     def _skill_registry(self) -> SkillRegistry:
         """The active skill registry for the default model.
@@ -244,6 +265,7 @@ class InferenceEngine:
         skills: Optional[SkillRegistry] = None,
         adapter_provider: Optional[AdapterProvider] = None,
         api_key: Optional[str] = None,
+        models: Optional[Sequence[str]] = None,
     ) -> "InferenceEngine":
         # Auto-create provider if none provided
         if api_key is None:
@@ -272,6 +294,7 @@ class InferenceEngine:
             adapter_provider=adapter_provider,
             api_key=api_key,
             api_base_url=api_base_url,
+            models=models,
         )
         await engine._initialize()
         return engine
@@ -281,7 +304,7 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
-        if self._default_model not in self._runtimes:
+        if any(model_id not in self._runtimes for model_id in self._model_ids):
             max_lora_rank = (
                 self._adapter_provider.config()["max_lora_rank"]
                 if self._adapter_provider is not None
@@ -296,13 +319,12 @@ class InferenceEngine:
                         "if LoRA support is needed on your platform."
                     )
                     max_lora_rank = None
-            from kestrel.models import get_spec
-
-            runtime_cls = get_spec(self._runtime_cfg.model).runtime
-            built = await loop.run_in_executor(
-                None, lambda: runtime_cls(self._runtime_cfg, max_lora_rank=max_lora_rank)
+            # Build every configured model's runtime from its spec, off the
+            # event loop (weight loading is blocking). The default is
+            # autoregressive; co-hosted models may be single-pass.
+            await loop.run_in_executor(
+                None, self._build_configured_runtimes, max_lora_rank
             )
-            self._runtimes[self._default_model] = built
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
@@ -338,6 +360,39 @@ class InferenceEngine:
         # Drop the reference to the completed init task so its
         # captured locals can be garbage-collected.
         self._init_task = None
+
+    def _build_configured_runtimes(self, max_lora_rank: Optional[int]) -> None:
+        """Build each configured model's runtime from its registered spec.
+
+        Synchronous (called via ``run_in_executor`` during init) and
+        idempotent: models already in ``_runtimes`` (e.g. an injected
+        default) are skipped. The default model is autoregressive;
+        co-hosted models may be single-pass.
+        """
+        for model_id in self._model_ids:
+            if model_id in self._runtimes:
+                continue
+            self._runtimes[model_id] = self._build_runtime(model_id, max_lora_rank)
+
+    def _build_runtime(self, model_id: str, max_lora_rank: Optional[int]) -> Runtime:
+        """Construct one model's runtime via its ``ModelSpec.runtime`` factory.
+
+        The default model reuses ``runtime_cfg`` (already resolved for it).
+        A co-hosted model gets a per-model config — its own ``model`` id, and
+        ``model_path`` reset so it resolves for that model (a single-pass
+        spec declares no weight file, so its path stays ``None`` and the
+        factory owns loading). ``max_lora_rank`` is the default
+        autoregressive model's concern (supplied by the adapter provider);
+        co-hosted models are built without it, since single-pass factories
+        don't accept it.
+        """
+        from kestrel.models import get_spec
+
+        spec = get_spec(model_id)
+        if model_id == self._default_model:
+            return spec.runtime(self._runtime_cfg, max_lora_rank=max_lora_rank)
+        cfg = replace(self._runtime_cfg, model=model_id, model_path=None)
+        return spec.runtime(cfg)
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
@@ -726,10 +781,11 @@ class InferenceEngine:
     def _configured_models(self) -> set[str]:
         """Model ids this engine serves — built or pending build.
 
-        Built runtimes plus the configured default, so model() works both
-        before and after ``_initialize`` populates ``_runtimes``.
+        Built runtimes plus every configured model id (the default and any
+        co-hosted ``models``), so model() works both before and after
+        ``_initialize`` populates ``_runtimes``.
         """
-        return set(self._runtimes) | {self._default_model}
+        return set(self._runtimes) | set(self._model_ids)
 
     def _tasks_for(self, model_id: str) -> tuple[str, ...]:
         """Capability names a registered model serves.

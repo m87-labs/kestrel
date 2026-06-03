@@ -1,16 +1,18 @@
 """Registry of model families supported by Kestrel.
 
-A ``ModelSpec`` carries the small handful of facts the engine needs to
-bootstrap a model: the HuggingFace download coordinates, the default
-config dict, the checkpoint format tag (consumed by the weight loader),
-the HF tokenizer hub id, and the runtime constructor.
+A ``ModelSpec`` carries the facts the engine needs to bootstrap a model.
+Only ``name``, the ``runtime`` constructor, and the ``skills`` factory are
+universal; the rest are autoregressive/HuggingFace bootstrap hints (download
+coordinates, checkpoint-format tag, tokenizer id, default config) consumed by
+a specific runtime family. A single-pass model whose runtime factory owns its
+own loading leaves them unset.
 
 New model families register themselves at import time from their
 package's ``__init__.py`` (see ``kestrel/models/moondream/__init__.py``).
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from kestrel.config import RuntimeConfig
@@ -23,11 +25,6 @@ class ModelSpec:
     """Bootstrap metadata for a supported model."""
 
     name: str
-    repo_id: str
-    filename: str
-    checkpoint_format: str
-    default_config: Dict[str, Any]
-    tokenizer_id: str
     # Constructor invoked as ``runtime(cfg, **kwargs)`` by the engine to
     # produce a concrete :class:`~kestrel.runtime.Runtime` for this
     # model. Kwargs (e.g. ``max_lora_rank``) are forwarded from the
@@ -40,6 +37,16 @@ class ModelSpec:
     # Models with no autoregressive skills (e.g. single-pass) leave this
     # at the default empty registry and advertise tasks via the runtime.
     skills: Callable[[], "SkillRegistry"] = lambda: _empty_skill_registry()
+
+    # --- Autoregressive / HuggingFace bootstrap hints (optional) ---
+    # Consumed by a specific runtime family's weight loader + tokenizer
+    # (Moondream's). A single-pass spec whose factory owns loading omits
+    # them; the kernel never reads these — it only calls ``runtime``.
+    repo_id: Optional[str] = None
+    filename: Optional[str] = None
+    checkpoint_format: Optional[str] = None
+    tokenizer_id: Optional[str] = None
+    default_config: Dict[str, Any] = field(default_factory=dict)
 
 
 def _empty_skill_registry() -> "SkillRegistry":

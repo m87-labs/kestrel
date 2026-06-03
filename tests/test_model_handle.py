@@ -35,6 +35,7 @@ def _engine() -> InferenceEngine:
     ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
     eng = object.__new__(InferenceEngine)
     eng._default_model = "ar-model"
+    eng._model_ids = ["ar-model", "sp-model"]
     eng._runtimes = {
         "ar-model": SimpleNamespace(
             model_name="ar-model",
