@@ -199,8 +199,8 @@ Throughput and latency for the `query` skill, measured on the [ChartQA](https://
 
 | Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
 |-----------|---------------|----------------|-------------|--------------|
-| 1 | 0.70 | 2663.64 | 0.38 | 4183.03 |
-| 4 | 0.84 | 4981.50 | 0.51 | 4808.52 |
+| 1 | 0.70 | 2677.36 | 0.45 | 3679.69 |
+| 4 | 0.84 | 5549.44 | 0.68 | 3484.41 |
 
 ## MacBook Pro (M5 Max, 48GB)
 
