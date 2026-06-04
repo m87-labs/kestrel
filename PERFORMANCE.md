@@ -195,8 +195,6 @@ Throughput and latency for the `query` skill, measured on the [ChartQA](https://
 
 ## Mac mini (M4, 16GB)
 
-These Mac mini M4 results use the first 200 ChartQA test charts (`--limit 200`).
-
 ### Moondream 2
 
 | Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
