@@ -8,7 +8,7 @@ import torch
 
 from kestrel.models.moondream.region import SpatialDecodeTables
 from kestrel.models.moondream.runtime import TextToken
-from kestrel.scheduler.scheduler import GenerationScheduler
+from kestrel.scheduler.scheduler import GenerationScheduler, _MaskPlan
 from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillState
@@ -590,6 +590,39 @@ def test_sample_batch_suppression_composes_with_allowed_tokens() -> None:
         torch.empty((1,), dtype=torch.long),
     )
 
+    assert sampled.tolist() == [1]
+
+
+def test_sample_batch_plan_waits_through_event_abstraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EventStub:
+        waits = 0
+
+        def wait(self) -> None:
+            self.waits += 1
+
+    def fail_current_stream() -> None:
+        raise AssertionError("sampling should not query a CUDA stream")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", fail_current_stream)
+
+    event = EventStub()
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        _scheduler(),
+        torch.tensor([[5.0, 4.0, 3.0]], dtype=torch.float32),
+        [_sequence(temperature=0.0, return_logprobs=None)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        plan=_MaskPlan(
+            disallow=torch.tensor([[True, False, False]]),
+            event=event,
+            suppress_rows=[],
+            all_greedy=True,
+            any_return_logprobs=False,
+        ),
+    )
+
+    assert event.waits == 1
     assert sampled.tolist() == [1]
 
 

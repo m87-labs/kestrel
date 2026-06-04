@@ -144,6 +144,15 @@ class DecodeSlot:
     step_done_event: torch.cuda.Event = None  # type: ignore[assignment]
     commit_done_event: torch.cuda.Event = None  # type: ignore[assignment]
 
+    # Constrained-decode mask: a per-row boolean "disallow" mask over the
+    # vocabulary (True => force this token's logit to -inf). Built from
+    # skill_state right after commit and uploaded async on the copy stream
+    # during the forward; sampling waits on ``mask_ready_event`` then applies it
+    # with a single masked_fill_, so the per-step mask H2D never blocks the
+    # compute stream and there is no per-row apply loop.
+    disallow_mask: CpuGpuBuffer = None  # type: ignore[assignment]
+    mask_ready_event: torch.cuda.Event = None  # type: ignore[assignment]
+
 
 def create_decode_slot(
     slot_id: int,
@@ -317,6 +326,19 @@ def create_decode_slot(
     step_done_event = make_event(device)
     commit_done_event = make_event(device)
 
+    # Per-row boolean disallow mask over the vocabulary (True => -inf). Fixed
+    # shape [batch, vocab], so a step's constraint can never overflow it (no
+    # synchronous-H2D fall-back), and the apply is a single masked_fill_ with no
+    # per-row loop. copy_to_gpu(batch) ships only the active rows each step.
+    disallow_mask = CpuGpuBuffer(
+        max_batch_slots,
+        vocab_size,
+        dtype=torch.bool,
+        device=device,
+        pin_memory=True,
+    )
+    mask_ready_event = make_event(device, enable_timing=False, blocking=False)
+
     return DecodeSlot(
         slot_id=slot_id,
         meta=meta,
@@ -339,4 +361,6 @@ def create_decode_slot(
         cuda_graphs=None,  # Captured separately after slot creation
         step_done_event=step_done_event,
         commit_done_event=commit_done_event,
+        disallow_mask=disallow_mask,
+        mask_ready_event=mask_ready_event,
     )
