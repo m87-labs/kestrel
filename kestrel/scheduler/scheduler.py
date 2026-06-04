@@ -323,14 +323,24 @@ class GenerationScheduler:
         sequences admitted). Callers can keep invoking ``advance`` while it
         returns ``True`` to drain ready work before sleeping.
 
-        Phase 1 ordering (design doc §5):
-        1. Launch forward (if none in-flight) - forward doesn't need mask
-        2. Commit previous step (updates skill state via consume_step)
-        3. Finalize sampling (compute mask with updated skill state)
+        Decode-tick ordering: commit -> finalize -> launch.
+        1. Commit the oldest finalized step (updates skill state via
+           consume_step).
+        2. Finalize sampling for the in-flight forward (computes the mask with
+           the now-updated skill state).
+        3. Launch the next forward (last), so it enqueues behind this step's
+           sampling and runs on the GPU while the *next* tick does its
+           commit+finalize. This overlaps the commit and launch CPU work with
+           the forward instead of paying launch on the critical path between
+           forwards.
 
-        This is "commit-before-finalize" which ensures constrained decoding
-        sees the correct skill state. Forward t+1 runs on GPU while CPU
-        commits step t, achieving overlap.
+        Two invariants the ordering preserves:
+        * commit-before-finalize: commit advances skill state (consume_step),
+          so the forward we finalize samples under the correct
+          constrained-decoding mask. Commit stays before finalize.
+        * depth-1 speculation (zombies): the next forward is launched only
+          after committing the step two behind it, so a sequence that ends
+          rides exactly one in-flight step — no extra zombie waste.
         """
         progressed = False
         pipeline = self._pipeline
@@ -345,7 +355,25 @@ class GenerationScheduler:
                 or len(self.running) > 0
                 or len(self.waiting) > 0
             ):
-                # 1. Launch forward if none in-flight (forward doesn't need mask)
+                # 1. Commit the oldest finalized step (updates skill state for
+                # mask computation). The in-flight forward (launched last on the
+                # previous tick) runs on the GPU in parallel while CPU blocks on D2H.
+                oldest = pipeline.pop_oldest()
+                if oldest is not None:
+                    self.commit_step(oldest)
+                    pipeline.on_step_completed()
+                    progressed = True
+
+                # 2. Finalize sampling (now skill state is updated for mask)
+                handle = pipeline.launch_handle
+                if handle is not None:
+                    step = self.finalize_sampling(handle)
+                    pipeline.on_pending_commit(step)
+                    progressed = True
+
+                # 3. Launch the next forward last (forward doesn't need mask), so
+                # it overlaps the next tick's commit+finalize instead of paying
+                # the launch on the critical path between forwards.
                 if pipeline.can_launch():
                     launched_forward = False
                     progressed |= self._launch_prefill_step(pipeline)
@@ -361,21 +389,6 @@ class GenerationScheduler:
                             handle = self.launch_forward_async(plan, slot_id)
                             pipeline.on_launch(handle)
                             progressed = True
-
-                # 2. Commit previous step (updates skill state for mask computation)
-                # GPU runs forward in parallel while CPU blocks on D2H.
-                oldest = pipeline.pop_oldest()
-                if oldest is not None:
-                    self.commit_step(oldest)
-                    pipeline.on_step_completed()
-                    progressed = True
-
-                # 3. Finalize sampling (now skill state is updated for mask)
-                handle = pipeline.launch_handle
-                if handle is not None:
-                    step = self.finalize_sampling(handle)
-                    pipeline.on_pending_commit(step)
-                    progressed = True
 
         if not progressed:
             stalled = next((request for request in self.waiting if self._is_launchable_request(request)), None)
