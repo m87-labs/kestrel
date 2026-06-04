@@ -4,6 +4,7 @@ import collections
 import contextlib
 import io
 import json
+import os
 import subprocess
 import textwrap
 import time
@@ -40,6 +41,43 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+
+def _load_dotenv(path: Path) -> None:
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if not key or os.environ.get(key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def ensure_moondream_api_key() -> None:
+    if os.environ.get("MOONDREAM_API_KEY"):
+        return
+
+    env_path = REPO_ROOT / ".env"
+    if env_path.exists():
+        _load_dotenv(env_path)
+        if os.environ.get("MOONDREAM_API_KEY"):
+            return
+        detail = f"{env_path} exists but does not define MOONDREAM_API_KEY"
+    else:
+        detail = f"{env_path} does not exist"
+
+    raise RuntimeError(
+        "MOONDREAM_API_KEY is not set. chartqa_eval.py checked the process "
+        f"environment and tried to load {env_path}; {detail}."
+    )
+
+
 from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
 
@@ -50,7 +88,21 @@ PREFIX = (
     "and provide a precise answer without any additional explanation or formatting. "
 )
 POT_PREFIX = "Write a Python program to answer the following question: "
-COT_MAX_TOKENS = 1536  # bumped for Gemma 4's verbose CoT channel
+# CoT output cap, per-model. This matters beyond truncation: the engine reserves
+# prompt + max_tokens of paged KV at admission (scheduler reserve_length), so an
+# oversized cap cuts batch concurrency and can exceed a small model's context
+# window. Moondream 2/3 reasoning is short (<300 tokens); Gemma 4's CoT channel
+# is verbose and needs the larger budget — hence per-model rather than a single
+# global value.
+COT_MAX_TOKENS_DEFAULT = 1536  # Gemma 4 / unknown models: verbose CoT channel
+COT_MAX_TOKENS_BY_MODEL = {
+    "moondream2": 512,
+    "moondream3-preview": 512,
+}
+
+
+def cot_max_tokens(model: str) -> int:
+    return COT_MAX_TOKENS_BY_MODEL.get(model, COT_MAX_TOKENS_DEFAULT)
 DEFAULT_MAX_TOKENS = 10
 POT_MAX_TOKENS = 200
 
@@ -68,7 +120,6 @@ class EvalConfig:
     debug: bool
     enable_prefix_cache: bool
     dump_jsonl: Optional[Path] = None
-    concurrency: Optional[int] = None
     device: str | None = None
 
 
@@ -205,6 +256,7 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
+    ensure_moondream_api_key()
     runtime_kwargs: Dict[str, Any] = dict(
         model=cfg.model,
         max_batch_size=cfg.max_batch_size,
@@ -227,6 +279,7 @@ async def create_engine(cfg: EvalConfig) -> InferenceEngine:
 def build_prompt_and_settings(
     question: str,
     *,
+    model: str,
     use_pot: bool,
     cot_samples: int,
     base_temperature: float,
@@ -236,7 +289,7 @@ def build_prompt_and_settings(
     if cot_samples > 0:
         prompt = question.strip()
         reasoning = True
-        max_tokens = COT_MAX_TOKENS
+        max_tokens = cot_max_tokens(model)
         if cot_samples > 1 and temperature == 0.0:
             # Preserve legacy behaviour of injecting small stochasticity for CoT@N
             temperature = 1.0
@@ -334,11 +387,6 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     request_count = 0
     request_times_ms: List[float] = []  # prefill + decode per request
     cache_hit_count = 0  # requests with cached_tokens > 0
-    semaphore = (
-        asyncio.Semaphore(cfg.concurrency)
-        if cfg.concurrency is not None and cfg.concurrency > 0
-        else None
-    )
     dump_handle = None
     if cfg.dump_jsonl is not None:
         dump_path = cfg.dump_jsonl.expanduser()
@@ -364,23 +412,13 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         image: np.ndarray,
         qa: Dict[str, Any],
     ) -> Tuple[int, int, Dict[str, Any], bool, bool]:
-        if semaphore is None:
-            return await _evaluate_single_impl(row_idx, qa_idx, image, qa)
-        async with semaphore:
-            return await _evaluate_single_impl(row_idx, qa_idx, image, qa)
-
-    async def _evaluate_single_impl(
-        row_idx: int,
-        qa_idx: int,
-        image: np.ndarray,
-        qa: Dict[str, Any],
-    ) -> Tuple[int, int, Dict[str, Any], bool, bool]:
         question = qa["question"]
         answer = qa["answer"]
         source = qa.get("source", "model")
 
         prompt, reasoning, max_tokens, temperature = build_prompt_and_settings(
             question,
+            model=cfg.model,
             use_pot=cfg.use_pot,
             cot_samples=cfg.cot_samples,
             base_temperature=cfg.temperature,
@@ -519,6 +557,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         warmup_qa = rows[0]["qa"][0]
         warmup_prompt, warmup_reasoning, warmup_max_tokens, warmup_temp = build_prompt_and_settings(
             warmup_qa["question"],
+            model=cfg.model,
             use_pot=cfg.use_pot,
             cot_samples=cfg.cot_samples,
             base_temperature=cfg.temperature,
@@ -665,12 +704,6 @@ def parse_args() -> EvalConfig:
         default=None,
         help="Optional path to write per-question results as JSONL (debugging).",
     )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=0,
-        help="Limit number of concurrent in-flight questions (0 = unlimited).",
-    )
     parser.add_argument("--device", default=None,
                         help="Override torch device (e.g. cuda, mps). Auto-detects when omitted.")
     args = parser.parse_args()
@@ -694,7 +727,6 @@ def parse_args() -> EvalConfig:
         debug=bool(args.debug),
         enable_prefix_cache=not args.disable_prefix_cache,
         dump_jsonl=args.dump_jsonl,
-        concurrency=None if int(args.concurrency) <= 0 else int(args.concurrency),
         device=args.device,
     )
     return cfg
