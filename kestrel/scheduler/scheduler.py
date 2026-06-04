@@ -11,7 +11,7 @@ import logging
 import torch
 from torch import Tensor
 
-from kestrel.device import stream_context
+from kestrel.device import NoopEvent, stream_context
 from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
@@ -73,7 +73,7 @@ class _MaskPlan:
     """
 
     disallow: Tensor | None  # staged GPU bool mask [batch, vocab], or None
-    event: object | None  # slot.mask_ready_event, or None when unconstrained
+    event: torch.cuda.Event | NoopEvent | None  # None when unconstrained
     suppress_rows: list
     all_greedy: bool
     any_return_logprobs: bool
@@ -1084,7 +1084,7 @@ class GenerationScheduler:
         )
 
     def finalize_sampling(
-        self, handle: LaunchHandle, mask: "_MaskPlan | None" = None
+        self, handle: LaunchHandle, plan: "_MaskPlan | None" = None
     ) -> PendingCommit:
         """Finalize sampling for a forward pass (with stream context).
 
@@ -1094,16 +1094,16 @@ class GenerationScheduler:
         if handle.kind == "decode":
             slot = self.runtime.decode_slots[handle.slot_id]
             with stream_context(slot.compute_stream):
-                return self._finalize_sampling_on_stream(handle, mask)
+                return self._finalize_sampling_on_stream(handle, plan)
         if handle.kind == "prefill":
-            if mask is not None:
+            if plan is not None:
                 raise AssertionError("Prefill finalize does not support masks")
             with stream_context(self.runtime.primary_stream):
                 return self._finalize_prefill(handle)
         raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 
     def _finalize_sampling_on_stream(
-        self, handle: LaunchHandle, mask: "_MaskPlan | None" = None
+        self, handle: LaunchHandle, plan: "_MaskPlan | None" = None
     ) -> PendingCommit:
         """Finalize sampling for a forward pass and start D2H transfer.
 
@@ -1115,7 +1115,7 @@ class GenerationScheduler:
         writes to pending buffers, and kicks off async D2H via the slot's
         RenderBuffer.
 
-        ``mask`` is the ``_MaskPlan`` built by ``_build_mask`` after commit and
+        ``plan`` is the ``_MaskPlan`` built by ``_build_mask`` after commit and
         staged async on the slot's copy stream; sampling waits on its event and
         applies it. It is None only for prefill, which builds its mask inline.
 
@@ -1140,7 +1140,7 @@ class GenerationScheduler:
             slot.sampled_ids,
             batch_idx=batch_idx,
             logprobs_out=slot.sampled_logprobs[:batch_size],
-            plan=mask,
+            plan=plan,
         )
 
         # Record event once sampled_ids staging is ready. The copy stream
@@ -1438,7 +1438,7 @@ class GenerationScheduler:
             # copy stream during the forward. Wait for that H2D, then apply it as
             # a single vectorized masked_fill_ -- no per-row loop, no sync.
             if plan.event is not None:
-                torch.cuda.current_stream().wait_event(plan.event)
+                plan.event.wait()
             if plan.disallow is not None:
                 logits.masked_fill_(plan.disallow, float("-inf"))
             suppress_rows = plan.suppress_rows
