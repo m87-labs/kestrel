@@ -57,6 +57,29 @@ _MISS_FRONTIER_MIN_CAPACITY = 32
 
 
 @dataclass(slots=True)
+class _MaskPlan:
+    """Constrained-decode mask for one decode sampling step.
+
+    The constraint comes from skill_state (no logits needed), so it is built
+    right after commit and uploaded async on the slot's copy stream while the
+    forward runs. ``disallow`` is the staged per-row boolean mask over the
+    vocabulary (True => force that token's logit to -inf); sampling waits on
+    ``event`` then applies it with a single ``masked_fill_``. Both are None when
+    no row constrains this step (the mask build and H2D are skipped entirely).
+
+    ``suppress_rows`` (request-level ``suppress_next_token_ids``, which is
+    logprobs-baseline sensitive and only fires on a request's first generated
+    step) is carried through and applied inline in the sampling tail.
+    """
+
+    disallow: Tensor | None  # staged GPU bool mask [batch, vocab], or None
+    event: object | None  # slot.mask_ready_event, or None when unconstrained
+    suppress_rows: list
+    all_greedy: bool
+    any_return_logprobs: bool
+
+
+@dataclass(slots=True)
 class PrefillStaging:
     """Per-prefill staging buffers and RenderBuffer for D2H."""
 
@@ -364,10 +387,20 @@ class GenerationScheduler:
                     pipeline.on_step_completed()
                     progressed = True
 
-                # 2. Finalize sampling (now skill state is updated for mask)
+                # 2. Finalize sampling (now skill state is updated for mask).
+                # Build the constrained-decode mask for the in-flight decode
+                # forward now -- after commit (so skill_state is current), while
+                # the forward runs -- and stage it async on the copy stream, so
+                # finalize only waits on the slot's mask_ready event and applies
+                # a single masked_fill_, keeping the per-step mask H2D off the
+                # compute stream's critical path.
                 handle = pipeline.launch_handle
                 if handle is not None:
-                    step = self.finalize_sampling(handle)
+                    plan = None
+                    if handle.kind == "decode":
+                        slot = self.runtime.decode_slots[handle.slot_id]
+                        plan = self._build_mask(handle.sequences, slot)
+                    step = self.finalize_sampling(handle, plan)
                     pipeline.on_pending_commit(step)
                     progressed = True
 
@@ -1051,7 +1084,7 @@ class GenerationScheduler:
         )
 
     def finalize_sampling(
-        self, handle: LaunchHandle, mask: Optional[Tensor] = None
+        self, handle: LaunchHandle, mask: "_MaskPlan | None" = None
     ) -> PendingCommit:
         """Finalize sampling for a forward pass (with stream context).
 
@@ -1070,20 +1103,21 @@ class GenerationScheduler:
         raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 
     def _finalize_sampling_on_stream(
-        self, handle: LaunchHandle, mask: Optional[Tensor] = None
+        self, handle: LaunchHandle, mask: "_MaskPlan | None" = None
     ) -> PendingCommit:
         """Finalize sampling for a forward pass and start D2H transfer.
 
         IMPORTANT: Caller must already be on the compute stream.
 
-        Takes the forward outputs from the DecodeSlot's buffers, applies optional
-        token mask, samples tokens, runs the runtime's post-sample hook
-        (Moondream uses it for coord/size decode; default is a no-op),
+        Takes the forward outputs from the DecodeSlot's buffers, applies the
+        constrained-decode mask, samples tokens, runs the runtime's post-sample
+        hook (Moondream uses it for coord/size decode; default is a no-op),
         writes to pending buffers, and kicks off async D2H via the slot's
         RenderBuffer.
 
-        The mask parameter is for future constrained decoding support. Currently
-        masking is computed inline from skill_state.allowed_token_ids.
+        ``mask`` is the ``_MaskPlan`` built by ``_build_mask`` after commit and
+        staged async on the slot's copy stream; sampling waits on its event and
+        applies it. It is None only for prefill, which builds its mask inline.
 
         Returns a PendingCommit that can be passed to commit_step.
         """
@@ -1106,6 +1140,7 @@ class GenerationScheduler:
             slot.sampled_ids,
             batch_idx=batch_idx,
             logprobs_out=slot.sampled_logprobs[:batch_size],
+            plan=mask,
         )
 
         # Record event once sampled_ids staging is ready. The copy stream
@@ -1262,41 +1297,17 @@ class GenerationScheduler:
                 # propagate through the scheduler-fatal path.
                 self.runtime.release_sequence(seq.state)
 
-    def _sample_batch(
-        self,
-        logits: Tensor,
-        sequences: List[RequestLifecycle],
-        out: Tensor,
-        *,
-        batch_idx: Tensor | None = None,
-        logprobs_out: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
-        """Sample tokens from logits into the provided output buffer.
+    def _build_mask_spec(self, sequences: List[RequestLifecycle]) -> tuple:
+        """Per-sequence sampling-mask inputs (skill_state/request only, no logits).
 
-        Args:
-            logits: Logits tensor of shape [batch, vocab_size].
-            sequences: List of scheduled sequences (for temperature/top_p and
-                finalized state). Finalized sequences are treated as unconstrained
-                to avoid querying skill state after termination.
-            out: Pre-allocated output buffer for sampled token IDs. Must be
-                shape [batch] or larger, dtype long.
-
-        Returns:
-            Tuple of (sampled_ids, temps, top_ps, logprobs). sampled_ids is a
-            view of out[:batch]. logprobs is a view of logprobs_out[:batch]
-            when at least one sequence requested logprobs, otherwise None.
+        Hoisting this out of _sample_batch lets it run concurrently with the
+        in-flight forward instead of on the post-forward critical path.
         """
-        batch = len(sequences)
-        if batch == 0:
-            return out[:0], None, None, None
-
         allowed_tokens: list[Optional[Sequence[int]]] = []
         suppressed_tokens: list[Optional[Sequence[int]]] = []
         restrict = False
         for seq in sequences:
-            # Skip constraint queries for finalized sequences (zombies).
-            # Per design doc §4.6: treat finalized as unconstrained to avoid
-            # use-after-finalization bugs.
+            # Treat finalized sequences (zombies) as unconstrained.
             if seq.finalized:
                 allowed_tokens.append(None)
                 suppressed_tokens.append(None)
@@ -1306,30 +1317,6 @@ class GenerationScheduler:
             if allowed:
                 restrict = True
             suppressed_tokens.append(seq.skill_state.suppressed_token_ids(self.runtime))
-
-        if restrict:
-            for i, allowed in enumerate(allowed_tokens):
-                if not allowed:
-                    continue
-                idx = torch.tensor(allowed, device=logits.device, dtype=torch.long)
-                row = logits[i]
-                pruned = torch.full_like(row, float("-inf"))
-                pruned[idx] = row[idx]
-                logits[i] = pruned
-
-        # Apply per-skill token suppression (blacklist).
-        for i, suppressed in enumerate(suppressed_tokens):
-            if suppressed:
-                idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
-                logits[i, idx] = float("-inf")
-
-        want_logprobs = (
-            logprobs_out is not None
-            and any(seq.request.return_logprobs is True for seq in sequences)
-        )
-        logprobs = logprobs_out[:batch] if want_logprobs else None
-        out_view = out[:batch]
-
         suppress_rows: list[tuple[int, tuple[int, ...]]] = []
         for i, seq in enumerate(sequences):
             suppress = seq.request.suppress_next_token_ids
@@ -1340,6 +1327,155 @@ class GenerationScheduler:
             ):
                 continue
             suppress_rows.append((i, suppress))
+        all_greedy = all(seq.request.temperature <= 0.0 for seq in sequences)
+        any_return_logprobs = any(seq.request.return_logprobs is True for seq in sequences)
+        return (
+            allowed_tokens,
+            suppressed_tokens,
+            restrict,
+            suppress_rows,
+            all_greedy,
+            any_return_logprobs,
+        )
+
+    def _build_mask(
+        self, sequences: List[RequestLifecycle], slot
+    ) -> "_MaskPlan":
+        """Build the decode sampling mask and stage it async on the slot.
+
+        Runs after commit (so skill_state is current) while the forward is in
+        flight. Writes a per-row boolean disallow mask into the slot's pinned
+        buffer and kicks off the H2D on the copy stream, so the per-step mask
+        transfer overlaps the forward instead of blocking the compute stream.
+        Sampling waits on ``slot.mask_ready_event`` before applying it.
+        """
+        (
+            allowed_tokens,
+            suppressed_tokens,
+            restrict,
+            suppress_rows,
+            all_greedy,
+            any_return_logprobs,
+        ) = self._build_mask_spec(sequences)
+        batch = len(sequences)
+
+        # Nothing constrains this step: skip the mask build + H2D entirely.
+        if not restrict and not any(suppressed_tokens):
+            return _MaskPlan(
+                disallow=None,
+                event=None,
+                suppress_rows=suppress_rows,
+                all_greedy=all_greedy,
+                any_return_logprobs=any_return_logprobs,
+            )
+
+        # Fill the per-row boolean disallow mask (True => -inf) in pinned host
+        # memory. Restrict rows start fully disallowed then re-allow the
+        # permitted ids; suppression flips its blacklisted ids on. Unconstrained
+        # rows stay all-False (a no-op under masked_fill_). These are NumPy
+        # writes to the pinned view -- no device sync.
+        disallow_np = slot.disallow_mask.np
+        disallow_np[:batch] = False
+        for i in range(batch):
+            allowed = allowed_tokens[i]
+            if allowed:
+                disallow_np[i, :] = True
+                disallow_np[i, list(allowed)] = False
+            suppressed = suppressed_tokens[i]
+            if suppressed:
+                disallow_np[i, list(suppressed)] = True
+
+        # Async H2D on the copy stream (overlaps the forward); record the event
+        # finalize waits on before masked_fill_. The slot's ping-pong lifecycle
+        # (reused only after its commit, which fences past mask_ready) keeps the
+        # pinned buffer safe to overwrite next time this slot comes around.
+        with stream_context(self.runtime.copy_stream):
+            disallow_gpu = slot.disallow_mask.copy_to_gpu(batch)
+        slot.mask_ready_event.record(self.runtime.copy_stream)
+
+        return _MaskPlan(
+            disallow=disallow_gpu,
+            event=slot.mask_ready_event,
+            suppress_rows=suppress_rows,
+            all_greedy=all_greedy,
+            any_return_logprobs=any_return_logprobs,
+        )
+
+    def _sample_batch(
+        self,
+        logits: Tensor,
+        sequences: List[RequestLifecycle],
+        out: Tensor,
+        *,
+        batch_idx: Tensor | None = None,
+        logprobs_out: Tensor | None = None,
+        plan: "_MaskPlan | None" = None,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
+        """Sample tokens from logits into the provided output buffer.
+
+        Args:
+            logits: Logits tensor of shape [batch, vocab_size].
+            sequences: List of scheduled sequences (for temperature/top_p and
+                finalized state). Finalized sequences are treated as unconstrained
+                to avoid querying skill state after termination.
+            out: Pre-allocated output buffer for sampled token IDs. Must be
+                shape [batch] or larger, dtype long.
+            plan: Pre-built ``_MaskPlan`` whose disallow mask was staged async on
+                the slot (the decode hot path). When None (prefill, once per
+                request), the mask is built and applied inline here.
+
+        Returns:
+            Tuple of (sampled_ids, temps, top_ps, logprobs). sampled_ids is a
+            view of out[:batch]. logprobs is a view of logprobs_out[:batch]
+            when at least one sequence requested logprobs, otherwise None.
+        """
+        batch = len(sequences)
+        if batch == 0:
+            return out[:0], None, None, None
+
+        if plan is not None:
+            # Decode hot path: the disallow mask was filled and uploaded on the
+            # copy stream during the forward. Wait for that H2D, then apply it as
+            # a single vectorized masked_fill_ -- no per-row loop, no sync.
+            if plan.event is not None:
+                torch.cuda.current_stream().wait_event(plan.event)
+            if plan.disallow is not None:
+                logits.masked_fill_(plan.disallow, float("-inf"))
+            suppress_rows = plan.suppress_rows
+            all_greedy = plan.all_greedy
+            any_return_logprobs = plan.any_return_logprobs
+        else:
+            # Prefill (once per request, off the per-token critical path): build
+            # the constraint and apply it inline. The small synchronous H2D here
+            # is acceptable because it does not recur per generated token.
+            (
+                allowed_tokens,
+                suppressed_tokens,
+                restrict,
+                suppress_rows,
+                all_greedy,
+                any_return_logprobs,
+            ) = self._build_mask_spec(sequences)
+
+            if restrict:
+                for i, allowed in enumerate(allowed_tokens):
+                    if not allowed:
+                        continue
+                    idx = torch.tensor(allowed, device=logits.device, dtype=torch.long)
+                    row = logits[i]
+                    pruned = torch.full_like(row, float("-inf"))
+                    pruned[idx] = row[idx]
+                    logits[i] = pruned
+
+            # Apply per-skill token suppression (blacklist).
+            for i, suppressed in enumerate(suppressed_tokens):
+                if suppressed:
+                    idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
+                    logits[i, idx] = float("-inf")
+
+        want_logprobs = logprobs_out is not None and any_return_logprobs
+        logprobs = logprobs_out[:batch] if want_logprobs else None
+        out_view = out[:batch]
 
         baseline_row_idx: Tensor | None = None
         baseline_logits: Tensor | None = None
@@ -1359,7 +1495,6 @@ class GenerationScheduler:
             idx = torch.tensor(suppress, device=logits.device, dtype=torch.long)
             logits[i, idx] = float("-inf")
 
-        all_greedy = all(seq.request.temperature <= 0.0 for seq in sequences)
         if all_greedy:
             if logprobs is None:
                 torch.argmax(logits, dim=-1, out=out_view)
