@@ -304,6 +304,16 @@ class InferenceEngine:
             return
         loop = asyncio.get_running_loop()
         self._loop = loop
+        try:
+            from kestrel.model_download import probe_supported_model_configs
+
+            threading.Thread(
+                target=probe_supported_model_configs,
+                name="kestrel-hf-config-probe",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
         if any(model_id not in self._runtimes for model_id in self._model_ids):
             max_lora_rank = (
                 self._adapter_provider.config()["max_lora_rank"]
@@ -1507,5 +1517,4 @@ class InferenceEngine:
             except queue.Empty:
                 break
             self._fail_request(req, exc)
-
 

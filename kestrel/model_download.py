@@ -45,3 +45,32 @@ def ensure_model_weights(
         kwargs["revision"] = revision
 
     return Path(hf_hub_download(repo_id, filename=filename, **kwargs))
+
+
+def probe_supported_model_configs() -> None:
+    """Best-effort access check for supported HuggingFace model configs."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        from kestrel.models import get_spec, known_models
+
+        inaccessible: list[str] = []
+        for model in known_models():
+            try:
+                spec = get_spec(model)
+                if spec.repo_id is None:
+                    continue
+                hf_hub_download(
+                    spec.repo_id,
+                    filename="config.json",
+                    etag_timeout=2,
+                )
+            except Exception:
+                inaccessible.append(model)
+
+        if inaccessible:
+            # TODO: Log a warning once dynamic model loading can route requests
+            # to any supported Moondream model at runtime.
+            pass
+    except Exception:
+        return
