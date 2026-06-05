@@ -204,8 +204,6 @@ Throughput and latency for the `query` skill, measured on the [ChartQA](https://
 
 ## MacBook Pro (M5 Max, 48GB)
 
-These MacBook Pro M5 Max results use the first 200 ChartQA test charts (`--limit 200`).
-
 ### Moondream 2
 
 | Batch Size | Direct (req/s) | Direct P50 (ms) | CoT (req/s) | CoT P50 (ms) |
