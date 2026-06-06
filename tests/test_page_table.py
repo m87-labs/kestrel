@@ -45,6 +45,40 @@ def _make_runtime_for_cache(
 # Basic PageTable Tests (no prefix cache)
 # =============================================================================
 
+def test_populate_paged_kv_metadata_copies_active_pages_and_preserves_tail() -> None:
+    page_table = PageTable(n_pages=16, page_size=4, max_batch_size=8, device="cpu")
+    page_table.reserve(1, 9)
+    page_table.reserve(2, 17)
+    page_table.commit_block_table([1, 2])
+
+    batch_idx = torch.tensor([2, 1], dtype=torch.int64)
+    input_pos = torch.tensor([7, 8], dtype=torch.int32)
+    out_page_table = torch.full((2, page_table.n_pages), -99, dtype=torch.int32)
+    out_seqused_k = torch.full((2,), -1, dtype=torch.int32)
+
+    page_table.populate_paged_kv_metadata(
+        batch_idx=batch_idx,
+        input_pos=input_pos,
+        out_page_table=out_page_table,
+        out_seqused_k=out_seqused_k,
+    )
+
+    torch.testing.assert_close(
+        out_seqused_k,
+        torch.tensor([8, 9], dtype=torch.int32),
+    )
+    torch.testing.assert_close(out_page_table[0, :2], page_table.page_table[2, :2])
+    torch.testing.assert_close(out_page_table[1, :3], page_table.page_table[1, :3])
+    torch.testing.assert_close(
+        out_page_table[0, 2:],
+        torch.full((page_table.n_pages - 2,), -99, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        out_page_table[1, 3:],
+        torch.full((page_table.n_pages - 3,), -99, dtype=torch.int32),
+    )
+
+
 
 class TestAllocatePagesBasic:
     """Tests for allocate_pages without prefix cache."""

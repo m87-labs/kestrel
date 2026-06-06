@@ -2,7 +2,7 @@
 
 Each DecodeSlot bundles the GPU resources needed for one decode step:
 - Pinned host buffers for H2D metadata copies (batch_idx, input_pos, lora_slot_ids)
-- Per-slot FA3 paged-KV metadata buffers (page_table, seqused_k)
+- Per-slot paged-KV metadata buffers (page_table, seqused_k)
 - GPU staging buffers for sampled outputs
 - Forward output buffers (logits, hidden_last) for delayed sampling
 - RenderBuffer for D2H copies
