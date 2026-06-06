@@ -85,7 +85,12 @@ class ModelHandle:
         verbs dispatch to for that shape. Autoregressive models go through
         the skill path instead — ``engine.run`` would reject them, so reject
         here with a clearer message.
+
+        Starts the engine first: a co-hosted model's runtime (and thus its
+        tasks/shape) only exists once built, so the task check below must run
+        against a started engine, not raise "unknown model" pre-start.
         """
+        await self._engine._ensure_started()
         self._require(task)
         runtime = self._engine._runtimes.get(self._model)
         if runtime is not None and runtime.execution_shape is not (
@@ -123,7 +128,12 @@ class ModelHandle:
         out as its own argument, and ``image`` is pulled out for the image
         pipeline; ``stream`` selects streaming delivery but stays in the
         prompt, since the skill reads it to configure its streaming state.
+
+        Starts the engine first so shape dispatch sees a built runtime: a
+        co-hosted single-pass model isn't in ``_runtimes`` until startup, and
+        without it this would misroute to the autoregressive path.
         """
+        await self._engine._ensure_started()
         runtime = self._engine._runtimes.get(self._model)
         if runtime is not None and (
             runtime.execution_shape is ExecutionShape.SINGLE_PASS
