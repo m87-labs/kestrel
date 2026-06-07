@@ -1,4 +1,4 @@
-"""Photon telemetry reporting and API key validation."""
+"""Photon telemetry reporting and API key handling."""
 
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ from kestrel.config import RuntimeConfig
 
 
 _LOGGER = logging.getLogger(__name__)
-_PRICING_URL = "https://moondream.ai/pricing"
 _DOCS_URL = "https://moondream.ai/docs"
 _TELEMETRY_FLUSH_INTERVAL_SECONDS = 60
-_TELEMETRY_WARNING_INTERVAL_SECONDS = 600
 _MAX_PENDING_REPORTS = 100
 _MAX_REPORTS_PER_UPLOAD = 10
 
@@ -49,14 +47,8 @@ class PhotonReporter:
         *,
         api_key: Optional[str],
         api_base_url: str,
-        engine: Any,
     ) -> None:
-        self._engine = engine
-        # Strip leading/trailing whitespace. Common failure mode: pasting
-        # the key into a .env file leaves a trailing newline, which is an
-        # illegal HTTP header byte and trips httpx.LocalProtocolError —
-        # previously swallowed as "API unreachable" (see _flush_window).
-        self._api_key = api_key.strip() if api_key else api_key
+        self._api_key = self._normalize_api_key(api_key)
         self._api_base_url = api_base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             timeout=10.0,
@@ -73,62 +65,56 @@ class PhotonReporter:
         self._pending_reports: list[dict[str, Any]] = []
         self._stop_event = asyncio.Event()
         self._telemetry_task: Optional[asyncio.Task[None]] = None
-        self._last_telemetry_warning_at = 0.0
 
-    async def validate_api_key(self) -> None:
-        """Validate the API key by sending an initial telemetry flush.
+    async def validate_api_key(self) -> bool:
+        """Flush startup telemetry and return whether finetunes can use auth.
 
-        Raises RuntimeError if the key is missing, invalid, or the
-        account is not in good standing.  Warns and returns if the
-        Moondream API is unreachable (to avoid blocking startup during
-        API outages).
+        Missing or invalid keys never block base inference.
         """
-        # Do not disable Photon telemetry in product/runtime code. Bypassing
-        # this validation or suppressing telemetry violates the Terms of Service.
-        if not self._api_key:
-            raise RuntimeError(
-                "Moondream API key is not set. Pass api_key to PhotonVL() or "
-                "set the MOONDREAM_API_KEY environment variable. See %s" % _DOCS_URL
-            )
-
-        # Pre-validate the key can form a valid HTTP header. Otherwise
-        # `_flush_window`'s broad `except httpx.HTTPError` catches the
-        # client-side LocalProtocolError and returns None — which we treat
-        # as "API unreachable" and silently proceed without auth, bypassing
-        # telemetry. Check explicitly at the one-shot startup path; the
-        # steady-state telemetry loop keeps its permissive catch so an
-        # intermittent outage can't crash it.
-        if not self._api_key.isascii() or any(
-            c.isspace() or not c.isprintable() for c in self._api_key
-        ):
-            raise RuntimeError(
+        if self._api_key is not None and not self._is_api_key_header_safe(self._api_key):
+            self._disable_auth_header()
+            _LOGGER.warning(
                 "MOONDREAM_API_KEY has non-ASCII or whitespace characters that "
-                "make it unusable as an HTTP header. Check for stray newlines, "
-                "tabs, or pasted control characters in the key. See %s" % _DOCS_URL
+                "make it unusable as an HTTP header. Finetune inference is "
+                "disabled. Check for stray whitespace or pasted control "
+                "characters. See %s",
+                _DOCS_URL,
             )
+            await self._flush_window()
+            return False
 
+        had_api_key = self._api_key is not None
         standing = await self._flush_window()
+
+        if standing == "active":
+            return True
+
+        if not had_api_key:
+            return False
 
         if standing is None:
             _LOGGER.warning(
                 "Could not reach the Moondream API. The Photon inference "
-                "engine will start, but usage will not be reported and "
-                "finetunes will not be available while the API is "
-                "unreachable.",
+                "engine will start, but finetune inference is disabled while "
+                "the API is unreachable.",
             )
-            return
+            return False
 
         if standing == "invalid_api_key":
-            raise RuntimeError(
-                "MOONDREAM_API_KEY is not valid. Check that the key is "
-                "correct and try again. See %s" % _DOCS_URL
+            _LOGGER.warning(
+                "MOONDREAM_API_KEY is not valid. Finetune inference is "
+                "disabled. Check that the key is correct. See %s",
+                _DOCS_URL,
             )
+            await self._flush_window(rotate=False)
+            return False
 
-        if standing != "active":
-            raise RuntimeError(
-                "Your account does not have enough credits to start the "
-                "Photon inference engine. Add credits at %s" % _PRICING_URL
-            )
+        _LOGGER.warning(
+            "MOONDREAM_API_KEY is not active (standing=%s). Finetune "
+            "inference is disabled.",
+            standing,
+        )
+        return False
 
     def start(self) -> None:
         if self._telemetry_task is None:
@@ -180,18 +166,15 @@ class PhotonReporter:
             if self._stop_event.is_set():
                 break
 
-    async def _flush_window(self) -> Optional[str]:
+    async def _flush_window(self, *, rotate: bool = True) -> Optional[str]:
         """Flush pending telemetry reports and return account standing.
 
         Returns the standing string from the telemetry response:
         ``"active"``, ``"key_revoked"``, ``"billing_paused"``,
-        ``"inactive"``, ``"error"``, or ``None`` if the flush could not
-        be completed.
+        ``"inactive"``, ``"anonymous"``, ``"error"``, or ``None`` if the
+        flush could not be completed.
         """
-        reports = self._rotate_window()
-
-        if not self._api_key:
-            return None
+        reports = self._rotate_window() if rotate else []
 
         self._pending_reports.extend(reports)
         if len(self._pending_reports) > _MAX_PENDING_REPORTS:
@@ -206,12 +189,14 @@ class PhotonReporter:
                     f"{self._api_base_url}/v1/photon/telemetry",
                     json={"reports": batch},
                 )
-            except httpx.HTTPError as exc:
-                _LOGGER.warning("Photon usage reporting failed: %s", exc)
+            except httpx.HTTPError:
                 return None
 
             if response.status_code == 401:
-                return "invalid_api_key"
+                if self._api_key is not None:
+                    self._disable_auth_header()
+                    return "invalid_api_key"
+                return None
 
             if response.status_code >= 400:
                 return None
@@ -229,31 +214,14 @@ class PhotonReporter:
             if standing is None:
                 standing = "active"
 
-        if standing == "key_revoked":
-            _LOGGER.error(
-                "MOONDREAM_API_KEY has been revoked. The Photon inference "
-                "engine will stop accepting new requests.",
-            )
-            # Schedule engine shutdown as a separate task to avoid
-            # deadlock (engine.shutdown awaits this telemetry task).
-            asyncio.create_task(self._engine.shutdown())
-
-        elif standing == "invalid_api_key":
-            _LOGGER.error(
-                "MOONDREAM_API_KEY is no longer valid. The Photon inference "
-                "engine will stop accepting new requests.",
-            )
-            asyncio.create_task(self._engine.shutdown())
-
-        elif standing is not None and standing != "active":
-            self._maybe_log_telemetry_warning(
-                "Your account has run out of credits. Inference will "
-                "continue for this process, but new processes will fail "
-                "to start. Add credits at %s" % _PRICING_URL,
-                None,
-            )
-
         return standing
+
+    def _disable_auth_header(self) -> None:
+        self._api_key = None
+        try:
+            del self._client.headers["X-Moondream-Auth"]
+        except KeyError:
+            pass
 
     def _rotate_window(self) -> list[dict[str, Any]]:
         now = self._utc_now()
@@ -288,21 +256,6 @@ class PhotonReporter:
 
         return reports
 
-    def _maybe_log_telemetry_warning(
-        self,
-        message: str,
-        error: Optional[BaseException],
-    ) -> None:
-        now = asyncio.get_running_loop().time()
-        if now - self._last_telemetry_warning_at < _TELEMETRY_WARNING_INTERVAL_SECONDS:
-            return
-
-        self._last_telemetry_warning_at = now
-        if error is None:
-            _LOGGER.warning(message)
-            return
-        _LOGGER.warning("%s %s", message, error)
-
     @staticmethod
     def _utc_now() -> datetime:
         return datetime.now(timezone.utc)
@@ -315,6 +268,17 @@ class PhotonReporter:
     def _normalize_finetune(finetune: Optional[str]) -> str:
         normalized = (finetune or "").strip()
         return normalized
+
+    @staticmethod
+    def _normalize_api_key(api_key: Optional[str]) -> Optional[str]:
+        normalized = api_key.strip() if api_key else ""
+        return normalized or None
+
+    @staticmethod
+    def _is_api_key_header_safe(api_key: str) -> bool:
+        return api_key.isascii() and all(
+            not c.isspace() and c.isprintable() for c in api_key
+        )
 
     @staticmethod
     def _describe_active_gpu(runtime_device: torch.device) -> dict[str, Any]:
