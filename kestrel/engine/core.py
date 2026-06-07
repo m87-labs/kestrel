@@ -102,6 +102,7 @@ _LOGGER = logging.getLogger(__name__)
 _MPS_SAMPLER_DOCS_URL = "https://github.com/m87-labs/kestrel/pull/33"
 
 _DEFAULT_API_BASE_URL = "https://api.moondream.ai"
+_DOCS_URL = "https://moondream.ai/docs"
 _ALLOWED_API_BASE_URLS = (
     "https://api-staging.moondream.ai",
     _DEFAULT_API_BASE_URL,
@@ -127,6 +128,7 @@ class InferenceEngine:
         api_key: Optional[str] = None,
         api_base_url: str = _DEFAULT_API_BASE_URL,
         models: Optional[Sequence[str]] = None,
+        adapter_provider_uses_api_key: bool = False,
     ) -> None:
         if runtime is not None:
             cfg_device = runtime_cfg.resolved_device()
@@ -137,6 +139,7 @@ class InferenceEngine:
                 )
         self._runtime_cfg = runtime_cfg
         self._adapter_provider = adapter_provider
+        self._adapter_provider_uses_api_key = adapter_provider_uses_api_key
         self._api_key = api_key
         self._api_base_url = api_base_url
 
@@ -267,24 +270,40 @@ class InferenceEngine:
         api_key: Optional[str] = None,
         models: Optional[Sequence[str]] = None,
     ) -> "InferenceEngine":
-        # Auto-create provider if none provided
+        # Auto-create provider if none provided. Photon telemetry itself does
+        # not require auth; cloud-backed finetune inference does.
         if api_key is None:
             api_key = os.environ.get("MOONDREAM_API_KEY")
+        api_key = PhotonReporter._normalize_api_key(api_key)
         api_base_url = os.environ.get("MOONDREAM_API_BASE_URL", _DEFAULT_API_BASE_URL)
         api_base_url = api_base_url.rstrip("/")
         if api_base_url not in _ALLOWED_API_BASE_URLS:
             api_base_url = _DEFAULT_API_BASE_URL
+        adapter_provider_uses_api_key = False
         if adapter_provider is None and api_key:
-            from kestrel.cloud import MoondreamAdapterProvider
-            from kestrel.models.moondream.config import load_config
+            if PhotonReporter._is_api_key_header_safe(api_key):
+                from kestrel.cloud import MoondreamAdapterProvider
+                from kestrel.models.moondream.config import load_config
 
-            config = load_config()
-            adapter_provider = MoondreamAdapterProvider(
-                text_config=config.text,
-                api_key=api_key,
-                api_base_url=api_base_url,
-                device=torch.device(runtime_cfg.device),
-                dtype=runtime_cfg.resolved_dtype(),
+                config = load_config()
+                adapter_provider = MoondreamAdapterProvider(
+                    text_config=config.text,
+                    api_key=api_key,
+                    api_base_url=api_base_url,
+                    device=torch.device(runtime_cfg.device),
+                    dtype=runtime_cfg.resolved_dtype(),
+                )
+                adapter_provider_uses_api_key = True
+            else:
+                _LOGGER.warning(
+                    "MOONDREAM_API_KEY has non-ASCII or whitespace characters. "
+                    "Finetune inference is disabled. See %s",
+                    _DOCS_URL,
+                )
+        elif adapter_provider is None:
+            _LOGGER.warning(
+                "MOONDREAM_API_KEY is not set. Finetune inference is disabled. "
+                "Set MOONDREAM_API_KEY to enable finetune inference."
             )
 
         engine = cls(
@@ -295,6 +314,7 @@ class InferenceEngine:
             api_key=api_key,
             api_base_url=api_base_url,
             models=models,
+            adapter_provider_uses_api_key=adapter_provider_uses_api_key,
         )
         await engine._initialize()
         return engine
@@ -314,6 +334,17 @@ class InferenceEngine:
             ).start()
         except Exception:
             pass
+        reporter: Optional[PhotonReporter] = None
+        if self._photon_reporter is None:
+            reporter = PhotonReporter(
+                self._runtime_cfg,
+                self._runtime_cfg.resolved_device(),
+                api_key=self._api_key,
+                api_base_url=self._api_base_url,
+            )
+            auth_available = await reporter.validate_api_key()
+            if not auth_available and self._adapter_provider_uses_api_key:
+                self._disable_cloud_adapter_provider()
         if any(model_id not in self._runtimes for model_id in self._model_ids):
             max_lora_rank = (
                 self._adapter_provider.config()["max_lora_rank"]
@@ -349,19 +380,8 @@ class InferenceEngine:
         # ``_init_task is current_task`` check there keeps that
         # recursive call from re-entering this body.
         await self._warmup_query_pipeline()
-        if self._photon_reporter is None:
-            reporter = PhotonReporter(
-                self._runtime_cfg,
-                self.runtime.device,
-                api_key=self._api_key,
-                api_base_url=self._api_base_url,
-                engine=self,
-            )
-            await reporter.validate_api_key()
+        if reporter is not None:
             reporter.start()
-            # Only commit a successfully-validated, started reporter.
-            # If ``validate_api_key`` raises, the next ``_initialize``
-            # call will retry the build + validate.
             self._photon_reporter = reporter
         # Flip the guard last so a failure partway through (runtime
         # construction, warmup, photon) leaves the engine retry-able
@@ -370,6 +390,16 @@ class InferenceEngine:
         # Drop the reference to the completed init task so its
         # captured locals can be garbage-collected.
         self._init_task = None
+
+    def _disable_cloud_adapter_provider(self) -> None:
+        if self._adapter_provider is None:
+            return
+        _LOGGER.warning(
+            "Finetune inference is disabled because no valid MOONDREAM_API_KEY "
+            "is available."
+        )
+        self._adapter_provider = None
+        self._adapter_provider_uses_api_key = False
 
     def _build_configured_runtimes(self, max_lora_rank: Optional[int]) -> None:
         """Build each configured model's runtime from its registered spec.
@@ -841,8 +871,14 @@ class InferenceEngine:
         skill_spec = self._skill_registry().resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
         if self._adapter_provider is None and adapter_id is not None:
+            _LOGGER.warning(
+                "Adapter %r was requested, but finetune inference is disabled. "
+                "Set MOONDREAM_API_KEY or pass an adapter_provider to enable it.",
+                adapter_id,
+            )
             raise NotImplementedError(
-                "Adapter support requires an adapter_provider at engine creation."
+                "Finetune inference is disabled because no authenticated "
+                "adapter provider is available."
             )
 
         image_obj: Optional[np.ndarray | bytes] = None
@@ -1517,4 +1553,3 @@ class InferenceEngine:
             except queue.Empty:
                 break
             self._fail_request(req, exc)
-
