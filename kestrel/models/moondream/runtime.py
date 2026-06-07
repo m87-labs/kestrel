@@ -141,7 +141,7 @@ class PrefillScratch:
 class PrefillSlot:
     """Per-prefill slot resources.
 
-    Prefill work runs on the primary stream, but can be pipelined from the CPU
+    Prefill work runs on the compute stream, but can be pipelined from the CPU
     side (e.g., commit token0 for request A while the GPU runs request B's
     prefill). Slots avoid clobbering per-prefill buffers when multiple prefills
     are in-flight.
@@ -235,6 +235,7 @@ class MoondreamRuntime:
         *,
         max_lora_rank: int | None = None,
         kv_pool: KVMemoryPool | None = None,
+        compute_stream: torch.cuda.Stream | None,
     ) -> None:
         self._cfg = cfg
         self.device = cfg.resolved_device()
@@ -273,9 +274,9 @@ class MoondreamRuntime:
         if cfg.enable_prefix_cache:
             self.prefix_cache = RadixPrefixCache()
 
-        # Primary stream for all GPU operations. Created early because PageTable
-        # needs it for H2D copies that must synchronize with graph replay.
-        self._primary_stream = make_stream(self.device)
+        # Compute stream for model GPU work. The engine passes one shared
+        # stream when co-hosting multiple execution shapes.
+        self._compute_stream = compute_stream
 
         self.page_table = PageTable(
             n_pages=n_pages,
@@ -283,7 +284,7 @@ class MoondreamRuntime:
             max_batch_size=self.max_batch_slots,
             device=str(self.device),
             prefix_cache=self.prefix_cache,
-            h2d_stream=self._primary_stream,
+            h2d_stream=self._compute_stream,
         )
         self._kv_pool = kv_pool if kv_pool is not None else KVMemoryPool(
             device=self.device
@@ -547,7 +548,7 @@ class MoondreamRuntime:
                 hidden_dim=hidden_dim,
                 coord_dtype=coord_dtype,
                 size_dtype=size_dtype,
-                compute_stream=self._primary_stream,
+                compute_stream=self._compute_stream,
                 copy_stream=self._copy_stream,
             )
             for slot_id in range(2)
@@ -621,14 +622,14 @@ class MoondreamRuntime:
         return self.page_table.can_reserve_pages(total_length)
 
     @property
-    def copy_stream(self) -> torch.cuda.Stream:
-        """Shared copy stream for D2H transfers."""
-        return self._copy_stream
+    def compute_stream(self) -> torch.cuda.Stream | None:
+        """Compute stream used by engine-constructed runtime internals."""
+        return self._compute_stream
 
     @property
-    def primary_stream(self) -> torch.cuda.Stream:
-        """Primary compute stream for all GPU operations."""
-        return self._primary_stream
+    def copy_stream(self) -> torch.cuda.Stream | None:
+        """Shared copy stream for D2H transfers."""
+        return self._copy_stream
 
     @property
     def prefill_slots(self) -> list[PrefillSlot]:
@@ -1450,9 +1451,9 @@ class MoondreamRuntime:
         if batch_size > 1 and any(slot != 0 for slot in lora_slots):
             raise NotImplementedError("Batched prefill does not yet support LoRA slots")
 
-        # Keep all GPU work on the primary stream so all callers share identical
+        # Keep all GPU work on the compute stream so all callers share identical
         # ordering semantics.
-        with stream_context(self._primary_stream):
+        with stream_context(self._compute_stream):
             per_inputs: list[Tensor] = []
             per_positions: list[Tensor] = []
             use_prefix_attn: bool | None = None
@@ -1986,7 +1987,7 @@ class MoondreamRuntime:
 
         if is_new:
             try:
-                with stream_context(self._primary_stream):
+                with stream_context(self._compute_stream):
                     self._lora_workspace.load_slot_(slot, adapter)
             except Exception:
                 # Rollback on load failure

@@ -106,7 +106,7 @@ class DecodeSlot:
     slot_id: int
     meta: DecodeMetaBuffers
     render: object  # RenderBuffer (import deferred to avoid circular import)
-    compute_stream: torch.cuda.Stream
+    compute_stream: torch.cuda.Stream | None
 
     fa3_page_table: Tensor
     fa3_seqused_k: Tensor
@@ -165,8 +165,8 @@ def create_decode_slot(
     hidden_dim: int,
     coord_dtype: torch.dtype,
     size_dtype: torch.dtype,
-    compute_stream: torch.cuda.Stream,
-    copy_stream: torch.cuda.Stream,
+    compute_stream: torch.cuda.Stream | None,
+    copy_stream: torch.cuda.Stream | None,
 ) -> DecodeSlot:
     """Create a DecodeSlot with all per-slot resources allocated.
 

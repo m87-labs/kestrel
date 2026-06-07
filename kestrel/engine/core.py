@@ -54,7 +54,7 @@ from dataclasses import replace
 
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
-from kestrel.device import set_device, synchronize
+from kestrel.device import make_stream, set_device, synchronize
 from kestrel.runtime import (
     AutoregressiveRuntime,
     ExecutionShape,
@@ -176,6 +176,14 @@ class InferenceEngine:
         self._runtimes: Dict[str, Runtime] = {}
         if runtime is not None:
             self._runtimes[self._default_model] = runtime
+        runtime_device = (
+            runtime.device if runtime is not None else runtime_cfg.resolved_device()
+        )
+        self._compute_stream = (
+            cast(Any, runtime).compute_stream
+            if runtime is not None
+            else make_stream(runtime_device)
+        )
         # ``_initialized`` flips at the very end of ``_initialize`` so
         # any partial failure (warmup, photon validation) leaves the
         # engine retry-able. ``_init_task`` is the asyncio task that's
@@ -430,9 +438,13 @@ class InferenceEngine:
 
         spec = get_spec(model_id)
         if model_id == self._default_model:
-            return spec.runtime(self._runtime_cfg, max_lora_rank=max_lora_rank)
+            return spec.runtime(
+                self._runtime_cfg,
+                max_lora_rank=max_lora_rank,
+                compute_stream=self._compute_stream,
+            )
         cfg = replace(self._runtime_cfg, model=model_id, model_path=None)
-        return spec.runtime(cfg)
+        return spec.runtime(cfg, compute_stream=self._compute_stream)
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""
@@ -1258,6 +1270,7 @@ class InferenceEngine:
         # CUDA-graph capture, so pause/drain is handled specially below.
         ar_executor = AutoregressiveExecutor(
             runtime,
+            compute_stream=self._compute_stream,
             skills=self._skill_registry(),
             adapter_provider=self._adapter_provider,
             build_generation_request=self._build_generation_request,
@@ -1268,7 +1281,7 @@ class InferenceEngine:
         # folds advance() over every lane; single-pass forwards interleave
         # with autoregressive decode on the shared stream.
         single_pass: Dict[str, SinglePassExecutor] = {
-            name: SinglePassExecutor(rt)
+            name: SinglePassExecutor(rt, compute_stream=self._compute_stream)
             for name, rt in self._runtimes.items()
             if rt.execution_shape is ExecutionShape.SINGLE_PASS
         }

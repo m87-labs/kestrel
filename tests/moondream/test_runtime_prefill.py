@@ -37,7 +37,7 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
     runtime.device = torch.device("cpu")
     runtime.dtype = torch.float32
     runtime.bos_embed = torch.empty(1, 4)
-    runtime._primary_stream = None
+    runtime._compute_stream = None
     runtime.page_table = _FakePageTable()
 
     def build_inputs(prepared, *, image, image_crops):

@@ -250,6 +250,7 @@ def main() -> None:
     patch_vision_encoder_with_nvtx(detailed=not args.compact)
 
     from kestrel.config import RuntimeConfig
+    from kestrel.device import make_stream
     from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.models.moondream import vision as vision_module
 
@@ -262,7 +263,7 @@ def main() -> None:
     )
 
     print(f"Loading model from {args.weights}...")
-    runtime = MoondreamRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg, compute_stream=make_stream(device))
     vision_cfg = runtime.config.vision
     vision_model = runtime.model.vision
     print(

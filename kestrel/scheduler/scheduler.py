@@ -218,10 +218,12 @@ class GenerationScheduler:
         self,
         runtime: AutoregressiveRuntime,
         *,
+        compute_stream: object,
         skill_registry: SkillRegistry,
         adapter_provider: Optional[AdapterProvider] = None,
     ) -> None:
         self.runtime = runtime
+        self._compute_stream = compute_stream
         self._adapter_provider = adapter_provider
         self.waiting: RequestQueue[GenerationRequest] = RequestQueue()
         self.running: RunningQueue[RequestLifecycle] = RunningQueue()
@@ -367,7 +369,7 @@ class GenerationScheduler:
         """
         progressed = False
         pipeline = self._pipeline
-        with stream_context(self.runtime.primary_stream):
+        with stream_context(self._compute_stream):
             has_launch = pipeline.has_launch_in_flight()
             has_queued = pipeline.queue_depth() > 0
 
@@ -587,7 +589,7 @@ class GenerationScheduler:
     def _finalize_prefill(self, handle: LaunchHandle) -> PendingCommit:
         """Sample first token + start D2H for a prefill.
 
-        IMPORTANT: Caller must already be on the primary stream.
+        IMPORTANT: Caller must already be on the compute stream.
         """
         if handle.kind != "prefill":
             raise AssertionError("prefill finalize requires a prefill handle")
@@ -780,7 +782,7 @@ class GenerationScheduler:
 
             lifecycle.sequence_state = prepared.state
             batch_idx = prepared.state.batch_idx
-            with stream_context(self.runtime.primary_stream):
+            with stream_context(self._compute_stream):
                 self._sampling_temps_by_batch[batch_idx] = request.temperature
                 self._sampling_top_ps_by_batch[batch_idx] = request.top_p
 
@@ -850,7 +852,7 @@ class GenerationScheduler:
                     )
                 lifecycle.prefill_completed_at = time.perf_counter()
                 # Ensure prefill forward completes before cache finalize + release.
-                with stream_context(self.runtime.primary_stream):
+                with stream_context(self._compute_stream):
                     prefill_slot.commit_done_event.record()
                 prefill_slot.commit_done_event.synchronize()
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
@@ -1098,7 +1100,7 @@ class GenerationScheduler:
         if handle.kind == "prefill":
             if plan is not None:
                 raise AssertionError("Prefill finalize does not support masks")
-            with stream_context(self.runtime.primary_stream):
+            with stream_context(self._compute_stream):
                 return self._finalize_prefill(handle)
         raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 

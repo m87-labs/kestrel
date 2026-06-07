@@ -94,7 +94,6 @@ class AutoregressiveRuntime(Runtime, Protocol):
     image_prefix_length: int
 
     # Streams
-    primary_stream: Any
     copy_stream: Any
 
     # Slot containers + sequence registry
@@ -195,8 +194,8 @@ class SinglePassRuntime(Runtime, Protocol):
 
     No KV cache, no decode loop. The driver is pure compute: ``forward``
     enqueues the kernels for one forward and returns the result tensors
-    *without* a host sync, so the engine's single-pass executor can let
-    that work overlap autoregressive decode on the shared stream. The
+    *without* a host sync. The engine supplies the compute stream shared
+    with the autoregressive lane when it constructs the runtime. The
     executor owns the completion event, slot, and result delivery (the
     driver↔executor split mirrors the autoregressive path, where the
     model computes and the scheduler owns the pipeline).
@@ -206,13 +205,6 @@ class SinglePassRuntime(Runtime, Protocol):
     not call ``.item()`` / ``.cpu()`` / ``torch.cuda.synchronize`` before
     returning.
     """
-
-    # Stream the executor launches forwards on, so a single-pass forward
-    # and autoregressive decode share one ordered stream (the device's
-    # serialize-on-stream invariant). Declared here — not discovered via
-    # getattr — so a runtime that omits it fails loudly rather than
-    # silently running on the default stream with no interleaving.
-    primary_stream: Any
 
     # Capability names this runtime serves, e.g. ("segment_masks",). The
     # engine advertises these through ModelHandle.tasks / supports() and
