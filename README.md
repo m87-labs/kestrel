@@ -26,7 +26,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
     SM90 (H100, H200, GH200), SM100 (B200), SM110 (Jetson Thor), SM120 (RTX PRO 6000).
     Other CUDA GPUs may work but have not been tested.
   - **Apple Silicon Mac** (M-series) on macOS 13 (Ventura) or later, with native Metal kernels.
-- `MOONDREAM_API_KEY` environment variable or `api_key` parameter (get a key from [moondream.ai](https://moondream.ai))
+- `MOONDREAM_API_KEY` (optional) — only needed for finetuned-model inference (get a key from [moondream.ai](https://moondream.ai))
 
 ## Installation
 
@@ -61,8 +61,9 @@ async def main():
     # Use model="moondream2" or model="moondream3-preview".
     cfg = RuntimeConfig(model="moondream2")
 
-    # Create the engine (loads model and warms up)
-    engine = await InferenceEngine.create(cfg, api_key="your-key-here")
+    # Create the engine (loads model and warms up). No API key needed for
+    # local inference; pass api_key="..." only for finetuned models.
+    engine = await InferenceEngine.create(cfg)
 
     # Load an image (JPEG, PNG, or WebP bytes)
     image = open("photo.jpg", "rb").read()
@@ -244,7 +245,7 @@ RuntimeConfig(
 
 | Variable | Description |
 |----------|-------------|
-| `MOONDREAM_API_KEY` | Required. Get this from [moondream.ai](https://moondream.ai). |
+| `MOONDREAM_API_KEY` | Optional. Only needed for finetuned-model inference. Get this from [moondream.ai](https://moondream.ai). |
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
 | `HF_TOKEN` | HuggingFace token for gated models like Moondream 3. Alternatively, run `huggingface-cli login`. |
 
@@ -256,6 +257,15 @@ Kestrel can be deployed as a [Triton Inference Server](https://github.com/triton
 
 Throughput and latency for the `query` skill are tracked in [PERFORMANCE.md](./PERFORMANCE.md), with results broken out by GPU.
 
+## Telemetry
+
+Kestrel reports basic usage telemetry to help us decide which hardware platforms
+to prioritize for support and optimization. Each report includes the model in
+use, your GPU type and memory, aggregate request/error and token counts, your
+machine's hostname, and timestamps. Prompts, images, and model outputs are never
+sent.
+
 ## License
 
-Kestrel requires a Moondream API key for billing. See [moondream.ai/pricing](https://moondream.ai/pricing) for plans.
+Local inference is free and requires no API key. Finetuned-model inference
+requires a Moondream API key — see [moondream.ai/pricing](https://moondream.ai/pricing).
