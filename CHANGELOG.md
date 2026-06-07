@@ -2,6 +2,52 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.4.2 — 2026-06-06
+
+Local inference is now free and no longer needs an API key. This release also
+updates Kestrel to `kestrel-kernels` 0.4.6, raising Moondream 3 throughput
+across NVIDIA GPUs — with standout gains on Ampere — making high-rank LoRA
+dramatically faster, speeding up decoding on Apple Silicon, and fixing FP8 MoE
+accuracy on older cards.
+
+### Local inference is now free
+
+- Running the inference engine no longer requires a `MOONDREAM_API_KEY` — local
+  inference is now free and starts with no key configured. A key is only needed
+  for finetuned-model inference.
+
+### Performance
+
+- Moondream 3 throughput is up across NVIDIA GPUs on the published ChartQA
+  benchmarks, with by far the largest gains on Ampere: A100 is up ~25–44% on
+  direct queries and up to ~70% with chain-of-thought, at ~25–34% lower median
+  latency, and A10 is up ~30–45%. Jetson Thor is up to ~48% faster at low batch
+  sizes.
+- Constrained decoding (restricting output to a set of allowed tokens) is
+  faster, with the biggest gains at high concurrency — up to ~34% higher decode
+  throughput on B200 and ~11% on RTX 3090, with identical output.
+- Reduced decode CPU overhead on both Apple Silicon (M-series Macs) and in
+  NVIDIA MoE execution, speeding up Moondream 3 decoding.
+
+### LoRA
+
+- High-rank LoRA adapters are dramatically faster: a rank-512 adapter apply
+  dropped from ~140 ms to ~0.9 ms on B200 (2048 routed tokens), and
+  per-request cost now scales with the adapter's rank rather than the maximum
+  supported rank. Ranks up to 512 are supported.
+- LoRA adapters now also work on Apple Silicon and Windows, in addition to
+  NVIDIA. Windows couldn't run adapters before because the previous path
+  required Triton.
+
+### Fixes
+
+- Fixed a numerical issue in FP8 MoE on GPUs that lack native FP8 conversion
+  (A100, A10/A10G, RTX 3090): the software routine that converts activations to
+  FP8 truncated instead of rounding to nearest, biasing every quantized
+  activation about 4% low. Rounding to nearest removes the bias. The effect on
+  generated output was minor, and GPUs with hardware FP8 conversion were
+  unaffected.
+
 ## 0.4.1 — 2026-05-23
 
 This release lifts FP8 MoE performance on NVIDIA B200 through the
