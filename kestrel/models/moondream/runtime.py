@@ -532,7 +532,7 @@ class MoondreamRuntime:
             )
 
         # Create two ping-pong decode slots for pipelined decoding.
-        # Each slot has its own staging buffers, FA3 paged-KV metadata buffers,
+        # Each slot has its own staging buffers, paged-KV metadata buffers,
         # and RenderBuffer, but they share the decode compute stream and copy stream.
         vocab_size = self.model.text.lm_head.weight.shape[0]
         hidden_dim = self.model.text.lm_head.weight.shape[1]
@@ -1793,7 +1793,7 @@ class MoondreamRuntime:
 
         This method provides identical preparation for both graph and non-graph paths:
         1. Clear padding region (for graph batch size alignment)
-        2. Build FA3 paged-KV metadata buffers
+        2. Build paged-KV metadata buffers
         3. Execute: either graph.replay() or eager forward
 
         The only difference between paths is step 3. This ensures debugging with
@@ -1833,11 +1833,11 @@ class MoondreamRuntime:
         if self._lora_workspace is not None:
             self._prepare_decode_lora_metadata(slot, graph_batch_size)
 
-        # Build FA3 per-step metadata buffers (identical for both paths)
+        # Build per-step paged-KV metadata buffers (identical for both paths)
         # - page_table rows: [B, num_pages]
         # - seqused_k: [B] (KV length including the current token after update)
         batch_idx = slot.meta.batch_idx.gpu[:graph_batch_size]
-        self.page_table.populate_fa3_decode_metadata(
+        self.page_table.populate_paged_kv_metadata(
             batch_idx=batch_idx,
             input_pos=slot.meta.input_pos.gpu[:graph_batch_size],
             out_page_table=slot.fa3_page_table[:graph_batch_size],
@@ -2140,9 +2140,9 @@ class MoondreamRuntime:
                             if self._lora_workspace is not None:
                                 self._prepare_decode_lora_metadata(slot, bs)
 
-                            # Build FA3 per-step metadata buffers
+                            # Build per-step paged-KV metadata buffers
                             batch_idx = slot.meta.batch_idx.gpu[:bs]
-                            self.page_table.populate_fa3_decode_metadata(
+                            self.page_table.populate_paged_kv_metadata(
                                 batch_idx=batch_idx,
                                 input_pos=slot.meta.input_pos.gpu[:bs],
                                 out_page_table=slot.fa3_page_table[:bs],
