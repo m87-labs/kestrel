@@ -30,7 +30,6 @@ class _StubSinglePass:
         self.model_name = model_name
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
-        self.primary_stream = None
         self.calls: list[tuple[str, Any]] = []
 
     def forward(self, task: str, inputs: Any) -> Any:
@@ -62,6 +61,7 @@ def _engine_with(ar: FakeRuntime, sp: _StubSinglePass) -> InferenceEngine:
     engine._adapter_provider = None
     engine._default_temperature = 0.2
     engine._default_top_p = 0.9
+    engine._compute_stream = None
     engine._skills_override = None
     engine._request_ids = iter(range(1, 1_000_000))
     return engine

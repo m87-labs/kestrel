@@ -28,8 +28,11 @@ def test_engine_holds_injected_runtime() -> None:
     without having to ``await create``."""
 
     runtime = FakeRuntime(model_name="injected", device="cpu")
+    stream = object()
+    runtime.compute_stream = stream
     engine = InferenceEngine(_cpu_cfg(), runtime=runtime)
     assert engine.runtime is runtime
+    assert engine._compute_stream is stream
 
 
 def test_engine_rejects_runtime_with_mismatched_device() -> None:

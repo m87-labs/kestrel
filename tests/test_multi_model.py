@@ -33,7 +33,6 @@ class _SPStub:
         self.model_name = model_name
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
-        self.primary_stream = None
 
     def tasks(self) -> tuple[str, ...]:
         return ("segment",)
@@ -93,6 +92,7 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
         eng._default_model = "mm-ar"
         eng._model_ids = ["mm-ar", "mm-sp"]
         eng._runtimes = {}
+        eng._compute_stream = None
 
         eng._build_configured_runtimes(13)
 
@@ -101,10 +101,11 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
         assert eng._runtimes["mm-sp"].execution_shape is ExecutionShape.SINGLE_PASS
         # Each runtime is built with a per-model config carrying its own id.
         assert eng._runtimes["mm-sp"].model_name == "mm-sp"
-        # max_lora_rank → default AR only; the single-pass factory is called
-        # without it (single-pass factories don't accept it).
-        assert built_kwargs["mm-ar"] == {"max_lora_rank": 13}
-        assert built_kwargs["mm-sp"] == {}
+        # max_lora_rank → default AR only; compute_stream is supplied to
+        # every runtime factory so both execution shapes share the engine
+        # stream. CPU tests use None for that stream.
+        assert built_kwargs["mm-ar"] == {"max_lora_rank": 13, "compute_stream": None}
+        assert built_kwargs["mm-sp"] == {"compute_stream": None}
     finally:
         _REGISTRY.pop("mm-ar", None)
         _REGISTRY.pop("mm-sp", None)
@@ -126,6 +127,7 @@ def test_build_configured_runtimes_skips_already_built() -> None:
         eng._model_ids = ["preexisting", "mm-sp2"]
         injected = _SPStub("preexisting")
         eng._runtimes = {"preexisting": injected}
+        eng._compute_stream = None
 
         eng._build_configured_runtimes(None)
 

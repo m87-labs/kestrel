@@ -115,13 +115,12 @@ class SinglePassExecutor:
         self,
         runtime: SinglePassRuntime,
         *,
+        compute_stream: Any,
         max_in_flight: int = 1,
     ) -> None:
         self._runtime = runtime
         self._device = runtime.device
-        # Declared on SinglePassRuntime — access directly so a runtime that
-        # forgets it fails loudly instead of silently losing interleaving.
-        self._stream = runtime.primary_stream
+        self._stream = compute_stream
         self._max_in_flight = max_in_flight
         self._queue: "queue.Queue[_SinglePassRequest]" = queue.Queue()
         self._in_flight: List[_InFlight] = []

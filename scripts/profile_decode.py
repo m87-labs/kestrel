@@ -258,6 +258,7 @@ def main():
     patch_lm_head_with_nvtx()
 
     from kestrel.config import RuntimeConfig
+    from kestrel.device import make_stream
     from kestrel.models.moondream.runtime import MoondreamRuntime, SequenceState, TextToken
 
     device = torch.device("cuda")
@@ -273,7 +274,7 @@ def main():
     )
 
     print(f"Loading model from {args.weights}...")
-    runtime = MoondreamRuntime(runtime_cfg)
+    runtime = MoondreamRuntime(runtime_cfg, compute_stream=make_stream(device))
     config = runtime.config.text
     moe_desc = (
         f"MoE starts at layer {config.moe.start_layer}" if config.moe is not None else "no MoE"

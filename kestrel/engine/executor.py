@@ -160,6 +160,7 @@ class AutoregressiveExecutor:
         self,
         runtime: AutoregressiveRuntime,
         *,
+        compute_stream: Any,
         skills: "SkillRegistry",
         adapter_provider: Optional[AdapterProvider],
         build_generation_request: Callable[
@@ -174,6 +175,7 @@ class AutoregressiveExecutor:
         self._to_engine_result = to_engine_result
         self._scheduler = GenerationScheduler(
             runtime,
+            compute_stream=compute_stream,
             skill_registry=skills,
             adapter_provider=adapter_provider,
         )
@@ -334,5 +336,3 @@ class AutoregressiveExecutor:
                 self._runtime.release_sequence(state)
             except Exception:
                 pass
-
-

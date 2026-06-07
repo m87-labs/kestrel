@@ -80,6 +80,7 @@ class _FakeDecodeSlot:
 
     def __init__(self, *, slot_id: int) -> None:
         self.slot_id = slot_id
+        self.compute_stream = None
         self.step_done_event = NoopEvent()
         self.commit_done_event = NoopEvent()
 
@@ -117,7 +118,7 @@ class FakeRuntime:
         self.device: torch.device = (
             torch.device(device) if isinstance(device, str) else device
         )
-        self.primary_stream: Any = None
+        self.compute_stream: Any = None
         self.copy_stream: Any = None
 
         # Slot containers + sequence registry. The scheduler treats these

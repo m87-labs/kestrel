@@ -29,7 +29,6 @@ class _StubDriver:
         # reports done immediately, so collect() fires on the next tick.
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
-        self.primary_stream = None
         self.calls: list[tuple[str, Any]] = []
 
     def forward(self, task: str, inputs: Any) -> Any:
@@ -58,7 +57,7 @@ def _req(request_id: int, task: str, inputs: Any) -> _SinglePassRequest:
 
 
 def test_forward_result_becomes_completion() -> None:
-    ex = SinglePassExecutor(_StubDriver())
+    ex = SinglePassExecutor(_StubDriver(), compute_stream=None)
     ex.submit(_req(1, "segment", {"points": [[1, 2]]}))
 
     tick = ex.advance()  # launch + collect (NoopEvent done immediately)
@@ -73,7 +72,7 @@ def test_forward_result_becomes_completion() -> None:
 
 
 def test_forward_error_becomes_error_completion() -> None:
-    ex = SinglePassExecutor(_StubDriver())
+    ex = SinglePassExecutor(_StubDriver(), compute_stream=None)
     ex.submit(_req(2, "boom", {}))
 
     tick = ex.advance()
@@ -87,7 +86,7 @@ def test_forward_error_becomes_error_completion() -> None:
 def test_one_in_flight_at_a_time() -> None:
     """Default max_in_flight=1: a second job waits until the first frees."""
     driver = _StubDriver()
-    ex = SinglePassExecutor(driver, max_in_flight=1)
+    ex = SinglePassExecutor(driver, compute_stream=None, max_in_flight=1)
     ex.submit(_req(3, "a", 1))
     ex.submit(_req(4, "b", 2))
 
@@ -103,7 +102,7 @@ def test_one_in_flight_at_a_time() -> None:
 
 
 def test_idle_executor_reports_no_work() -> None:
-    ex = SinglePassExecutor(_StubDriver())
+    ex = SinglePassExecutor(_StubDriver(), compute_stream=None)
     tick = ex.advance()
     assert tick.completed == ()
     assert tick.has_work is False
@@ -135,7 +134,7 @@ def test_forward_stays_in_flight_until_event_fires(monkeypatch) -> None:
     event = _PendingEvent(not_done_polls=2)
     monkeypatch.setattr(single_pass_mod, "make_event", lambda device: event)
 
-    ex = SinglePassExecutor(_StubDriver())
+    ex = SinglePassExecutor(_StubDriver(), compute_stream=None)
     ex.submit(_req(7, "segment", {"k": "v"}))
 
     # Tick 1: forward launched, but the event reports not-done — nothing
@@ -160,7 +159,7 @@ def test_forward_stays_in_flight_until_event_fires(monkeypatch) -> None:
 
 def test_shutdown_fails_queued_and_in_flight() -> None:
     driver = _StubDriver()
-    ex = SinglePassExecutor(driver, max_in_flight=1)
+    ex = SinglePassExecutor(driver, compute_stream=None, max_in_flight=1)
     ex.submit(_req(5, "a", 1))
     ex.submit(_req(6, "b", 2))
     # Launch job 5 into the in-flight slot without collecting it: a real
