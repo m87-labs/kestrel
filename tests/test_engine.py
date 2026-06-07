@@ -402,9 +402,7 @@ def test_extract_private_suppress_next_token_ids_setting() -> None:
 
 def test_validate_suppress_next_token_ids_rejects_bad_request_scope() -> None:
     engine = object.__new__(InferenceEngine)
-    runtime = SimpleNamespace(
-        config=SimpleNamespace(text=SimpleNamespace(vocab_size=4))
-    )
+    runtime = SimpleNamespace(vocab_size=4)
 
     def skill_state(
         *,

@@ -622,6 +622,10 @@ class MoondreamRuntime:
         return self.page_table.can_reserve_pages(total_length)
 
     @property
+    def vocab_size(self) -> int:
+        return int(self.config.text.vocab_size)
+
+    @property
     def compute_stream(self) -> torch.cuda.Stream | None:
         """Compute stream used by engine-constructed runtime internals."""
         return self._compute_stream
