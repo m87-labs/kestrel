@@ -11,8 +11,11 @@ engines.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+import kestrel.engine.core as engine_core
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.models.registry import ModelSpec, register, _REGISTRY
@@ -89,3 +92,21 @@ def test_engine_cohosted_runtime_reuses_injected_runtime_pool() -> None:
         assert engine._kv_pool is runtime.kv_pool
     finally:
         _REGISTRY.pop("cohosted-ar", None)
+
+
+def test_engine_surfaces_scheduler_startup_failure(monkeypatch) -> None:
+    class BrokenExecutor:
+        def __init__(self, *args, **kwargs) -> None:
+            raise TypeError("scheduler constructor mismatch")
+
+    monkeypatch.setattr(engine_core, "AutoregressiveExecutor", BrokenExecutor)
+    runtime = FakeRuntime(model_name="anything", device="cpu")
+    engine = InferenceEngine(_cpu_cfg(), runtime=runtime)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="scheduler is not running") as exc:
+            await engine._initialize()
+        assert isinstance(exc.value.__cause__, TypeError)
+        assert "constructor mismatch" in str(exc.value.__cause__)
+
+    asyncio.run(run())
