@@ -102,7 +102,7 @@ class ModelHandle:
             )
         return await self._engine.run(self._model, task, inputs)
 
-    async def stream(self, task: str, **initial_prompt: Any) -> "ModelStream":
+    async def stream(self, task: str, /, **initial_prompt: Any) -> "ModelStream":
         """Start a stateful streaming session on this model.
 
         This is the generic escape hatch for execution shapes where the

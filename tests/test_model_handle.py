@@ -377,6 +377,35 @@ def test_capability_dispatches_to_stream_for_streaming_model() -> None:
     }
 
 
+def test_streaming_prompt_can_include_task_field() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: list[dict[str, Any]] = []
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.append({"model": model, "task": task, "inputs": inputs})
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    h = eng.model("tracker")
+
+    out = asyncio.run(h.stream("point", task="seed", points=[[0.5, 0.5]]))
+    assert out == "STREAM"
+    assert captured[-1] == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"task": "seed", "points": [[0.5, 0.5]]},
+    }
+
+    out = asyncio.run(h.point(task="seed", points=[[0.25, 0.75]]))
+    assert out == "STREAM"
+    assert captured[-1] == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"task": "seed", "points": [[0.25, 0.75]]},
+    }
+
+
 def test_stream_rejects_non_streaming_model() -> None:
     eng = _engine()
     with pytest.raises(ValueError, match="stream\\(\\) is for streaming models"):
