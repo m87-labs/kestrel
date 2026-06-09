@@ -9,6 +9,7 @@ that contract with stub runtimes — no GPU.
 from __future__ import annotations
 
 import asyncio
+import queue
 from types import SimpleNamespace
 from typing import Any
 
@@ -57,6 +58,12 @@ def _engine() -> InferenceEngine:
     }
     eng._skills_override = None  # AR runtime owns its skills
     eng._shutdown = False
+    eng._streaming_start_queue = queue.Queue()
+    eng._streaming_chunk_queue = queue.Queue()
+    eng._model_stream_models = {}
+    eng._model_stream_queues = {}
+    eng._scheduler_event = SimpleNamespace(set=lambda: None)
+    eng._request_ids = iter(range(1, 1_000_000))
     # Runtimes are injected (already built), so the engine is effectively
     # started: _ensure_started() (now awaited by the handle verbs) is a no-op.
     eng._scheduler_error = None
@@ -473,7 +480,11 @@ def test_engine_stream_validates_shape_and_task() -> None:
         with pytest.raises(ValueError, match="does not support 'detect'"):
             await eng.stream("tracker", "detect", {})
 
-        with pytest.raises(NotImplementedError, match="streaming executor"):
-            await eng.stream("tracker", "point", {"points": [[0.5, 0.5]]})
+        stream = await eng.stream("tracker", "point", {"points": [[0.5, 0.5]]})
+        model, req = eng._streaming_start_queue.get_nowait()
+        assert stream.session_id == req.request_id
+        assert model == "tracker"
+        assert req.task == "point"
+        assert req.initial_inputs == {"points": [[0.5, 0.5]]}
 
     asyncio.run(go())
