@@ -139,7 +139,7 @@ class ModelHandle:
         self,
         task: str,
         prompt: dict[str, Any],
-    ) -> "EngineResult | EngineStream":
+    ) -> "EngineResult | EngineStream | ModelStream":
         """Route one capability call by the bound model's execution shape.
 
         A single-pass model interprets the whole prompt in its forward pass
@@ -160,6 +160,8 @@ class ModelHandle:
             runtime.execution_shape is ExecutionShape.SINGLE_PASS
         ):
             return await self.run(task, prompt)
+        if runtime is not None and runtime.execution_shape is ExecutionShape.STREAMING:
+            return await self.stream(task, **prompt)
         self._require_default_ar(task)
         settings = prompt.pop("settings", None)
         stream = bool(prompt.get("stream", False))
@@ -168,19 +170,29 @@ class ModelHandle:
             task, image=image, prompt=prompt, settings=settings, stream=stream
         )
 
-    async def query(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def query(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("query", prompt)
 
-    async def caption(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def caption(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("caption", prompt)
 
-    async def detect(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def detect(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("detect", prompt)
 
-    async def point(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def point(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("point", prompt)
 
-    async def segment(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def segment(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("segment", prompt)
 
     def __repr__(self) -> str:
