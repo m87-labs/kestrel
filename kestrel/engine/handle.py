@@ -25,7 +25,7 @@ from kestrel.runtime import ExecutionShape
 
 if TYPE_CHECKING:
     from kestrel.engine.core import InferenceEngine
-    from kestrel.engine._types import EngineResult, EngineStream
+    from kestrel.engine._types import EngineResult, EngineStream, ModelStream
 
 
 class ModelHandle:
@@ -101,6 +101,27 @@ class ModelHandle:
                 f"{runtime.execution_shape.value} — use its typed verbs."
             )
         return await self._engine.run(self._model, task, inputs)
+
+    async def stream(self, task: str, **initial_prompt: Any) -> "ModelStream":
+        """Start a stateful streaming session on this model.
+
+        This is the generic escape hatch for execution shapes where the
+        caller drives model state forward with chunks/frames. It is
+        separate from autoregressive token streaming, which remains a
+        per-request delivery mode selected by capability prompts such as
+        ``stream=True``.
+        """
+        await self._engine._ensure_started()
+        self._require(task)
+        runtime = self._engine._runtimes.get(self._model)
+        if runtime is None:
+            raise ValueError(f"Unknown model {self._model!r}")
+        if runtime.execution_shape is not ExecutionShape.STREAMING:
+            raise ValueError(
+                f"stream() is for streaming models; {self._model!r} is "
+                f"{runtime.execution_shape.value}"
+            )
+        return await self._engine.stream(self._model, task, initial_prompt)
 
     # -- capability vocabulary ----------------------------------------
     #

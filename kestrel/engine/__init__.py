@@ -9,6 +9,8 @@ from kestrel.engine._types import (
     EngineMetrics,
     EngineResult,
     EngineStream,
+    ModelStream,
+    ModelStreamUpdate,
     TickResult,
 )
 from kestrel.engine.executor import (
@@ -26,6 +28,8 @@ __all__ = [
     "EngineResult",
     "EngineMetrics",
     "EngineStream",
+    "ModelStream",
+    "ModelStreamUpdate",
     "Executor",
     "AutoregressiveExecutor",
     "SinglePassExecutor",

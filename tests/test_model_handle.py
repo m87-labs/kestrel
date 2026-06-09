@@ -30,6 +30,16 @@ class _StubSinglePass:
         return self._tasks
 
 
+class _StubStreaming:
+    def __init__(self, model_name: str, tasks: tuple[str, ...]) -> None:
+        self.model_name = model_name
+        self.execution_shape = ExecutionShape.STREAMING
+        self._tasks = tasks
+
+    def tasks(self) -> tuple[str, ...]:
+        return self._tasks
+
+
 def _engine() -> InferenceEngine:
     """Minimal engine with an AR default + a single-pass model registered."""
     ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
@@ -46,6 +56,7 @@ def _engine() -> InferenceEngine:
         "sp-model": _StubSinglePass("sp-model", ("segment_masks",)),
     }
     eng._skills_override = None  # AR runtime owns its skills
+    eng._shutdown = False
     # Runtimes are injected (already built), so the engine is effectively
     # started: _ensure_started() (now awaited by the handle verbs) is a no-op.
     eng._initialized = True
@@ -320,3 +331,48 @@ def test_run_gates_on_task_then_forwards() -> None:
     # An unknown task is rejected before forwarding.
     with pytest.raises(ValueError, match="does not support 'bogus'"):
         asyncio.run(h.run("bogus", {}))
+
+
+def test_stream_forwards_to_engine_for_streaming_model() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: dict[str, Any] = {}
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    out = asyncio.run(
+        eng.model("tracker").stream("point", points=[[0.5, 0.5]], labels=[1])
+    )
+
+    assert out == "STREAM"
+    assert captured == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"points": [[0.5, 0.5]], "labels": [1]},
+    }
+
+
+def test_stream_rejects_non_streaming_model() -> None:
+    eng = _engine()
+    with pytest.raises(ValueError, match="stream\\(\\) is for streaming models"):
+        asyncio.run(eng.model("sp-model").stream("segment_masks", points=[[1, 2]]))
+
+
+def test_engine_stream_validates_shape_and_task() -> None:
+    async def go() -> None:
+        eng = _engine()
+        eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+
+        with pytest.raises(ValueError, match="not a streaming model"):
+            await eng.stream("sp-model", "segment_masks", {})
+
+        with pytest.raises(ValueError, match="does not support 'detect'"):
+            await eng.stream("tracker", "detect", {})
+
+        with pytest.raises(NotImplementedError, match="streaming executor"):
+            await eng.stream("tracker", "point", {"points": [[0.5, 0.5]]})
+
+    asyncio.run(go())
