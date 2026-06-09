@@ -94,6 +94,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     max_batch_slots: int
     max_seq_length: int
     image_prefix_length: int
+    vocab_size: int
 
     # Streams
     copy_stream: Any

@@ -1493,7 +1493,7 @@ class InferenceEngine:
         if not suppress:
             return
 
-        vocab_size = int(runtime.config.text.vocab_size)
+        vocab_size = int(runtime.vocab_size)
         for token_id in suppress:
             if token_id >= vocab_size:
                 raise ValueError(
