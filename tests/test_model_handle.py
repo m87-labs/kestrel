@@ -48,6 +48,7 @@ def _engine() -> InferenceEngine:
     eng._skills_override = None  # AR runtime owns its skills
     # Runtimes are injected (already built), so the engine is effectively
     # started: _ensure_started() (now awaited by the handle verbs) is a no-op.
+    eng._scheduler_error = None
     eng._initialized = True
     return eng
 

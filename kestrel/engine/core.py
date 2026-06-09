@@ -210,6 +210,7 @@ class InferenceEngine:
         self._paused_flag = threading.Event()  # set == paused
         self._paused_event = threading.Event()  # acknowledgment for callers
         self._scheduler_thread: Optional[threading.Thread] = None
+        self._scheduler_error: Optional[BaseException] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._photon_reporter: Optional[PhotonReporter] = None
         self._request_ids = itertools.count()
@@ -331,6 +332,7 @@ class InferenceEngine:
     async def _initialize(self) -> None:
         if self._initialized:
             return
+        self._scheduler_error = None
         loop = asyncio.get_running_loop()
         self._loop = loop
         try:
@@ -820,8 +822,11 @@ class InferenceEngine:
             inputs=inputs,
             submitted_at=time.perf_counter(),
         )
+        self._raise_if_scheduler_failed()
         self._single_pass_queue.put((model, req))
         self._scheduler_event.set()
+        if self._scheduler_error is not None:
+            self._fail_all_pending(self._scheduler_failed_error())
         return await future
 
     def model(self, model_id: Optional[str] = None) -> "ModelHandle":
@@ -947,6 +952,7 @@ class InferenceEngine:
         return future, req_id
 
     async def _ensure_started(self) -> None:
+        self._raise_if_scheduler_failed()
         if self._initialized:
             return
 
@@ -960,6 +966,7 @@ class InferenceEngine:
         # If another caller has init in flight, wait for it.
         if self._init_task is not None and not self._init_task.done():
             await asyncio.shield(self._init_task)
+            self._raise_if_scheduler_failed()
             if self._initialized:
                 return
             # Init failed; fall through to retry below.
@@ -970,6 +977,16 @@ class InferenceEngine:
             # self._init_task`` catches the warmup recursion above).
             self._init_task = asyncio.create_task(self._initialize())
         await asyncio.shield(self._init_task)
+        self._raise_if_scheduler_failed()
+
+    def _scheduler_failed_error(self) -> RuntimeError:
+        exc = RuntimeError("InferenceEngine scheduler is not running")
+        exc.__cause__ = self._scheduler_error
+        return exc
+
+    def _raise_if_scheduler_failed(self) -> None:
+        if self._scheduler_error is not None:
+            raise self._scheduler_failed_error()
 
     async def _worker_loop(self) -> None:
         shutdown_error = RuntimeError("Engine shut down")
@@ -980,8 +997,13 @@ class InferenceEngine:
                 self._scheduler_queue.put(None)
                 self._scheduler_event.set()
                 break
+            if self._scheduler_error is not None:
+                self._fail_request(request, self._scheduler_failed_error())
+                continue
             self._scheduler_queue.put(request)
             self._scheduler_event.set()
+            if self._scheduler_error is not None:
+                self._fail_all_pending(self._scheduler_failed_error())
 
         while not self._queue.empty():
             pending = self._queue.get_nowait()
@@ -1273,30 +1295,37 @@ class InferenceEngine:
 
 
     def _scheduler_loop(self) -> None:
-        runtime = self._runtimes.get(self._default_model)
-        if runtime is None:
+        try:
+            runtime = self._runtimes.get(self._default_model)
+            if runtime is None:
+                raise RuntimeError(
+                    f"No runtime registered for default model {self._default_model!r}"
+                )
+            set_device(runtime.device)
+            # The default (autoregressive) lane. Its pipeline owns the device's
+            # CUDA-graph capture, so pause/drain is handled specially below.
+            ar_executor = AutoregressiveExecutor(
+                runtime,
+                compute_stream=self._compute_stream,
+                skills=self._skill_registry(),
+                adapter_provider=self._adapter_provider,
+                build_generation_request=self._build_generation_request,
+                to_engine_result=self._to_engine_result,
+                wake_event=self._scheduler_event,
+            )
+            # One single-pass lane per registered single-pass model. The kernel
+            # folds advance() over every lane; single-pass forwards interleave
+            # with autoregressive decode on the shared stream.
+            single_pass: Dict[str, SinglePassExecutor] = {
+                name: SinglePassExecutor(rt, compute_stream=self._compute_stream)
+                for name, rt in self._runtimes.items()
+                if rt.execution_shape is ExecutionShape.SINGLE_PASS
+            }
+        except Exception as exc:
+            self._scheduler_error = exc
+            _LOGGER.exception("Scheduler startup failed", exc_info=exc)
+            self._fail_all_pending(self._scheduler_failed_error())
             return
-        set_device(runtime.device)
-
-        # The default (autoregressive) lane. Its pipeline owns the device's
-        # CUDA-graph capture, so pause/drain is handled specially below.
-        ar_executor = AutoregressiveExecutor(
-            runtime,
-            compute_stream=self._compute_stream,
-            skills=self._skill_registry(),
-            adapter_provider=self._adapter_provider,
-            build_generation_request=self._build_generation_request,
-            to_engine_result=self._to_engine_result,
-            wake_event=self._scheduler_event,
-        )
-        # One single-pass lane per registered single-pass model. The kernel
-        # folds advance() over every lane; single-pass forwards interleave
-        # with autoregressive decode on the shared stream.
-        single_pass: Dict[str, SinglePassExecutor] = {
-            name: SinglePassExecutor(rt, compute_stream=self._compute_stream)
-            for name, rt in self._runtimes.items()
-            if rt.execution_shape is ExecutionShape.SINGLE_PASS
-        }
 
         shutdown_requested = False
         wake_event = self._scheduler_event
@@ -1385,6 +1414,7 @@ class InferenceEngine:
                     try:
                         tick = ar_executor.advance()
                     except Exception as exc:
+                        self._scheduler_error = exc
                         _LOGGER.exception("Autoregressive advance failed", exc_info=exc)
                         deliver(ar_executor.shutdown(exc))
                         for lane in single_pass.values():
