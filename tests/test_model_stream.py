@@ -98,3 +98,37 @@ def test_model_stream_surfaces_completion_errors() -> None:
             await stream.__anext__()
 
     asyncio.run(go())
+
+
+def test_model_stream_completion_closes_public_session() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        closed: list[int] = []
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("completed stream accepted a chunk")
+
+        async def close_session(session_id: int) -> None:
+            closed.append(session_id)
+
+        stream = ModelStream(
+            session_id=10,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+        result = _result(10)
+        queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await stream.send(frame="f1")
+        assert await stream.close() is result
+        assert closed == []
+
+    asyncio.run(go())

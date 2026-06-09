@@ -192,6 +192,7 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         while True:
             item = await self._queue.get()
             if isinstance(item, _ModelStreamCompletion):
+                self._closed = True
                 if item.error is not None:
                     self._error = item.error
                     raise item.error
@@ -310,4 +311,3 @@ class TickResult:
     progressed: bool = False
     completed: tuple[Completion, ...] = ()
     has_work: bool = False  # queued or in flight (gates shutdown exit)
-
