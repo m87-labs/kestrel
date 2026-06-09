@@ -234,7 +234,7 @@ class MoondreamRuntime:
         cfg: RuntimeConfig,
         *,
         max_lora_rank: int | None = None,
-        kv_pool: KVMemoryPool | None = None,
+        kv_pool: KVMemoryPool,
         compute_stream: torch.cuda.Stream | None,
     ) -> None:
         self._cfg = cfg
@@ -286,9 +286,7 @@ class MoondreamRuntime:
             prefix_cache=self.prefix_cache,
             h2d_stream=self._compute_stream,
         )
-        self._kv_pool = kv_pool if kv_pool is not None else KVMemoryPool(
-            device=self.device
-        )
+        self._kv_pool = kv_pool
         if self._kv_pool.device != self.device:
             raise ValueError(
                 f"kv_pool.device ({self._kv_pool.device}) must match runtime "
@@ -625,6 +623,11 @@ class MoondreamRuntime:
     def compute_stream(self) -> torch.cuda.Stream | None:
         """Compute stream used by engine-constructed runtime internals."""
         return self._compute_stream
+
+    @property
+    def kv_pool(self) -> KVMemoryPool:
+        """KV memory pool owned by the engine/runtime construction path."""
+        return self._kv_pool
 
     @property
     def copy_stream(self) -> torch.cuda.Stream | None:

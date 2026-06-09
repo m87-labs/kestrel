@@ -15,6 +15,7 @@ import pytest
 
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
+from kestrel.models.registry import ModelSpec, register, _REGISTRY
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -33,6 +34,7 @@ def test_engine_holds_injected_runtime() -> None:
     engine = InferenceEngine(_cpu_cfg(), runtime=runtime)
     assert engine.runtime is runtime
     assert engine._compute_stream is stream
+    assert engine._kv_pool is runtime.kv_pool
 
 
 def test_engine_rejects_runtime_with_mismatched_device() -> None:
@@ -65,3 +67,25 @@ def test_engine_registers_injected_runtime_under_config_model_id() -> None:
     assert engine._default_model == "moondream2"
     assert engine._runtimes == {"moondream2": runtime}
     assert engine.runtime is runtime
+
+
+def test_engine_cohosted_runtime_reuses_injected_runtime_pool() -> None:
+    """An injected default runtime supplies the shared KV pool for later builds."""
+
+    seen: dict[str, object] = {}
+
+    def factory(cfg: RuntimeConfig, **kwargs):
+        seen[cfg.model] = kwargs["kv_pool"]
+        return FakeRuntime(model_name=cfg.model, device="cpu")
+
+    register(ModelSpec(name="cohosted-ar", runtime=factory))
+    try:
+        runtime = FakeRuntime(model_name="anything", device="cpu")
+        engine = InferenceEngine(_cpu_cfg(), runtime=runtime, models=["cohosted-ar"])
+        engine._build_configured_runtimes(max_lora_rank=None)
+
+        assert engine._runtimes["moondream2"] is runtime
+        assert seen["cohosted-ar"] is runtime.kv_pool
+        assert engine._kv_pool is runtime.kv_pool
+    finally:
+        _REGISTRY.pop("cohosted-ar", None)

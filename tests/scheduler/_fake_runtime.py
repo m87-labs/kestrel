@@ -120,6 +120,7 @@ class FakeRuntime:
         )
         self.compute_stream: Any = None
         self.copy_stream: Any = None
+        self.kv_pool: Any = object()
 
         # Slot containers + sequence registry. The scheduler treats these
         # as fixed-capacity arrays — sizing its staging pool from

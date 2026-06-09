@@ -174,6 +174,7 @@ class InferenceEngine:
         # addresses runtimes by id and routes by ``execution_shape``, never by
         # interrogating the object.
         self._runtimes: Dict[str, Runtime] = {}
+        self._kv_pool = runtime.kv_pool if runtime is not None else None
         if runtime is not None:
             self._runtimes[self._default_model] = runtime
         runtime_device = (
@@ -429,22 +430,33 @@ class InferenceEngine:
         A co-hosted model gets a per-model config — its own ``model`` id, and
         ``model_path`` reset so it resolves for that model (a single-pass
         spec declares no weight file, so its path stays ``None`` and the
-        factory owns loading). ``max_lora_rank`` is the default
-        autoregressive model's concern (supplied by the adapter provider);
-        co-hosted models are built without it, since single-pass factories
-        don't accept it.
+        factory owns loading). Runtime factories receive common engine-owned
+        resources such as the compute stream and KV pool. ``max_lora_rank`` is
+        the default autoregressive model's concern, supplied by the adapter
+        provider only for that model.
         """
         from kestrel.models import get_spec
 
         spec = get_spec(model_id)
+        kwargs: dict[str, Any] = {
+            "compute_stream": self._compute_stream,
+            "kv_pool": self._shared_kv_pool(),
+        }
         if model_id == self._default_model:
             return spec.runtime(
                 self._runtime_cfg,
                 max_lora_rank=max_lora_rank,
-                compute_stream=self._compute_stream,
+                **kwargs,
             )
         cfg = replace(self._runtime_cfg, model=model_id, model_path=None)
-        return spec.runtime(cfg, compute_stream=self._compute_stream)
+        return spec.runtime(cfg, **kwargs)
+
+    def _shared_kv_pool(self):
+        if self._kv_pool is None:
+            from kestrel.kv_cache import KVMemoryPool
+
+            self._kv_pool = KVMemoryPool(device=self._runtime_cfg.resolved_device())
+        return self._kv_pool
 
     async def _warmup_query_pipeline(self) -> None:
         """Ensure the high-level query path is exercised before serving traffic."""

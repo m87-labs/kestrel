@@ -259,6 +259,7 @@ def main():
 
     from kestrel.config import RuntimeConfig
     from kestrel.device import make_stream
+    from kestrel.kv_cache import KVMemoryPool
     from kestrel.models.moondream.runtime import MoondreamRuntime, SequenceState, TextToken
 
     device = torch.device("cuda")
@@ -274,7 +275,11 @@ def main():
     )
 
     print(f"Loading model from {args.weights}...")
-    runtime = MoondreamRuntime(runtime_cfg, compute_stream=make_stream(device))
+    runtime = MoondreamRuntime(
+        runtime_cfg,
+        kv_pool=KVMemoryPool(device=device),
+        compute_stream=make_stream(device),
+    )
     config = runtime.config.text
     moe_desc = (
         f"MoE starts at layer {config.moe.start_layer}" if config.moe is not None else "no MoE"
