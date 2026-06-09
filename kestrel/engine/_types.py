@@ -154,6 +154,7 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         "_error",
         "_closed",
         "_closing",
+        "_close_lock",
     )
 
     def __init__(
@@ -176,6 +177,7 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         self._error: Optional[BaseException] = None
         self._closed = False
         self._closing = False
+        self._close_lock = asyncio.Lock()
 
     async def send(self, **chunk: Any) -> None:
         """Append one model-defined chunk/frame to the session."""
@@ -229,16 +231,18 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
     async def _request_close(self) -> None:
         if self._closed:
             return
-        if self._closing:
-            return
-        self._closing = True
-        try:
-            await self._close_session(self.session_id)
-            self._closed = True
-        except BaseException:
-            self._closing = False
-            raise
-        self._closing = False
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                await self._close_session(self.session_id)
+            except BaseException:
+                raise
+            else:
+                self._closed = True
+            finally:
+                self._closing = False
 
 
 @dataclass(slots=True)

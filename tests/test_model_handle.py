@@ -226,6 +226,15 @@ def test_capability_verbs_are_uniform_kwargs() -> None:
         )
 
 
+def test_stream_selector_is_positional_only() -> None:
+    import inspect
+
+    params = list(inspect.signature(ModelHandle.stream).parameters.values())
+    assert [p.name for p in params] == ["self", "task", "initial_prompt"]
+    assert params[1].kind is inspect.Parameter.POSITIONAL_ONLY
+    assert params[2].kind is inspect.Parameter.VAR_KEYWORD
+
+
 def test_capability_dispatches_to_run_for_single_pass() -> None:
     """A single-pass model interprets the whole prompt in its forward pass:
     the handle forwards it verbatim (media payload included) to run()."""
@@ -404,6 +413,46 @@ def test_streaming_prompt_can_include_task_field() -> None:
         "task": "point",
         "inputs": {"task": "seed", "points": [[0.25, 0.75]]},
     }
+
+
+def test_streaming_capability_preserves_ar_reserved_prompt_keys() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: dict[str, Any] = {}
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    out = asyncio.run(
+        eng.model("tracker").point(
+            image="frame0",
+            settings={"temperature": 0.0},
+            stream=True,
+            model="payload-model",
+        )
+    )
+
+    assert out == "STREAM"
+    assert captured == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {
+            "image": "frame0",
+            "settings": {"temperature": 0.0},
+            "stream": True,
+            "model": "payload-model",
+        },
+    }
+
+
+def test_unsupported_streaming_capability_rejects_before_ar_path() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+
+    with pytest.raises(ValueError, match="does not support 'detect'"):
+        asyncio.run(eng.model("tracker").detect(points=[[0.5, 0.5]]))
 
 
 def test_stream_rejects_non_streaming_model() -> None:

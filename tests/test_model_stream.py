@@ -220,3 +220,198 @@ def test_model_stream_rejects_send_after_close_starts() -> None:
         assert result.output == {"done": True}
 
     asyncio.run(go())
+
+
+def test_model_stream_concurrent_close_requests_share_cleanup() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        close_calls = 0
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("not used")
+
+        async def close_session(session_id: int) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            close_started.set()
+            await release_close.wait()
+            result = _result(session_id)
+            future.set_result(result)
+            queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        stream = ModelStream(
+            session_id=13,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        first_close = asyncio.create_task(stream.close())
+        await close_started.wait()
+        second_close = asyncio.create_task(stream.close())
+        await asyncio.sleep(0)
+
+        release_close.set()
+        first_result, second_result = await asyncio.gather(first_close, second_close)
+
+        assert close_calls == 1
+        assert first_result is second_result
+        assert first_result.output == {"done": True}
+
+    asyncio.run(go())
+
+
+def test_model_stream_waiting_close_retries_after_leading_close_cancelled() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        close_calls = 0
+        first_close_started = asyncio.Event()
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("not used")
+
+        async def close_session(session_id: int) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                first_close_started.set()
+                await asyncio.Future()
+            else:
+                result = _result(session_id)
+                future.set_result(result)
+                queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        stream = ModelStream(
+            session_id=14,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        first_close = asyncio.create_task(stream.close())
+        await first_close_started.wait()
+        second_close = asyncio.create_task(stream.close())
+        await asyncio.sleep(0)
+
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+
+        result = await asyncio.wait_for(second_close, timeout=1.0)
+
+        assert close_calls == 2
+        assert result.output == {"done": True}
+
+    asyncio.run(go())
+
+
+def test_model_stream_close_failure_allows_send_and_retry() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        close_calls = 0
+        sent: list[dict[str, Any]] = []
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            sent.append(chunk)
+
+        async def close_session(session_id: int) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                raise RuntimeError("close failed")
+            result = _result(session_id)
+            future.set_result(result)
+            queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        stream = ModelStream(
+            session_id=15,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await stream.close()
+
+        await stream.send(frame="after-failure")
+        result = await stream.close()
+
+        assert close_calls == 2
+        assert sent == [{"frame": "after-failure"}]
+        assert result.output == {"done": True}
+
+    asyncio.run(go())
+
+
+def test_model_stream_error_completion_closes_public_session() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        closed: list[int] = []
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("completed stream accepted a chunk")
+
+        async def close_session(session_id: int) -> None:
+            closed.append(session_id)
+
+        stream = ModelStream(
+            session_id=16,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+        queue.put_nowait(_ModelStreamCompletion(error=ValueError("bad frame")))
+
+        with pytest.raises(ValueError, match="bad frame"):
+            await stream.__anext__()
+        with pytest.raises(RuntimeError, match="closed"):
+            await stream.send(frame="f1")
+        with pytest.raises(ValueError, match="bad frame"):
+            await stream.close()
+        assert closed == []
+
+    asyncio.run(go())
+
+
+def test_model_stream_context_exception_requests_close_without_result_wait() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        closed: list[int] = []
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("not used")
+
+        async def close_session(session_id: int) -> None:
+            closed.append(session_id)
+
+        stream = ModelStream(
+            session_id=17,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        await stream.__aexit__(ValueError, ValueError("boom"), None)
+
+        assert closed == [17]
+        with pytest.raises(RuntimeError, match="closed"):
+            await stream.send(frame="f1")
+
+    asyncio.run(go())
