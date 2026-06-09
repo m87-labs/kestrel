@@ -1002,6 +1002,8 @@ class InferenceEngine:
                 continue
             self._scheduler_queue.put(request)
             self._scheduler_event.set()
+            if self._scheduler_error is not None:
+                self._fail_all_pending(self._scheduler_failed_error())
 
         while not self._queue.empty():
             pending = self._queue.get_nowait()

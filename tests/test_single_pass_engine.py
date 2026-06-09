@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from kestrel.engine import InferenceEngine
+from kestrel.engine._types import _AutoregressiveRequest
 from kestrel.runtime import ExecutionShape
 
 from tests.scheduler._fake_runtime import FakeRuntime
@@ -129,6 +130,59 @@ def test_run_fails_if_scheduler_dies_after_single_pass_enqueue() -> None:
         assert isinstance(exc.value.__cause__, RuntimeError)
         assert "scheduler crashed" in str(exc.value.__cause__)
         assert engine._single_pass_queue.empty()
+
+    asyncio.run(go())
+
+
+def test_worker_fails_ar_if_scheduler_dies_after_forwarding() -> None:
+    """Regression: AR submit must not hang if scheduler drains before put().
+
+    The worker checks the latched scheduler error before forwarding requests,
+    but the scheduler can fail between that check and ``_scheduler_queue.put``.
+    In that race, the request lands in a queue that no scheduler will consume.
+    """
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        sp = _StubSinglePass()
+        engine = _engine_with(ar, sp)
+        engine._loop = asyncio.get_running_loop()
+        engine._queue = asyncio.Queue()
+
+        class _QueueThatFailsAfterPut(_queue.Queue):
+            def put(self, item: Any, *args: Any, **kwargs: Any) -> None:
+                super().put(item, *args, **kwargs)
+                if item is not None:
+                    engine._scheduler_error = RuntimeError("scheduler crashed")
+
+        engine._scheduler_queue = _QueueThatFailsAfterPut()
+        future = asyncio.get_running_loop().create_future()
+        request = _AutoregressiveRequest(
+            request_id=1,
+            prompt="",
+            prompt_tokens=[],
+            image=None,
+            image_hash=None,
+            max_new_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            submitted_at=0.0,
+            future=future,
+            stream_queue=None,
+            skill=object(),  # type: ignore[arg-type]
+            request_context=None,
+        )
+
+        await engine._queue.put(request)
+        await engine._queue.put(None)
+        await asyncio.wait_for(engine._worker_loop(), timeout=1.0)
+
+        with pytest.raises(RuntimeError, match="scheduler is not running") as exc:
+            await asyncio.wait_for(future, timeout=1.0)
+        assert isinstance(exc.value.__cause__, RuntimeError)
+        assert "scheduler crashed" in str(exc.value.__cause__)
+        assert engine._scheduler_queue.get_nowait() is None
+        assert engine._scheduler_queue.empty()
 
     asyncio.run(go())
 
