@@ -1160,12 +1160,12 @@ class MoondreamRuntime:
             skip_positions, prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
 
-        # FA3 needs to know total KV length (cached + new)
-        fa3_seqused_k = torch.tensor(
+        # Paged attention needs the total KV length (cached + new).
+        paged_kv_seqlens_k = torch.tensor(
             [prompt_len], dtype=torch.int32, device=self.device
         )
 
-        return inputs_embeds, position_ids, fa3_seqused_k
+        return inputs_embeds, position_ids, paged_kv_seqlens_k
 
     def _prepare_full_prefill_inputs(
         self,
@@ -1201,11 +1201,11 @@ class MoondreamRuntime:
         position_ids = torch.arange(
             prompt_len, dtype=torch.long, device=self.device
         ).unsqueeze(0)
-        fa3_seqused_k = torch.tensor(
+        paged_kv_seqlens_k = torch.tensor(
             [prompt_len], dtype=torch.int32, device=self.device
         )
 
-        return inputs_embeds, position_ids, fa3_seqused_k
+        return inputs_embeds, position_ids, paged_kv_seqlens_k
 
     def _finalize_cache_after_prefill(
         self,
@@ -1504,12 +1504,12 @@ class MoondreamRuntime:
                 (batch_size,), dtype=torch.long, device=self.device
             )
             q_is_padded = any(seq_len != max_seq_len for seq_len in seq_lens)
-            fa3_seqused_q = (
+            paged_kv_seqlens_q = (
                 torch.empty((batch_size,), dtype=torch.int32, device=self.device)
                 if q_is_padded
                 else None
             )
-            fa3_seqused_k = torch.tensor(
+            paged_kv_seqlens_k = torch.tensor(
                 [
                     int(prepared.state.prompt_length or prepared.state.length)
                     for prepared in prepared_sequences
@@ -1537,8 +1537,8 @@ class MoondreamRuntime:
                 # Route padded tokens to reserved batch row 0 so they never write
                 # into real sequence KV slots.
                 slot_batch_idx[row, :seq_len].fill_(batch_idx)
-                if fa3_seqused_q is not None:
-                    fa3_seqused_q[row] = seq_len
+                if paged_kv_seqlens_q is not None:
+                    paged_kv_seqlens_q[row] = seq_len
                 last_token_positions[row] = seq_len - 1
 
             # Commit page table rows for all batch indices before forward pass.
@@ -1552,8 +1552,8 @@ class MoondreamRuntime:
                 batch_idx=slot_batch_idx,
                 lora_slot=lora_slot,
                 use_prefix_attn=use_prefix_attn,
-                fa3_seqused_q=fa3_seqused_q,
-                fa3_seqused_k=fa3_seqused_k,
+                paged_kv_seqlens_q=paged_kv_seqlens_q,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
             )
 
@@ -1672,8 +1672,8 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool,
-        fa3_seqused_q: Tensor | None,
-        fa3_seqused_k: Tensor,
+        paged_kv_seqlens_q: Tensor | None,
+        paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if batch_idx.ndim != 2:
@@ -1690,8 +1690,8 @@ class MoondreamRuntime:
             batch_idx=batch_idx, positions=position_ids
         )
 
-        # Build FA3 paged attention metadata for prefill
-        fa3_page_table = torch.index_select(
+        # Build paged attention metadata for prefill.
+        paged_kv_page_table = torch.index_select(
             self.page_table.page_table, 0, batch_rows
         )
 
@@ -1769,9 +1769,9 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
-            page_table=fa3_page_table,
-            fa3_seqused_q=fa3_seqused_q,
-            fa3_seqused_k=fa3_seqused_k,
+            page_table=paged_kv_page_table,
+            paged_kv_seqlens_q=paged_kv_seqlens_q,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
@@ -1843,13 +1843,13 @@ class MoondreamRuntime:
 
         # Build per-step paged-KV metadata buffers (identical for both paths)
         # - page_table rows: [B, num_pages]
-        # - seqused_k: [B] (KV length including the current token after update)
+        # - paged_kv_seqlens_k: [B] (KV length including the current token after update)
         batch_idx = slot.meta.batch_idx.gpu[:graph_batch_size]
         self.page_table.populate_paged_kv_metadata(
             batch_idx=batch_idx,
             input_pos=slot.meta.input_pos.gpu[:graph_batch_size],
-            out_page_table=slot.fa3_page_table[:graph_batch_size],
-            out_seqused_k=slot.fa3_seqused_k[:graph_batch_size],
+            out_page_table=slot.paged_kv_page_table[:graph_batch_size],
+            out_seqused_k=slot.paged_kv_seqlens_k[:graph_batch_size],
         )
 
         # Execute (only difference between paths)
@@ -1930,8 +1930,8 @@ class MoondreamRuntime:
             config=self.config.text,
             mode="decode",
             slot_mapping=slot_mapping,
-            page_table=slot.fa3_page_table[:batch_size],
-            fa3_seqused_k=slot.fa3_seqused_k[:batch_size],
+            page_table=slot.paged_kv_page_table[:batch_size],
+            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
             lora_workspace=lora_workspace,
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
@@ -2118,8 +2118,8 @@ class MoondreamRuntime:
             device = self.device
 
             # Graph capture must happen on the same stream we use for decode replay.
-            # Otherwise, replayed kernels may read stale metadata (page tables / seqused_k)
-            # written on a different stream, producing incorrect results.
+            # Otherwise, replayed kernels may read stale paged-KV metadata written
+            # on a different stream, producing incorrect results.
             with torch.cuda.stream(slot.compute_stream):
                 # Zero all slot buffers for capture.
                 # Use batch index 0 for all entries - row 0 in the page table is
@@ -2137,8 +2137,8 @@ class MoondreamRuntime:
                 slot.meta.active_lora_ids.cpu.zero_()
                 slot.meta.active_lora_meta.gpu.zero_()
                 slot.meta.active_lora_meta.cpu.zero_()
-                slot.fa3_page_table.zero_()
-                slot.fa3_seqused_k.zero_()
+                slot.paged_kv_page_table.zero_()
+                slot.paged_kv_seqlens_k.zero_()
 
                 try:
                     torch.cuda.synchronize(device=device)
@@ -2153,8 +2153,8 @@ class MoondreamRuntime:
                             self.page_table.populate_paged_kv_metadata(
                                 batch_idx=batch_idx,
                                 input_pos=slot.meta.input_pos.gpu[:bs],
-                                out_page_table=slot.fa3_page_table[:bs],
-                                out_seqused_k=slot.fa3_seqused_k[:bs],
+                                out_page_table=slot.paged_kv_page_table[:bs],
+                                out_seqused_k=slot.paged_kv_seqlens_k[:bs],
                             )
 
                             # Warmup run (not captured)
@@ -2176,8 +2176,8 @@ class MoondreamRuntime:
                     slot.meta.active_token_ids.gpu.zero_()
                     slot.meta.active_lora_ids.gpu.zero_()
                     slot.meta.active_lora_meta.gpu.zero_()
-                    slot.fa3_page_table.zero_()
-                    slot.fa3_seqused_k.zero_()
+                    slot.paged_kv_page_table.zero_()
+                    slot.paged_kv_seqlens_k.zero_()
 
         return cuda_graphs
 

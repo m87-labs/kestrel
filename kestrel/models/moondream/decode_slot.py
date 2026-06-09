@@ -2,7 +2,7 @@
 
 Each DecodeSlot bundles the GPU resources needed for one decode step:
 - Pinned host buffers for H2D metadata copies (batch_idx, input_pos, lora_slot_ids)
-- Per-slot paged-KV metadata buffers (page_table, seqused_k)
+- Per-slot paged-KV metadata buffers (page table, KV sequence lengths)
 - GPU staging buffers for sampled outputs
 - Forward output buffers (logits, hidden_last) for delayed sampling
 - RenderBuffer for D2H copies
@@ -79,8 +79,8 @@ class DecodeSlot:
             All decode forwards across both slots serialize on this stream
             to preserve sequential token dependencies (invariant I1).
 
-        fa3_page_table: Per-slot page table rows for FA3 paged decode.
-        fa3_seqused_k: Per-slot per-sequence KV lengths for FA3 paged decode.
+        paged_kv_page_table: Per-slot page table rows for paged attention decode.
+        paged_kv_seqlens_k: Per-slot per-sequence KV lengths for paged attention decode.
 
         # GPU staging buffers for sampled outputs (per-slot to avoid clobbering)
         sampled_ids: GPU buffer for sampled token IDs.
@@ -108,8 +108,8 @@ class DecodeSlot:
     render: object  # RenderBuffer (import deferred to avoid circular import)
     compute_stream: torch.cuda.Stream | None
 
-    fa3_page_table: Tensor
-    fa3_seqused_k: Tensor
+    paged_kv_page_table: Tensor
+    paged_kv_seqlens_k: Tensor
 
     # GPU staging for sampled outputs
     sampled_ids: Tensor
@@ -241,12 +241,12 @@ def create_decode_slot(
         copy_stream=copy_stream,
     )
 
-    fa3_page_table = torch.empty(
+    paged_kv_page_table = torch.empty(
         (max_batch_slots, kv_cache_pages),
         dtype=torch.int32,
         device=device,
     )
-    fa3_seqused_k = torch.empty(
+    paged_kv_seqlens_k = torch.empty(
         (max_batch_slots,),
         dtype=torch.int32,
         device=device,
@@ -344,8 +344,8 @@ def create_decode_slot(
         meta=meta,
         render=render,
         compute_stream=compute_stream,
-        fa3_page_table=fa3_page_table,
-        fa3_seqused_k=fa3_seqused_k,
+        paged_kv_page_table=paged_kv_page_table,
+        paged_kv_seqlens_k=paged_kv_seqlens_k,
         sampled_ids=sampled_ids,
         sampled_logprobs=sampled_logprobs,
         coord_staging=coord_staging,

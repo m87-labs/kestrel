@@ -55,13 +55,13 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
         lora_slot=0,
         *,
         use_prefix_attn,
-        fa3_seqused_q,
-        fa3_seqused_k,
+        paged_kv_seqlens_q,
+        paged_kv_seqlens_k,
         last_token_positions,
     ):
         del attn_mask, position_ids, batch_idx, lora_slot, use_prefix_attn
-        captured["fa3_seqused_q"] = fa3_seqused_q
-        captured["fa3_seqused_k"] = fa3_seqused_k
+        captured["paged_kv_seqlens_q"] = paged_kv_seqlens_q
+        captured["paged_kv_seqlens_k"] = paged_kv_seqlens_k
         captured["last_token_positions"] = last_token_positions
         batch_size = inputs_embeds.shape[0]
         return inputs_embeds, torch.zeros((batch_size, 8), dtype=inputs_embeds.dtype)
@@ -71,7 +71,7 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
     return runtime, captured
 
 
-def test_launch_prepared_batch_omits_seqused_q_for_uniform_q_lengths() -> None:
+def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() -> None:
     runtime, captured = _make_runtime({1: 3, 2: 3})
     slot = runtime_mod.PrefillSlot(
         slot_id=0,
@@ -91,9 +91,9 @@ def test_launch_prepared_batch_omits_seqused_q_for_uniform_q_lengths() -> None:
     )
 
     assert logits.shape == (2, 8)
-    assert captured["fa3_seqused_q"] is None
+    assert captured["paged_kv_seqlens_q"] is None
     torch.testing.assert_close(
-        captured["fa3_seqused_k"],
+        captured["paged_kv_seqlens_k"],
         torch.tensor([10, 11], dtype=torch.int32),
     )
     torch.testing.assert_close(
@@ -102,7 +102,7 @@ def test_launch_prepared_batch_omits_seqused_q_for_uniform_q_lengths() -> None:
     )
 
 
-def test_launch_prepared_batch_omits_seqused_q_for_single_token_append() -> None:
+def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_single_token_append() -> None:
     runtime, captured = _make_runtime({1: 1, 2: 1})
     slot = runtime_mod.PrefillSlot(
         slot_id=0,
@@ -122,14 +122,14 @@ def test_launch_prepared_batch_omits_seqused_q_for_single_token_append() -> None
     )
 
     assert logits.shape == (2, 8)
-    assert captured["fa3_seqused_q"] is None
+    assert captured["paged_kv_seqlens_q"] is None
     torch.testing.assert_close(
         captured["last_token_positions"],
         torch.tensor([0, 0], dtype=torch.long),
     )
 
 
-def test_launch_prepared_batch_keeps_seqused_q_for_padded_q_lengths() -> None:
+def test_launch_prepared_batch_keeps_paged_kv_q_lengths_for_padded_q_lengths() -> None:
     runtime, captured = _make_runtime({1: 1, 2: 3})
     slot = runtime_mod.PrefillSlot(
         slot_id=0,
@@ -150,7 +150,7 @@ def test_launch_prepared_batch_keeps_seqused_q_for_padded_q_lengths() -> None:
 
     assert logits.shape == (2, 8)
     torch.testing.assert_close(
-        captured["fa3_seqused_q"],
+        captured["paged_kv_seqlens_q"],
         torch.tensor([1, 3], dtype=torch.int32),
     )
     torch.testing.assert_close(
