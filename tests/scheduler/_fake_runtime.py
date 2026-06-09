@@ -96,6 +96,7 @@ class FakeRuntime:
         max_batch_slots: int = 2,
         max_seq_length: int = 1024,
         image_prefix_length: int = 0,
+        vocab_size: int = 1024,
         device: torch.device | str = "cpu",
         page_size: int = 1,
         n_prefill_slots: int | None = None,
@@ -113,6 +114,7 @@ class FakeRuntime:
         self.max_batch_slots = max_batch_slots
         self.max_seq_length = max_seq_length
         self.image_prefix_length = image_prefix_length
+        self.vocab_size = vocab_size
 
         # Device + streams
         self.device: torch.device = (
