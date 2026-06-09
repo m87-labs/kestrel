@@ -107,6 +107,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     # Engine + scheduler infrastructure
     prefix_cache: Any  # ``RadixPrefixCache | None`` on MoondreamRuntime
     graph_capture_lock: Any  # context manager serializing CUDA-graph capture
+    kv_pool: Any  # Engine-owned KV memory pool shared with co-hosted AR runtimes
 
     # Model-specific state callers reach into today.
     # Narrowing these is a follow-up.

@@ -251,6 +251,7 @@ def main() -> None:
 
     from kestrel.config import RuntimeConfig
     from kestrel.device import make_stream
+    from kestrel.kv_cache import KVMemoryPool
     from kestrel.models.moondream.runtime import MoondreamRuntime
     from kestrel.models.moondream import vision as vision_module
 
@@ -263,7 +264,11 @@ def main() -> None:
     )
 
     print(f"Loading model from {args.weights}...")
-    runtime = MoondreamRuntime(runtime_cfg, compute_stream=make_stream(device))
+    runtime = MoondreamRuntime(
+        runtime_cfg,
+        kv_pool=KVMemoryPool(device=device),
+        compute_stream=make_stream(device),
+    )
     vision_cfg = runtime.config.vision
     vision_model = runtime.model.vision
     print(

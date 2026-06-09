@@ -8,6 +8,7 @@ factories — no GPU, no real weights:
     pre-start via ``model()`` / ``_configured_models``;
   - ``_build_configured_runtimes`` builds every model from its spec,
     including a *tokenizer-free* single-pass spec (ModelSpec generalization);
+  - the shared KV pool is engine-owned and passed through runtime factory kwargs;
   - ``max_lora_rank`` is forwarded only to the default AR model.
 """
 
@@ -93,6 +94,7 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
         eng._model_ids = ["mm-ar", "mm-sp"]
         eng._runtimes = {}
         eng._compute_stream = None
+        eng._kv_pool = None
 
         eng._build_configured_runtimes(13)
 
@@ -103,9 +105,15 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
         assert eng._runtimes["mm-sp"].model_name == "mm-sp"
         # max_lora_rank → default AR only; compute_stream is supplied to
         # every runtime factory so both execution shapes share the engine
-        # stream. CPU tests use None for that stream.
-        assert built_kwargs["mm-ar"] == {"max_lora_rank": 13, "compute_stream": None}
-        assert built_kwargs["mm-sp"] == {"compute_stream": None}
+        # stream. The engine-owned kv_pool is also supplied via the common
+        # runtime factory kwargs contract.
+        assert built_kwargs["mm-ar"]["max_lora_rank"] == 13
+        assert built_kwargs["mm-ar"]["compute_stream"] is None
+        assert built_kwargs["mm-ar"]["kv_pool"] is eng._kv_pool
+        assert built_kwargs["mm-sp"] == {
+            "compute_stream": None,
+            "kv_pool": eng._kv_pool,
+        }
     finally:
         _REGISTRY.pop("mm-ar", None)
         _REGISTRY.pop("mm-sp", None)
@@ -128,6 +136,7 @@ def test_build_configured_runtimes_skips_already_built() -> None:
         injected = _SPStub("preexisting")
         eng._runtimes = {"preexisting": injected}
         eng._compute_stream = None
+        eng._kv_pool = None
 
         eng._build_configured_runtimes(None)
 
