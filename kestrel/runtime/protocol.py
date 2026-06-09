@@ -13,6 +13,8 @@ kernel:
   consumes; ``MoondreamRuntime`` implements it.
 - :class:`SinglePassRuntime` — runtimes that fulfill a request with one
   forward (no decode loop).
+- :class:`StreamingRuntime` — runtimes that keep model-owned session
+  state across caller-supplied chunks (for example video frames).
 
 Some attributes are typed as ``Any`` because they expose model-specific
 state the engine + scheduler currently reach into directly (config,
@@ -50,7 +52,7 @@ class ExecutionShape(Enum):
 
     AUTOREGRESSIVE = "autoregressive"
     SINGLE_PASS = "single_pass"
-    # STREAMING = "streaming"  # video / memory-bank models, later
+    STREAMING = "streaming"
 
 
 class Runtime(Protocol):
@@ -217,3 +219,41 @@ class SinglePassRuntime(Runtime, Protocol):
     ) -> Future[Any]: ...
 
     def forward(self, task: str, inputs: Any) -> Any: ...
+
+
+class StreamingRuntime(Runtime, Protocol):
+    """Runtime that advances model-owned state over caller-supplied chunks.
+
+    Streaming runtimes are for non-token models whose state spans a
+    sequence of inputs, such as a video tracker that receives an initial
+    prompt and then one frame at a time. The runtime owns the semantic
+    session state; the engine/executor owns ordering, backpressure,
+    completion events, stream updates, and result delivery.
+
+    Like :class:`SinglePassRuntime`, compute methods must enqueue work and
+    return without a host sync so the executor can interleave steps with
+    other lanes. Implementations must not call ``.item()`` / ``.cpu()`` /
+    ``torch.cuda.synchronize`` before returning from ``start`` or
+    ``step``.
+    """
+
+    # Stream the executor launches session steps on, so streaming steps
+    # share the device's serialize-on-stream invariant with the other
+    # engine lanes.
+    primary_stream: Any
+
+    # Capability names this runtime serves, e.g. ("point",).
+    def tasks(self) -> Sequence[str]: ...
+
+    # Create the model-owned session state from the initial prompt. This
+    # may enqueue initial GPU work, so it follows the same no-host-sync
+    # rule as ``step``.
+    def start(self, task: str, inputs: Any) -> Any: ...
+
+    # Advance an existing session with one caller-supplied chunk/frame and
+    # return model-defined output plus the next session state.
+    def step(self, session: Any, inputs: Any) -> Any: ...
+
+    # Release model-owned session resources. Called once when the engine
+    # closes, cancels, or fails the session.
+    def finish(self, session: Any) -> None: ...
