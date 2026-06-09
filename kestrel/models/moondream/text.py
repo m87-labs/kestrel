@@ -82,8 +82,8 @@ def attn(
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
     page_table: torch.Tensor | None = None,
-    fa3_seqused_q: torch.Tensor | None = None,
-    fa3_seqused_k: torch.Tensor | None = None,
+    paged_kv_seqlens_q: torch.Tensor | None = None,
+    paged_kv_seqlens_k: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     scratch_pool: dict | None = None,
 ) -> torch.Tensor:
@@ -125,8 +125,8 @@ def attn(
 
     if kv_cache is None:
         raise RuntimeError("paged attention requires a KV cache")
-    if page_table is None or fa3_seqused_k is None:
-        raise RuntimeError("paged attention requires page_table and seqused_k")
+    if page_table is None or paged_kv_seqlens_k is None:
+        raise RuntimeError("paged attention requires page_table and paged KV lengths")
 
     kv_cache.update(position_ids, k, v, slot_mapping=slot_mapping)
 
@@ -152,8 +152,8 @@ def attn(
             k_cache,
             v_cache,
             page_table=page_table,
-            seqused_q=fa3_seqused_q,
-            seqused_k=fa3_seqused_k,
+            seqused_q=paged_kv_seqlens_q,
+            seqused_k=paged_kv_seqlens_k,
             paged_kv_non_tma=True,
             causal=causal,
             pack_gqa=pack_gqa,
@@ -167,8 +167,8 @@ def attn(
             k_cache,
             v_cache,
             page_table=page_table,
-            seqused_q=fa3_seqused_q,
-            seqused_k=fa3_seqused_k,
+            seqused_q=paged_kv_seqlens_q,
+            seqused_k=paged_kv_seqlens_k,
             paged_kv_non_tma=True,
             causal=True,
             k_scale=k_scale,
@@ -196,8 +196,8 @@ def text_decoder(
     use_prefix_attn: bool = False,
     mode: Literal["prefill", "decode"] = "decode",
     page_table: torch.Tensor | None = None,
-    fa3_seqused_q: torch.Tensor | None = None,
-    fa3_seqused_k: torch.Tensor | None = None,
+    paged_kv_seqlens_q: torch.Tensor | None = None,
+    paged_kv_seqlens_k: torch.Tensor | None = None,
     lora_workspace: TextLoRAWorkspace | None = None,
     lora_slot_ids: torch.Tensor | None = None,
     moe_lora_metadata: Any | None = None,
@@ -227,8 +227,8 @@ def text_decoder(
             slot_mapping=slot_mapping,
             use_prefix_attn=use_prefix_attn,
             page_table=page_table,
-            fa3_seqused_q=fa3_seqused_q,
-            fa3_seqused_k=fa3_seqused_k,
+            paged_kv_seqlens_q=paged_kv_seqlens_q,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
             residual=x,
             scratch_pool=scratch_pool,
         )

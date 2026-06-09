@@ -46,7 +46,7 @@ Key output sections:
 | Component | Count | Notes |
 |-----------|-------|-------|
 | layernorm | 25 | 24 pre-attn + 1 final |
-| attention | 24 | QKV + rotary + FA3 + out_proj |
+| attention | 24 | QKV + rotary + paged attention + out_proj |
 | dense_mlp | 4 | Layers 0-3 |
 | moe_mlp | 20 | Layers 4-23 |
 | lm_head | 1 | Final projection |
@@ -112,7 +112,7 @@ def patch_text_decoder_with_nvtx():
     def instrumented_text_decoder(
         x, module, attn_mask, position_ids, config, *,
         slot_mapping, use_prefix_attn=False, mode="decode",
-        page_table=None, fa3_seqused_q=None, fa3_seqused_k=None,
+        page_table=None, paged_kv_seqlens_q=None, paged_kv_seqlens_k=None,
         lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
         dense_lora_scratch=None,
         scratch_pool=None,
@@ -146,8 +146,8 @@ def patch_text_decoder_with_nvtx():
                     slot_mapping=slot_mapping,
                     use_prefix_attn=use_prefix_attn,
                     page_table=page_table,
-                    fa3_seqused_q=fa3_seqused_q,
-                    fa3_seqused_k=fa3_seqused_k,
+                    paged_kv_seqlens_q=paged_kv_seqlens_q,
+                    paged_kv_seqlens_k=paged_kv_seqlens_k,
                     residual=x,
                 )
                 nvtx.range_pop()
