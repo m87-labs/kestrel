@@ -178,3 +178,45 @@ def test_model_stream_close_retries_after_cancelled_cleanup() -> None:
             await stream.send(frame="f1")
 
     asyncio.run(go())
+
+
+def test_model_stream_rejects_send_after_close_starts() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        sent: list[dict[str, Any]] = []
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            sent.append(chunk)
+
+        async def close_session(session_id: int) -> None:
+            close_started.set()
+            await release_close.wait()
+            result = _result(session_id)
+            future.set_result(result)
+            queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        stream = ModelStream(
+            session_id=12,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        close_task = asyncio.create_task(stream.close())
+        await close_started.wait()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await stream.send(frame="late")
+
+        release_close.set()
+        result = await close_task
+
+        assert sent == []
+        assert result.output == {"done": True}
+
+    asyncio.run(go())

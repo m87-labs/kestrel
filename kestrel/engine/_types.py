@@ -153,6 +153,7 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         "_final_result",
         "_error",
         "_closed",
+        "_closing",
     )
 
     def __init__(
@@ -174,10 +175,11 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         self._final_result: Optional[EngineResult] = None
         self._error: Optional[BaseException] = None
         self._closed = False
+        self._closing = False
 
     async def send(self, **chunk: Any) -> None:
         """Append one model-defined chunk/frame to the session."""
-        if self._closed:
+        if self._closed or self._closing:
             raise RuntimeError("model stream is closed")
         await self._send_chunk(self.session_id, dict(chunk))
 
@@ -203,9 +205,7 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
 
     async def close(self) -> EngineResult:
         """Close the session and return its final result."""
-        if not self._closed:
-            await self._close_session(self.session_id)
-            self._closed = True
+        await self._request_close()
         return await self.result()
 
     async def result(self) -> EngineResult:
@@ -223,9 +223,22 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         if exc_type is None:
             await self.close()
-        elif not self._closed:
+        else:
+            await self._request_close()
+
+    async def _request_close(self) -> None:
+        if self._closed:
+            return
+        if self._closing:
+            return
+        self._closing = True
+        try:
             await self._close_session(self.session_id)
             self._closed = True
+        except BaseException:
+            self._closing = False
+            raise
+        self._closing = False
 
 
 @dataclass(slots=True)
