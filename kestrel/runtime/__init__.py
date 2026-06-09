@@ -12,6 +12,7 @@ from kestrel.runtime.protocol import (
     ExecutionShape,
     Runtime,
     SinglePassRuntime,
+    StreamingRuntime,
 )
 from kestrel.runtime.state import (
     PrefillClassification,
@@ -37,6 +38,7 @@ __all__ = [
     "SequenceState",
     "SinglePassRuntime",
     "SizeToken",
+    "StreamingRuntime",
     "TextToken",
     "Token",
 ]
