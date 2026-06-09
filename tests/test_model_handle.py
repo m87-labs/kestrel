@@ -30,6 +30,16 @@ class _StubSinglePass:
         return self._tasks
 
 
+class _StubStreaming:
+    def __init__(self, model_name: str, tasks: tuple[str, ...]) -> None:
+        self.model_name = model_name
+        self.execution_shape = ExecutionShape.STREAMING
+        self._tasks = tasks
+
+    def tasks(self) -> tuple[str, ...]:
+        return self._tasks
+
+
 def _engine() -> InferenceEngine:
     """Minimal engine with an AR default + a single-pass model registered."""
     ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
@@ -46,6 +56,7 @@ def _engine() -> InferenceEngine:
         "sp-model": _StubSinglePass("sp-model", ("segment_masks",)),
     }
     eng._skills_override = None  # AR runtime owns its skills
+    eng._shutdown = False
     # Runtimes are injected (already built), so the engine is effectively
     # started: _ensure_started() (now awaited by the handle verbs) is a no-op.
     eng._scheduler_error = None
@@ -216,6 +227,15 @@ def test_capability_verbs_are_uniform_kwargs() -> None:
         )
 
 
+def test_stream_selector_is_positional_only() -> None:
+    import inspect
+
+    params = list(inspect.signature(ModelHandle.stream).parameters.values())
+    assert [p.name for p in params] == ["self", "task", "initial_prompt"]
+    assert params[1].kind is inspect.Parameter.POSITIONAL_ONLY
+    assert params[2].kind is inspect.Parameter.VAR_KEYWORD
+
+
 def test_capability_dispatches_to_run_for_single_pass() -> None:
     """A single-pass model interprets the whole prompt in its forward pass:
     the handle forwards it verbatim (media payload included) to run()."""
@@ -321,3 +341,139 @@ def test_run_gates_on_task_then_forwards() -> None:
     # An unknown task is rejected before forwarding.
     with pytest.raises(ValueError, match="does not support 'bogus'"):
         asyncio.run(h.run("bogus", {}))
+
+
+def test_stream_forwards_to_engine_for_streaming_model() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: dict[str, Any] = {}
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    out = asyncio.run(
+        eng.model("tracker").stream("point", points=[[0.5, 0.5]], labels=[1])
+    )
+
+    assert out == "STREAM"
+    assert captured == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"points": [[0.5, 0.5]], "labels": [1]},
+    }
+
+
+def test_capability_dispatches_to_stream_for_streaming_model() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: dict[str, Any] = {}
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    h = eng.model("tracker")
+    out = asyncio.run(h.point(points=[[0.5, 0.5]], labels=[1]))
+
+    assert h.supports("point") is True
+    assert out == "STREAM"
+    assert captured == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"points": [[0.5, 0.5]], "labels": [1]},
+    }
+
+
+def test_streaming_prompt_can_include_task_field() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: list[dict[str, Any]] = []
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.append({"model": model, "task": task, "inputs": inputs})
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    h = eng.model("tracker")
+
+    out = asyncio.run(h.stream("point", task="seed", points=[[0.5, 0.5]]))
+    assert out == "STREAM"
+    assert captured[-1] == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"task": "seed", "points": [[0.5, 0.5]]},
+    }
+
+    out = asyncio.run(h.point(task="seed", points=[[0.25, 0.75]]))
+    assert out == "STREAM"
+    assert captured[-1] == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {"task": "seed", "points": [[0.25, 0.75]]},
+    }
+
+
+def test_streaming_capability_preserves_ar_reserved_prompt_keys() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+    captured: dict[str, Any] = {}
+
+    async def fake_stream(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "STREAM"
+
+    eng.stream = fake_stream  # type: ignore[method-assign]
+    out = asyncio.run(
+        eng.model("tracker").point(
+            image="frame0",
+            settings={"temperature": 0.0},
+            stream=True,
+            model="payload-model",
+        )
+    )
+
+    assert out == "STREAM"
+    assert captured == {
+        "model": "tracker",
+        "task": "point",
+        "inputs": {
+            "image": "frame0",
+            "settings": {"temperature": 0.0},
+            "stream": True,
+            "model": "payload-model",
+        },
+    }
+
+
+def test_unsupported_streaming_capability_rejects_before_ar_path() -> None:
+    eng = _engine()
+    eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+
+    with pytest.raises(ValueError, match="does not support 'detect'"):
+        asyncio.run(eng.model("tracker").detect(points=[[0.5, 0.5]]))
+
+
+def test_stream_rejects_non_streaming_model() -> None:
+    eng = _engine()
+    with pytest.raises(ValueError, match="stream\\(\\) is for streaming models"):
+        asyncio.run(eng.model("sp-model").stream("segment_masks", points=[[1, 2]]))
+
+
+def test_engine_stream_validates_shape_and_task() -> None:
+    async def go() -> None:
+        eng = _engine()
+        eng._runtimes["tracker"] = _StubStreaming("tracker", ("point",))
+
+        with pytest.raises(ValueError, match="not a streaming model"):
+            await eng.stream("sp-model", "segment_masks", {})
+
+        with pytest.raises(ValueError, match="does not support 'detect'"):
+            await eng.stream("tracker", "detect", {})
+
+        with pytest.raises(NotImplementedError, match="streaming executor"):
+            await eng.stream("tracker", "point", {"points": [[0.5, 0.5]]})
+
+    asyncio.run(go())

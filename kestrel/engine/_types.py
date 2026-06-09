@@ -12,7 +12,18 @@ import asyncio
 import hashlib
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Sequence, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Union,
+)
 
 import numpy as np
 
@@ -103,6 +114,138 @@ class EngineStream(AsyncIterator[StreamUpdate]):
 
 
 @dataclass(slots=True)
+class ModelStreamUpdate:
+    """One model-defined update from a stateful streaming session."""
+
+    session_id: int
+    task: str
+    output: Dict[str, object]
+
+
+@dataclass(slots=True)
+class _ModelStreamCompletion:
+    result: Optional[EngineResult] = None
+    error: Optional[BaseException] = None
+
+
+_ModelStreamQueueItem = Union[ModelStreamUpdate, _ModelStreamCompletion]
+_ModelStreamQueue = asyncio.Queue[_ModelStreamQueueItem]
+_SendModelStreamChunk = Callable[[int, Dict[str, Any]], Awaitable[None]]
+_CloseModelStream = Callable[[int], Awaitable[None]]
+
+
+class ModelStream(AsyncIterator[ModelStreamUpdate]):
+    """Asynchronous session for stateful model streaming.
+
+    Unlike :class:`EngineStream`, which streams token deltas for one
+    autoregressive request, ``ModelStream`` is caller-driven: the caller
+    sends chunks/frames into a model-owned session and iterates over
+    model-defined updates.
+    """
+
+    __slots__ = (
+        "session_id",
+        "task",
+        "_queue",
+        "_result_future",
+        "_send_chunk",
+        "_close_session",
+        "_final_result",
+        "_error",
+        "_closed",
+        "_closing",
+        "_close_lock",
+    )
+
+    def __init__(
+        self,
+        *,
+        session_id: int,
+        task: str,
+        queue: _ModelStreamQueue,
+        result_future: asyncio.Future[EngineResult],
+        send_chunk: _SendModelStreamChunk,
+        close_session: _CloseModelStream,
+    ) -> None:
+        self.session_id = session_id
+        self.task = task
+        self._queue = queue
+        self._result_future = result_future
+        self._send_chunk = send_chunk
+        self._close_session = close_session
+        self._final_result: Optional[EngineResult] = None
+        self._error: Optional[BaseException] = None
+        self._closed = False
+        self._closing = False
+        self._close_lock = asyncio.Lock()
+
+    async def send(self, **chunk: Any) -> None:
+        """Append one model-defined chunk/frame to the session."""
+        if self._closed or self._closing:
+            raise RuntimeError("model stream is closed")
+        await self._send_chunk(self.session_id, dict(chunk))
+
+    def updates(self) -> "ModelStream":
+        """Return the async update iterator."""
+        return self
+
+    def __aiter__(self) -> "ModelStream":
+        return self
+
+    async def __anext__(self) -> ModelStreamUpdate:
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, _ModelStreamCompletion):
+                self._closed = True
+                if item.error is not None:
+                    self._error = item.error
+                    raise item.error
+                if item.result is not None:
+                    self._final_result = item.result
+                raise StopAsyncIteration
+            return item
+
+    async def close(self) -> EngineResult:
+        """Close the session and return its final result."""
+        await self._request_close()
+        return await self.result()
+
+    async def result(self) -> EngineResult:
+        if self._final_result is not None:
+            return self._final_result
+        if self._error is not None:
+            raise self._error
+        result = await self._result_future
+        self._final_result = result
+        return result
+
+    async def __aenter__(self) -> "ModelStream":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            await self.close()
+        else:
+            await self._request_close()
+
+    async def _request_close(self) -> None:
+        if self._closed:
+            return
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                await self._close_session(self.session_id)
+            except BaseException:
+                raise
+            else:
+                self._closed = True
+            finally:
+                self._closing = False
+
+
+@dataclass(slots=True)
 class _AutoregressiveRequest:
     request_id: int
     prompt: str
@@ -185,5 +328,3 @@ class TickResult:
     progressed: bool = False
     completed: tuple[Completion, ...] = ()
     has_work: bool = False  # queued or in flight (gates shutdown exit)
-
-

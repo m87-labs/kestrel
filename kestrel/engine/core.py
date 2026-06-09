@@ -85,6 +85,7 @@ from kestrel.engine._types import (
     EngineRequest,
     EngineResult,
     EngineStream,
+    ModelStream,
     _AutoregressiveRequest,
     _StreamCompletion,
     _StreamQueue,
@@ -829,6 +830,44 @@ class InferenceEngine:
             self._fail_all_pending(self._scheduler_failed_error())
         return await future
 
+    async def stream(
+        self,
+        model: str,
+        task: str,
+        initial_inputs: Mapping[str, object],
+    ) -> ModelStream:
+        """Start a stateful streaming ``task`` on ``model``.
+
+        This is distinct from autoregressive response streaming: the
+        caller supplies chunks/frames after the initial prompt, and a
+        streaming runtime carries model-owned state across those chunks.
+        Kernel/executor wiring lands in the streaming executor branch; the
+        validation here pins the public shape without changing existing
+        AR or single-pass behavior.
+        """
+        if self._shutdown:
+            raise RuntimeError("InferenceEngine is shut down")
+        await self._ensure_started()
+
+        runtime = self._runtimes.get(model)
+        if runtime is None:
+            raise ValueError(f"Unknown model {model!r}")
+        if runtime.execution_shape is not ExecutionShape.STREAMING:
+            raise ValueError(
+                f"Model {model!r} is not a streaming model "
+                f"(execution_shape={runtime.execution_shape.value})"
+            )
+        if task not in tuple(runtime.tasks()):
+            supported = ", ".join(tuple(runtime.tasks())) or "none"
+            raise ValueError(
+                f"Model {model!r} does not support {task!r} "
+                f"(supports: {supported})"
+            )
+
+        raise NotImplementedError(
+            "stateful streaming sessions require the streaming executor"
+        )
+
     def model(self, model_id: Optional[str] = None) -> "ModelHandle":
         """Return a :class:`ModelHandle` bound to ``model_id``.
 
@@ -864,7 +903,7 @@ class InferenceEngine:
         runtime's skills, or the spec's). This keeps reported capabilities
         consistent with execution, works before startup, and does not
         require ``tasks()`` on the autoregressive runtime protocol. Every
-        other (single-pass) model advertises its own ``runtime.tasks()``
+        other non-autoregressive model advertises its own ``runtime.tasks()``
         once built.
         """
         if model_id == self._default_model:

@@ -25,7 +25,7 @@ from kestrel.runtime import ExecutionShape
 
 if TYPE_CHECKING:
     from kestrel.engine.core import InferenceEngine
-    from kestrel.engine._types import EngineResult, EngineStream
+    from kestrel.engine._types import EngineResult, EngineStream, ModelStream
 
 
 class ModelHandle:
@@ -102,6 +102,27 @@ class ModelHandle:
             )
         return await self._engine.run(self._model, task, inputs)
 
+    async def stream(self, task: str, /, **initial_prompt: Any) -> "ModelStream":
+        """Start a stateful streaming session on this model.
+
+        This is the generic escape hatch for execution shapes where the
+        caller drives model state forward with chunks/frames. It is
+        separate from autoregressive token streaming, which remains a
+        per-request delivery mode selected by capability prompts such as
+        ``stream=True``.
+        """
+        await self._engine._ensure_started()
+        self._require(task)
+        runtime = self._engine._runtimes.get(self._model)
+        if runtime is None:
+            raise ValueError(f"Unknown model {self._model!r}")
+        if runtime.execution_shape is not ExecutionShape.STREAMING:
+            raise ValueError(
+                f"stream() is for streaming models; {self._model!r} is "
+                f"{runtime.execution_shape.value}"
+            )
+        return await self._engine.stream(self._model, task, initial_prompt)
+
     # -- capability vocabulary ----------------------------------------
     #
     # One task is one method; its inputs are model-defined. Every verb is
@@ -118,7 +139,7 @@ class ModelHandle:
         self,
         task: str,
         prompt: dict[str, Any],
-    ) -> "EngineResult | EngineStream":
+    ) -> "EngineResult | EngineStream | ModelStream":
         """Route one capability call by the bound model's execution shape.
 
         A single-pass model interprets the whole prompt in its forward pass
@@ -139,6 +160,8 @@ class ModelHandle:
             runtime.execution_shape is ExecutionShape.SINGLE_PASS
         ):
             return await self.run(task, prompt)
+        if runtime is not None and runtime.execution_shape is ExecutionShape.STREAMING:
+            return await self.stream(task, **prompt)
         self._require_default_ar(task)
         settings = prompt.pop("settings", None)
         stream = bool(prompt.get("stream", False))
@@ -147,19 +170,29 @@ class ModelHandle:
             task, image=image, prompt=prompt, settings=settings, stream=stream
         )
 
-    async def query(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def query(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("query", prompt)
 
-    async def caption(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def caption(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("caption", prompt)
 
-    async def detect(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def detect(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("detect", prompt)
 
-    async def point(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def point(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("point", prompt)
 
-    async def segment(self, **prompt: Any) -> "EngineResult | EngineStream":
+    async def segment(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("segment", prompt)
 
     def __repr__(self) -> str:
