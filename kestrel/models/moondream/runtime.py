@@ -31,9 +31,10 @@ from kestrel.prefix_cache import (
     RadixPrefixCache,
     TreeNode,
 )
+from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime import (
-    ExecutionShape,
     CoordToken,
+    ExecutionShape,
     PrefillClassification,
     PreparedSequence,
     RuntimeDecodeResult,
@@ -450,9 +451,6 @@ class MoondreamRuntime:
         self._spatial_rng = torch.Generator(device=self.device)
         self._spatial_rng.manual_seed(torch.seed())
 
-        # CUDA graph batch sizes for decode (same for all slots).
-        self._graph_batch_sizes: list[int] = []
-
         # Vision encoder CUDA graphs
         self._vision_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._vision_input: torch.Tensor | None = None   # [max_crops, 3, 378, 378]
@@ -551,6 +549,17 @@ class MoondreamRuntime:
             )
             for slot_id in range(2)
         ]
+        self._decode_graphs = DecodeGraphManager[DecodeSlot](
+            enabled=self._use_cuda_graphs,
+            device=self.device,
+            max_batch=self.max_batch_size,
+            graph_capture_lock=self.graph_capture_lock,
+            compute_stream=self._compute_stream,
+            run_forward=self._run_decode_forward,
+            prepare_step=self._prepare_decode_graph_step,
+            zero_padding=self._zero_decode_graph_padding,
+            zero_for_capture=self._zero_decode_graph_capture_buffers,
+        )
 
         # Shared pending coord/size values, indexed by batch_idx. These
         # are the runtime-side equivalent of the scheduler's
@@ -1799,64 +1808,57 @@ class MoondreamRuntime:
     def _decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         """Unified decode using slot buffers. Writes results to slot.logits/hidden_last.
 
-        This method provides identical preparation for both graph and non-graph paths:
-        1. Clear padding region (for graph batch size alignment)
-        2. Build paged-KV metadata buffers
-        3. Execute: either graph.replay() or eager forward
-
-        The only difference between paths is step 3. This ensures debugging with
-        graphs disabled produces identical behavior to the graph path.
-
         Args:
             slot: DecodeSlot with inputs already staged in its buffers.
             batch_size: Actual number of sequences (before padding).
         """
-        use_graph = self._use_cuda_graphs and slot.cuda_graphs is not None
+        self._decode_graphs.run(slot, batch_size)
 
-        # Determine padded batch size for graph alignment
-        if use_graph:
-            graph_batch_size = self._select_graph_batch_size(batch_size)
-            if graph_batch_size is None:
-                raise RuntimeError(
-                    f"Batch size {batch_size} exceeds max graph capacity "
-                    f"{self._graph_batch_sizes[-1] if self._graph_batch_sizes else 0}"
-                )
-            if graph_batch_size not in slot.cuda_graphs:
-                raise RuntimeError(
-                    f"No CUDA graph captured for batch size {graph_batch_size}"
-                )
-        else:
-            graph_batch_size = batch_size
+    def _zero_decode_graph_padding(
+        self,
+        slot: DecodeSlot,
+        batch_size: int,
+        graph_batch_size: int,
+    ) -> None:
+        slot.decode_token_ids[batch_size:graph_batch_size].zero_()
+        slot.decode_coord_values[batch_size:graph_batch_size].zero_()
+        slot.decode_size_values[batch_size:graph_batch_size].zero_()
+        slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
-        # Clear padding region for deterministic graph behavior.
-        if graph_batch_size > batch_size:
-            slot.decode_token_ids[batch_size:graph_batch_size].zero_()
-            slot.decode_coord_values[batch_size:graph_batch_size].zero_()
-            slot.decode_size_values[batch_size:graph_batch_size].zero_()
-            slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
-            slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
-            slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
-            slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
-
+    def _prepare_decode_graph_step(self, slot: DecodeSlot, batch_size: int) -> None:
         if self._lora_workspace is not None:
-            self._prepare_decode_lora_metadata(slot, graph_batch_size)
+            self._prepare_decode_lora_metadata(slot, batch_size)
 
-        # Build per-step paged-KV metadata buffers (identical for both paths)
-        # - page_table rows: [B, num_pages]
-        # - paged_kv_seqlens_k: [B] (KV length including the current token after update)
-        batch_idx = slot.meta.batch_idx.gpu[:graph_batch_size]
+        # Build per-step paged-KV metadata buffers.
+        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
         self.page_table.populate_paged_kv_metadata(
             batch_idx=batch_idx,
-            input_pos=slot.meta.input_pos.gpu[:graph_batch_size],
-            out_page_table=slot.paged_kv_page_table[:graph_batch_size],
-            out_seqused_k=slot.paged_kv_seqlens_k[:graph_batch_size],
+            input_pos=slot.meta.input_pos.gpu[:batch_size],
+            out_page_table=slot.paged_kv_page_table[:batch_size],
+            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
         )
 
-        # Execute (only difference between paths)
-        if use_graph:
-            slot.cuda_graphs[graph_batch_size].replay()
-        else:
-            self._run_decode_forward(slot, graph_batch_size)
+    def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
+        # Use batch index 0 for all entries: page-table row 0 is initialized and
+        # provides valid memory access patterns during capture warmup/replay.
+        slot.decode_token_ids.zero_()
+        slot.decode_coord_values.zero_()
+        slot.decode_size_values.zero_()
+        slot.meta.batch_idx.gpu.zero_()
+        slot.meta.input_pos.gpu.zero_()
+        slot.meta.input_pos.cpu.zero_()
+        slot.meta.lora_slot_ids.gpu.zero_()
+        slot.meta.active_token_ids.gpu.zero_()
+        slot.meta.active_token_ids.cpu.zero_()
+        slot.meta.active_lora_ids.gpu.zero_()
+        slot.meta.active_lora_ids.cpu.zero_()
+        slot.meta.active_lora_meta.gpu.zero_()
+        slot.meta.active_lora_meta.cpu.zero_()
+        slot.paged_kv_page_table.zero_()
+        slot.paged_kv_seqlens_k.zero_()
 
     def _prepare_decode_lora_metadata(
         self,
@@ -2041,11 +2043,7 @@ class MoondreamRuntime:
             # Clear vision graphs
             self._vision_graphs = {}
 
-            # Clear per-slot decode graph state
-            for slot in self._decode_slots:
-                slot.cuda_graphs = None
-
-            self._graph_batch_sizes = []
+            self._decode_graphs.clear()
 
             self._ensure_cuda_graphs_ready()
             self._capture_vision_graphs()
@@ -2054,17 +2052,7 @@ class MoondreamRuntime:
         """Capture CUDA graphs for all slots using slot buffers directly."""
         if not self._use_cuda_graphs:
             return
-        # Check if graphs already captured (first slot has graphs)
-        if self._decode_slots and self._decode_slots[0].cuda_graphs is not None:
-            return
-
-        # Initialize graph batch sizes once
-        max_effective_batch = max(1, self.max_batch_size)
-        self._graph_batch_sizes = self._make_graph_batch_sizes(max_effective_batch)
-
-        # Capture graphs for each slot using its own buffers
-        for slot in self._decode_slots:
-            slot.cuda_graphs = self._capture_decode_graphs_for_slot(slot)
+        self._decode_graphs.ensure_ready(self._decode_slots)
 
     def _preallocate_workspaces(self) -> None:
         """Pre-allocate all shared workspaces to ensure stable pointers for CUDA graphs.
@@ -2090,102 +2078,6 @@ class MoondreamRuntime:
         # Base MoE workspaces are owned by kestrel-kernels MoeHandle
         # preparation. MoE LoRA scratch is reserved when the LoRA workspace is
         # created so CUDA graph capture sees stable intermediate buffers.
-
-    def _make_graph_batch_sizes(self, max_batch: int) -> list[int]:
-        seeds = [size for size in (1, 2, 4, 8) if size <= max_batch]
-        ramps = list(range(16, max_batch + 1, 16))
-        sizes = sorted({*seeds, *ramps, max_batch})
-        return sizes
-
-    def _capture_decode_graphs_for_slot(
-        self,
-        slot: DecodeSlot,
-    ) -> dict[int, torch.cuda.CUDAGraph]:
-        """Capture CUDA graphs for a decode slot using its own buffers.
-
-        Graphs are captured using the slot's staging buffers (decode_token_ids,
-        meta.batch_idx.gpu, etc.) and output buffers (logits, hidden_last).
-        This ensures graph replay reads from and writes to the same addresses
-        that the non-graph path uses, making behavior identical.
-        """
-        cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
-
-        with self.graph_capture_lock:
-            max_batch = slot.decode_token_ids.shape[0]
-            if max_batch == 0:
-                return cuda_graphs
-
-            device = self.device
-
-            # Graph capture must happen on the same stream we use for decode replay.
-            # Otherwise, replayed kernels may read stale paged-KV metadata written
-            # on a different stream, producing incorrect results.
-            with torch.cuda.stream(slot.compute_stream):
-                # Zero all slot buffers for capture.
-                # Use batch index 0 for all entries - row 0 in the page table is
-                # pre-initialized and provides valid memory access patterns.
-                slot.decode_token_ids.zero_()
-                slot.decode_coord_values.zero_()
-                slot.decode_size_values.zero_()
-                slot.meta.batch_idx.gpu.zero_()
-                slot.meta.input_pos.gpu.zero_()
-                slot.meta.input_pos.cpu.zero_()
-                slot.meta.lora_slot_ids.gpu.zero_()
-                slot.meta.active_token_ids.gpu.zero_()
-                slot.meta.active_token_ids.cpu.zero_()
-                slot.meta.active_lora_ids.gpu.zero_()
-                slot.meta.active_lora_ids.cpu.zero_()
-                slot.meta.active_lora_meta.gpu.zero_()
-                slot.meta.active_lora_meta.cpu.zero_()
-                slot.paged_kv_page_table.zero_()
-                slot.paged_kv_seqlens_k.zero_()
-
-                try:
-                    torch.cuda.synchronize(device=device)
-                    for bs in reversed(self._graph_batch_sizes):
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.inference_mode():
-                            if self._lora_workspace is not None:
-                                self._prepare_decode_lora_metadata(slot, bs)
-
-                            # Build per-step paged-KV metadata buffers
-                            batch_idx = slot.meta.batch_idx.gpu[:bs]
-                            self.page_table.populate_paged_kv_metadata(
-                                batch_idx=batch_idx,
-                                input_pos=slot.meta.input_pos.gpu[:bs],
-                                out_page_table=slot.paged_kv_page_table[:bs],
-                                out_seqused_k=slot.paged_kv_seqlens_k[:bs],
-                            )
-
-                            # Warmup run (not captured)
-                            self._run_decode_forward(slot, bs)
-                            torch.cuda.synchronize(device=device)
-
-                            # Capture the graph (each graph gets its own pool for isolation)
-                            with torch.cuda.graph(graph):
-                                self._run_decode_forward(slot, bs)
-
-                        cuda_graphs[bs] = graph
-                        torch.cuda.synchronize(device=device)
-                finally:
-                    # Clear slot buffers after capture
-                    slot.decode_token_ids.zero_()
-                    slot.meta.batch_idx.gpu.zero_()
-                    slot.meta.input_pos.gpu.zero_()
-                    slot.meta.lora_slot_ids.gpu.zero_()
-                    slot.meta.active_token_ids.gpu.zero_()
-                    slot.meta.active_lora_ids.gpu.zero_()
-                    slot.meta.active_lora_meta.gpu.zero_()
-                    slot.paged_kv_page_table.zero_()
-                    slot.paged_kv_seqlens_k.zero_()
-
-        return cuda_graphs
-
-    def _select_graph_batch_size(self, batch_size: int) -> int | None:
-        for size in self._graph_batch_sizes:
-            if size >= batch_size:
-                return size
-        return None
 
     def _allocate_vision_buffers(self) -> None:
         """Allocate stable buffers for vision encoder."""

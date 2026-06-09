@@ -6,7 +6,7 @@ Each DecodeSlot bundles the GPU resources needed for one decode step:
 - GPU staging buffers for sampled outputs
 - Forward output buffers (logits, hidden_last) for delayed sampling
 - RenderBuffer for D2H copies
-- CUDA graph workspace and captured graphs
+- CUDA graph input/output workspace
 
 With two slots, we can pipeline decode steps: while slot A's forward runs on the GPU,
 slot B's D2H transfer completes and its outputs are committed on CPU. The slots
@@ -20,7 +20,7 @@ Ownership model:
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -97,10 +97,8 @@ class DecodeSlot:
         decode_coord_values: GPU buffer for decode coord inputs.
         decode_size_values: GPU buffer for decode size inputs.
 
-        # CUDA graphs (per-slot, optional)
-        cuda_graphs: Captured CUDA graphs keyed by batch size, or None if disabled.
-            Graphs are captured using this slot's buffers (decode_*, meta.*, logits,
-            hidden_last), so replay reads/writes directly to slot buffers.
+        # CUDA graph input/output workspace
+        These fixed-address buffers are used by DecodeGraphManager capture/replay.
     """
 
     slot_id: int
@@ -131,9 +129,6 @@ class DecodeSlot:
     decode_token_ids: Tensor
     decode_coord_values: Tensor  # [max_batch_slots, 1]
     decode_size_values: Tensor   # [max_batch_slots, 2]
-
-    # CUDA graphs (optional) - captured using this slot's buffers
-    cuda_graphs: Optional[dict[int, torch.cuda.CUDAGraph]] = None
 
     # Pre-allocated events for decode-step synchronization (avoids per-step allocation).
     #
@@ -358,7 +353,6 @@ def create_decode_slot(
         decode_token_ids=decode_token_ids,
         decode_coord_values=decode_coord_values,
         decode_size_values=decode_size_values,
-        cuda_graphs=None,  # Captured separately after slot creation
         step_done_event=step_done_event,
         commit_done_event=commit_done_event,
         disallow_mask=disallow_mask,
