@@ -132,3 +132,49 @@ def test_model_stream_completion_closes_public_session() -> None:
         assert closed == []
 
     asyncio.run(go())
+
+
+def test_model_stream_close_retries_after_cancelled_cleanup() -> None:
+    async def go() -> None:
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = asyncio.get_running_loop().create_future()
+        close_calls = 0
+        first_close_started = asyncio.Event()
+
+        async def send_chunk(session_id: int, chunk: dict[str, Any]) -> None:
+            raise AssertionError("not used")
+
+        async def close_session(session_id: int) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                first_close_started.set()
+                await asyncio.Future()
+            else:
+                result = _result(session_id)
+                future.set_result(result)
+                queue.put_nowait(_ModelStreamCompletion(result=result))
+
+        stream = ModelStream(
+            session_id=11,
+            task="point",
+            queue=queue,
+            result_future=future,
+            send_chunk=send_chunk,
+            close_session=close_session,
+        )
+
+        first_close = asyncio.create_task(stream.close())
+        await first_close_started.wait()
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+
+        result = await stream.close()
+
+        assert close_calls == 2
+        assert result.output == {"done": True}
+        with pytest.raises(RuntimeError, match="closed"):
+            await stream.send(frame="f1")
+
+    asyncio.run(go())

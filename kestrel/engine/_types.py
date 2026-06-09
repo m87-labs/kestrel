@@ -204,8 +204,8 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
     async def close(self) -> EngineResult:
         """Close the session and return its final result."""
         if not self._closed:
-            self._closed = True
             await self._close_session(self.session_id)
+            self._closed = True
         return await self.result()
 
     async def result(self) -> EngineResult:
@@ -224,8 +224,8 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
         if exc_type is None:
             await self.close()
         elif not self._closed:
-            self._closed = True
             await self._close_session(self.session_id)
+            self._closed = True
 
 
 @dataclass(slots=True)
