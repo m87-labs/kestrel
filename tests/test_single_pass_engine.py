@@ -53,6 +53,10 @@ def _engine_with(ar: FakeRuntime, sp: _StubSinglePass) -> InferenceEngine:
     engine._runtimes = {ar.model_name: ar, sp.model_name: sp}
     engine._scheduler_queue = _queue.Queue()
     engine._single_pass_queue = _queue.Queue()
+    engine._streaming_start_queue = _queue.Queue()
+    engine._streaming_chunk_queue = _queue.Queue()
+    engine._model_stream_models = {}
+    engine._model_stream_queues = {}
     engine._scheduler_event = threading.Event()
     engine._run_gate = threading.Event()
     engine._run_gate.set()

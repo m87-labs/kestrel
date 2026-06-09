@@ -86,13 +86,19 @@ from kestrel.engine._types import (
     EngineResult,
     EngineStream,
     ModelStream,
+    ModelStreamUpdate,
     _AutoregressiveRequest,
+    _ModelStreamCompletion,
+    _ModelStreamQueue,
     _StreamCompletion,
     _StreamQueue,
     _StreamQueueItem,
+    _StreamingChunk,
+    _StreamingSessionRequest,
 )
 from kestrel.engine.executor import AutoregressiveExecutor
 from kestrel.engine.single_pass import SinglePassExecutor, _SinglePassRequest
+from kestrel.engine.streaming import StreamingExecutor
 from kestrel.engine.handle import ModelHandle
 
 
@@ -205,6 +211,16 @@ class InferenceEngine:
         self._single_pass_queue: "queue.Queue[tuple[str, _SinglePassRequest]]" = (
             queue.Queue()
         )
+        # Stateful streaming ingress: starts and chunks are tagged by model
+        # id so the kernel routes them to that model's streaming lane.
+        self._streaming_start_queue: (
+            "queue.Queue[tuple[str, _StreamingSessionRequest]]"
+        ) = queue.Queue()
+        self._streaming_chunk_queue: "queue.Queue[tuple[str, _StreamingChunk]]" = (
+            queue.Queue()
+        )
+        self._model_stream_models: Dict[int, str] = {}
+        self._model_stream_queues: Dict[int, _ModelStreamQueue] = {}
         self._scheduler_event = threading.Event()
         self._run_gate = threading.Event()
         self._run_gate.set()  # set == running
@@ -841,9 +857,8 @@ class InferenceEngine:
         This is distinct from autoregressive response streaming: the
         caller supplies chunks/frames after the initial prompt, and a
         streaming runtime carries model-owned state across those chunks.
-        Kernel/executor wiring lands in the streaming executor branch; the
-        validation here pins the public shape without changing existing
-        AR or single-pass behavior.
+        The returned ``ModelStream`` is caller-driven: callers ``send``
+        chunks/frames and iterate over model-defined updates.
         """
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -864,9 +879,54 @@ class InferenceEngine:
                 f"(supports: {supported})"
             )
 
-        raise NotImplementedError(
-            "stateful streaming sessions require the streaming executor"
+        loop = asyncio.get_running_loop()
+        session_id = next(self._request_ids)
+        queue: _ModelStreamQueue = asyncio.Queue()
+        future: asyncio.Future[EngineResult] = loop.create_future()
+        req = _StreamingSessionRequest(
+            request_id=session_id,
+            future=future,
+            task=task,
+            initial_inputs=dict(initial_inputs),
+            submitted_at=time.perf_counter(),
+            model_stream_queue=queue,
         )
+        self._model_stream_models[session_id] = model
+        self._model_stream_queues[session_id] = queue
+        self._streaming_start_queue.put((model, req))
+        self._scheduler_event.set()
+        return ModelStream(
+            session_id=session_id,
+            task=task,
+            queue=queue,
+            result_future=future,
+            send_chunk=self._send_model_stream_chunk,
+            close_session=self._close_model_stream,
+        )
+
+    async def _send_model_stream_chunk(
+        self,
+        session_id: int,
+        chunk: Dict[str, Any],
+    ) -> None:
+        if self._shutdown:
+            raise RuntimeError("InferenceEngine is shut down")
+        model = self._model_stream_models.get(session_id)
+        if model is None:
+            raise RuntimeError(f"Unknown or closed model stream {session_id}")
+        self._streaming_chunk_queue.put(
+            (model, _StreamingChunk(session_id=session_id, inputs=chunk))
+        )
+        self._scheduler_event.set()
+
+    async def _close_model_stream(self, session_id: int) -> None:
+        model = self._model_stream_models.get(session_id)
+        if model is None:
+            return
+        self._streaming_chunk_queue.put(
+            (model, _StreamingChunk(session_id=session_id, close=True))
+        )
+        self._scheduler_event.set()
 
     def model(self, model_id: Optional[str] = None) -> "ModelHandle":
         """Return a :class:`ModelHandle` bound to ``model_id``.
@@ -1320,12 +1380,38 @@ class InferenceEngine:
         completion = _StreamCompletion(result=result, error=error)
         self._loop.call_soon_threadsafe(queue.put_nowait, completion)
 
+    def _complete_model_stream(
+        self,
+        req: EngineRequest,
+        *,
+        result: Optional[EngineResult] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        queue = getattr(req, "model_stream_queue", None)
+        if queue is None:
+            return
+        req.model_stream_queue = None
+        self._model_stream_models.pop(req.request_id, None)
+        self._model_stream_queues.pop(req.request_id, None)
+        completion = _ModelStreamCompletion(result=result, error=error)
+        self._loop.call_soon_threadsafe(queue.put_nowait, completion)
+
+    def _deliver_model_stream_update(
+        self,
+        update: ModelStreamUpdate,
+    ) -> None:
+        queue = self._model_stream_queues.get(update.session_id)
+        if queue is None:
+            return
+        self._loop.call_soon_threadsafe(queue.put_nowait, update)
+
     def _fail_request(self, req: EngineRequest, error: BaseException) -> None:
         future = req.future
         if future and not future.done():
             assert self._loop is not None
             self._loop.call_soon_threadsafe(future.set_exception, error)
         self._complete_stream(req, error=error)
+        self._complete_model_stream(req, error=error)
         if self._photon_reporter is not None:
             try:
                 self._photon_reporter.record_error(finetune=req.adapter)
@@ -1359,6 +1445,11 @@ class InferenceEngine:
                 name: SinglePassExecutor(rt, compute_stream=self._compute_stream)
                 for name, rt in self._runtimes.items()
                 if rt.execution_shape is ExecutionShape.SINGLE_PASS
+            }
+            streaming: Dict[str, StreamingExecutor] = {
+                name: StreamingExecutor(rt, compute_stream=self._compute_stream)
+                for name, rt in self._runtimes.items()
+                if rt.execution_shape is ExecutionShape.STREAMING
             }
         except Exception as exc:
             self._scheduler_error = exc
@@ -1395,11 +1486,18 @@ class InferenceEngine:
                 if future and not future.done():
                     loop.call_soon_threadsafe(future.set_result, engine_result)
                 self._complete_stream(req, result=engine_result)
+                self._complete_model_stream(req, result=engine_result)
+
+        def deliver_model_stream_updates(
+            updates: tuple[ModelStreamUpdate, ...]
+        ) -> None:
+            for update in updates:
+                self._deliver_model_stream_update(update)
 
         def any_work() -> bool:
             return ar_executor.has_work or any(
                 sp.has_work for sp in single_pass.values()
-            )
+            ) or any(stream.has_work for stream in streaming.values())
 
         try:
             with torch.inference_mode():
@@ -1446,6 +1544,30 @@ class InferenceEngine:
                         else:
                             lane.submit(req)
                         progressed = True
+                    # Streaming session starts (model-tagged).
+                    while True:
+                        try:
+                            model, req = self._streaming_start_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        lane = streaming.get(model)
+                        if lane is None:  # pragma: no cover - guarded in stream()
+                            self._fail_request(
+                                req, ValueError(f"No streaming lane for {model!r}")
+                            )
+                        else:
+                            lane.submit(req)
+                        progressed = True
+                    # Streaming chunks / close commands (model-tagged).
+                    while True:
+                        try:
+                            model, chunk = self._streaming_chunk_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        lane = streaming.get(model)
+                        if lane is not None:
+                            lane.submit_chunk(chunk)
+                        progressed = True
 
                     # Advance the autoregressive lane. Its pipeline is the
                     # shared device state, so a failure here is fatal to the
@@ -1457,6 +1579,8 @@ class InferenceEngine:
                         _LOGGER.exception("Autoregressive advance failed", exc_info=exc)
                         deliver(ar_executor.shutdown(exc))
                         for lane in single_pass.values():
+                            deliver(lane.shutdown(exc))
+                        for lane in streaming.values():
                             deliver(lane.shutdown(exc))
                         self._fail_all_pending(exc)
                         return
@@ -1481,6 +1605,26 @@ class InferenceEngine:
                             deliver(sp_tick.completed)
                         progressed = sp_tick.progressed or progressed
 
+                    # Advance each streaming lane in isolation; a runtime
+                    # session failure should fail only that lane/session.
+                    for name, lane in streaming.items():
+                        try:
+                            stream_tick = lane.advance()
+                        except Exception as exc:
+                            _LOGGER.exception(
+                                "Streaming advance failed for %s", name, exc_info=exc
+                            )
+                            deliver(lane.shutdown(exc))
+                            progressed = True
+                            continue
+                        if stream_tick.model_stream_updates:
+                            deliver_model_stream_updates(
+                                stream_tick.model_stream_updates
+                            )
+                        if stream_tick.completed:
+                            deliver(stream_tick.completed)
+                        progressed = stream_tick.progressed or progressed
+
                     if shutdown_requested and not any_work():
                         break
 
@@ -1494,7 +1638,11 @@ class InferenceEngine:
                         # could sleep past the GPU finishing and leave
                         # engine.run() unresolved until an unrelated request
                         # happens to wake the loop.
-                        if any(sp.has_in_flight for sp in single_pass.values()):
+                        if any(
+                            sp.has_in_flight for sp in single_pass.values()
+                        ) or any(
+                            stream.has_in_flight for stream in streaming.values()
+                        ):
                             wake_event.wait(timeout=_SINGLE_PASS_POLL_INTERVAL_S)
                         else:
                             wake_event.wait()
@@ -1502,6 +1650,8 @@ class InferenceEngine:
         finally:
             deliver(ar_executor.shutdown())
             for lane in single_pass.values():
+                deliver(lane.shutdown())
+            for lane in streaming.values():
                 deliver(lane.shutdown())
             self._fail_all_pending()
 
@@ -1647,3 +1797,14 @@ class InferenceEngine:
             except queue.Empty:
                 break
             self._fail_request(req, exc)
+        while True:
+            try:
+                _model, req = self._streaming_start_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._fail_request(req, exc)
+        while True:
+            try:
+                self._streaming_chunk_queue.get_nowait()
+            except queue.Empty:
+                break

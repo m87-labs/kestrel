@@ -246,6 +246,33 @@ class ModelStream(AsyncIterator[ModelStreamUpdate]):
 
 
 @dataclass(slots=True)
+class _StreamingSessionRequest:
+    """A stateful streaming session start request.
+
+    Satisfies the common ``EngineRequest`` envelope for terminal delivery
+    and carries this lane's model-stream queue for per-step updates.
+    """
+
+    request_id: int
+    future: asyncio.Future[EngineResult]
+    task: str
+    initial_inputs: Dict[str, Any]
+    submitted_at: float
+    model_stream_queue: Optional[_ModelStreamQueue]
+    adapter: Optional[str] = None
+    stream_queue: Optional[_StreamQueue] = None
+
+
+@dataclass(slots=True)
+class _StreamingChunk:
+    """One caller-supplied chunk/frame or close request for a session."""
+
+    session_id: int
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    close: bool = False
+
+
+@dataclass(slots=True)
 class _AutoregressiveRequest:
     request_id: int
     prompt: str
@@ -327,4 +354,5 @@ class TickResult:
 
     progressed: bool = False
     completed: tuple[Completion, ...] = ()
+    model_stream_updates: tuple[ModelStreamUpdate, ...] = ()
     has_work: bool = False  # queued or in flight (gates shutdown exit)
