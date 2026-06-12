@@ -40,12 +40,12 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
     runtime._compute_stream = None
     runtime.page_table = _FakePageTable()
 
-    def build_inputs(prepared, *, image, image_crops):
+    def build_inputs(prepared, *, image, image_crops, staging, row):
+        del staging, row
         del image, image_crops
         seq_len = seq_lens[prepared.state.batch_idx]
         hidden = torch.full((1, seq_len, 4), float(prepared.state.batch_idx))
-        positions = torch.arange(seq_len, dtype=torch.long).view(1, seq_len)
-        return hidden, positions, False
+        return hidden, 0, False
 
     def prefill_impl(
         inputs_embeds,
@@ -58,8 +58,12 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
         paged_kv_seqlens_q,
         paged_kv_seqlens_k,
         last_token_positions,
+        input_staging,
     ):
+        captured["position_ids_contiguous"] = position_ids.is_contiguous()
+        captured["batch_idx_contiguous"] = batch_idx.is_contiguous()
         del attn_mask, position_ids, batch_idx, lora_slot, use_prefix_attn
+        del input_staging
         captured["paged_kv_seqlens_q"] = paged_kv_seqlens_q
         captured["paged_kv_seqlens_k"] = paged_kv_seqlens_k
         captured["last_token_positions"] = last_token_positions
@@ -71,11 +75,10 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
     return runtime, captured
 
 
-def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() -> None:
-    runtime, captured = _make_runtime({1: 3, 2: 3})
-    slot = runtime_mod.PrefillSlot(
+def _make_prefill_slot() -> runtime_mod.PrefillSlot:
+    return runtime_mod.PrefillSlot(
         slot_id=0,
-        batch_idx=torch.zeros(2, dtype=torch.int64),
+        batch_idx=torch.zeros(8, dtype=torch.int64),
         step_done_event=None,  # type: ignore[arg-type]
         commit_done_event=None,  # type: ignore[arg-type]
         aux_done_event=None,  # type: ignore[arg-type]
@@ -83,7 +86,21 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() 
         size_staging=torch.empty(0),
         coord_cpu=torch.empty(0),
         size_cpu=torch.empty(0),
+        input_staging=runtime_mod.PrefillInputStaging(
+            max_batch_size=8,
+            max_seq_length=16,
+            max_lora_slots=0,
+            coord_dtype=torch.float32,
+            size_dtype=torch.float32,
+            device=torch.device("cpu"),
+            pin_memory=False,
+        ),
     )
+
+
+def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() -> None:
+    runtime, captured = _make_runtime({1: 3, 2: 3})
+    slot = _make_prefill_slot()
 
     logits = runtime.launch_prepared_batch(
         [_make_prepared(1, 10), _make_prepared(2, 11)],
@@ -91,6 +108,8 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() 
     )
 
     assert logits.shape == (2, 8)
+    assert captured["position_ids_contiguous"]
+    assert captured["batch_idx_contiguous"]
     assert captured["paged_kv_seqlens_q"] is None
     torch.testing.assert_close(
         captured["paged_kv_seqlens_k"],
@@ -104,17 +123,7 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() 
 
 def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_single_token_append() -> None:
     runtime, captured = _make_runtime({1: 1, 2: 1})
-    slot = runtime_mod.PrefillSlot(
-        slot_id=0,
-        batch_idx=torch.zeros(2, dtype=torch.int64),
-        step_done_event=None,  # type: ignore[arg-type]
-        commit_done_event=None,  # type: ignore[arg-type]
-        aux_done_event=None,  # type: ignore[arg-type]
-        coord_staging=torch.empty(0),
-        size_staging=torch.empty(0),
-        coord_cpu=torch.empty(0),
-        size_cpu=torch.empty(0),
-    )
+    slot = _make_prefill_slot()
 
     logits = runtime.launch_prepared_batch(
         [_make_prepared(1, 10), _make_prepared(2, 11)],
@@ -131,17 +140,7 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_single_token_append(
 
 def test_launch_prepared_batch_keeps_paged_kv_q_lengths_for_padded_q_lengths() -> None:
     runtime, captured = _make_runtime({1: 1, 2: 3})
-    slot = runtime_mod.PrefillSlot(
-        slot_id=0,
-        batch_idx=torch.zeros(2, dtype=torch.int64),
-        step_done_event=None,  # type: ignore[arg-type]
-        commit_done_event=None,  # type: ignore[arg-type]
-        aux_done_event=None,  # type: ignore[arg-type]
-        coord_staging=torch.empty(0),
-        size_staging=torch.empty(0),
-        coord_cpu=torch.empty(0),
-        size_cpu=torch.empty(0),
-    )
+    slot = _make_prefill_slot()
 
     logits = runtime.launch_prepared_batch(
         [_make_prepared(1, 10), _make_prepared(2, 11)],
