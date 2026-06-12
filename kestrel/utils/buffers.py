@@ -73,6 +73,7 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool,
         with_numpy: bool = True,
+        zero: bool = True,
     ) -> None:
         # Pinned memory is a CUDA-specific allocator hint that accelerates
         # async H2D copies; on MPS torch raises ``DispatchStub: missing
@@ -80,10 +81,22 @@ class CpuGpuBuffer:
         # is wired through the active device. The hint has no effect off
         # CUDA, so just drop it.
         pin_memory_effective = pin_memory and device.type == "cuda"
-        self.cpu = torch.zeros(
-            *size, dtype=dtype, device="cpu", pin_memory=pin_memory_effective,
-        )
-        self.gpu = torch.zeros_like(self.cpu, device=device)
+        if zero:
+            self.cpu = torch.zeros(
+                *size,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=pin_memory_effective,
+            )
+            self.gpu = torch.zeros_like(self.cpu, device=device)
+        else:
+            self.cpu = torch.empty(
+                *size,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=pin_memory_effective,
+            )
+            self.gpu = torch.empty_like(self.cpu, device=device)
         self.np: np.ndarray
 
         if with_numpy:
@@ -98,6 +111,20 @@ class CpuGpuBuffer:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+
+    def cpu_view(self, shape: tuple[int, ...]) -> torch.Tensor:
+        numel = prod(shape)
+        return self.cpu[:numel].view(shape)
+
+    def gpu_view(self, shape: tuple[int, ...]) -> torch.Tensor:
+        numel = prod(shape)
+        return self.gpu[:numel].view(shape)
+
+    def copy_view_to_gpu(self, shape: tuple[int, ...]) -> torch.Tensor:
+        cpu = self.cpu_view(shape)
+        gpu = self.gpu_view(shape)
+        gpu.copy_(cpu, non_blocking=True)
+        return gpu
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """Non-blocking copy from device to host (caller must synchronize)."""
