@@ -116,6 +116,9 @@ def patch_text_decoder_with_nvtx():
         lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
         dense_lora_scratch=None,
         scratch_pool=None,
+        # Absorb decoder kwargs added after this mirror was written so the
+        # profiler keeps loading; forward the ones the mirrored calls take.
+        **extra_kwargs,
     ):
         clear_scratch_pool = None
         if scratch_pool is not None:
@@ -162,8 +165,7 @@ def patch_text_decoder_with_nvtx():
                         config.moe.experts_per_token,
                         mode=mode,
                         lora_workspace=moe_workspace,
-                        lora_slot_ids=lora_slot_ids,
-                        single_lora_id=single_lora_id,
+                        moe_lora_metadata=extra_kwargs.get("moe_lora_metadata"),
                     )
                     nvtx.range_pop()
                 else:

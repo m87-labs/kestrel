@@ -111,7 +111,7 @@ def patch_vision_encoder_with_nvtx(detailed: bool = True) -> None:
         def _layer_norm(x_in: torch.Tensor, ln: torch.nn.LayerNorm) -> torch.Tensor:
             if x_norm_buf is None:
                 return F.layer_norm(x_in, ln.normalized_shape, ln.weight, ln.bias, float(ln.eps))
-            vision_module.layernorm_bias_into(
+            vision_module._layernorm_bias_into(
                 x=x_in,
                 weight=ln.weight,
                 bias=ln.bias,
@@ -331,6 +331,21 @@ def main() -> None:
         for _ in range(args.warmup):
             run_forward()
         torch.cuda.synchronize()
+
+        # Steady-state CUDA-event timing (printed like profile_decode's
+        # PROFILE line) so the script is useful without an nsys wrapper.
+        _start = torch.cuda.Event(enable_timing=True)
+        _end = torch.cuda.Event(enable_timing=True)
+        _timed_iters = 20
+        _start.record()
+        for _ in range(_timed_iters):
+            run_forward()
+        _end.record()
+        torch.cuda.synchronize()
+        print(
+            f"PROFILE: vision_forward avg_ms="
+            f"{_start.elapsed_time(_end) / _timed_iters:.3f}"
+        )
 
         print(f"Running {args.iters} profiled iterations...")
         for _ in range(args.iters):
