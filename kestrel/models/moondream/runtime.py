@@ -138,6 +138,332 @@ class PrefillScratch:
             self.router_logits = torch.empty(tokens, self.router_logits.size(1), dtype=dtype, device=device)
 
 
+class PrefillInputStaging:
+    """Pinned host staging and persistent device buffers for prefill metadata."""
+
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        max_seq_length: int,
+        max_lora_slots: int,
+        coord_dtype: torch.dtype,
+        size_dtype: torch.dtype,
+        device: torch.device,
+        pin_memory: bool,
+    ) -> None:
+        pin = pin_memory and device.type == "cuda"
+        self.max_batch_size = max_batch_size
+        self.max_seq_length = max_seq_length
+        self.max_lora_slots = max_lora_slots
+        self.max_prefill_tokens = max_batch_size * max_seq_length
+
+        token_shape = (max_batch_size, max_seq_length)
+        coord_shape = (max_batch_size, max_seq_length, 1)
+        size_shape = (max_batch_size, max_seq_length, 2)
+
+        self.text_ids_cpu = torch.empty(
+            token_shape, dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.text_ids_gpu = torch.empty(token_shape, dtype=torch.long, device=device)
+
+        self.coord_values_cpu = torch.empty(
+            coord_shape, dtype=coord_dtype, device="cpu", pin_memory=pin
+        )
+        self.coord_values_gpu = torch.empty(coord_shape, dtype=coord_dtype, device=device)
+
+        self.size_values_cpu = torch.empty(
+            size_shape, dtype=size_dtype, device="cpu", pin_memory=pin
+        )
+        self.size_values_gpu = torch.empty(size_shape, dtype=size_dtype, device=device)
+
+        self.text_pos_cpu = torch.empty(
+            token_shape, dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.text_pos_gpu = torch.empty(token_shape, dtype=torch.long, device=device)
+        self.coord_pos_cpu = torch.empty(
+            token_shape, dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.coord_pos_gpu = torch.empty(token_shape, dtype=torch.long, device=device)
+        self.size_pos_cpu = torch.empty(
+            token_shape, dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.size_pos_gpu = torch.empty(token_shape, dtype=torch.long, device=device)
+
+        self.position_template_cpu = torch.empty(
+            (max_seq_length,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.position_template_cpu.copy_(torch.arange(max_seq_length, dtype=torch.long))
+        self.position_ids_cpu = torch.empty(
+            (self.max_prefill_tokens,),
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=pin,
+        )
+        self.position_ids_gpu = torch.empty(
+            (self.max_prefill_tokens,), dtype=torch.long, device=device
+        )
+
+        self.slot_batch_idx_cpu = torch.empty(
+            (self.max_prefill_tokens,),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=pin,
+        )
+        self.slot_batch_idx_gpu = torch.empty(
+            (self.max_prefill_tokens,), dtype=torch.int64, device=device
+        )
+        self.batch_idx_cpu = torch.empty(
+            (max_batch_size,), dtype=torch.int64, device="cpu", pin_memory=pin
+        )
+        self.last_token_positions_cpu = torch.empty(
+            (max_batch_size,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.last_token_positions_gpu = torch.empty(
+            (max_batch_size,), dtype=torch.long, device=device
+        )
+        self.paged_kv_seqlens_q_cpu = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.paged_kv_seqlens_q_gpu = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=device
+        )
+        self.paged_kv_seqlens_k_cpu = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.paged_kv_seqlens_k_gpu = torch.empty(
+            (max_batch_size,), dtype=torch.int32, device=device
+        )
+
+        self.lora_slot_ids_cpu = torch.empty(
+            (1,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.lora_slot_ids_gpu = torch.empty((1,), dtype=torch.int32, device=device)
+        self.token_lora_slot_ids_cpu = torch.empty(
+            (self.max_prefill_tokens,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.active_token_ids_cpu = torch.empty(
+            (self.max_prefill_tokens,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.active_token_ids_gpu = torch.empty(
+            (self.max_prefill_tokens,), dtype=torch.int32, device=device
+        )
+        self.active_lora_ids_cpu = torch.empty(
+            (max_lora_slots,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.active_lora_ids_gpu = torch.empty(
+            (max_lora_slots,), dtype=torch.int32, device=device
+        )
+        self.active_lora_meta_cpu = torch.empty(
+            (max_lora_slots + 4,), dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self.active_lora_meta_gpu = torch.empty(
+            (max_lora_slots + 4,), dtype=torch.int32, device=device
+        )
+
+    def _check_row(self, row: int) -> None:
+        if row < 0 or row >= self.max_batch_size:
+            raise ValueError(
+                f"Prefill row {row} exceeds max_batch_size={self.max_batch_size}"
+            )
+
+    def _check_seq_length(self, length: int, name: str) -> None:
+        if length > self.max_seq_length:
+            raise ValueError(
+                f"{name} length {length} exceeds max_seq_length={self.max_seq_length}"
+            )
+
+    @staticmethod
+    def _fill_1d_int(values_cpu: Tensor, values: Sequence[int]) -> None:
+        for idx, value in enumerate(values):
+            values_cpu[idx] = int(value)
+
+    @staticmethod
+    def _fill_1d_float(values_cpu: Tensor, values: Sequence[float]) -> None:
+        for idx, value in enumerate(values):
+            values_cpu[idx] = float(value)
+
+    def stage_text_ids(self, row: int, text_ids: Sequence[int]) -> Tensor:
+        self._check_row(row)
+        n = len(text_ids)
+        self._check_seq_length(n, "text id")
+        cpu = self.text_ids_cpu[row, :n]
+        self._fill_1d_int(cpu, text_ids)
+        gpu = self.text_ids_gpu[row, :n]
+        gpu.copy_(cpu, non_blocking=True)
+        return gpu.view(1, n)
+
+    def stage_coord_values(self, row: int, coord_values: Sequence[float]) -> Tensor:
+        self._check_row(row)
+        n = len(coord_values)
+        self._check_seq_length(n, "coord")
+        cpu = self.coord_values_cpu[row, :n, 0]
+        self._fill_1d_float(cpu, coord_values)
+        gpu = self.coord_values_gpu[row, :n, :]
+        gpu.copy_(self.coord_values_cpu[row, :n, :], non_blocking=True)
+        return gpu
+
+    def stage_size_values(
+        self, row: int, size_values: Sequence[tuple[float, float]]
+    ) -> Tensor:
+        self._check_row(row)
+        n = len(size_values)
+        self._check_seq_length(n, "size")
+        cpu = self.size_values_cpu[row, :n, :]
+        for idx, (width, height) in enumerate(size_values):
+            cpu[idx, 0] = float(width)
+            cpu[idx, 1] = float(height)
+        gpu = self.size_values_gpu[row, :n, :]
+        gpu.copy_(cpu, non_blocking=True)
+        return gpu
+
+    def stage_token_positions(
+        self,
+        row: int,
+        positions: Sequence[int],
+        *,
+        kind: str,
+    ) -> Tensor:
+        self._check_row(row)
+        n = len(positions)
+        self._check_seq_length(n, f"{kind} position")
+        if kind == "text":
+            cpu = self.text_pos_cpu[row, :n]
+            gpu = self.text_pos_gpu[row, :n]
+        elif kind == "coord":
+            cpu = self.coord_pos_cpu[row, :n]
+            gpu = self.coord_pos_gpu[row, :n]
+        elif kind == "size":
+            cpu = self.size_pos_cpu[row, :n]
+            gpu = self.size_pos_gpu[row, :n]
+        else:  # pragma: no cover - defensive
+            raise ValueError(f"Unknown token position kind: {kind}")
+        self._fill_1d_int(cpu, positions)
+        gpu.copy_(cpu, non_blocking=True)
+        return gpu
+
+    def stage_batch_metadata(
+        self,
+        *,
+        batch_indices: Sequence[int],
+        seq_lens: Sequence[int],
+        prompt_lens: Sequence[int],
+        position_starts: Sequence[int],
+        q_is_padded: bool,
+        max_seq_len: int,
+        batch_idx_gpu: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor, Tensor]:
+        batch_size = len(batch_indices)
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"Prefill batch size {batch_size} exceeds max_batch_size={self.max_batch_size}"
+            )
+        if not (
+            len(seq_lens)
+            == len(prompt_lens)
+            == len(position_starts)
+            == batch_size
+        ):
+            raise ValueError("Prefill metadata sequences must have matching lengths")
+        self._check_seq_length(max_seq_len, "prefill")
+
+        metadata_tokens = batch_size * max_seq_len
+        position_cpu = self.position_ids_cpu[:metadata_tokens].view(
+            batch_size, max_seq_len
+        )
+        slot_batch_idx_cpu = self.slot_batch_idx_cpu[:metadata_tokens].view(
+            batch_size, max_seq_len
+        )
+        position_cpu.zero_()
+        slot_batch_idx_cpu.zero_()
+
+        for row, (batch_idx, seq_len, prompt_len, position_start) in enumerate(
+            zip(batch_indices, seq_lens, prompt_lens, position_starts)
+        ):
+            self._check_seq_length(seq_len, "sequence")
+            if position_start < 0 or position_start + seq_len > self.max_seq_length:
+                raise ValueError(
+                    f"Position range [{position_start}, {position_start + seq_len}) "
+                    f"exceeds max_seq_length={self.max_seq_length}"
+                )
+            position_cpu[row, :seq_len].copy_(
+                self.position_template_cpu[position_start : position_start + seq_len]
+            )
+            slot_batch_idx_cpu[row, :seq_len].fill_(int(batch_idx))
+            self.batch_idx_cpu[row] = int(batch_idx)
+            self.last_token_positions_cpu[row] = int(seq_len - 1)
+            self.paged_kv_seqlens_k_cpu[row] = int(prompt_len)
+            if q_is_padded:
+                self.paged_kv_seqlens_q_cpu[row] = int(seq_len)
+
+        position_ids = self.position_ids_gpu[:metadata_tokens].view(
+            batch_size, max_seq_len
+        )
+        position_ids.copy_(position_cpu, non_blocking=True)
+        slot_batch_idx = self.slot_batch_idx_gpu[:metadata_tokens].view(
+            batch_size, max_seq_len
+        )
+        slot_batch_idx.copy_(slot_batch_idx_cpu, non_blocking=True)
+        batch_idx_gpu[:batch_size].copy_(
+            self.batch_idx_cpu[:batch_size], non_blocking=True
+        )
+        last_token_positions = self.last_token_positions_gpu[:batch_size]
+        last_token_positions.copy_(
+            self.last_token_positions_cpu[:batch_size], non_blocking=True
+        )
+        paged_kv_seqlens_k = self.paged_kv_seqlens_k_gpu[:batch_size]
+        paged_kv_seqlens_k.copy_(
+            self.paged_kv_seqlens_k_cpu[:batch_size], non_blocking=True
+        )
+        paged_kv_seqlens_q = None
+        if q_is_padded:
+            paged_kv_seqlens_q = self.paged_kv_seqlens_q_gpu[:batch_size]
+            paged_kv_seqlens_q.copy_(
+                self.paged_kv_seqlens_q_cpu[:batch_size], non_blocking=True
+            )
+        return (
+            position_ids,
+            slot_batch_idx,
+            paged_kv_seqlens_q,
+            paged_kv_seqlens_k,
+            last_token_positions,
+        )
+
+    def stage_lora_slot_ids(self, lora_slot: int) -> Tensor:
+        self.lora_slot_ids_cpu[0] = int(lora_slot)
+        self.lora_slot_ids_gpu.copy_(self.lora_slot_ids_cpu, non_blocking=True)
+        return self.lora_slot_ids_gpu
+
+    def fill_token_lora_slots(self, count: int, lora_slot: int) -> Tensor:
+        if count > self.max_prefill_tokens:
+            raise ValueError(
+                f"LoRA token count {count} exceeds capacity {self.max_prefill_tokens}"
+            )
+        slots = self.token_lora_slot_ids_cpu[:count]
+        slots.fill_(int(lora_slot))
+        return slots
+
+    def lora_metadata_buffers(
+        self, *, token_count: int, max_loras: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if token_count > self.max_prefill_tokens:
+            raise ValueError(
+                f"LoRA token count {token_count} exceeds capacity {self.max_prefill_tokens}"
+            )
+        if max_loras > self.max_lora_slots:
+            raise ValueError(
+                f"LoRA count {max_loras} exceeds capacity {self.max_lora_slots}"
+            )
+        return (
+            self.active_token_ids_cpu[:token_count],
+            self.active_token_ids_gpu[:token_count],
+            self.active_lora_ids_cpu[:max_loras],
+            self.active_lora_ids_gpu[:max_loras],
+            self.active_lora_meta_cpu[: max_loras + 4],
+            self.active_lora_meta_gpu[: max_loras + 4],
+        )
+
+
 @dataclass(slots=True)
 class PrefillSlot:
     """Per-prefill slot resources.
@@ -167,6 +493,7 @@ class PrefillSlot:
     commit_done_event: "torch.cuda.Event"
     aux_done_event: "torch.cuda.Event"   # signals coord/size D2H complete
     scratch: PrefillScratch | None = None
+    input_staging: PrefillInputStaging | None = None
 
 
 class _LayerPagedCache(torch.nn.Module):
@@ -464,6 +791,7 @@ class MoondreamRuntime:
         # Size for typical prefill (1024 tokens). Grows automatically if needed.
         _prefill_scratch_tokens = 1024
         pin = self.device.type == "cuda"
+        max_lora_slots = max(0, self.max_batch_slots - 1)
         self._prefill_slots: list[PrefillSlot] = [
             PrefillSlot(
                 slot_id=slot_id,
@@ -490,6 +818,15 @@ class MoondreamRuntime:
                 scratch=PrefillScratch(
                     _prefill_scratch_tokens, self.config.text, self.device, self.dtype,
                 ) if self.config.text else None,
+                input_staging=PrefillInputStaging(
+                    max_batch_size=self.max_batch_size,
+                    max_seq_length=self.max_seq_length,
+                    max_lora_slots=max_lora_slots,
+                    coord_dtype=coord_dtype,
+                    size_dtype=size_dtype,
+                    device=self.device,
+                    pin_memory=pin,
+                ),
             )
             for slot_id in range(2)
         ]
@@ -823,14 +1160,17 @@ class MoondreamRuntime:
 
     @functools.cached_property
     def bos_embed(self) -> Tensor:
-        bos = torch.tensor(
-            [[self.config.tokenizer.bos_id]],
-            device=self.device,
-            dtype=torch.long,
-        )
+        bos = torch.empty((1, 1), device=self.device, dtype=torch.long)
+        bos.fill_(self.config.tokenizer.bos_id)
         return text_encoder(bos, self.model.text)
 
-    def _embed_tokens(self, tokens: Sequence[Token]) -> Tensor:
+    def _embed_tokens(
+        self,
+        tokens: Sequence[Token],
+        *,
+        staging: PrefillInputStaging,
+        row: int,
+    ) -> Tensor:
         """Embed an in-order prompt (single sequence) into shape (1, L, dim)."""
 
         if not tokens:
@@ -838,8 +1178,6 @@ class MoondreamRuntime:
             return torch.empty((1, 0, dim), device=self.device, dtype=self.dtype)
 
         length = len(tokens)
-        width = self.bos_embed.shape[-1]
-        out = torch.empty((1, length, width), device=self.device, dtype=self.dtype)
 
         text_pos: list[int] = []
         coord_pos: list[int] = []
@@ -862,27 +1200,29 @@ class MoondreamRuntime:
                 raise TypeError(f"Unsupported token type: {type(token)!r}")
 
         if text_ids:
-            ids = torch.tensor([text_ids], device=self.device, dtype=torch.long)
+            ids = staging.stage_text_ids(row, text_ids)
             text_emb = text_encoder(ids, self.model.text)
-            out[:, text_pos, :] = text_emb
+            if len(text_ids) == length:
+                return text_emb
+            width = self.bos_embed.shape[-1]
+            out = torch.empty((1, length, width), device=self.device, dtype=self.dtype)
+            positions = staging.stage_token_positions(row, text_pos, kind="text")
+            out.index_copy_(1, positions, text_emb)
+        else:
+            width = self.bos_embed.shape[-1]
+            out = torch.empty((1, length, width), device=self.device, dtype=self.dtype)
 
         if coord_vals:
-            coords = torch.tensor(
-                coord_vals,
-                device=self.device,
-                dtype=self.region.coord_features.dtype,
-            ).view(-1, 1)
+            coords = staging.stage_coord_values(row, coord_vals)
             coord_emb = encode_coordinate(coords, self.region)
-            out[:, coord_pos, :] = coord_emb.unsqueeze(0)
+            positions = staging.stage_token_positions(row, coord_pos, kind="coord")
+            out.index_copy_(1, positions, coord_emb.unsqueeze(0))
 
         if size_vals:
-            sizes = torch.tensor(
-                size_vals,
-                device=self.device,
-                dtype=self.region.size_features.dtype,
-            )
+            sizes = staging.stage_size_values(row, size_vals)
             size_emb = encode_size(sizes, self.region)
-            out[:, size_pos, :] = size_emb.unsqueeze(0)
+            positions = staging.stage_token_positions(row, size_pos, kind="size")
+            out.index_copy_(1, positions, size_emb.unsqueeze(0))
 
         return out
 
@@ -1142,7 +1482,10 @@ class MoondreamRuntime:
         skip_positions: int,
         image_kv_length: int,
         prompt_len: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        *,
+        staging: PrefillInputStaging,
+        row: int,
+    ) -> tuple[Tensor, int]:
         """Prepare inputs for append prefill (cache hit path)."""
         # Derive suffix tokens from skip_positions
         if image_kv_length > 0:
@@ -1156,7 +1499,7 @@ class MoondreamRuntime:
 
         # Embed suffix tokens
         if suffix_tokens:
-            inputs_embeds = self._embed_tokens(suffix_tokens)
+            inputs_embeds = self._embed_tokens(suffix_tokens, staging=staging, row=row)
         else:
             # This shouldn't happen due to skip_positions capping
             inputs_embeds = torch.empty(
@@ -1165,16 +1508,7 @@ class MoondreamRuntime:
                 dtype=self.dtype,
             )
 
-        position_ids = torch.arange(
-            skip_positions, prompt_len, dtype=torch.long, device=self.device
-        ).unsqueeze(0)
-
-        # Paged attention needs the total KV length (cached + new).
-        paged_kv_seqlens_k = torch.tensor(
-            [prompt_len], dtype=torch.int32, device=self.device
-        )
-
-        return inputs_embeds, position_ids, paged_kv_seqlens_k
+        return inputs_embeds, skip_positions
 
     def _prepare_full_prefill_inputs(
         self,
@@ -1182,11 +1516,14 @@ class MoondreamRuntime:
         image: Optional[np.ndarray],
         image_crops: Optional[OverlapCropOutput],
         prompt_len: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        *,
+        staging: PrefillInputStaging,
+        row: int,
+    ) -> tuple[Tensor, int]:
         """Prepare inputs for full prefill (cache miss path)."""
         # Embed prompt tokens
         if len(tokens_list) > 0:
-            prompt_embed = self._embed_tokens(tokens_list)
+            prompt_embed = self._embed_tokens(tokens_list, staging=staging, row=row)
         else:
             prompt_embed = None
 
@@ -1207,14 +1544,7 @@ class MoondreamRuntime:
             segments = [self.bos_embed]
 
         inputs_embeds = torch.cat(segments, dim=1)
-        position_ids = torch.arange(
-            prompt_len, dtype=torch.long, device=self.device
-        ).unsqueeze(0)
-        paged_kv_seqlens_k = torch.tensor(
-            [prompt_len], dtype=torch.int32, device=self.device
-        )
-
-        return inputs_embeds, position_ids, paged_kv_seqlens_k
+        return inputs_embeds, 0
 
     def _finalize_cache_after_prefill(
         self,
@@ -1407,7 +1737,9 @@ class MoondreamRuntime:
         *,
         image: Optional[np.ndarray],
         image_crops: Optional[OverlapCropOutput],
-    ) -> tuple[Tensor, Tensor, bool]:
+        staging: PrefillInputStaging,
+        row: int,
+    ) -> tuple[Tensor, int, bool]:
         """Build per-sequence prefill inputs for a prepared sequence."""
         tokens_list = prepared.tokens_list
         state = prepared.state
@@ -1416,22 +1748,26 @@ class MoondreamRuntime:
         image_kv_length = state.image_length
 
         if cache_result.can_reuse:
-            inputs_embeds, position_ids, _ = self._prepare_append_prefill_inputs(
+            inputs_embeds, position_start = self._prepare_append_prefill_inputs(
                 tokens_list,
                 cache_result.skip_positions,
                 image_kv_length,
                 prompt_len,
+                staging=staging,
+                row=row,
             )
         else:
-            inputs_embeds, position_ids, _ = self._prepare_full_prefill_inputs(
+            inputs_embeds, position_start = self._prepare_full_prefill_inputs(
                 tokens_list,
                 image,
                 image_crops,
                 prompt_len,
+                staging=staging,
+                row=row,
             )
 
         use_prefix_attn = bool(image_kv_length) and not cache_result.can_reuse
-        return inputs_embeds, position_ids, use_prefix_attn
+        return inputs_embeds, position_start, use_prefix_attn
 
     def launch_prepared_batch(
         self,
@@ -1463,6 +1799,10 @@ class MoondreamRuntime:
         if len(image_crops_list) != batch_size:
             raise ValueError("image_crops_list length must match prepared_sequences")
 
+        input_staging = prefill_slot.input_staging
+        if input_staging is None:
+            raise RuntimeError("Prefill slot is missing input staging buffers")
+
         lora_slots = [prepared.state.lora_slot for prepared in prepared_sequences]
         if batch_size > 1 and any(slot != 0 for slot in lora_slots):
             raise NotImplementedError("Batched prefill does not yet support LoRA slots")
@@ -1471,16 +1811,18 @@ class MoondreamRuntime:
         # ordering semantics.
         with stream_context(self._compute_stream):
             per_inputs: list[Tensor] = []
-            per_positions: list[Tensor] = []
+            position_starts: list[int] = []
             use_prefix_attn: bool | None = None
-            for prepared, image, image_crops in zip(
+            for row, (prepared, image, image_crops) in enumerate(zip(
                 prepared_sequences, images, image_crops_list
-            ):
-                inputs_embeds, position_ids, seq_use_prefix_attn = (
+            )):
+                inputs_embeds, position_start, seq_use_prefix_attn = (
                     self._build_prefill_inputs_for_prepared(
                         prepared,
                         image=image,
                         image_crops=image_crops,
+                        staging=input_staging,
+                        row=row,
                     )
                 )
                 if inputs_embeds.shape[1] == 0:
@@ -1492,63 +1834,51 @@ class MoondreamRuntime:
                         "All sequences in a prefill batch must share use_prefix_attn mode"
                     )
                 per_inputs.append(inputs_embeds)
-                per_positions.append(position_ids)
+                position_starts.append(position_start)
 
             assert use_prefix_attn is not None
             hidden_dim = self.bos_embed.shape[-1]
             seq_lens = [int(t.shape[1]) for t in per_inputs]
+            prompt_lens = [
+                int(prepared.state.prompt_length or prepared.state.length)
+                for prepared in prepared_sequences
+            ]
             max_seq_len = max(seq_lens)
             inputs_embeds = torch.zeros(
                 (batch_size, max_seq_len, hidden_dim),
                 dtype=self.dtype,
                 device=self.device,
             )
-            position_ids = torch.zeros(
-                (batch_size, max_seq_len), dtype=torch.long, device=self.device
-            )
-            slot_batch_idx = torch.zeros(
-                (batch_size, max_seq_len), dtype=torch.int64, device=self.device
-            )
-            last_token_positions = torch.empty(
-                (batch_size,), dtype=torch.long, device=self.device
-            )
             q_is_padded = any(seq_len != max_seq_len for seq_len in seq_lens)
-            paged_kv_seqlens_q = (
-                torch.empty((batch_size,), dtype=torch.int32, device=self.device)
-                if q_is_padded
-                else None
-            )
-            paged_kv_seqlens_k = torch.tensor(
-                [
-                    int(prepared.state.prompt_length or prepared.state.length)
-                    for prepared in prepared_sequences
-                ],
-                dtype=torch.int32,
-                device=self.device,
+            batch_indices = [
+                prepared.state.batch_idx for prepared in prepared_sequences
+            ]
+
+            (
+                position_ids,
+                slot_batch_idx,
+                paged_kv_seqlens_q,
+                paged_kv_seqlens_k,
+                last_token_positions,
+            ) = input_staging.stage_batch_metadata(
+                batch_indices=batch_indices,
+                seq_lens=seq_lens,
+                prompt_lens=prompt_lens,
+                position_starts=position_starts,
+                q_is_padded=q_is_padded,
+                max_seq_len=max_seq_len,
+                batch_idx_gpu=prefill_slot.batch_idx,
             )
 
-            row_batch_idx = prefill_slot.batch_idx[:batch_size]
-            batch_indices: list[int] = []
-
-            for row, (prepared, embed_row, pos_row, seq_len) in enumerate(
-                zip(prepared_sequences, per_inputs, per_positions, seq_lens)
+            for row, (prepared, embed_row, seq_len) in enumerate(
+                zip(prepared_sequences, per_inputs, seq_lens)
             ):
-                prompt_len = int(prepared.state.prompt_length or prepared.state.length)
+                prompt_len = prompt_lens[row]
                 if seq_len > prompt_len:
                     raise AssertionError(
                         f"Prefill input length ({seq_len}) exceeds prompt length ({prompt_len})"
                     )
-                batch_idx = prepared.state.batch_idx
-                batch_indices.append(batch_idx)
-                row_batch_idx[row] = batch_idx
                 inputs_embeds[row, :seq_len, :].copy_(embed_row[0, :, :])
-                position_ids[row, :seq_len].copy_(pos_row[0, :])
-                # Route padded tokens to reserved batch row 0 so they never write
-                # into real sequence KV slots.
-                slot_batch_idx[row, :seq_len].fill_(batch_idx)
-                if paged_kv_seqlens_q is not None:
-                    paged_kv_seqlens_q[row] = seq_len
-                last_token_positions[row] = seq_len - 1
 
             # Commit page table rows for all batch indices before forward pass.
             self.page_table.commit_block_table(batch_indices)
@@ -1564,10 +1894,14 @@ class MoondreamRuntime:
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
+                input_staging=input_staging,
             )
 
-            row_ids = torch.arange(batch_size, device=self.device)
-            hidden_last = hidden[row_ids, last_token_positions]
+            gather_idx = last_token_positions.to(dtype=torch.long).view(
+                batch_size, 1, 1
+            )
+            gather_idx = gather_idx.expand(batch_size, 1, hidden.shape[-1])
+            hidden_last = hidden.gather(1, gather_idx).squeeze(1)
             for row, prepared in enumerate(prepared_sequences):
                 prepared.state.last_hidden = hidden_last[row].detach()
 
@@ -1684,6 +2018,7 @@ class MoondreamRuntime:
         paged_kv_seqlens_q: Tensor | None,
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
+        input_staging: PrefillInputStaging,
     ) -> tuple[Tensor, Tensor]:
         if batch_idx.ndim != 2:
             raise ValueError("batch_idx must be rank-2")
@@ -1719,27 +2054,30 @@ class MoondreamRuntime:
                 if lora_workspace is not None
                 else None
             )
-            lora_slot_ids_cpu = torch.tensor([lora_slot], dtype=torch.int32)
-            lora_slot_ids = lora_slot_ids_cpu.to(self.device)
-            token_lora_slot_ids_cpu = torch.full(
-                (int(M),), int(lora_slot), dtype=torch.int32
+            lora_slot_ids = input_staging.stage_lora_slot_ids(lora_slot)
+            token_lora_slot_ids_cpu = input_staging.fill_token_lora_slots(
+                int(M), lora_slot
+            )
+            (
+                active_token_ids_cpu,
+                active_token_ids_gpu,
+                active_lora_ids_cpu,
+                active_lora_ids_gpu,
+                active_lora_meta_cpu,
+                active_lora_meta_gpu,
+            ) = input_staging.lora_metadata_buffers(
+                token_count=int(M), max_loras=max_loras
             )
             moe_lora_metadata = moe_runtime.prepare_lora_metadata(
                 lora_slot_ids_cpu=token_lora_slot_ids_cpu,
-                active_token_ids_cpu=torch.empty((int(M),), dtype=torch.int32),
-                active_token_ids_gpu=torch.empty(
-                    (int(M),), dtype=torch.int32, device=self.device
-                ),
-                active_lora_ids_cpu=torch.empty((max_loras,), dtype=torch.int32),
-                active_lora_ids_gpu=torch.empty(
-                    (max_loras,), dtype=torch.int32, device=self.device
-                ),
+                active_token_ids_cpu=active_token_ids_cpu,
+                active_token_ids_gpu=active_token_ids_gpu,
+                active_lora_ids_cpu=active_lora_ids_cpu,
+                active_lora_ids_gpu=active_lora_ids_gpu,
                 # 3 header ints + one start offset per active LoRA + one sentinel
                 # end offset, so kernels can read route i as meta[3+i]..meta[4+i].
-                active_lora_meta_cpu=torch.empty((max_loras + 4,), dtype=torch.int32),
-                active_lora_meta_gpu=torch.empty(
-                    (max_loras + 4,), dtype=torch.int32, device=self.device
-                ),
+                active_lora_meta_cpu=active_lora_meta_cpu,
+                active_lora_meta_gpu=active_lora_meta_gpu,
                 batch_size=int(M),
                 max_loras=max_loras,
                 lora_ranks_host=[
@@ -1787,8 +2125,10 @@ class MoondreamRuntime:
             scratch_pool=scratch_pool,
         )
 
-        row_ids = torch.arange(hidden.shape[0], device=hidden.device)
-        hidden_last = hidden[row_ids, last_token_positions.to(dtype=torch.long)]
+        batch_size = int(hidden.shape[0])
+        gather_idx = last_token_positions.to(dtype=torch.long).view(batch_size, 1, 1)
+        gather_idx = gather_idx.expand(batch_size, 1, hidden.shape[-1])
+        hidden_last = hidden.gather(1, gather_idx).squeeze(1)
         logits = lm_head(hidden_last.unsqueeze(1), self.model.text)
         return hidden, logits
 

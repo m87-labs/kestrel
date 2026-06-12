@@ -85,6 +85,10 @@ class PrefillStaging:
 
     sampled_ids: Tensor
     sampled_logprobs: Tensor
+    sampling_temps_cpu: Tensor
+    sampling_temps_gpu: Tensor
+    sampling_top_ps_cpu: Tensor
+    sampling_top_ps_gpu: Tensor
     render: RenderBuffer
 
 
@@ -275,6 +279,7 @@ class GenerationScheduler:
             device=runtime.device,
         )
         # Prefill staging pool (size matches max in-flight prefills).
+        pin_prefill_staging = runtime.device.type == "cuda"
         self._prefill_staging_pool: Deque[PrefillStaging] = deque(
             [
                 PrefillStaging(
@@ -284,6 +289,28 @@ class GenerationScheduler:
                         device=runtime.device,
                     ),
                     sampled_logprobs=torch.empty(
+                        (runtime.max_batch_size,),
+                        dtype=torch.float32,
+                        device=runtime.device,
+                    ),
+                    sampling_temps_cpu=torch.empty(
+                        (runtime.max_batch_size,),
+                        dtype=torch.float32,
+                        device="cpu",
+                        pin_memory=pin_prefill_staging,
+                    ),
+                    sampling_temps_gpu=torch.empty(
+                        (runtime.max_batch_size,),
+                        dtype=torch.float32,
+                        device=runtime.device,
+                    ),
+                    sampling_top_ps_cpu=torch.empty(
+                        (runtime.max_batch_size,),
+                        dtype=torch.float32,
+                        device="cpu",
+                        pin_memory=pin_prefill_staging,
+                    ),
+                    sampling_top_ps_gpu=torch.empty(
                         (runtime.max_batch_size,),
                         dtype=torch.float32,
                         device=runtime.device,
@@ -586,6 +613,30 @@ class GenerationScheduler:
         """Return a prefill staging bundle to the pool."""
         self._prefill_staging_pool.append(staging)
 
+    def _stage_prefill_sampling_params(
+        self,
+        staging: PrefillStaging,
+        requests: Sequence[GenerationRequest],
+        batch_idx: Tensor,
+    ) -> None:
+        """Stage prefill sampling params without pageable scalar H2D copies."""
+
+        batch = len(requests)
+        temps_cpu = staging.sampling_temps_cpu[:batch]
+        top_ps_cpu = staging.sampling_top_ps_cpu[:batch]
+        for row, request in enumerate(requests):
+            temps_cpu[row] = float(request.temperature)
+            top_ps_cpu[row] = float(request.top_p)
+
+        temps_gpu = staging.sampling_temps_gpu[:batch]
+        top_ps_gpu = staging.sampling_top_ps_gpu[:batch]
+        temps_gpu.copy_(temps_cpu, non_blocking=True)
+        top_ps_gpu.copy_(top_ps_cpu, non_blocking=True)
+
+        batch_idx = batch_idx.view(-1)[:batch]
+        self._sampling_temps_by_batch.index_copy_(0, batch_idx, temps_gpu)
+        self._sampling_top_ps_by_batch.index_copy_(0, batch_idx, top_ps_gpu)
+
     def _finalize_prefill(self, handle: LaunchHandle) -> PendingCommit:
         """Sample first token + start D2H for a prefill.
 
@@ -781,10 +832,6 @@ class GenerationScheduler:
                 continue
 
             lifecycle.sequence_state = prepared.state
-            batch_idx = prepared.state.batch_idx
-            with stream_context(self._compute_stream):
-                self._sampling_temps_by_batch[batch_idx] = request.temperature
-                self._sampling_top_ps_by_batch[batch_idx] = request.top_p
 
             self.waiting.remove(request)
             bound_batch.append(
@@ -885,6 +932,12 @@ class GenerationScheduler:
                     images=[request.image for request in requests],
                     image_crops_list=[request.image_crops for request in requests],
                 )
+                with stream_context(self._compute_stream):
+                    self._stage_prefill_sampling_params(
+                        staging,
+                        requests,
+                        prefill_slot.batch_idx[: len(requests)],
+                    )
             prefill_completed = time.perf_counter()
             for lifecycle in lifecycles:
                 lifecycle.prefill_completed_at = prefill_completed
