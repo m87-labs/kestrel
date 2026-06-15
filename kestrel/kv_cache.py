@@ -27,6 +27,33 @@ def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
     return (x + multiple - 1) // multiple
 
 
+def _flatten_bshd_tokens(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim != 4:
+        raise ValueError(f"{name} must have shape [batch, seq, heads, head_dim]")
+    batch, seq_len, n_heads, head_dim = tensor.shape
+    if tensor.stride(3) != 1 or tensor.stride(2) != head_dim:
+        raise ValueError(
+            f"{name} must be compact across heads/head_dim; "
+            f"got shape={tuple(tensor.shape)} stride={tensor.stride()}"
+        )
+
+    if seq_len == 1:
+        token_stride = tensor.stride(0)
+    else:
+        token_stride = tensor.stride(1)
+    if batch > 1 and seq_len > 1 and tensor.stride(0) != seq_len * token_stride:
+        raise ValueError(
+            f"{name} batch/sequence dimensions cannot be flattened without a copy; "
+            f"got shape={tuple(tensor.shape)} stride={tensor.stride()}"
+        )
+
+    return tensor.as_strided(
+        (batch * seq_len, n_heads, head_dim),
+        (token_stride, tensor.stride(2), tensor.stride(3)),
+        storage_offset=tensor.storage_offset(),
+    )
+
+
 
 class KVMemoryPool:
     """Allocator for paged KV cache storage.
@@ -166,8 +193,8 @@ class PagedKVCache(torch.nn.Module):
         *,
         slot_mapping: torch.Tensor,
     ):
-        k_view = k_val.view(-1, k_val.shape[2], k_val.shape[3])
-        v_view = v_val.view(-1, v_val.shape[2], v_val.shape[3])
+        k_view = _flatten_bshd_tokens("k_val", k_val)
+        v_view = _flatten_bshd_tokens("v_val", v_val)
 
         if slot_mapping.shape != input_pos.shape:
             raise ValueError("slot_mapping must match input_pos shape")

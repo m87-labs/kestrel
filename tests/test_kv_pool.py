@@ -74,6 +74,110 @@ def test_pool_normalizes_string_device() -> None:
     assert pool.device == torch.device("cpu")
 
 
+def test_paged_cache_update_accepts_fused_projection_value_slice() -> None:
+    pool = KVMemoryPool(device="cpu")
+    page_table = _make_page_table(page_size=4, n_pages=3)
+    cache = PagedKVCache(
+        page_table,
+        n_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        pool=pool,
+    )
+
+    batch = 2
+    seq_len = 3
+    q_size = 16
+    kv_size = 8
+    key = torch.arange(batch * seq_len * kv_size, dtype=torch.float32).reshape(
+        batch, seq_len, 2, 4
+    )
+    fused = torch.arange(
+        batch * seq_len * (q_size + 2 * kv_size),
+        dtype=torch.float32,
+    ).reshape(batch, seq_len, q_size + 2 * kv_size)
+    value = fused[..., q_size + kv_size :].reshape(batch, seq_len, 2, 4)
+
+    assert value.stride(1) > value.shape[2] * value.shape[3]
+    assert value.stride(2) == value.shape[3]
+    assert value.stride(3) == 1
+
+    slot_mapping = torch.tensor([[0, 1, 2], [4, 5, 6]], dtype=torch.int64)
+    input_pos = torch.arange(batch * seq_len).reshape(batch, seq_len)
+
+    cache.update(
+        input_pos=input_pos,
+        k_val=key,
+        v_val=value,
+        slot_mapping=slot_mapping,
+    )
+
+    expected_k = torch.zeros_like(cache.k_cache)
+    expected_v = torch.zeros_like(cache.v_cache)
+    key_flat = key.view(-1, 2, 4)
+    value_flat = value.view(-1, 2, 4)
+    for row, slot in enumerate(slot_mapping.view(-1).tolist()):
+        if slot < 0:
+            continue
+        block = slot // page_table.page_size
+        offset = slot % page_table.page_size
+        expected_k[block, :, offset, :] = key_flat[row]
+        expected_v[block, :, offset, :] = value_flat[row]
+
+    torch.testing.assert_close(cache.k_cache, expected_k)
+    torch.testing.assert_close(cache.v_cache, expected_v)
+
+
+def test_paged_cache_update_accepts_batched_decode_value_slice() -> None:
+    pool = KVMemoryPool(device="cpu")
+    page_table = _make_page_table(page_size=4, n_pages=3)
+    cache = PagedKVCache(
+        page_table,
+        n_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        pool=pool,
+    )
+
+    batch = 2
+    seq_len = 1
+    q_size = 16
+    kv_size = 8
+    fused = torch.arange(
+        batch * seq_len * (q_size + 2 * kv_size),
+        dtype=torch.float32,
+    ).reshape(batch, seq_len, q_size + 2 * kv_size)
+    key = fused[..., q_size : q_size + kv_size].reshape(batch, seq_len, 2, 4)
+    value = fused[..., q_size + kv_size :].reshape(batch, seq_len, 2, 4)
+
+    assert value.stride(0) > value.stride(1)
+    assert value.stride(2) == value.shape[3]
+    assert value.stride(3) == 1
+
+    slot_mapping = torch.tensor([[2], [5]], dtype=torch.int64)
+    input_pos = torch.tensor([[0], [0]], dtype=torch.int64)
+
+    cache.update(
+        input_pos=input_pos,
+        k_val=key,
+        v_val=value,
+        slot_mapping=slot_mapping,
+    )
+
+    expected_k = torch.zeros_like(cache.k_cache)
+    expected_v = torch.zeros_like(cache.v_cache)
+    key_flat = key[:, 0]
+    value_flat = value[:, 0]
+    for row, slot in enumerate(slot_mapping.view(-1).tolist()):
+        block = slot // page_table.page_size
+        offset = slot % page_table.page_size
+        expected_k[block, :, offset, :] = key_flat[row]
+        expected_v[block, :, offset, :] = value_flat[row]
+
+    torch.testing.assert_close(cache.k_cache, expected_k)
+    torch.testing.assert_close(cache.v_cache, expected_v)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
