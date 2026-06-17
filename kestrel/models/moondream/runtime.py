@@ -2087,17 +2087,10 @@ class MoondreamRuntime:
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
     def _prepare_decode_graph_step(self, slot: DecodeSlot, batch_size: int) -> None:
+        # Only host-side LoRA metadata stays live here; the paged-KV metadata is
+        # built inside the captured decode graph (see _run_decode_forward).
         if self._lora_workspace is not None:
             self._prepare_decode_lora_metadata(slot, batch_size)
-
-        # Build per-step paged-KV metadata buffers.
-        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
-        self.page_table.populate_paged_kv_metadata(
-            batch_idx=batch_idx,
-            input_pos=slot.meta.input_pos.gpu[:batch_size],
-            out_page_table=slot.paged_kv_page_table[:batch_size],
-            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
-        )
 
     def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
         # Use batch index 0 for all entries: page-table row 0 is initialized and
@@ -2170,9 +2163,22 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
+        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
+        # Build the paged-KV metadata here, inside the captured decode graph,
+        # rather than eagerly each step. It reads the static (pre-reserved) page
+        # table and the engine-written batch_idx/input_pos buffers and writes the
+        # slot's fixed metadata buffers, so a graph replay reproduces it
+        # bit-identically while folding the launch into the single graph replay
+        # (this is already how build_slot_mapping below is handled).
+        self.page_table.populate_paged_kv_metadata(
+            batch_idx=batch_idx,
+            input_pos=slot.meta.input_pos.gpu[:batch_size],
+            out_page_table=slot.paged_kv_page_table[:batch_size],
+            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
+        )
         position_ids = slot.meta.input_pos.gpu[:batch_size].to(torch.long).view(-1, 1)
         slot_mapping = self.page_table.build_slot_mapping(
-            batch_idx=slot.meta.batch_idx.gpu[:batch_size].view(-1, 1),
+            batch_idx=batch_idx.view(-1, 1),
             positions=position_ids,
         )
         lora_workspace = self._lora_workspace
