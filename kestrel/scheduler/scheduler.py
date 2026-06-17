@@ -1091,10 +1091,10 @@ class GenerationScheduler:
                 pos_np[i] = seq.state.length
                 lora_np[i] = seq.state.lora_slot
 
-            # H2D copies for all metadata
-            batch_idx = slot.meta.batch_idx.copy_to_gpu(batch_size)
-            slot.meta.input_pos.copy_to_gpu(batch_size)
-            slot.meta.lora_slot_ids.copy_to_gpu(batch_size)
+            # One H2D copy stages batch_idx/input_pos/lora_slot_ids together
+            # (they share a packed buffer) instead of three separate launches.
+            slot.meta.copy_inputs_to_gpu()
+            batch_idx = slot.meta.batch_idx.gpu[:batch_size]
 
             # Gather decode inputs from _pending_token_ids into slot staging.
             token_ids = slot.decode_token_ids[:batch_size]

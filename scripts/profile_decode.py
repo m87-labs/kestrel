@@ -397,10 +397,8 @@ def main():
         for i, seq in enumerate(seq_states):
             slot.meta.input_pos.cpu[i] = seq.length
 
-        # H2D copies for metadata
-        slot.meta.batch_idx.copy_to_gpu(args.batch_size)
-        slot.meta.input_pos.copy_to_gpu(args.batch_size)
-        slot.meta.lora_slot_ids.copy_to_gpu(args.batch_size)
+        # One H2D copy stages batch_idx/input_pos/lora_slot_ids together.
+        slot.meta.copy_inputs_to_gpu()
 
         # Stage decode inputs
         slot.decode_token_ids[: args.batch_size].copy_(token_ids, non_blocking=True)
