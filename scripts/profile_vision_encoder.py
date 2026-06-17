@@ -117,7 +117,6 @@ def patch_vision_encoder_with_nvtx(detailed: bool = True) -> None:
                 bias=ln.bias,
                 out=x_norm_buf,
                 eps=float(ln.eps),
-                fallback_to_torch=True,
             )
             return x_norm_buf
 
