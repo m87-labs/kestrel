@@ -1,6 +1,9 @@
 """Shared host/device buffer helpers."""
 
+from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -132,3 +135,106 @@ class CpuGpuBuffer:
         if n is None:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
+
+
+@dataclass
+class PackedField:
+    """A named ``cpu``/``gpu``/``np`` view into a slice of a :class:`PackedBuffer`.
+
+    Exposes the subset of the :class:`CpuGpuBuffer` surface that metadata
+    staging code reads/writes; the three views share storage with the packed
+    buffer, so host-side writes (via ``cpu`` or ``np``) are picked up by the
+    parent buffer's single ``copy_to_gpu``.
+    """
+
+    cpu: torch.Tensor
+    gpu: torch.Tensor
+    np: np.ndarray | None
+
+
+class PackedBuffer:
+    """Pack several named tensors of mixed dtype/shape into one CPU/GPU buffer
+    pair so the whole group stages to the device in a single ``cudaMemcpyAsync``
+    instead of one copy per field.
+
+    The backing store is a flat ``uint8`` buffer; each field is an aligned,
+    contiguous ``view(dtype).view(shape)`` slice exposed as an attribute
+    returning a :class:`PackedField`. This is the staging-time complement to
+    :class:`CpuGpuBuffer`: reach for it wherever several small per-step or
+    per-batch metadata tensors are filled on the host and shipped together
+    (prefill/decode metadata, gather indices, …) to cut per-launch overhead.
+
+    Fields keep their own ``cpu``/``gpu``/``np`` views, so call sites that
+    already use ``CpuGpuBuffer`` fields (``field.np[...] = ...`` on the host,
+    ``field.gpu[...]`` on the device) work unchanged; only the copy collapses
+    from N calls to one ``copy_to_gpu()``.
+
+    ``copy_to_gpu`` transfers the *entire* buffer (every field, full capacity)
+    in one contiguous copy. Unused tails of a field are shipped but never read
+    by consumers that slice to the live length, so size the buffer to the
+    working set rather than a loose upper bound.
+    """
+
+    # Every field starts at an 8-byte boundary, which satisfies the alignment
+    # requirement of ``Tensor.view(dtype)`` for any packed dtype up to 8 bytes.
+    _ALIGN = 8
+
+    def __init__(
+        self,
+        fields: Iterable[tuple[str, Sequence[int], torch.dtype]],
+        *,
+        device: torch.device,
+        pin_memory: bool = False,
+        with_numpy: bool = True,
+    ) -> None:
+        specs = [
+            (str(name), tuple(int(s) for s in shape), dtype)
+            for name, shape, dtype in fields
+        ]
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        for _, shape, dtype in specs:
+            elem_size = torch.empty((), dtype=dtype).element_size()
+            nbytes = elem_size * prod(shape)
+            cursor = -(-cursor // self._ALIGN) * self._ALIGN  # round up to align
+            offsets.append((cursor, nbytes))
+            cursor += nbytes
+        total = max(1, -(-cursor // self._ALIGN) * self._ALIGN)
+
+        pin = pin_memory and device.type == "cuda"
+        self.device = device
+        self.nbytes = total
+        self.cpu = torch.zeros(total, dtype=torch.uint8, device="cpu", pin_memory=pin)
+        self.gpu = torch.zeros(total, dtype=torch.uint8, device=device)
+        self._fields: dict[str, PackedField] = {}
+
+        for (name, shape, dtype), (offset, nbytes) in zip(specs, offsets):
+            raw_cpu = self.cpu[offset : offset + nbytes]
+            raw_gpu = self.gpu[offset : offset + nbytes]
+            cpu_view = raw_cpu.view(dtype).view(shape)
+            gpu_view = raw_gpu.view(dtype).view(shape)
+            np_view = (
+                cpu_view.numpy()
+                if with_numpy and dtype != torch.bfloat16
+                else None
+            )
+            self._fields[name] = PackedField(cpu=cpu_view, gpu=gpu_view, np=np_view)
+
+    def __getattr__(self, name: str) -> PackedField:
+        # Only consulted when normal attribute lookup misses, so the real
+        # instance attributes (cpu/gpu/device/_fields) resolve directly.
+        fields = self.__dict__.get("_fields")
+        if fields is not None and name in fields:
+            return fields[name]
+        raise AttributeError(name)
+
+    def field(self, name: str) -> PackedField:
+        return self._fields[name]
+
+    def copy_to_gpu(self) -> torch.Tensor:
+        """Stage every field to the device in one contiguous H2D copy."""
+        return self.gpu.copy_(self.cpu, non_blocking=True)
+
+    def copy_to_cpu(self) -> torch.Tensor:
+        """Copy every field back to the host in one D2H copy (caller syncs)."""
+        return self.cpu.copy_(self.gpu, non_blocking=True)
