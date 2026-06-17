@@ -26,36 +26,67 @@ import torch
 from torch import Tensor
 
 from kestrel.device import make_event
-from kestrel.utils import CpuGpuBuffer
+from kestrel.utils import CpuGpuBuffer, PackedBuffer
 
 
-@dataclass
 class DecodeMetaBuffers:
     """Per-slot pinned host metadata buffers for H2D copies.
 
-    These buffers hold the batch metadata (batch indices, positions, LoRA slots)
-    that are copied to GPU at the start of each decode step. Each slot needs its
-    own buffers to prevent the CPU from overwriting the pinned source while a
-    previous step's H2D copy is still in flight.
+    The per-step decode inputs the scheduler stages every step — ``batch_idx``,
+    ``input_pos`` and ``lora_slot_ids`` — share one :class:`PackedBuffer`, so
+    they upload in a single H2D copy (``copy_inputs_to_gpu``) instead of three.
+    They are exposed as :class:`PackedField` views, so call sites read/write
+    ``.np``/``.cpu``/``.gpu`` exactly as before. The MoE-LoRA ``active_*``
+    buffers are staged separately (only on the LoRA path), so they stay
+    individual CpuGpuBuffers.
 
-    The pinned memory ensures DMA transfers don't require CPU involvement after
-    the copy is initiated.
+    Each slot needs its own buffers to prevent the CPU from overwriting the
+    pinned source while a previous step's H2D copy is still in flight.
     """
 
-    batch_idx: CpuGpuBuffer  # int64 [max_batch] - sequence batch indices
-    input_pos: CpuGpuBuffer  # int32 [max_batch] - token positions
-    lora_slot_ids: CpuGpuBuffer  # int32 [max_batch] - LoRA slot assignments
-    active_token_ids: CpuGpuBuffer  # int32 [max_batch] - token-major MoE LoRA ids
-    active_lora_ids: CpuGpuBuffer  # int32 [max_batch] - active MoE LoRA ids
-    # int32 [max_loras + 4]. Layout:
-    #   [0] active LoRA count
-    #   [1] active max rank
-    #   [2] active token count
-    #   [3:] per-active-LoRA token-start offsets, plus one sentinel end offset
-    # The sentinel lets kernels read each range as meta[3 + i]..meta[4 + i]
-    # without a last-route special case.
-    active_lora_meta: CpuGpuBuffer
-    moe_lora_metadata: Any | None = None
+    def __init__(self, *, max_batch_slots: int, device: torch.device) -> None:
+        self._inputs = PackedBuffer(
+            [
+                ("batch_idx", (max_batch_slots,), torch.int64),  # sequence batch idx
+                ("input_pos", (max_batch_slots,), torch.int32),  # token positions
+                ("lora_slot_ids", (max_batch_slots,), torch.int32),  # LoRA slots
+            ],
+            device=device,
+            pin_memory=True,
+        )
+        # token-major MoE LoRA ids
+        self.active_token_ids = CpuGpuBuffer(
+            max_batch_slots, dtype=torch.int32, device=device, pin_memory=True
+        )
+        # active MoE LoRA ids
+        self.active_lora_ids = CpuGpuBuffer(
+            max_batch_slots, dtype=torch.int32, device=device, pin_memory=True
+        )
+        # int32 [max_loras + 4]; max_loras == max_batch_slots - 1 (slot 0 == no
+        # LoRA), so + 3 here. Layout: [0] active LoRA count, [1] active max rank,
+        # [2] active token count, [3:] per-active-LoRA token-start offsets plus
+        # one sentinel end offset (so kernels read meta[3+i]..meta[4+i] with no
+        # last-route special case).
+        self.active_lora_meta = CpuGpuBuffer(
+            max_batch_slots + 3, dtype=torch.int32, device=device, pin_memory=True
+        )
+        self.moe_lora_metadata: Any | None = None
+
+    @property
+    def batch_idx(self):
+        return self._inputs.batch_idx
+
+    @property
+    def input_pos(self):
+        return self._inputs.input_pos
+
+    @property
+    def lora_slot_ids(self):
+        return self._inputs.lora_slot_ids
+
+    def copy_inputs_to_gpu(self) -> None:
+        """Stage batch_idx/input_pos/lora_slot_ids to the GPU in one H2D copy."""
+        self._inputs.copy_to_gpu()
 
 
 @dataclass
@@ -185,47 +216,9 @@ def create_decode_slot(
     # runtime.py -> decode_slot.py -> scheduler/transfer.py -> scheduler.py -> runtime.py
     from kestrel.scheduler.transfer import RenderBuffer
 
-    # Per-slot pinned host buffers for H2D metadata
-    meta = DecodeMetaBuffers(
-        batch_idx=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int64,
-            device=device,
-            pin_memory=True,
-        ),
-        input_pos=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-        lora_slot_ids=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-        active_token_ids=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-        active_lora_ids=CpuGpuBuffer(
-            max_batch_slots,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-        active_lora_meta=CpuGpuBuffer(
-            # max_loras == max_batch_slots - 1 because LoRA slot 0 means no LoRA.
-            # The +4 layout above therefore becomes max_batch_slots + 3 here.
-            max_batch_slots + 3,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
-        ),
-    )
+    # Per-slot pinned host buffers for H2D metadata. batch_idx/input_pos/
+    # lora_slot_ids are packed for a single per-step H2D copy.
+    meta = DecodeMetaBuffers(max_batch_slots=max_batch_slots, device=device)
 
     # Per-slot RenderBuffer for D2H copies of sampled ids + logprobs.
     # Moondream's coord/size aux values use a separate runtime-owned
