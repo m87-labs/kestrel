@@ -77,14 +77,13 @@ def vision_encoder(
     x = x + module.pos_emb
     early = None
     # Cross-arch: ``_layernorm_bias_into`` dispatches to the .so kernel
-    # on CUDA / the Metal kernel on MPS, falling through to torch on
-    # any unsupported config.
+    # on CUDA / the Metal kernel on MPS. The kernel handles the SigLIP
+    # vision config directly and raises on anything unsupported.
     x_norm_buf = torch.empty(x.shape, device=x.device, dtype=x.dtype)
 
     def _layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
         _layernorm_bias_into(
             x_norm_buf, x, ln.weight, ln.bias, float(ln.eps),
-            fallback_to_torch=True,
         )
         return x_norm_buf
 
