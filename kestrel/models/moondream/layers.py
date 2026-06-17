@@ -38,10 +38,10 @@ class LayerNormWeights:
 
 
 def layer_norm(x: torch.Tensor, w: LayerNormWeights) -> torch.Tensor:
-    # Cross-arch: dispatches to the .so kernel on CUDA, the Metal
-    # kernel on MPS. Anything else (or any unsupported config — fp16 on
-    # CUDA, non-mul-of-8 last dim) falls through to ``F.layer_norm``.
-    return _layernorm_bias(x, w.weight, w.bias, fallback_to_torch=True)
+    # Cross-arch: dispatches to the .so kernel on CUDA, the Metal kernel
+    # on MPS. The kernel handles Moondream's configs directly and raises
+    # on anything unsupported (no torch fallback).
+    return _layernorm_bias(x, w.weight, w.bias)
 
 
 @dataclass
