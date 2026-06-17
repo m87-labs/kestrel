@@ -42,42 +42,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def _load_dotenv(path: Path) -> None:
-    for raw_line in path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export ") :].strip()
-        if not key or os.environ.get(key):
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        os.environ[key] = value
-
-
-def ensure_moondream_api_key() -> None:
-    if os.environ.get("MOONDREAM_API_KEY"):
-        return
-
-    env_path = REPO_ROOT / ".env"
-    if env_path.exists():
-        _load_dotenv(env_path)
-        if os.environ.get("MOONDREAM_API_KEY"):
-            return
-        detail = f"{env_path} exists but does not define MOONDREAM_API_KEY"
-    else:
-        detail = f"{env_path} does not exist"
-
-    raise RuntimeError(
-        "MOONDREAM_API_KEY is not set. chartqa_eval.py checked the process "
-        f"environment and tried to load {env_path}; {detail}."
-    )
-
-
 from kestrel.config import RuntimeConfig
 from kestrel.engine import EngineMetrics, InferenceEngine
 
@@ -256,7 +220,6 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
-    ensure_moondream_api_key()
     runtime_kwargs: Dict[str, Any] = dict(
         model=cfg.model,
         max_batch_size=cfg.max_batch_size,
