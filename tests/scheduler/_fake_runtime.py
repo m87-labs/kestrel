@@ -108,6 +108,8 @@ class FakeRuntime:
         # Identity
         self.model_name = model_name
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
+        # No speculative decoding in the fake; decode one token per step.
+        self.spec = None
 
         # Capacity / shape
         self.max_batch_size = max_batch_size
