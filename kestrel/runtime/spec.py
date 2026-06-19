@@ -6,10 +6,10 @@ inert on its own: a runtime that leaves
 :attr:`~kestrel.runtime.protocol.AutoregressiveRuntime.spec` as ``None`` behaves
 exactly as a non-speculative runtime, so adding this module changes no behavior.
 
-The full design lives in ``docs/speculative-decoding-design.md`` in
-``kestrel-proprietary``. This scaffolding deliberately covers only the pieces a
-proposer and a runtime advertise; the verify/accept and hybrid-state hooks land
-with scheduler integration, where they are actually consumed.
+The full design lives in the speculative-decoding design doc. This scaffolding
+deliberately covers only the pieces a proposer and a runtime advertise; the
+verify/accept and hybrid-state hooks land with scheduler integration, where they
+are actually consumed.
 """
 
 from __future__ import annotations
@@ -40,9 +40,8 @@ class SpecProposer(Protocol):
     """Produces draft tokens for the target model to verify.
 
     Implementations live alongside the model they draft for (e.g. the DFlash
-    drafter in ``kestrel-proprietary``). The context argument types are
-    intentionally left open here; they are pinned down with scheduler
-    integration, the PR that first consumes them.
+    drafter). The context argument types are intentionally left open here; they
+    are pinned down with scheduler integration, the PR that first consumes them.
     """
 
     # Drafts proposed per step (K).
