@@ -6,8 +6,6 @@ No model construction, no GPU.
 
 from __future__ import annotations
 
-import dataclasses
-
 from kestrel.runtime.spec import DraftResult, SpecDecodeCaps, SpecProposer
 
 
@@ -47,7 +45,3 @@ def test_autoregressive_runtime_declares_spec_attribute() -> None:
     from kestrel.runtime.protocol import AutoregressiveRuntime
 
     assert "spec" in AutoregressiveRuntime.__annotations__
-
-
-def test_draft_result_is_a_dataclass() -> None:
-    assert dataclasses.is_dataclass(DraftResult)

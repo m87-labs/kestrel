@@ -101,7 +101,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     # today) means one token per decode step, identical to non-speculative
     # behavior; a non-``None`` value advertises a drafter the scheduler can use.
     # Inert until scheduler integration reads it.
-    spec: "SpecDecodeCaps | None"
+    spec: SpecDecodeCaps | None
 
     # Streams
     copy_stream: Any

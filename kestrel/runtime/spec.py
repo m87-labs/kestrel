@@ -31,8 +31,8 @@ class DraftResult:
     acceptance path.
     """
 
-    token_ids: "torch.Tensor"
-    draft_probs: "torch.Tensor | None" = None
+    token_ids: torch.Tensor
+    draft_probs: torch.Tensor | None = None
 
 
 @runtime_checkable
