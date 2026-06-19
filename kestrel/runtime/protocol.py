@@ -29,6 +29,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
+from kestrel.runtime.spec import SpecDecodeCaps
 from kestrel.runtime.state import (
     PrefillClassification,
     PreparedSequence,
@@ -95,6 +96,12 @@ class AutoregressiveRuntime(Runtime, Protocol):
     max_seq_length: int
     image_prefix_length: int
     vocab_size: int
+
+    # Speculative decoding capability. ``None`` (the default on every runtime
+    # today) means one token per decode step, identical to non-speculative
+    # behavior; a non-``None`` value advertises a drafter the scheduler can use.
+    # Inert until scheduler integration reads it.
+    spec: SpecDecodeCaps | None
 
     # Streams
     copy_stream: Any

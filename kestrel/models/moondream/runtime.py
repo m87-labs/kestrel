@@ -486,6 +486,9 @@ class MoondreamRuntime:
         self._cfg = cfg
         self.device = cfg.resolved_device()
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
+        # Speculative decoding is not wired for Moondream; decode one token per
+        # step as before. See kestrel.runtime.spec / the spec-decode design doc.
+        self.spec = None
         self.dtype = cfg.resolved_dtype()
         set_device(self.device)
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
