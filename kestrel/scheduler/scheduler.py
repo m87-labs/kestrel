@@ -17,6 +17,7 @@ from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
     AutoregressiveRuntime,
+    SequenceState,
     TextToken,
     Token,
 )
@@ -397,7 +398,14 @@ class GenerationScheduler:
         * depth-1 speculation (zombies): the next forward is launched only
           after committing the step two behind it, so a sequence that ends
           rides exactly one in-flight step — no extra zombie waste.
+
+        When the runtime advertises speculative decoding (``runtime.spec`` is
+        not ``None``) the loop drives the spec macro-step path instead; the
+        single-token pipeline below runs unchanged when ``runtime.spec`` is
+        ``None`` (byte-for-byte identical behavior).
         """
+        if self.runtime.spec is not None:
+            return self._advance_spec()
         progressed = False
         pipeline = self._pipeline
         with stream_context(self._compute_stream):
@@ -493,6 +501,114 @@ class GenerationScheduler:
             if step is not None:
                 self.commit_step(step)
                 pipeline.on_step_completed()
+
+    # ------------------------------------------------------------------
+    # Speculative decode path
+    #
+    # When ``runtime.spec`` is set the runtime exposes a per-macro-step
+    # decoder (draft + verify + greedy-accept + commit, see
+    # ``kestrel.runtime.spec.SpecDecoder``). One macro-step advances each active
+    # sequence by a *variable* amount (a_i + 1 tokens). The runtime owns all
+    # device state (persistent pool + reused CUDA graphs + GDN ring buffers); the
+    # scheduler only admits/retires sequences and stages the returned tokens.
+    #
+    # This path is deliberately synchronous (the spec decoder samples + commits
+    # on the GPU itself and reads accept counts back to the host each step), so
+    # it does not use the single-token depth-1 pipeline above. The non-spec path
+    # is untouched.
+    # ------------------------------------------------------------------
+
+    def _advance_spec(self) -> bool:
+        progressed = False
+        with stream_context(self._compute_stream):
+            progressed |= self._spec_admit()
+            progressed |= self._spec_decode_step()
+        return progressed
+
+    def _spec_admit(self) -> bool:
+        """Admit waiting requests into free spec rows (prefill + first token)."""
+        decoder = self.runtime.spec.decoder
+        if decoder is None:
+            raise RuntimeError("runtime.spec set without a decoder")
+        progressed = False
+        while decoder.free_slots > 0:
+            request = next(
+                (r for r in self.waiting if self._is_launchable_request(r)), None
+            )
+            if request is None:
+                break
+            lifecycle = request.lifecycle
+            prompt_ids = [int(t.token_id) for t in request.prefill_tokens]
+            # Admission capacity is the decoder's free rows: the spec decoder
+            # owns a fixed, pre-reserved pool of page-table rows (its captured
+            # graphs depend on them), so ``runtime.can_reserve`` -- which gates on
+            # the shared page/slot pool those rows have already claimed -- does
+            # not apply here.
+            self.waiting.remove(request)
+            lifecycle.prefill_started_at = time.perf_counter()
+            lifecycle.transition(RequestPhase.PREFILLING)
+            # batch_idx is assigned by ``admit`` (it picks the spec pool row).
+            state = SequenceState(
+                batch_idx=-1,
+                length=len(prompt_ids),
+                max_length=request.target_length,
+                prompt_length=len(prompt_ids),
+                lora_slot=request.lora_slot,
+            )
+            try:
+                with torch.inference_mode():
+                    first_token_id = decoder.admit(state, prompt_ids)
+            except Exception as exc:
+                self._fail_request_early(request, exc)
+                progressed = True
+                continue
+
+            lifecycle.sequence_state = state
+            lifecycle.prefill_completed_at = time.perf_counter()
+            self.runtime.active_sequences[state.batch_idx] = state
+            request.skill_state.on_prefill(self.runtime)
+
+            # Stage the first (prefill/bonus) token exactly like the non-spec
+            # prefill path: consume_step + streaming + finish check.
+            token = TextToken(token_id=int(first_token_id))
+            lifecycle.stage_token(self.runtime, token, logprob=None)
+            progressed = True
+            if self._mark_finished_if_needed(lifecycle):
+                lifecycle.finalized = True
+                decoder.retire(state)
+                self.runtime.active_sequences.pop(state.batch_idx, None)
+                continue
+            self.running.push(lifecycle)
+        return progressed
+
+    def _spec_decode_step(self) -> bool:
+        """Run one spec macro-step over the active running sequences."""
+        decoder = self.runtime.spec.decoder
+        active = [
+            seq
+            for seq in self.running
+            if not seq.finished and seq.sequence_state is not None
+        ]
+        if not active:
+            return False
+
+        states = [seq.state for seq in active]
+        with torch.inference_mode():
+            result = decoder.step(states)
+
+        for seq, new_token_ids in zip(active, result.tokens):
+            for token_id in new_token_ids:
+                # Advance KV length to mirror the committed token.
+                seq.state.advance()
+                token = TextToken(token_id=int(token_id))
+                seq.stage_token(self.runtime, token, logprob=None)
+                if self._mark_finished_if_needed(seq):
+                    seq.finalized = True
+                    self.running.remove(seq)
+                    decoder.retire(seq.state)
+                    self.runtime.active_sequences.pop(seq.state.batch_idx, None)
+                    break
+        return True
 
     def pop_completed(self) -> List[SchedulerResult]:
         """Retrieve all completed results accumulated so far."""
@@ -1326,6 +1442,12 @@ class GenerationScheduler:
         was finalized earlier (in _mark_finished_if_needed or schedule_decode_step)
         but resource release was deferred because inflight_refs > 0.
         """
+        # Speculative decoding: the spec decoder owns the page-table rows (a
+        # fixed, persistently-reserved pool backing its captured CUDA graphs).
+        # Releasing the batch_idx here would erase pages out from under those
+        # graphs; row reuse is handled by ``decoder.retire`` at finish instead.
+        if self.runtime.spec is not None:
+            return
         if seq.state.batch_idx in self.runtime.active_sequences:
             try:
                 # The generated prefix was part of prefill, so only tokens
