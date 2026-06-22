@@ -12,8 +12,8 @@ as the HuggingFace ``tokenizers.Tokenizer`` class today; no abstraction
 exists for it yet because there is no concrete second implementation.
 """
 
-from dataclasses import dataclass
-from typing import List, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,38 @@ class PrefixSuffix:
 
     prefix: List[int]
     suffix: List[int]
+
+
+@dataclass(frozen=True)
+class ChatTemplate:
+    """Token framing for rendering a multi-turn chat into a prompt.
+
+    Each turn is rendered by the chat skill as::
+
+        turn_prefix  <role-word>  role_suffix  <content>  turn_suffix
+
+    The role word (``roles[role]``) and the message content are encoded by
+    the skill via ``runtime.tokenizer``; only the framing/special tokens
+    live here, so a model never has to hard-code the token id of "user" or
+    "assistant". After the final turn the skill appends the assistant
+    opener — ``turn_prefix <assistant-word> role_suffix`` followed by
+    ``assistant_open`` (or ``assistant_open_reasoning`` when reasoning is
+    enabled). ``post_reasoning_prefix`` is force-injected once the model
+    emits ``answer_id`` (the reasoning→answer boundary). ``turn_end_ids``
+    are the token ids that terminate an assistant turn; the scheduler stops
+    decoding on them in addition to ``eos_id``.
+    """
+
+    turn_prefix: List[int]
+    role_suffix: List[int]
+    turn_suffix: List[int]
+    assistant_open: List[int]
+    assistant_open_reasoning: List[int]
+    post_reasoning_prefix: List[int]
+    turn_end_ids: List[int]
+    roles: Dict[str, str]
+    bos: List[int] = field(default_factory=list)
+    supports_system: bool = True
 
 
 @runtime_checkable
@@ -69,6 +101,14 @@ class PromptTemplate(Protocol):
     def query(self) -> Optional[QueryTemplate]:
         """Token sequences for the question-answering skill."""
 
+    def chat(self) -> Optional["ChatTemplate"]:
+        """Token framing for multi-turn chat, or ``None``.
+
+        ``None`` means the model has no native multi-turn chat format; the
+        chat skill then falls back to flattening the conversation into the
+        single-turn ``query`` prompt.
+        """
+
     def detect(self) -> Optional[PrefixSuffix]:
         """Prefix/suffix for the detect skill."""
 
@@ -80,6 +120,7 @@ class PromptTemplate(Protocol):
 
 
 __all__ = [
+    "ChatTemplate",
     "PrefixSuffix",
     "PromptTemplate",
     "QueryTemplate",

@@ -545,12 +545,15 @@ class InferenceEngine:
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
+        # A skill may carry media it pulled out of its own prompt (e.g. an
+        # image inside chat messages); prefer it over the top-level argument.
+        effective_image = built.image if built.image is not None else image
         submit_fn = self.submit_streaming if stream else self.submit
         return await submit_fn(
             built.request_context,
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
-            image=image,
+            image=effective_image,
             temperature=built.temperature,
             top_p=built.top_p,
             _logprobs=return_logprobs,
@@ -646,6 +649,27 @@ class InferenceEngine:
                 "reasoning": reasoning,
                 "stream": stream,
                 "spatial_refs": spatial_refs,
+            },
+            settings=settings,
+            stream=stream,
+        )
+
+    async def chat(
+        self,
+        messages: Optional[Sequence[Mapping[str, object]]] = None,
+        *,
+        reasoning: bool = False,
+        stream: bool = False,
+        image: Optional[np.ndarray | bytes] = None,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> Union[EngineResult, EngineStream]:
+        return await self._run_skill(
+            "chat",
+            image=image,
+            prompt={
+                "messages": messages,
+                "reasoning": reasoning,
+                "stream": stream,
             },
             settings=settings,
             stream=stream,
