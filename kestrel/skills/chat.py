@@ -1,24 +1,21 @@
 """Shared, model-agnostic chat skill (OpenAI-compatible message shape).
 
-``ChatSkill`` is a *base* capability: a model "implements" it by exposing a
-``chat()`` template from its ``prompt_template`` (see
-:class:`kestrel.models.protocols.ChatTemplate`). The skill itself owns the
-generic parts — validating OpenAI-style ``messages``, extracting at most one
-image, rendering the conversation into prompt tokens, interpreting the decode
-stream, and materialising an assistant ``message`` — so the same instance
-serves any model.
+``ChatSkill`` is a *base* capability for models with a native multi-turn
+chat format: a model opts in by exposing a ``chat()`` prompt template (see
+:class:`kestrel.models.protocols.ChatTemplate`). The skill owns the generic
+parts — validating OpenAI-style ``messages``, extracting at most one image,
+rendering the conversation into prompt tokens with role markers, interpreting
+the decode stream, and materialising an assistant ``message``.
 
-Two rendering modes, selected per model:
+A model that needs different behaviour *subclasses* this skill rather than
+having the kernel branch on model specifics. For example a model with no
+trained chat format (Moondream) registers a subclass that flattens the
+conversation into its single-turn ``query`` prompt and reuses the query
+decode path — see ``kestrel.models.moondream.skills.chat``.
 
-* ``prompt_template.chat()`` returns a template → native multi-turn rendering
-  with role markers (ChatML-style ``<|im_start|>role ... <|im_end|>`` turns).
-* ``prompt_template.chat()`` returns ``None`` → the conversation is flattened
-  into the single-turn ``query`` prompt (Moondream, which has no trained
-  multi-turn chat format).
-
-Validation is plain Python (raises ``ValueError``); pydantic stays at the HTTP
-boundary. The ``output`` shape (``{"message": {...}, "finish_reason": ...}``)
-maps directly onto an OpenAI chat-completion *choice*, so a future
+Validation is plain Python (raises ``ValueError``); pydantic stays at the
+HTTP boundary. The ``output`` shape (``{"message": {...}, "finish_reason":
+...}``) maps directly onto an OpenAI chat-completion *choice*, so a future
 ``/v1/chat/completions`` route is a thin wrapper.
 """
 
@@ -53,8 +50,12 @@ _ROLES = ("system", "user", "assistant")
 
 
 @dataclass(slots=True)
-class _ChatMessage:
-    """One validated turn: role + flattened text (image handled separately)."""
+class ChatMessage:
+    """One validated turn: role + flattened text (image handled separately).
+
+    Part of the subclass contract: a ``ChatSkill`` subclass receives these
+    via ``ChatRequest.messages``.
+    """
 
     role: str
     text: str
@@ -65,14 +66,20 @@ class _ChatMessage:
 class ChatRequest:
     """Validated chat payload carried to decode."""
 
-    messages: Tuple[_ChatMessage, ...]
+    messages: Tuple[ChatMessage, ...]
     image: "Optional[np.ndarray | bytes]"
     reasoning: bool
     stream: bool
 
 
 class ChatSkill(SkillSpec):
-    """Multi-turn chat capability shared across models."""
+    """Multi-turn chat for models with a native ``chat()`` template.
+
+    Subclass to customise rendering or decode for a model that does not have
+    one (override ``build_prompt_tokens`` / ``create_state``); ``build_request``
+    — OpenAI message validation and image extraction — is model-agnostic and
+    inherited.
+    """
 
     def __init__(self) -> None:
         super().__init__(name="chat")
@@ -93,7 +100,7 @@ class ChatSkill(SkillSpec):
         if len(raw) == 0:
             raise ValueError("messages must be a non-empty list")
 
-        messages: List[_ChatMessage] = []
+        messages: List[ChatMessage] = []
         found_image: "Optional[np.ndarray | bytes]" = None
         for idx, m in enumerate(raw):
             if not isinstance(m, _Mapping):
@@ -114,7 +121,7 @@ class ChatSkill(SkillSpec):
                         "at most one image is supported across chat messages"
                     )
                 found_image = img
-            messages.append(_ChatMessage(role=role, text=text, has_image=img is not None))
+            messages.append(ChatMessage(role=role, text=text, has_image=img is not None))
 
         if messages[-1].role != "user":
             raise ValueError("the last message must be from 'user'")
@@ -164,9 +171,13 @@ class ChatSkill(SkillSpec):
         if not isinstance(request_context, ChatRequest):
             raise ValueError("ChatSkill.build_prompt_tokens requires a ChatRequest")
         chat_tpl = runtime.prompt_template.chat()
-        if chat_tpl is not None:
-            return self._render_chat(runtime, chat_tpl, request_context)
-        return self._render_flattened(runtime, request_context)
+        if chat_tpl is None:
+            raise ValueError(
+                "model has no chat() template; a model without a native chat "
+                "format should register a ChatSkill subclass that renders chat "
+                "its own way (e.g. Moondream flattens into the query prompt)"
+            )
+        return self._render_chat(runtime, chat_tpl, request_context)
 
     def _render_chat(
         self, runtime: "MoondreamRuntime", ct, ctx: ChatRequest
@@ -201,27 +212,6 @@ class ChatSkill(SkillSpec):
         tokens.extend(TextToken(token_id=int(t)) for t in opener)
         return tokens
 
-    def _render_flattened(
-        self, runtime: "MoondreamRuntime", ctx: ChatRequest
-    ) -> List[Token]:
-        pt = runtime.prompt_template
-        template = pt.query()
-        if template is None:
-            raise ValueError("model supports neither a chat nor a query template")
-        question = _flatten_messages(ctx.messages)
-        pre = (
-            template.prefix_when_reasoning
-            if ctx.reasoning and template.prefix_when_reasoning is not None
-            else template.prefix
-        )
-        opener = template.reasoning_prefix if ctx.reasoning else template.answer_prefix
-        encoded = runtime.tokenizer.encode(question).ids if question else []
-        tokens: List[Token] = [TextToken(token_id=int(pt.bos_id))]
-        tokens.extend(TextToken(token_id=int(t)) for t in pre)
-        tokens.extend(TextToken(token_id=int(t)) for t in encoded)
-        tokens.extend(TextToken(token_id=int(t)) for t in opener)
-        return tokens
-
     # -- decode state ------------------------------------------------------
 
     def create_state(
@@ -233,19 +223,14 @@ class ChatSkill(SkillSpec):
         if not isinstance(request_context, ChatRequest):
             raise ValueError("ChatSkill.create_state requires a ChatRequest context")
         chat_tpl = runtime.prompt_template.chat()
-        if chat_tpl is not None:
-            post_reasoning = list(chat_tpl.post_reasoning_prefix)
-            turn_end = list(chat_tpl.turn_end_ids)
-        else:
-            template = runtime.prompt_template.query()
-            post_reasoning = list(template.post_reasoning_prefix) if template else []
-            turn_end = []
+        if chat_tpl is None:
+            raise ValueError("model has no chat() template for ChatSkill")
         return ChatSkillState(
             self,
             request,
             request_context,
-            post_reasoning_prefix=post_reasoning,
-            turn_end_ids=turn_end,
+            post_reasoning_prefix=list(chat_tpl.post_reasoning_prefix),
+            turn_end_ids=list(chat_tpl.turn_end_ids),
         )
 
 
@@ -434,32 +419,4 @@ def _coerce_image(obj: object) -> "np.ndarray | bytes":
     raise ValueError(f"unsupported image value of type {type(obj).__name__}")
 
 
-def _flatten_messages(messages: Sequence[_ChatMessage]) -> str:
-    """Render a conversation as a single question for models without a chat
-    template. A lone user turn (optionally with a system preamble) passes
-    through cleanly; longer histories are labelled best-effort."""
-    if len(messages) == 1:
-        return messages[0].text
-    system = ""
-    convo: List[_ChatMessage] = []
-    for msg in messages:
-        if msg.role == "system":
-            system = msg.text
-        else:
-            convo.append(msg)
-    if len(convo) == 1 and not system:
-        return convo[0].text
-    lines: List[str] = []
-    if system:
-        lines.append(system)
-    for i, msg in enumerate(convo):
-        is_last = i == len(convo) - 1
-        if is_last and msg.role == "user":
-            lines.append(msg.text)
-        else:
-            label = "User" if msg.role == "user" else "Assistant"
-            lines.append(f"{label}: {msg.text}")
-    return "\n\n".join(line for line in lines if line)
-
-
-__all__ = ["ChatRequest", "ChatSkill", "ChatSkillState"]
+__all__ = ["ChatMessage", "ChatRequest", "ChatSkill", "ChatSkillState"]

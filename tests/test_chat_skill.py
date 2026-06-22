@@ -1,5 +1,5 @@
-"""ChatSkill: message validation, prompt-token rendering (native chat
-template vs. flatten-into-query), and decode-state output shape."""
+"""ChatSkill: message validation, native chat-template rendering, decode-state
+output shape, and Moondream's flatten-into-query subclass."""
 
 from __future__ import annotations
 
@@ -12,18 +12,13 @@ import pytest
 from kestrel.models.protocols import ChatTemplate, QueryTemplate
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills.base import DecodeStep
-from kestrel.skills.chat import (
-    ChatRequest,
-    ChatSkill,
-    _ChatMessage,
-    _flatten_messages,
-)
+from kestrel.skills.chat import ChatMessage, ChatRequest, ChatSkill
 
-# Synthetic token ids for a Qwen-like chat template.
+# Synthetic token ids for a native (ChatML-like) chat template.
 IM_START, IM_END, NL, DNL, THINK_S, THINK_E = 900, 901, 198, 271, 800, 801
 
 
-def _qwen_chat_template() -> ChatTemplate:
+def _native_chat_template() -> ChatTemplate:
     return ChatTemplate(
         bos=[],
         turn_prefix=[IM_START],
@@ -38,17 +33,8 @@ def _qwen_chat_template() -> ChatTemplate:
     )
 
 
-def _md_query_template() -> QueryTemplate:
-    return QueryTemplate(
-        prefix=[10, 11],
-        answer_prefix=[20],
-        reasoning_prefix=[21],
-        post_reasoning_prefix=[3],
-    )
-
-
 @dataclass
-class _PromptTemplate:
+class _NativePromptTemplate:
     bos_id: int = 5
     eos_id: int = 99
     answer_id: int = THINK_E
@@ -58,13 +44,12 @@ class _PromptTemplate:
     start_ground_points_id: int = 0
     end_ground_id: int = 0
     _chat: Optional[ChatTemplate] = None
-    _query: Optional[QueryTemplate] = None
 
     def chat(self) -> Optional[ChatTemplate]:
         return self._chat
 
     def query(self) -> Optional[QueryTemplate]:
-        return self._query
+        return None
 
 
 class _Tokenizer:
@@ -77,17 +62,10 @@ class _Tokenizer:
         return "".join(chr(i) for i in ids)
 
 
-def _chat_runtime() -> SimpleNamespace:
+def _chat_runtime(chat: bool = True) -> SimpleNamespace:
+    tpl = _native_chat_template() if chat else None
     return SimpleNamespace(
-        prompt_template=_PromptTemplate(_chat=_qwen_chat_template()),
-        tokenizer=_Tokenizer(),
-    )
-
-
-def _flatten_runtime() -> SimpleNamespace:
-    return SimpleNamespace(
-        prompt_template=_PromptTemplate(answer_id=3, _query=_md_query_template()),
-        tokenizer=_Tokenizer(),
+        prompt_template=_NativePromptTemplate(_chat=tpl), tokenizer=_Tokenizer()
     )
 
 
@@ -99,7 +77,7 @@ def _ords(text: str) -> List[int]:
     return [ord(c) for c in text]
 
 
-# -- validation -----------------------------------------------------------
+# -- validation (generic, lives on the base) ------------------------------
 
 
 def test_build_request_accepts_minimal_conversation() -> None:
@@ -109,7 +87,7 @@ def test_build_request_accepts_minimal_conversation() -> None:
     ctx = built.request_context
     assert isinstance(ctx, ChatRequest)
     assert [(m.role, m.text) for m in ctx.messages] == [("user", "hi")]
-    assert ctx.reasoning is False  # chat defaults to non-thinking
+    assert ctx.reasoning is False
 
 
 def test_build_request_requires_messages() -> None:
@@ -186,16 +164,13 @@ def test_build_request_reasoning_opt_in_via_settings() -> None:
     assert built.request_context.reasoning is True
 
 
-# -- rendering: native chat template --------------------------------------
+# -- native chat rendering ------------------------------------------------
 
 
 def test_render_single_turn_chat() -> None:
     runtime = _chat_runtime()
     ctx = ChatRequest(
-        messages=(_ChatMessage("user", "hi"),),
-        image=None,
-        reasoning=False,
-        stream=False,
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
     )
     tokens = ChatSkill().build_prompt_tokens(runtime, ctx)
     expected = (
@@ -209,10 +184,10 @@ def test_render_multi_turn_with_system_and_reasoning() -> None:
     runtime = _chat_runtime()
     ctx = ChatRequest(
         messages=(
-            _ChatMessage("system", "be nice"),
-            _ChatMessage("user", "a"),
-            _ChatMessage("assistant", "b"),
-            _ChatMessage("user", "c"),
+            ChatMessage("system", "be nice"),
+            ChatMessage("user", "a"),
+            ChatMessage("assistant", "b"),
+            ChatMessage("user", "c"),
         ),
         image=None,
         reasoning=True,
@@ -228,42 +203,21 @@ def test_render_multi_turn_with_system_and_reasoning() -> None:
         + turn("user", "a")
         + turn("assistant", "b")
         + turn("user", "c")
-        + [IM_START] + _ords("assistant") + [NL] + [THINK_S, NL]  # reasoning opener
+        + [IM_START] + _ords("assistant") + [NL] + [THINK_S, NL]
     )
     assert _ids(tokens) == expected
 
 
-# -- rendering: flatten into query ----------------------------------------
-
-
-def test_render_flatten_single_turn_matches_query_shape() -> None:
-    runtime = _flatten_runtime()
+def test_base_chat_skill_requires_chat_template() -> None:
+    runtime = _chat_runtime(chat=False)  # chat() returns None
     ctx = ChatRequest(
-        messages=(_ChatMessage("user", "hi"),),
-        image=None,
-        reasoning=False,
-        stream=False,
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
     )
-    tokens = ChatSkill().build_prompt_tokens(runtime, ctx)
-    # bos + prefix + encoded(question) + answer_prefix
-    assert _ids(tokens) == [5, 10, 11] + _ords("hi") + [20]
+    with pytest.raises(ValueError, match="no chat\\(\\) template"):
+        ChatSkill().build_prompt_tokens(runtime, ctx)
 
 
-def test_flatten_messages_labels_history() -> None:
-    msgs = [
-        _ChatMessage("system", "sys"),
-        _ChatMessage("user", "u1"),
-        _ChatMessage("assistant", "a1"),
-        _ChatMessage("user", "u2"),
-    ]
-    assert _flatten_messages(msgs) == "sys\n\nUser: u1\n\nAssistant: a1\n\nu2"
-
-
-def test_flatten_messages_single_user_passthrough() -> None:
-    assert _flatten_messages([_ChatMessage("user", "just this")]) == "just this"
-
-
-# -- decode state ---------------------------------------------------------
+# -- native decode state --------------------------------------------------
 
 
 def _drive(state, runtime, ids: List[int]) -> None:
@@ -273,11 +227,10 @@ def _drive(state, runtime, ids: List[int]) -> None:
 
 def test_state_non_reasoning_strips_turn_end_token() -> None:
     runtime = _chat_runtime()
-    skill = ChatSkill()
     ctx = ChatRequest(
-        messages=(_ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
     )
-    state = skill.create_state(runtime, SimpleNamespace(), ctx)
+    state = ChatSkill().create_state(runtime, SimpleNamespace(), ctx)
     assert list(state.stop_token_ids(runtime)) == [IM_END]
     _drive(state, runtime, _ords("ok") + [IM_END])
     result = state.finalize(runtime, reason="stop")
@@ -289,18 +242,15 @@ def test_state_non_reasoning_strips_turn_end_token() -> None:
 
 def test_state_reasoning_splits_thinking_and_answer() -> None:
     runtime = _chat_runtime()
-    skill = ChatSkill()
     ctx = ChatRequest(
-        messages=(_ChatMessage("user", "hi"),), image=None, reasoning=True, stream=False
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=True, stream=False
     )
-    state = skill.create_state(runtime, SimpleNamespace(), ctx)
+    state = ChatSkill().create_state(runtime, SimpleNamespace(), ctx)
     state.on_prefill(runtime)
-    # reasoning text, then the answer_id boundary
     _drive(state, runtime, _ords("think"))
     state.consume_step(
         runtime, DecodeStep(token=TextToken(token_id=THINK_E), position=99)
     )
-    # the post-reasoning opener is now forced one token at a time
     assert list(state.allowed_token_ids(runtime)) == [DNL]
     _drive(state, runtime, [DNL])
     assert state.allowed_token_ids(runtime) is None
@@ -310,14 +260,102 @@ def test_state_reasoning_splits_thinking_and_answer() -> None:
     assert result.output["reasoning"] == {"text": "think"}
 
 
-def test_state_flatten_path_has_no_extra_stop_tokens() -> None:
-    runtime = _flatten_runtime()
-    skill = ChatSkill()
-    ctx = ChatRequest(
-        messages=(_ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+# -- Moondream flatten-into-query subclass --------------------------------
+
+
+@dataclass
+class _MdPromptTemplate:
+    bos_id: int = 5
+    eos_id: int = 0
+    answer_id: int = 3
+    thinking_id: int = 4
+    coord_id: int = 5
+    size_id: int = 6
+    start_ground_points_id: int = 7
+    end_ground_id: int = 9
+
+    def chat(self) -> None:
+        return None
+
+    def query(self) -> QueryTemplate:
+        return QueryTemplate(
+            prefix=[10, 11], answer_prefix=[20], reasoning_prefix=[21],
+            post_reasoning_prefix=[3],
+        )
+
+
+def _md_runtime(model_name: str = "moondream2") -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt_template=_MdPromptTemplate(),
+        tokenizer=_Tokenizer(),
+        model_name=model_name,
     )
-    state = skill.create_state(runtime, SimpleNamespace(), ctx)
-    assert state.stop_token_ids(runtime) is None
-    _drive(state, runtime, _ords("ok") + [99])  # 99 == eos_id, stripped
+
+
+def test_moondream_chat_flattens_to_query_tokens() -> None:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+    from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
+
+    runtime = _md_runtime()
+    chat_ctx = ChatRequest(
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+    )
+    chat_tokens = MoondreamChatSkill().build_prompt_tokens(runtime, chat_ctx)
+    query_tokens = QuerySkill().build_prompt_tokens(
+        runtime, QueryRequest(question="hi", image=None, reasoning=False, stream=False)
+    )
+    assert _ids(chat_tokens) == _ids(query_tokens)
+
+
+def test_moondream_flatten_messages_labels_history() -> None:
+    from kestrel.models.moondream.skills.chat import _flatten_messages
+
+    msgs = [
+        ChatMessage("system", "sys"),
+        ChatMessage("user", "u1"),
+        ChatMessage("assistant", "a1"),
+        ChatMessage("user", "u2"),
+    ]
+    assert _flatten_messages(msgs) == "sys\n\nUser: u1\n\nAssistant: a1\n\nu2"
+    assert _flatten_messages([ChatMessage("user", "just this")]) == "just this"
+
+
+def test_moondream_chat_finalizes_as_message() -> None:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    runtime = _md_runtime()
+    ctx = ChatRequest(
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+    )
+    state = MoondreamChatSkill().create_state(runtime, SimpleNamespace(), ctx)
+    _drive(state, runtime, _ords("Paris"))
     result = state.finalize(runtime, reason="stop")
-    assert result.output["message"]["content"] == "ok"
+    assert result.output == {
+        "message": {"role": "assistant", "content": "Paris"},
+        "finish_reason": "stop",
+    }
+
+
+def test_moondream_chat_inherits_query_suppression() -> None:
+    """Codex P2: flattened chat must mirror the query skill's md2 masking."""
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    skill = MoondreamChatSkill()
+    rt = _md_runtime("moondream2")
+
+    answer_ctx = ChatRequest(
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+    )
+    answer_state = skill.create_state(rt, SimpleNamespace(), answer_ctx)
+    assert list(answer_state.suppressed_token_ids(rt)) == [3]  # answer_id
+
+    think_ctx = ChatRequest(
+        messages=(ChatMessage("user", "hi"),), image=None, reasoning=True, stream=False
+    )
+    think_state = skill.create_state(rt, SimpleNamespace(), think_ctx)
+    assert list(think_state.suppressed_token_ids(rt)) == [0, 6]  # eos_id, size_id
+
+    # Non-moondream2 models are unaffected.
+    rt3 = _md_runtime("moondream3-preview")
+    state3 = skill.create_state(rt3, SimpleNamespace(), answer_ctx)
+    assert state3.suppressed_token_ids(rt3) is None

@@ -26,13 +26,14 @@ from .base import (
     SkillState,
     parse_settings,
 )
-from .chat import ChatRequest, ChatSkill, ChatSkillState
+from .chat import ChatMessage, ChatRequest, ChatSkill, ChatSkillState
 
 __all__ = [
     "AR_DEFAULT_MAX_NEW_TOKENS",
     "AR_DEFAULT_TEMPERATURE",
     "AR_DEFAULT_TOP_P",
     "BuiltRequest",
+    "ChatMessage",
     "ChatRequest",
     "ChatSkill",
     "ChatSkillState",
