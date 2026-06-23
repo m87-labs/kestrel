@@ -157,14 +157,16 @@ def test_build_request_extracts_image_from_data_url() -> None:
     assert built.request_context.messages[-1].text == "what is this?"
 
 
-def test_build_request_rejects_filesystem_path_image_url() -> None:
-    # image_url.url is untrusted; a server path must not be read as image bytes.
+@pytest.mark.parametrize("url", ["/etc/passwd", "https://example.com/cat.png"])
+def test_build_request_rejects_non_data_image_url(url: str) -> None:
+    # image_url.url is untrusted: only base64 data: URLs are accepted — no
+    # filesystem reads and no remote fetches.
     msgs = [
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "x"},
-                {"type": "image_url", "image_url": {"url": "/etc/passwd"}},
+                {"type": "image_url", "image_url": {"url": url}},
             ],
         }
     ]
