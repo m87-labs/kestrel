@@ -101,6 +101,11 @@ class ChatSkill(SkillSpec):
     inherited.
     """
 
+    # Per-model reasoning default when the caller doesn't pass ``reasoning``.
+    # The base is off; a model whose chat format defaults to thinking sets
+    # this True in its subclass (Qwen, Moondream).
+    default_reasoning: bool = False
+
     def __init__(self) -> None:
         super().__init__(name="chat")
 
@@ -154,7 +159,7 @@ class ChatSkill(SkillSpec):
                     )
                     break
 
-        reasoning = bool(prompt.get("reasoning", False))
+        reasoning = bool(prompt.get("reasoning", self.default_reasoning))
         if settings is not None and "reasoning" in settings:
             reasoning = bool(settings["reasoning"])
 
@@ -378,14 +383,18 @@ class ChatSkillState(SkillState):
     ) -> SkillFinalizeResult:
         tokenizer = runtime.tokenizer
         answer_text = tokenizer.decode(self._answer_tokens) if self._answer_tokens else ""
+        # Trim leading whitespace: in reasoning mode the model emits a "\n\n"
+        # separator after the thinking block before the answer proper.
+        answer_text = answer_text.lstrip()
         message: Dict[str, object] = {"role": "assistant", "content": answer_text}
-        output: Dict[str, object] = {"message": message, "finish_reason": reason}
+        # OpenRouter-style: reasoning is a string field on the message, separate
+        # from content (omitted when there's no reasoning).
         if self._reasoning_enabled and self._reasoning_tokens:
-            output["reasoning"] = {"text": tokenizer.decode(self._reasoning_tokens)}
+            message["reasoning"] = tokenizer.decode(self._reasoning_tokens)
         return SkillFinalizeResult(
             text=answer_text,
             tokens=list(self.tokens),
-            output=output,
+            output={"message": message, "finish_reason": reason},
         )
 
 

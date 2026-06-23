@@ -199,6 +199,26 @@ def test_build_request_reasoning_opt_in_via_settings() -> None:
     assert built.request_context.reasoning is True
 
 
+def test_base_reasoning_default_off() -> None:
+    built = ChatSkill().build_request(None, {"messages": [{"role": "user", "content": "hi"}]}, None)
+    assert built.request_context.reasoning is False
+
+
+def test_subclass_reasoning_default_on() -> None:
+    class _ThinkingChatSkill(ChatSkill):
+        default_reasoning = True
+
+    built = _ThinkingChatSkill().build_request(
+        None, {"messages": [{"role": "user", "content": "hi"}]}, None
+    )
+    assert built.request_context.reasoning is True
+    # Explicit opt-out still wins.
+    off = _ThinkingChatSkill().build_request(
+        None, {"messages": [{"role": "user", "content": "hi"}], "reasoning": False}, None
+    )
+    assert off.request_context.reasoning is False
+
+
 # -- native chat rendering ------------------------------------------------
 
 
@@ -300,8 +320,12 @@ def test_state_reasoning_splits_thinking_and_answer() -> None:
     assert state.allowed_token_ids(runtime) is None
     _drive(state, runtime, _ords("ans") + [IM_END])
     result = state.finalize(runtime, reason="stop")
-    assert result.output["message"] == {"role": "assistant", "content": "ans"}
-    assert result.output["reasoning"] == {"text": "think"}
+    # OpenRouter style: reasoning is a string on the message, beside content.
+    assert result.output["message"] == {
+        "role": "assistant",
+        "content": "ans",
+        "reasoning": "think",
+    }
 
 
 # -- Moondream flatten-into-query subclass --------------------------------

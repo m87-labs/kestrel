@@ -36,6 +36,9 @@ def _single_image(ctx: ChatRequest):
 class MoondreamChatSkill(ChatSkill):
     """Chat over Moondream by flattening the conversation into ``query``."""
 
+    # Moondream's query path defaults to reasoning on; honor that for chat.
+    default_reasoning = True
+
     def build_request(
         self,
         image: "Optional[np.ndarray | bytes]",
@@ -105,15 +108,22 @@ class MoondreamChatSkillState(QuerySkillState):
         self, runtime: "MoondreamRuntime", *, reason: str
     ) -> SkillFinalizeResult:
         result = super().finalize(runtime, reason=reason)
-        answer = result.output.get("answer", "")
-        output: Dict[str, object] = {
-            "message": {"role": "assistant", "content": answer},
-            "finish_reason": reason,
+        message: Dict[str, object] = {
+            "role": "assistant",
+            "content": result.output.get("answer", ""),
         }
-        if "reasoning" in result.output:
-            output["reasoning"] = result.output["reasoning"]
+        # OpenRouter-style: reasoning as a string on the message; Moondream's
+        # spatial grounding (if any) is preserved under reasoning_details.
+        reasoning = result.output.get("reasoning")
+        if reasoning:
+            message["reasoning"] = reasoning.get("text", "")
+            grounding = reasoning.get("grounding")
+            if grounding:
+                message["reasoning_details"] = {"grounding": grounding}
         return SkillFinalizeResult(
-            text=result.text, tokens=result.tokens, output=output
+            text=result.text,
+            tokens=result.tokens,
+            output={"message": message, "finish_reason": reason},
         )
 
 
