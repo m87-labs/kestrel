@@ -11,13 +11,12 @@ from typing import List, Optional
 import pytest
 
 from kestrel.models.protocols import ChatTemplate, QueryTemplate
-from kestrel.runtime.tokens import TextToken
+from kestrel.runtime.tokens import ImageMarker, TextToken
 from kestrel.skills.base import DecodeStep
 from kestrel.skills.chat import ChatRequest, ChatSkill
 
 # Synthetic token ids for a native (ChatML-like) chat template.
 IM_START, IM_END, NL, DNL, THINK_S, THINK_E = 900, 901, 198, 271, 800, 801
-VS, IPAD, VE = 700, 701, 702  # vision_start, image_pad, vision_end
 
 _IMG = "data:image/png;base64,aGk="  # decodes to b"hi" (content irrelevant here)
 
@@ -57,14 +56,14 @@ class _NativePromptTemplate:
 
 
 class _VisionChatSkill(ChatSkill):
-    """Test-only subclass that renders an image as the vision placeholder —
+    """Test-only subclass that renders an image as an ImageMarker sentinel —
     standing in for a model's multimodal chat subclass (e.g. Qwen)."""
 
     def render_content(self, tokenizer, parts):
         tokens = []
         for part in parts:
             if part.image_index is not None:
-                tokens.extend(TextToken(token_id=t) for t in (VS, IPAD, VE))
+                tokens.append(ImageMarker(index=part.image_index))
             elif part.text:
                 tokens.extend(TextToken(token_id=t) for t in tokenizer.encode(part.text).ids)
         return tokens
@@ -97,6 +96,13 @@ def _ctx(messages, reasoning: bool = False) -> ChatRequest:
 
 def _ids(tokens) -> List[int]:
     return [t.token_id for t in tokens]
+
+
+def _norm(tokens):
+    """TextToken -> its id; ImageMarker -> ("IMG", index). For mixed streams."""
+    return [
+        ("IMG", t.index) if isinstance(t, ImageMarker) else t.token_id for t in tokens
+    ]
 
 
 def _ords(text: str) -> List[int]:
@@ -253,16 +259,16 @@ def test_subclass_renders_multi_image_at_content_positions() -> None:
     ]
     tokens = _VisionChatSkill().build_prompt_tokens(runtime, _ctx(msgs))
     expected = (
-        # turn 1: image BEFORE text
-        [IM_START] + _ords("user") + [NL] + [VS, IPAD, VE] + _ords("a") + [IM_END, NL]
+        # turn 1: image marker BEFORE text
+        [IM_START] + _ords("user") + [NL] + [("IMG", 0)] + _ords("a") + [IM_END, NL]
         # turn 2: assistant text
         + [IM_START] + _ords("assistant") + [NL] + _ords("b") + [IM_END, NL]
-        # turn 3: image AFTER text
-        + [IM_START] + _ords("user") + [NL] + _ords("c") + [VS, IPAD, VE] + [IM_END, NL]
+        # turn 3: image marker AFTER text
+        + [IM_START] + _ords("user") + [NL] + _ords("c") + [("IMG", 1)] + [IM_END, NL]
         # generation opener
         + [IM_START] + _ords("assistant") + [NL] + [THINK_S, DNL, THINK_E, DNL]
     )
-    assert _ids(tokens) == expected
+    assert _norm(tokens) == expected
 
 
 def test_render_reasoning_opener() -> None:

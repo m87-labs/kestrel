@@ -22,6 +22,7 @@ from kestrel.runtime.state import (
 )
 from kestrel.runtime.tokens import (
     CoordToken,
+    ImageMarker,
     SizeToken,
     TextToken,
     Token,
@@ -31,6 +32,7 @@ __all__ = [
     "AutoregressiveRuntime",
     "CoordToken",
     "ExecutionShape",
+    "ImageMarker",
     "PrefillClassification",
     "PreparedSequence",
     "Runtime",

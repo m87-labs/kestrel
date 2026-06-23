@@ -52,4 +52,26 @@ class SizeToken(NamedTuple):
         return 1
 
 
-Token = TextToken | CoordToken | SizeToken
+class ImageMarker(NamedTuple):
+    """Sentinel marking where an image is spliced into the prompt.
+
+    Deliberately NOT a vocabulary id, so user text can never collide with it.
+    A model's runtime replaces it before the forward pass — Qwen expands it to
+    ``<|vision_start|><|image_pad|>×N<|vision_end|>``; Moondream injects the
+    image-embedding block. ``index`` is the image's position in the request's
+    ordered image list, so each marker maps to a specific image.
+    """
+
+    index: int
+
+    def cache_key(self) -> tuple:
+        """Cache key: (4, index) - 4 discriminates from other token types."""
+        return (4, self.index)
+
+    def kv_length(self) -> int:
+        # A single placeholder slot; the runtime expands it to the image's
+        # real token/embedding length during sequence preparation.
+        return 1
+
+
+Token = TextToken | CoordToken | SizeToken | ImageMarker
