@@ -21,7 +21,6 @@ HTTP boundary. The ``output`` shape (``{"message": {...}, "finish_reason":
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping as _Mapping, Sequence as _Sequence
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -398,6 +397,10 @@ def _load_image_part(part: "_Mapping") -> "np.ndarray | bytes":
 
 
 def _coerce_image(obj: object) -> "np.ndarray | bytes":
+    # Message content can come from untrusted callers (this payload maps onto
+    # an OpenAI HTTP request), so never read a server filesystem path here:
+    # accept only in-memory images and data: URLs. A caller with a file on
+    # disk loads it themselves (raw bytes or a numpy array).
     if isinstance(obj, (bytes, bytearray)):
         return bytes(obj)
     if isinstance(obj, np.ndarray):
@@ -408,14 +411,13 @@ def _coerce_image(obj: object) -> "np.ndarray | bytes":
             return load_image_bytes_from_base64(value)
         if value.startswith(("http://", "https://")):
             raise ValueError(
-                "remote image URLs are not supported yet; pass a data: URL, a "
-                "local file path, raw bytes, or a numpy array"
+                "remote image URLs are not supported yet; pass a data: URL, "
+                "raw bytes, or a numpy array"
             )
-        if os.path.exists(value):
-            with open(value, "rb") as handle:
-                return handle.read()
-        # Last resort: treat the string as a raw base64 payload.
-        return load_image_bytes_from_base64(value)
+        raise ValueError(
+            "an image string must be a data: URL; pass raw bytes or a numpy "
+            "array for an in-memory image"
+        )
     raise ValueError(f"unsupported image value of type {type(obj).__name__}")
 
 

@@ -157,6 +157,21 @@ def test_build_request_extracts_image_from_data_url() -> None:
     assert built.request_context.messages[-1].text == "what is this?"
 
 
+def test_build_request_rejects_filesystem_path_image_url() -> None:
+    # image_url.url is untrusted; a server path must not be read as image bytes.
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "x"},
+                {"type": "image_url", "image_url": {"url": "/etc/passwd"}},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="data: URL"):
+        ChatSkill().build_request(None, {"messages": msgs}, None)
+
+
 def test_build_request_reasoning_opt_in_via_settings() -> None:
     built = ChatSkill().build_request(
         None, {"messages": [{"role": "user", "content": "hi"}]}, {"reasoning": True}
