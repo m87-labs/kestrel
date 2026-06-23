@@ -1033,12 +1033,15 @@ class InferenceEngine:
                 "adapter provider is available."
             )
 
-        image_obj: Optional[np.ndarray | bytes] = None
+        image_obj = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
-            if not isinstance(image, (np.ndarray, bytes)):
-                raise TypeError("image must be np.ndarray or bytes")
+            # A skill may pass several images (an ordered list, e.g. chat with
+            # multiple images); the runtime that accepts them unpacks the list.
+            items = image if isinstance(image, (list, tuple)) else [image]
+            if not items or not all(isinstance(one, (np.ndarray, bytes)) for one in items):
+                raise TypeError("image must be an np.ndarray/bytes, or a list of them")
             image_obj = image
 
         prompt_str = skill_spec.prompt_text(request_context)

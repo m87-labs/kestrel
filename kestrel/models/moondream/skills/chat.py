@@ -12,18 +12,45 @@ from __future__ import annotations
 
 from typing import Dict, List, Sequence
 
-from kestrel.skills.base import SkillFinalizeResult, SkillSpec
+from kestrel.skills.base import BuiltRequest, SkillFinalizeResult, SkillSpec
 from kestrel.skills.chat import ChatMessage, ChatRequest, ChatSkill
 
 from .query import QueryRequest, QuerySkill, QuerySkillState
 
 if False:  # pragma: no cover - type-checking imports
+    from typing import Mapping, Optional
+
+    import numpy as np
+
     from ..runtime import MoondreamRuntime, Token
     from kestrel.scheduler.types import GenerationRequest
 
 
+def _single_image(ctx: ChatRequest):
+    """Moondream is single-image; reject more and return the one (or None)."""
+    if len(ctx.images) > 1:
+        raise ValueError("Moondream supports at most one image per request")
+    return ctx.images[0] if ctx.images else None
+
+
 class MoondreamChatSkill(ChatSkill):
     """Chat over Moondream by flattening the conversation into ``query``."""
+
+    def build_request(
+        self,
+        image: "Optional[np.ndarray | bytes]",
+        prompt: "Mapping",
+        settings: "Optional[Mapping]",
+    ) -> BuiltRequest:
+        built = super().build_request(image, prompt, settings)
+        # The base may carry an images tuple; Moondream's pipeline takes one.
+        return BuiltRequest(
+            request_context=built.request_context,
+            max_new_tokens=built.max_new_tokens,
+            temperature=built.temperature,
+            top_p=built.top_p,
+            image=_single_image(built.request_context),
+        )
 
     def build_prompt_tokens(
         self,
@@ -36,7 +63,7 @@ class MoondreamChatSkill(ChatSkill):
             )
         query_request = QueryRequest(
             question=_flatten_messages(request_context.messages),
-            image=request_context.image,
+            image=_single_image(request_context),
             reasoning=request_context.reasoning,
             stream=request_context.stream,
             spatial_refs=None,
@@ -67,7 +94,7 @@ class MoondreamChatSkillState(QuerySkillState):
     ) -> None:
         query_request = QueryRequest(
             question="",
-            image=chat_request.image,
+            image=_single_image(chat_request),
             reasoning=chat_request.reasoning,
             stream=chat_request.stream,
             spatial_refs=None,

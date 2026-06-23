@@ -3,26 +3,27 @@
 ``ChatSkill`` is a *base* capability for models with a native multi-turn
 chat format: a model opts in by exposing a ``chat()`` prompt template (see
 :class:`kestrel.models.protocols.ChatTemplate`). The skill owns the generic
-parts — validating OpenAI-style ``messages``, extracting at most one image,
-rendering the conversation into prompt tokens with role markers, interpreting
-the decode stream, and materialising an assistant ``message``.
+parts — validating OpenAI-style ``messages``, parsing each message's content
+into an ordered list of text/image parts, rendering the conversation into
+prompt tokens (emitting one ``image_placeholder`` per image **at its content
+position**), interpreting the decode stream, and materialising an assistant
+``message``. The runtime expands each image placeholder to that image's token
+count.
 
 A model that needs different behaviour *subclasses* this skill rather than
-having the kernel branch on model specifics. For example a model with no
-trained chat format (Moondream) registers a subclass that flattens the
-conversation into its single-turn ``query`` prompt and reuses the query
-decode path — see ``kestrel.models.moondream.skills.chat``.
+having the kernel branch on model specifics — e.g. a model with no trained
+chat format (Moondream) flattens the conversation into its single-turn
+``query`` prompt (``kestrel.models.moondream.skills.chat``).
 
 Validation is plain Python (raises ``ValueError``); pydantic stays at the
 HTTP boundary. The ``output`` shape (``{"message": {...}, "finish_reason":
-...}``) maps directly onto an OpenAI chat-completion *choice*, so a future
-``/v1/chat/completions`` route is a thin wrapper.
+...}``) maps directly onto an OpenAI chat-completion *choice*.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping as _Mapping, Sequence as _Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -49,16 +50,36 @@ _ROLES = ("system", "user", "assistant")
 
 
 @dataclass(slots=True)
+class ChatContentPart:
+    """One ordered piece of a message's content: text or an image reference.
+
+    Exactly one of ``text`` / ``image_index`` is set. ``image_index`` points
+    into :attr:`ChatRequest.images`.
+    """
+
+    text: Optional[str] = None
+    image_index: Optional[int] = None
+
+
+@dataclass(slots=True)
 class ChatMessage:
-    """One validated turn: role + flattened text (image handled separately).
+    """One validated turn: role + ordered content parts.
 
     Part of the subclass contract: a ``ChatSkill`` subclass receives these
     via ``ChatRequest.messages``.
     """
 
     role: str
-    text: str
-    has_image: bool = False
+    parts: Tuple[ChatContentPart, ...]
+
+    @property
+    def text(self) -> str:
+        """Concatenated text of this turn (image parts omitted)."""
+        return "".join(p.text for p in self.parts if p.text is not None)
+
+    @property
+    def has_image(self) -> bool:
+        return any(p.image_index is not None for p in self.parts)
 
 
 @dataclass(slots=True)
@@ -66,7 +87,7 @@ class ChatRequest:
     """Validated chat payload carried to decode."""
 
     messages: Tuple[ChatMessage, ...]
-    image: "Optional[np.ndarray | bytes]"
+    images: Tuple["np.ndarray | bytes", ...]
     reasoning: bool
     stream: bool
 
@@ -74,8 +95,8 @@ class ChatRequest:
 class ChatSkill(SkillSpec):
     """Multi-turn chat for models with a native ``chat()`` template.
 
-    Subclass to customise rendering or decode for a model that does not have
-    one (override ``build_prompt_tokens`` / ``create_state``); ``build_request``
+    Subclass to customise rendering or decode for a model without one
+    (override ``build_prompt_tokens`` / ``create_state``); ``build_request``
     — OpenAI message validation and image extraction — is model-agnostic and
     inherited.
     """
@@ -99,8 +120,8 @@ class ChatSkill(SkillSpec):
         if len(raw) == 0:
             raise ValueError("messages must be a non-empty list")
 
+        images: List["np.ndarray | bytes"] = []
         messages: List[ChatMessage] = []
-        found_image: "Optional[np.ndarray | bytes]" = None
         for idx, m in enumerate(raw):
             if not isinstance(m, _Mapping):
                 raise ValueError(
@@ -113,23 +134,25 @@ class ChatSkill(SkillSpec):
                 )
             if role == "system" and idx != 0:
                 raise ValueError("a 'system' message must be the first message")
-            text, img = _parse_content(m.get("content"))
-            if img is not None:
-                if found_image is not None:
-                    raise ValueError(
-                        "at most one image is supported across chat messages"
-                    )
-                found_image = img
-            messages.append(ChatMessage(role=role, text=text, has_image=img is not None))
+            parts = _parse_content(m.get("content"), images, role)
+            messages.append(ChatMessage(role=role, parts=tuple(parts)))
 
         if messages[-1].role != "user":
             raise ValueError("the last message must be from 'user'")
         if not messages[-1].text and not messages[-1].has_image:
             raise ValueError("the last user message must have text or an image")
 
-        # Image precedence: one carried inside the messages, else the
-        # top-level ``image=`` argument (a convenience for non-OpenAI callers).
-        resolved_image = found_image if found_image is not None else image
+        # Convenience for non-OpenAI callers: a top-level ``image=`` with no
+        # in-message images is placed at the start of the first user turn.
+        if not images and image is not None:
+            images.append(image)
+            for i, msg in enumerate(messages):
+                if msg.role == "user":
+                    messages[i] = ChatMessage(
+                        role="user",
+                        parts=(ChatContentPart(image_index=0),) + msg.parts,
+                    )
+                    break
 
         reasoning = bool(prompt.get("reasoning", False))
         if settings is not None and "reasoning" in settings:
@@ -143,7 +166,7 @@ class ChatSkill(SkillSpec):
         )
         request = ChatRequest(
             messages=tuple(messages),
-            image=resolved_image,
+            images=tuple(images),
             reasoning=reasoning,
             stream=bool(prompt.get("stream", False)),
         )
@@ -152,7 +175,7 @@ class ChatSkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
-            image=resolved_image,
+            image=tuple(images) if images else None,
         )
 
     def prompt_text(self, request_context: object) -> str:
@@ -182,33 +205,49 @@ class ChatSkill(SkillSpec):
         self, runtime: "MoondreamRuntime", ct, ctx: ChatRequest
     ) -> List[Token]:
         tokenizer = runtime.tokenizer
-        tokens: List[Token] = [TextToken(token_id=int(t)) for t in ct.bos]
+
+        def emit(ids) -> List[Token]:
+            return [TextToken(token_id=int(t)) for t in ids]
+
+        tokens: List[Token] = emit(ct.bos)
         for msg in ctx.messages:
-            if msg.role == "system" and not ct.supports_system:
-                raise ValueError(
-                    "this model's chat template does not support a system message"
-                )
             role_word = ct.roles.get(msg.role)
             if role_word is None:
                 raise ValueError(f"chat template has no role word for {msg.role!r}")
-            tokens.extend(TextToken(token_id=int(t)) for t in ct.turn_prefix)
-            tokens.extend(
-                TextToken(token_id=int(t)) for t in tokenizer.encode(role_word).ids
-            )
-            tokens.extend(TextToken(token_id=int(t)) for t in ct.role_suffix)
-            if msg.text:
-                tokens.extend(
-                    TextToken(token_id=int(t)) for t in tokenizer.encode(msg.text).ids
-                )
-            tokens.extend(TextToken(token_id=int(t)) for t in ct.turn_suffix)
+            tokens += emit(ct.turn_prefix)
+            tokens += emit(tokenizer.encode(role_word).ids)
+            tokens += emit(ct.role_suffix)
+            tokens += list(self.render_content(tokenizer, msg.parts))
+            tokens += emit(ct.turn_suffix)
         # Open the assistant turn for the model to complete.
-        tokens.extend(TextToken(token_id=int(t)) for t in ct.turn_prefix)
-        tokens.extend(
-            TextToken(token_id=int(t)) for t in tokenizer.encode(ct.roles["assistant"]).ids
-        )
-        tokens.extend(TextToken(token_id=int(t)) for t in ct.role_suffix)
-        opener = ct.assistant_open_reasoning if ctx.reasoning else ct.assistant_open
-        tokens.extend(TextToken(token_id=int(t)) for t in opener)
+        tokens += emit(ct.turn_prefix)
+        tokens += emit(tokenizer.encode(ct.roles["assistant"]).ids)
+        tokens += emit(ct.role_suffix)
+        tokens += emit(ct.assistant_open_reasoning if ctx.reasoning else ct.assistant_open)
+        return tokens
+
+    def render_content(
+        self, tokenizer, parts: "Sequence[ChatContentPart]"
+    ) -> List[Token]:
+        """Render one message's content parts to tokens.
+
+        The base handles text only and rejects images. A multimodal model
+        *subclasses* and overrides this to emit its own image tokens (e.g.
+        ``<|vision_start|><|image_pad|><|vision_end|>``) at each image's
+        position — so the kernel and the shared chat template carry no image
+        concept.
+        """
+        tokens: List[Token] = []
+        for part in parts:
+            if part.image_index is not None:
+                raise ValueError(
+                    "this chat skill does not render images; subclass ChatSkill "
+                    "and override render_content to add image support"
+                )
+            if part.text:
+                tokens.extend(
+                    TextToken(token_id=int(t)) for t in tokenizer.encode(part.text).ids
+                )
         return tokens
 
     # -- decode state ------------------------------------------------------
@@ -353,15 +392,19 @@ class ChatSkillState(SkillState):
 # -- helpers --------------------------------------------------------------
 
 
-def _parse_content(content: object) -> Tuple[str, "Optional[np.ndarray | bytes]"]:
-    """Return (text, image) from a message ``content`` (str or parts list)."""
+def _parse_content(
+    content: object,
+    images: "List[np.ndarray | bytes]",
+    role: str,
+) -> List[ChatContentPart]:
+    """Parse a message ``content`` into ordered parts, appending any images
+    (in order) to ``images`` and referencing them by index."""
     if content is None:
-        return "", None
+        return []
     if isinstance(content, str):
-        return content, None
+        return [ChatContentPart(text=content)]
     if isinstance(content, _Sequence) and not isinstance(content, (str, bytes, bytearray)):
-        texts: List[str] = []
-        image: "Optional[np.ndarray | bytes]" = None
+        parts: List[ChatContentPart] = []
         for part in content:
             if not isinstance(part, _Mapping):
                 raise ValueError("each content part must be a mapping")
@@ -370,14 +413,15 @@ def _parse_content(content: object) -> Tuple[str, "Optional[np.ndarray | bytes]"
                 value = part.get("text")
                 if value is None:
                     raise ValueError("a text content part is missing 'text'")
-                texts.append(str(value))
+                parts.append(ChatContentPart(text=str(value)))
             elif ptype in ("image_url", "image"):
-                if image is not None:
-                    raise ValueError("a message may contain at most one image")
-                image = _load_image_part(part)
+                if role == "system":
+                    raise ValueError("a system message cannot contain images")
+                images.append(_load_image_part(part))
+                parts.append(ChatContentPart(image_index=len(images) - 1))
             else:
                 raise ValueError(f"unsupported content part type: {ptype!r}")
-        return "\n".join(texts), image
+        return parts
     raise ValueError("message content must be a string or a list of content parts")
 
 
@@ -417,4 +461,10 @@ def _coerce_image(obj: object) -> "np.ndarray | bytes":
     raise ValueError(f"unsupported image value of type {type(obj).__name__}")
 
 
-__all__ = ["ChatMessage", "ChatRequest", "ChatSkill", "ChatSkillState"]
+__all__ = [
+    "ChatContentPart",
+    "ChatMessage",
+    "ChatRequest",
+    "ChatSkill",
+    "ChatSkillState",
+]

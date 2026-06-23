@@ -1,5 +1,6 @@
-"""ChatSkill: message validation, native chat-template rendering, decode-state
-output shape, and Moondream's flatten-into-query subclass."""
+"""ChatSkill: message validation, native chat-template rendering (incl.
+multi-image at content positions), decode-state output, and Moondream's
+flatten-into-query subclass."""
 
 from __future__ import annotations
 
@@ -12,10 +13,13 @@ import pytest
 from kestrel.models.protocols import ChatTemplate, QueryTemplate
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills.base import DecodeStep
-from kestrel.skills.chat import ChatMessage, ChatRequest, ChatSkill
+from kestrel.skills.chat import ChatRequest, ChatSkill
 
 # Synthetic token ids for a native (ChatML-like) chat template.
 IM_START, IM_END, NL, DNL, THINK_S, THINK_E = 900, 901, 198, 271, 800, 801
+VS, IPAD, VE = 700, 701, 702  # vision_start, image_pad, vision_end
+
+_IMG = "data:image/png;base64,aGk="  # decodes to b"hi" (content irrelevant here)
 
 
 def _native_chat_template() -> ChatTemplate:
@@ -52,6 +56,20 @@ class _NativePromptTemplate:
         return None
 
 
+class _VisionChatSkill(ChatSkill):
+    """Test-only subclass that renders an image as the vision placeholder —
+    standing in for a model's multimodal chat subclass (e.g. Qwen)."""
+
+    def render_content(self, tokenizer, parts):
+        tokens = []
+        for part in parts:
+            if part.image_index is not None:
+                tokens.extend(TextToken(token_id=t) for t in (VS, IPAD, VE))
+            elif part.text:
+                tokens.extend(TextToken(token_id=t) for t in tokenizer.encode(part.text).ids)
+        return tokens
+
+
 class _Tokenizer:
     """Reversible char-level fake: encode→code points, decode→chars."""
 
@@ -65,8 +83,16 @@ class _Tokenizer:
 def _chat_runtime(chat: bool = True) -> SimpleNamespace:
     tpl = _native_chat_template() if chat else None
     return SimpleNamespace(
-        prompt_template=_NativePromptTemplate(_chat=tpl), tokenizer=_Tokenizer()
+        prompt_template=_NativePromptTemplate(_chat=tpl),
+        tokenizer=_Tokenizer(),
     )
+
+
+def _ctx(messages, reasoning: bool = False) -> ChatRequest:
+    built = ChatSkill().build_request(
+        None, {"messages": messages, "reasoning": reasoning}, None
+    )
+    return built.request_context
 
 
 def _ids(tokens) -> List[int]:
@@ -77,16 +103,14 @@ def _ords(text: str) -> List[int]:
     return [ord(c) for c in text]
 
 
-# -- validation (generic, lives on the base) ------------------------------
+# -- validation -----------------------------------------------------------
 
 
 def test_build_request_accepts_minimal_conversation() -> None:
-    built = ChatSkill().build_request(
-        None, {"messages": [{"role": "user", "content": "hi"}]}, None
-    )
-    ctx = built.request_context
+    ctx = _ctx([{"role": "user", "content": "hi"}])
     assert isinstance(ctx, ChatRequest)
     assert [(m.role, m.text) for m in ctx.messages] == [("user", "hi")]
+    assert ctx.images == ()
     assert ctx.reasoning is False
 
 
@@ -125,51 +149,45 @@ def test_build_request_last_must_be_user() -> None:
         ChatSkill().build_request(None, {"messages": msgs}, None)
 
 
-def test_build_request_rejects_two_images() -> None:
-    img = "data:image/png;base64,aGk="  # b"hi"
+def test_build_request_collects_multiple_images_in_order() -> None:
     msgs = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "two?"},
-                {"type": "image_url", "image_url": {"url": img}},
-                {"type": "image_url", "image_url": {"url": img}},
+                {"type": "image_url", "image_url": {"url": _IMG}},
+                {"type": "text", "text": "first?"},
             ],
-        }
-    ]
-    with pytest.raises(ValueError, match="at most one image"):
-        ChatSkill().build_request(None, {"messages": msgs}, None)
-
-
-def test_build_request_extracts_image_from_data_url() -> None:
-    msgs = [
+        },
+        {"role": "assistant", "content": "a"},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "what is this?"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                {"type": "text", "text": "second?"},
+                {"type": "image_url", "image_url": {"url": _IMG}},
             ],
-        }
+        },
     ]
     built = ChatSkill().build_request(None, {"messages": msgs}, None)
-    assert built.image == b"hi"
-    assert built.request_context.image == b"hi"
-    assert built.request_context.messages[-1].text == "what is this?"
+    ctx = built.request_context
+    assert len(ctx.images) == 2
+    assert built.image == (b"hi", b"hi")
+    # parts carry image indices in conversation order
+    assert ctx.messages[0].parts[0].image_index == 0
+    assert ctx.messages[2].parts[1].image_index == 1
+
+
+def test_build_request_rejects_image_in_system_message() -> None:
+    msgs = [
+        {"role": "system", "content": [{"type": "image_url", "image_url": {"url": _IMG}}]},
+        {"role": "user", "content": "hi"},
+    ]
+    with pytest.raises(ValueError, match="system message cannot contain images"):
+        ChatSkill().build_request(None, {"messages": msgs}, None)
 
 
 @pytest.mark.parametrize("url", ["/etc/passwd", "https://example.com/cat.png"])
 def test_build_request_rejects_non_data_image_url(url: str) -> None:
-    # image_url.url is untrusted: only base64 data: URLs are accepted — no
-    # filesystem reads and no remote fetches.
-    msgs = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "x"},
-                {"type": "image_url", "image_url": {"url": url}},
-            ],
-        }
-    ]
+    msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]
     with pytest.raises(ValueError, match="data: URL"):
         ChatSkill().build_request(None, {"messages": msgs}, None)
 
@@ -186,10 +204,7 @@ def test_build_request_reasoning_opt_in_via_settings() -> None:
 
 def test_render_single_turn_chat() -> None:
     runtime = _chat_runtime()
-    ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
-    )
-    tokens = ChatSkill().build_prompt_tokens(runtime, ctx)
+    tokens = ChatSkill().build_prompt_tokens(runtime, _ctx([{"role": "user", "content": "hi"}]))
     expected = (
         [IM_START] + _ords("user") + [NL] + _ords("hi") + [IM_END, NL]
         + [IM_START] + _ords("assistant") + [NL] + [THINK_S, DNL, THINK_E, DNL]
@@ -197,39 +212,57 @@ def test_render_single_turn_chat() -> None:
     assert _ids(tokens) == expected
 
 
-def test_render_multi_turn_with_system_and_reasoning() -> None:
+def test_subclass_renders_multi_image_at_content_positions() -> None:
     runtime = _chat_runtime()
-    ctx = ChatRequest(
-        messages=(
-            ChatMessage("system", "be nice"),
-            ChatMessage("user", "a"),
-            ChatMessage("assistant", "b"),
-            ChatMessage("user", "c"),
-        ),
-        image=None,
-        reasoning=True,
-        stream=False,
-    )
-    tokens = ChatSkill().build_prompt_tokens(runtime, ctx)
-
-    def turn(role: str, text: str) -> List[int]:
-        return [IM_START] + _ords(role) + [NL] + _ords(text) + [IM_END, NL]
-
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _IMG}},
+                {"type": "text", "text": "a"},
+            ],
+        },
+        {"role": "assistant", "content": "b"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "c"},
+                {"type": "image_url", "image_url": {"url": _IMG}},
+            ],
+        },
+    ]
+    tokens = _VisionChatSkill().build_prompt_tokens(runtime, _ctx(msgs))
     expected = (
-        turn("system", "be nice")
-        + turn("user", "a")
-        + turn("assistant", "b")
-        + turn("user", "c")
-        + [IM_START] + _ords("assistant") + [NL] + [THINK_S, NL]
+        # turn 1: image BEFORE text
+        [IM_START] + _ords("user") + [NL] + [VS, IPAD, VE] + _ords("a") + [IM_END, NL]
+        # turn 2: assistant text
+        + [IM_START] + _ords("assistant") + [NL] + _ords("b") + [IM_END, NL]
+        # turn 3: image AFTER text
+        + [IM_START] + _ords("user") + [NL] + _ords("c") + [VS, IPAD, VE] + [IM_END, NL]
+        # generation opener
+        + [IM_START] + _ords("assistant") + [NL] + [THINK_S, DNL, THINK_E, DNL]
     )
     assert _ids(tokens) == expected
 
 
-def test_base_chat_skill_requires_chat_template() -> None:
-    runtime = _chat_runtime(chat=False)  # chat() returns None
-    ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+def test_render_reasoning_opener() -> None:
+    runtime = _chat_runtime()
+    tokens = ChatSkill().build_prompt_tokens(
+        runtime, _ctx([{"role": "user", "content": "hi"}], reasoning=True)
     )
+    assert _ids(tokens)[-2:] == [THINK_S, NL]  # assistant_open_reasoning
+
+
+def test_base_chat_skill_rejects_images() -> None:
+    runtime = _chat_runtime()
+    ctx = _ctx([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": _IMG}}]}])
+    with pytest.raises(ValueError, match="does not render images"):
+        ChatSkill().build_prompt_tokens(runtime, ctx)
+
+
+def test_base_chat_skill_requires_chat_template() -> None:
+    runtime = _chat_runtime(chat=False)
+    ctx = _ctx([{"role": "user", "content": "hi"}])
     with pytest.raises(ValueError, match="no chat\\(\\) template"):
         ChatSkill().build_prompt_tokens(runtime, ctx)
 
@@ -244,10 +277,7 @@ def _drive(state, runtime, ids: List[int]) -> None:
 
 def test_state_non_reasoning_strips_turn_end_token() -> None:
     runtime = _chat_runtime()
-    ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
-    )
-    state = ChatSkill().create_state(runtime, SimpleNamespace(), ctx)
+    state = ChatSkill().create_state(runtime, SimpleNamespace(), _ctx([{"role": "user", "content": "hi"}]))
     assert list(state.stop_token_ids(runtime)) == [IM_END]
     _drive(state, runtime, _ords("ok") + [IM_END])
     result = state.finalize(runtime, reason="stop")
@@ -259,15 +289,12 @@ def test_state_non_reasoning_strips_turn_end_token() -> None:
 
 def test_state_reasoning_splits_thinking_and_answer() -> None:
     runtime = _chat_runtime()
-    ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=True, stream=False
+    state = ChatSkill().create_state(
+        runtime, SimpleNamespace(), _ctx([{"role": "user", "content": "hi"}], reasoning=True)
     )
-    state = ChatSkill().create_state(runtime, SimpleNamespace(), ctx)
     state.on_prefill(runtime)
     _drive(state, runtime, _ords("think"))
-    state.consume_step(
-        runtime, DecodeStep(token=TextToken(token_id=THINK_E), position=99)
-    )
+    state.consume_step(runtime, DecodeStep(token=TextToken(token_id=THINK_E), position=99))
     assert list(state.allowed_token_ids(runtime)) == [DNL]
     _drive(state, runtime, [DNL])
     assert state.allowed_token_ids(runtime) is None
@@ -309,15 +336,21 @@ def _md_runtime(model_name: str = "moondream2") -> SimpleNamespace:
     )
 
 
+def _md_ctx(messages, reasoning: bool = False) -> ChatRequest:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    return MoondreamChatSkill().build_request(
+        None, {"messages": messages, "reasoning": reasoning}, None
+    ).request_context
+
+
 def test_moondream_chat_flattens_to_query_tokens() -> None:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
     from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
 
     runtime = _md_runtime()
-    chat_ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
-    )
-    chat_tokens = MoondreamChatSkill().build_prompt_tokens(runtime, chat_ctx)
+    ctx = _md_ctx([{"role": "user", "content": "hi"}])
+    chat_tokens = MoondreamChatSkill().build_prompt_tokens(runtime, ctx)
     query_tokens = QuerySkill().build_prompt_tokens(
         runtime, QueryRequest(question="hi", image=None, reasoning=False, stream=False)
     )
@@ -327,24 +360,33 @@ def test_moondream_chat_flattens_to_query_tokens() -> None:
 def test_moondream_flatten_messages_labels_history() -> None:
     from kestrel.models.moondream.skills.chat import _flatten_messages
 
-    msgs = [
-        ChatMessage("system", "sys"),
-        ChatMessage("user", "u1"),
-        ChatMessage("assistant", "a1"),
-        ChatMessage("user", "u2"),
-    ]
-    assert _flatten_messages(msgs) == "sys\n\nUser: u1\n\nAssistant: a1\n\nu2"
-    assert _flatten_messages([ChatMessage("user", "just this")]) == "just this"
+    ctx = _md_ctx([
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ])
+    assert _flatten_messages(ctx.messages) == "sys\n\nUser: u1\n\nAssistant: a1\n\nu2"
+
+
+def test_moondream_rejects_multiple_images() -> None:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    msgs = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": _IMG}},
+        {"type": "image_url", "image_url": {"url": _IMG}},
+    ]}]
+    with pytest.raises(ValueError, match="at most one image"):
+        MoondreamChatSkill().build_request(None, {"messages": msgs}, None)
 
 
 def test_moondream_chat_finalizes_as_message() -> None:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
     runtime = _md_runtime()
-    ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
+    state = MoondreamChatSkill().create_state(
+        runtime, SimpleNamespace(), _md_ctx([{"role": "user", "content": "hi"}])
     )
-    state = MoondreamChatSkill().create_state(runtime, SimpleNamespace(), ctx)
     _drive(state, runtime, _ords("Paris"))
     result = state.finalize(runtime, reason="stop")
     assert result.output == {
@@ -360,19 +402,12 @@ def test_moondream_chat_inherits_query_suppression() -> None:
     skill = MoondreamChatSkill()
     rt = _md_runtime("moondream2")
 
-    answer_ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=False, stream=False
-    )
-    answer_state = skill.create_state(rt, SimpleNamespace(), answer_ctx)
+    answer_state = skill.create_state(rt, SimpleNamespace(), _md_ctx([{"role": "user", "content": "hi"}]))
     assert list(answer_state.suppressed_token_ids(rt)) == [3]  # answer_id
 
-    think_ctx = ChatRequest(
-        messages=(ChatMessage("user", "hi"),), image=None, reasoning=True, stream=False
-    )
-    think_state = skill.create_state(rt, SimpleNamespace(), think_ctx)
+    think_state = skill.create_state(rt, SimpleNamespace(), _md_ctx([{"role": "user", "content": "hi"}], reasoning=True))
     assert list(think_state.suppressed_token_ids(rt)) == [0, 6]  # eos_id, size_id
 
-    # Non-moondream2 models are unaffected.
     rt3 = _md_runtime("moondream3-preview")
-    state3 = skill.create_state(rt3, SimpleNamespace(), answer_ctx)
+    state3 = skill.create_state(rt3, SimpleNamespace(), _md_ctx([{"role": "user", "content": "hi"}]))
     assert state3.suppressed_token_ids(rt3) is None
