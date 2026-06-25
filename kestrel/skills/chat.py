@@ -147,18 +147,6 @@ class ChatSkill(SkillSpec):
         if not messages[-1].text and not messages[-1].has_image:
             raise ValueError("the last user message must have text or an image")
 
-        # Convenience for non-OpenAI callers: a top-level ``image=`` with no
-        # in-message images is placed at the start of the first user turn.
-        if not images and image is not None:
-            images.append(image)
-            for i, msg in enumerate(messages):
-                if msg.role == "user":
-                    messages[i] = ChatMessage(
-                        role="user",
-                        parts=(ChatContentPart(image_index=0),) + msg.parts,
-                    )
-                    break
-
         reasoning = bool(prompt.get("reasoning", self.default_reasoning))
         if settings is not None and "reasoning" in settings:
             reasoning = bool(settings["reasoning"])
@@ -382,10 +370,12 @@ class ChatSkillState(SkillState):
         self, runtime: "MoondreamRuntime", *, reason: str
     ) -> SkillFinalizeResult:
         tokenizer = runtime.tokenizer
+        # Decode the answer tokens as-is — matching the query skill. The
+        # reasoning→answer boundary is the answer_id token plus the (force-fed,
+        # uncollected) post_reasoning_prefix, so _answer_tokens is already just
+        # the answer; stripping here would mutate legitimate leading whitespace
+        # and desync streamed deltas (decoded un-stripped) from this content.
         answer_text = tokenizer.decode(self._answer_tokens) if self._answer_tokens else ""
-        # Trim leading whitespace: in reasoning mode the model emits a "\n\n"
-        # separator after the thinking block before the answer proper.
-        answer_text = answer_text.lstrip()
         message: Dict[str, object] = {"role": "assistant", "content": answer_text}
         # OpenRouter-style: reasoning is a string field on the message, separate
         # from content (omitted when there's no reasoning).
@@ -423,7 +413,7 @@ def _parse_content(
                 if value is None:
                     raise ValueError("a text content part is missing 'text'")
                 parts.append(ChatContentPart(text=str(value)))
-            elif ptype in ("image_url", "image"):
+            elif ptype == "image_url":
                 if role == "system":
                     raise ValueError("a system message cannot contain images")
                 images.append(_load_image_part(part))
@@ -434,40 +424,22 @@ def _parse_content(
     raise ValueError("message content must be a string or a list of content parts")
 
 
-def _load_image_part(part: "_Mapping") -> "np.ndarray | bytes":
-    if part.get("type") == "image":
-        # Convenience for Python callers: a native image object passed directly.
-        obj = part.get("image")
-        if obj is None:
-            raise ValueError("an image content part is missing 'image'")
-        return _coerce_image(obj)
+def _load_image_part(part: "_Mapping") -> bytes:
     spec = part.get("image_url")
     if isinstance(spec, _Mapping):
         spec = spec.get("url")
     if spec is None:
         raise ValueError("an image_url content part is missing 'url'")
-    return _coerce_image(spec)
-
-
-def _coerce_image(obj: object) -> "np.ndarray | bytes":
-    # Message content can come from untrusted callers (this payload maps onto
-    # an OpenAI HTTP request). A string image is accepted only as a base64
-    # ``data:`` URL — no remote (http) fetches and no server filesystem reads.
-    # In-memory images (raw bytes or a numpy array) pass through for Python
-    # callers; a caller with a file on disk loads it themselves.
-    if isinstance(obj, (bytes, bytearray)):
-        return bytes(obj)
-    if isinstance(obj, np.ndarray):
-        return obj
-    if isinstance(obj, str):
-        value = obj.strip()
-        if value.startswith("data:"):
-            return load_image_bytes_from_base64(value)
+    # The payload maps onto an untrusted OpenAI HTTP request: accept only a
+    # base64 data: URL — no remote (http) fetches and no server filesystem reads.
+    if not isinstance(spec, str):
         raise ValueError(
-            "an image string must be a base64 data: URL; pass raw bytes or a "
-            "numpy array for an in-memory image"
+            f"an image_url 'url' must be a string, got {type(spec).__name__}"
         )
-    raise ValueError(f"unsupported image value of type {type(obj).__name__}")
+    value = spec.strip()
+    if not value.startswith("data:"):
+        raise ValueError("an image_url 'url' must be a base64 data: URL")
+    return load_image_bytes_from_base64(value)
 
 
 __all__ = [

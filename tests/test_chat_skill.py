@@ -313,6 +313,18 @@ def test_state_non_reasoning_strips_turn_end_token() -> None:
     }
 
 
+def test_state_preserves_leading_whitespace() -> None:
+    # The finalized content must not be lstripped: that diverges from the query
+    # skill and from streamed deltas (which decode un-stripped).
+    runtime = _chat_runtime()
+    state = ChatSkill().create_state(
+        runtime, SimpleNamespace(), _ctx([{"role": "user", "content": "hi"}])
+    )
+    _drive(state, runtime, _ords("  ok") + [IM_END])
+    result = state.finalize(runtime, reason="stop")
+    assert result.output["message"]["content"] == "  ok"
+
+
 def test_state_reasoning_splits_thinking_and_answer() -> None:
     runtime = _chat_runtime()
     state = ChatSkill().create_state(
@@ -424,6 +436,24 @@ def test_moondream_accepts_multiple_images() -> None:
     ]}]
     ctx = MoondreamChatSkill().build_request(None, {"messages": msgs}, None).request_context
     assert len(ctx.images) == 2
+
+
+def test_moondream_rejects_assistant_image() -> None:
+    # Moondream markers only user-turn images; an assistant image would land in
+    # the tuple but never render, desyncing the tuple from the prompt.
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    runtime = _md_runtime()
+    ctx = _md_ctx([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [
+            {"type": "image_url", "image_url": {"url": _IMG}},
+            {"type": "text", "text": "a"},
+        ]},
+        {"role": "user", "content": "q2"},
+    ])
+    with pytest.raises(ValueError, match="only in user messages"):
+        MoondreamChatSkill().build_prompt_tokens(runtime, ctx)
 
 
 def test_moondream_chat_finalizes_as_message() -> None:

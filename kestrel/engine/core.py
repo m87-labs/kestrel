@@ -660,7 +660,6 @@ class InferenceEngine:
         *,
         reasoning: Optional[bool] = None,
         stream: bool = False,
-        image: Optional[np.ndarray | bytes] = None,
         settings: Optional[Mapping[str, object]] = None,
     ) -> Union[EngineResult, EngineStream]:
         # Omit ``reasoning`` from the prompt when the caller doesn't set it, so
@@ -673,7 +672,7 @@ class InferenceEngine:
             prompt["reasoning"] = reasoning
         return await self._run_skill(
             "chat",
-            image=image,
+            image=None,
             prompt=prompt,
             settings=settings,
             stream=stream,
