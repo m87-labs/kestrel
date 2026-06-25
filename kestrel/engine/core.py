@@ -658,19 +658,23 @@ class InferenceEngine:
         self,
         messages: Optional[Sequence[Mapping[str, object]]] = None,
         *,
-        reasoning: bool = False,
+        reasoning: Optional[bool] = None,
         stream: bool = False,
         image: Optional[np.ndarray | bytes] = None,
         settings: Optional[Mapping[str, object]] = None,
     ) -> Union[EngineResult, EngineStream]:
+        # Omit ``reasoning`` from the prompt when the caller doesn't set it, so
+        # ``ChatSkill.build_request`` falls back to the skill's
+        # ``default_reasoning`` (e.g. MoondreamChatSkill defaults it on) —
+        # matching ``ModelHandle.chat()``, which preserves the model default by
+        # not passing the key.
+        prompt: dict[str, object] = {"messages": messages, "stream": stream}
+        if reasoning is not None:
+            prompt["reasoning"] = reasoning
         return await self._run_skill(
             "chat",
             image=image,
-            prompt={
-                "messages": messages,
-                "reasoning": reasoning,
-                "stream": stream,
-            },
+            prompt=prompt,
             settings=settings,
             stream=stream,
         )
