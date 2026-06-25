@@ -374,7 +374,7 @@ def _md_ctx(messages, reasoning: bool = False) -> ChatRequest:
     ).request_context
 
 
-def test_moondream_chat_flattens_to_query_tokens() -> None:
+def test_moondream_single_turn_equals_query() -> None:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
     from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
 
@@ -387,27 +387,43 @@ def test_moondream_chat_flattens_to_query_tokens() -> None:
     assert _ids(chat_tokens) == _ids(query_tokens)
 
 
-def test_moondream_flatten_messages_labels_history() -> None:
-    from kestrel.models.moondream.skills.chat import _flatten_messages
+def test_moondream_multi_turn_images_at_turn_start() -> None:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
+    runtime = _md_runtime()
     ctx = _md_ctx([
         {"role": "system", "content": "sys"},
-        {"role": "user", "content": "u1"},
-        {"role": "assistant", "content": "a1"},
-        {"role": "user", "content": "u2"},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": _IMG}},
+            {"type": "text", "text": "a"},
+        ]},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "c"},
+            {"type": "image_url", "image_url": {"url": _IMG}},  # at end of content...
+        ]},
     ])
-    assert _flatten_messages(ctx.messages) == "sys\n\nUser: u1\n\nAssistant: a1\n\nu2"
+    tokens = MoondreamChatSkill().build_prompt_tokens(runtime, ctx)
+    # bos=5, query prefix=[10,11], answer_prefix=[20]; system folds into turn 1;
+    # both images sit at the START of their turn (the second one too).
+    expected = (
+        [5]
+        + [("IMG", 0)] + [10, 11] + _ords("sys\n\na") + [20] + _ords("b")
+        + [("IMG", 1)] + [10, 11] + _ords("c") + [20]
+    )
+    assert _norm(tokens) == expected
 
 
-def test_moondream_rejects_multiple_images() -> None:
+def test_moondream_accepts_multiple_images() -> None:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
     msgs = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": _IMG}},
         {"type": "image_url", "image_url": {"url": _IMG}},
+        {"type": "text", "text": "compare"},
     ]}]
-    with pytest.raises(ValueError, match="at most one image"):
-        MoondreamChatSkill().build_request(None, {"messages": msgs}, None)
+    ctx = MoondreamChatSkill().build_request(None, {"messages": msgs}, None).request_context
+    assert len(ctx.images) == 2
 
 
 def test_moondream_chat_finalizes_as_message() -> None:

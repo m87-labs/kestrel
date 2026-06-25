@@ -66,6 +66,12 @@ class _AdmissionCoordinator:
         if req.image is None:
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
 
+        if isinstance(req.image, (list, tuple)):
+            # Multi-image chat: the single-image prefix cache and overlap-crop
+            # precompute don't apply (the marker interleaver crops each image
+            # inline). Admit directly with no precomputed crops.
+            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
+
         if self._runtime.prefix_cache is not None:
             req.image_hash = _hash_image(req.image)
             prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
@@ -271,7 +277,11 @@ class AutoregressiveExecutor:
             self._admission_failures.append(Completion(request=req, error=exc))
             return
         crops_ready = (
-            req.image is None or ready.prefix_cache_hit or (ready.crops is not None)
+            req.image is None
+            # Multi-image chat crops each image inline (no overlap precompute).
+            or isinstance(req.image, (list, tuple))
+            or ready.prefix_cache_hit
+            or (ready.crops is not None)
         )
         lora_slot_ready = req.adapter is None
         phase = (

@@ -1690,11 +1690,13 @@ class InferenceEngine:
     ) -> tuple[GenerationRequest, SkillState]:
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)
-        image_length = (
-            runtime.image_prefix_length
-            if (req.image is not None or image_crops is not None)
-            else 0
-        )
+        if req.image is None and image_crops is None:
+            image_length = 0
+        elif isinstance(req.image, (list, tuple)):
+            # Multi-image chat: each image contributes one patch block.
+            image_length = len(req.image) * runtime.image_prefix_length
+        else:
+            image_length = runtime.image_prefix_length
         adapter = req.adapter
         request_obj = GenerationRequest(
             request_id=req.request_id,
