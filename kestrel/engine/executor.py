@@ -69,7 +69,18 @@ class _AdmissionCoordinator:
         if isinstance(req.image, (list, tuple)):
             # Multi-image chat: the single-image prefix cache and overlap-crop
             # precompute don't apply (the marker interleaver crops each image
-            # inline). Admit directly with no precomputed crops.
+            # inline). Decode/validate each element up front so unsupported
+            # bytes fail THIS request at admission. Deferring the decode to
+            # encode_image() runs it mid-prefill in scheduler.advance(), where
+            # the exception is treated as a fatal AR-advance failure that drops
+            # every in-flight request rather than just this one.
+            from kestrel.utils.image import decode_to_srgb
+
+            try:
+                req.image = tuple(decode_to_srgb(im) for im in req.image)
+            except Exception as exc:
+                self._fail_request(req, exc)
+                return None
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
 
         if self._runtime.prefix_cache is not None:
