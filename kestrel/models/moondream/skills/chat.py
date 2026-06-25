@@ -46,6 +46,19 @@ class MoondreamChatSkill(ChatSkill):
             raise ValueError(
                 "MoondreamChatSkill.build_prompt_tokens requires a ChatRequest"
             )
+        # Moondream renders images only at user turns (one ImageMarker per user
+        # image part). A system/assistant image part is parsed into the image
+        # tuple but never gets a marker here, desyncing the tuple from the
+        # prompt and the length accounting — reject it rather than silently
+        # dropping the image.
+        for m in request_context.messages:
+            if m.role != "user" and any(
+                p.image_index is not None for p in m.parts
+            ):
+                raise ValueError(
+                    "Moondream chat supports images only in user messages; "
+                    f"found image content in a {m.role!r} message"
+                )
         pt = runtime.prompt_template
         template = pt.query()
         if template is None:
