@@ -87,7 +87,7 @@ class ChatRequest:
     """Validated chat payload carried to decode."""
 
     messages: Tuple[ChatMessage, ...]
-    images: Tuple["np.ndarray | bytes", ...]
+    images: Tuple[bytes, ...]
     reasoning: bool
     stream: bool
 
@@ -125,7 +125,7 @@ class ChatSkill(SkillSpec):
         if len(raw) == 0:
             raise ValueError("messages must be a non-empty list")
 
-        images: List["np.ndarray | bytes"] = []
+        images: List[bytes] = []
         messages: List[ChatMessage] = []
         for idx, m in enumerate(raw):
             if not isinstance(m, _Mapping):
@@ -393,7 +393,7 @@ class ChatSkillState(SkillState):
 
 def _parse_content(
     content: object,
-    images: "List[np.ndarray | bytes]",
+    images: List[bytes],
     role: str,
 ) -> List[ChatContentPart]:
     """Parse a message ``content`` into ordered parts, appending any images

@@ -114,6 +114,12 @@ def _disable_parameter_initialization():
             setattr(cls, method_name, original)
 
 
+def _count_image_markers(tokens) -> int:
+    """Number of ImageMarker sentinels in a prompt-token sequence (one per
+    multi-image chat image; each expands to image_prefix_length positions)."""
+    return sum(1 for t in tokens if isinstance(t, ImageMarker))
+
+
 class PrefillScratch:
     """Pre-allocated scratch buffers for prefill to avoid per-layer allocations."""
 
@@ -1288,7 +1294,7 @@ class MoondreamRuntime:
         """Return the current prefix-cache classification for a request."""
 
         tokens_list = list(prompt_tokens)
-        num_image_markers = sum(1 for t in tokens_list if isinstance(t, ImageMarker))
+        num_image_markers = _count_image_markers(tokens_list)
         if num_image_markers > 0:
             image_kv_length = num_image_markers * self.image_prefix_length
             prompt_len = len(tokens_list) - num_image_markers + image_kv_length
@@ -1639,7 +1645,7 @@ class MoondreamRuntime:
         tokens_list = list(prompt_tokens)
 
         # 2. Validate image/hash consistency
-        num_image_markers = sum(1 for t in tokens_list if isinstance(t, ImageMarker))
+        num_image_markers = _count_image_markers(tokens_list)
         has_image = (
             image is not None or image_crops is not None or num_image_markers > 0
         )
