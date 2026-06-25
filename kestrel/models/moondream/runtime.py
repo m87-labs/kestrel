@@ -1196,6 +1196,20 @@ class MoondreamRuntime:
             else:
                 if image is None:
                     raise ValueError("image must be provided when overlap is not supplied")
+                # Multi-image chat passes images straight through here with no
+                # precomputed overlap, so decode raw bytes (image_url data URLs)
+                # and normalize to sRGB exactly as ImagePreprocessor.preprocess
+                # does for the single-image path before cropping.
+                if isinstance(image, (bytes, bytearray)):
+                    import kestrel_native
+
+                    decoded = kestrel_native.decode_image(bytes(image))
+                    if decoded is None:
+                        raise ValueError("Unsupported image format")
+                    image = decoded
+                from kestrel.utils.image import ensure_srgb
+
+                image = ensure_srgb(image)
                 crops, tiling = prepare_crops(image, self.config.vision, self.device, self.dtype)
 
             batch_size = crops.shape[0]
