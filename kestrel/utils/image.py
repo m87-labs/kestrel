@@ -40,6 +40,24 @@ def ensure_srgb(image: np.ndarray) -> np.ndarray:
     return np_image
 
 
+def decode_to_srgb(image) -> np.ndarray:
+    """Decode raw image bytes (e.g. an ``image_url`` data URL) to an 8-bit
+    sRGB array; a normalization-only pass for arrays already in memory.
+
+    Raises ``ValueError`` on bytes that aren't a supported image so callers
+    can fail the originating request at admission rather than deep inside a
+    batched prefill.
+    """
+    if isinstance(image, (bytes, bytearray)):
+        import kestrel_native
+
+        decoded = kestrel_native.decode_image(bytes(image))
+        if decoded is None:
+            raise ValueError("Unsupported image format")
+        image = decoded
+    return ensure_srgb(image)
+
+
 def _b64decode(payload: str) -> bytes:
     try:
         return base64.b64decode(payload, validate=True)

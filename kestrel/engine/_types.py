@@ -301,10 +301,17 @@ class _ReadyAdmission:
     prefix_cache_hit: bool
 
 
-def _hash_image(image: np.ndarray | bytes) -> bytes:
-    """SHA-256 over the raw image input for prefix-cache keying."""
-    raw = image.tobytes() if isinstance(image, np.ndarray) else image
-    return hashlib.sha256(raw).digest()
+def _hash_image(image: "np.ndarray | bytes | Sequence[np.ndarray | bytes]") -> bytes:
+    """SHA-256 over the raw image input(s) for prefix-cache keying.
+
+    A chat request may carry several images (an ordered list); hash them in
+    order so the key reflects the full set.
+    """
+    items = image if isinstance(image, (list, tuple)) else [image]
+    digest = hashlib.sha256()
+    for one in items:
+        digest.update(one.tobytes() if isinstance(one, np.ndarray) else one)
+    return digest.digest()
 
 
 class EngineRequest(Protocol):

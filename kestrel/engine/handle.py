@@ -170,6 +170,11 @@ class ModelHandle:
             task, image=image, prompt=prompt, settings=settings, stream=stream
         )
 
+    async def chat(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
+        return await self._capability("chat", prompt)
+
     async def query(
         self, **prompt: Any
     ) -> "EngineResult | EngineStream | ModelStream":

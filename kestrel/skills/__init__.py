@@ -6,9 +6,11 @@ This package is model-agnostic: it defines what a *skill* is — the
 types they exchange with the kernel (``DecodeStep``, ``BuiltRequest``,
 ``SkillFinalizeResult``, autoregressive sampling defaults).
 
-Concrete capabilities live with their model (e.g.
+Most concrete capabilities live with their model (e.g.
 ``kestrel.models.moondream.skills``), since validation and request-building
-are model-specific.
+are model-specific. The exception is :class:`~kestrel.skills.chat.ChatSkill`,
+a model-agnostic chat capability that any model can serve by exposing a
+``chat()`` prompt template — it lives here so models share one instance.
 """
 
 from .base import (
@@ -24,12 +26,18 @@ from .base import (
     SkillState,
     parse_settings,
 )
+from .chat import ChatContentPart, ChatMessage, ChatRequest, ChatSkill, ChatSkillState
 
 __all__ = [
     "AR_DEFAULT_MAX_NEW_TOKENS",
     "AR_DEFAULT_TEMPERATURE",
     "AR_DEFAULT_TOP_P",
     "BuiltRequest",
+    "ChatContentPart",
+    "ChatMessage",
+    "ChatRequest",
+    "ChatSkill",
+    "ChatSkillState",
     "DecodeStep",
     "SkillFinalizeResult",
     "SkillRegistry",

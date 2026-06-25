@@ -57,6 +57,11 @@ class BuiltRequest:
     max_new_tokens: int
     temperature: float
     top_p: float
+    # Media the skill extracted from its own prompt (e.g. an image carried
+    # inside OpenAI chat messages). When set, the engine sends this through
+    # the image pipeline instead of the top-level ``image`` argument; ``None``
+    # leaves any caller-supplied ``image`` in force.
+    image: "Optional[np.ndarray | bytes]" = None
 
 
 def parse_settings(
@@ -217,6 +222,17 @@ class SkillState:
 
         Complement of allowed_token_ids: these tokens are forced to -inf
         rather than being the only ones kept.
+        """
+        return None
+
+    def stop_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+        """Optional per-skill token ids that end generation.
+
+        The scheduler stops a sequence when its last token matches the
+        model's ``eos_id``; a skill returns extra ids here to also stop on a
+        capability-specific terminator. The chat skill uses this for a
+        turn-end token (e.g. a ChatML-style ``<|im_end|>``) that differs
+        from the model's ``eos_id``.
         """
         return None
 

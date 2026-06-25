@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from kestrel.models.protocols import PrefixSuffix, QueryTemplate
+from kestrel.models.protocols import ChatTemplate, PrefixSuffix, QueryTemplate
 
 
 @dataclass(frozen=True)
@@ -101,6 +101,11 @@ class TokenizerConfig:
                 else None
             ),
         )
+
+    def chat(self) -> Optional[ChatTemplate]:
+        # Moondream has no trained multi-turn chat format; the chat skill
+        # flattens the conversation into the single-turn ``query`` prompt.
+        return None
 
     def detect(self) -> Optional[PrefixSuffix]:
         return self._prefix_suffix("detect")

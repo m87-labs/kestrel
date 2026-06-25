@@ -1626,7 +1626,14 @@ class GenerationScheduler:
     def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
         eos_id = self.runtime.prompt_template.eos_id
-        eos_hit = isinstance(last_token, TextToken) and last_token.token_id == eos_id
+        is_text = isinstance(last_token, TextToken)
+        eos_hit = is_text and last_token.token_id == eos_id
+        if is_text and not eos_hit:
+            # A skill (e.g. chat) may terminate a turn on its own token — a
+            # ChatML-style ``<|im_end|>`` can differ from the model's ``eos_id``.
+            stop_ids = seq.skill_state.stop_token_ids(self.runtime)
+            if stop_ids is not None and last_token.token_id in stop_ids:
+                eos_hit = True
         max_new_hit = seq.skill_state.token_count >= seq.request.max_new_tokens
         max_len_hit = seq.total_length >= seq.state.max_length
 

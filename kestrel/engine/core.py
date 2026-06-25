@@ -545,12 +545,15 @@ class InferenceEngine:
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
+        # A skill may carry media it pulled out of its own prompt (e.g. an
+        # image inside chat messages); prefer it over the top-level argument.
+        effective_image = built.image if built.image is not None else image
         submit_fn = self.submit_streaming if stream else self.submit
         return await submit_fn(
             built.request_context,
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
-            image=image,
+            image=effective_image,
             temperature=built.temperature,
             top_p=built.top_p,
             _logprobs=return_logprobs,
@@ -647,6 +650,30 @@ class InferenceEngine:
                 "stream": stream,
                 "spatial_refs": spatial_refs,
             },
+            settings=settings,
+            stream=stream,
+        )
+
+    async def chat(
+        self,
+        messages: Optional[Sequence[Mapping[str, object]]] = None,
+        *,
+        reasoning: Optional[bool] = None,
+        stream: bool = False,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> Union[EngineResult, EngineStream]:
+        # Omit ``reasoning`` from the prompt when the caller doesn't set it, so
+        # ``ChatSkill.build_request`` falls back to the skill's
+        # ``default_reasoning`` (e.g. MoondreamChatSkill defaults it on) —
+        # matching ``ModelHandle.chat()``, which preserves the model default by
+        # not passing the key.
+        prompt: dict[str, object] = {"messages": messages, "stream": stream}
+        if reasoning is not None:
+            prompt["reasoning"] = reasoning
+        return await self._run_skill(
+            "chat",
+            image=None,
+            prompt=prompt,
             settings=settings,
             stream=stream,
         )
@@ -1009,12 +1036,15 @@ class InferenceEngine:
                 "adapter provider is available."
             )
 
-        image_obj: Optional[np.ndarray | bytes] = None
+        image_obj = None
         if image is not None:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
-            if not isinstance(image, (np.ndarray, bytes)):
-                raise TypeError("image must be np.ndarray or bytes")
+            # A skill may pass several images (an ordered list, e.g. chat with
+            # multiple images); the runtime that accepts them unpacks the list.
+            items = image if isinstance(image, (list, tuple)) else [image]
+            if not items or not all(isinstance(one, (np.ndarray, bytes)) for one in items):
+                raise TypeError("image must be an np.ndarray/bytes, or a list of them")
             image_obj = image
 
         prompt_str = skill_spec.prompt_text(request_context)
@@ -1663,11 +1693,16 @@ class InferenceEngine:
     ) -> tuple[GenerationRequest, SkillState]:
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)
-        image_length = (
-            runtime.image_prefix_length
-            if (req.image is not None or image_crops is not None)
-            else 0
-        )
+        if req.image is None and image_crops is None:
+            image_length = 0
+        elif isinstance(req.image, (list, tuple)):
+            # Multi-image chat: each image expands one ImageMarker token — which
+            # is already counted in prompt_length — into an image_prefix_length
+            # patch block, so it adds image_prefix_length - 1 KV positions per
+            # image. (target_length = prompt_length + image_length + max_new.)
+            image_length = len(req.image) * (runtime.image_prefix_length - 1)
+        else:
+            image_length = runtime.image_prefix_length
         adapter = req.adapter
         request_obj = GenerationRequest(
             request_id=req.request_id,

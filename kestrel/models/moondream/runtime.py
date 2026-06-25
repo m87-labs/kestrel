@@ -36,6 +36,7 @@ from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime import (
     CoordToken,
     ExecutionShape,
+    ImageMarker,
     PrefillClassification,
     PreparedSequence,
     RuntimeDecodeResult,
@@ -111,6 +112,12 @@ def _disable_parameter_initialization():
     finally:
         for cls, method_name, original in originals:
             setattr(cls, method_name, original)
+
+
+def _count_image_markers(tokens) -> int:
+    """Number of ImageMarker sentinels in a prompt-token sequence (one per
+    multi-image chat image; each expands to image_prefix_length positions)."""
+    return sum(1 for t in tokens if isinstance(t, ImageMarker))
 
 
 class PrefillScratch:
@@ -1195,6 +1202,14 @@ class MoondreamRuntime:
             else:
                 if image is None:
                     raise ValueError("image must be provided when overlap is not supplied")
+                # Multi-image chat passes images straight through here with no
+                # precomputed overlap. The executor decodes/validates the tuple
+                # at admission, but normalize defensively in case a caller hands
+                # raw bytes straight to encode_image (decode_to_srgb is a no-op
+                # for arrays already in sRGB).
+                from kestrel.utils.image import decode_to_srgb
+
+                image = decode_to_srgb(image)
                 crops, tiling = prepare_crops(image, self.config.vision, self.device, self.dtype)
 
             batch_size = crops.shape[0]
@@ -1279,12 +1294,19 @@ class MoondreamRuntime:
         """Return the current prefix-cache classification for a request."""
 
         tokens_list = list(prompt_tokens)
-        image_kv_length = self.image_prefix_length if has_image else 0
-        prompt_len = len(tokens_list) + image_kv_length
+        num_image_markers = _count_image_markers(tokens_list)
+        if num_image_markers > 0:
+            image_kv_length = num_image_markers * self.image_prefix_length
+            prompt_len = len(tokens_list) - num_image_markers + image_kv_length
+        else:
+            image_kv_length = self.image_prefix_length if has_image else 0
+            prompt_len = len(tokens_list) + image_kv_length
         can_reuse = False
         skip_positions = 0
 
-        if self.prefix_cache is not None:
+        # The single-image prefix cache doesn't cover the multi-image marker
+        # layout; classify those as full prefill (no reuse).
+        if self.prefix_cache is not None and num_image_markers == 0:
             if has_image:
                 assert image_hash is not None, (
                     "image_hash must be provided when prefix cache is enabled for image prompts"
@@ -1434,38 +1456,88 @@ class MoondreamRuntime:
     def _prepare_full_prefill_inputs(
         self,
         tokens_list: list[Token],
-        image: Optional[np.ndarray],
+        images: Optional[Sequence[Optional[np.ndarray]]],
         image_crops: Optional[OverlapCropOutput],
         prompt_len: int,
         *,
         staging: PrefillInputStaging,
         row: int,
-    ) -> tuple[Tensor, int]:
-        """Prepare inputs for full prefill (cache miss path)."""
-        # Embed prompt tokens
-        if len(tokens_list) > 0:
-            prompt_embed = self._embed_tokens(tokens_list, staging=staging, row=row)
-        else:
-            prompt_embed = None
+    ) -> tuple[Tensor, int, Optional[Tensor]]:
+        """Prepare inputs for full prefill (cache-miss path).
+
+        Returns ``(inputs_embeds, position_start, block_sequence_ids)``. Images
+        are spliced in as image-patch embedding blocks: at each ``ImageMarker``
+        sentinel (multi-image chat path), or after BOS (single-image query
+        path). ``block_sequence_ids`` (int32, one entry per expanded position:
+        image-block id >= 0, or -1 for text) drives the block-bidirectional
+        attention mask; it is ``None`` when there is no image. BOS joins the
+        first image block when the image starts right after it, reproducing the
+        retired ``prefix_lm_730`` mask for a single front image.
+        """
+        marker_positions = [
+            i for i, t in enumerate(tokens_list) if isinstance(t, ImageMarker)
+        ]
 
         segments: list[Tensor] = []
-        if prompt_embed is not None and len(tokens_list) > 0:
-            # Add BOS embed (first token)
-            segments.append(prompt_embed[:, :1, :])
+        block_ids: list[int] = []
 
-        if image is not None or image_crops is not None:
-            image_embed = self.encode_image(image, overlap=image_crops).unsqueeze(0)
-            segments.append(image_embed)
-
-        if prompt_embed is not None and len(tokens_list) > 1:
-            # Add remaining tokens after BOS
-            segments.append(prompt_embed[:, 1:, :])
+        if marker_positions:
+            # Multi-image chat path: images interleaved at ImageMarker sentinels.
+            if images is None:
+                raise RuntimeError("ImageMarker tokens require images")
+            cursor = 0
+            for mpos in marker_positions:
+                if mpos > cursor:
+                    seg = self._embed_tokens(
+                        tokens_list[cursor:mpos], staging=staging, row=row
+                    )
+                    segments.append(seg)
+                    block_ids.extend([-1] * int(seg.shape[1]))
+                marker = tokens_list[mpos]
+                seg = self.encode_image(images[marker.index]).unsqueeze(0)
+                segments.append(seg)
+                block_ids.extend([marker.index] * int(seg.shape[1]))
+                cursor = mpos + 1
+            if cursor < len(tokens_list):
+                seg = self._embed_tokens(
+                    tokens_list[cursor:], staging=staging, row=row
+                )
+                segments.append(seg)
+                block_ids.extend([-1] * int(seg.shape[1]))
+        else:
+            # Single-image query path: BOS, image, then the rest of the prompt.
+            prompt_embed = (
+                self._embed_tokens(tokens_list, staging=staging, row=row)
+                if len(tokens_list) > 0 else None
+            )
+            image = images[0] if images else None
+            has_image = image is not None or image_crops is not None
+            if prompt_embed is not None and len(tokens_list) > 0:
+                segments.append(prompt_embed[:, :1, :])  # BOS
+                block_ids.append(-1)
+            if has_image:
+                seg = self.encode_image(image, overlap=image_crops).unsqueeze(0)
+                segments.append(seg)
+                block_ids.extend([0] * int(seg.shape[1]))
+            if prompt_embed is not None and len(tokens_list) > 1:
+                segments.append(prompt_embed[:, 1:, :])  # remaining tokens
+                block_ids.extend([-1] * (len(tokens_list) - 1))
 
         if not segments:
             segments = [self.bos_embed]
+            block_ids = [-1]
+
+        # BOS joins the first image block when the image starts right after it.
+        if len(block_ids) > 1 and block_ids[0] == -1 and block_ids[1] >= 0:
+            block_ids[0] = block_ids[1]
 
         inputs_embeds = torch.cat(segments, dim=1)
-        return inputs_embeds, 0
+        block_sequence_ids = None
+        if any(b >= 0 for b in block_ids):
+            block_sequence_ids = torch.tensor(
+                block_ids, dtype=torch.int32, device=self.device
+            )
+        return inputs_embeds, 0, block_sequence_ids
 
     def _finalize_cache_after_prefill(
         self,
@@ -1573,7 +1645,10 @@ class MoondreamRuntime:
         tokens_list = list(prompt_tokens)
 
         # 2. Validate image/hash consistency
-        has_image = image is not None or image_crops is not None
+        num_image_markers = _count_image_markers(tokens_list)
+        has_image = (
+            image is not None or image_crops is not None or num_image_markers > 0
+        )
         if not has_image:
             assert image_hash is None, "image_hash must be None when no image is provided"
         else:
@@ -1583,14 +1658,22 @@ class MoondreamRuntime:
                 raise ValueError(
                     "Image prompts must include at least one text token after BOS"
                 )
-            if self.prefix_cache is not None:
+            # The single-image prefix cache (keyed by one image_hash) only applies
+            # to the single-image (no-marker) path.
+            if num_image_markers == 0 and self.prefix_cache is not None:
                 assert image_hash is not None, (
                     "image_hash must be provided when prefix cache is enabled for image prompts"
                 )
 
-        # 3. Compute dimensions
-        image_kv_length = self.image_prefix_length if has_image else 0
-        prompt_len = len(tokens_list) + image_kv_length
+        # 3. Compute dimensions. ImageMarker tokens (1 each) expand to an
+        # image_prefix_length patch block; the single-image path adds one block
+        # that is not in the token list.
+        if num_image_markers > 0:
+            image_kv_length = num_image_markers * self.image_prefix_length
+            prompt_len = len(tokens_list) - num_image_markers + image_kv_length
+        else:
+            image_kv_length = self.image_prefix_length if has_image else 0
+            prompt_len = len(tokens_list) + image_kv_length
 
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
         target_length = prompt_len + max_new
@@ -1599,8 +1682,9 @@ class MoondreamRuntime:
                 f"Requested length {target_length} exceeds max_seq_length={self.max_seq_length}."
             )
 
-        # 4. Build cache tokens (skip when prefix cache is disabled).
-        if self.prefix_cache is None:
+        # 4. Build cache tokens (skip when prefix cache is disabled, or for the
+        # multi-image marker layout which the single-image cache doesn't cover).
+        if self.prefix_cache is None or num_image_markers > 0:
             cache_tokens = []
         else:
             cache_tokens = self._build_cache_tokens(
@@ -1668,7 +1752,10 @@ class MoondreamRuntime:
         prompt_len = state.prompt_length or state.length
         image_kv_length = state.image_length
 
+        block_sequence_ids = None
         if cache_result.can_reuse:
+            # Append/cache-reuse path: prefix is already cached, attention is
+            # plain causal over the new suffix (no image-block mask).
             inputs_embeds, position_start = self._prepare_append_prefill_inputs(
                 tokens_list,
                 cache_result.skip_positions,
@@ -1678,17 +1765,28 @@ class MoondreamRuntime:
                 row=row,
             )
         else:
-            inputs_embeds, position_start = self._prepare_full_prefill_inputs(
-                tokens_list,
-                image,
-                image_crops,
-                prompt_len,
-                staging=staging,
-                row=row,
+            # `image` may be a single array (query path) or an ordered list of
+            # images (multi-image chat); normalize to the list the interleaver
+            # indexes by ImageMarker.index.
+            if image is None:
+                images = None
+            elif isinstance(image, (list, tuple)):
+                images = list(image)
+            else:
+                images = [image]
+            inputs_embeds, position_start, block_sequence_ids = (
+                self._prepare_full_prefill_inputs(
+                    tokens_list,
+                    images,
+                    image_crops,
+                    prompt_len,
+                    staging=staging,
+                    row=row,
+                )
             )
 
         use_prefix_attn = bool(image_kv_length) and not cache_result.can_reuse
-        return inputs_embeds, position_start, use_prefix_attn
+        return inputs_embeds, position_start, use_prefix_attn, block_sequence_ids
 
     def launch_prepared_batch(
         self,
@@ -1733,11 +1831,12 @@ class MoondreamRuntime:
         with stream_context(self._compute_stream):
             per_inputs: list[Tensor] = []
             position_starts: list[int] = []
+            per_block_ids: list[Optional[Tensor]] = []
             use_prefix_attn: bool | None = None
             for row, (prepared, image, image_crops) in enumerate(zip(
                 prepared_sequences, images, image_crops_list
             )):
-                inputs_embeds, position_start, seq_use_prefix_attn = (
+                inputs_embeds, position_start, seq_use_prefix_attn, seq_block_ids = (
                     self._build_prefill_inputs_for_prepared(
                         prepared,
                         image=image,
@@ -1756,6 +1855,7 @@ class MoondreamRuntime:
                     )
                 per_inputs.append(inputs_embeds)
                 position_starts.append(position_start)
+                per_block_ids.append(seq_block_ids)
 
             assert use_prefix_attn is not None
             hidden_dim = self.bos_embed.shape[-1]
@@ -1801,6 +1901,20 @@ class MoondreamRuntime:
                     )
                 inputs_embeds[row, :seq_len, :].copy_(embed_row[0, :, :])
 
+            block_sequence_ids = None
+            if use_prefix_attn:
+                # Assemble per-row image-block ids into [batch, max_seq_len]; the
+                # padded (seqlen-masked) tail stays -1.
+                block_sequence_ids = torch.full(
+                    (batch_size, max_seq_len), -1,
+                    dtype=torch.int32, device=self.device,
+                )
+                for r, seq_block_ids in enumerate(per_block_ids):
+                    if seq_block_ids is not None:
+                        block_sequence_ids[r, : int(seq_block_ids.shape[0])].copy_(
+                            seq_block_ids
+                        )
+
             # Commit page table rows for all batch indices before forward pass.
             self.page_table.commit_block_table(batch_indices)
 
@@ -1812,6 +1926,7 @@ class MoondreamRuntime:
                 batch_idx=slot_batch_idx,
                 lora_slot=lora_slot,
                 use_prefix_attn=use_prefix_attn,
+                block_sequence_ids=block_sequence_ids,
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
@@ -1936,6 +2051,7 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool,
+        block_sequence_ids: Tensor | None = None,
         paged_kv_seqlens_q: Tensor | None,
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
@@ -2037,6 +2153,7 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
+            block_sequence_ids=block_sequence_ids,
             page_table=paged_kv_page_table,
             paged_kv_seqlens_q=paged_kv_seqlens_q,
             paged_kv_seqlens_k=paged_kv_seqlens_k,
