@@ -752,19 +752,54 @@ class InferenceEngine:
             settings=settings,
         )
 
+    @overload
+    async def segment(
+        self,
+        image: Optional[np.ndarray | bytes],
+        object: str,
+        *,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
+        stream: Literal[True],
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> "EngineStream": ...
+
+    @overload
+    async def segment(
+        self,
+        image: Optional[np.ndarray | bytes],
+        object: str,
+        *,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
+        stream: Literal[False] = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> EngineResult: ...
+
+    @overload
+    async def segment(
+        self,
+        image: Optional[np.ndarray | bytes],
+        object: str,
+        *,
+        spatial_refs: Optional[Sequence[Sequence[float]]] = ...,
+        stream: bool = ...,
+        settings: Optional[Mapping[str, object]] = ...,
+    ) -> Union[EngineResult, EngineStream]: ...
+
     async def segment(
         self,
         image: Optional[np.ndarray | bytes],
         object: str,
         *,
         spatial_refs: Optional[Sequence[Sequence[float]]] = None,
+        stream: bool = False,
         settings: Optional[Mapping[str, object]] = None,
-    ) -> EngineResult:
+    ) -> Union[EngineResult, EngineStream]:
         return await self._run_skill(
             "segment",
             image=image,
-            prompt={"object": object, "spatial_refs": spatial_refs},
+            prompt={"object": object, "spatial_refs": spatial_refs, "stream": stream},
             settings=settings,
+            stream=stream,
         )
 
     async def submit_streaming(

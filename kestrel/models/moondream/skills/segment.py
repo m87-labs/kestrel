@@ -67,7 +67,7 @@ class SegmentSkill(SkillSpec):
         request = SegmentRequest(
             object=obj,
             image=image,
-            stream=False,
+            stream=bool(prompt.get("stream", False)),
             spatial_refs=normalize_spatial_refs(prompt.get("spatial_refs")),
         )
         return BuiltRequest(
