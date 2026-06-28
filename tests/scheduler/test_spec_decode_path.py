@@ -97,7 +97,16 @@ def _spec_runtime(decoder: _FakeDecoder, *, eos_id: int = 999) -> FakeRuntime:
     return rt
 
 
-def _enqueue(sched: GenerationScheduler, rid: int, prompt_len: int, max_new: int):
+def _enqueue(
+    sched: GenerationScheduler,
+    rid: int,
+    prompt_len: int,
+    max_new: int,
+    *,
+    adapter: str | None = None,
+    lora_slot_ready: bool = True,
+    return_logprobs: bool | None = None,
+):
     req = GenerationRequest(
         request_id=rid,
         prompt="p",
@@ -105,10 +114,12 @@ def _enqueue(sched: GenerationScheduler, rid: int, prompt_len: int, max_new: int
         max_new_tokens=max_new,
         skill=_SpecSkillSpec(),  # type: ignore[arg-type]
         request_context=object(),
+        adapter=adapter,
+        return_logprobs=return_logprobs,
     )
     lc = RequestLifecycle(request=req, skill_state=_RecordingState(req))
     lc.crops_ready = True
-    lc.lora_slot_ready = True
+    lc.lora_slot_ready = lora_slot_ready
     lc.transition(RequestPhase.READY_FOR_PREFILL)
     req.lifecycle = lc
     sched.enqueue_request(req, lc.skill_state)
@@ -239,3 +250,160 @@ def test_advance_routes_to_spec_when_capability_present() -> None:
     # single-token decode pipeline.
     assert sched.advance() is True
     assert dec.admitted == [0]
+
+
+def test_has_pending_work_tracks_pending_spec_until_drained() -> None:
+    """Regression for the depth-1 drain leak (codex finding @ L617).
+
+    A finishing sequence launches one optimistic follow-up macro-step before its
+    own commit removes it from ``running``. That follow-up lives in
+    ``_pending_spec`` as a zombie. ``has_pending_work()`` must stay True while it
+    is outstanding, otherwise the executor stops calling ``advance`` and the
+    zombie step is never committed -> ``decoder.retire`` never runs -> the spec
+    row leaks. Drive the loop until ``running`` empties with a pending step still
+    outstanding and assert (a) the row is retired exactly once, (b)
+    ``has_pending_work`` only goes False after the pending step is committed.
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()
+
+    # Drive macro-steps manually so we can observe the tick where ``running``
+    # is already empty but a pending (zombie) spec step is still outstanding.
+    saw_pending_after_running_empty = False
+    for _ in range(10):
+        if not sched._spec_decode_step():
+            break
+        if len(sched.running) == 0 and sched._pending_spec is not None:
+            saw_pending_after_running_empty = True
+            # This is exactly the window the bug regressed: the old
+            # has_pending_work() (waiting/running/pipeline only) returned False
+            # here and the executor would stop driving advance().
+            assert sched.has_pending_work() is True
+
+    assert saw_pending_after_running_empty is True
+    # Pending step committed, row retired exactly once, nothing leaked.
+    assert sched._pending_spec is None
+    assert dec.retired == [0]
+    assert rt.active_sequences == {}
+    assert sched.has_pending_work() is False
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+
+
+def test_spec_admit_acquires_lora_slot_for_adapter_request() -> None:
+    """Regression for the LoRA wrong-slot bug (codex finding @ L560).
+
+    Adapter requests admitted to the spec path must acquire a LoRA slot the way
+    the normal prefill path does; otherwise ``request.lora_slot`` stays 0 and the
+    finetune is silently ignored (base-model slot).
+    """
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    # Adapter request enters WAITING_RESOURCES with no slot yet.
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    assert sched._spec_admit() is True
+    # Slot was acquired (FakeRuntime returns slot index >= 1) and threaded onto
+    # both the request and the admitted SequenceState.
+    assert rt.acquired_adapter_slots == [("ft-1", rt.acquired_adapter_slots[0][1])]
+    assert req.lifecycle.lora_slot_ready is True
+    assert req.lora_slot >= 1
+    assert req.lifecycle.state.lora_slot == req.lora_slot
+
+
+def test_spec_admit_defers_when_lora_slots_exhausted() -> None:
+    """Out-of-slots is recoverable: keep the request WAITING_RESOURCES.
+
+    When ``acquire_adapter_slot`` raises ``RuntimeError`` (all LoRA slots in
+    use), the adapter request must stay in the waiting queue (not be admitted
+    with the wrong slot, nor failed) so it retries once a slot frees up.
+    """
+
+    class _ExhaustedAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _FakeDecoder(n_rows=2, first_tokens={0: 11, 1: 22}, plans={0: [[12]], 1: [[23]]})
+    rt = _spec_runtime(dec)
+
+    def _raise_out_of_slots(adapter_id: str, adapter: object) -> int:
+        raise RuntimeError("Out of LoRA slots: all slots are in use.")
+
+    rt.acquire_adapter_slot = _raise_out_of_slots  # type: ignore[method-assign]
+
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_ExhaustedAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    # No row admitted, request stays waiting (WAITING_RESOURCES), no error result.
+    assert sched._spec_admit() is False
+    assert dec.admitted == []
+    assert len(sched.waiting) == 1
+    assert len(sched.running) == 0
+    assert req.lifecycle.phase == RequestPhase.WAITING_RESOURCES
+    assert sched.pop_completed() == []
+
+
+def test_spec_admit_rejects_logprobs_request_cleanly() -> None:
+    """Regression for the spec+logprobs crash (codex finding @ L578).
+
+    A ``return_logprobs=True`` request on the spec path must fail just that
+    request (clean error result + row retired) instead of raising a
+    scheduler-wide exception when ``stage_token`` sees a None logprob.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8, return_logprobs=True)
+
+    # Must not raise.
+    assert sched._spec_admit() is True
+    # Request failed cleanly: errored result, not pushed to running, row retired.
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    assert len(sched.running) == 0
+    assert dec.retired == [0]
+    assert rt.active_sequences == {}
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "error"
+    assert "error" in completed[0].output
+
+    # And the spec decode loop stays healthy afterward (no leaked pending step).
+    assert sched._spec_decode_step() is False
+    assert sched.has_pending_work() is False

@@ -375,6 +375,14 @@ class GenerationScheduler:
             len(self.waiting) > 0
             or len(self.running) > 0
             or not self._pipeline.is_empty()
+            # Depth-1 spec overlap: a launched-but-uncommitted macro-step keeps
+            # work pending even when ``running`` is already empty. The last
+            # running sequence can finish in ``_commit_spec`` while the
+            # follow-up (zombie) step it launched stays in ``_pending_spec``;
+            # without this term the executor stops calling ``advance`` and that
+            # step is never committed, so ``decoder.retire`` never runs and the
+            # spec row leaks.
+            or self._pending_spec is not None
         )
 
     def advance(self) -> bool:
@@ -535,13 +543,56 @@ class GenerationScheduler:
         if decoder is None:
             raise RuntimeError("runtime.spec set without a decoder")
         progressed = False
+        # Requests deferred this call because their adapter slot is currently
+        # unavailable. Tracking them stops the launchable scan from re-picking
+        # the same request (it stays in ``waiting``) while still letting other
+        # waiting requests be considered for admission.
+        deferred_ids: set[int] = set()
         while decoder.free_slots > 0:
             request = next(
-                (r for r in self.waiting if self._is_launchable_request(r)), None
+                (
+                    r
+                    for r in self.waiting
+                    if self._is_launchable_request(r)
+                    and r.request_id not in deferred_ids
+                ),
+                None,
             )
             if request is None:
                 break
             lifecycle = request.lifecycle
+
+            # Acquire the LoRA slot before admission, mirroring the normal
+            # prefill path. Without this, adapter requests admitted to the spec
+            # path keep ``request.lora_slot == 0`` and silently run on the
+            # base-model slot, ignoring the requested finetune. A genuine load
+            # failure fails just that request; transient slot exhaustion (all
+            # LoRA slots in use) keeps the request WAITING_RESOURCES so it
+            # retries once an adapter retires, instead of admitting it wrong.
+            if not lifecycle.lora_slot_ready:
+                try:
+                    request.lora_slot = self._acquire_adapter_slot(request.adapter)
+                    lifecycle.lora_slot_ready = True
+                except RuntimeError as exc:
+                    # Out of LoRA slots: recoverable. The request is genuinely
+                    # blocked on a LoRA resource, so put it back in
+                    # WAITING_RESOURCES (it stays in the waiting queue) and try
+                    # other waiting requests; it retries once a slot frees up.
+                    _LOGGER.debug(
+                        "Deferring spec admission for request %s: %s",
+                        request.request_id,
+                        exc,
+                    )
+                    lifecycle.transition(RequestPhase.WAITING_RESOURCES)
+                    deferred_ids.add(request.request_id)
+                    continue
+                except Exception as exc:
+                    # Unrecoverable adapter load/config error: fail this request.
+                    self.waiting.remove(request)
+                    self._fail_request_early(request, exc)
+                    progressed = True
+                    continue
+
             prompt_ids = [int(t.token_id) for t in request.prefill_tokens]
             # Admission capacity is the decoder's free rows: the spec decoder
             # owns a fixed, pre-reserved pool of page-table rows (its captured
@@ -563,6 +614,15 @@ class GenerationScheduler:
                 with torch.inference_mode():
                     first_token_id = decoder.admit(state, prompt_ids)
             except Exception as exc:
+                if lifecycle.lora_slot_ready and request.lora_slot:
+                    # Release the LoRA slot we acquired for this failed admission
+                    # so its refcount does not leak.
+                    try:
+                        self.runtime.release_adapter_slot(request.lora_slot)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    request.lora_slot = 0
+                    lifecycle.lora_slot_ready = False
                 self._fail_request_early(request, exc)
                 progressed = True
                 continue
@@ -572,10 +632,31 @@ class GenerationScheduler:
             self.runtime.active_sequences[state.batch_idx] = state
             request.skill_state.on_prefill(self.runtime)
 
+            # TODO(spec-logprobs): the spec macro-step does not yet supply
+            # per-token logprobs (``admit`` returns only a token id and
+            # ``SpecStepResult`` carries none). Until the speculator branch
+            # populates them on the compute side, a ``return_logprobs`` request
+            # cannot be served on the spec path. Reject just that request here --
+            # cleanly retiring the row/slot ``admit`` allocated -- instead of
+            # letting ``stage_token`` raise a scheduler-wide exception on a None
+            # logprob. Once the macro-step provides logprobs, stage them through
+            # ``_spec_stage_token`` like the non-spec path.
+            if request.return_logprobs is True:
+                self._fail_admitted_spec_request(
+                    decoder,
+                    lifecycle,
+                    RuntimeError(
+                        "Speculative decoding does not yet support logprobs; "
+                        "disable speculation for return_logprobs requests."
+                    ),
+                )
+                progressed = True
+                continue
+
             # Stage the first (prefill/bonus) token exactly like the non-spec
             # prefill path: consume_step + streaming + finish check.
             token = TextToken(token_id=int(first_token_id))
-            lifecycle.stage_token(self.runtime, token, logprob=None)
+            self._spec_stage_token(lifecycle, token, logprob=None)
             progressed = True
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
@@ -584,6 +665,72 @@ class GenerationScheduler:
                 continue
             self.running.push(lifecycle)
         return progressed
+
+    def _spec_stage_token(
+        self,
+        seq: RequestLifecycle,
+        token: Token,
+        *,
+        logprob: float | None,
+    ) -> None:
+        """Stage one spec-committed token onto ``seq``.
+
+        Mirrors ``RequestLifecycle.stage_token`` but is the single spec-path
+        staging point. ``return_logprobs`` requests are rejected at admission
+        (the spec macro-step cannot supply logprobs yet, see the
+        ``# TODO(spec-logprobs)`` above), so any sequence reaching here either
+        does not want logprobs or carries a real one. The non-None ``logprob``
+        branch is wired so that the day the macro-step supplies logprobs they
+        flow through unchanged.
+        """
+        seq.stage_token(self.runtime, token, logprob=logprob)
+
+    def _fail_admitted_spec_request(
+        self,
+        decoder,
+        seq: RequestLifecycle,
+        exc: Exception,
+    ) -> None:
+        """Fail one already-admitted spec sequence cleanly (no scheduler abort).
+
+        ``admit`` has already allocated a pool row (and the caller a LoRA slot),
+        so retire the row, drop it from ``active_sequences``, release any LoRA
+        slot, and emit an error result for just this request. The request was
+        not yet pushed onto ``running``.
+        """
+        _LOGGER.warning(
+            "Failing spec request %s: %s", seq.request.request_id, exc
+        )
+        state = seq.sequence_state
+        if state is not None:
+            try:
+                decoder.retire(state)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            self.runtime.active_sequences.pop(state.batch_idx, None)
+        request = seq.request
+        if seq.lora_slot_ready and request.lora_slot:
+            try:
+                self.runtime.release_adapter_slot(request.lora_slot)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            request.lora_slot = 0
+            seq.lora_slot_ready = False
+        seq.finish_reason = "error"
+        seq.error = exc
+        seq.finished = True
+        seq.finalized = True
+        seq.transition(RequestPhase.COMPLETED)
+        metrics = seq.build_metrics(decode_tokens=0)
+        self._completed.append(
+            SchedulerResult(
+                request_id=request.request_id,
+                tokens=[],
+                finish_reason="error",
+                metrics=metrics,
+                output={"error": str(exc)},
+            )
+        )
 
     def _spec_decode_step(self) -> bool:
         """Run one spec macro-step, overlapped depth-1.
@@ -643,7 +790,12 @@ class GenerationScheduler:
             for token_id in new_token_ids:
                 seq.state.advance()  # KV length mirrors the committed token
                 token = TextToken(token_id=int(token_id))
-                seq.stage_token(self.runtime, token, logprob=None)
+                # TODO(spec-logprobs): pass the macro-step's per-token logprob
+                # here once ``SpecStepResult`` carries them. ``return_logprobs``
+                # requests are rejected at spec admission today, so every
+                # sequence reaching this commit has ``return_logprobs`` unset and
+                # ``stage_token`` does not require a logprob.
+                self._spec_stage_token(seq, token, logprob=None)
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     self.running.remove(seq)
