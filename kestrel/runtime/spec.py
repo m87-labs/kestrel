@@ -62,7 +62,6 @@ class SpecProposer(Protocol):
         ...
 
 
-@dataclass
 class SpecStepResult:
     """Per-sequence outcome of one speculative *macro-step*.
 
@@ -77,10 +76,43 @@ class SpecStepResult:
     ids for ``sequences[i]`` (length ``a_i + 1``, always ``>= 1``).
     ``accept_counts[i]`` is ``a_i`` (drafts accepted, excludes the bonus); it is
     diagnostic — ``len(tokens[i]) == accept_counts[i] + 1``.
+
+    The fields resolve **lazily**. A proposer may build this from an in-flight
+    D2H of its committed-token buffer so ``step`` never stalls the GPU on a
+    readback; the first access to :attr:`tokens` / :attr:`accept_counts` blocks
+    on that transfer. The async scheduler defers that access to a later step, so
+    the wait overlaps GPU work (see ``docs/speculative-decoding-design.md`` §12).
+    Eager construction (``SpecStepResult(tokens=..., accept_counts=...)``) stays
+    valid for synchronous callers and tests.
     """
 
-    tokens: list[list[int]]
-    accept_counts: list[int]
+    __slots__ = ("_tokens", "_accept_counts", "_resolve")
+
+    def __init__(
+        self,
+        tokens: "list[list[int]] | None" = None,
+        accept_counts: "list[int] | None" = None,
+        *,
+        resolve: "Any | None" = None,
+    ) -> None:
+        self._resolve = resolve
+        self._tokens = tokens
+        self._accept_counts = accept_counts
+
+    def _ensure(self) -> None:
+        if self._resolve is not None:
+            self._tokens, self._accept_counts = self._resolve()
+            self._resolve = None
+
+    @property
+    def tokens(self) -> "list[list[int]]":
+        self._ensure()
+        return self._tokens
+
+    @property
+    def accept_counts(self) -> "list[int]":
+        self._ensure()
+        return self._accept_counts
 
 
 @runtime_checkable

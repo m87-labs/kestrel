@@ -73,7 +73,12 @@ class _FakeDecoder:
         tokens, accepts = [], []
         for s in states:
             row = self._row_of[id(s)]
-            nxt = self._plans[row].pop(0)
+            plan = self._plans[row]
+            # Depth-1 overlap launches one macro-step ahead, so a finishing row
+            # gets one extra optimistic launch whose result is discarded as a
+            # zombie at commit. Hand back a throwaway token when the script is
+            # exhausted.
+            nxt = plan.pop(0) if plan else [0]
             tokens.append(list(nxt))
             accepts.append(len(nxt) - 1)
         return SpecStepResult(tokens=tokens, accept_counts=accepts)
@@ -148,13 +153,17 @@ def test_spec_step_variable_advance_and_state_length() -> None:
     )
     rt = _spec_runtime(dec)
     sched = _make_scheduler(rt)
-    r0 = _enqueue(sched, 0, prompt_len=3, max_new=8)
-    r1 = _enqueue(sched, 1, prompt_len=2, max_new=8)
+    # max_new sized so each row finishes exactly at its scripted step (the
+    # depth-1 pipeline commits a step one tick after it launches).
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    r1 = _enqueue(sched, 1, prompt_len=2, max_new=2)
     sched._spec_admit()
 
     len0_before = r0.lifecycle.state.length
     len1_before = r1.lifecycle.state.length
-    assert sched._spec_decode_step() is True
+    # Drive the depth-1 pipeline to quiescence (launch N / commit N-1 / drain).
+    while sched._spec_decode_step():
+        pass
 
     # Variable advance: row 0 committed 2, row 1 committed 1.
     assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [11, 12, 13]
@@ -175,7 +184,8 @@ def test_spec_finish_on_eos_within_run_retires_and_completes() -> None:
     sched = _make_scheduler(rt)
     r0 = _enqueue(sched, 0, prompt_len=3, max_new=20)
     sched._spec_admit()
-    sched._spec_decode_step()
+    while sched._spec_decode_step():  # depth-1: commit lands a tick after launch
+        pass
 
     toks = [int(t.token_id) for t in r0.lifecycle.skill_state.tokens]
     # Staged up to and including eos, then stopped (13 dropped).
@@ -198,8 +208,10 @@ def test_spec_finish_on_max_new_tokens() -> None:
     sched = _make_scheduler(rt)
     r0 = _enqueue(sched, 0, prompt_len=3, max_new=3)
     sched._spec_admit()
-    # admit already staged 1; one step stages 2 more -> hits max_new=3.
-    sched._spec_decode_step()
+    # admit staged 1; the scripted step stages 2 more -> hits max_new=3. Drive
+    # the depth-1 pipeline to quiescence (commit lands a tick after launch).
+    while sched._spec_decode_step():
+        pass
     assert r0.lifecycle.finished is True
     assert dec.retired == [0]
     assert [c.finish_reason for c in sched.pop_completed()] == ["length"]

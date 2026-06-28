@@ -333,6 +333,10 @@ class GenerationScheduler:
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
         self._last_deferred_request_id: int | None = None
+        # Depth-1 spec overlap: the previously-launched macro-step's
+        # (sequences, lazy SpecStepResult) awaiting commit while the GPU runs the
+        # next step. None when no spec step is in flight.
+        self._pending_spec = None
 
     # ------------------------------------------------------------------
     # Submission
@@ -582,33 +586,71 @@ class GenerationScheduler:
         return progressed
 
     def _spec_decode_step(self) -> bool:
-        """Run one spec macro-step over the active running sequences."""
+        """Run one spec macro-step, overlapped depth-1.
+
+        Launch the macro-step for the current running set *first* (async: the
+        decoder samples + commits on the GPU and returns a lazy
+        ``SpecStepResult`` whose token D2H is in flight), then commit the
+        *previous* macro-step -- whose D2H landed while this launch ran. The CPU
+        commit (token materialize + stage + finish) therefore overlaps GPU
+        compute.
+
+        Membership is an optimistic snapshot: a sequence finished by the previous
+        commit but already launched here rides as a zombie (``finalized`` with
+        ``inflight_refs > 0``) and is skipped + retired at its own commit next
+        tick -- the same zombie discipline the single-token pipeline uses.
+        """
         decoder = self.runtime.spec.decoder
+        pending = self._pending_spec
+        self._pending_spec = None
+
         active = [
             seq
             for seq in self.running
             if not seq.finished and seq.sequence_state is not None
         ]
-        if not active:
-            return False
+        if active:
+            with torch.inference_mode():
+                result = decoder.step([seq.state for seq in active])
+            for seq in active:
+                seq.inflight_refs += 1
+            self._pending_spec = (active, result)
 
-        states = [seq.state for seq in active]
-        with torch.inference_mode():
-            result = decoder.step(states)
+        if pending is not None:
+            self._commit_spec(decoder, pending)
 
-        for seq, new_token_ids in zip(active, result.tokens):
+        return bool(active) or pending is not None
+
+    def _commit_spec(self, decoder, pending) -> None:
+        """Commit one previously-launched spec macro-step (depth-1).
+
+        Resolving ``result.tokens`` blocks on the macro-step's deferred D2H, but
+        that transfer completed while the GPU ran the step launched after it, so
+        the wait is hidden. Mirrors ``commit_step``'s decode commit: decrement
+        ``inflight_refs``, skip + retire zombies, else stage the variable run of
+        committed tokens and finish/retire on EOS or length cap.
+        """
+        active, result = pending
+        tokens = result.tokens  # lazy: waits the (already-landed) deferred D2H
+        for seq, new_token_ids in zip(active, tokens):
+            seq.inflight_refs -= 1
+            if seq.finalized:
+                # Zombie: finished by an earlier commit while still in flight here.
+                if seq.inflight_refs == 0:
+                    decoder.retire(seq.state)
+                    self.runtime.active_sequences.pop(seq.state.batch_idx, None)
+                continue
             for token_id in new_token_ids:
-                # Advance KV length to mirror the committed token.
-                seq.state.advance()
+                seq.state.advance()  # KV length mirrors the committed token
                 token = TextToken(token_id=int(token_id))
                 seq.stage_token(self.runtime, token, logprob=None)
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     self.running.remove(seq)
-                    decoder.retire(seq.state)
-                    self.runtime.active_sequences.pop(seq.state.batch_idx, None)
+                    if seq.inflight_refs == 0:
+                        decoder.retire(seq.state)
+                        self.runtime.active_sequences.pop(seq.state.batch_idx, None)
                     break
-        return True
 
     def pop_completed(self) -> List[SchedulerResult]:
         """Retrieve all completed results accumulated so far."""
