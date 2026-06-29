@@ -1507,12 +1507,15 @@ def test_spec_step_caps_stateful_mask_to_one_committed_token_per_step() -> None:
 def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
     """A non-stateful row keeps the full multi-token speculative accept.
 
-    The L958 cap is *only* for rows whose mask can change within a run. An
-    unconstrained row (no allowed/suppressed set) and a row that declares its
-    mask constant via ``mask_is_stateful = False`` must stay uncapped, so they
-    still commit their whole accepted run in one macro-step (the throughput win
-    spec decode exists for). Asserts the scheduler forwards ``commit_caps`` of
-    ``None`` for both and the full 3-token run commits in a single step.
+    The STATEFUL-mask cap is *only* for rows whose mask can change within a run.
+    An unconstrained row (no allowed/suppressed set) and a row that declares its
+    mask constant via ``mask_is_stateful = False`` must not be throttled to one
+    token per step, so they still commit their whole accepted run in a single
+    macro-step (the throughput win spec decode exists for). With a generous
+    ``max_new_tokens`` the only ``commit_caps`` entry is the remaining-budget cap
+    (well above the run length, so it does not truncate) -- never the stateful
+    ``1``. Asserts the scheduler forwards the loose budget cap (NOT the stateful
+    cap) for both rows and the full 3-token run commits in a single step.
     """
 
     class _ConstantMaskState(_RecordingState):
@@ -1532,6 +1535,8 @@ def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
     )
     rt = _spec_runtime(dec)
     sched = _make_scheduler(rt)
+    # max_new far above the run length so the remaining-budget cap never bites
+    # (isolating the stateful-cap behaviour this test is about).
     r0 = _enqueue(sched, 0, prompt_len=3, max_new=20)
     r1 = _enqueue(sched, 1, prompt_len=3, max_new=20)
     constant = _ConstantMaskState(r1)
@@ -1542,8 +1547,10 @@ def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
     sched._spec_decode_step()  # launch macro-step over both rows
     sched._spec_decode_step()  # commit it
 
-    # No row was capped: the scheduler forwarded ``None`` for both.
-    assert dec.step_commit_caps[0] == [None, None]
+    # Neither row was capped by the STATEFUL cap (which would be ``1``): the only
+    # cap is the loose remaining budget (max_new 20 - 1 staged at admit == 19),
+    # far above the 3-token run, so the full run still commits this step.
+    assert dec.step_commit_caps[0] == [19, 19]
     # Each row committed its WHOLE 3-token run in the single macro-step (the
     # admit token plus the full accepted run -- not throttled to one/step).
     assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [
@@ -1611,3 +1618,127 @@ def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:
     assert rt.active_sequences == {}
     assert sched._pending_spec is None
     assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+
+
+def test_spec_step_caps_commit_to_remaining_max_new_tokens() -> None:
+    """Regression for codex P1 @ L2079: cap the committed run to the budget.
+
+    For an unconstrained row the stateful-mask cap is ``None``, so before the fix
+    ``commit_caps[i]`` stayed ``None`` even when the request had fewer than the
+    decoder's offered run left. ``_commit_spec`` stops *staging* at
+    ``max_new_tokens``, but the decoder advances its KV / proposer state through
+    the WHOLE accepted run, so the row (and the optimistic depth-1 zombie step
+    launched off it) runs past the request's target length while the surplus
+    tokens are silently dropped -- over-generation the non-spec path never does
+    (it stops sampling exactly at the limit).
+
+    The scheduler now folds the remaining output budget
+    (``max_new_tokens - token_count``) into ``commit_caps``. This scripts a
+    decoder that WOULD commit a 3-token run in the final macro-step of a request
+    with only 2 new tokens left, and asserts the cap holds the committed run to
+    exactly the remaining budget: the request finishes at exactly
+    ``max_new_tokens`` (``length``), no surplus token is ever staged, and the
+    decoder advance stays in lockstep with the (truncated) committed run.
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        # The decoder OFFERS a 3-token run, but admit already staged 1 of the 3
+        # allowed tokens, so only 2 remain. Without the budget cap all 3 would
+        # advance the decoder; the cap must hold the committed run to 2.
+        plans={0: [[12, 13, 14]]},
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()  # stages token 11 -> token_count == 1, budget == 2
+
+    len_before = r0.lifecycle.state.length
+    while sched._spec_decode_step():
+        pass
+
+    # The first launch saw budget == 2 (max_new 3 - 1 staged) and, with no skill
+    # mask, forwarded that budget as the row's commit cap (NOT None).
+    assert dec.step_commit_caps[0] == [2]
+    # Exactly the remaining budget was staged: token 14 was NEVER committed, so
+    # the request stops at exactly max_new_tokens with no over-generation.
+    assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [11, 12, 13]
+    # The decoder's KV length advanced by the committed (truncated) run only -- it
+    # did not run past the target length through the dropped token.
+    assert r0.lifecycle.state.length - len_before == 2
+    # Finished at the limit, length-finished, row retired exactly once.
+    assert r0.lifecycle.finished is True
+    assert dec.retired == [0]
+    assert r0.lifecycle.state.batch_idx not in rt.active_sequences
+    assert sched._pending_spec is None
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+
+
+def test_spec_step_rolls_back_refs_when_launch_raises() -> None:
+    """Regression for codex P2 @ L941: roll back reserved refs on launch failure.
+
+    ``_spec_decode_step`` reserves an ``inflight_refs`` for every active row
+    BEFORE committing the previous macro-step and launching this one. If the
+    commit or ``decoder.step`` raises before ``_pending_spec`` is installed, those
+    reserved refs were owned by nothing -- no future ``_commit_spec`` decrements
+    them -- so a later finish stays stuck in ``FINALIZING`` and the spec row /
+    adapter slot leaks. The non-spec launch path (``launch_decode_step``) rolls
+    back its reservation for exactly this reason; the spec path now does too. This
+    scripts a decoder whose SECOND ``step`` raises and asserts the reservation is
+    undone (no phantom ref), ``_pending_spec`` stays clear, and the row is left in
+    a clean, still-running state rather than wedged.
+    """
+
+    class _RaisingDecoder(_FakeDecoder):
+        def __init__(self, *, raise_on_step: int, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._raise_on_step = raise_on_step
+            self._step_calls = 0
+
+        def step(self, states, **kwargs):
+            self._step_calls += 1
+            if self._step_calls == self._raise_on_step:
+                raise RuntimeError("simulated decoder.step CUDA failure")
+            return super().step(states, **kwargs)
+
+    dec = _RaisingDecoder(
+        raise_on_step=2,
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12], [13]]},  # max_new large -> row keeps running across steps
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=20)
+    sched._spec_admit()  # stages token 11
+
+    # Step 1 launches cleanly: reserves a ref and installs the pending step.
+    assert sched._spec_decode_step() is True
+    assert sched._pending_spec is not None
+    assert r0.lifecycle.inflight_refs == 1
+
+    # Step 2 reserves a SECOND ref for this launch, commits step 1 (which
+    # consumes step 1's ref and stages token 12), and then raises inside
+    # ``decoder.step`` -- after step 2's ref was reserved but before
+    # ``_pending_spec`` is reinstalled.
+    try:
+        sched._spec_decode_step()
+        raise AssertionError("expected decoder.step to raise")
+    except RuntimeError as exc:
+        assert "simulated decoder.step CUDA failure" in str(exc)
+
+    # Step 2's reservation was rolled back and step 1's was consumed by its
+    # commit, so the row is left with ZERO in-flight refs -- no phantom ref. (The
+    # bug would leave it at 1: step 2's reservation orphaned, since no future
+    # ``_commit_spec`` would ever decrement it, wedging a later finish in
+    # ``FINALIZING`` and leaking the pool/adapter slot.) No pending step dangles.
+    assert r0.lifecycle.inflight_refs == 0
+    assert sched._pending_spec is None
+    # The commit that ran before the raise still took effect (token 12 staged),
+    # and the row is left running -- not finished/finalized -- so a clean retry
+    # could proceed without a wedged FINALIZING row or leaked pool slot.
+    assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [11, 12]
+    assert r0.lifecycle.finished is False
+    assert r0.lifecycle.finalized is False
+    assert r0.lifecycle in sched.running
+    assert r0.lifecycle.state.batch_idx in rt.active_sequences

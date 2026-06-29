@@ -69,6 +69,22 @@ def _is_out_of_lora_slots(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and _OUT_OF_LORA_SLOTS_MARKER in str(exc)
 
 
+def _min_cap(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """Combine two spec ``commit_caps`` (per-row token bounds).
+
+    Each cap is an upper bound on tokens a spec macro-step may commit for a row,
+    with ``None`` meaning "no bound" (+inf). The combined cap is the tighter of
+    the two: ``min`` when both are present, the present one when only one is, and
+    ``None`` when neither bounds the row. Used to fold the stateful-mask cap and
+    the remaining-output-budget cap into a single per-row ``commit_caps`` entry.
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a <= b else b
+
+
 @dataclass(slots=True)
 class _MaskPlan:
     """Constrained-decode mask for one decode sampling step.
@@ -940,39 +956,61 @@ class GenerationScheduler:
         for seq in active:
             seq.inflight_refs += 1
 
-        if pending is not None:
-            self._commit_spec(pending)
+        # The commit + launch below can raise (e.g. ``decoder.step`` on a CUDA
+        # error). Until ``_pending_spec`` is installed those reserved refs are
+        # owned by nothing -- no future ``_commit_spec`` will decrement them -- so
+        # a finishing row would stay stuck in ``FINALIZING`` and its pool row /
+        # adapter slot would leak. Mirror the non-spec launch path
+        # (``launch_decode_step``): on any failure before the pending step is
+        # installed, roll back exactly the reservation added above, then re-raise.
+        try:
+            if pending is not None:
+                self._commit_spec(pending)
 
-        if active:
-            # Recompute each row's skill mask from the now-current skill state
-            # (post-commit), so stateful skills constrain the drafter + verify
-            # with the up-to-date allowed/suppressed set this step -- not the
-            # admit-time snapshot. Finalized zombies come back unconstrained.
-            # ``commit_caps`` caps a STATEFUL-masked row (one whose allowed/
-            # suppressed set changes per committed token) to a single committed
-            # token this step: the single per-step mask is only exact for one
-            # constraint transition per run, so a row that would otherwise commit
-            # a multi-token run under a stale 1st-position mask is held to one
-            # token and re-masked from the now-current skill state next step (see
-            # ``_build_spec_step_masks`` / ``decoder.step``).
-            (
-                allowed_token_ids,
-                suppressed_token_ids,
-                commit_caps,
-            ) = self._build_spec_step_masks(active)
-            with torch.inference_mode():
-                result = decoder.step(
-                    [seq.state for seq in active],
-                    allowed_token_ids=allowed_token_ids,
-                    suppressed_token_ids=suppressed_token_ids,
-                    commit_caps=commit_caps,
-                )
-            self._pending_spec = (active, result)
-        else:
-            # No launch this tick: roll back the refs reserved above so the
-            # count stays balanced (no-op when ``active`` is empty).
-            for seq in active:
-                seq.inflight_refs -= 1
+            if active:
+                # Recompute each row's skill mask from the now-current skill
+                # state (post-commit), so stateful skills constrain the drafter +
+                # verify with the up-to-date allowed/suppressed set this step --
+                # not the admit-time snapshot. Finalized zombies come back
+                # unconstrained. ``commit_caps`` is the per-row min of two
+                # accept-truncations: the STATEFUL-mask cap (a row whose allowed/
+                # suppressed set changes per committed token is held to one token
+                # this step, since the single per-step mask is only exact for one
+                # constraint transition per run -- then re-masked from the
+                # now-current skill state next step), and the REMAINING-BUDGET cap
+                # (``max_new_tokens - token_count``) so the decoder's KV/proposer
+                # state never advances past the request's output limit (the
+                # optimistic depth-1 zombie step would otherwise run off a row
+                # already past its target length). See ``_build_spec_step_masks``
+                # / ``decoder.step``.
+                (
+                    allowed_token_ids,
+                    suppressed_token_ids,
+                    commit_caps,
+                ) = self._build_spec_step_masks(active)
+                with torch.inference_mode():
+                    result = decoder.step(
+                        [seq.state for seq in active],
+                        allowed_token_ids=allowed_token_ids,
+                        suppressed_token_ids=suppressed_token_ids,
+                        commit_caps=commit_caps,
+                    )
+                self._pending_spec = (active, result)
+            else:
+                # No launch this tick: roll back the refs reserved above so the
+                # count stays balanced (no-op when ``active`` is empty).
+                for seq in active:
+                    seq.inflight_refs -= 1
+        except Exception:
+            # Failure before ``_pending_spec`` was installed: undo this launch's
+            # reservation so the count stays balanced and no row is left with a
+            # phantom ref (mirrors ``launch_decode_step``'s rollback). ``active``
+            # is the only set whose refs this method added; ``_commit_spec``
+            # already decremented whatever it committed before raising.
+            if self._pending_spec is None:
+                for seq in active:
+                    seq.inflight_refs -= 1
+            raise
 
         return bool(active) or pending is not None
 
@@ -2046,19 +2084,39 @@ class GenerationScheduler:
         window.
 
         The third return is the per-row ``commit_caps`` (parallel to
-        ``sequences``): ``1`` for a row whose skill mask is STATEFUL (its
-        allowed/suppressed set changes per committed token), else ``None``
-        (uncapped). The single per-step mask is exact only for one constraint
-        transition per committed run -- a macro-step commits a *variable* run of
-        ``a_i + 1`` tokens under ONE mask, so a stateful row's 2nd..Nth positions
-        would be verified under the stale 1st-position mask (e.g. a detect run
-        could suppress the required ``size_id`` or accept a ``coord`` where
-        ``size`` is required). Capping such a row to one committed token forces
-        exactly one transition per run -- the regime where the per-step mask IS
-        exact, identical to the non-spec one-token-per-step path -- and the next
-        step re-queries the mask from the now-current skill state. A non-stateful
-        (unconstrained, or constant-mask) row stays uncapped so it keeps the full
-        multi-token speculative accept. Returns
+        ``sequences``): the per-row upper bound on tokens this macro-step may
+        commit, the ``min`` of two independent accept-truncation caps (``None``
+        in either slot means that cap is absent / +inf):
+
+        * the STATEFUL-mask cap -- ``1`` for a row whose skill mask changes per
+          committed token, else absent. The single per-step mask is exact only
+          for one constraint transition per committed run: a macro-step commits a
+          *variable* run of ``a_i + 1`` tokens under ONE mask, so a stateful
+          row's 2nd..Nth positions would be verified under the stale
+          1st-position mask (e.g. a detect run could suppress the required
+          ``size_id`` or accept a ``coord`` where ``size`` is required). Capping
+          such a row to one committed token forces exactly one transition per run
+          -- the regime where the per-step mask IS exact, identical to the
+          non-spec one-token-per-step path -- and the next step re-queries the
+          mask from the now-current skill state.
+
+        * the REMAINING-BUDGET cap -- ``max_new_tokens - token_count``, the
+          number of output tokens the request may still emit. ``_commit_spec``
+          already stops *staging* once ``max_new_tokens`` is reached, but the
+          decoder advances its KV / proposer state through the *whole* committed
+          run regardless, so without this cap the row's pool state (and the
+          optimistic depth-1 zombie step launched off it) runs past the request's
+          target length even though the extra tokens are never emitted. Capping
+          the committed run to the remaining budget makes the decoder finish the
+          row at exactly ``max_new_tokens`` -- the same hard stop the non-spec
+          path hits -- so this step's commit lands the final token and
+          ``_commit_spec`` marks it ``length``-finished. A continuing (not
+          finalized) row always has ``token_count < max_new_tokens`` here (else a
+          prior commit would have finished it), so the budget is ``>= 1``.
+
+        A non-stateful row with budget to spare stays uncapped (``None``) so it
+        keeps the full multi-token speculative accept. Finalized/zombie rows come
+        back ``None`` (their tokens are dropped at commit). Returns
         ``(allowed_per_row, suppressed_per_row, commit_caps_per_row)``.
         """
         allowed_tokens: list[Optional[Sequence[int]]] = []
@@ -2074,10 +2132,30 @@ class GenerationScheduler:
             suppressed = seq.skill_state.suppressed_token_ids(self.runtime)
             allowed_tokens.append(allowed)
             suppressed_tokens.append(suppressed)
-            commit_caps.append(
+            stateful_cap = (
                 1 if self._mask_is_stateful(seq, allowed, suppressed) else None
             )
+            budget_cap = self._remaining_commit_budget(seq)
+            commit_caps.append(_min_cap(stateful_cap, budget_cap))
         return allowed_tokens, suppressed_tokens, commit_caps
+
+    def _remaining_commit_budget(self, seq: RequestLifecycle) -> Optional[int]:
+        """Tokens ``seq`` may still emit this macro-step before ``max_new_tokens``.
+
+        The committed run must not advance the decoder past the request's output
+        budget (the non-spec path stops sampling exactly at ``max_new_tokens``).
+        ``skill_state.token_count`` already reflects every token committed through
+        the prior macro-step (this runs post-commit), so the remaining budget is
+        ``max_new_tokens - token_count``. Returns ``None`` (uncapped) only when
+        ``max_new_tokens`` is unset; otherwise the live remaining count, which is
+        ``>= 1`` for any not-yet-finalized row (a row that had already reached the
+        limit would have been finished + retired at the prior commit and is not in
+        this step's ``active`` set).
+        """
+        max_new = seq.request.max_new_tokens
+        if max_new is None:
+            return None
+        return max(0, max_new - seq.skill_state.token_count)
 
     def _mask_is_stateful(
         self,
