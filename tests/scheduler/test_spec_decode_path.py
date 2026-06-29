@@ -93,6 +93,10 @@ class _FakeDecoder:
         # each parallel to that call's ``states``). Lets a test assert the
         # scheduler caps a STATEFUL-masked row to a single committed token.
         self.step_commit_caps: list = []
+        # Per-``step`` row ids the scheduler launches (one entry per call, the
+        # decoder rows backing that call's ``states``). Lets a test assert a row
+        # finalized by the prior commit is NOT launched into another macro-step.
+        self.step_rows: list = []
 
     @property
     def free_slots(self) -> int:
@@ -162,6 +166,7 @@ class _FakeDecoder:
         self.step_commit_caps.append(
             list(commit_caps) if commit_caps is not None else None
         )
+        self.step_rows.append([self._row_of[id(s)] for s in states])
         tokens, accepts, logprobs = [], [], []
         for idx, s in enumerate(states):
             row = self._row_of[id(s)]
@@ -378,45 +383,65 @@ def test_advance_routes_to_spec_when_capability_present() -> None:
 def test_has_pending_work_tracks_pending_spec_until_drained() -> None:
     """Regression for the depth-1 drain leak (codex finding @ L617).
 
-    A finishing sequence launches one optimistic follow-up macro-step before its
-    own commit removes it from ``running``. That follow-up lives in
-    ``_pending_spec`` as a zombie. ``has_pending_work()`` must stay True while it
-    is outstanding, otherwise the executor stops calling ``advance`` and the
-    zombie step is never committed -> ``decoder.retire`` never runs -> the spec
-    row leaks. Drive the loop until ``running`` empties with a pending step still
-    outstanding and assert (a) the row is retired exactly once, (b)
-    ``has_pending_work`` only goes False after the pending step is committed.
+    A launched-but-uncommitted macro-step lives in ``_pending_spec`` (depth-1
+    overlap launches step N+1 while committing step N). ``has_pending_work()``
+    must stay True while such a step is outstanding, otherwise the executor stops
+    calling ``advance`` and the pending step is never committed -> the spec row
+    leaks. The ``_pending_spec is not None`` term in ``has_pending_work`` is the
+    guard for exactly that.
+
+    NOTE on the L997 fix: a row finalized by the commit (it hit ``max_new_tokens``)
+    is now dropped from the next launch and retired SYNCHRONOUSLY -- its reserved
+    ref is decremented and the row retired inside the same ``_spec_decode_step``
+    -- rather than launched into one more optimistic ``decoder.step`` and retired
+    a tick later. So a *finishing* row no longer produces a ``running``-empty /
+    ``_pending_spec``-set window (that window only existed because the finished
+    row was launched into a throwaway step -- the exact unsafe relaunch L997
+    fixes). This drives a CONTINUING (multi-step) sequence -- whose follow-up step
+    is genuinely in flight across ticks -- to assert the live invariant
+    (``_pending_spec`` set => ``has_pending_work`` True), then lets it finish and
+    asserts the finishing row retires exactly once, ends ``COMPLETED``, and leaves
+    ``has_pending_work`` False, with no leak.
     """
     dec = _FakeDecoder(
         n_rows=1,
         first_tokens={0: 11},
-        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+        # A continuing run: one token per step across several steps, then EOS, so a
+        # real follow-up step sits in ``_pending_spec`` while the row keeps running.
+        plans={0: [[12], [13], [14], [999]]},  # 999 == eos -> finishes
     )
-    rt = _spec_runtime(dec)
+    rt = _spec_runtime(dec, eos_id=999)
     sched = _make_scheduler(rt)
-    _enqueue(sched, 0, prompt_len=3, max_new=3)
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=20)
     sched._spec_admit()
 
-    # Drive macro-steps manually so we can observe the tick where ``running``
-    # is already empty but a pending (zombie) spec step is still outstanding.
-    saw_pending_after_running_empty = False
-    for _ in range(10):
+    # While the row is running with a launched-but-uncommitted step in flight,
+    # ``has_pending_work`` must report True via the ``_pending_spec`` term.
+    saw_pending_while_running = False
+    for _ in range(20):
         if not sched._spec_decode_step():
             break
-        if len(sched.running) == 0 and sched._pending_spec is not None:
-            saw_pending_after_running_empty = True
-            # This is exactly the window the bug regressed: the old
-            # has_pending_work() (waiting/running/pipeline only) returned False
-            # here and the executor would stop driving advance().
+        if sched._pending_spec is not None:
+            # The live L617 invariant: an outstanding pending step keeps work
+            # pending so the executor keeps driving ``advance`` until it commits.
             assert sched.has_pending_work() is True
+            if len(sched.running) > 0:
+                saw_pending_while_running = True
+        # L997: a finishing row retires synchronously, so a ``running``-empty tick
+        # never leaves an optimistic follow-up step dangling in ``_pending_spec``.
+        if len(sched.running) == 0:
+            assert sched._pending_spec is None
 
-    assert saw_pending_after_running_empty is True
-    # Pending step committed, row retired exactly once, nothing leaked.
+    # The pending-while-running window (the one the L617 guard protects) occurred.
+    assert saw_pending_while_running is True
+    # Drained: pending committed, row retired exactly once, COMPLETED, no leak.
     assert sched._pending_spec is None
     assert dec.retired == [0]
+    assert dec.retired.count(0) == 1
+    assert r0.lifecycle.phase == RequestPhase.COMPLETED
     assert rt.active_sequences == {}
     assert sched.has_pending_work() is False
-    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+    assert [c.finish_reason for c in sched.pop_completed()] == ["stop"]
 
 
 def test_spec_admit_acquires_lora_slot_for_adapter_request() -> None:
@@ -1568,17 +1593,23 @@ def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
 
 
 def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:
-    """Regression for codex P2 @ L1012: zombie -> COMPLETED before row retire.
+    """Regression for codex P2 @ L1012: a finished spec row ends COMPLETED, retired once.
 
-    When a spec request finishes while its depth-1 follow-up macro-step is still
-    in flight, ``_finalize_sequence`` leaves it FINALIZING (``inflight_refs >
-    0``). The zombie branch in ``_commit_spec`` is where that last ref reaches
-    zero; it used to ONLY retire the decoder row and never transition the
-    lifecycle to COMPLETED, so a normally-completed spec request could stay stuck
-    in FINALIZING forever after its row was retired. This drives a sequence that
-    finishes with an optimistic follow-up step outstanding and asserts the
-    lifecycle ends COMPLETED (not FINALIZING) and its row is retired exactly
-    once -- matching the non-spec zombie ordering in ``commit_step``.
+    A finishing spec request must end ``COMPLETED`` (not stuck ``FINALIZING``)
+    with its decoder row retired exactly once -- the invariant this guards (the
+    bug left a completed request in ``FINALIZING`` forever after its row was
+    retired, because the zombie commit retired the row but never transitioned the
+    lifecycle).
+
+    L997 fix changes only the *timing*, not this invariant: a row finalized by the
+    commit (it hit ``max_new_tokens``) is now dropped from the next launch and
+    retired SYNCHRONOUSLY inside the finishing ``_spec_decode_step`` -- the
+    ``transition(COMPLETED)`` + ``_retire_spec_row`` happen in the filter right
+    after the commit, NOT a tick later via an optimistic follow-up (zombie)
+    commit. So there is no longer a FINALIZING-with-pending window: the request
+    goes ``FINALIZING -> COMPLETED -> retired`` within one step. This asserts the
+    end state (COMPLETED, retired exactly once, no leak) and that the row was
+    never left FINALIZING after its retire.
     """
     dec = _FakeDecoder(
         n_rows=1,
@@ -1590,27 +1621,19 @@ def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:
     req = _enqueue(sched, 0, prompt_len=3, max_new=3)
     sched._spec_admit()
 
-    # Drive to quiescence. The finishing commit lands while a follow-up
-    # (zombie) step is in flight; the zombie's own commit retires the row and
-    # must mark the lifecycle COMPLETED.
-    saw_finalizing_with_pending = False
+    # Drive to quiescence, asserting the row is never left FINALIZING while still
+    # holding the decoder row (the bug's stuck state). Under L997 the finishing
+    # step transitions COMPLETED + retires in one go, so a retired row is never
+    # observed in FINALIZING.
     for _ in range(10):
         if not sched._spec_decode_step():
             break
-        if (
-            req.lifecycle.finished
-            and sched._pending_spec is not None
-            and req.lifecycle.phase == RequestPhase.FINALIZING
-        ):
-            # The exact window: finished + an in-flight zombie step still holds a
-            # ref, so the lifecycle is (correctly) FINALIZING, not yet COMPLETED.
-            saw_finalizing_with_pending = True
+        if req.lifecycle.phase == RequestPhase.FINALIZING:
+            # If ever FINALIZING, its row must still be live (not yet retired) --
+            # i.e. the lifecycle is never stuck FINALIZING after a retire.
+            assert req.lifecycle.state.batch_idx in rt.active_sequences
 
-    # The FINALIZING-with-zombie window actually occurred (otherwise the test
-    # would not be exercising the zombie completion path at all).
-    assert saw_finalizing_with_pending is True
-    # After the zombie's commit: row retired exactly once, lifecycle COMPLETED
-    # (the bug left it stuck in FINALIZING), nothing leaked.
+    # End state: lifecycle COMPLETED, row retired exactly once, nothing leaked.
     assert dec.retired == [0]
     assert dec.retired.count(0) == 1
     assert req.lifecycle.phase == RequestPhase.COMPLETED
@@ -1742,3 +1765,138 @@ def test_spec_step_rolls_back_refs_when_launch_raises() -> None:
     assert r0.lifecycle.finalized is False
     assert r0.lifecycle in sched.running
     assert r0.lifecycle.state.batch_idx in rt.active_sequences
+
+
+def test_spec_step_does_not_launch_row_finalized_by_commit() -> None:
+    """Regression for codex P1 @ L997: a row finalized by the commit is not relaunched.
+
+    ``_spec_decode_step`` snapshots ``active`` (the launch membership) BEFORE
+    committing the previous macro-step. That commit can FINALIZE a row -- the row
+    hit ``max_new_tokens`` so its last allowed token was ``length``-committed --
+    which sets ``finalized`` and drops it from ``running`` but cannot retire it
+    yet because this tick reserved an ``inflight_refs`` for the (about-to-launch)
+    step. Because the snapshot predates the commit, that now-finalized row was
+    still in ``active``; ``_build_spec_step_masks`` then returns a ``None`` commit
+    cap for it (finalized rows come back unconstrained), so the scheduler asked
+    ``decoder.step`` to run ANOTHER macro-step on a row whose
+    ``SequenceState.length`` already equals ``max_length`` -- a real spec decoder
+    that reserves only the request budget can advance/write past the row or raise.
+    The non-spec launch set never includes a finalized row (``_can_dispatch``
+    returns False for it); the spec path must match that by filtering the rows the
+    commit just finalized out of the launch (and immediately retiring their
+    reserved ref).
+
+    This scripts a single row that finishes by ``max_new_tokens`` and asserts the
+    decoder is launched EXACTLY ONCE (the legitimate macro-step that lands the
+    final token) -- never a second time on the finalized row -- that the row's
+    ``length`` never exceeds ``max_length``, and that the row retires cleanly with
+    the ref count balanced (no phantom ref / pool leak).
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        # admit stages 1; this single macro-step commits 2 more == max_new=3, so
+        # the row FINALIZES at the commit that runs on the NEXT tick (depth-1).
+        plans={0: [[12, 13]]},
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()  # stages token 11 -> token_count == 1
+
+    max_len = r0.lifecycle.state.max_length
+    # Drive the depth-1 pipeline to quiescence, asserting on every tick that the
+    # row's KV length never runs past its absolute limit (the bug would launch a
+    # macro-step off a row already at ``max_length``).
+    while sched._spec_decode_step():
+        assert r0.lifecycle.state.length <= max_len
+
+    # The decoder.step was invoked exactly ONCE -- the one launch that commits the
+    # final token. The pre-fix code launched a SECOND macro-step on the now-
+    # finalized row (its tick-2 ``active`` snapshot still held the row the commit
+    # had just finished), which this asserts never happens: row 0 appears in
+    # exactly one launch and there is no extra launch after it finalized.
+    assert dec.step_rows == [[0]]
+    assert sum(1 for rows in dec.step_rows if 0 in rows) == 1
+
+    # The request finished at exactly max_new_tokens (length), the row retired
+    # exactly once, the ref count is balanced (no phantom ref), and nothing leaks.
+    assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [11, 12, 13]
+    assert r0.lifecycle.finished is True
+    assert r0.lifecycle.phase == RequestPhase.COMPLETED
+    assert r0.lifecycle.inflight_refs == 0
+    assert dec.retired == [0]
+    assert dec.retired.count(0) == 1
+    assert r0.lifecycle.state.batch_idx not in rt.active_sequences
+    assert sched._pending_spec is None
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+
+
+def test_spec_step_excludes_finalized_row_but_launches_continuing_row() -> None:
+    """L997, multi-row: drop the finalized row from the launch, keep the continuer.
+
+    The interesting case the single-row test cannot show: in one macro-step row A
+    is committed to its ``max_new_tokens`` (finalizes) while row B keeps running.
+    ``active`` is snapshotted before the commit, so BOTH rows are in it; after the
+    commit finalizes A, the next ``decoder.step`` must launch ONLY B -- never A
+    (A's ``state.length`` already equals ``max_length``; relaunching it is the
+    unsafe over-advance L997 fixes) -- and A must retire synchronously while B's
+    refs/launch continue undisturbed. Asserts (a) A appears in exactly the launch
+    that lands its final token and never after it finalizes, (b) B is launched on
+    every step it runs, (c) both rows retire exactly once with no leak and end
+    COMPLETED.
+    """
+    dec = _FakeDecoder(
+        n_rows=2,
+        first_tokens={0: 11, 1: 22},
+        plans={
+            0: [[12, 13]],          # admit(1) + 2 == max_new=3 -> A finalizes
+            1: [[23], [24], [999]],  # B keeps running, then EOS
+        },
+    )
+    rt = _spec_runtime(dec, eos_id=999)
+    sched = _make_scheduler(rt)
+    rA = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    rB = _enqueue(sched, 1, prompt_len=2, max_new=20)
+    sched._spec_admit()
+
+    rowA = rA.lifecycle.state.batch_idx
+    rowB = rB.lifecycle.state.batch_idx
+    maxlenA = rA.lifecycle.state.max_length
+    # Drive to quiescence, asserting on every tick that A's KV length never runs
+    # past its limit (the bug would relaunch A off a row already at max_length).
+    finalized_tick = None
+    for tick in range(20):
+        if not sched._spec_decode_step():
+            break
+        assert rA.lifecycle.state.length <= maxlenA
+        if rA.lifecycle.finished and finalized_tick is None:
+            finalized_tick = len(dec.step_rows)
+
+    # A finalized; from the launch AT/AFTER its finalizing commit it is excluded.
+    assert finalized_tick is not None
+    # A was launched exactly once (the macro-step that lands its final token) and
+    # never appears in a launch again -- the L997 fix dropped it from ``active``.
+    a_launches = [rows for rows in dec.step_rows if 0 in rows]
+    assert len(a_launches) == 1
+    assert a_launches[0] == [0, 1]  # the single shared launch, with B alongside
+    # Every launch after A finalized contains ONLY B (never A).
+    assert all(rows == [1] for rows in dec.step_rows if rows != [0, 1])
+
+    # B was launched on each of its running steps (1 shared + its solo steps).
+    assert sum(1 for rows in dec.step_rows if 1 in rows) >= 3
+
+    # Both rows finished cleanly: retired exactly once, COMPLETED, no leak.
+    assert sorted(dec.retired) == [0, 1]
+    assert dec.retired.count(0) == 1
+    assert dec.retired.count(1) == 1
+    assert rA.lifecycle.phase == RequestPhase.COMPLETED
+    assert rB.lifecycle.phase == RequestPhase.COMPLETED
+    assert rA.lifecycle.inflight_refs == 0
+    assert rB.lifecycle.inflight_refs == 0
+    assert rowA not in rt.active_sequences
+    assert rowB not in rt.active_sequences
+    assert sched._pending_spec is None
+    assert sched.has_pending_work() is False
+    reasons = sorted(c.finish_reason for c in sched.pop_completed())
+    assert reasons == ["length", "stop"]  # A by length (max_new), B by eos

@@ -915,13 +915,19 @@ class GenerationScheduler:
         Ordering per tick: snapshot membership -> reserve in-flight refs ->
         commit the previous macro-step -> build this step's masks -> launch.
 
-        Membership is an *optimistic* snapshot taken BEFORE the commit, so a
-        sequence the upcoming commit finishes still rides this tick's launch as
-        a zombie (``finalized`` with ``inflight_refs > 0``) and is skipped +
-        retired at its own commit next tick -- the same zombie discipline the
-        single-token pipeline uses, and the property the depth-1
-        ``has_pending_work`` leak-guard relies on (a finishing sequence's
-        optimistic follow-up step stays pending until committed).
+        Membership is an *optimistic* snapshot taken BEFORE the commit. The
+        commit can FINALIZE a sequence (it hit ``max_new_tokens`` / EOS); because
+        the snapshot predates the commit, such a row is still in ``active`` but
+        must NOT be launched into another macro-step -- its ``state.length`` can
+        already equal ``max_length`` and a real decoder that reserves only the
+        request budget would advance/write past the row. So after the commit the
+        snapshot is filtered: rows the commit finalized are dropped from this
+        launch and retired SYNCHRONOUSLY (their reserved ref is released and the
+        row retired here, mirroring ``_commit_spec``'s zombie branch), exactly
+        like the non-spec launch set, which excludes finalized rows via
+        ``_can_dispatch``. Only continuing rows are launched. The depth-1
+        ``has_pending_work`` leak-guard (``_pending_spec is not None``) still
+        covers a launched-but-uncommitted step for those continuing rows.
 
         Why the commit happens before the launch (and before the mask build):
         ``_commit_spec`` advances each committed sequence's skill state via
@@ -967,22 +973,44 @@ class GenerationScheduler:
             if pending is not None:
                 self._commit_spec(pending)
 
+            # The commit above can FINALIZE a row (its last allowed token was
+            # ``length``-committed), which sets ``finalized`` and removes it from
+            # ``running`` but cannot retire it yet because the ref reserved above
+            # keeps ``inflight_refs > 0``. That row is still in ``active`` (the
+            # snapshot predates the commit), so it must NOT be launched into
+            # another macro-step: its ``SequenceState.length`` can already equal
+            # ``max_length``, and ``_build_spec_step_masks`` returns ``None`` caps
+            # for a finalized row, so the decoder would be asked to advance/write
+            # past a row that has no budget left (the non-spec launch set excludes
+            # finalized rows via ``_can_dispatch``). Drop those rows from the
+            # launch and turn each one's reserved ref into an immediate retire
+            # (mirrors ``_commit_spec``'s zombie branch: COMPLETED then retire when
+            # the last ref clears).
+            launchable = []
+            for seq in active:
+                if seq.finalized:
+                    seq.inflight_refs -= 1
+                    if seq.inflight_refs == 0:
+                        seq.transition(RequestPhase.COMPLETED)
+                        self._retire_spec_row(seq.state)
+                else:
+                    launchable.append(seq)
+            active = launchable
+
             if active:
                 # Recompute each row's skill mask from the now-current skill
                 # state (post-commit), so stateful skills constrain the drafter +
                 # verify with the up-to-date allowed/suppressed set this step --
-                # not the admit-time snapshot. Finalized zombies come back
-                # unconstrained. ``commit_caps`` is the per-row min of two
-                # accept-truncations: the STATEFUL-mask cap (a row whose allowed/
-                # suppressed set changes per committed token is held to one token
-                # this step, since the single per-step mask is only exact for one
-                # constraint transition per run -- then re-masked from the
+                # not the admit-time snapshot. ``commit_caps`` is the per-row min
+                # of two accept-truncations: the STATEFUL-mask cap (a row whose
+                # allowed/suppressed set changes per committed token is held to one
+                # token this step, since the single per-step mask is only exact for
+                # one constraint transition per run -- then re-masked from the
                 # now-current skill state next step), and the REMAINING-BUDGET cap
                 # (``max_new_tokens - token_count``) so the decoder's KV/proposer
-                # state never advances past the request's output limit (the
-                # optimistic depth-1 zombie step would otherwise run off a row
-                # already past its target length). See ``_build_spec_step_masks``
-                # / ``decoder.step``.
+                # state never advances past the request's output limit. Rows
+                # finalized by the commit above were already dropped from
+                # ``active``. See ``_build_spec_step_masks`` / ``decoder.step``.
                 (
                     allowed_token_ids,
                     suppressed_token_ids,
@@ -996,11 +1024,6 @@ class GenerationScheduler:
                         commit_caps=commit_caps,
                     )
                 self._pending_spec = (active, result)
-            else:
-                # No launch this tick: roll back the refs reserved above so the
-                # count stays balanced (no-op when ``active`` is empty).
-                for seq in active:
-                    seq.inflight_refs -= 1
         except Exception:
             # Failure before ``_pending_spec`` was installed: undo this launch's
             # reservation so the count stays balanced and no row is left with a
