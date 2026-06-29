@@ -86,8 +86,13 @@ class _FakeDecoder:
         # each parallel to that call's ``states``). Lets a test assert the
         # stateful skill mask is RECOMPUTED per macro-step rather than reusing
         # the stale admit-time snapshot.
+
         self.step_allowed: list = []
         self.step_suppressed: list = []
+        # Per-``step`` commit caps the scheduler forwards (one entry per call,
+        # each parallel to that call's ``states``). Lets a test assert the
+        # scheduler caps a STATEFUL-masked row to a single committed token.
+        self.step_commit_caps: list = []
 
     @property
     def free_slots(self) -> int:
@@ -136,7 +141,15 @@ class _FakeDecoder:
         )
         return self._first[row], first_logprob
 
-    def step(self, states, *, allowed_token_ids=None, suppressed_token_ids=None):
+
+    def step(
+        self,
+        states,
+        *,
+        allowed_token_ids=None,
+        suppressed_token_ids=None,
+        commit_caps=None,
+    ):
         # Record the per-step masks the scheduler recomputes + forwards.
         self.step_allowed.append(
             list(allowed_token_ids) if allowed_token_ids is not None else None
@@ -146,8 +159,11 @@ class _FakeDecoder:
             if suppressed_token_ids is not None
             else None
         )
+        self.step_commit_caps.append(
+            list(commit_caps) if commit_caps is not None else None
+        )
         tokens, accepts, logprobs = [], [], []
-        for s in states:
+        for idx, s in enumerate(states):
             row = self._row_of[id(s)]
             plan = self._plans[row]
             # Depth-1 overlap launches one macro-step ahead, so a finishing row
@@ -155,6 +171,15 @@ class _FakeDecoder:
             # zombie at commit. Hand back a throwaway token when the script is
             # exhausted.
             nxt = plan.pop(0) if plan else [0]
+            # Honor the scheduler's per-row commit cap exactly as the real
+            # decoder must: truncate the accepted run to ``commit_caps[idx]``
+            # tokens (a stateful-masked row is capped to 1) and push the dropped
+            # tail back onto the script so it is committed on later steps -- the
+            # KV/pool advance stays consistent with the (truncated) committed run.
+            cap = None if commit_caps is None else commit_caps[idx]
+            if cap is not None and len(nxt) > cap:
+                plan.insert(0, nxt[cap:])
+                nxt = nxt[:cap]
             tokens.append(list(nxt))
             accepts.append(len(nxt) - 1)
             # Scripted logprob per committed token: -(token_id) keeps it
@@ -1382,7 +1407,157 @@ def test_spec_step_recomputes_stateful_skill_mask_per_step() -> None:
     assert per_step[0] != list(dec.admit_kwargs[0]["allowed_token_ids"])
     # ... and it tracks the toggling skill state across subsequent steps: each
     # committed token flips the allowed set, so it alternates per macro-step.
+
     assert per_step[:4] == [[COORD], [COORD, EOS], [COORD], [COORD, EOS]]
+
+
+def test_spec_step_caps_stateful_mask_to_one_committed_token_per_step() -> None:
+    """Regression for codex P1 @ L958: cap stateful masks within a macro-step.
+
+    The L727 fix re-queries the per-row skill mask each macro-step, but a single
+    ``decoder.step`` mask still covers a *variable* committed run: ``_commit_spec``
+    can stage MULTIPLE accepted tokens before the next ``consume_step`` refreshes
+    the mask. For a per-token-STATEFUL skill (detect cycles x->y->size; point
+    toggles coord/eos) a >1-token run would verify its 2nd..Nth positions under
+    the stale 1st-position mask -- e.g. a detect run could accept a ``coord``
+    where ``size`` is required, or suppress the required ``size_id``.
+
+    The scheduler now sends ``commit_caps[i] = 1`` for a stateful-masked row, so
+    that row commits exactly one token per macro-step (one constraint transition
+    per run -- the regime where the single per-step mask IS exact) and is
+    re-masked from the now-current skill state on the next step. This scripts a
+    decoder that WOULD commit the whole x/y/size run in one step and asserts the
+    cap holds it to one token per step, with the mask the scheduler hands each
+    step advancing in lockstep with the single committed token -- so every
+    committed position is constrained by ITS OWN stage, never the whole run under
+    the first-position mask.
+    """
+    COORD, SIZE, EOS = 7, 8, 9
+
+    class _DetectLikeState(_RecordingState):
+        # Mirror DetectSkillState: allowed set cycles x -> y -> size per token.
+        def __init__(self, request: GenerationRequest) -> None:
+            super().__init__(request)
+            self._stage = "x"
+
+        def consume_step(self, runtime: object, step: DecodeStep) -> None:
+            self.append_token(step.token)
+            if self._stage == "x":
+                self._stage = "y"
+            elif self._stage == "y":
+                self._stage = "size"
+            else:
+                self._stage = "x"
+
+        def allowed_token_ids(self, runtime: object):
+            if self._stage == "x":
+                return [COORD, EOS]
+            if self._stage == "y":
+                return [COORD]
+            return [SIZE]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 19},
+        # The decoder OFFERS a 3-token run (x, y, size) in a single macro-step.
+        # Without the cap this whole run would commit under the first-position
+        # mask; the cap must split it to one token per step.
+        plans={0: [[20, 21, 22]]},
+    )
+    rt = _spec_runtime(dec, eos_id=EOS)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=20)
+    detect = _DetectLikeState(req)
+    req.lifecycle.skill_state = detect
+    req.skill_state = detect
+
+    assert sched._spec_admit() is True
+    # ``admit`` sampled token 19 and advanced the stage x -> y, so the first
+    # ``step`` is launched under the y mask. The admit-time snapshot was the x
+    # mask -- which the bug would have reused for the whole run.
+    assert list(dec.admit_kwargs[0]["allowed_token_ids"]) == [COORD, EOS]
+
+    # Four macro-steps drive the depth-1 pipeline so the 3-token run commits ONE
+    # token per step (commit lands one tick after launch): step1 launches /
+    # step2..4 each commit one of 20, 21, 22.
+    for _ in range(4):
+        sched._spec_decode_step()
+
+    # The scheduler signalled a one-token cap for this stateful row every step.
+    assert dec.step_commit_caps[:4] == [[1], [1], [1], [1]]
+
+    # Exactly one token committed per macro-step -- the run was NOT swallowed
+    # under a single mask: tokens 20, 21, 22 staged across the steps, in order,
+    # after the admit token 19.
+    assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [
+        19,
+        20,
+        21,
+        22,
+    ]
+
+    # ...and the mask the scheduler hands each launch advances with the single
+    # committed token (y -> size -> x -> y), so the token committed by each
+    # step's commit was drafted/verified under ITS OWN stage's mask -- not all
+    # three positions under the first (x) mask.
+    per_step = [call[0] for call in dec.step_allowed]
+    assert per_step[:4] == [[COORD], [SIZE], [COORD, EOS], [COORD]]
+
+
+def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
+    """A non-stateful row keeps the full multi-token speculative accept.
+
+    The L958 cap is *only* for rows whose mask can change within a run. An
+    unconstrained row (no allowed/suppressed set) and a row that declares its
+    mask constant via ``mask_is_stateful = False`` must stay uncapped, so they
+    still commit their whole accepted run in one macro-step (the throughput win
+    spec decode exists for). Asserts the scheduler forwards ``commit_caps`` of
+    ``None`` for both and the full 3-token run commits in a single step.
+    """
+
+    class _ConstantMaskState(_RecordingState):
+        # A constant suppression set (like caption's ``[answer_id]``): present
+        # every step but never transitions, so the per-step mask is already exact
+        # for a multi-token run. Declares itself non-stateful so it is uncapped.
+        mask_is_stateful = False
+
+        def suppressed_token_ids(self, runtime: object):
+            return [42]
+
+    # Row 0: unconstrained (no mask). Row 1: constant-mask, declared not stateful.
+    dec = _FakeDecoder(
+        n_rows=2,
+        first_tokens={0: 11, 1: 21},
+        plans={0: [[12, 13, 14]], 1: [[22, 23, 24]]},
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    r0 = _enqueue(sched, 0, prompt_len=3, max_new=20)
+    r1 = _enqueue(sched, 1, prompt_len=3, max_new=20)
+    constant = _ConstantMaskState(r1)
+    r1.lifecycle.skill_state = constant
+    r1.skill_state = constant
+
+    assert sched._spec_admit() is True
+    sched._spec_decode_step()  # launch macro-step over both rows
+    sched._spec_decode_step()  # commit it
+
+    # No row was capped: the scheduler forwarded ``None`` for both.
+    assert dec.step_commit_caps[0] == [None, None]
+    # Each row committed its WHOLE 3-token run in the single macro-step (the
+    # admit token plus the full accepted run -- not throttled to one/step).
+    assert [int(t.token_id) for t in r0.lifecycle.skill_state.tokens] == [
+        11,
+        12,
+        13,
+        14,
+    ]
+    assert [int(t.token_id) for t in r1.lifecycle.skill_state.tokens] == [
+        21,
+        22,
+        23,
+        24,
+    ]
 
 
 def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:

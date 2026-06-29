@@ -315,12 +315,14 @@ class SpecDecoder(Protocol):
         """
         ...
 
+
     def step(
         self,
         states: Sequence[Any],
         *,
         allowed_token_ids: Sequence[Sequence[int] | None] | None = None,
         suppressed_token_ids: Sequence[Sequence[int] | None] | None = None,
+        commit_caps: Sequence[int | None] | None = None,
     ) -> SpecStepResult:
         """Run one macro-step over the active ``states`` and commit accepts.
 
@@ -341,12 +343,33 @@ class SpecDecoder(Protocol):
         mask each step. ``None`` for the whole argument keeps the admit-time mask
         (back-compat for a runtime/caller that does not refresh).
 
-        NOTE: a macro-step commits a *variable* run of ``a_i + 1`` tokens; for a
-        per-token-stateful skill the allowed set can change *within* one run. A
-        single per-step mask is exact only when at most one constraint transition
-        occurs per committed run -- the regime the non-spec one-token-per-step
-        path always satisfies. Tighter intra-run constraint enforcement (advancing
-        the mask per accepted draft) is the decoder's responsibility.
+        ``commit_caps`` is the per-row upper bound on how many tokens this
+        macro-step may commit for ``states[i]`` (parallel to ``states``; ``None``
+        for a row means uncapped -- commit the full accepted run). A single
+        per-step mask is exact only when at most one constraint transition occurs
+        per committed run: a macro-step commits a *variable* run of ``a_i + 1``
+        tokens, but the scheduler hands one mask for the whole run, so for a
+        per-token-*stateful* skill (detect cycles x->y->size; point toggles
+        ``[coord, eos]`` <-> ``[coord]`` after each coordinate; query injects a
+        fixed post-reasoning prefix one id at a time) the allowed/suppressed set
+        the run's 2nd..Nth positions should obey has already changed and the run
+        would be verified under a stale (1st-position) mask. The scheduler
+        therefore sets ``commit_caps[i] = 1`` for a stateful-masked row so that
+        row advances exactly one token per macro-step (one constraint transition
+        per run -- the regime where the single per-step mask IS exact, identical
+        to the non-spec one-token-per-step path), and re-queries the mask from the
+        now-current skill state next step. The decoder MUST NOT commit more than
+        ``commit_caps[i]`` tokens for that row (truncate the accepted run to the
+        cap and keep its KV/pool advance consistent with the truncated run).
+        ``None`` for the whole argument leaves every row uncapped (back-compat for
+        a runtime/caller that does not constrain stateful runs).
+
+        NOTE: capping a stateful row to one token is the scheduler-side analog of
+        the non-spec sampler only ever advancing one token per refreshed mask; it
+        trades that row's intra-step speculation for exact constrained decode.
+        Tighter intra-run enforcement (advancing the mask per accepted draft so a
+        stateful row can still commit multiple tokens) remains an optional decoder
+        refinement, but is not required for correctness once the cap is honored.
         """
         ...
 

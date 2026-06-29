@@ -67,7 +67,15 @@ class _StubDecoder:
         # not produce logprobs, so the logprob is None.
         return 42, None
 
-    def step(self, states):  # noqa: ANN001
+
+    def step(
+        self,
+        states,
+        *,
+        allowed_token_ids=None,
+        suppressed_token_ids=None,
+        commit_caps=None,
+    ):  # noqa: ANN001
         return SpecStepResult(
             tokens=[[1, 2, 3] for _ in states],
             accept_counts=[2 for _ in states],

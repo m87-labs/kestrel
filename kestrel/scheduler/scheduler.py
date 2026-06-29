@@ -948,14 +948,24 @@ class GenerationScheduler:
             # (post-commit), so stateful skills constrain the drafter + verify
             # with the up-to-date allowed/suppressed set this step -- not the
             # admit-time snapshot. Finalized zombies come back unconstrained.
-            allowed_token_ids, suppressed_token_ids = self._build_spec_step_masks(
-                active
-            )
+            # ``commit_caps`` caps a STATEFUL-masked row (one whose allowed/
+            # suppressed set changes per committed token) to a single committed
+            # token this step: the single per-step mask is only exact for one
+            # constraint transition per run, so a row that would otherwise commit
+            # a multi-token run under a stale 1st-position mask is held to one
+            # token and re-masked from the now-current skill state next step (see
+            # ``_build_spec_step_masks`` / ``decoder.step``).
+            (
+                allowed_token_ids,
+                suppressed_token_ids,
+                commit_caps,
+            ) = self._build_spec_step_masks(active)
             with torch.inference_mode():
                 result = decoder.step(
                     [seq.state for seq in active],
                     allowed_token_ids=allowed_token_ids,
                     suppressed_token_ids=suppressed_token_ids,
+                    commit_caps=commit_caps,
                 )
             self._pending_spec = (active, result)
         else:
@@ -2008,8 +2018,12 @@ class GenerationScheduler:
 
     def _build_spec_step_masks(
         self, sequences: List[RequestLifecycle]
-    ) -> tuple[list[Optional[Sequence[int]]], list[Optional[Sequence[int]]]]:
-        """Per-row skill masks for a spec macro-step, re-queried per step.
+    ) -> tuple[
+        list[Optional[Sequence[int]]],
+        list[Optional[Sequence[int]]],
+        list[Optional[int]],
+    ]:
+        """Per-row skill masks (+ commit caps) for a spec macro-step.
 
         The spec-decode analog of ``_build_mask_spec``'s allowed/suppressed
         re-query. ``_spec_decode_step`` calls this AFTER committing the previous
@@ -2029,21 +2043,75 @@ class GenerationScheduler:
         ``suppress_next_token_ids``: that suppression targets a request's *first*
         generated token only and is applied once, at ``admit`` (which samples
         that token); re-applying it here would wrongly suppress past the one-shot
-        window. Returns ``(allowed_per_row, suppressed_per_row)`` parallel to
-        ``sequences``.
+        window.
+
+        The third return is the per-row ``commit_caps`` (parallel to
+        ``sequences``): ``1`` for a row whose skill mask is STATEFUL (its
+        allowed/suppressed set changes per committed token), else ``None``
+        (uncapped). The single per-step mask is exact only for one constraint
+        transition per committed run -- a macro-step commits a *variable* run of
+        ``a_i + 1`` tokens under ONE mask, so a stateful row's 2nd..Nth positions
+        would be verified under the stale 1st-position mask (e.g. a detect run
+        could suppress the required ``size_id`` or accept a ``coord`` where
+        ``size`` is required). Capping such a row to one committed token forces
+        exactly one transition per run -- the regime where the per-step mask IS
+        exact, identical to the non-spec one-token-per-step path -- and the next
+        step re-queries the mask from the now-current skill state. A non-stateful
+        (unconstrained, or constant-mask) row stays uncapped so it keeps the full
+        multi-token speculative accept. Returns
+        ``(allowed_per_row, suppressed_per_row, commit_caps_per_row)``.
         """
         allowed_tokens: list[Optional[Sequence[int]]] = []
         suppressed_tokens: list[Optional[Sequence[int]]] = []
+        commit_caps: list[Optional[int]] = []
         for seq in sequences:
             if seq.finalized:
                 allowed_tokens.append(None)
                 suppressed_tokens.append(None)
+                commit_caps.append(None)
                 continue
-            allowed_tokens.append(seq.skill_state.allowed_token_ids(self.runtime))
-            suppressed_tokens.append(
-                seq.skill_state.suppressed_token_ids(self.runtime)
+            allowed = seq.skill_state.allowed_token_ids(self.runtime)
+            suppressed = seq.skill_state.suppressed_token_ids(self.runtime)
+            allowed_tokens.append(allowed)
+            suppressed_tokens.append(suppressed)
+            commit_caps.append(
+                1 if self._mask_is_stateful(seq, allowed, suppressed) else None
             )
-        return allowed_tokens, suppressed_tokens
+        return allowed_tokens, suppressed_tokens, commit_caps
+
+    def _mask_is_stateful(
+        self,
+        seq: RequestLifecycle,
+        allowed: Optional[Sequence[int]],
+        suppressed: Optional[Sequence[int]],
+    ) -> bool:
+        """Whether ``seq``'s skill mask can change WITHIN one committed run.
+
+        A spec macro-step commits a variable run of tokens under a single
+        per-step mask, so a row whose allowed/suppressed set evolves per
+        committed token (point cycles coord/eos; detect cycles x->y->size; query
+        injects a fixed post-reasoning prefix one id at a time, and toggles its
+        suppression as it leaves reasoning) must be capped to one committed token
+        per step -- otherwise the run's later positions verify under the stale
+        first-position mask. This decides that cap from the live skill state,
+        model-agnostically (the scheduler never imports a model's skills).
+
+        A skill may declare its mask precisely via an optional
+        ``mask_is_stateful`` attribute / property on its ``SkillState`` (``True``
+        => evolving, ``False`` => provably constant); when present that wins. In
+        its absence the conservative behavioural rule is: any ACTIVE constraint
+        (a non-empty ``allowed`` whitelist or ``suppressed`` blacklist this step)
+        is treated as potentially stateful and capped, because the scheduler
+        cannot prove the set is position-independent without model knowledge.
+        Correctness-first: over-capping a constant-mask skill only costs that
+        row's intra-step speculation (it still advances one token per step), while
+        under-capping a stateful one corrupts constrained output. A row with no
+        active constraint is never stateful and keeps the full multi-token accept.
+        """
+        declared = getattr(seq.skill_state, "mask_is_stateful", None)
+        if declared is not None:
+            return bool(declared)
+        return bool(allowed) or bool(suppressed)
 
     def _build_mask(
         self, sequences: List[RequestLifecycle], slot
