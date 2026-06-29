@@ -1,6 +1,7 @@
 """Runtime configuration objects for the Kestrel inference engine."""
 
 
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -59,12 +60,35 @@ def _cuda_version_tuple(version: str | None) -> tuple[int, ...] | None:
 
 def _torch_cuda_driver_version() -> str | None:
     getter = getattr(torch._C, "_cuda_getDriverVersion", None)
-    if getter is None:
+    if getter is not None:
+        try:
+            return _format_cuda_version(getter())
+        except Exception:
+            pass
+    return _libcuda_driver_version()
+
+
+def _libcuda_driver_version() -> str | None:
+    for soname in ("libcuda.so.1", "libcuda.so"):
+        try:
+            libcuda = ctypes.CDLL(soname)
+            break
+        except OSError:
+            continue
+    else:
         return None
+
     try:
-        return _format_cuda_version(getter())
+        get_version = libcuda.cuDriverGetVersion
+        get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        get_version.restype = ctypes.c_int
+        version = ctypes.c_int(0)
+        rc = get_version(ctypes.byref(version))
     except Exception:
         return None
+    if rc != 0 or version.value <= 0:
+        return None
+    return _format_cuda_version(version.value)
 
 
 def _mps_total_memory_bytes() -> int | None:

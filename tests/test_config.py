@@ -29,6 +29,29 @@ def test_runtime_config_rejects_invalid_service_name_before_download(
     assert calls == []
 
 
+def test_torch_cuda_driver_version_falls_back_to_libcuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TorchCWithoutDriverVersion:
+        pass
+
+    class FakeCuDriverGetVersion:
+        argtypes = None
+        restype = None
+
+        def __call__(self, ptr) -> int:
+            ptr._obj.value = 12080
+            return 0
+
+    class FakeLibCuda:
+        cuDriverGetVersion = FakeCuDriverGetVersion()
+
+    monkeypatch.setattr(config_mod.torch, "_C", TorchCWithoutDriverVersion())
+    monkeypatch.setattr(config_mod.ctypes, "CDLL", lambda _soname: FakeLibCuda())
+
+    assert config_mod._torch_cuda_driver_version() == "12.8"
+
+
 def test_runtime_config_explains_torch_cuda_newer_than_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
