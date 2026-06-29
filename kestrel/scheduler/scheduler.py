@@ -56,6 +56,17 @@ _SAMPLING_EPS = 1e-6
 # Prefer seeding miss-frontier work only when launch capacity is large enough to
 # absorb the short-term hit latency tradeoff.
 _MISS_FRONTIER_MIN_CAPACITY = 32
+# Marker the LoRA slot manager raises when every adapter slot is in use (see
+# ``LoRASlotManager.acquire`` -> "Out of LoRA slots: all N slots are in use").
+# Only this RuntimeError is a recoverable, retry-once-a-slot-frees deferral;
+# every other RuntimeError from adapter acquisition (e.g. a CUDA load/copy
+# failure) is unrecoverable and must fail the request, not loop forever.
+_OUT_OF_LORA_SLOTS_MARKER = "Out of LoRA slots"
+
+
+def _is_out_of_lora_slots(exc: BaseException) -> bool:
+    """True only for the recoverable out-of-LoRA-slots signal."""
+    return isinstance(exc, RuntimeError) and _OUT_OF_LORA_SLOTS_MARKER in str(exc)
 
 
 @dataclass(slots=True)
@@ -574,6 +585,16 @@ class GenerationScheduler:
                     request.lora_slot = self._acquire_adapter_slot(request.adapter)
                     lifecycle.lora_slot_ready = True
                 except RuntimeError as exc:
+                    if not _is_out_of_lora_slots(exc):
+                        # Not the recoverable out-of-slots case: a genuine
+                        # adapter load/copy failure (e.g. a CUDA error while
+                        # loading a new slot) also surfaces as a RuntimeError.
+                        # Retrying it would loop forever, so fail this request
+                        # cleanly instead of deferring it.
+                        self.waiting.remove(request)
+                        self._fail_request_early(request, exc)
+                        progressed = True
+                        continue
                     # Out of LoRA slots: recoverable. The request is genuinely
                     # blocked on a LoRA resource, so put it back in
                     # WAITING_RESOURCES (it stays in the waiting queue) and try
@@ -587,7 +608,9 @@ class GenerationScheduler:
                     deferred_ids.add(request.request_id)
                     continue
                 except Exception as exc:
-                    # Unrecoverable adapter load/config error: fail this request.
+                    # Unrecoverable adapter load/config error (NotImplementedError
+                    # for an unconfigured provider, ValueError for a rank/device
+                    # mismatch, etc.): fail this request rather than retry it.
                     self.waiting.remove(request)
                     self._fail_request_early(request, exc)
                     progressed = True
@@ -635,18 +658,38 @@ class GenerationScheduler:
             suppressed_token_ids = request.skill_state.suppressed_token_ids(
                 self.runtime
             )
+            # Request-level *one-shot* suppression. The non-spec path applies
+            # ``suppress_next_token_ids`` to a request's first generated token
+            # only (``_build_mask_spec`` gates it on
+            # ``token_count == generated_prefix_length``). ``admit`` samples that
+            # exact first token, so forward the suppression here -- otherwise a
+            # suppressed id can be sampled at admit, staged, and the one-shot
+            # window closes (``token_count`` advances) before ``step`` could ever
+            # apply it. ``None`` when the request set no one-shot suppression or
+            # already generated past its prefix (resumed request).
+            suppress_next_token_ids = None
+            if (
+                request.suppress_next_token_ids
+                and request.skill_state.token_count
+                == request.generated_prefix_length
+            ):
+                suppress_next_token_ids = request.suppress_next_token_ids
             try:
                 with torch.inference_mode():
                     # Pass the request's image (image prefill: vision block + KV
-                    # prefix), skill mask, and sampling params (temperature/top_p)
-                    # through to ``admit`` so image + constrained + non-greedy
-                    # requests run on the spec path with no fallback.
-                    first_token_id = decoder.admit(
+                    # prefix), skill mask, one-shot suppression, and sampling
+                    # params (temperature/top_p) through to ``admit`` so image +
+                    # constrained + non-greedy requests run on the spec path with
+                    # no fallback. ``admit`` returns ``(first_token_id,
+                    # first_logprob)``: the real selected-token logprob for a
+                    # ``return_logprobs`` request, or ``None`` otherwise.
+                    first_token_id, first_logprob = decoder.admit(
                         state,
                         prompt_ids,
                         image=request.image,
                         allowed_token_ids=allowed_token_ids,
                         suppressed_token_ids=suppressed_token_ids,
+                        suppress_next_token_ids=suppress_next_token_ids,
                         temperature=float(request.temperature),
                         top_p=float(request.top_p),
                     )
@@ -669,15 +712,30 @@ class GenerationScheduler:
             self.runtime.active_sequences[state.batch_idx] = state
 
             # Stage the first (prefill/bonus) token exactly like the non-spec
-            # prefill path: consume_step + streaming + finish check. ``admit``
-            # returns the greedy/bonus token id (it does not type the token or
-            # return a logprob), so the first token is a ``TextToken`` and, for a
-            # ``return_logprobs`` request, carries the greedy-bonus logprob (0.0
-            # under the non-spec sampler's greedy convention -- the bonus token
-            # is the argmax of the prefill logits). The macro-step supplies real
-            # per-token logprobs for every subsequently committed token.
-            token = TextToken(token_id=int(first_token_id))
-            first_logprob = 0.0 if request.return_logprobs is True else None
+            # prefill path: consume_step + streaming + finish check.
+            #
+            # Type the admit token through the runtime ``materialize_tokens``
+            # hook -- not a hard-coded ``TextToken``. On a spatial runtime the
+            # first generated id can be ``coord_id`` / ``size_id`` (point/detect
+            # apply the skill mask before this first sample), so it must become a
+            # ``CoordToken`` / ``SizeToken`` the way the non-spec prefill path
+            # does via ``post_sample`` -> ``materialize_tokens``; otherwise the
+            # first coordinate/box component is dropped. ``admit`` surfaces the
+            # admit-position side-values (the target's last hidden + sampling
+            # knobs the spatial hook needs to decode the coord/size value) on
+            # ``state.admit_side_values``; a text-only runtime leaves it ``None``
+            # and the id materialises as a plain ``TextToken`` (unchanged).
+            admit_side_values = getattr(state, "admit_side_values", None)
+            (typed_first,) = self._materialize_spec_tokens(
+                [lifecycle], [[int(first_token_id)]], admit_side_values
+            )
+            token = typed_first[0]
+            # ``admit`` returns the real first-token logprob for a
+            # ``return_logprobs`` request (the sampler's selected-token logprob,
+            # matching the non-spec prefill path's transferred ``sampled_logprobs``
+            # for token0) and ``None`` otherwise. Stage it through unchanged --
+            # no 0.0 greedy-approximation placeholder. The macro-step supplies
+            # real per-token logprobs for every subsequently committed token.
             self._spec_stage_token(lifecycle, token, logprob=first_logprob)
             progressed = True
             if self._mark_finished_if_needed(lifecycle):

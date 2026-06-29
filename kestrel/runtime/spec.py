@@ -245,15 +245,25 @@ class SpecDecoder(Protocol):
         image: Any | None = None,
         allowed_token_ids: Sequence[int] | None = None,
         suppressed_token_ids: Sequence[int] | None = None,
+        suppress_next_token_ids: Sequence[int] | None = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-    ) -> int:
+    ) -> "tuple[int, float | None]":
         """Prefill ``prompt_token_ids`` into a free pool row for ``state``.
 
         Assigns the row's device batch index onto ``state.batch_idx`` (so the
         scheduler's KV/finish bookkeeping addresses the same storage the spec
-        loop commits into) and returns the first sampled (greedy/bonus) token
-        id, mirroring prefill.
+        loop commits into) and returns ``(first_token_id, first_logprob)`` for
+        the first sampled (greedy/bonus) token, mirroring prefill.
+
+        ``first_logprob`` is the sampler's selected-token logprob for that first
+        token (under the request's temperature/top-p) when ``state`` requests
+        logprobs (``state.return_logprobs`` truthy), matching the non-spec
+        prefill path which computes and transfers ``sampled_logprobs`` for
+        token0; it is ``None`` when the request did not ask for logprobs (the
+        gather is skipped). Returning the real value avoids the ``0.0``
+        greedy-approximation placeholder for non-greedy requests
+        (``temperature > 0``, e.g. the query/caption default).
 
         Multimodal + constrained-decode admission (so the spec path covers the
         same requests the non-spec path does, with no fallback):
@@ -268,6 +278,12 @@ class SpecDecoder(Protocol):
           applied to **both** the drafter and the verify on every :meth:`step`,
           so masked decoding stays lossless and high-acceptance. ``None`` leaves
           the row unmasked.
+        * ``suppress_next_token_ids`` — the request-level *one-shot* suppression
+          (``GenerationRequest.suppress_next_token_ids``) that the non-spec path
+          applies only to a request's first generated token. ``admit`` samples
+          that very token, so it must blacklist these ids for this first sample
+          (and only this one — :meth:`step` never re-applies it). ``None`` leaves
+          the first sample unsuppressed.
         * ``temperature`` / ``top_p`` — the request's sampling knobs, recorded so
           :meth:`step` runs the matching greedy/rejection-sampling path and the
           per-token logprobs / spatial decode use the request's settings.

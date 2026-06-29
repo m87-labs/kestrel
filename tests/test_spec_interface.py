@@ -61,9 +61,11 @@ class _StubDecoder:
     def free_slots(self) -> int:
         return 4
 
-    def admit(self, state, prompt_token_ids):  # noqa: ANN001
+    def admit(self, state, prompt_token_ids, **kwargs):  # noqa: ANN001
         state.batch_idx = 1
-        return 42
+        # New contract: return (first_token_id, first_logprob). The stub does
+        # not produce logprobs, so the logprob is None.
+        return 42, None
 
     def step(self, states):  # noqa: ANN001
         return SpecStepResult(
@@ -84,8 +86,9 @@ def test_stub_decoder_satisfies_protocol_and_sets_batch_idx() -> None:
     dec = _StubDecoder()
     assert isinstance(dec, SpecDecoder)
     state = _StubState()
-    first = dec.admit(state, [1, 2, 3])
+    first, first_logprob = dec.admit(state, [1, 2, 3])
     assert first == 42
+    assert first_logprob is None  # stub produces no logprobs
     assert state.batch_idx == 1  # admit assigns the pool row's batch index
     out = dec.step([state, state])
     assert len(out.tokens) == 2

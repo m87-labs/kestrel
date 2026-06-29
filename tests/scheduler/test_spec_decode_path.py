@@ -62,6 +62,8 @@ class _FakeDecoder:
         first_tokens: dict,
         emit_logprobs: bool = False,
         side_values: object | None = None,
+        first_logprobs: dict | None = None,
+        admit_side_values: object | None = None,
     ) -> None:
         self._free = list(range(n_rows))
         self._row_of: dict[int, int] = {}
@@ -69,6 +71,12 @@ class _FakeDecoder:
         self._first = first_tokens     # row -> first token id
         self._emit_logprobs = emit_logprobs
         self._side_values = side_values
+        # row -> first-token logprob ``admit`` returns when the request wants
+        # logprobs (defaults to the non-spec greedy-bonus convention 0.0).
+        self._first_logprobs = first_logprobs or {}
+        # Optional per-admit side-values the decoder attaches to the state so
+        # the scheduler types the admit token via the runtime hook.
+        self._admit_side_values = admit_side_values
         self.admitted: list[int] = []
         self.retired: list[int] = []
         # admit kwargs recorded per row.
@@ -86,22 +94,33 @@ class _FakeDecoder:
         image=None,
         allowed_token_ids=None,
         suppressed_token_ids=None,
+        suppress_next_token_ids=None,
         temperature: float = 0.0,
         top_p: float = 1.0,
     ):
         row = self._free.pop(0)
         self._row_of[id(state)] = row
         state.batch_idx = 100 + row
+        if self._admit_side_values is not None:
+            state.admit_side_values = self._admit_side_values
         self.admitted.append(row)
+        want_logprobs = getattr(state, "return_logprobs", None) is True
         self.admit_kwargs[row] = {
             "image": image,
             "allowed_token_ids": allowed_token_ids,
             "suppressed_token_ids": suppressed_token_ids,
+            "suppress_next_token_ids": suppress_next_token_ids,
             "temperature": temperature,
             "top_p": top_p,
             "return_logprobs": getattr(state, "return_logprobs", None),
         }
-        return self._first[row]
+        # New contract: ``admit`` returns ``(first_token_id, first_logprob)``.
+        # ``first_logprob`` is the real selected-token logprob when the request
+        # wants logprobs, else ``None``.
+        first_logprob = (
+            self._first_logprobs.get(row, 0.0) if want_logprobs else None
+        )
+        return self._first[row], first_logprob
 
     def step(self, states):
         tokens, accepts, logprobs = [], [], []
@@ -446,6 +465,9 @@ def test_spec_admit_and_step_stage_logprobs() -> None:
         first_tokens={0: 11},
         plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
         emit_logprobs=True,
+        # admit returns the REAL first-token logprob (not the 0.0 greedy
+        # placeholder) for a return_logprobs request.
+        first_logprobs={0: -0.5},
     )
     rt = _spec_runtime(dec)
     sched = _make_scheduler(rt)
@@ -464,11 +486,193 @@ def test_spec_admit_and_step_stage_logprobs() -> None:
         pass
 
     assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
-    # First (bonus) token from admit carries the greedy-bonus logprob (0.0);
-    # the macro-step supplies the real logprobs for the committed tokens.
-    assert req.lifecycle.logprobs == [0.0, -12.0, -13.0]
+    # First (bonus) token carries the REAL admit logprob (-0.5), and the
+    # macro-step supplies the real logprobs for the committed tokens.
+    assert req.lifecycle.logprobs == [-0.5, -12.0, -13.0]
     completed = sched.pop_completed()
-    assert completed[0].logprobs == [0.0, -12.0, -13.0]
+    assert completed[0].logprobs == [-0.5, -12.0, -13.0]
+
+
+def test_spec_admit_returns_real_first_token_logprob() -> None:
+    """Regression for codex finding: real admit logprob, not a 0.0 placeholder.
+
+    For a non-greedy ``return_logprobs`` request the first (bonus) token sampled
+    by ``decoder.admit`` must be staged with the sampler's selected-token logprob
+    (the value ``admit`` now returns), not the 0.0 greedy approximation. Asserts
+    the staged first logprob is exactly the real value the decoder returned.
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+        emit_logprobs=True,
+        first_logprobs={0: -1.25},  # real selected-token logprob from admit
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    # temperature > 0: the case where 0.0 would be wrong (non-greedy default).
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, return_logprobs=True, temperature=0.7
+    )
+
+    assert sched._spec_admit() is True
+    # The first staged logprob is the real value, not the 0.0 placeholder.
+    assert req.lifecycle.logprobs == [-1.25]
+
+
+def test_spec_admit_no_logprob_when_not_requested() -> None:
+    """``admit`` returns ``None`` logprob (and none is staged) without a request."""
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8)  # return_logprobs unset
+
+    assert sched._spec_admit() is True
+    # No logprobs requested -> none collected (staging would raise if a stray
+    # 0.0 were threaded for a non-logprobs request).
+    assert req.lifecycle.logprobs == []
+
+
+def test_spec_admit_applies_one_shot_suppression() -> None:
+    """Regression for codex finding: one-shot suppression reaches the admit sample.
+
+    ``GenerationRequest.suppress_next_token_ids`` is a one-shot blacklist the
+    non-spec path applies to a request's *first* generated token. ``admit``
+    samples that exact token, so the scheduler must forward the suppression as
+    ``suppress_next_token_ids`` -- otherwise a suppressed id can be emitted at
+    admit and the one-shot window closes before ``step`` could apply it.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8)
+    req.suppress_next_token_ids = (7, 8, 9)
+
+    assert sched._spec_admit() is True
+    # The one-shot suppression was forwarded into admit (the first sample).
+    assert tuple(dec.admit_kwargs[0]["suppress_next_token_ids"]) == (7, 8, 9)
+
+
+def test_spec_admit_no_one_shot_suppression_past_prefix() -> None:
+    """One-shot suppression is *not* forwarded once past a request's prefix.
+
+    Mirrors the non-spec gate (``token_count == generated_prefix_length``): a
+    resumed request that already generated its prefix is not on its first
+    generated token, so the one-shot suppression must not re-fire at admit.
+    """
+
+    class _PrefixState(_RecordingState):
+        # Pretend the request already generated one prefix token.
+        @property
+        def token_count(self) -> int:  # type: ignore[override]
+            return 1
+
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8)
+    req.suppress_next_token_ids = (7, 8, 9)
+    prefix_state = _PrefixState(req)
+    req.lifecycle.skill_state = prefix_state
+    req.skill_state = prefix_state
+
+    assert sched._spec_admit() is True
+    # token_count (1) != generated_prefix_length (0) -> suppression not applied.
+    assert dec.admit_kwargs[0]["suppress_next_token_ids"] is None
+
+
+def test_spec_admit_types_admit_token_via_materialize_hook() -> None:
+    """Regression for codex finding: type the admit token through the hook.
+
+    On a spatial runtime the first generated id can be coord/size, so the admit
+    (first) token must be typed through the runtime ``materialize_tokens`` hook
+    using ``admit``'s side-values -- not hard-coded to ``TextToken``. Stubs the
+    hook to wrap the admit id and asserts (a) it ran for the admit token, (b) it
+    received ``admit``'s side-values as the opaque step-handle, (c) the staged
+    first token is the typed token.
+    """
+    admit_side_values = object()
+    calls: list[dict] = []
+
+    @dataclass
+    class _TypedToken:
+        token_id: int
+
+    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+        ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
+        calls.append({"step_handle": step_handle, "ids": ids})
+        return [_TypedToken(token_id=int(t)) for t in ids]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+        admit_side_values=admit_side_values,
+    )
+    rt = _spec_runtime(dec)
+    from kestrel.runtime.sampling import SamplingHooks
+
+    # Hooks are read at scheduler construction, so install before _make_scheduler.
+    rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8)
+
+    assert sched._spec_admit() is True
+    # The hook typed the admit id (11) and was handed admit's side-values.
+    admit_call = next(c for c in calls if c["ids"] == [11])
+    assert admit_call["step_handle"] is admit_side_values
+    staged = req.lifecycle.skill_state.tokens
+    assert isinstance(staged[0], _TypedToken)
+    assert int(staged[0].token_id) == 11
+
+
+def test_spec_admit_fails_on_non_slot_adapter_error() -> None:
+    """Regression for codex finding: a non-slot adapter error fails, not defers.
+
+    Only the recoverable out-of-LoRA-slots ``RuntimeError`` should defer the
+    request back to WAITING_RESOURCES. A different ``RuntimeError`` (e.g. a CUDA
+    load/copy failure) is unrecoverable: the request must FAIL cleanly rather
+    than loop forever in the waiting queue.
+    """
+
+    class _BrokenAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+
+    def _raise_load_failure(adapter_id: str, adapter: object) -> int:
+        # A genuine load/copy failure, NOT the out-of-slots signal.
+        raise RuntimeError("CUDA error: out of memory while loading adapter slot")
+
+    rt.acquire_adapter_slot = _raise_load_failure  # type: ignore[method-assign]
+
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_BrokenAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    # The request is removed from waiting and failed (error result), not deferred.
+    assert sched._spec_admit() is True
+    assert dec.admitted == []
+    assert len(sched.waiting) == 0
+    assert len(sched.running) == 0
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "error"
 
 
 def test_spec_admit_forwards_image_mask_and_sampling_params() -> None:
