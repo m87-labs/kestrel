@@ -588,7 +588,24 @@ class GenerationScheduler:
         # the same request (it stays in ``waiting``) while still letting other
         # waiting requests be considered for admission.
         deferred_ids: set[int] = set()
-        while decoder.free_slots > 0:
+        # Cap the live spec batch to the runtime's captured-graph batch size.
+        #
+        # The decoder's pool can expose MORE free rows than ``max_batch_size``
+        # (it is sized from ``max_batch_slots == max_batch_size + 2`` to keep
+        # headroom for transient prefill, see ``runtime.max_batch_slots``), so
+        # admitting ``while decoder.free_slots > 0`` alone would queue up to
+        # ``max_batch_slots`` running rows. ``_spec_decode_step`` then snapshots
+        # EVERY running row into ``active`` and hands the whole set to one
+        # ``decoder.step`` call -- but the verify/draft CUDA graphs and staging
+        # buffers are captured for ``max_batch_size`` states, so an oversized
+        # batch overruns them. The non-spec path enforces the same bound via its
+        # ``max_batch_size`` dispatch cap (``_cap_decode_dispatch``); bound the
+        # spec batch at admission so the running set -- and thus every
+        # ``decoder.step`` -- never exceeds it. Excess launchable requests stay
+        # WAITING and are admitted as running rows retire (same deferral the
+        # non-spec path applies when more rows are dispatchable than fit).
+        max_running = self.runtime.max_batch_size
+        while decoder.free_slots > 0 and len(self.running) < max_running:
             request = next(
                 (
                     r

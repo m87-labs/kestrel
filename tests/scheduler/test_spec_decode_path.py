@@ -369,6 +369,59 @@ def test_spec_admit_respects_free_slots() -> None:
     assert len(sched.running) == 1
 
 
+def test_spec_admit_caps_running_batch_to_max_batch_size() -> None:
+    """Regression: cap the live spec batch to ``runtime.max_batch_size``.
+
+    The decoder's pool can expose MORE free rows than ``max_batch_size`` -- it
+    is sized from ``max_batch_slots == max_batch_size + 2`` for transient-prefill
+    headroom (here ``_spec_runtime`` uses ``max_batch_size=4`` /
+    ``max_batch_slots=8``, and the decoder pool has 8 rows). If ``_spec_admit``
+    admitted ``while decoder.free_slots > 0`` with no batch bound, it would queue
+    all 8 running rows, and ``_spec_decode_step`` would then snapshot every one
+    into a single ``decoder.step`` call -- overrunning the verify/draft graphs
+    and staging buffers captured for ``max_batch_size`` states (the non-spec path
+    caps the same way via ``_cap_decode_dispatch``).
+
+    Enqueue 6 launchable requests against an 8-row pool and assert:
+
+    * admission stops at ``max_batch_size`` (4) even though 8 rows are free and 6
+      requests are launchable -- the surplus stays WAITING; and
+    * across the whole depth-1 run, NO ``decoder.step`` call is ever handed more
+      than ``max_batch_size`` states (``_FakeDecoder.step_rows`` records each
+      call's launched rows).
+    """
+    n = 8  # pool rows -- intentionally > max_batch_size (4)
+    dec = _FakeDecoder(
+        n_rows=n,
+        first_tokens={r: 10 + r for r in range(n)},
+        # One token per step for a few steps so ``decoder.step`` actually fires
+        # with the full admitted batch before any row finishes.
+        plans={r: [[100 + r], [200 + r], [300 + r]] for r in range(n)},
+    )
+    rt = _spec_runtime(dec)
+    assert rt.max_batch_size == 4 and dec.free_slots == 8
+    sched = _make_scheduler(rt)
+    for rid in range(6):  # more launchable requests than the batch cap
+        _enqueue(sched, rid, prompt_len=3, max_new=8)
+
+    sched._spec_admit()
+    # Capped at max_batch_size: only 4 rows admitted, the other 2 stay waiting,
+    # and free pool rows remain (admission was bound by the batch, not the pool).
+    assert len(dec.admitted) == rt.max_batch_size
+    assert dec.admitted == [0, 1, 2, 3]
+    assert len(sched.running) == rt.max_batch_size
+    assert len(sched.waiting) == 2
+    assert dec.free_slots == n - rt.max_batch_size  # pool not over-subscribed
+
+    # Drive the depth-1 pipeline; every ``decoder.step`` must stay within the
+    # captured batch size for the whole run.
+    for _ in range(8):
+        if not sched._spec_decode_step():
+            break
+    assert dec.step_rows  # at least one macro-step actually launched
+    assert all(len(rows) <= rt.max_batch_size for rows in dec.step_rows)
+
+
 def test_advance_routes_to_spec_when_capability_present() -> None:
     dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12], [13]]})
     rt = _spec_runtime(dec)
