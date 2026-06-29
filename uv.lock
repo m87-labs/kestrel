@@ -587,7 +587,7 @@ requires-dist = [
     { name = "kestrel-native", specifier = "==0.1.5" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "tokenizers", specifier = ">=0.15" },
-    { name = "torch", specifier = ">=2.4" },
+    { name = "torch", specifier = ">=2.8" },
     { name = "torch-c-dlpack-ext", specifier = ">=0.1.3" },
 ]
 
