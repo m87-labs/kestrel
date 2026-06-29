@@ -82,6 +82,12 @@ class _FakeDecoder:
         self.retired: list[int] = []
         # admit kwargs recorded per row.
         self.admit_kwargs: dict[int, dict] = {}
+        # Per-``step`` skill masks the scheduler forwards (one entry per call,
+        # each parallel to that call's ``states``). Lets a test assert the
+        # stateful skill mask is RECOMPUTED per macro-step rather than reusing
+        # the stale admit-time snapshot.
+        self.step_allowed: list = []
+        self.step_suppressed: list = []
 
     @property
     def free_slots(self) -> int:
@@ -128,7 +134,16 @@ class _FakeDecoder:
         )
         return self._first[row], first_logprob
 
-    def step(self, states):
+    def step(self, states, *, allowed_token_ids=None, suppressed_token_ids=None):
+        # Record the per-step masks the scheduler recomputes + forwards.
+        self.step_allowed.append(
+            list(allowed_token_ids) if allowed_token_ids is not None else None
+        )
+        self.step_suppressed.append(
+            list(suppressed_token_ids)
+            if suppressed_token_ids is not None
+            else None
+        )
         tokens, accepts, logprobs = [], [], []
         for s in states:
             row = self._row_of[id(s)]
@@ -1130,3 +1145,127 @@ def test_spec_drain_pipeline_noop_when_no_pending_spec() -> None:
     sched._drain_pipeline()
     assert sched._pending_spec is None
     assert dec.retired == []
+def test_spec_step_recomputes_stateful_skill_mask_per_step() -> None:
+    """Regression for codex P1 @ L727: stateful skill masks refresh per step.
+
+    For a STATEFUL constrained skill the allowed-token set evolves per committed
+    token (point toggles ``[coord, eos]`` <-> ``[coord]`` after each coordinate;
+    detect cycles x->y->size). The spec path used to snapshot the mask ONCE at
+    ``admit`` and reuse it for every later position, so ``decoder.step`` -- which
+    only saw ``SequenceState`` -- could never see the mask change after a
+    ``consume_step``, allowing e.g. EOS where ``y`` is required.
+
+    This drives a toggling skill state (mirroring point: allowed set flips every
+    committed token) through several macro-steps with ONE token committed per
+    step (so at most one stateful transition happens per committed run -- the
+    regime where a single per-step mask is exact, matching the non-spec
+    one-token-per-step refresh) and asserts the mask the scheduler hands to each
+    ``decoder.step`` is RECOMPUTED from the live skill state -- it alternates
+    with the state instead of being frozen at the admit-time value.
+    """
+    COORD, EOS = 7, 8
+
+    class _TogglingState(_RecordingState):
+        def __init__(self, request: GenerationRequest) -> None:
+            super().__init__(request)
+            self._awaiting_y = False
+
+        def consume_step(self, runtime: object, step: DecodeStep) -> None:
+            # Mirror PointSkillState: every committed token flips the stage.
+            self.append_token(step.token)
+            self._awaiting_y = not self._awaiting_y
+
+        def allowed_token_ids(self, runtime: object):
+            # awaiting y -> only a coordinate may follow; else coord or EOS.
+            return [COORD] if self._awaiting_y else [COORD, EOS]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 19},
+        # One token committed per macro-step -> one stateful transition per run.
+        plans={0: [[20], [21], [22], [23]]},
+        # EOS exists in the skill mask but is never the scripted token, so the
+        # request runs long enough to observe several mask refreshes.
+    )
+    rt = _spec_runtime(dec, eos_id=EOS)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=20)
+    toggling = _TogglingState(req)
+    req.lifecycle.skill_state = toggling
+    req.skill_state = toggling
+
+    assert sched._spec_admit() is True
+    # At admit the state was ``_awaiting_y=False`` -> the admit-time (stale)
+    # snapshot allows [COORD, EOS]. The bug reused exactly this for all later
+    # positions. ``admit`` staged token 19, flipping the state to awaiting_y.
+    assert list(dec.admit_kwargs[0]["allowed_token_ids"]) == [COORD, EOS]
+
+    # Drive four macro-steps so each commits one scripted token and flips state.
+    for _ in range(4):
+        sched._spec_decode_step()
+
+    # Each ``step`` got a single-row mask (the one active sequence). Pull the
+    # per-call allowed set for that row.
+    per_step = [call[0] for call in dec.step_allowed]
+
+    # The mask handed to step 0 reflects the POST-admit state (awaiting_y=True)
+    # -> [COORD] -- already DIFFERENT from the admit-time [COORD, EOS], proving
+    # it is recomputed, not the frozen admit snapshot.
+    assert per_step[0] == [COORD]
+    assert per_step[0] != list(dec.admit_kwargs[0]["allowed_token_ids"])
+    # ... and it tracks the toggling skill state across subsequent steps: each
+    # committed token flips the allowed set, so it alternates per macro-step.
+    assert per_step[:4] == [[COORD], [COORD, EOS], [COORD], [COORD, EOS]]
+
+
+def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:
+    """Regression for codex P2 @ L1012: zombie -> COMPLETED before row retire.
+
+    When a spec request finishes while its depth-1 follow-up macro-step is still
+    in flight, ``_finalize_sequence`` leaves it FINALIZING (``inflight_refs >
+    0``). The zombie branch in ``_commit_spec`` is where that last ref reaches
+    zero; it used to ONLY retire the decoder row and never transition the
+    lifecycle to COMPLETED, so a normally-completed spec request could stay stuck
+    in FINALIZING forever after its row was retired. This drives a sequence that
+    finishes with an optimistic follow-up step outstanding and asserts the
+    lifecycle ends COMPLETED (not FINALIZING) and its row is retired exactly
+    once -- matching the non-spec zombie ordering in ``commit_step``.
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes mid-pipeline
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()
+
+    # Drive to quiescence. The finishing commit lands while a follow-up
+    # (zombie) step is in flight; the zombie's own commit retires the row and
+    # must mark the lifecycle COMPLETED.
+    saw_finalizing_with_pending = False
+    for _ in range(10):
+        if not sched._spec_decode_step():
+            break
+        if (
+            req.lifecycle.finished
+            and sched._pending_spec is not None
+            and req.lifecycle.phase == RequestPhase.FINALIZING
+        ):
+            # The exact window: finished + an in-flight zombie step still holds a
+            # ref, so the lifecycle is (correctly) FINALIZING, not yet COMPLETED.
+            saw_finalizing_with_pending = True
+
+    # The FINALIZING-with-zombie window actually occurred (otherwise the test
+    # would not be exercising the zombie completion path at all).
+    assert saw_finalizing_with_pending is True
+    # After the zombie's commit: row retired exactly once, lifecycle COMPLETED
+    # (the bug left it stuck in FINALIZING), nothing leaked.
+    assert dec.retired == [0]
+    assert dec.retired.count(0) == 1
+    assert req.lifecycle.phase == RequestPhase.COMPLETED
+    assert req.lifecycle.finished is True
+    assert rt.active_sequences == {}
+    assert sched._pending_spec is None
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]

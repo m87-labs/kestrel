@@ -856,17 +856,34 @@ class GenerationScheduler:
     def _spec_decode_step(self) -> bool:
         """Run one spec macro-step, overlapped depth-1.
 
-        Launch the macro-step for the current running set *first* (async: the
-        decoder samples + commits on the GPU and returns a lazy
-        ``SpecStepResult`` whose token D2H is in flight), then commit the
-        *previous* macro-step -- whose D2H landed while this launch ran. The CPU
-        commit (token materialize + stage + finish) therefore overlaps GPU
-        compute.
+        Ordering per tick: snapshot membership -> reserve in-flight refs ->
+        commit the previous macro-step -> build this step's masks -> launch.
 
-        Membership is an optimistic snapshot: a sequence finished by the previous
-        commit but already launched here rides as a zombie (``finalized`` with
-        ``inflight_refs > 0``) and is skipped + retired at its own commit next
-        tick -- the same zombie discipline the single-token pipeline uses.
+        Membership is an *optimistic* snapshot taken BEFORE the commit, so a
+        sequence the upcoming commit finishes still rides this tick's launch as
+        a zombie (``finalized`` with ``inflight_refs > 0``) and is skipped +
+        retired at its own commit next tick -- the same zombie discipline the
+        single-token pipeline uses, and the property the depth-1
+        ``has_pending_work`` leak-guard relies on (a finishing sequence's
+        optimistic follow-up step stays pending until committed).
+
+        Why the commit happens before the launch (and before the mask build):
+        ``_commit_spec`` advances each committed sequence's skill state via
+        ``consume_step``, and STATEFUL constrained skills evolve their allowed-
+        token set per committed token (e.g. point toggles ``[coord,eos]`` <->
+        ``[coord]`` every coordinate; detect cycles x->y->size). The mask handed
+        to ``decoder.step`` must therefore be recomputed from the skill state
+        *after* the prior run is committed -- exactly the non-spec
+        commit-before-finalize invariant (``advance`` docstring), where
+        ``_build_mask`` re-queries ``allowed_token_ids`` post-commit.
+        Snapshotting once at ``admit`` and reusing it (as the spec path did)
+        left stateful skills with a stale mask for every later position.
+
+        ``inflight_refs`` is reserved for this launch BEFORE the commit so a
+        sequence present in both the previous step and this one (the common
+        continuing case) never drops to zero refs mid-commit and is not retired
+        out from under the relaunch; its ref is decremented again when this
+        launch is itself committed next tick, keeping the count balanced.
         """
         decoder = self.runtime.spec.decoder
         pending = self._pending_spec
@@ -877,15 +894,35 @@ class GenerationScheduler:
             for seq in self.running
             if not seq.finished and seq.sequence_state is not None
         ]
-        if active:
-            with torch.inference_mode():
-                result = decoder.step([seq.state for seq in active])
-            for seq in active:
-                seq.inflight_refs += 1
-            self._pending_spec = (active, result)
+        # Reserve this launch's ref before the commit (see docstring): protects
+        # continuing sequences from a premature retire when the commit drops
+        # their previous-step ref.
+        for seq in active:
+            seq.inflight_refs += 1
 
         if pending is not None:
             self._commit_spec(pending)
+
+        if active:
+            # Recompute each row's skill mask from the now-current skill state
+            # (post-commit), so stateful skills constrain the drafter + verify
+            # with the up-to-date allowed/suppressed set this step -- not the
+            # admit-time snapshot. Finalized zombies come back unconstrained.
+            allowed_token_ids, suppressed_token_ids = self._build_spec_step_masks(
+                active
+            )
+            with torch.inference_mode():
+                result = decoder.step(
+                    [seq.state for seq in active],
+                    allowed_token_ids=allowed_token_ids,
+                    suppressed_token_ids=suppressed_token_ids,
+                )
+            self._pending_spec = (active, result)
+        else:
+            # No launch this tick: roll back the refs reserved above so the
+            # count stays balanced (no-op when ``active`` is empty).
+            for seq in active:
+                seq.inflight_refs -= 1
 
         return bool(active) or pending is not None
 
@@ -1008,7 +1045,14 @@ class GenerationScheduler:
             seq.inflight_refs -= 1
             if seq.finalized:
                 # Zombie: finished by an earlier commit while still in flight here.
+                # When its last in-flight ref drops, mark the lifecycle COMPLETED
+                # *before* retiring the row, mirroring the non-spec zombie path in
+                # ``commit_step`` (``seq.transition(COMPLETED)`` then release). The
+                # finishing commit left it FINALIZING because ``inflight_refs > 0``;
+                # without this transition a normally-completed spec request stays
+                # stuck in FINALIZING forever after its row is retired.
                 if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
                     self._retire_spec_row(seq.state)
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
@@ -1921,6 +1965,45 @@ class GenerationScheduler:
             all_greedy,
             any_return_logprobs,
         )
+
+    def _build_spec_step_masks(
+        self, sequences: List[RequestLifecycle]
+    ) -> tuple[list[Optional[Sequence[int]]], list[Optional[Sequence[int]]]]:
+        """Per-row skill masks for a spec macro-step, re-queried per step.
+
+        The spec-decode analog of ``_build_mask_spec``'s allowed/suppressed
+        re-query. ``_spec_decode_step`` calls this AFTER committing the previous
+        macro-step (so ``skill_state`` reflects every token committed through the
+        prior run), then threads the result into ``decoder.step`` so the drafter
+        + verify constrain to the *current* allowed/suppressed set instead of the
+        snapshot taken once at ``admit``. This is what keeps STATEFUL skills
+        correct on the spec path (point toggles ``[coord,eos]`` <-> ``[coord]``
+        every coordinate; detect cycles x->y->size), mirroring how the non-spec
+        ``_build_mask`` refreshes the mask each step.
+
+        Finalized/zombie rows come back unconstrained (``None``), exactly like
+        ``_build_mask_spec`` -- their tokens are dropped at commit, so masking
+        them is moot.
+
+        Deliberately does NOT re-apply the request-level one-shot
+        ``suppress_next_token_ids``: that suppression targets a request's *first*
+        generated token only and is applied once, at ``admit`` (which samples
+        that token); re-applying it here would wrongly suppress past the one-shot
+        window. Returns ``(allowed_per_row, suppressed_per_row)`` parallel to
+        ``sequences``.
+        """
+        allowed_tokens: list[Optional[Sequence[int]]] = []
+        suppressed_tokens: list[Optional[Sequence[int]]] = []
+        for seq in sequences:
+            if seq.finalized:
+                allowed_tokens.append(None)
+                suppressed_tokens.append(None)
+                continue
+            allowed_tokens.append(seq.skill_state.allowed_token_ids(self.runtime))
+            suppressed_tokens.append(
+                seq.skill_state.suppressed_token_ids(self.runtime)
+            )
+        return allowed_tokens, suppressed_tokens
 
     def _build_mask(
         self, sequences: List[RequestLifecycle], slot

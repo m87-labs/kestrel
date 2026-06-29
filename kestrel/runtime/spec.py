@@ -286,10 +286,13 @@ class SpecDecoder(Protocol):
           like a normal image prefill (vision block spliced + vision encoder
           run), not text-only. ``None`` keeps the text-only prefill.
         * ``allowed_token_ids`` / ``suppressed_token_ids`` — the sequence's skill
-          mask (point/detect/query constrain the vocabulary). Stored per row and
-          applied to **both** the drafter and the verify on every :meth:`step`,
-          so masked decoding stays lossless and high-acceptance. ``None`` leaves
-          the row unmasked.
+          mask at admit (point/detect/query constrain the vocabulary). Stored per
+          row and applied to **both** the drafter and the verify, so masked
+          decoding stays lossless and high-acceptance. This is the row's
+          *initial* mask; :meth:`step` re-supplies the mask per macro-step (the
+          scheduler recomputes it from the live skill state) and that per-step
+          value overrides the stored one for stateful skills whose allowed set
+          evolves. ``None`` leaves the row unmasked.
         * ``suppress_next_token_ids`` — the request-level *one-shot* suppression
           (``GenerationRequest.suppress_next_token_ids``) that the non-spec path
           applies only to a request's first generated token. ``admit`` samples
@@ -302,14 +305,38 @@ class SpecDecoder(Protocol):
         """
         ...
 
-    def step(self, states: Sequence[Any]) -> SpecStepResult:
+    def step(
+        self,
+        states: Sequence[Any],
+        *,
+        allowed_token_ids: Sequence[Sequence[int] | None] | None = None,
+        suppressed_token_ids: Sequence[Sequence[int] | None] | None = None,
+    ) -> SpecStepResult:
         """Run one macro-step over the active ``states`` and commit accepts.
 
-        Applies each row's admit-time token mask to the drafter + verify,
-        returns a :class:`SpecStepResult` carrying the committed ids, accept
+        Returns a :class:`SpecStepResult` carrying the committed ids, accept
         counts, per-token logprobs (when any active sequence wants them), and the
         typed-token :class:`SpecSideValues` (when the runtime types coord/size
         ids). See :class:`SpecStepResult`.
+
+        ``allowed_token_ids`` / ``suppressed_token_ids`` are the per-row skill
+        masks the scheduler recomputes from each sequence's *current* skill state
+        THIS macro-step (parallel to ``states``; entry ``i`` is the mask for
+        ``states[i]``, ``None`` for an unconstrained or finalized/zombie row).
+        They REPLACE the admit-time mask for this step. Stateful constrained
+        skills (point/detect) evolve their allowed set per committed token, so a
+        mask snapshotted once at ``admit`` goes stale after the first position;
+        the scheduler builds these post-commit (after the prior run's
+        ``consume_step`` ran) exactly like the non-spec sampler re-queries the
+        mask each step. ``None`` for the whole argument keeps the admit-time mask
+        (back-compat for a runtime/caller that does not refresh).
+
+        NOTE: a macro-step commits a *variable* run of ``a_i + 1`` tokens; for a
+        per-token-stateful skill the allowed set can change *within* one run. A
+        single per-step mask is exact only when at most one constraint transition
+        occurs per committed run -- the regime the non-spec one-token-per-step
+        path always satisfies. Tighter intra-run constraint enforcement (advancing
+        the mask per accepted draft) is the decoder's responsibility.
         """
         ...
 
