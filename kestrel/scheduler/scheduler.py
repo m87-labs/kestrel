@@ -770,6 +770,38 @@ class GenerationScheduler:
                         top_p=float(request.top_p),
                     )
             except Exception as exc:
+                # ``admit`` prefills into a free spec pool row and assigns
+                # ``state.batch_idx`` before the prefill's image/CUDA work
+                # runs, so a mid-admit failure can leave the row reserved
+                # (and ``batch_idx`` set) even though no token was staged.
+                # This request has already left ``waiting`` and
+                # ``lifecycle.sequence_state`` is not set yet, so no later
+                # finish/zombie path will ever call ``decoder.retire`` for
+                # it -- the row would leak permanently and repeated failures
+                # would drain ``decoder.free_slots`` and stall unrelated spec
+                # requests. Retire the row here when ``admit`` got far enough
+                # to reserve one (``batch_idx`` left at its ``-1`` sentinel
+                # means it never did, so there is nothing to retire).
+                #
+                # This is NOT ``_retire_spec_row``: that also calls
+                # ``release_adapter_slot(state.lora_slot)``, which would
+                # double-release the LoRA slot the block below already frees
+                # via ``request.lora_slot`` (the same slot). Each resource is
+                # released exactly once -- pool row via ``decoder.retire``,
+                # adapter slot via the ``release_adapter_slot`` below --
+                # mirroring the per-resource cleanup the non-spec
+                # admit-failure path performs.
+                if state.batch_idx >= 0:
+                    try:
+                        decoder.retire(state)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    # ``active_sequences[batch_idx]`` is only populated AFTER
+                    # the ``try`` (on the success path), so on this failure
+                    # path it is normally absent; pop defensively in case a
+                    # future reorder registers it earlier, leaving no dangling
+                    # entry.
+                    self.runtime.active_sequences.pop(state.batch_idx, None)
                 if lifecycle.lora_slot_ready and request.lora_slot:
                     # Release the LoRA slot we acquired for this failed admission
                     # so its refcount does not leak.

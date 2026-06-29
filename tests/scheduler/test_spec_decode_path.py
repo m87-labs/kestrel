@@ -979,6 +979,141 @@ def test_spec_admit_finish_releases_lora_slot() -> None:
     assert req.lifecycle.state.batch_idx not in rt.active_sequences
 
 
+class _RaisingAdmitDecoder(_FakeDecoder):
+    """``SpecDecoder`` whose ``admit`` reserves a pool row, sets ``batch_idx``,
+    then RAISES -- emulating a prefill that fails mid-flight (e.g. an image
+    preprocessing / CUDA error) *after* the decoder has already claimed a free
+    row for the sequence. Unlike the base ``_FakeDecoder``, ``retire`` returns
+    the row to the free pool so a test can assert the failed admission did not
+    leak a slot (``free_slots`` returns to baseline).
+    """
+
+    def admit(self, state, prompt_token_ids, **kwargs):
+        # Reserve a row + assign batch_idx exactly like a real admit does before
+        # its prefill work runs, so the failure path has a row to leak.
+        row = self._free.pop(0)
+        self._row_of[id(state)] = row
+        state.batch_idx = 100 + row
+        self.admitted.append(row)
+        raise RuntimeError("CUDA error: image prefill failed mid-admit")
+
+    def retire(self, state) -> None:
+        row = self._row_of.pop(id(state))
+        self.retired.append(row)
+        # Return the row to the free pool so the test can prove no leak.
+        self._free.append(row)
+
+
+def test_spec_admit_failure_retires_row_no_leak() -> None:
+    """P2 codex finding @ scheduler.py:776: a failed ``decoder.admit`` retires
+    the reserved spec row so ``free_slots`` does not leak.
+
+    ``admit`` reserves a free pool row and assigns ``state.batch_idx`` BEFORE its
+    prefill image/CUDA work, so a mid-admit failure leaves the row reserved even
+    though no token was staged. The request has already left ``waiting`` and
+    ``lifecycle.sequence_state`` is never set, so no finish/zombie path retires
+    it -- the row would leak permanently and repeated failures would drain
+    ``decoder.free_slots`` and stall unrelated spec requests. Asserts the failed
+    admission (a) fails the request cleanly, (b) retires the reserved row, and
+    (c) leaves ``free_slots`` back at baseline (no leak), and that a SUBSEQUENT
+    request can still be admitted into the reclaimed row.
+    """
+    dec = _RaisingAdmitDecoder(
+        n_rows=1, first_tokens={0: 11}, plans={0: [[12]]}
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    assert dec.free_slots == 1  # baseline: one row free
+
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8)
+
+    assert sched._spec_admit() is True
+    # The row was reserved (admit started) then retired on failure.
+    assert dec.admitted == [0]
+    assert dec.retired == [0]
+    # No leak: the reserved row was returned to the pool.
+    assert dec.free_slots == 1
+    # The request failed cleanly (error result), not deferred/queued.
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    assert len(sched.waiting) == 0
+    assert len(sched.running) == 0
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "error"
+    # ``sequence_state`` is intentionally never set on the admit-failure path
+    # (it is only assigned AFTER a successful admit) -- which is exactly why no
+    # finish/zombie path would have retired the row without this fix. The
+    # reserved row left no dangling ``active_sequences`` entry.
+    assert req.lifecycle.sequence_state is None
+    assert rt.active_sequences == {}
+
+    # The reclaimed row is genuinely reusable: a fresh request admits into it
+    # rather than starving on a permanently-drained pool.
+    dec.admit = _FakeDecoder.admit.__get__(dec, _RaisingAdmitDecoder)  # stop raising
+    req2 = _enqueue(sched, 1, prompt_len=2, max_new=8)
+    assert sched._spec_admit() is True
+    assert req2.lifecycle.finished is False
+    assert req2.lifecycle.state.batch_idx in rt.active_sequences
+    assert dec.free_slots == 0  # the single row is now in use by req2
+
+
+def test_spec_admit_failure_releases_lora_slot_and_retires_row() -> None:
+    """P2 codex finding @ scheduler.py:776 (adapter variant): a failed
+    ``decoder.admit`` releases BOTH the reserved spec row and the LoRA slot.
+
+    For an adapter request, ``_spec_admit`` acquires a LoRA slot *and* (via
+    ``admit``) reserves a pool row before the prefill can fail. On failure both
+    must be released exactly once -- the row via ``decoder.retire`` and the
+    adapter slot via ``release_adapter_slot`` -- without double-releasing the
+    slot (the cleanup is deliberately NOT ``_retire_spec_row``, which would
+    release the slot a second time). Asserts the row is retired, the acquired
+    slot is released exactly once, and the request fails cleanly.
+    """
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _RaisingAdmitDecoder(
+        n_rows=1, first_tokens={0: 11}, plans={0: [[12]]}
+    )
+    rt = _spec_runtime(dec)
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    assert sched._spec_admit() is True
+    # The slot was acquired for the adapter, then released on the failure path.
+    assert len(rt.acquired_adapter_slots) == 1
+    acquired_slot = len(rt.acquired_adapter_slots)  # FakeRuntime numbers from 1
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1  # not double-released
+    # The reserved row was retired -> no leak.
+    assert dec.admitted == [0]
+    assert dec.retired == [0]
+    assert dec.free_slots == 1
+    # request.lora_slot was zeroed so a later path cannot re-release it.
+    assert req.lora_slot == 0
+    assert req.lifecycle.lora_slot_ready is False
+    # The request failed cleanly.
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    assert req.lifecycle.sequence_state is None
+    assert rt.active_sequences == {}
+
+
 def test_spec_side_values_guarded_when_no_spec_hook() -> None:
     """Round-2 codex finding @ L836: SpecSideValues never hits the non-spec hook.
 
