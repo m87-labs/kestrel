@@ -616,7 +616,18 @@ class GenerationScheduler:
                     progressed = True
                     continue
 
-            prompt_ids = [int(t.token_id) for t in request.prefill_tokens]
+            # Hand ``admit`` the request's *typed* prefill tokens -- exactly the
+            # ``prompt_tokens`` the non-spec ``prepare_sequence`` path receives --
+            # not a text-only ``int(t.token_id)`` projection. A launchable prefill
+            # can contain non-text tokens: multi-image chat prompts carry
+            # ``ImageMarker`` tokens, and a generated prefix (resumed request) can
+            # carry ``CoordToken`` / ``SizeToken``; none of those expose
+            # ``token_id``, so stripping every token to its id would raise
+            # ``AttributeError`` here -- *before* the per-request ``try`` below --
+            # and abort the whole scheduler instead of admitting or failing just
+            # this request. ``admit`` (like ``prepare_sequence``) expands
+            # ``ImageMarker``s with the image KV prefix and reads the typed ids.
+            prompt_tokens = list(request.prefill_tokens)
             # Admission capacity is the decoder's free rows: the spec decoder
             # owns a fixed, pre-reserved pool of page-table rows (its captured
             # graphs depend on them), so ``runtime.can_reserve`` -- which gates on
@@ -626,11 +637,13 @@ class GenerationScheduler:
             lifecycle.prefill_started_at = time.perf_counter()
             lifecycle.transition(RequestPhase.PREFILLING)
             # batch_idx is assigned by ``admit`` (it picks the spec pool row).
+            # ``length`` / ``prompt_length`` are the token *count* (markers count
+            # as one each; ``admit`` expands them and owns the real KV length).
             state = SequenceState(
                 batch_idx=-1,
-                length=len(prompt_ids),
+                length=len(prompt_tokens),
                 max_length=request.target_length,
-                prompt_length=len(prompt_ids),
+                prompt_length=len(prompt_tokens),
                 lora_slot=request.lora_slot,
             )
             # The spec decoder reads ``return_logprobs`` off the state to decide
@@ -685,7 +698,7 @@ class GenerationScheduler:
                     # ``return_logprobs`` request, or ``None`` otherwise.
                     first_token_id, first_logprob = decoder.admit(
                         state,
-                        prompt_ids,
+                        prompt_tokens,
                         image=request.image,
                         allowed_token_ids=allowed_token_ids,
                         suppressed_token_ids=suppressed_token_ids,
@@ -714,17 +727,20 @@ class GenerationScheduler:
             # Stage the first (prefill/bonus) token exactly like the non-spec
             # prefill path: consume_step + streaming + finish check.
             #
-            # Type the admit token through the runtime ``materialize_tokens``
-            # hook -- not a hard-coded ``TextToken``. On a spatial runtime the
-            # first generated id can be ``coord_id`` / ``size_id`` (point/detect
-            # apply the skill mask before this first sample), so it must become a
-            # ``CoordToken`` / ``SizeToken`` the way the non-spec prefill path
-            # does via ``post_sample`` -> ``materialize_tokens``; otherwise the
-            # first coordinate/box component is dropped. ``admit`` surfaces the
+            # Type the admit token through the runtime hook -- not a hard-coded
+            # ``TextToken``. On a spatial runtime the first generated id can be
+            # ``coord_id`` / ``size_id`` (point/detect apply the skill mask before
+            # this first sample), so it must become a ``CoordToken`` /
+            # ``SizeToken`` the way the non-spec prefill path does via
+            # ``post_sample`` -> ``materialize_tokens``; otherwise the first
+            # coordinate/box component is dropped. ``admit`` surfaces the
             # admit-position side-values (the target's last hidden + sampling
             # knobs the spatial hook needs to decode the coord/size value) on
-            # ``state.admit_side_values``; a text-only runtime leaves it ``None``
-            # and the id materialises as a plain ``TextToken`` (unchanged).
+            # ``state.admit_side_values`` -- a :class:`SpecSideValues`, so
+            # ``_materialize_spec_tokens`` routes it through the spec-aware
+            # ``materialize_spec_tokens`` hook (not the non-spec one). A text-only
+            # runtime leaves it ``None`` and the id materialises as a plain
+            # ``TextToken`` (unchanged).
             admit_side_values = getattr(state, "admit_side_values", None)
             (typed_first,) = self._materialize_spec_tokens(
                 [lifecycle], [[int(first_token_id)]], admit_side_values
@@ -740,8 +756,7 @@ class GenerationScheduler:
             progressed = True
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
-                decoder.retire(state)
-                self.runtime.active_sequences.pop(state.batch_idx, None)
+                self._retire_spec_row(state)
                 continue
             self.running.push(lifecycle)
         return progressed
@@ -762,6 +777,26 @@ class GenerationScheduler:
         to ``stage_token`` exactly like the non-spec single-token path.
         """
         seq.stage_token(self.runtime, token, logprob=logprob)
+
+    def _retire_spec_row(self, state: SequenceState) -> None:
+        """Release every resource a finished spec row holds.
+
+        The single spec-path retire point. The spec decoder owns the pool's
+        page-table rows, so ``decoder.retire`` (not ``runtime.release_sequence``)
+        reclaims the row; ``_release_sequence`` deliberately early-returns for a
+        spec runtime to avoid erasing those persistently-reserved pages. But the
+        adapter slot is *not* part of that pool -- ``_spec_admit`` acquires it via
+        ``_acquire_adapter_slot`` exactly like the non-spec prefill path, which
+        releases it in ``runtime.release_sequence`` -> ``release_adapter_slot``.
+        Since the spec path skips ``release_sequence``, release the slot here too;
+        otherwise every completed adapter spec request leaks its LoRA slot until
+        the adapter pool starves. ``release_adapter_slot`` is a no-op for
+        ``lora_slot == 0`` (a base-model request), so this is unconditional.
+        """
+        decoder = self.runtime.spec.decoder
+        decoder.retire(state)
+        self.runtime.active_sequences.pop(state.batch_idx, None)
+        self.runtime.release_adapter_slot(state.lora_slot)
 
     def _spec_decode_step(self) -> bool:
         """Run one spec macro-step, overlapped depth-1.
@@ -795,7 +830,7 @@ class GenerationScheduler:
             self._pending_spec = (active, result)
 
         if pending is not None:
-            self._commit_spec(decoder, pending)
+            self._commit_spec(pending)
 
         return bool(active) or pending is not None
 
@@ -807,15 +842,27 @@ class GenerationScheduler:
     ) -> list[list[Token]]:
         """Type each sequence's committed run via the runtime hook.
 
-        ``runs[i]`` is the committed id list for ``active[i]``. Routes the whole
-        step's ids through the runtime ``materialize_tokens`` hook, threading
-        ``side_values`` (the macro-step's :class:`SpecSideValues`) as the opaque
-        runtime step-handle so a spatial runtime (Moondream) types coord/size ids
-        into ``CoordToken`` / ``SizeToken`` from the per-position hidden it
-        carries -- the spec analog of the non-spec ``post_sample`` ->
-        ``materialize_tokens`` path. A text-only runtime (``side_values is None``,
-        or no hook) materialises plain ``TextToken``s. Returns the typed tokens
-        re-grouped per sequence (parallel to ``runs``).
+        ``runs[i]`` is the committed id list for ``active[i]``.
+
+        Dispatch is on ``side_values`` (the macro-step's :class:`SpecSideValues`),
+        which carries the target's per-committed-position final hidden + sampling
+        knobs a spatial runtime decodes coord/size ids from. It must NOT be handed
+        to the non-spec ``materialize_tokens`` hook: that hook's step-handle is the
+        ``post_sample`` aux handle (Moondream unpacks it as ``(slot, batch_size)``
+        and synchronises slot-local staging), so feeding it a ``SpecSideValues``
+        raises (cannot unpack) or reads the wrong layout. So:
+
+        * ``side_values`` set -> route through the dedicated
+          ``materialize_spec_tokens`` hook (the spec analog that decodes coord/size
+          from the packed hidden). If the runtime exposes no such hook (text-only,
+          or a runtime that does not type spatial tokens on the spec path),
+          *guard* by materialising plain ``TextToken``s rather than misusing the
+          non-spec hook.
+        * ``side_values is None`` -> a text-only macro-step; use the normal
+          ``materialize_tokens`` path with a ``None`` handle (its plain-text
+          branch), matching the non-spec single-token commit.
+
+        Returns the typed tokens re-grouped per sequence (parallel to ``runs``).
         """
         flat_ids: list[int] = [int(t) for run in runs for t in run]
         if not flat_ids:
@@ -829,12 +876,29 @@ class GenerationScheduler:
             seq.state.batch_idx for seq, run in zip(active, runs) for _ in run
         ]
         batch_idx = torch.tensor(batch_indices, dtype=torch.long)
-        flat_tokens = self._materialize_tokens(
-            token_ids_cpu,
-            active,
-            batch_idx,
-            side_values,
-        )
+        if side_values is not None:
+            spec_hook = self._hooks.materialize_spec_tokens
+            if spec_hook is not None:
+                flat_tokens = spec_hook(
+                    token_ids_cpu, active, batch_idx, side_values
+                )
+            else:
+                # Guard: a runtime that does not type spatial tokens on the spec
+                # path still returned side-values; never pass them to the
+                # non-spec hook -- materialise plain text ids.
+                flat_tokens = [
+                    TextToken(token_id=int(t))
+                    for t in token_ids_cpu.view(-1).tolist()
+                ]
+        else:
+            # Text-only macro-step: the non-spec hook's ``step_handle is None``
+            # branch (plain text) applies.
+            flat_tokens = self._materialize_tokens(
+                token_ids_cpu,
+                active,
+                batch_idx,
+                None,
+            )
         # Re-group the flat typed tokens back into per-sequence runs.
         grouped: list[list[Token]] = []
         cursor = 0
@@ -844,7 +908,7 @@ class GenerationScheduler:
             cursor += n
         return grouped
 
-    def _commit_spec(self, decoder, pending) -> None:
+    def _commit_spec(self, pending) -> None:
         """Commit one previously-launched spec macro-step (depth-1).
 
         Resolving ``result.tokens`` blocks on the macro-step's deferred D2H, but
@@ -869,8 +933,7 @@ class GenerationScheduler:
             if seq.finalized:
                 # Zombie: finished by an earlier commit while still in flight here.
                 if seq.inflight_refs == 0:
-                    decoder.retire(seq.state)
-                    self.runtime.active_sequences.pop(seq.state.batch_idx, None)
+                    self._retire_spec_row(seq.state)
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
             for j, token in enumerate(typed_run):
@@ -881,8 +944,7 @@ class GenerationScheduler:
                     seq.finalized = True
                     self.running.remove(seq)
                     if seq.inflight_refs == 0:
-                        decoder.retire(seq.state)
-                        self.runtime.active_sequences.pop(seq.state.batch_idx, None)
+                        self._retire_spec_row(seq.state)
                     break
 
     def pop_completed(self) -> List[SchedulerResult]:

@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
 if TYPE_CHECKING:
     import torch
 
+    from kestrel.runtime.tokens import Token
+
 
 @dataclass
 class DraftResult:
@@ -240,7 +242,7 @@ class SpecDecoder(Protocol):
     def admit(
         self,
         state: Any,
-        prompt_token_ids: Sequence[int],
+        prompt_tokens: "Sequence[Token]",
         *,
         image: Any | None = None,
         allowed_token_ids: Sequence[int] | None = None,
@@ -249,7 +251,17 @@ class SpecDecoder(Protocol):
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> "tuple[int, float | None]":
-        """Prefill ``prompt_token_ids`` into a free pool row for ``state``.
+        """Prefill ``prompt_tokens`` into a free pool row for ``state``.
+
+        ``prompt_tokens`` is the request's *typed* prefill sequence -- the same
+        ``Sequence[Token]`` the non-spec ``AutoregressiveRuntime.prepare_sequence``
+        receives, **not** a text-only ``Sequence[int]``. It can contain
+        ``ImageMarker`` tokens (multi-image chat prompts) and, for a resumed
+        request, ``CoordToken`` / ``SizeToken`` in the generated prefix; the
+        decoder expands ``ImageMarker``s with the image KV prefix exactly like
+        ``prepare_sequence`` and reads the typed ids. Stripping these to raw ids
+        on the scheduler side is what dropped image/spatial prefill context, so
+        the typed list is passed through whole.
 
         Assigns the row's device batch index onto ``state.batch_idx`` (so the
         scheduler's KV/finish bookkeeping addresses the same storage the spec

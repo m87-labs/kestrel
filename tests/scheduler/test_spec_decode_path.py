@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from kestrel.runtime import TextToken
-from kestrel.runtime.spec import SpecDecodeCaps, SpecStepResult
+from kestrel.runtime.tokens import CoordToken, ImageMarker, SizeToken
+from kestrel.runtime.spec import SpecDecodeCaps, SpecSideValues, SpecStepResult
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.types import (
     GenerationRequest,
@@ -106,6 +107,11 @@ class _FakeDecoder:
         self.admitted.append(row)
         want_logprobs = getattr(state, "return_logprobs", None) is True
         self.admit_kwargs[row] = {
+            # The *typed* prompt tokens the scheduler forwards (the non-spec
+            # ``prepare_sequence`` contract): asserted to survive admission whole,
+            # not be stripped to ``int(t.token_id)`` (which would raise on
+            # ImageMarker/Coord/Size tokens that lack ``token_id``).
+            "prompt_tokens": list(prompt_token_ids),
             "image": image,
             "allowed_token_ids": allowed_token_ids,
             "suppressed_token_ids": suppressed_token_ids,
@@ -582,26 +588,35 @@ def test_spec_admit_no_one_shot_suppression_past_prefix() -> None:
 
 
 def test_spec_admit_types_admit_token_via_materialize_hook() -> None:
-    """Regression for codex finding: type the admit token through the hook.
+    """Regression for codex finding: type the admit token through the spec hook.
 
     On a spatial runtime the first generated id can be coord/size, so the admit
-    (first) token must be typed through the runtime ``materialize_tokens`` hook
-    using ``admit``'s side-values -- not hard-coded to ``TextToken``. Stubs the
-    hook to wrap the admit id and asserts (a) it ran for the admit token, (b) it
-    received ``admit``'s side-values as the opaque step-handle, (c) the staged
-    first token is the typed token.
+    (first) token must be typed through the runtime ``materialize_spec_tokens``
+    hook using ``admit``'s :class:`SpecSideValues` -- not hard-coded to
+    ``TextToken``, and not via the non-spec ``materialize_tokens`` hook (whose
+    ``(slot, batch_size)`` handle shape ``SpecSideValues`` does not match). Stubs
+    the spec hook to wrap the admit id and asserts (a) it ran for the admit
+    token, (b) it received ``admit``'s side-values, (c) the staged first token is
+    the typed token, (d) the non-spec hook was never invoked with the
+    side-values.
     """
     admit_side_values = object()
     calls: list[dict] = []
+    nonspec_calls: list[object] = []
 
     @dataclass
     class _TypedToken:
         token_id: int
 
-    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+    def materialize_spec_tokens(token_ids_cpu, sequences, batch_idx, side_values):
         ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
-        calls.append({"step_handle": step_handle, "ids": ids})
+        calls.append({"side_values": side_values, "ids": ids})
         return [_TypedToken(token_id=int(t)) for t in ids]
+
+    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+        # The spec side-values must never reach the non-spec hook.
+        nonspec_calls.append(step_handle)
+        return [_TypedToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()]
 
     dec = _FakeDecoder(
         n_rows=1,
@@ -613,14 +628,19 @@ def test_spec_admit_types_admit_token_via_materialize_hook() -> None:
     from kestrel.runtime.sampling import SamplingHooks
 
     # Hooks are read at scheduler construction, so install before _make_scheduler.
-    rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
+    rt.sampling_hooks = SamplingHooks(
+        materialize_tokens=materialize_tokens,
+        materialize_spec_tokens=materialize_spec_tokens,
+    )
     sched = _make_scheduler(rt)
     req = _enqueue(sched, 0, prompt_len=3, max_new=8)
 
     assert sched._spec_admit() is True
-    # The hook typed the admit id (11) and was handed admit's side-values.
+    # The spec hook typed the admit id (11) and was handed admit's side-values.
     admit_call = next(c for c in calls if c["ids"] == [11])
-    assert admit_call["step_handle"] is admit_side_values
+    assert admit_call["side_values"] is admit_side_values
+    # The non-spec hook was never called with the SpecSideValues.
+    assert admit_side_values not in nonspec_calls
     staged = req.lifecycle.skill_state.tokens
     assert isinstance(staged[0], _TypedToken)
     assert int(staged[0].token_id) == 11
@@ -714,25 +734,33 @@ def test_spec_admit_forwards_image_mask_and_sampling_params() -> None:
 
 
 def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:
-    """Committed ids are typed via the runtime ``materialize_tokens`` hook.
+    """Committed ids are typed via the runtime ``materialize_spec_tokens`` hook.
 
-    Regression for typed-token finding @ L792: the spec commit must route the
-    committed ids (+ ``SpecStepResult.side_values``) through the runtime hook so a
-    spatial runtime types coord/size ids -- not hardcode ``TextToken``. Stubs the
-    hook to wrap every committed id and asserts the macro-step's ``side_values``
-    reached it.
+    Regression for typed-token finding @ L792 + SpecSideValues finding @ L836:
+    the spec commit must route the committed ids (+ ``SpecStepResult.side_values``)
+    through the *spec-aware* runtime hook so a spatial runtime types coord/size
+    ids -- not hardcode ``TextToken``, and not via the non-spec
+    ``materialize_tokens`` hook (whose ``(slot, batch_size)`` handle shape a
+    ``SpecSideValues`` does not match). Stubs the spec hook to wrap every
+    committed id and asserts the macro-step's ``side_values`` reached it and the
+    non-spec hook was never handed the side-values.
     """
     sentinel_side_values = object()
     calls: list[dict] = []
+    nonspec_calls: list[object] = []
 
     @dataclass
     class _TypedToken:
         token_id: int
 
-    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+    def materialize_spec_tokens(token_ids_cpu, sequences, batch_idx, side_values):
         ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
-        calls.append({"step_handle": step_handle, "ids": ids})
+        calls.append({"side_values": side_values, "ids": ids})
         return [_TypedToken(token_id=int(t)) for t in ids]
+
+    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+        nonspec_calls.append(step_handle)
+        return [_TypedToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()]
 
     dec = _FakeDecoder(
         n_rows=1,
@@ -744,19 +772,211 @@ def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:
     from kestrel.runtime.sampling import SamplingHooks
 
     # Hooks are read at scheduler construction, so install before _make_scheduler.
-    rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
+    rt.sampling_hooks = SamplingHooks(
+        materialize_tokens=materialize_tokens,
+        materialize_spec_tokens=materialize_spec_tokens,
+    )
     sched = _make_scheduler(rt)
     req = _enqueue(sched, 0, prompt_len=3, max_new=3)
     sched._spec_admit()
     while sched._spec_decode_step():
         pass
 
-    # The runtime hook typed the committed ids (12, 13) and was handed the
-    # macro-step's side_values as its opaque step-handle.
+    # The spec hook typed the committed ids (12, 13) and was handed the
+    # macro-step's side_values.
     real = next(c for c in calls if c["ids"] == [12, 13])
-    assert real["step_handle"] is sentinel_side_values
+    assert real["side_values"] is sentinel_side_values
+    # The SpecSideValues was never passed into the non-spec hook.
+    assert sentinel_side_values not in nonspec_calls
     staged = req.lifecycle.skill_state.tokens
-    # token 11 is the admit bonus (TextToken); 12/13 come from the typed hook.
+    # token 11 is the admit bonus (TextToken); 12/13 come from the typed spec hook.
     assert isinstance(staged[1], _TypedToken)
     assert isinstance(staged[2], _TypedToken)
     assert [int(t.token_id) for t in staged] == [11, 12, 13]
+
+
+def test_spec_admit_preserves_typed_prefill_tokens() -> None:
+    """Round-2 codex finding @ L619: typed prefill tokens survive admission.
+
+    A launchable prefill can contain non-text tokens -- multi-image chat prompts
+    carry ``ImageMarker`` tokens, and a resumed request's generated prefix can
+    carry ``CoordToken`` / ``SizeToken`` -- none of which expose ``token_id``.
+    The old ``prompt_ids = [int(t.token_id) for t in prefill_tokens]`` ran
+    *before* the per-request ``try`` and raised ``AttributeError``, aborting the
+    whole scheduler. The fix forwards the full typed list (like the non-spec
+    ``prepare_sequence`` path). Asserts admission succeeds and the decoder
+    receives the typed tokens whole (not stripped / dropped).
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    img = object()
+    req = _enqueue(sched, 0, prompt_len=1, max_new=8, image=img)
+    # Inject a mixed typed prefill: BOS text + image marker + a generated-prefix
+    # spatial pair. The base ``_enqueue`` already added one TextToken; replace
+    # the prompt with the multimodal layout.
+    typed_prompt = [
+        TextToken(1),
+        ImageMarker(index=0),
+        CoordToken(pos=0.25),
+        SizeToken(width=0.1, height=0.2),
+        TextToken(2),
+    ]
+    req.prompt_tokens = typed_prompt
+
+    # Must NOT raise (the bug raised AttributeError here, aborting the scheduler).
+    assert sched._spec_admit() is True
+    assert dec.admitted == [0]
+    # The decoder got the *typed* tokens, unstripped and in order.
+    forwarded = dec.admit_kwargs[0]["prompt_tokens"]
+    assert forwarded == typed_prompt
+    # Non-text tokens survived (the regression dropped them via int(t.token_id)).
+    assert any(isinstance(t, ImageMarker) for t in forwarded)
+    assert any(isinstance(t, CoordToken) for t in forwarded)
+    assert any(isinstance(t, SizeToken) for t in forwarded)
+    # The state's token count reflects the typed list length (markers count 1).
+    assert req.lifecycle.state.prompt_length == len(typed_prompt)
+
+
+def test_spec_adapter_request_releases_lora_slot_on_retire() -> None:
+    """Round-2 codex finding @ L1725: a retiring spec row frees its LoRA slot.
+
+    ``_spec_admit`` acquires a runtime LoRA slot for an adapter request, but the
+    spec completion path retires the pool row via ``decoder.retire`` and skips
+    ``runtime.release_sequence`` (which is where the non-spec path drops the
+    adapter ref). Without an explicit release the slot leaks until the adapter
+    pool starves. Asserts every acquired slot is released after the row retires
+    (slot count returns to baseline -- no leak).
+    """
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes + retires
+    )
+    rt = _spec_runtime(dec)
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=3, adapter="ft-1", lora_slot_ready=False
+    )
+    sched._spec_admit()
+    acquired_slot = req.lora_slot
+    assert acquired_slot >= 1  # a real adapter slot was acquired
+    assert rt.released_adapter_slots == []  # not yet released
+
+    # Drive the row to completion (it finishes at max_new=3 and retires).
+    while sched._spec_decode_step():
+        pass
+
+    assert req.lifecycle.finished is True
+    assert dec.retired == [0]
+    # The acquired slot was released exactly once -> count back to baseline.
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1
+    assert req.lifecycle.state.batch_idx not in rt.active_sequences
+
+
+def test_spec_admit_finish_releases_lora_slot() -> None:
+    """LoRA slot is released even when the request finishes at admit time.
+
+    If the admit bonus token already finishes the request (e.g. immediate EOS),
+    ``_spec_admit`` retires the row inline. That path must also release the
+    adapter slot (it goes through the same ``_retire_spec_row`` helper).
+    """
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    # First token is EOS -> request finishes right after admit.
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 999}, plans={0: [[0]]})
+    rt = _spec_runtime(dec, eos_id=999)
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    assert sched._spec_admit() is True
+    acquired_slot = req.lora_slot
+    assert acquired_slot >= 1
+    assert req.lifecycle.finished is True
+    assert dec.retired == [0]
+    # Slot released on the admit-finish path too (no leak).
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert req.lifecycle.state.batch_idx not in rt.active_sequences
+
+
+def test_spec_side_values_guarded_when_no_spec_hook() -> None:
+    """Round-2 codex finding @ L836: SpecSideValues never hits the non-spec hook.
+
+    When a macro-step returns spatial ``SpecSideValues`` but the runtime exposes
+    only the non-spec ``materialize_tokens`` hook (whose handle is the
+    ``post_sample`` ``(slot, batch_size)`` aux value), the scheduler must NOT feed
+    the side-values into it -- doing so raises ``cannot unpack SpecSideValues`` or
+    reads the wrong layout. The guard materialises plain ``TextToken``s instead.
+    Asserts (a) no crash, (b) the non-spec hook is never handed the side-values,
+    (c) the committed ids still materialise (as text) and stage correctly.
+    """
+    real_side_values = SpecSideValues(
+        hidden=__import__("torch").zeros(1, 3, 4),
+        temperatures=__import__("torch").zeros(1),
+        top_ps=__import__("torch").ones(1),
+    )
+    nonspec_handles: list[object] = []
+
+    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+        # Emulate the Moondream hook's unpack so a SpecSideValues would blow up
+        # here if the scheduler ever routed it through this non-spec hook.
+        nonspec_handles.append(step_handle)
+        if step_handle is not None:
+            _slot, _batch_size = step_handle  # would raise on SpecSideValues
+        return [TextToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+        side_values=real_side_values,
+    )
+    rt = _spec_runtime(dec)
+    from kestrel.runtime.sampling import SamplingHooks
+
+    # Only the NON-spec hook is installed; no materialize_spec_tokens.
+    rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()
+    # Must not raise (the bug fed SpecSideValues into the non-spec hook -> unpack
+    # TypeError, aborting the scheduler).
+    while sched._spec_decode_step():
+        pass
+
+    # The non-spec hook was never handed the SpecSideValues (guard held).
+    assert real_side_values not in nonspec_handles
+    # Committed ids still staged (materialised as plain text via the guard).
+    assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
+    assert req.lifecycle.finished is True
