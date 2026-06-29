@@ -238,3 +238,81 @@ def test_shutdown_returns_requests_failed_during_fail_all() -> None:
     assert [c.request for c in completions] == [stuck]
     assert isinstance(completions[0].error, RuntimeError)
     assert ex._admission_failures == []
+
+
+def test_shutdown_retires_spec_rows_through_the_decoder() -> None:
+    """Regression: spec rows must be retired via ``decoder.retire`` on shutdown.
+
+    On a spec runtime the rows in ``active_sequences`` are decoder-owned: a
+    persistently-reserved pool backing captured CUDA graphs. The generic
+    cleanup must NOT call ``runtime.release_sequence`` for them (that erases the
+    reserved pages and skips the decoder), but route through the decoder's
+    retire the same way ``GenerationScheduler._retire_spec_row`` does -- freeing
+    the decoder-owned row (so it is reusable) and the admit-acquired adapter
+    slot. Mirrors the L836 admit site that registers the spec row here.
+    """
+    retired: list[Any] = []
+    released_slots: list[int] = []
+    released_via_release_sequence: list[Any] = []
+    free_rows: set[int] = set()
+
+    def _retire(state: Any) -> None:
+        retired.append(state)
+        # Model the decoder reclaiming its pool row: the freed row index
+        # becomes reusable for a future admit.
+        free_rows.add(state.batch_idx)
+
+    def _release_sequence(st: Any) -> None:
+        released_via_release_sequence.append(st)
+
+    decoder = SimpleNamespace(retire=_retire)
+    state = SimpleNamespace(batch_idx=7, lora_slot=3)
+
+    ex = _executor()
+    ex._runtime = SimpleNamespace(
+        max_batch_size=1,
+        active_sequences={state.batch_idx: state},
+        spec=SimpleNamespace(decoder=decoder),
+        release_adapter_slot=lambda slot: released_slots.append(slot),
+        # If the generic non-spec path is taken for a spec row this records it;
+        # the assertion below proves it never runs.
+        release_sequence=_release_sequence,
+    )
+
+    completions = ex.shutdown(RuntimeError("stop"))
+
+    assert completions == ()
+    # The decoder retired the row (not the generic release_sequence path).
+    assert retired == [state]
+    assert released_via_release_sequence == []
+    # Adapter slot the spec admit acquired was released.
+    assert released_slots == [state.lora_slot]
+    # The row is freed from the registry and reusable (decoder reclaimed it).
+    assert state.batch_idx not in ex._runtime.active_sequences
+    assert state.batch_idx in free_rows
+
+
+def test_shutdown_retires_base_model_spec_row_with_zero_slot() -> None:
+    """A base-model spec row (``lora_slot == 0``) still retires through the
+    decoder; ``release_adapter_slot(0)`` is the documented no-op."""
+    retired: list[Any] = []
+    released_slots: list[int] = []
+    state = SimpleNamespace(batch_idx=2, lora_slot=0)
+
+    def _must_not_run(st: Any) -> None:
+        raise AssertionError("release_sequence must not run for a spec row")
+
+    ex = _executor()
+    ex._runtime = SimpleNamespace(
+        max_batch_size=1,
+        active_sequences={state.batch_idx: state},
+        spec=SimpleNamespace(decoder=SimpleNamespace(retire=retired.append)),
+        release_adapter_slot=lambda slot: released_slots.append(slot),
+        release_sequence=_must_not_run,
+    )
+
+    ex.shutdown(RuntimeError("stop"))
+
+    assert retired == [state]
+    assert released_slots == [0]
+    assert state.batch_idx not in ex._runtime.active_sequences

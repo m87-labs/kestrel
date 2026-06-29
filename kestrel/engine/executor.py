@@ -352,8 +352,27 @@ class AutoregressiveExecutor:
             runtime_sequences = list(self._runtime.active_sequences.values())
         except Exception:  # pragma: no cover - defensive cleanup
             return
+        # On a spec runtime the rows registered in ``active_sequences`` are
+        # decoder-owned: a fixed, persistently-reserved pool backing the
+        # captured verify/draft CUDA graphs. ``runtime.release_sequence``
+        # would erase those pages out from under the graphs and never call
+        # ``decoder.retire``, so reclaim each row through the decoder the
+        # same way ``GenerationScheduler._retire_spec_row`` does (the single
+        # spec-path retire contract). The adapter slot a spec admit acquired
+        # is not part of that pool, so release it here too -- the spec path
+        # never runs through ``release_sequence`` -> ``release_adapter_slot``
+        # (``release_adapter_slot`` is a no-op for ``lora_slot == 0``).
+        spec = getattr(self._runtime, "spec", None)
+        decoder = getattr(spec, "decoder", None) if spec is not None else None
         for state in runtime_sequences:
             try:
-                self._runtime.release_sequence(state)
+                if decoder is not None:
+                    decoder.retire(state)
+                    self._runtime.active_sequences.pop(state.batch_idx, None)
+                    self._runtime.release_adapter_slot(
+                        getattr(state, "lora_slot", 0)
+                    )
+                else:
+                    self._runtime.release_sequence(state)
             except Exception:
                 pass
