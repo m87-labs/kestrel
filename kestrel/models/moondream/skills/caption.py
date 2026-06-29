@@ -105,6 +105,16 @@ class CaptionSkill(SkillSpec):
 class CaptionSkillState(SkillState):
     """Skill state that accumulates caption text."""
 
+    # The caption mask is position-independent: ``suppressed_token_ids`` returns
+    # the same constant set (``[answer_id]`` for moondream2, else ``None``) at
+    # every decode position -- it never transitions within a committed run. The
+    # spec scheduler treats any active constraint as stateful unless told
+    # otherwise, so declare the mask constant here; without this, the constant
+    # ``answer_id`` suppression would force caption spec decode to one committed
+    # token per macro-step (``commit_caps = 1``), throwing away the multi-token
+    # speculative accept for no correctness benefit.
+    mask_is_stateful = False
+
     def __init__(
         self,
         spec: SkillSpec,

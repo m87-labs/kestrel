@@ -1730,6 +1730,111 @@ def test_spec_step_does_not_cap_unconstrained_or_constant_mask_row() -> None:
     ]
 
 
+def test_spec_real_caption_skill_not_capped_while_stateful_skills_are() -> None:
+    """The REAL moondream skills carry the right ``mask_is_stateful`` verdict.
+
+    Regression for codex P2 @ scheduler ``_mask_is_stateful``: caption's
+    ``suppressed_token_ids`` returns a CONSTANT set (``[answer_id]`` on
+    moondream2) at every position, so its per-step mask is already exact for a
+    whole committed run -- it must NOT be capped to one token per macro-step.
+    The behavioural fallback ("any active constraint is stateful") would wrongly
+    cap it, so ``CaptionSkillState`` declares ``mask_is_stateful = False``; this
+    pins that declaration on the real class (the generic ``_ConstantMaskState``
+    test above would still pass even if the real skill forgot it).
+
+    Conversely the genuinely stateful skills -- detect (cycles x->y->size) and
+    point (toggles coord/eos) -- whose allowed set changes per committed token
+    must STAY capped (``commit_caps = 1``), so this asserts the scheduler keeps
+    throttling them. Drives the scheduler's ``_build_spec_step_masks`` directly
+    over real skill states attached to enqueued rows.
+    """
+    from kestrel.models.moondream.skills.caption import (
+        CaptionRequest,
+        CaptionSkill,
+        CaptionSkillState,
+    )
+    from kestrel.models.moondream.skills.detect import (
+        DetectRequest,
+        DetectSkill,
+        DetectSkillState,
+    )
+    from kestrel.models.moondream.skills.point import (
+        PointRequest,
+        PointSkill,
+        PointSkillState,
+    )
+
+    # Minimal runtime/template the real mask queries read: caption needs
+    # ``model_name`` + ``answer_id``; detect needs coord/eos/size; point needs
+    # coord/eos. The ids are arbitrary-but-distinct.
+    COORD, EOS, SIZE, ANSWER = 3, 4, 5, 6
+    runtime = SimpleNamespace(
+        model_name="moondream2",
+        prompt_template=SimpleNamespace(
+            answer_id=ANSWER, coord_id=COORD, eos_id=EOS, size_id=SIZE
+        ),
+    )
+
+    dec = _FakeDecoder(
+        n_rows=3,
+        first_tokens={0: 10, 1: 20, 2: 30},
+        plans={0: [[]], 1: [[]], 2: [[]]},
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    # The scheduler queries the REAL skills against the stub ``runtime`` above,
+    # not the bare ``_spec_runtime`` fake -- point ``_build_spec_step_masks`` at it.
+    sched.runtime = runtime
+
+    # Generous budget so the remaining-budget cap never bites: the only cap that
+    # can appear is the STATEFUL cap (``1``). caption => no stateful cap; detect
+    # / point => stateful cap of ``1``.
+    r_cap = _enqueue(sched, 0, prompt_len=3, max_new=1000)
+    r_det = _enqueue(sched, 1, prompt_len=3, max_new=1000)
+    r_pt = _enqueue(sched, 2, prompt_len=3, max_new=1000)
+
+    cap_state = CaptionSkillState(
+        CaptionSkill(),
+        r_cap,
+        CaptionRequest(length="normal", image=None, stream=False),
+    )
+    det_state = DetectSkillState(
+        DetectSkill(),
+        r_det,
+        DetectRequest(object="cat", image=None, stream=False, max_objects=10),
+    )
+    pt_state = PointSkillState(
+        PointSkill(),
+        r_pt,
+        PointRequest(object="cat", image=None, stream=False),
+    )
+    r_cap.lifecycle.skill_state = cap_state
+    r_det.lifecycle.skill_state = det_state
+    r_pt.lifecycle.skill_state = pt_state
+
+    seqs = [r_cap.lifecycle, r_det.lifecycle, r_pt.lifecycle]
+
+    # Caption: constant ``[answer_id]`` suppression, declared non-stateful.
+    assert cap_state.suppressed_token_ids(runtime) == [ANSWER]
+    assert sched._mask_is_stateful(r_cap.lifecycle, None, [ANSWER]) is False
+    # Detect / point: their allowed set evolves per committed token -> stateful.
+    assert det_state.allowed_token_ids(runtime) == [COORD, EOS]
+    assert pt_state.allowed_token_ids(runtime) == [COORD, EOS]
+    assert sched._mask_is_stateful(r_det.lifecycle, [COORD, EOS], None) is True
+    assert sched._mask_is_stateful(r_pt.lifecycle, [COORD, EOS], None) is True
+
+    _allowed, _suppressed, commit_caps = sched._build_spec_step_masks(seqs)
+
+    # Caption row is NOT capped to one token: its only cap is the loose remaining
+    # budget (1000 - 0 staged == 1000), never the stateful ``1``. The constant
+    # suppression is still forwarded so masking stays correct.
+    assert commit_caps[0] == 1000
+    assert list(_suppressed[0]) == [ANSWER]
+    # Detect and point rows stay capped at one committed token per macro-step.
+    assert commit_caps[1] == 1
+    assert commit_caps[2] == 1
+
+
 def test_spec_zombie_lifecycle_marked_completed_before_retire() -> None:
     """Regression for codex P2 @ L1012: a finished spec row ends COMPLETED, retired once.
 
