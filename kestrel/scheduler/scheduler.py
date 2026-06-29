@@ -744,17 +744,25 @@ class GenerationScheduler:
                 suppress_next_token_ids = request.suppress_next_token_ids
             try:
                 with torch.inference_mode():
-                    # Pass the request's image (image prefill: vision block + KV
-                    # prefix), skill mask, one-shot suppression, and sampling
-                    # params (temperature/top_p) through to ``admit`` so image +
-                    # constrained + non-greedy requests run on the spec path with
-                    # no fallback. ``admit`` returns ``(first_token_id,
+                    # Pass the request's image AND its multi-crop tiles
+                    # (``image_crops``) -- exactly what the non-spec
+                    # ``prepare_sequence`` forwards (it hands both to the vision
+                    # encoder, which reads ``image_crops`` as the ``overlap`` so
+                    # the high-res crop tiles are encoded, not just the
+                    # global/thumbnail image). Forwarding ``image`` alone would
+                    # give a multi-crop request an incomplete image prefill on
+                    # the spec path and diverge from the non-spec output. Skill
+                    # mask, one-shot suppression, and sampling params
+                    # (temperature/top_p) likewise go through ``admit`` so image
+                    # + constrained + non-greedy requests run on the spec path
+                    # with no fallback. ``admit`` returns ``(first_token_id,
                     # first_logprob)``: the real selected-token logprob for a
                     # ``return_logprobs`` request, or ``None`` otherwise.
                     first_token_id, first_logprob = decoder.admit(
                         state,
                         prompt_tokens,
                         image=request.image,
+                        image_crops=request.image_crops,
                         allowed_token_ids=allowed_token_ids,
                         suppressed_token_ids=suppressed_token_ids,
                         suppress_next_token_ids=suppress_next_token_ids,

@@ -99,6 +99,7 @@ class _FakeDecoder:
         prompt_token_ids,
         *,
         image=None,
+        image_crops=None,
         allowed_token_ids=None,
         suppressed_token_ids=None,
         suppress_next_token_ids=None,
@@ -119,6 +120,7 @@ class _FakeDecoder:
             # ImageMarker/Coord/Size tokens that lack ``token_id``).
             "prompt_tokens": list(prompt_token_ids),
             "image": image,
+            "image_crops": image_crops,
             "allowed_token_ids": allowed_token_ids,
             "suppressed_token_ids": suppressed_token_ids,
             "suppress_next_token_ids": suppress_next_token_ids,
@@ -191,6 +193,7 @@ def _enqueue(
     temperature: float = 0.0,
     top_p: float = 1.0,
     image: object | None = None,
+    image_crops: object | None = None,
     image_length: int = 0,
     skill_state: SkillState | None = None,
 ):
@@ -206,12 +209,13 @@ def _enqueue(
         temperature=temperature,
         top_p=top_p,
         image=image,
+        image_crops=image_crops,
         image_length=image_length,
     )
     lc = RequestLifecycle(
         request=req, skill_state=skill_state or _RecordingState(req)
     )
-    lc.has_image = image is not None
+    lc.has_image = image is not None or image_crops is not None
     lc.crops_ready = True
     lc.lora_slot_ready = lora_slot_ready
     lc.transition(RequestPhase.READY_FOR_PREFILL)
@@ -748,6 +752,34 @@ def test_spec_admit_forwards_image_mask_and_sampling_params() -> None:
     assert list(kw["suppressed_token_ids"]) == [99]
     assert kw["temperature"] == 0.7
     assert kw["top_p"] == 0.9
+
+
+def test_spec_admit_forwards_image_crops_for_multicrop_request() -> None:
+    """The spec path forwards a request's multi-crop tiles into ``admit``.
+
+    Regression for the codex finding @ scheduler.py:757: ``_spec_admit`` forwarded
+    ``request.image`` but NOT ``request.image_crops`` -- the high-res overlap crop
+    tiles Moondream tiles a large image into. The non-spec ``prepare_sequence``
+    path forwards BOTH (the vision encoder reads ``image_crops`` as its ``overlap``
+    so the crop tiles -- not just the global/thumbnail image -- are encoded into
+    the KV prefix). Dropping ``image_crops`` on the spec path gives a multi-crop
+    request an incomplete image prefill and diverges from the non-spec output.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    img = object()
+    crops = object()  # stand-in for the OverlapCropOutput the runtime tiles
+    _enqueue(sched, 0, prompt_len=3, max_new=8, image=img, image_crops=crops)
+
+    assert sched._spec_admit() is True
+    kw = dec.admit_kwargs[0]
+    # Both the image AND its crop tiles must reach ``admit`` -- exactly what the
+    # non-spec ``prepare_sequence`` forwards. Forwarding ``image`` alone (the
+    # pre-fix behaviour) would prefill only the global image for a multi-crop
+    # request.
+    assert kw["image"] is img
+    assert kw["image_crops"] is crops
 
 
 def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:

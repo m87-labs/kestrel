@@ -245,6 +245,7 @@ class SpecDecoder(Protocol):
         prompt_tokens: "Sequence[Token]",
         *,
         image: Any | None = None,
+        image_crops: Any | None = None,
         allowed_token_ids: Sequence[int] | None = None,
         suppressed_token_ids: Sequence[int] | None = None,
         suppress_next_token_ids: Sequence[int] | None = None,
@@ -285,6 +286,15 @@ class SpecDecoder(Protocol):
           When set, the prompt is prefilled *with the image KV prefix* exactly
           like a normal image prefill (vision block spliced + vision encoder
           run), not text-only. ``None`` keeps the text-only prefill.
+        * ``image_crops`` — the request's multi-crop tiles
+          (``GenerationRequest.image_crops``, the high-resolution overlap crops
+          Moondream tiles a large image into). The non-spec
+          ``prepare_sequence`` forwards this alongside ``image`` and the vision
+          encoder reads it as the ``overlap`` so the crop tiles -- not just the
+          global/thumbnail image -- are encoded into the KV prefix. Omitting it
+          for a multi-crop request would prefill only the global image and
+          diverge from the non-spec path. ``None`` for a single-crop / text-only
+          request (the encoder then uses ``image`` alone).
         * ``allowed_token_ids`` / ``suppressed_token_ids`` — the sequence's skill
           mask at admit (point/detect/query constrain the vocabulary). Stored per
           row and applied to **both** the drafter and the verify, so masked
