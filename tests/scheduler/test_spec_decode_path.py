@@ -1217,6 +1217,91 @@ def test_spec_admit_failure_releases_lora_slot_and_retires_row() -> None:
     assert rt.active_sequences == {}
 
 
+def test_spec_pre_admit_hook_failure_releases_lora_slot_and_fails_cleanly() -> None:
+    """P2 codex finding @ scheduler.py:781: a pre-admit hook failure stays on the
+    admit-failure cleanup path (LoRA slot released, request failed cleanly).
+
+    The skill ``on_prefill`` hook (and the ``allowed_token_ids`` /
+    ``suppressed_token_ids`` mask queries) run AFTER the request has left
+    ``waiting``, transitioned to ``PREFILLING``, and acquired its LoRA slot, but
+    BEFORE ``decoder.admit``. If that hook raises while it sits outside the
+    ``try``/cleanup block, the request is dropped from ``waiting`` stuck in
+    ``PREFILLING`` with its LoRA slot leaked (``sequence_state`` is never set, so
+    no finish/zombie path ever releases it) and the scheduler later crashes on
+    it. With the hook inside the same ``try`` as ``admit``, the existing
+    admit-failure cleanup releases the slot and fails the request cleanly.
+    ``decoder.admit`` never runs, so no pool row is reserved (``batch_idx`` stays
+    at its ``-1`` sentinel) and nothing is retired. Asserts the slot is released
+    exactly once, ``admit``/``retire`` are never called (no row leak), and the
+    request ends as a clean error -- not stuck PREFILLING.
+    """
+
+    class _RaisingOnPrefillState(_RecordingState):
+        def on_prefill(self, runtime: object) -> None:  # type: ignore[override]
+            raise RuntimeError("skill on_prefill failed before admit")
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    assert dec.free_slots == 1  # baseline: one row free
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    req = GenerationRequest(
+        request_id=0,
+        prompt="p",
+        prompt_tokens=[TextToken(1)] * 3,
+        max_new_tokens=8,
+        skill=_SpecSkillSpec(),  # type: ignore[arg-type]
+        request_context=object(),
+        adapter="ft-1",
+    )
+    lc = RequestLifecycle(request=req, skill_state=_RaisingOnPrefillState(req))
+    lc.lora_slot_ready = False
+    lc.transition(RequestPhase.READY_FOR_PREFILL)
+    req.lifecycle = lc
+    sched.enqueue_request(req, lc.skill_state)
+
+    assert sched._spec_admit() is True
+    # ``admit`` was never reached (the hook raised first) -> no pool row was ever
+    # reserved, so none was admitted and none retired, and ``free_slots`` is
+    # untouched (no leak).
+    assert dec.admitted == []
+    assert dec.retired == []
+    assert dec.free_slots == 1
+    # The LoRA slot acquired before the hook ran is released exactly once on the
+    # cleanup path (not leaked, not double-released).
+    assert len(rt.acquired_adapter_slots) == 1
+    acquired_slot = len(rt.acquired_adapter_slots)  # FakeRuntime numbers from 1
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1
+    # request.lora_slot was zeroed so no later path can re-release it.
+    assert req.lora_slot == 0
+    assert req.lifecycle.lora_slot_ready is False
+    # The request failed cleanly -- it is NOT left stuck in PREFILLING, and no
+    # sequence_state / active row was registered for it.
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    assert req.lifecycle.phase == RequestPhase.COMPLETED
+    assert req.lifecycle.sequence_state is None
+    assert rt.active_sequences == {}
+    # It was removed from the waiting queue (the scheduler removes it before the
+    # hook runs) and never entered the running set.
+    assert req not in sched.waiting
+    assert len(sched.running) == 0
+
+
 def test_spec_side_values_guarded_when_no_spec_hook() -> None:
     """Round-2 codex finding @ L836: SpecSideValues never hits the non-spec hook.
 

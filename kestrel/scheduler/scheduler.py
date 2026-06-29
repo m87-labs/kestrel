@@ -778,34 +778,49 @@ class GenerationScheduler:
             # ``allowed_token_ids`` depends on inside ``on_prefill``. The hook
             # only reads ``runtime.prompt_template`` (no dependency on the
             # forward having run), so running it here is safe.
-            request.skill_state.on_prefill(self.runtime)
-
-            # Per-sequence constrained-decode mask (skill whitelist/blacklist),
-            # forwarded into ``admit`` so the spec path constrains the drafter +
-            # verify exactly like the non-spec sampler's whitelist-then-blacklist
-            # -- no gating to a text-only/unconstrained fallback. ``None`` leaves
-            # the row unmasked.
-            allowed_token_ids = request.skill_state.allowed_token_ids(self.runtime)
-            suppressed_token_ids = request.skill_state.suppressed_token_ids(
-                self.runtime
-            )
-            # Request-level *one-shot* suppression. The non-spec path applies
-            # ``suppress_next_token_ids`` to a request's first generated token
-            # only (``_build_mask_spec`` gates it on
-            # ``token_count == generated_prefix_length``). ``admit`` samples that
-            # exact first token, so forward the suppression here -- otherwise a
-            # suppressed id can be sampled at admit, staged, and the one-shot
-            # window closes (``token_count`` advances) before ``step`` could ever
-            # apply it. ``None`` when the request set no one-shot suppression or
-            # already generated past its prefix (resumed request).
-            suppress_next_token_ids = None
-            if (
-                request.suppress_next_token_ids
-                and request.skill_state.token_count
-                == request.generated_prefix_length
-            ):
-                suppress_next_token_ids = request.suppress_next_token_ids
+            #
+            # The ``on_prefill`` hook and the mask queries below run INSIDE the
+            # same ``try`` as ``admit``: a skill whose ``on_prefill`` /
+            # ``allowed_token_ids`` / ``suppressed_token_ids`` raises does so
+            # after this request has already left ``waiting``, transitioned to
+            # ``PREFILLING``, and acquired its LoRA slot. Outside the ``try`` that
+            # would bypass the admit-failure cleanup -- leaking the LoRA slot and
+            # leaving the request stuck in ``PREFILLING`` (it is gone from
+            # ``waiting`` and ``lifecycle.sequence_state`` is never set, so no
+            # finish/zombie path retires it) until the scheduler later crashes on
+            # it. The ``except`` below already releases the slot and fails the
+            # request cleanly; ``admit`` has not run yet so ``state.batch_idx`` is
+            # still its ``-1`` sentinel and no pool row is retired.
             try:
+                request.skill_state.on_prefill(self.runtime)
+
+                # Per-sequence constrained-decode mask (skill whitelist/blacklist),
+                # forwarded into ``admit`` so the spec path constrains the drafter +
+                # verify exactly like the non-spec sampler's whitelist-then-blacklist
+                # -- no gating to a text-only/unconstrained fallback. ``None`` leaves
+                # the row unmasked.
+                allowed_token_ids = request.skill_state.allowed_token_ids(
+                    self.runtime
+                )
+                suppressed_token_ids = request.skill_state.suppressed_token_ids(
+                    self.runtime
+                )
+                # Request-level *one-shot* suppression. The non-spec path applies
+                # ``suppress_next_token_ids`` to a request's first generated token
+                # only (``_build_mask_spec`` gates it on
+                # ``token_count == generated_prefix_length``). ``admit`` samples that
+                # exact first token, so forward the suppression here -- otherwise a
+                # suppressed id can be sampled at admit, staged, and the one-shot
+                # window closes (``token_count`` advances) before ``step`` could ever
+                # apply it. ``None`` when the request set no one-shot suppression or
+                # already generated past its prefix (resumed request).
+                suppress_next_token_ids = None
+                if (
+                    request.suppress_next_token_ids
+                    and request.skill_state.token_count
+                    == request.generated_prefix_length
+                ):
+                    suppress_next_token_ids = request.suppress_next_token_ids
                 with torch.inference_mode():
                     # Pass the request's image AND its multi-crop tiles
                     # (``image_crops``) -- exactly what the non-spec
