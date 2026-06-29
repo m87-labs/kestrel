@@ -176,6 +176,7 @@ def _enqueue(
     temperature: float = 0.0,
     top_p: float = 1.0,
     image: object | None = None,
+    image_length: int = 0,
     skill_state: SkillState | None = None,
 ):
     req = GenerationRequest(
@@ -190,6 +191,7 @@ def _enqueue(
         temperature=temperature,
         top_p=top_p,
         image=image,
+        image_length=image_length,
     )
     lc = RequestLifecycle(
         request=req, skill_state=skill_state or _RecordingState(req)
@@ -980,3 +982,151 @@ def test_spec_side_values_guarded_when_no_spec_hook() -> None:
     # Committed ids still staged (materialised as plain text via the guard).
     assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
     assert req.lifecycle.finished is True
+
+
+def test_spec_admit_image_sequence_state_includes_image_kv_length() -> None:
+    """Regression for the image-prompt length under-report (codex finding @ L646).
+
+    For an image request the spec ``SequenceState`` must record the *KV* prompt
+    length -- the typed-token count PLUS the image KV prefix -- exactly like the
+    non-spec ``prepare_sequence`` (which expands a single-image prefix /
+    ``ImageMarker``s into the KV prompt length). Initializing ``length`` /
+    ``prompt_length`` from the typed token count alone (leaving ``image_length``
+    at 0) made ``build_metrics`` under-report prompt tokens by the image prefix
+    and skewed ``output_length`` (``length - prompt_length``). Assert the state
+    carries ``len(prompt_tokens) + request.image_length`` and ``image_length``.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    prompt_len = 3
+    image_kv = 729  # a single-image prefix (image_prefix_length) worth of KV
+    req = _enqueue(
+        sched, 0, prompt_len=prompt_len, max_new=8, image=object(),
+        image_length=image_kv,
+    )
+
+    assert sched._spec_admit() is True
+    state = req.lifecycle.state
+    # KV prompt length = typed token count + image KV prefix (matches the
+    # non-spec prepare_sequence single-image layout: len(tokens) + image_kv).
+    assert state.length == prompt_len + image_kv
+    assert state.prompt_length == prompt_len + image_kv
+    assert state.image_length == image_kv
+    # build_metrics reports the full (image-inclusive) prompt length, not the
+    # bare typed-token count.
+    metrics = req.lifecycle.build_metrics(decode_tokens=0)
+    assert metrics.prompt_tokens == prompt_len + image_kv
+
+
+def test_spec_admit_text_sequence_state_length_unchanged() -> None:
+    """Text-only spec admission is unaffected by the image-KV length fix.
+
+    With ``image_length == 0`` the state length must remain the bare typed-token
+    count (no regression to the non-image path).
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=4, max_new=8)
+
+    assert sched._spec_admit() is True
+    state = req.lifecycle.state
+    assert state.length == 4
+    assert state.prompt_length == 4
+    assert state.image_length == 0
+
+
+def test_spec_admit_zero_token_request_admits_and_samples_nothing() -> None:
+    """Regression for the 0-token spec admit (codex finding @ L699).
+
+    ``decoder.admit`` prefills *and* samples/stages token0, but a request with
+    ``max_new_tokens == 0`` must not sample/stream any token (the non-spec path
+    has a dedicated zero-length branch that finalizes as ``"length"`` without
+    sampling). A 0-token request routed through the spec runtime must therefore
+    admit nothing, consume no spec pool row, stage no token, and complete
+    immediately with finish_reason ``"length"`` and zero output tokens.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=0)
+
+    progressed = sched._spec_admit()
+
+    assert progressed is True
+    # No spec row consumed (admit never called), nothing retired, no active row.
+    assert dec.admitted == []
+    assert dec.retired == []
+    assert rt.active_sequences == {}
+    # Not queued into running; no sequence_state attached.
+    assert len(sched.running) == 0
+    assert len(sched.waiting) == 0
+    assert req.lifecycle.sequence_state is None
+    # No token sampled/staged.
+    assert list(req.lifecycle.skill_state.tokens) == []
+    # Completed immediately as a length-capped (0-token) result.
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "length"
+    assert list(completed[0].tokens) == []
+    # build_metrics falls back to request.prompt_length (no sequence_state),
+    # mirroring the non-spec zero-length path.
+    assert completed[0].metrics.prompt_tokens == req.prompt_length
+
+
+def test_spec_drain_pipeline_commits_pending_spec_before_pause() -> None:
+    """Regression for the pause/drain leak of in-flight spec work (finding @ L548).
+
+    The engine PAUSE path calls ``Executor.drain`` -> ``_drain_pipeline`` before
+    mutating runtime/graph state. ``_spec_decode_step`` launches a macro-step
+    (stored in ``_pending_spec``) one tick before committing it, so a pause can
+    land with a spec result still uncommitted. ``_drain_pipeline`` must drain that
+    pending spec work (commit + retire) before returning -- otherwise the runtime
+    is mutated under an active, uncommitted spec row and the completion/retire is
+    deferred to resume. Launch a macro-step, leave it pending, then assert
+    ``_drain_pipeline`` flushes it.
+    """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes in the run
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()
+
+    # One macro-step: depth-1 means this LAUNCHES the step and leaves it pending
+    # (uncommitted) -- exactly the window a pause can land in.
+    assert sched._spec_decode_step() is True
+    assert sched._pending_spec is not None
+    assert req.lifecycle.finished is False  # not yet committed
+
+    # The pause path's drain entry point must flush the pending spec step.
+    sched._drain_pipeline()
+
+    assert sched._pending_spec is None
+    assert req.lifecycle.finished is True
+    assert dec.retired == [0]
+    assert rt.active_sequences == {}
+    # Drained work surfaced its completion (committed tokens 11,12,13).
+    assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "length"
+
+
+def test_spec_drain_pipeline_noop_when_no_pending_spec() -> None:
+    """``_drain_pipeline`` is a safe no-op when no spec step is outstanding."""
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    _enqueue(sched, 0, prompt_len=3, max_new=8)
+    sched._spec_admit()
+    assert sched._pending_spec is None
+
+    # No launched-but-uncommitted step: drain must not raise or launch new work.
+    sched._drain_pipeline()
+    assert sched._pending_spec is None
+    assert dec.retired == []

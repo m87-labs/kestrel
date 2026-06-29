@@ -497,12 +497,25 @@ class GenerationScheduler:
         return progressed
 
     def _drain_pipeline(self) -> None:
-        """Drain the pipeline before prefill - complete all in-flight work.
+        """Drain in-flight work before prefill / before an engine pause.
 
         Respects Phase 1 commit-before-finalize ordering: complete all queued
         steps before finalizing any in-flight forward. This ensures grammar
         state is updated before computing masks for constrained decoding.
+
+        The engine PAUSE path calls this (``Executor.drain``) before mutating
+        runtime state under ``graph_capture_lock`` (e.g. rebuilding CUDA graphs).
+        The spec macro-step path commits through ``_pending_spec``, which the
+        non-spec pipeline drain below does not touch, so drain spec work first:
+        if a pause lands after a macro-step was launched (``_pending_spec`` set)
+        and before the next ``advance``, the spec result would otherwise stay
+        uncommitted while the runtime/graphs are mutated under an active spec row
+        -- corrupting that row and delaying its completion/retirement until
+        resume. ``_drain_spec`` commits the in-flight macro-step (no new launch)
+        until ``_pending_spec`` is empty. In non-spec mode it is a no-op.
         """
+        self._drain_spec()
+
         pipeline = self._pipeline
 
         # 1. Complete all queued steps first (commit-before-finalize)
@@ -573,6 +586,31 @@ class GenerationScheduler:
                 break
             lifecycle = request.lifecycle
 
+            # Zero-length generation: the non-spec path has a dedicated branch
+            # (see the ``max_new_tokens <= 0`` case in ``_launch_prefill_step``)
+            # that finalizes the request as ``"length"`` WITHOUT sampling/staging
+            # a first token. ``decoder.admit`` has no prefill-only mode -- its
+            # contract is to prefill *and* sample/stage token0 -- so routing a
+            # 0-token request through it would stream/return one extra token and
+            # briefly consume a spec pool row. Match the non-spec contract:
+            # finalize with zero generated tokens, no admit, no row. The spec
+            # decoder's persistently-reserved pool gains nothing from a prefill it
+            # would immediately retire, so skipping admission entirely is both
+            # correct and leaves the row free for real work.
+            if request.max_new_tokens <= 0:
+                self.waiting.remove(request)
+                # No spec row, so no ``sequence_state``; ``build_metrics`` then
+                # falls back to ``request.prompt_length`` exactly like the
+                # non-spec 0-length path (which also leaves ``sequence_state``
+                # unset). ``_finalize_sequence`` -> ``_release_sequence``
+                # early-returns for a spec runtime before touching the (absent)
+                # state, so this is safe with ``sequence_state is None``.
+                lifecycle.prefill_started_at = time.perf_counter()
+                lifecycle.prefill_completed_at = lifecycle.prefill_started_at
+                self._finalize_sequence(lifecycle, "length")
+                progressed = True
+                continue
+
             # Acquire the LoRA slot before admission, mirroring the normal
             # prefill path. Without this, adapter requests admitted to the spec
             # path keep ``request.lora_slot == 0`` and silently run on the
@@ -636,14 +674,31 @@ class GenerationScheduler:
             self.waiting.remove(request)
             lifecycle.prefill_started_at = time.perf_counter()
             lifecycle.transition(RequestPhase.PREFILLING)
-            # batch_idx is assigned by ``admit`` (it picks the spec pool row).
-            # ``length`` / ``prompt_length`` are the token *count* (markers count
-            # as one each; ``admit`` expands them and owns the real KV length).
+            # ``length`` / ``prompt_length`` must be the row's *KV* prompt length,
+            # exactly what the non-spec ``prepare_sequence`` records (it expands
+            # image markers / a single-image prefix into the KV prompt length, see
+            # ``moondream/runtime.py``). ``len(prompt_tokens)`` counts each
+            # ``ImageMarker`` as one token but the image occupies
+            # ``image_prefix_length`` KV slots, so the count excludes the image KV
+            # prefix. ``request.image_length`` is exactly that prefix
+            # (``image_prefix_length`` for a single image; ``num_images *
+            # (image_prefix_length - 1)`` for the multi-image marker layout, where
+            # each marker is already one token in ``prompt_tokens``), so
+            # ``len(prompt_tokens) + request.image_length`` reconstructs the KV
+            # prompt length for both layouts and leaves text-only requests
+            # (``image_length == 0``) unchanged. Without this, ``build_metrics``
+            # (which reports ``sequence_state.prompt_length``) under-reports image
+            # prompt tokens and ``output_length`` (``length - prompt_length``) is
+            # off by the image prefix. ``batch_idx`` is assigned by ``admit`` (it
+            # picks the spec pool row); carry ``image_length`` so downstream
+            # KV/total-length accounting on the state stays consistent.
+            kv_prompt_length = len(prompt_tokens) + request.image_length
             state = SequenceState(
                 batch_idx=-1,
-                length=len(prompt_tokens),
+                length=kv_prompt_length,
                 max_length=request.target_length,
-                prompt_length=len(prompt_tokens),
+                prompt_length=kv_prompt_length,
+                image_length=request.image_length,
                 lora_slot=request.lora_slot,
             )
             # The spec decoder reads ``return_logprobs`` off the state to decide
@@ -833,6 +888,27 @@ class GenerationScheduler:
             self._commit_spec(pending)
 
         return bool(active) or pending is not None
+
+    def _drain_spec(self) -> None:
+        """Commit any in-flight spec macro-step, launching no new work.
+
+        ``_spec_decode_step`` overlaps depth-1 by launching the next macro-step
+        *before* committing the previous one, so between ticks a launched-but-
+        uncommitted step lives in ``_pending_spec``. Unlike ``_spec_decode_step``
+        this deliberately does NOT launch a new step -- it only flushes the
+        outstanding one -- so it is safe to call from the pause/drain path
+        (``_drain_pipeline``) without admitting more spec work while the engine is
+        trying to quiesce. ``_commit_spec`` finalizes/retires any sequence that
+        ended in the committed run and never repopulates ``_pending_spec``, so a
+        single commit empties it; the loop is defensive and converges. No-op when
+        the runtime does not speculate (``_pending_spec`` stays ``None``).
+        """
+        while self._pending_spec is not None:
+            pending = self._pending_spec
+            self._pending_spec = None
+            with stream_context(self._compute_stream):
+                with torch.inference_mode():
+                    self._commit_spec(pending)
 
     def _materialize_spec_tokens(
         self,
