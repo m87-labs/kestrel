@@ -1027,6 +1027,121 @@ class MoondreamRuntime:
                 size_id=size_id,
             )
 
+        def materialize_spec_tokens(
+            token_ids_cpu: Tensor,
+            sequences: Sequence,
+            batch_idx: Tensor,
+            side_values: object,
+        ) -> list[Token]:
+            """Type a spec macro-step's committed run into coord/size tokens.
+
+            Speculative analog of ``materialize_tokens``. A macro-step commits a
+            *variable run* of positions per sequence, so the spatial decode the
+            non-spec ``post_sample`` does one-position-at-a-time runs here over
+            **all** committed positions at once, reading the target's final
+            ``hidden_last`` for each committed position out of the macro-step's
+            :class:`~kestrel.runtime.spec.SpecSideValues` (rather than the slot's
+            ``post_sample`` aux staging, which holds a single step's values).
+
+            ``side_values.hidden`` is ``[num_sequences, K + 1, hidden_dim]`` (the
+            verify-block final hidden, indexed by ``sequences`` order); only the
+            leading ``n_i`` positions of row ``i`` are committed, where ``n_i`` is
+            that sequence's committed-run length. ``token_ids_cpu`` / ``batch_idx``
+            are flat over all committed positions (``sequences``-major, contiguous
+            per sequence). We slice ``hidden[i, :n_i]`` per sequence, pack the
+            committed hiddens into one ``[total, hidden_dim]`` batch, decode
+            coord/size in a single ``compute_spatial_values`` call under each
+            sequence's sampling knobs, then render the typed tokens.
+            """
+            from kestrel.runtime.spec import SpecSideValues
+
+            if not isinstance(side_values, SpecSideValues):
+                raise TypeError(
+                    "materialize_spec_tokens requires a SpecSideValues; got "
+                    f"{type(side_values).__name__}"
+                )
+            seqs = list(sequences)
+            flat_ids = token_ids_cpu.view(-1)
+            total = int(flat_ids.shape[0])
+            if total == 0:
+                return []
+
+            # Per-sequence committed-run lengths (``n_i``). Prefer the producer's
+            # explicit ``counts``; otherwise recover them from the flat per-token
+            # ``batch_idx`` (each active sequence owns a distinct pool row, and the
+            # flat layout is sequences-major + contiguous), so the slice of
+            # ``hidden[i]`` matches the actually-committed run (which may be capped
+            # below ``accept_counts[i] + 1`` by the scheduler's commit cap).
+            counts = side_values.counts
+            if counts is None:
+                flat_rows = batch_idx.view(-1).tolist()
+                counts = []
+                cursor = 0
+                for seq in seqs:
+                    row = seq.state.batch_idx
+                    n = 0
+                    while cursor + n < total and flat_rows[cursor + n] == row:
+                        n += 1
+                    counts.append(n)
+                    cursor += n
+            if len(counts) != len(seqs):
+                raise ValueError(
+                    "materialize_spec_tokens: counts length "
+                    f"{len(counts)} != num sequences {len(seqs)}"
+                )
+            if sum(int(c) for c in counts) != total:
+                raise ValueError(
+                    "materialize_spec_tokens: committed counts "
+                    f"{counts} do not sum to flat token count {total}"
+                )
+
+            hidden = side_values.hidden  # [num_sequences, K+1, hidden_dim]
+            device = hidden.device
+            # Gather the committed final-hidden for every committed position into
+            # one packed ``[total, hidden_dim]`` batch (sequences-major), plus the
+            # parallel per-position requests / sampling knobs.
+            hidden_rows: list[Tensor] = []
+            requests: list = []
+            temp_parts: list[Tensor] = []
+            top_p_parts: list[Tensor] = []
+            for i, (seq, n) in enumerate(zip(seqs, counts)):
+                n = int(n)
+                if n == 0:
+                    continue
+                hidden_rows.append(hidden[i, :n])
+                requests.extend(seq.request for _ in range(n))
+                temp_parts.append(side_values.temperatures[i].expand(n))
+                top_p_parts.append(side_values.top_ps[i].expand(n))
+            hidden_last = torch.cat(hidden_rows, dim=0)  # [total, hidden_dim]
+            temperatures = torch.cat(temp_parts, dim=0)
+            top_ps = torch.cat(top_p_parts, dim=0)
+            token_ids = flat_ids.to(device=device, dtype=torch.long)
+
+            coord_out = torch.empty((total, 1), device=device, dtype=torch.float32)
+            size_out = torch.empty((total, 2), device=device, dtype=torch.float32)
+            compute_spatial_values(
+                token_ids,
+                hidden_last,
+                requests,
+                spatial_tables,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                token_logprobs=None,
+                coord_id=coord_id,
+                size_id=size_id,
+                out_coord=coord_out,
+                out_size=size_out,
+                rng=spatial_rng,
+            )
+            from kestrel.scheduler.tokens import render_tokens_from_packed
+            return render_tokens_from_packed(
+                token_ids_cpu,
+                coord_out.cpu(),
+                size_out.cpu(),
+                coord_id=coord_id,
+                size_id=size_id,
+            )
+
         def prepare_decode_inputs(
             slot: DecodeSlot,
             batch_idx: Tensor,
@@ -1044,6 +1159,7 @@ class MoondreamRuntime:
         return SamplingHooks(
             post_sample=post_sample,
             materialize_tokens=materialize_tokens,
+            materialize_spec_tokens=materialize_spec_tokens,
             prepare_decode_inputs=prepare_decode_inputs,
         )
 

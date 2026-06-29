@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
 from kestrel.runtime import TextToken
 from kestrel.runtime.tokens import CoordToken, ImageMarker, SizeToken
 from kestrel.runtime.spec import SpecDecodeCaps, SpecSideValues, SpecStepResult
@@ -1302,21 +1304,28 @@ def test_spec_pre_admit_hook_failure_releases_lora_slot_and_fails_cleanly() -> N
     assert len(sched.running) == 0
 
 
-def test_spec_side_values_guarded_when_no_spec_hook() -> None:
-    """Round-2 codex finding @ L836: SpecSideValues never hits the non-spec hook.
+def test_spec_side_values_fails_fast_when_no_spec_hook() -> None:
+    """Spatial ``SpecSideValues`` without a spec hook must FAIL FAST, not degrade.
 
-    When a macro-step returns spatial ``SpecSideValues`` but the runtime exposes
+    P2: ``side_values`` is produced ONLY when the runtime decoded spatial values
+    that must be typed into ``CoordToken`` / ``SizeToken`` from the target's
+    per-position final hidden (the detect/point spec path). If the runtime exposes
     only the non-spec ``materialize_tokens`` hook (whose handle is the
-    ``post_sample`` ``(slot, batch_size)`` aux value), the scheduler must NOT feed
-    the side-values into it -- doing so raises ``cannot unpack SpecSideValues`` or
-    reads the wrong layout. The guard materialises plain ``TextToken``s instead.
-    Asserts (a) no crash, (b) the non-spec hook is never handed the side-values,
-    (c) the committed ids still materialise (as text) and stage correctly.
+    ``post_sample`` ``(slot, batch_size)`` aux value, which a ``SpecSideValues``
+    does not match), the scheduler must NOT (a) feed the side-values into that hook
+    (``cannot unpack`` / wrong layout) NOR (b) silently materialise the committed
+    ids as plain ``TextToken``s -- that would DROP the decoded coordinates/sizes
+    and corrupt the result. The project goal is full coverage / no silent
+    fallback, so the scheduler raises a clear ``RuntimeError`` instead. Asserts
+    (a) it raises, (b) the message names ``materialize_spec_tokens``, (c) the
+    non-spec hook was never handed the side-values.
     """
+    import torch
+
     real_side_values = SpecSideValues(
-        hidden=__import__("torch").zeros(1, 3, 4),
-        temperatures=__import__("torch").zeros(1),
-        top_ps=__import__("torch").ones(1),
+        hidden=torch.zeros(1, 3, 4),
+        temperatures=torch.zeros(1),
+        top_ps=torch.ones(1),
     )
     nonspec_handles: list[object] = []
 
@@ -1340,18 +1349,256 @@ def test_spec_side_values_guarded_when_no_spec_hook() -> None:
     # Only the NON-spec hook is installed; no materialize_spec_tokens.
     rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
     sched = _make_scheduler(rt)
-    req = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    _enqueue(sched, 0, prompt_len=3, max_new=3)
     sched._spec_admit()
-    # Must not raise (the bug fed SpecSideValues into the non-spec hook -> unpack
-    # TypeError, aborting the scheduler).
-    while sched._spec_decode_step():
-        pass
+    # The macro-step commit must fail fast rather than silently drop coord/size.
+    with pytest.raises(RuntimeError, match="materialize_spec_tokens"):
+        while sched._spec_decode_step():
+            pass
 
-    # The non-spec hook was never handed the SpecSideValues (guard held).
+    # The non-spec hook was never handed the SpecSideValues (no misuse).
     assert real_side_values not in nonspec_handles
-    # Committed ids still staged (materialised as plain text via the guard).
-    assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
-    assert req.lifecycle.finished is True
+
+
+def _synthetic_spatial_tables(coord_bins: int, size_bins: int):
+    """An MLP ``SpatialDecodeTables`` whose argmax bins are read straight out of
+    the hidden state, with a pure-PyTorch decode (CPU-runnable, no custom kernels).
+
+    Lays the hidden out as ``[coord one-hot (coord_bins) | width one-hot (size_bins)
+    | height one-hot (size_bins)]``. The MLP path (``F.gelu`` + ``F.linear`` only,
+    unlike the linear path which calls a bf16-only LayerNorm CUDA kernel) is built
+    so ``argmax`` over each logit group recovers exactly the one-hot index set in
+    that group's hidden slice: ``fc1`` is a scaled identity (so gelu maps the hot
+    position to a large positive value and zeros to ~0), and ``fc2`` selects each
+    group's hidden dims. The greedy branch of ``compute_spatial_values`` uses
+    ``torch.argmax`` only, so the decoded coord/size values are deterministic and
+    the whole thing runs on CPU.
+    """
+    import torch
+    import torch.nn as nn
+
+    from kestrel.models.moondream.region import SpatialDecodeTables
+
+    hidden_dim = coord_bins + 2 * size_bins
+    inner = hidden_dim
+    scale = 50.0
+
+    def _decoder(select_rows: int, offset: int) -> nn.ModuleDict:
+        fc1 = nn.Linear(hidden_dim, inner)
+        with torch.no_grad():
+            fc1.weight.copy_(torch.eye(inner, hidden_dim) * scale)
+            fc1.bias.zero_()
+        fc2 = nn.Linear(inner, select_rows)
+        with torch.no_grad():
+            sel = torch.zeros(select_rows, inner)
+            for r in range(select_rows):
+                sel[r, offset + r] = 1.0
+            fc2.weight.copy_(sel)
+            fc2.bias.zero_()
+        return nn.ModuleDict({"fc1": fc1, "fc2": fc2})
+
+    coord_decoder = _decoder(coord_bins, offset=0)
+    size_decoder = _decoder(2 * size_bins, offset=coord_bins)
+
+    coord_value_lut = torch.linspace(0.0, 1.0, coord_bins, dtype=torch.float32)
+    size_exponents = torch.linspace(-10.0, 0.0, size_bins, dtype=torch.float32)
+    size_value_lut = torch.exp2(size_exponents)
+    tables = SpatialDecodeTables(
+        coord_value_lut=coord_value_lut,
+        size_value_lut=size_value_lut,
+        coord_logits_dim=coord_bins,
+        coord_decoder=coord_decoder,
+        size_decoder=size_decoder,
+    )
+    return tables, hidden_dim
+
+
+def _encode_spatial_hidden(coord_bins, size_bins, hidden_dim, *, coord, width, height):
+    """One-hot a (coord_bin, width_bin, height_bin) triple into a hidden vector that
+    ``_synthetic_spatial_tables`` decodes back to those bins."""
+    import torch
+
+    h = torch.zeros(hidden_dim, dtype=torch.float32)
+    h[coord] = 1.0
+    h[coord_bins + width] = 1.0
+    h[coord_bins + size_bins + height] = 1.0
+    return h
+
+
+def test_moondream_materialize_spec_tokens_types_coord_size() -> None:
+    """The REAL ``MoondreamRuntime.materialize_spec_tokens`` types a ragged spec
+    macro-step's committed ids into ``CoordToken`` / ``SizeToken`` (P2 full
+    coverage).
+
+    Exercises the actual production hook (not a stub) on CPU: builds the hook via
+    ``MoondreamRuntime.sampling_hooks`` over a minimal stand-in that supplies only
+    the attributes the property reads (``config.tokenizer.coord_id``/``size_id``,
+    ``spatial_tables``, the pending-pool buffers + copy stream + spatial RNG used by
+    the *other* closures), then drives it with the scheduler's exact
+    ``materialize_spec_tokens`` contract: a flat (sequences-major, contiguous-
+    per-sequence) committed-id batch + per-token ``batch_idx`` + a
+    :class:`SpecSideValues` whose ``hidden[i, j]`` is the committed-position final
+    hidden. Two ragged sequences mix ``coord_id`` / ``size_id`` / a plain text id,
+    and we assert each id is typed correctly with the value decoded from its OWN
+    hidden position (proving per-position routing, not a single shared value).
+    """
+    import torch
+
+    from kestrel.models.moondream.runtime import (
+        CoordToken,
+        MoondreamRuntime,
+        SizeToken,
+        TextToken,
+    )
+    from kestrel.runtime.spec import SpecSideValues
+
+    coord_bins, size_bins = 11, 8
+    tables, hidden_dim = _synthetic_spatial_tables(coord_bins, size_bins)
+    coord_id, size_id = 5000, 5001
+
+    # Minimal stand-in carrying exactly what ``sampling_hooks`` reads.
+    stub = SimpleNamespace(
+        config=SimpleNamespace(
+            tokenizer=SimpleNamespace(coord_id=coord_id, size_id=size_id)
+        ),
+        spatial_tables=tables,
+        _pending_coord_values=torch.zeros(8, 1),
+        _pending_size_values=torch.zeros(8, 2),
+        _copy_stream=None,
+        _spatial_rng=None,  # greedy path never samples, so the RNG is unused
+    )
+    hooks = MoondreamRuntime.sampling_hooks.func(stub)
+    assert hooks.materialize_spec_tokens is not None
+
+    # Two sequences (greedy: temperature 0). Seq A commits 3 tokens
+    # [coord, size, text]; seq B commits 1 token [coord]. Flat layout is
+    # sequences-major + contiguous per sequence (the scheduler's contract).
+    seq_a = SimpleNamespace(
+        request=SimpleNamespace(temperature=0.0, top_p=1.0),
+        state=SimpleNamespace(batch_idx=101),
+    )
+    seq_b = SimpleNamespace(
+        request=SimpleNamespace(temperature=0.0, top_p=1.0),
+        state=SimpleNamespace(batch_idx=102),
+    )
+    sequences = [seq_a, seq_b]
+
+    text_id = 42
+    flat_ids = [coord_id, size_id, text_id, coord_id]
+    batch_idx = torch.tensor([101, 101, 101, 102], dtype=torch.long)
+    token_ids_cpu = torch.tensor(flat_ids, dtype=torch.long)
+
+    # Per-committed-position target bins -> expected decoded values.
+    a_coord_bin = 7   # coord value 7/10 = 0.7
+    a_w_bin, a_h_bin = 2, 5
+    b_coord_bin = 3   # coord value 3/10 = 0.3
+    # K+1 hidden slots per sequence; only the committed leading positions matter.
+    K1 = 4
+    hidden = torch.zeros(2, K1, hidden_dim, dtype=torch.float32)
+    # Seq A committed positions 0,1,2 (coord, size, text); position 2 is text so
+    # its decoded coord/size are ignored -- still set a sentinel to prove text ids
+    # are NOT mis-typed even when their hidden would decode to a valid bin.
+    hidden[0, 0] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=a_coord_bin, width=0, height=0
+    )
+    hidden[0, 1] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=0, width=a_w_bin, height=a_h_bin
+    )
+    hidden[0, 2] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=9, width=7, height=7
+    )
+    # Seq B committed position 0 (coord).
+    hidden[1, 0] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=b_coord_bin, width=0, height=0
+    )
+
+    side_values = SpecSideValues(
+        hidden=hidden,
+        temperatures=torch.zeros(2, dtype=torch.float32),
+        top_ps=torch.ones(2, dtype=torch.float32),
+        counts=None,  # force the batch_idx-derived run-length path
+    )
+
+    tokens = hooks.materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, side_values
+    )
+
+    assert len(tokens) == 4
+    # Seq A: coord -> CoordToken(0.7); size -> SizeToken(2^(...)); text -> TextToken.
+    assert isinstance(tokens[0], CoordToken)
+    assert tokens[0].pos == pytest.approx(a_coord_bin / (coord_bins - 1))
+    assert isinstance(tokens[1], SizeToken)
+    assert tokens[1].width == pytest.approx(float(tables.size_value_lut[a_w_bin]))
+    assert tokens[1].height == pytest.approx(float(tables.size_value_lut[a_h_bin]))
+    assert isinstance(tokens[2], TextToken)
+    assert tokens[2].token_id == text_id
+    # Seq B: its coord uses seq B's OWN hidden row (0.3), not seq A's (0.7).
+    assert isinstance(tokens[3], CoordToken)
+    assert tokens[3].pos == pytest.approx(b_coord_bin / (coord_bins - 1))
+
+
+def test_moondream_materialize_spec_tokens_honors_explicit_counts() -> None:
+    """The hook uses ``SpecSideValues.counts`` when the producer supplies them.
+
+    Mirrors the explicit-``counts`` admit path (single position per sequence); the
+    decoded coord must come from each sequence's own ``hidden[i, 0]``.
+    """
+    import torch
+
+    from kestrel.models.moondream.runtime import (
+        CoordToken,
+        MoondreamRuntime,
+    )
+    from kestrel.runtime.spec import SpecSideValues
+
+    coord_bins, size_bins = 11, 8
+    tables, hidden_dim = _synthetic_spatial_tables(coord_bins, size_bins)
+    coord_id, size_id = 5000, 5001
+    stub = SimpleNamespace(
+        config=SimpleNamespace(
+            tokenizer=SimpleNamespace(coord_id=coord_id, size_id=size_id)
+        ),
+        spatial_tables=tables,
+        _pending_coord_values=torch.zeros(8, 1),
+        _pending_size_values=torch.zeros(8, 2),
+        _copy_stream=None,
+        _spatial_rng=None,
+    )
+    hooks = MoondreamRuntime.sampling_hooks.func(stub)
+
+    seqs = [
+        SimpleNamespace(
+            request=SimpleNamespace(temperature=0.0, top_p=1.0),
+            state=SimpleNamespace(batch_idx=200),
+        ),
+        SimpleNamespace(
+            request=SimpleNamespace(temperature=0.0, top_p=1.0),
+            state=SimpleNamespace(batch_idx=201),
+        ),
+    ]
+    hidden = torch.zeros(2, 1, hidden_dim, dtype=torch.float32)
+    hidden[0, 0] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=4, width=0, height=0
+    )
+    hidden[1, 0] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=8, width=0, height=0
+    )
+    side_values = SpecSideValues(
+        hidden=hidden,
+        temperatures=torch.zeros(2, dtype=torch.float32),
+        top_ps=torch.ones(2, dtype=torch.float32),
+        counts=[1, 1],
+    )
+    token_ids_cpu = torch.tensor([coord_id, coord_id], dtype=torch.long)
+    batch_idx = torch.tensor([200, 201], dtype=torch.long)
+
+    tokens = hooks.materialize_spec_tokens(
+        token_ids_cpu, seqs, batch_idx, side_values
+    )
+    assert isinstance(tokens[0], CoordToken)
+    assert tokens[0].pos == pytest.approx(4 / (coord_bins - 1))
+    assert isinstance(tokens[1], CoordToken)
+    assert tokens[1].pos == pytest.approx(8 / (coord_bins - 1))
 
 
 def test_spec_admit_image_sequence_state_includes_image_kv_length() -> None:

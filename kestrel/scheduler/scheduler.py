@@ -1162,10 +1162,13 @@ class GenerationScheduler:
 
         * ``side_values`` set -> route through the dedicated
           ``materialize_spec_tokens`` hook (the spec analog that decodes coord/size
-          from the packed hidden). If the runtime exposes no such hook (text-only,
-          or a runtime that does not type spatial tokens on the spec path),
-          *guard* by materialising plain ``TextToken``s rather than misusing the
-          non-spec hook.
+          from the packed hidden). If the runtime emits spatial side-values but
+          exposes no such hook, *fail fast* (``RuntimeError``) -- never silently
+          materialise the committed ids as plain ``TextToken``s (that would DROP
+          the decoded coordinates/sizes and corrupt spatial-skill results), and
+          never misuse the non-spec hook (whose handle shape ``SpecSideValues``
+          does not match). A text-only runtime leaves ``side_values`` ``None`` and
+          takes the branch below, so it never reaches this guard.
         * ``side_values is None`` -> a text-only macro-step; use the normal
           ``materialize_tokens`` path with a ``None`` handle (its plain-text
           branch), matching the non-spec single-token commit.
@@ -1186,18 +1189,28 @@ class GenerationScheduler:
         batch_idx = torch.tensor(batch_indices, dtype=torch.long)
         if side_values is not None:
             spec_hook = self._hooks.materialize_spec_tokens
-            if spec_hook is not None:
-                flat_tokens = spec_hook(
-                    token_ids_cpu, active, batch_idx, side_values
+            if spec_hook is None:
+                # Fail fast (no silent fallback). ``side_values`` is produced ONLY
+                # when the runtime decoded spatial values that MUST be typed into
+                # ``CoordToken`` / ``SizeToken`` from the target's per-position
+                # final hidden (the spatial-skill spec path: detect/point). The
+                # non-spec ``materialize_tokens`` hook cannot consume a
+                # ``SpecSideValues`` (its handle is the ``post_sample``
+                # ``(slot, batch_size)`` aux value), and materialising the
+                # committed ids as plain ``TextToken``s would silently DROP the
+                # decoded coordinates/sizes and corrupt the result. A runtime that
+                # emits spatial side-values must expose ``materialize_spec_tokens``
+                # (see ``MoondreamRuntime.sampling_hooks``); a text-only runtime
+                # leaves ``side_values`` ``None`` and never reaches here.
+                raise RuntimeError(
+                    "Speculative macro-step returned spatial SpecSideValues but "
+                    "the runtime's SamplingHooks expose no materialize_spec_tokens "
+                    "hook; refusing to silently drop decoded coord/size values to "
+                    "TextToken. Implement materialize_spec_tokens on the runtime "
+                    "(mirror its non-spec materialize_tokens spatial decode) to "
+                    "enable spec for spatial skills."
                 )
-            else:
-                # Guard: a runtime that does not type spatial tokens on the spec
-                # path still returned side-values; never pass them to the
-                # non-spec hook -- materialise plain text ids.
-                flat_tokens = [
-                    TextToken(token_id=int(t))
-                    for t in token_ids_cpu.view(-1).tolist()
-                ]
+            flat_tokens = spec_hook(token_ids_cpu, active, batch_idx, side_values)
         else:
             # Text-only macro-step: the non-spec hook's ``step_handle is None``
             # branch (plain text) applies.
