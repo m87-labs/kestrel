@@ -2296,3 +2296,129 @@ def test_spec_admit_zero_token_request_bypasses_saturated_batch() -> None:
     assert 77 in completed2
     assert completed2[77].finish_reason == "length"
     assert completed2[77].tokens == []
+
+
+def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
+    """A reasoning mask that is None at step start but forces a prefix mid-run is capped.
+
+    Regression for the codex P1 @ scheduler ``_mask_is_stateful``: the
+    behavioural fallback inspects the constraint at the committed run's FIRST
+    position only, so it cannot see a mask that is INACTIVE at step start but
+    transitions to ACTIVE within the run. Reasoning skills do exactly that --
+    while collecting reasoning, ``QuerySkillState`` (non-moondream2) and
+    ``ChatSkillState`` expose NO constraint (both ``allowed_token_ids`` and
+    ``suppressed_token_ids`` return ``None``); once the model emits ``answer_id``
+    they force ``post_reasoning_prefix`` one id at a time. If a spec macro-step
+    committed ``answer_id`` plus following tokens under that None-at-start mask,
+    the post-boundary tokens would be accepted WITHOUT the required prefix
+    constraint. So both states declare ``mask_is_stateful = True`` and the
+    scheduler must cap them to one committed token per step EVEN THOUGH both
+    masks read ``None`` this step -- the verdict the bare fallback would miss.
+
+    The contrast row is caption: under the same non-moondream2 runtime its mask
+    is also unconstrained (no allowed/suppressed), and it declares
+    ``mask_is_stateful = False``, so it must STAY uncapped. Same None/None
+    step-start signature, opposite cap verdict -- proving the declaration (not
+    the fallback) decides.
+    """
+    from kestrel.models.moondream.skills.caption import (
+        CaptionRequest,
+        CaptionSkill,
+        CaptionSkillState,
+    )
+    from kestrel.models.moondream.skills.query import (
+        QueryRequest,
+        QuerySkill,
+        QuerySkillState,
+    )
+    from kestrel.skills.chat import (
+        ChatMessage,
+        ChatContentPart,
+        ChatRequest,
+        ChatSkill,
+        ChatSkillState,
+    )
+
+    # A NON-moondream2 runtime: this is the case the bug lived in -- query's
+    # ``suppressed_token_ids`` returns ``None`` off-model, so a reasoning row's
+    # mask is fully None at step start. ``answer_id`` is only read once a step is
+    # consumed (not on the bare mask query this test drives), but provide it for
+    # completeness.
+    ANSWER = 7
+    runtime = SimpleNamespace(
+        model_name="qwen3",
+        prompt_template=SimpleNamespace(answer_id=ANSWER),
+    )
+
+    dec = _FakeDecoder(
+        n_rows=3,
+        first_tokens={0: 10, 1: 20, 2: 30},
+        plans={0: [[]], 1: [[]], 2: [[]]},
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    # Query the REAL skills against the stub ``runtime`` above.
+    sched.runtime = runtime
+
+    # Generous budget so the remaining-budget cap never bites: the only cap that
+    # can appear is the STATEFUL cap (``1``).
+    r_query = _enqueue(sched, 0, prompt_len=3, max_new=1000)
+    r_chat = _enqueue(sched, 1, prompt_len=3, max_new=1000)
+    r_cap = _enqueue(sched, 2, prompt_len=3, max_new=1000)
+
+    # Reasoning ON for query + chat: collecting reasoning, no constraint yet, but
+    # the mask WILL force a prefix after ``answer_id`` -- the transition the
+    # fallback can't see.
+    query_state = QuerySkillState(
+        QuerySkill(),
+        r_query,
+        QueryRequest(
+            question="q", image=None, reasoning=True, stream=False, spatial_refs=None
+        ),
+    )
+    chat_state = ChatSkillState(
+        ChatSkill(),
+        r_chat,
+        ChatRequest(
+            messages=(
+                ChatMessage(role="user", parts=(ChatContentPart(text="hi"),)),
+            ),
+            images=(),
+            reasoning=True,
+            stream=False,
+        ),
+        post_reasoning_prefix=[ANSWER],
+        turn_end_ids=[],
+    )
+    cap_state = CaptionSkillState(
+        CaptionSkill(),
+        r_cap,
+        CaptionRequest(length="normal", image=None, stream=False),
+    )
+    r_query.lifecycle.skill_state = query_state
+    r_chat.lifecycle.skill_state = chat_state
+    r_cap.lifecycle.skill_state = cap_state
+
+    seqs = [r_query.lifecycle, r_chat.lifecycle, r_cap.lifecycle]
+
+    # The exact bug precondition: every row's mask reads None/None THIS step.
+    assert query_state.allowed_token_ids(runtime) is None
+    assert query_state.suppressed_token_ids(runtime) is None
+    assert chat_state.allowed_token_ids(runtime) is None
+    assert chat_state.suppressed_token_ids(runtime) is None
+    assert cap_state.suppressed_token_ids(runtime) is None
+    # The bare behavioural fallback would call all three non-stateful (both masks
+    # empty); the declarations override that for the reasoning rows only.
+    assert (bool(None) or bool(None)) is False  # what the fallback alone returns
+    assert sched._mask_is_stateful(r_query.lifecycle, None, None) is True
+    assert sched._mask_is_stateful(r_chat.lifecycle, None, None) is True
+    assert sched._mask_is_stateful(r_cap.lifecycle, None, None) is False
+
+    _allowed, _suppressed, commit_caps = sched._build_spec_step_masks(seqs)
+
+    # Reasoning rows capped to one committed token per macro-step despite the
+    # None-at-start mask; caption keeps the full multi-token accept (its only cap
+    # is the loose remaining budget).
+    assert commit_caps[0] == 1
+    assert commit_caps[1] == 1
+    assert commit_caps[2] == 1000

@@ -2281,17 +2281,35 @@ class GenerationScheduler:
         first-position mask. This decides that cap from the live skill state,
         model-agnostically (the scheduler never imports a model's skills).
 
-        A skill may declare its mask precisely via an optional
-        ``mask_is_stateful`` attribute / property on its ``SkillState`` (``True``
-        => evolving, ``False`` => provably constant); when present that wins. In
-        its absence the conservative behavioural rule is: any ACTIVE constraint
-        (a non-empty ``allowed`` whitelist or ``suppressed`` blacklist this step)
-        is treated as potentially stateful and capped, because the scheduler
-        cannot prove the set is position-independent without model knowledge.
-        Correctness-first: over-capping a constant-mask skill only costs that
-        row's intra-step speculation (it still advances one token per step), while
-        under-capping a stateful one corrupts constrained output. A row with no
-        active constraint is never stateful and keeps the full multi-token accept.
+        A skill MUST declare its mask precisely via the ``mask_is_stateful``
+        attribute / property on its ``SkillState`` (``True`` => evolving,
+        ``False`` => provably constant) whenever its mask is anything other than
+        a single constant set held for the whole generation; when present that
+        declaration wins. The behavioural fallback below is only a safety net for
+        states that never declare, and it is NOT sufficient on its own for an
+        important class of stateful masks: it inspects the constraint at the run's
+        FIRST position, so it cannot see a mask that is INACTIVE at step start but
+        transitions to ACTIVE within the committed run. Reasoning skills do
+        exactly this -- ``QuerySkillState`` / ``ChatSkillState`` hold no
+        constraint while collecting reasoning (for non-moondream2 query, and for
+        chat, both ``allowed`` and ``suppressed`` are ``None``), then force a
+        ``post_reasoning_prefix`` AFTER the model emits ``answer_id``; if a run
+        committed ``answer_id`` plus following tokens under that None-at-start
+        mask, the post-boundary tokens would be accepted WITHOUT the required
+        prefix constraint. Those states therefore declare ``mask_is_stateful =
+        True`` so they are always capped (see their class comments); the fallback
+        alone would wrongly return ``False`` for them.
+
+        In the absence of a declaration the conservative behavioural rule is: any
+        ACTIVE constraint (a non-empty ``allowed`` whitelist or ``suppressed``
+        blacklist this step) is treated as potentially stateful and capped,
+        because the scheduler cannot prove the set is position-independent without
+        model knowledge. Correctness-first: over-capping a constant-mask skill
+        only costs that row's intra-step speculation (it still advances one token
+        per step), while under-capping a stateful one corrupts constrained
+        output. A row with no active constraint AND no stateful declaration is
+        treated as non-stateful and keeps the full multi-token accept -- which is
+        why a transitions-from-None mask must not rely on the fallback.
         """
         declared = getattr(seq.skill_state, "mask_is_stateful", None)
         if declared is not None:
