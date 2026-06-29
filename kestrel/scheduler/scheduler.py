@@ -937,17 +937,28 @@ class GenerationScheduler:
             # runtime leaves it ``None`` and the id materialises as a plain
             # ``TextToken`` (unchanged).
             admit_side_values = getattr(state, "admit_side_values", None)
-            (typed_first,) = self._materialize_spec_tokens(
-                [lifecycle], [[int(first_token_id)]], admit_side_values
-            )
-            token = typed_first[0]
             # ``admit`` returns the real first-token logprob for a
             # ``return_logprobs`` request (the sampler's selected-token logprob,
             # matching the non-spec prefill path's transferred ``sampled_logprobs``
-            # for token0) and ``None`` otherwise. Stage it through unchanged --
+            # for token0) and ``None`` otherwise. Thread it through the hook so a
+            # spatial admit token (``coord_id`` / ``size_id`` -- point/detect apply
+            # the skill mask before this first sample) gets its coord/size head
+            # logprob folded in, exactly as the non-spec prefill ``post_sample``
+            # path does. ``None`` (no logprobs requested) stays ``None``.
+            admit_logprobs = None if first_logprob is None else [[first_logprob]]
+            (typed_first,), typed_first_logprobs = self._materialize_spec_tokens(
+                [lifecycle], [[int(first_token_id)]], admit_side_values, admit_logprobs
+            )
+            token = typed_first[0]
+            staged_first_logprob = (
+                typed_first_logprobs[0][0]
+                if typed_first_logprobs is not None
+                else first_logprob
+            )
+            # Stage the (spatial-augmented) first-token logprob through unchanged --
             # no 0.0 greedy-approximation placeholder. The macro-step supplies
             # real per-token logprobs for every subsequently committed token.
-            self._spec_stage_token(lifecycle, token, logprob=first_logprob)
+            self._spec_stage_token(lifecycle, token, logprob=staged_first_logprob)
             progressed = True
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
@@ -1147,10 +1158,23 @@ class GenerationScheduler:
         active: List[RequestLifecycle],
         runs: Sequence[Sequence[int]],
         side_values: object | None,
-    ) -> list[list[Token]]:
+        logprobs: Sequence[Sequence[float]] | None = None,
+    ) -> tuple[list[list[Token]], list[list[float]] | None]:
         """Type each sequence's committed run via the runtime hook.
 
         ``runs[i]`` is the committed id list for ``active[i]``.
+
+        ``logprobs`` (optional) is the per-committed-token vocab logprob, parallel
+        to ``runs`` (``logprobs[i][j]`` for ``runs[i][j]``). It is the spec
+        decoder's verify-logit logprob -- the vocab head only. A spatial runtime
+        also has a coord/size head whose logprob the non-spec ``post_sample`` path
+        folds into the token logprob in-place; the spec ``materialize_spec_tokens``
+        hook mirrors that, mutating the flat logprob list to add each spatial
+        position's head logprob. We flatten ``logprobs`` into that hook (sequences-
+        major, parallel to the flat ids), then re-group the (now-augmented) values
+        so the caller stages the combined vocab + coord/size logprob for spatial
+        tokens, matching the non-spec convention. ``None`` (no request wanted
+        logprobs) skips this and returns ``None`` for the regrouped logprobs.
 
         Dispatch is on ``side_values`` (the macro-step's :class:`SpecSideValues`),
         which carries the target's per-committed-position final hidden + sampling
@@ -1173,11 +1197,29 @@ class GenerationScheduler:
           ``materialize_tokens`` path with a ``None`` handle (its plain-text
           branch), matching the non-spec single-token commit.
 
-        Returns the typed tokens re-grouped per sequence (parallel to ``runs``).
+        Returns the typed tokens re-grouped per sequence (parallel to ``runs``)
+        plus the per-sequence logprobs (augmented with the spatial head logprob
+        when a spatial hook ran), or ``None`` for the logprobs when ``logprobs``
+        was ``None``.
         """
         flat_ids: list[int] = [int(t) for run in runs for t in run]
         if not flat_ids:
-            return [[] for _ in runs]
+            empty_lp: list[list[float]] | None = (
+                [[] for _ in runs] if logprobs is not None else None
+            )
+            return [[] for _ in runs], empty_lp
+        # Flatten the per-sequence logprobs parallel to the flat ids. The spec hook
+        # may mutate this list in place to fold in each spatial position's
+        # coord/size head logprob (mirroring the non-spec ``post_sample`` path).
+        flat_logprobs: list[float] | None = None
+        if logprobs is not None:
+            flat_logprobs = [float(lp) for run in logprobs for lp in run]
+            if len(flat_logprobs) != len(flat_ids):
+                raise ValueError(
+                    "_materialize_spec_tokens: logprobs length "
+                    f"{len(flat_logprobs)} != committed token count "
+                    f"{len(flat_ids)}"
+                )
         token_ids_cpu = torch.tensor(flat_ids, dtype=torch.long)
         # ``batch_idx`` parallel to the flattened ids (the spec batch row each
         # committed token belongs to); a spatial hook indexes side-values by the
@@ -1210,24 +1252,36 @@ class GenerationScheduler:
                     "(mirror its non-spec materialize_tokens spatial decode) to "
                     "enable spec for spatial skills."
                 )
-            flat_tokens = spec_hook(token_ids_cpu, active, batch_idx, side_values)
+            # The spatial hook folds each coord/size position's head logprob into
+            # ``flat_logprobs`` in place (no-op when ``flat_logprobs`` is ``None``).
+            flat_tokens = spec_hook(
+                token_ids_cpu, active, batch_idx, side_values, flat_logprobs
+            )
         else:
             # Text-only macro-step: the non-spec hook's ``step_handle is None``
-            # branch (plain text) applies.
+            # branch (plain text) applies. No spatial head, so the vocab logprobs
+            # pass through unchanged.
             flat_tokens = self._materialize_tokens(
                 token_ids_cpu,
                 active,
                 batch_idx,
                 None,
             )
-        # Re-group the flat typed tokens back into per-sequence runs.
+        # Re-group the flat typed tokens (and augmented logprobs) into per-sequence
+        # runs parallel to ``runs``.
         grouped: list[list[Token]] = []
+        grouped_logprobs: list[list[float]] | None = (
+            [] if flat_logprobs is not None else None
+        )
         cursor = 0
         for run in runs:
             n = len(run)
             grouped.append(list(flat_tokens[cursor:cursor + n]))
+            if grouped_logprobs is not None:
+                assert flat_logprobs is not None
+                grouped_logprobs.append(list(flat_logprobs[cursor:cursor + n]))
             cursor += n
-        return grouped
+        return grouped, grouped_logprobs
 
     def _commit_spec(self, pending) -> None:
         """Commit one previously-launched spec macro-step (depth-1).
@@ -1248,7 +1302,16 @@ class GenerationScheduler:
         # Type the whole step's committed ids up front (coord/size via the
         # runtime hook using ``side_values``), then stage each typed token below
         # so a mid-run EOS still drops the trailing typed tokens correctly.
-        typed = self._materialize_spec_tokens(active, tokens, side_values)
+        # Passing ``logprobs`` lets the spatial hook fold each coord/size head
+        # logprob into the staged value (mirroring the non-spec ``post_sample``
+        # path); ``typed_logprobs`` is the augmented per-sequence logprobs (or
+        # ``None`` when no request wanted logprobs), which we stage instead of the
+        # raw vocab-only ``logprobs``.
+        typed, typed_logprobs = self._materialize_spec_tokens(
+            active, tokens, side_values, logprobs
+        )
+        if typed_logprobs is not None:
+            logprobs = typed_logprobs
         for i, (seq, typed_run) in enumerate(zip(active, typed)):
             seq.inflight_refs -= 1
             if seq.finalized:

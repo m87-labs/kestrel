@@ -1032,6 +1032,7 @@ class MoondreamRuntime:
             sequences: Sequence,
             batch_idx: Tensor,
             side_values: object,
+            token_logprobs: list[float] | None = None,
         ) -> list[Token]:
             """Type a spec macro-step's committed run into coord/size tokens.
 
@@ -1052,6 +1053,19 @@ class MoondreamRuntime:
             committed hiddens into one ``[total, hidden_dim]`` batch, decode
             coord/size in a single ``compute_spatial_values`` call under each
             sequence's sampling knobs, then render the typed tokens.
+
+            ``token_logprobs`` (optional) is the flat per-committed-position
+            vocab-token logprob list (parallel to ``token_ids_cpu``) the scheduler
+            staged from the spec decoder's verify logits. When supplied, it is
+            mutated **in place** so each spatial position's entry gains its
+            coord/size head logprob -- mirroring the non-spec ``post_sample`` path,
+            where ``compute_spatial_values`` adds the spatial head's selected-bin
+            logprob to the vocab logprob in-place. The spec decoder only gathers
+            the vocab logprob (it never runs the spatial head), so without this the
+            scheduler would under-report logprobs for ``coord_id`` / ``size_id``
+            tokens (and the spatial admit token, which routes through this hook).
+            ``None`` (no request wanted logprobs) leaves the spatial decode purely
+            value-producing, exactly as before.
             """
             from kestrel.runtime.spec import SpecSideValues
 
@@ -1117,6 +1131,26 @@ class MoondreamRuntime:
             top_ps = torch.cat(top_p_parts, dim=0)
             token_ids = flat_ids.to(device=device, dtype=torch.long)
 
+            # When the request wants logprobs, seed a packed device buffer with the
+            # per-position vocab logprobs (already in the packed sequences-major
+            # order ``hidden_last`` is built in -- ``hidden_rows`` and ``flat_ids``
+            # share that order, and ``token_logprobs`` is parallel to
+            # ``token_ids_cpu`` / ``flat_ids``) so ``compute_spatial_values`` adds
+            # each spatial position's coord/size head logprob in-place, exactly like
+            # the non-spec ``post_sample`` path. Then copy the combined values back
+            # into the caller's flat list so the scheduler stages the combined
+            # vocab + spatial-head logprob.
+            logprobs_buf: Tensor | None = None
+            if token_logprobs is not None:
+                if len(token_logprobs) != total:
+                    raise ValueError(
+                        "materialize_spec_tokens: token_logprobs length "
+                        f"{len(token_logprobs)} != flat token count {total}"
+                    )
+                logprobs_buf = torch.tensor(
+                    token_logprobs, device=device, dtype=torch.float32
+                )
+
             coord_out = torch.empty((total, 1), device=device, dtype=torch.float32)
             size_out = torch.empty((total, 2), device=device, dtype=torch.float32)
             compute_spatial_values(
@@ -1126,13 +1160,17 @@ class MoondreamRuntime:
                 spatial_tables,
                 temperatures=temperatures,
                 top_ps=top_ps,
-                token_logprobs=None,
+                token_logprobs=logprobs_buf,
                 coord_id=coord_id,
                 size_id=size_id,
                 out_coord=coord_out,
                 out_size=size_out,
                 rng=spatial_rng,
             )
+            if logprobs_buf is not None:
+                assert token_logprobs is not None
+                combined = logprobs_buf.cpu().tolist()
+                token_logprobs[:] = combined
             from kestrel.scheduler.tokens import render_tokens_from_packed
             return render_tokens_from_packed(
                 token_ids_cpu,

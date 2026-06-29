@@ -665,6 +665,82 @@ def test_spec_admit_no_logprob_when_not_requested() -> None:
     assert req.lifecycle.logprobs == []
 
 
+def test_spec_spatial_logprob_folds_head_logprob_into_staged() -> None:
+    """P2 regression: the scheduler stages the spatial-head-augmented logprob.
+
+    When a macro-step emits ``SpecSideValues`` (spatial runtime) and the request
+    wants logprobs, the scheduler must hand the spec decoder's *vocab* logprobs to
+    ``materialize_spec_tokens`` and stage the value the hook returns -- which a
+    spatial runtime augments with the coord/size head logprob in place. This is
+    the wiring the P2 fixed: previously the hook got ``token_logprobs=None`` and
+    the scheduler staged only the vocab logprob (under-reporting spatial tokens,
+    including the admit token, which routes through the same hook).
+
+    A fake spatial hook here adds a fixed ``-0.5`` head delta to every position
+    (standing in for the real coord/size head logprob) and records the vocab
+    logprobs it received. We assert: (a) the hook was handed the spec decoder's
+    vocab logprobs (parallel to the committed ids), and (b) every staged logprob
+    -- the admit token AND each committed token -- is the vocab value PLUS the
+    head delta (not the bare vocab value).
+    """
+    from kestrel.runtime.sampling import SamplingHooks
+
+    HEAD_DELTA = -0.5
+    side_values = object()
+    received: list[list[float]] = []
+
+    @dataclass
+    class _TypedToken:
+        token_id: int
+
+    def materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, sv, token_logprobs=None
+    ):
+        ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
+        if token_logprobs is not None:
+            received.append(list(token_logprobs))
+            # Fold a per-position "spatial head" logprob in place, exactly as the
+            # real Moondream hook folds the coord/size head logprob.
+            for k in range(len(token_logprobs)):
+                token_logprobs[k] += HEAD_DELTA
+        return [_TypedToken(token_id=t) for t in ids]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+        emit_logprobs=True,
+        first_logprobs={0: -0.5},  # real admit vocab logprob
+        side_values=side_values,
+        admit_side_values=side_values,  # route the admit token through the hook
+    )
+    rt = _spec_runtime(dec)
+    rt.sampling_hooks = SamplingHooks(
+        materialize_spec_tokens=materialize_spec_tokens
+    )
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3, return_logprobs=True)
+
+    assert sched._spec_admit() is True
+    while sched._spec_decode_step():
+        pass
+
+    # The hook was handed the spec decoder's vocab logprobs: the admit token
+    # (-0.5) on its own, then the macro-step's committed-token vocab logprobs
+    # (-12.0, -13.0 == -(token_id)).
+    assert [-0.5] in received
+    assert [-12.0, -13.0] in received
+    # Every staged logprob is vocab + head delta (folded by the hook), not the
+    # bare vocab value the spec decoder gathered.
+    assert req.lifecycle.logprobs == pytest.approx(
+        [-0.5 + HEAD_DELTA, -12.0 + HEAD_DELTA, -13.0 + HEAD_DELTA]
+    )
+    completed = sched.pop_completed()
+    assert completed[0].logprobs == pytest.approx(
+        [-0.5 + HEAD_DELTA, -12.0 + HEAD_DELTA, -13.0 + HEAD_DELTA]
+    )
+
+
 def test_spec_admit_applies_one_shot_suppression() -> None:
     """Regression for codex finding: one-shot suppression reaches the admit sample.
 
@@ -734,7 +810,9 @@ def test_spec_admit_types_admit_token_via_materialize_hook() -> None:
     class _TypedToken:
         token_id: int
 
-    def materialize_spec_tokens(token_ids_cpu, sequences, batch_idx, side_values):
+    def materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, side_values, token_logprobs=None
+    ):
         ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
         calls.append({"side_values": side_values, "ids": ids})
         return [_TypedToken(token_id=int(t)) for t in ids]
@@ -907,7 +985,9 @@ def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:
     class _TypedToken:
         token_id: int
 
-    def materialize_spec_tokens(token_ids_cpu, sequences, batch_idx, side_values):
+    def materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, side_values, token_logprobs=None
+    ):
         ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
         calls.append({"side_values": side_values, "ids": ids})
         return [_TypedToken(token_id=int(t)) for t in ids]
@@ -1535,6 +1615,144 @@ def test_moondream_materialize_spec_tokens_types_coord_size() -> None:
     # Seq B: its coord uses seq B's OWN hidden row (0.3), not seq A's (0.7).
     assert isinstance(tokens[3], CoordToken)
     assert tokens[3].pos == pytest.approx(b_coord_bin / (coord_bins - 1))
+
+
+def test_moondream_materialize_spec_tokens_folds_spatial_head_logprob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 regression: a spatial spec token requesting logprobs reports the
+    coord/size head logprob *added* to the vocab logprob, not the vocab logprob
+    alone -- matching the non-spec ``post_sample`` convention.
+
+    The spec decoder only gathers the vocab-token logprob (it never runs the
+    spatial head), so the scheduler hands ``materialize_spec_tokens`` the flat
+    per-committed-position vocab logprobs and the hook must fold each spatial
+    position's coord/size head logprob into them in place (exactly as the non-spec
+    path's ``compute_spatial_values`` does). We patch ``sample_step_from_logits``
+    (the spatial sampler) to emit scripted per-head logprobs -- the same hermetic
+    technique ``tests/scheduler/test_logprobs.py`` uses for the non-spec path -- so
+    the expected combined value is exact and CPU-deterministic. We assert:
+
+    * a ``coord_id`` position: ``vocab + coord_head`` logprob,
+    * a ``size_id`` position: ``vocab + width_head + height_head`` logprob,
+    * a plain text position: vocab logprob unchanged (no spatial head),
+    * the hook returns the same per-token combined values to the scheduler.
+    """
+    import torch
+
+    from kestrel.models.moondream.runtime import (
+        CoordToken,
+        MoondreamRuntime,
+        SizeToken,
+        TextToken,
+    )
+    from kestrel.runtime.spec import SpecSideValues
+
+    coord_bins, size_bins = 11, 8
+    tables, hidden_dim = _synthetic_spatial_tables(coord_bins, size_bins)
+    coord_id, size_id = 5000, 5001
+
+    stub = SimpleNamespace(
+        config=SimpleNamespace(
+            tokenizer=SimpleNamespace(coord_id=coord_id, size_id=size_id)
+        ),
+        spatial_tables=tables,
+        _pending_coord_values=torch.zeros(8, 1),
+        _pending_size_values=torch.zeros(8, 2),
+        _copy_stream=None,
+        _spatial_rng=None,
+    )
+    hooks = MoondreamRuntime.sampling_hooks.func(stub)
+
+    # One sequence committing 3 tokens: [coord, size, text]. Greedy (temp 0), but
+    # ``token_logprobs`` is set so ``compute_spatial_values`` still runs the
+    # sampler (and thus the spatial-head logprob fold) rather than the pure-argmax
+    # branch -- which is exactly the path that was passing ``token_logprobs=None``.
+    seq = SimpleNamespace(
+        request=SimpleNamespace(temperature=0.0, top_p=1.0),
+        state=SimpleNamespace(batch_idx=300),
+    )
+    text_id = 42
+    flat_ids = [coord_id, size_id, text_id]
+    token_ids_cpu = torch.tensor(flat_ids, dtype=torch.long)
+    batch_idx = torch.tensor([300, 300, 300], dtype=torch.long)
+    total = len(flat_ids)
+
+    coord_bin, w_bin, h_bin = 7, 2, 5
+    hidden = torch.zeros(1, total, hidden_dim, dtype=torch.float32)
+    hidden[0, 0] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=coord_bin, width=0, height=0
+    )
+    hidden[0, 1] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=0, width=w_bin, height=h_bin
+    )
+    # Text position: hidden would decode to a valid bin, but the head logprob must
+    # NOT be added (it is not a coord/size id).
+    hidden[0, 2] = _encode_spatial_hidden(
+        coord_bins, size_bins, hidden_dim, coord=9, width=7, height=7
+    )
+
+    side_values = SpecSideValues(
+        hidden=hidden,
+        temperatures=torch.zeros(1, dtype=torch.float32),
+        top_ps=torch.ones(1, dtype=torch.float32),
+        counts=None,
+    )
+
+    # Scripted spatial-head logprobs. ``compute_spatial_values`` calls the sampler
+    # twice: first coord (batch == total), then size (batch == total*2, the
+    # width rows then the height rows stacked). Return the argmax bins (so decoded
+    # values stay consistent with the one-hot hidden) and write known logprobs.
+    coord_head = [-0.10, -0.20, -0.30]               # per position
+    width_head = [-0.40, -0.50, -0.60]               # per position
+    height_head = [-0.70, -0.80, -0.90]              # per position
+
+    def fake_sample_step_from_logits(
+        logits, temperatures, top_p, *, generator=None, logprobs_out=None
+    ):
+        bins = torch.argmax(logits, dim=-1)
+        if logits.shape[0] == total:  # coord head
+            if logprobs_out is not None:
+                logprobs_out.copy_(torch.tensor(coord_head, dtype=torch.float32))
+        else:  # size head: [width(total) | height(total)]
+            if logprobs_out is not None:
+                logprobs_out.copy_(
+                    torch.tensor(width_head + height_head, dtype=torch.float32)
+                )
+        return bins
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.spatial.sample_step_from_logits",
+        fake_sample_step_from_logits,
+    )
+
+    # Vocab logprobs the spec decoder staged (parallel to ``flat_ids``). The hook
+    # mutates this list in place to fold in the spatial head logprobs.
+    vocab_logprobs = [-1.0, -2.0, -3.0]
+    token_logprobs = list(vocab_logprobs)
+
+    tokens = hooks.materialize_spec_tokens(
+        token_ids_cpu, [seq], batch_idx, side_values, token_logprobs
+    )
+
+    # Token typing is unaffected by the logprob threading.
+    assert isinstance(tokens[0], CoordToken)
+    assert isinstance(tokens[1], SizeToken)
+    assert isinstance(tokens[2], TextToken)
+    assert tokens[2].token_id == text_id
+
+    # coord: vocab + coord_head; size: vocab + width_head + height_head; text: vocab.
+    expected = [
+        vocab_logprobs[0] + coord_head[0],
+        vocab_logprobs[1] + width_head[1] + height_head[1],
+        vocab_logprobs[2],  # text id -- no spatial head added
+    ]
+    assert token_logprobs == pytest.approx(expected)
+    # The spatial positions are strictly more negative than the vocab-only value
+    # (under-reporting would have left them at the vocab logprob).
+    assert token_logprobs[0] < vocab_logprobs[0]
+    assert token_logprobs[1] < vocab_logprobs[1]
+    assert token_logprobs[2] == pytest.approx(vocab_logprobs[2])
 
 
 def test_moondream_materialize_spec_tokens_honors_explicit_counts() -> None:
