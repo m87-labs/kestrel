@@ -1429,10 +1429,13 @@ def test_spec_admit_zero_token_request_admits_and_samples_nothing() -> None:
     assert dec.admitted == []
     assert dec.retired == []
     assert rt.active_sequences == {}
-    # Not queued into running; no sequence_state attached.
+    # Not queued into running. A metrics-only ``SequenceState`` is attached so
+    # ``build_metrics`` reports the KV prompt length (no spec pool row backs it:
+    # ``batch_idx == -1`` and ``_release_sequence`` early-returns for spec).
     assert len(sched.running) == 0
     assert len(sched.waiting) == 0
-    assert req.lifecycle.sequence_state is None
+    assert req.lifecycle.sequence_state is not None
+    assert req.lifecycle.sequence_state.batch_idx == -1
     # No token sampled/staged.
     assert list(req.lifecycle.skill_state.tokens) == []
     # Completed immediately as a length-capped (0-token) result.
@@ -1440,9 +1443,59 @@ def test_spec_admit_zero_token_request_admits_and_samples_nothing() -> None:
     assert [c.request_id for c in completed] == [0]
     assert completed[0].finish_reason == "length"
     assert list(completed[0].tokens) == []
-    # build_metrics falls back to request.prompt_length (no sequence_state),
-    # mirroring the non-spec zero-length path.
+    # Text-only zero-token request (image_length == 0): the recorded KV prompt
+    # length equals request.prompt_length, so prompt_tokens is unchanged.
     assert completed[0].metrics.prompt_tokens == req.prompt_length
+
+
+def test_spec_admit_zero_token_image_request_reports_image_prompt_tokens() -> None:
+    """Regression for the 0-token spec image-prompt metrics under-report (P3).
+
+    The ``max_new_tokens <= 0`` spec fast-path finalizes WITHOUT calling
+    ``decoder.admit`` (no pool row), so it does not go through the regular spec
+    admit path that records ``prompt_length = len(prompt_tokens) + image_length``.
+    Earlier it left ``sequence_state`` unset, so ``build_metrics`` fell back to
+    the TEXT-ONLY ``request.prompt_length`` and under-reported ``prompt_tokens``
+    by the image KV prefix -- even though the request carried image context. The
+    fast-path now attaches a metrics-only ``SequenceState`` whose KV prompt
+    length includes ``image_length`` (matching the regular spec path and the
+    non-spec 0-length path, whose ``prepare_sequence`` state also includes the
+    image prefix). Assert a zero-token IMAGE request reports
+    ``prompt_tokens == prompt_len + image_length``.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    prompt_len = 3
+    image_kv = 729  # a single-image prefix (image_prefix_length) worth of KV
+    req = _enqueue(
+        sched, 0, prompt_len=prompt_len, max_new=0, image=object(),
+        image_length=image_kv,
+    )
+
+    assert sched._spec_admit() is True
+    # No spec row consumed (admit never called), nothing retired, no active row.
+    assert dec.admitted == []
+    assert dec.retired == []
+    assert rt.active_sequences == {}
+    assert len(sched.running) == 0
+    assert len(sched.waiting) == 0
+    # Metrics-only state carries the image-inclusive KV prompt length; no pool
+    # row backs it (batch_idx == -1).
+    state = req.lifecycle.sequence_state
+    assert state is not None
+    assert state.batch_idx == -1
+    assert state.prompt_length == prompt_len + image_kv
+    assert state.image_length == image_kv
+    # Completed immediately as a length-capped (0-token) result.
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "length"
+    assert list(completed[0].tokens) == []
+    # build_metrics reports the FULL (image-inclusive) prompt length, matching
+    # the regular prefill path -- not the bare text-only request.prompt_length.
+    assert completed[0].metrics.prompt_tokens == prompt_len + image_kv
+    assert completed[0].metrics.prompt_tokens != req.prompt_length
 
 
 def test_spec_drain_pipeline_commits_pending_spec_before_pause() -> None:
@@ -2193,9 +2246,12 @@ def test_spec_admit_zero_token_request_bypasses_saturated_batch() -> None:
     # was never called for it (row 99's id is not among the admitted pool rows;
     # admitted rows are the 4 real ones [0..3]).
     assert 99 not in dec.admitted
-    # No spec row / sequence_state assigned (the ``.state`` property would raise
-    # if ``sequence_state`` were unset, so assert the underlying field directly).
-    assert rz.lifecycle.sequence_state is None
+    # No spec POOL ROW is assigned (``decoder.admit`` never ran), but a
+    # metrics-only ``SequenceState`` is attached so ``build_metrics`` reports the
+    # KV prompt length; it is unbacked (``batch_idx == -1``).
+    assert rz.lifecycle.sequence_state is not None
+    assert rz.lifecycle.sequence_state.batch_idx == -1
+    assert rz.lifecycle.sequence_state.prompt_length == rz.prompt_length
     assert all(r.request_id != 99 for r in sched.waiting)
     assert all(lc.request.request_id != 99 for lc in sched.running)
     completed = {c.request_id: c for c in sched.pop_completed()}
@@ -2232,7 +2288,9 @@ def test_spec_admit_zero_token_request_bypasses_saturated_batch() -> None:
     # The zero-token request finalized despite the empty pool: not waiting, not
     # running, never admitted.
     assert 77 not in dec2.admitted
-    assert rz2.lifecycle.sequence_state is None
+    assert rz2.lifecycle.sequence_state is not None
+    assert rz2.lifecycle.sequence_state.batch_idx == -1
+    assert rz2.lifecycle.sequence_state.prompt_length == rz2.prompt_length
     assert all(r.request_id != 77 for r in sched2.waiting)
     completed2 = {c.request_id: c for c in sched2.pop_completed()}
     assert 77 in completed2

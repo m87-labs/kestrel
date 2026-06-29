@@ -624,12 +624,34 @@ class GenerationScheduler:
                 break
             lifecycle = request.lifecycle
             self.waiting.remove(request)
-            # No spec row, so no ``sequence_state``; ``build_metrics`` then
-            # falls back to ``request.prompt_length`` exactly like the
-            # non-spec 0-length path (which also leaves ``sequence_state``
-            # unset). ``_finalize_sequence`` -> ``_release_sequence``
-            # early-returns for a spec runtime before touching the (absent)
-            # state, so this is safe with ``sequence_state is None``.
+            # No spec row is consumed (``decoder.admit`` is never called), but
+            # this request still carried a (possibly image-bearing) prompt, so
+            # record a minimal ``SequenceState`` purely to carry the KV prompt
+            # length for metrics -- mirroring BOTH the regular spec admit path
+            # (which sets ``prompt_length = len(prompt_tokens) + image_length``)
+            # and the non-spec 0-length path (which sets ``sequence_state`` from
+            # ``prepare_sequence``, whose ``prompt_length`` includes the image
+            # KV prefix). Without it ``build_metrics`` would fall back to the
+            # text-only ``request.prompt_length`` and under-report
+            # ``prompt_tokens`` by ``request.image_length`` for a zero-token
+            # IMAGE request. The KV prompt length is the full prompt --
+            # ``request.prompt_length + request.image_length`` (the same
+            # convention as ``request.target_length``); a zero-token request can
+            # carry no generated prefix, so the typed prefill length equals
+            # ``request.prompt_length`` here. ``batch_idx == -1`` because no pool
+            # row backs this state; it is never dereferenced --
+            # ``_finalize_sequence`` -> ``_release_sequence`` early-returns for a
+            # spec runtime before touching ``batch_idx``, and a zero-token
+            # request never enters the running/active decode paths that read it.
+            kv_prompt_length = request.prompt_length + request.image_length
+            lifecycle.sequence_state = SequenceState(
+                batch_idx=-1,
+                length=kv_prompt_length,
+                max_length=request.target_length,
+                prompt_length=kv_prompt_length,
+                image_length=request.image_length,
+                lora_slot=request.lora_slot,
+            )
             lifecycle.prefill_started_at = time.perf_counter()
             lifecycle.prefill_completed_at = lifecycle.prefill_started_at
             self._finalize_sequence(lifecycle, "length")
