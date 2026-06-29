@@ -43,34 +43,68 @@ class _RecordingState(SkillState):
 class _FakeDecoder:
     """Scriptable ``SpecDecoder`` for the scheduler test (no GPU).
 
-    ``admit`` hands back a fixed first token and assigns the next free pool row.
-    ``step`` pops a scripted ``(tokens, accept)`` plan per call from each row's
-    queue (rows advance by *different* amounts to exercise ragged advance).
+    ``admit`` hands back a fixed first token and assigns the next free pool row,
+    recording the image / skill-mask / sampling kwargs the scheduler forwards so
+    tests can assert the spec path passes a request's full context through (no
+    text-only/unconstrained fallback). ``step`` pops a scripted ``tokens`` plan
+    per call from each row's queue (rows advance by *different* amounts to
+    exercise ragged advance) and, when ``emit_logprobs`` is set, returns a
+    parallel per-committed-token logprob list.
     """
 
     num_speculative_tokens = 3
 
-    def __init__(self, *, n_rows: int, plans: dict, first_tokens: dict) -> None:
+    def __init__(
+        self,
+        *,
+        n_rows: int,
+        plans: dict,
+        first_tokens: dict,
+        emit_logprobs: bool = False,
+        side_values: object | None = None,
+    ) -> None:
         self._free = list(range(n_rows))
         self._row_of: dict[int, int] = {}
         self._plans = plans            # row -> list[list[int]] per step
         self._first = first_tokens     # row -> first token id
+        self._emit_logprobs = emit_logprobs
+        self._side_values = side_values
         self.admitted: list[int] = []
         self.retired: list[int] = []
+        # admit kwargs recorded per row.
+        self.admit_kwargs: dict[int, dict] = {}
 
     @property
     def free_slots(self) -> int:
         return len(self._free)
 
-    def admit(self, state, prompt_token_ids):
+    def admit(
+        self,
+        state,
+        prompt_token_ids,
+        *,
+        image=None,
+        allowed_token_ids=None,
+        suppressed_token_ids=None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ):
         row = self._free.pop(0)
         self._row_of[id(state)] = row
         state.batch_idx = 100 + row
         self.admitted.append(row)
+        self.admit_kwargs[row] = {
+            "image": image,
+            "allowed_token_ids": allowed_token_ids,
+            "suppressed_token_ids": suppressed_token_ids,
+            "temperature": temperature,
+            "top_p": top_p,
+            "return_logprobs": getattr(state, "return_logprobs", None),
+        }
         return self._first[row]
 
     def step(self, states):
-        tokens, accepts = [], []
+        tokens, accepts, logprobs = [], [], []
         for s in states:
             row = self._row_of[id(s)]
             plan = self._plans[row]
@@ -81,7 +115,15 @@ class _FakeDecoder:
             nxt = plan.pop(0) if plan else [0]
             tokens.append(list(nxt))
             accepts.append(len(nxt) - 1)
-        return SpecStepResult(tokens=tokens, accept_counts=accepts)
+            # Scripted logprob per committed token: -(token_id) keeps it
+            # deterministic and easy to assert.
+            logprobs.append([-float(t) for t in nxt])
+        return SpecStepResult(
+            tokens=tokens,
+            accept_counts=accepts,
+            logprobs=logprobs if self._emit_logprobs else None,
+            side_values=self._side_values,
+        )
 
     def retire(self, state) -> None:
         self.retired.append(self._row_of.pop(id(state)))
@@ -106,6 +148,10 @@ def _enqueue(
     adapter: str | None = None,
     lora_slot_ready: bool = True,
     return_logprobs: bool | None = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    image: object | None = None,
+    skill_state: SkillState | None = None,
 ):
     req = GenerationRequest(
         request_id=rid,
@@ -116,8 +162,14 @@ def _enqueue(
         request_context=object(),
         adapter=adapter,
         return_logprobs=return_logprobs,
+        temperature=temperature,
+        top_p=top_p,
+        image=image,
     )
-    lc = RequestLifecycle(request=req, skill_state=_RecordingState(req))
+    lc = RequestLifecycle(
+        request=req, skill_state=skill_state or _RecordingState(req)
+    )
+    lc.has_image = image is not None
     lc.crops_ready = True
     lc.lora_slot_ready = lora_slot_ready
     lc.transition(RequestPhase.READY_FOR_PREFILL)
@@ -379,31 +431,128 @@ def test_spec_admit_defers_when_lora_slots_exhausted() -> None:
     assert sched.pop_completed() == []
 
 
-def test_spec_admit_rejects_logprobs_request_cleanly() -> None:
-    """Regression for the spec+logprobs crash (codex finding @ L578).
+def test_spec_admit_and_step_stage_logprobs() -> None:
+    """``return_logprobs`` is served on the spec path (no clean-reject fallback).
 
-    A ``return_logprobs=True`` request on the spec path must fail just that
-    request (clean error result + row retired) instead of raising a
-    scheduler-wide exception when ``stage_token`` sees a None logprob.
+    The spec macro-step now supplies per-committed-token logprobs
+    (``SpecStepResult.logprobs``), so a ``return_logprobs=True`` request is
+    admitted and its logprobs are staged through ``stage_token`` like the
+    non-spec single-token path -- not rejected. ``admit`` also learns the request
+    wants logprobs (via ``state.return_logprobs``) so ``step`` knows to gather
+    them.
     """
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+        emit_logprobs=True,
+    )
+    rt = _spec_runtime(dec)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3, return_logprobs=True)
+
+    # Admission succeeds (not rejected) and tells the decoder logprobs are wanted.
+    assert sched._spec_admit() is True
+    assert dec.admitted == [0]
+    assert dec.admit_kwargs[0]["return_logprobs"] is True
+    assert req.lifecycle.finished is False
+    assert len(sched.running) == 1
+
+    # Drive the depth-1 pipeline to quiescence; the scripted step commits
+    # tokens 12, 13 with logprobs -12.0, -13.0.
+    while sched._spec_decode_step():
+        pass
+
+    assert [int(t.token_id) for t in req.lifecycle.skill_state.tokens] == [11, 12, 13]
+    # First (bonus) token from admit carries the greedy-bonus logprob (0.0);
+    # the macro-step supplies the real logprobs for the committed tokens.
+    assert req.lifecycle.logprobs == [0.0, -12.0, -13.0]
+    completed = sched.pop_completed()
+    assert completed[0].logprobs == [0.0, -12.0, -13.0]
+
+
+def test_spec_admit_forwards_image_mask_and_sampling_params() -> None:
+    """The spec path passes a request's full context into ``admit`` (no fallback).
+
+    Regression for the three newer codex findings (image @ L615, masks/sampling
+    @ L761): image requests must prefill *with the image*, skill masks must
+    constrain the drafter+verify, and temperature/top_p must reach the decoder --
+    not be silently dropped to a text-only / unconstrained / greedy path.
+    """
+
+    class _MaskedState(_RecordingState):
+        def allowed_token_ids(self, runtime: object):
+            return [12, 13]
+
+        def suppressed_token_ids(self, runtime: object):
+            return [99]
+
     dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
     rt = _spec_runtime(dec)
     sched = _make_scheduler(rt)
-    req = _enqueue(sched, 0, prompt_len=3, max_new=8, return_logprobs=True)
+    img = object()
+    # Build the request, then bind a masked skill-state to it (the state needs
+    # the real request so its mask methods see the right context).
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, temperature=0.7, top_p=0.9, image=img
+    )
+    masked_state = _MaskedState(req)
+    req.lifecycle.skill_state = masked_state
+    req.skill_state = masked_state
 
-    # Must not raise.
     assert sched._spec_admit() is True
-    # Request failed cleanly: errored result, not pushed to running, row retired.
-    assert req.lifecycle.finished is True
-    assert req.lifecycle.finish_reason == "error"
-    assert len(sched.running) == 0
-    assert dec.retired == [0]
-    assert rt.active_sequences == {}
-    completed = sched.pop_completed()
-    assert [c.request_id for c in completed] == [0]
-    assert completed[0].finish_reason == "error"
-    assert "error" in completed[0].output
+    kw = dec.admit_kwargs[0]
+    assert kw["image"] is img
+    assert list(kw["allowed_token_ids"]) == [12, 13]
+    assert list(kw["suppressed_token_ids"]) == [99]
+    assert kw["temperature"] == 0.7
+    assert kw["top_p"] == 0.9
 
-    # And the spec decode loop stays healthy afterward (no leaked pending step).
-    assert sched._spec_decode_step() is False
-    assert sched.has_pending_work() is False
+
+def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:
+    """Committed ids are typed via the runtime ``materialize_tokens`` hook.
+
+    Regression for typed-token finding @ L792: the spec commit must route the
+    committed ids (+ ``SpecStepResult.side_values``) through the runtime hook so a
+    spatial runtime types coord/size ids -- not hardcode ``TextToken``. Stubs the
+    hook to wrap every committed id and asserts the macro-step's ``side_values``
+    reached it.
+    """
+    sentinel_side_values = object()
+    calls: list[dict] = []
+
+    @dataclass
+    class _TypedToken:
+        token_id: int
+
+    def materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle):
+        ids = [int(t) for t in token_ids_cpu.view(-1).tolist()]
+        calls.append({"step_handle": step_handle, "ids": ids})
+        return [_TypedToken(token_id=int(t)) for t in ids]
+
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 13]]},  # admit(1) + 2 == max_new=3 -> finishes here
+        side_values=sentinel_side_values,
+    )
+    rt = _spec_runtime(dec)
+    from kestrel.runtime.sampling import SamplingHooks
+
+    # Hooks are read at scheduler construction, so install before _make_scheduler.
+    rt.sampling_hooks = SamplingHooks(materialize_tokens=materialize_tokens)
+    sched = _make_scheduler(rt)
+    req = _enqueue(sched, 0, prompt_len=3, max_new=3)
+    sched._spec_admit()
+    while sched._spec_decode_step():
+        pass
+
+    # The runtime hook typed the committed ids (12, 13) and was handed the
+    # macro-step's side_values as its opaque step-handle.
+    real = next(c for c in calls if c["ids"] == [12, 13])
+    assert real["step_handle"] is sentinel_side_values
+    staged = req.lifecycle.skill_state.tokens
+    # token 11 is the admit bonus (TextToken); 12/13 come from the typed hook.
+    assert isinstance(staged[1], _TypedToken)
+    assert isinstance(staged[2], _TypedToken)
+    assert [int(t.token_id) for t in staged] == [11, 12, 13]

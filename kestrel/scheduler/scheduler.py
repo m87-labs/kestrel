@@ -610,9 +610,46 @@ class GenerationScheduler:
                 prompt_length=len(prompt_ids),
                 lora_slot=request.lora_slot,
             )
+            # The spec decoder reads ``return_logprobs`` off the state to decide
+            # whether ``step`` computes per-committed-token logprobs for this row
+            # (matching the non-spec sampler, which gates the logprob gather on
+            # the request). ``SequenceState`` is a plain dataclass, so attach it
+            # as an extra attribute the decoder picks up via ``getattr``.
+            state.return_logprobs = request.return_logprobs is True
+
+            # Run the skill's prefill hook BEFORE building the mask + admitting:
+            # ``admit`` prefills *and* samples the first (bonus) token in one
+            # call, so the row's skill mask has to be installed before that
+            # sample -- and some skills (e.g. query) initialise the ids their
+            # ``allowed_token_ids`` depends on inside ``on_prefill``. The hook
+            # only reads ``runtime.prompt_template`` (no dependency on the
+            # forward having run), so running it here is safe.
+            request.skill_state.on_prefill(self.runtime)
+
+            # Per-sequence constrained-decode mask (skill whitelist/blacklist),
+            # forwarded into ``admit`` so the spec path constrains the drafter +
+            # verify exactly like the non-spec sampler's whitelist-then-blacklist
+            # -- no gating to a text-only/unconstrained fallback. ``None`` leaves
+            # the row unmasked.
+            allowed_token_ids = request.skill_state.allowed_token_ids(self.runtime)
+            suppressed_token_ids = request.skill_state.suppressed_token_ids(
+                self.runtime
+            )
             try:
                 with torch.inference_mode():
-                    first_token_id = decoder.admit(state, prompt_ids)
+                    # Pass the request's image (image prefill: vision block + KV
+                    # prefix), skill mask, and sampling params (temperature/top_p)
+                    # through to ``admit`` so image + constrained + non-greedy
+                    # requests run on the spec path with no fallback.
+                    first_token_id = decoder.admit(
+                        state,
+                        prompt_ids,
+                        image=request.image,
+                        allowed_token_ids=allowed_token_ids,
+                        suppressed_token_ids=suppressed_token_ids,
+                        temperature=float(request.temperature),
+                        top_p=float(request.top_p),
+                    )
             except Exception as exc:
                 if lifecycle.lora_slot_ready and request.lora_slot:
                     # Release the LoRA slot we acquired for this failed admission
@@ -630,33 +667,18 @@ class GenerationScheduler:
             lifecycle.sequence_state = state
             lifecycle.prefill_completed_at = time.perf_counter()
             self.runtime.active_sequences[state.batch_idx] = state
-            request.skill_state.on_prefill(self.runtime)
-
-            # TODO(spec-logprobs): the spec macro-step does not yet supply
-            # per-token logprobs (``admit`` returns only a token id and
-            # ``SpecStepResult`` carries none). Until the speculator branch
-            # populates them on the compute side, a ``return_logprobs`` request
-            # cannot be served on the spec path. Reject just that request here --
-            # cleanly retiring the row/slot ``admit`` allocated -- instead of
-            # letting ``stage_token`` raise a scheduler-wide exception on a None
-            # logprob. Once the macro-step provides logprobs, stage them through
-            # ``_spec_stage_token`` like the non-spec path.
-            if request.return_logprobs is True:
-                self._fail_admitted_spec_request(
-                    decoder,
-                    lifecycle,
-                    RuntimeError(
-                        "Speculative decoding does not yet support logprobs; "
-                        "disable speculation for return_logprobs requests."
-                    ),
-                )
-                progressed = True
-                continue
 
             # Stage the first (prefill/bonus) token exactly like the non-spec
-            # prefill path: consume_step + streaming + finish check.
+            # prefill path: consume_step + streaming + finish check. ``admit``
+            # returns the greedy/bonus token id (it does not type the token or
+            # return a logprob), so the first token is a ``TextToken`` and, for a
+            # ``return_logprobs`` request, carries the greedy-bonus logprob (0.0
+            # under the non-spec sampler's greedy convention -- the bonus token
+            # is the argmax of the prefill logits). The macro-step supplies real
+            # per-token logprobs for every subsequently committed token.
             token = TextToken(token_id=int(first_token_id))
-            self._spec_stage_token(lifecycle, token, logprob=None)
+            first_logprob = 0.0 if request.return_logprobs is True else None
+            self._spec_stage_token(lifecycle, token, logprob=first_logprob)
             progressed = True
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
@@ -676,61 +698,12 @@ class GenerationScheduler:
         """Stage one spec-committed token onto ``seq``.
 
         Mirrors ``RequestLifecycle.stage_token`` but is the single spec-path
-        staging point. ``return_logprobs`` requests are rejected at admission
-        (the spec macro-step cannot supply logprobs yet, see the
-        ``# TODO(spec-logprobs)`` above), so any sequence reaching here either
-        does not want logprobs or carries a real one. The non-None ``logprob``
-        branch is wired so that the day the macro-step supplies logprobs they
-        flow through unchanged.
+        staging point. ``logprob`` is the macro-step's per-committed-token
+        logprob (``SpecStepResult.logprobs``) for a ``return_logprobs`` request,
+        or ``None`` when the request did not ask for logprobs; it flows through
+        to ``stage_token`` exactly like the non-spec single-token path.
         """
         seq.stage_token(self.runtime, token, logprob=logprob)
-
-    def _fail_admitted_spec_request(
-        self,
-        decoder,
-        seq: RequestLifecycle,
-        exc: Exception,
-    ) -> None:
-        """Fail one already-admitted spec sequence cleanly (no scheduler abort).
-
-        ``admit`` has already allocated a pool row (and the caller a LoRA slot),
-        so retire the row, drop it from ``active_sequences``, release any LoRA
-        slot, and emit an error result for just this request. The request was
-        not yet pushed onto ``running``.
-        """
-        _LOGGER.warning(
-            "Failing spec request %s: %s", seq.request.request_id, exc
-        )
-        state = seq.sequence_state
-        if state is not None:
-            try:
-                decoder.retire(state)
-            except Exception:  # pragma: no cover - defensive
-                pass
-            self.runtime.active_sequences.pop(state.batch_idx, None)
-        request = seq.request
-        if seq.lora_slot_ready and request.lora_slot:
-            try:
-                self.runtime.release_adapter_slot(request.lora_slot)
-            except Exception:  # pragma: no cover - defensive
-                pass
-            request.lora_slot = 0
-            seq.lora_slot_ready = False
-        seq.finish_reason = "error"
-        seq.error = exc
-        seq.finished = True
-        seq.finalized = True
-        seq.transition(RequestPhase.COMPLETED)
-        metrics = seq.build_metrics(decode_tokens=0)
-        self._completed.append(
-            SchedulerResult(
-                request_id=request.request_id,
-                tokens=[],
-                finish_reason="error",
-                metrics=metrics,
-                output={"error": str(exc)},
-            )
-        )
 
     def _spec_decode_step(self) -> bool:
         """Run one spec macro-step, overlapped depth-1.
@@ -768,6 +741,51 @@ class GenerationScheduler:
 
         return bool(active) or pending is not None
 
+    def _materialize_spec_tokens(
+        self,
+        active: List[RequestLifecycle],
+        runs: Sequence[Sequence[int]],
+        side_values: object | None,
+    ) -> list[list[Token]]:
+        """Type each sequence's committed run via the runtime hook.
+
+        ``runs[i]`` is the committed id list for ``active[i]``. Routes the whole
+        step's ids through the runtime ``materialize_tokens`` hook, threading
+        ``side_values`` (the macro-step's :class:`SpecSideValues`) as the opaque
+        runtime step-handle so a spatial runtime (Moondream) types coord/size ids
+        into ``CoordToken`` / ``SizeToken`` from the per-position hidden it
+        carries -- the spec analog of the non-spec ``post_sample`` ->
+        ``materialize_tokens`` path. A text-only runtime (``side_values is None``,
+        or no hook) materialises plain ``TextToken``s. Returns the typed tokens
+        re-grouped per sequence (parallel to ``runs``).
+        """
+        flat_ids: list[int] = [int(t) for run in runs for t in run]
+        if not flat_ids:
+            return [[] for _ in runs]
+        token_ids_cpu = torch.tensor(flat_ids, dtype=torch.long)
+        # ``batch_idx`` parallel to the flattened ids (the spec batch row each
+        # committed token belongs to); a spatial hook indexes side-values by the
+        # active-sequence order, but keep the row ids aligned for hooks that key
+        # off them.
+        batch_indices: list[int] = [
+            seq.state.batch_idx for seq, run in zip(active, runs) for _ in run
+        ]
+        batch_idx = torch.tensor(batch_indices, dtype=torch.long)
+        flat_tokens = self._materialize_tokens(
+            token_ids_cpu,
+            active,
+            batch_idx,
+            side_values,
+        )
+        # Re-group the flat typed tokens back into per-sequence runs.
+        grouped: list[list[Token]] = []
+        cursor = 0
+        for run in runs:
+            n = len(run)
+            grouped.append(list(flat_tokens[cursor:cursor + n]))
+            cursor += n
+        return grouped
+
     def _commit_spec(self, decoder, pending) -> None:
         """Commit one previously-launched spec macro-step (depth-1).
 
@@ -775,11 +793,20 @@ class GenerationScheduler:
         that transfer completed while the GPU ran the step launched after it, so
         the wait is hidden. Mirrors ``commit_step``'s decode commit: decrement
         ``inflight_refs``, skip + retire zombies, else stage the variable run of
-        committed tokens and finish/retire on EOS or length cap.
+        committed tokens (typed via the runtime hook, each with its macro-step
+        logprob) and finish/retire on EOS or length cap.
         """
         active, result = pending
-        tokens = result.tokens  # lazy: waits the (already-landed) deferred D2H
-        for seq, new_token_ids in zip(active, tokens):
+        # ``tokens``/``logprobs`` resolve lazily off the (already-landed) D2H;
+        # ``side_values`` holds device tensors read at ``step`` time.
+        tokens = result.tokens
+        logprobs = result.logprobs  # None when nobody requested logprobs
+        side_values = result.side_values
+        # Type the whole step's committed ids up front (coord/size via the
+        # runtime hook using ``side_values``), then stage each typed token below
+        # so a mid-run EOS still drops the trailing typed tokens correctly.
+        typed = self._materialize_spec_tokens(active, tokens, side_values)
+        for i, (seq, typed_run) in enumerate(zip(active, typed)):
             seq.inflight_refs -= 1
             if seq.finalized:
                 # Zombie: finished by an earlier commit while still in flight here.
@@ -787,15 +814,11 @@ class GenerationScheduler:
                     decoder.retire(seq.state)
                     self.runtime.active_sequences.pop(seq.state.batch_idx, None)
                 continue
-            for token_id in new_token_ids:
+            seq_logprobs = logprobs[i] if logprobs is not None else None
+            for j, token in enumerate(typed_run):
                 seq.state.advance()  # KV length mirrors the committed token
-                token = TextToken(token_id=int(token_id))
-                # TODO(spec-logprobs): pass the macro-step's per-token logprob
-                # here once ``SpecStepResult`` carries them. ``return_logprobs``
-                # requests are rejected at spec admission today, so every
-                # sequence reaching this commit has ``return_logprobs`` unset and
-                # ``stage_token`` does not require a logprob.
-                self._spec_stage_token(seq, token, logprob=None)
+                logprob = seq_logprobs[j] if seq_logprobs is not None else None
+                self._spec_stage_token(seq, token, logprob=logprob)
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     self.running.remove(seq)
