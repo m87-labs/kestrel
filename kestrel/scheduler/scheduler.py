@@ -588,7 +588,55 @@ class GenerationScheduler:
         # the same request (it stays in ``waiting``) while still letting other
         # waiting requests be considered for admission.
         deferred_ids: set[int] = set()
-        # Cap the live spec batch to the runtime's captured-graph batch size.
+        # Zero-length generation finalizes WITHOUT consuming a spec row.
+        #
+        # The non-spec path has a dedicated branch (see the ``max_new_tokens <=
+        # 0`` case in ``_launch_prefill_step``) that finalizes the request as
+        # ``"length"`` WITHOUT sampling/staging a first token. ``decoder.admit``
+        # has no prefill-only mode -- its contract is to prefill *and*
+        # sample/stage token0 -- so routing a 0-token request through it would
+        # stream/return one extra token and briefly consume a spec pool row.
+        # Match the non-spec contract: finalize with zero generated tokens, no
+        # admit, no row. The spec decoder's persistently-reserved pool gains
+        # nothing from a prefill it would immediately retire, so skipping
+        # admission entirely is both correct and leaves the row free for real
+        # work.
+        #
+        # Because such a request needs NO free pool row and NO running-batch
+        # slot, drain every launchable zero-token request in a pre-pass that is
+        # NOT gated by the capacity guard below. Otherwise a zero-token request
+        # queued behind a saturated spec batch (``decoder.free_slots == 0`` or
+        # ``len(self.running) >= max_batch_size``) would wait for an unrelated
+        # row to retire before completing -- diverging from this no-row
+        # contract -- even though it consumes none of the gated resources.
+        while True:
+            request = next(
+                (
+                    r
+                    for r in self.waiting
+                    if self._is_launchable_request(r)
+                    and r.request_id not in deferred_ids
+                    and r.max_new_tokens <= 0
+                ),
+                None,
+            )
+            if request is None:
+                break
+            lifecycle = request.lifecycle
+            self.waiting.remove(request)
+            # No spec row, so no ``sequence_state``; ``build_metrics`` then
+            # falls back to ``request.prompt_length`` exactly like the
+            # non-spec 0-length path (which also leaves ``sequence_state``
+            # unset). ``_finalize_sequence`` -> ``_release_sequence``
+            # early-returns for a spec runtime before touching the (absent)
+            # state, so this is safe with ``sequence_state is None``.
+            lifecycle.prefill_started_at = time.perf_counter()
+            lifecycle.prefill_completed_at = lifecycle.prefill_started_at
+            self._finalize_sequence(lifecycle, "length")
+            progressed = True
+
+        # Admit real (>=1 token) requests into free spec rows, capping the live
+        # spec batch to the runtime's captured-graph batch size.
         #
         # The decoder's pool can expose MORE free rows than ``max_batch_size``
         # (it is sized from ``max_batch_slots == max_batch_size + 2`` to keep
@@ -618,30 +666,12 @@ class GenerationScheduler:
             if request is None:
                 break
             lifecycle = request.lifecycle
-
-            # Zero-length generation: the non-spec path has a dedicated branch
-            # (see the ``max_new_tokens <= 0`` case in ``_launch_prefill_step``)
-            # that finalizes the request as ``"length"`` WITHOUT sampling/staging
-            # a first token. ``decoder.admit`` has no prefill-only mode -- its
-            # contract is to prefill *and* sample/stage token0 -- so routing a
-            # 0-token request through it would stream/return one extra token and
-            # briefly consume a spec pool row. Match the non-spec contract:
-            # finalize with zero generated tokens, no admit, no row. The spec
-            # decoder's persistently-reserved pool gains nothing from a prefill it
-            # would immediately retire, so skipping admission entirely is both
-            # correct and leaves the row free for real work.
+            # Zero-token requests were already finalized in the pre-pass above
+            # (no row, no batch slot); the launchable scan there shares this
+            # filter, so none can reach here. Guard defensively so a request can
+            # never fall through to ``decoder.admit`` (which would prefill +
+            # stage an unwanted token0) if invariants ever change.
             if request.max_new_tokens <= 0:
-                self.waiting.remove(request)
-                # No spec row, so no ``sequence_state``; ``build_metrics`` then
-                # falls back to ``request.prompt_length`` exactly like the
-                # non-spec 0-length path (which also leaves ``sequence_state``
-                # unset). ``_finalize_sequence`` -> ``_release_sequence``
-                # early-returns for a spec runtime before touching the (absent)
-                # state, so this is safe with ``sequence_state is None``.
-                lifecycle.prefill_started_at = time.perf_counter()
-                lifecycle.prefill_completed_at = lifecycle.prefill_started_at
-                self._finalize_sequence(lifecycle, "length")
-                progressed = True
                 continue
 
             # Acquire the LoRA slot before admission, mirroring the normal

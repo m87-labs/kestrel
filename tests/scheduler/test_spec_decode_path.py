@@ -1953,3 +1953,98 @@ def test_spec_step_excludes_finalized_row_but_launches_continuing_row() -> None:
     assert sched.has_pending_work() is False
     reasons = sorted(c.finish_reason for c in sched.pop_completed())
     assert reasons == ["length", "stop"]  # A by length (max_new), B by eos
+
+
+def test_spec_admit_zero_token_request_bypasses_saturated_batch() -> None:
+    """Regression for the codex finding @ scheduler.py:608.
+
+    A ``max_new_tokens <= 0`` request finalizes as ``"length"`` WITHOUT calling
+    ``decoder.admit`` and WITHOUT consuming a spec pool row -- mirroring the
+    non-spec ``_launch_prefill_step`` zero-length branch. That finalize therefore
+    needs neither a free pool row nor a free running-batch slot.
+
+    Before the fix, the zero-token branch lived INSIDE the admission loop whose
+    guard is ``while decoder.free_slots > 0 and len(self.running) < max_running``.
+    So a zero-token request queued behind a saturated spec batch -- either the
+    pool is full (``decoder.free_slots == 0``) or the running set is already at
+    ``max_batch_size`` -- never reached the branch and stalled until an unrelated
+    row retired, diverging from its documented no-row contract. The fix drains
+    launchable zero-token requests in a pre-pass that is NOT gated by that
+    capacity guard. This covers BOTH saturating conditions.
+    """
+    # --- Condition A: running already at max_batch_size (pool still has rows) ---
+    # ``_spec_runtime`` is max_batch_size=4 / max_batch_slots=8 over an 8-row
+    # pool, so the batch cap stops real admissions at 4 while 4 pool rows stay
+    # free. A zero-token request must still finalize despite ``running`` being
+    # saturated -- this is exactly the ``len(self.running) < max_running`` clause
+    # added in 6d27414 that the finding flags.
+    n = 8
+    dec = _FakeDecoder(
+        n_rows=n,
+        first_tokens={r: 10 + r for r in range(n)},
+        plans={r: [[100 + r]] for r in range(n)},
+    )
+    rt = _spec_runtime(dec)
+    assert rt.max_batch_size == 4 and dec.free_slots == 8
+    sched = _make_scheduler(rt)
+    # 4 real requests saturate the running batch at max_batch_size.
+    for rid in range(4):
+        _enqueue(sched, rid, prompt_len=3, max_new=8)
+    # A zero-token request queued BEHIND the saturating batch.
+    rz = _enqueue(sched, 99, prompt_len=5, max_new=0)
+
+    assert sched._spec_admit() is True
+    # Running saturated at the cap; pool NOT full (4 rows still free).
+    assert len(dec.admitted) == rt.max_batch_size
+    assert len(sched.running) == rt.max_batch_size
+    assert dec.free_slots == n - rt.max_batch_size
+    # The zero-token request finalized WITHOUT admit and WITHOUT a pool row:
+    # it is no longer waiting, never entered ``running``, and ``decoder.admit``
+    # was never called for it (row 99's id is not among the admitted pool rows;
+    # admitted rows are the 4 real ones [0..3]).
+    assert 99 not in dec.admitted
+    # No spec row / sequence_state assigned (the ``.state`` property would raise
+    # if ``sequence_state`` were unset, so assert the underlying field directly).
+    assert rz.lifecycle.sequence_state is None
+    assert all(r.request_id != 99 for r in sched.waiting)
+    assert all(lc.request.request_id != 99 for lc in sched.running)
+    completed = {c.request_id: c for c in sched.pop_completed()}
+    assert 99 in completed
+    assert completed[99].finish_reason == "length"
+    assert completed[99].tokens == []
+
+    # --- Condition B: pool fully drained (decoder.free_slots == 0) ---
+    # Size the runtime so the batch cap does NOT block draining the pool: a
+    # 2-row pool with max_batch_size=4 lets both rows admit, leaving
+    # ``free_slots == 0``. A zero-token request behind the full pool must still
+    # finalize immediately.
+    dec2 = _FakeDecoder(
+        n_rows=2,
+        first_tokens={0: 11, 1: 22},
+        plans={0: [[12]], 1: [[23]]},
+    )
+    rt2 = FakeRuntime(max_batch_size=4, max_batch_slots=6)
+    rt2.spec = SpecDecodeCaps(
+        proposer=SimpleNamespace(num_speculative_tokens=3, num_lookahead_tokens=4),
+        decoder=dec2,
+    )
+    rt2.prompt_template = SimpleNamespace(eos_id=999)
+    sched2 = _make_scheduler(rt2)
+    _enqueue(sched2, 0, prompt_len=3, max_new=8)
+    _enqueue(sched2, 1, prompt_len=3, max_new=8)
+    rz2 = _enqueue(sched2, 77, prompt_len=4, max_new=0)
+
+    assert sched2._spec_admit() is True
+    # Pool fully consumed by the two real admissions.
+    assert dec2.free_slots == 0
+    assert dec2.admitted == [0, 1]
+    assert len(sched2.running) == 2
+    # The zero-token request finalized despite the empty pool: not waiting, not
+    # running, never admitted.
+    assert 77 not in dec2.admitted
+    assert rz2.lifecycle.sequence_state is None
+    assert all(r.request_id != 77 for r in sched2.waiting)
+    completed2 = {c.request_id: c for c in sched2.pop_completed()}
+    assert 77 in completed2
+    assert completed2[77].finish_reason == "length"
+    assert completed2[77].tokens == []
