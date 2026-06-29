@@ -52,6 +52,24 @@ def test_torch_cuda_driver_version_falls_back_to_libcuda(
     assert config_mod._torch_cuda_driver_version() == "12.8"
 
 
+def test_torch_cuda_driver_version_treats_zero_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TorchCWithNoDriver:
+        @staticmethod
+        def _cuda_getDriverVersion() -> int:
+            return 0
+
+    monkeypatch.setattr(config_mod.torch, "_C", TorchCWithNoDriver())
+    monkeypatch.setattr(
+        config_mod,
+        "_libcuda_driver_version",
+        lambda: pytest.fail("zero driver version should not fall back"),
+    )
+
+    assert config_mod._torch_cuda_driver_version() is None
+
+
 def test_runtime_config_explains_torch_cuda_newer_than_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

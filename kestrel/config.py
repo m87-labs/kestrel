@@ -62,7 +62,10 @@ def _torch_cuda_driver_version() -> str | None:
     getter = getattr(torch._C, "_cuda_getDriverVersion", None)
     if getter is not None:
         try:
-            return _format_cuda_version(getter())
+            version = getter()
+            if isinstance(version, int) and version <= 0:
+                return None
+            return _format_cuda_version(version)
         except Exception:
             pass
     return _libcuda_driver_version()
