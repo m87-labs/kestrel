@@ -1,6 +1,7 @@
 """Runtime configuration objects for the Kestrel inference engine."""
 
 
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -29,6 +30,68 @@ _MPS_PAGES_BY_TOTAL_GIB = (
     (None, 65536), # 96+ GB Ultra
 )
 _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _format_cuda_version(version: int | str | None) -> str | None:
+    if version is None:
+        return None
+    if isinstance(version, str):
+        return version
+    try:
+        raw = int(version)
+    except (TypeError, ValueError):
+        return None
+    major = raw // 1000
+    minor = (raw % 1000) // 10
+    patch = raw % 10
+    if patch:
+        return f"{major}.{minor}.{patch}"
+    return f"{major}.{minor}"
+
+
+def _cuda_version_tuple(version: str | None) -> tuple[int, ...] | None:
+    if version is None:
+        return None
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return None
+
+
+def _torch_cuda_driver_version() -> str | None:
+    getter = getattr(torch._C, "_cuda_getDriverVersion", None)
+    if getter is not None:
+        try:
+            version = getter()
+            if isinstance(version, int) and version <= 0:
+                return None
+            return _format_cuda_version(version)
+        except Exception:
+            pass
+    return _libcuda_driver_version()
+
+
+def _libcuda_driver_version() -> str | None:
+    for soname in ("libcuda.so.1", "libcuda.so"):
+        try:
+            libcuda = ctypes.CDLL(soname)
+            break
+        except OSError:
+            continue
+    else:
+        return None
+
+    try:
+        get_version = libcuda.cuDriverGetVersion
+        get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        get_version.restype = ctypes.c_int
+        version = ctypes.c_int(0)
+        rc = get_version(ctypes.byref(version))
+    except Exception:
+        return None
+    if rc != 0 or version.value <= 0:
+        return None
+    return _format_cuda_version(version.value)
 
 
 def _mps_total_memory_bytes() -> int | None:
@@ -176,6 +239,39 @@ class RuntimeConfig:
                 "install command. Verify the fix with: "
                 "`python -c 'import torch; print(torch.cuda.is_available())'`."
             )
+        torch_cuda = _format_cuda_version(getattr(torch.version, "cuda", None))
+        driver_cuda = _torch_cuda_driver_version()
+        torch_cuda_tuple = _cuda_version_tuple(torch_cuda)
+        driver_cuda_tuple = _cuda_version_tuple(driver_cuda)
+        details = [
+            "Photon needs CUDA, but PyTorch could not initialize CUDA.",
+        ]
+        if torch_cuda is not None:
+            details.append(f"Installed PyTorch is built for CUDA {torch_cuda}.")
+        if driver_cuda is not None:
+            details.append(f"The NVIDIA driver reports CUDA {driver_cuda} support.")
+        if (
+            torch_cuda_tuple is not None
+            and driver_cuda_tuple is not None
+            and torch_cuda_tuple[:1] > driver_cuda_tuple[:1]
+        ):
+            details.append(
+                "PyTorch's bundled CUDA runtime is newer than the installed "
+                "NVIDIA driver supports. Install a PyTorch build whose CUDA "
+                "runtime is supported by the driver (for example a CUDA 12.x "
+                "wheel on CUDA 12.x drivers), or update the NVIDIA driver."
+            )
+        else:
+            details.append(
+                "This usually means no NVIDIA GPU/driver is visible to this "
+                "process, or the installed NVIDIA driver is incompatible with "
+                "the PyTorch CUDA runtime."
+            )
+        details.append(
+            "Verify with: `python -c 'import torch; print(torch.version.cuda, "
+            "torch.cuda.is_available())'`."
+        )
+        raise RuntimeError(" ".join(details))
 
 
 __all__ = ["RuntimeConfig"]
