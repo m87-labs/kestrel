@@ -1096,8 +1096,20 @@ class GenerationScheduler:
         launch is itself committed next tick, keeping the count balanced.
         """
         decoder = self.runtime.spec.decoder
+        # Snapshot the previous macro-step but KEEP ``self._pending_spec``
+        # pointing at it until ``_commit_spec`` has actually consumed its
+        # in-flight refs. ``_commit_spec`` decrements each pending sequence's
+        # ``inflight_refs`` only in its final per-sequence loop, AFTER resolving
+        # the lazy ``result.tokens`` and running ``_materialize_spec_tokens`` --
+        # either of which can raise (a fail-fast hook, a deferred D2H error). If
+        # we cleared ``_pending_spec`` up front and the commit raised before that
+        # loop, the OLD pending refs would be left on the sequences with no
+        # ``_pending_spec`` record left to ever commit them: a finishing row would
+        # stay stuck in ``FINALIZING`` and leak its decoder row / LoRA slot. By
+        # leaving the record installed, a failed commit's pending refs stay owned
+        # by ``_pending_spec`` for a later ``_drain_spec`` / retry to consume; we
+        # clear it only once the commit SUCCEEDS (below).
         pending = self._pending_spec
-        self._pending_spec = None
 
         active = [
             seq
@@ -1109,17 +1121,28 @@ class GenerationScheduler:
         # their previous-step ref.
         for seq in active:
             seq.inflight_refs += 1
+        # Tracks whether this launch's reservation has been handed to a freshly
+        # installed ``_pending_spec`` (the next step). Until it is, the ``except``
+        # path owns the rollback of exactly that reservation.
+        launch_committed = False
 
         # The commit + launch below can raise (e.g. ``decoder.step`` on a CUDA
-        # error). Until ``_pending_spec`` is installed those reserved refs are
-        # owned by nothing -- no future ``_commit_spec`` will decrement them -- so
-        # a finishing row would stay stuck in ``FINALIZING`` and its pool row /
-        # adapter slot would leak. Mirror the non-spec launch path
-        # (``launch_decode_step``): on any failure before the pending step is
-        # installed, roll back exactly the reservation added above, then re-raise.
+        # error). Until this launch's reservation is handed to a new
+        # ``_pending_spec`` those reserved refs are owned by nothing -- no future
+        # ``_commit_spec`` will decrement them -- so a finishing row would stay
+        # stuck in ``FINALIZING`` and its pool row / adapter slot would leak.
+        # Mirror the non-spec launch path (``launch_decode_step``): on any failure
+        # before the new pending step is installed, roll back exactly the
+        # reservation added above, then re-raise. The OLD pending step's refs are
+        # NOT this method's to roll back -- they stay owned by ``_pending_spec``
+        # (still installed on a commit failure) for a later drain/retry.
         try:
             if pending is not None:
                 self._commit_spec(pending)
+                # Commit consumed the old pending step's refs; only now is it safe
+                # to drop the record. A raise above skips this, leaving
+                # ``_pending_spec`` installed so those refs are never orphaned.
+                self._pending_spec = None
 
             # The commit above can FINALIZE a row (its last allowed token was
             # ``length``-committed), which sets ``finalized`` and removes it from
@@ -1172,13 +1195,20 @@ class GenerationScheduler:
                         commit_caps=commit_caps,
                     )
                 self._pending_spec = (active, result)
+                launch_committed = True
         except Exception:
-            # Failure before ``_pending_spec`` was installed: undo this launch's
-            # reservation so the count stays balanced and no row is left with a
-            # phantom ref (mirrors ``launch_decode_step``'s rollback). ``active``
-            # is the only set whose refs this method added; ``_commit_spec``
-            # already decremented whatever it committed before raising.
-            if self._pending_spec is None:
+            # Failure before this launch's reservation was handed to a new
+            # ``_pending_spec``: undo exactly that reservation so the count stays
+            # balanced and no row is left with a phantom ref (mirrors
+            # ``launch_decode_step``'s rollback). ``active`` is the only set whose
+            # refs this method added; ``_commit_spec`` already decremented whatever
+            # it committed before raising, and a commit that did NOT reach its
+            # decrement loop leaves the OLD pending refs owned by the still-
+            # installed ``_pending_spec`` (committed later by drain/retry) -- not
+            # this method's to touch. ``launch_committed`` (not ``_pending_spec``
+            # being unset) gates the rollback, because on a commit failure
+            # ``_pending_spec`` is deliberately left set to the OLD step.
+            if not launch_committed:
                 for seq in active:
                     seq.inflight_refs -= 1
             raise

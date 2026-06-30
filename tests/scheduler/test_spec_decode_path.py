@@ -3003,3 +3003,172 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
     assert commit_caps[0] == 1
     assert commit_caps[1] == 1
     assert commit_caps[2] == 1000
+
+
+class _CommitSideValuesDecoder(_FakeDecoder):
+    """``SpecDecoder`` whose macro-step ``step`` attaches spatial ``side_values``
+    so the COMMIT routes the committed ids through ``materialize_spec_tokens``
+    (the spatial typing hook), and whose ``retire`` returns the row to the free
+    pool so a test can prove a commit-time failure leaked no pool row.
+
+    The admit token is deliberately left text-only (``admit_side_values`` unset),
+    so admission types it through the default ``materialize_tokens`` path and
+    never touches the spec hook -- the ONLY ``materialize_spec_tokens`` call is in
+    ``_commit_spec``. That isolates the fail-fast hook to the commit step, which
+    is exactly the path the P2 guards: ``_commit_spec`` resolves the lazy result
+    and runs ``materialize_spec_tokens`` BEFORE its per-sequence ``inflight_refs``
+    decrement, so a hook raise there must not orphan the pending step's refs.
+    """
+
+    def retire(self, state) -> None:
+        row = self._row_of.pop(id(state))
+        self.retired.append(row)
+        # Return the row to the free pool so the test can prove no leak.
+        self._free.append(row)
+
+
+def test_spec_commit_failure_keeps_pending_refs_until_committed() -> None:
+    """P2 codex finding @ scheduler.py:1100: keep the pending spec record until
+    ``_commit_spec`` SUCCEEDS, so a commit-time failure orphans no in-flight refs.
+
+    Depth-1 overlap launches step N+1 while committing step N. The previous
+    implementation cleared ``_pending_spec`` BEFORE ``_commit_spec(pending)`` ran;
+    ``_commit_spec`` decrements each pending sequence's ``inflight_refs`` only in
+    its FINAL per-sequence loop, after resolving the lazy ``result.tokens`` and
+    running ``materialize_spec_tokens`` -- either of which can raise (a fail-fast
+    hook, a deferred-D2H error). On such a raise the OLD pending refs stayed on
+    the sequences with no ``_pending_spec`` record left to ever commit them, and
+    the ``except`` rolled back only the NEWLY reserved launch refs -- so a
+    finishing row was stranded in ``FINALIZING`` and leaked its decoder row +
+    LoRA slot.
+
+    This drives an adapter row to the point where a macro-step is in flight in
+    ``_pending_spec`` (its ref held on the sequence), makes the NEXT
+    ``_commit_spec`` raise inside ``materialize_spec_tokens`` (before its
+    decrement loop), and asserts that:
+
+    * the commit-time raise propagates but ``_pending_spec`` is STILL installed
+      (the pending step is not lost), the row keeps exactly its one in-flight ref,
+      and nothing was retired / released / finalized -- the refs are not orphaned;
+      and
+    * once the hook stops failing, draining the pipeline commits that same pending
+      step, the row finishes, retires EXACTLY once, ends ``COMPLETED`` with
+      ``inflight_refs`` back at 0, its LoRA slot released exactly once, no
+      ``active_sequences`` entry, and the pool row back at baseline -- i.e. the
+      pending refs were committed, never leaked.
+    """
+    from kestrel.runtime.sampling import SamplingHooks
+
+    @dataclass
+    class _TypedToken:
+        token_id: int
+
+    # Arm the spec typing hook to raise on its FIRST commit call (emulating a
+    # fail-fast materialize / lazy-result error), then succeed on every later
+    # call so the retry/drain can complete the pending step.
+    hook_calls = {"n": 0}
+
+    def materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, side_values, token_logprobs=None
+    ):
+        hook_calls["n"] += 1
+        if hook_calls["n"] == 1:
+            raise RuntimeError("materialize_spec_tokens failed mid-commit")
+        return [
+            _TypedToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()
+        ]
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    # admit(1) + a 1-token macro-step == max_new=2 -> the committed step finishes
+    # the row, so a botched commit would strand a FINALIZING row (the exact leak).
+    dec = _CommitSideValuesDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+        side_values=object(),  # macro-step emits side-values -> commit uses the hook
+        # admit_side_values left None: the admit token stays text-only.
+    )
+    rt = _spec_runtime(dec)
+    rt.sampling_hooks = SamplingHooks(
+        materialize_spec_tokens=materialize_spec_tokens
+    )
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    assert dec.free_slots == 1  # baseline: one row free
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=2, adapter="ft-1", lora_slot_ready=False
+    )
+
+    sched._spec_admit()
+    seq = req.lifecycle
+    acquired_slot = req.lora_slot
+    assert acquired_slot >= 1  # a real adapter slot was acquired
+    assert dec.free_slots == 0  # the row is in use
+
+    # Tick 1 launches the macro-step (no commit yet); it now lives in
+    # ``_pending_spec`` with its in-flight ref held on the sequence.
+    assert sched._spec_decode_step() is True
+    assert sched._pending_spec is not None
+    refs_with_pending = seq.inflight_refs
+    assert refs_with_pending >= 1  # the pending step's ref is held
+
+    # Tick 2 commits the pending step -> the hook raises inside ``_commit_spec``
+    # BEFORE its per-sequence decrement. The raise propagates.
+    with pytest.raises(RuntimeError, match="materialize_spec_tokens failed"):
+        sched._spec_decode_step()
+
+    # ---- The core regression invariant: the pending refs are NOT orphaned. ----
+    # The pending record is STILL installed (old code cleared it up front, losing
+    # the only handle that could ever commit those refs).
+    assert sched._pending_spec is not None
+    # The newly reserved launch ref was rolled back; the row keeps EXACTLY the
+    # pending step's ref (no phantom ref, no dropped ref).
+    assert seq.inflight_refs == refs_with_pending
+    # Nothing was retired / released / finalized by the failed commit: the row is
+    # not stranded in FINALIZING and holds all its resources.
+    assert dec.retired == []
+    assert rt.released_adapter_slots == []
+    assert seq.finalized is False
+    assert seq.finished is False
+    assert seq in sched.running
+    assert seq.phase != RequestPhase.FINALIZING
+    assert req.lora_slot == acquired_slot  # slot still held, not released
+    assert seq.state.batch_idx in rt.active_sequences
+    assert dec.free_slots == 0  # row still in use, not leaked-then-lost
+    # ``has_pending_work`` stays True so the executor keeps driving the commit.
+    assert sched.has_pending_work() is True
+
+    # The hook now succeeds; draining the pipeline commits that SAME pending step
+    # (its refs are consumed, not orphaned), finishing the row.
+    sched._drain_pipeline()
+
+    # The pending step was committed and the row finished cleanly.
+    assert sched._pending_spec is None
+    assert seq.finished is True
+    # Retired EXACTLY once (the committed pending refs drove the retire), back to
+    # a balanced ref count -- the leak the P2 fixes would have left this nonzero
+    # with the row never retired.
+    assert dec.retired == [0]
+    assert dec.retired.count(0) == 1
+    assert seq.inflight_refs == 0
+    assert seq.phase == RequestPhase.COMPLETED
+    # LoRA slot released exactly once (no leak, no double-release).
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1
+    # No dangling active-sequence entry and the pool row is back at baseline.
+    assert seq.state.batch_idx not in rt.active_sequences
+    assert rt.active_sequences == {}
+    assert dec.free_slots == 1
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
