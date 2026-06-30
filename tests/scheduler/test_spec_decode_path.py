@@ -3172,3 +3172,154 @@ def test_spec_commit_failure_keeps_pending_refs_until_committed() -> None:
     assert rt.active_sequences == {}
     assert dec.free_slots == 1
     assert [c.finish_reason for c in sched.pop_completed()] == ["length"]
+
+
+def test_spec_drain_commit_failure_keeps_pending_refs_until_committed() -> None:
+    """P2 codex finding @ scheduler.py:1234 (``_drain_spec``): keep the pending
+    spec record installed until the DRAIN commit SUCCEEDS, so a commit-time
+    failure on the PAUSE/DRAIN path orphans no in-flight refs.
+
+    This is the follow-on of the ``_spec_decode_step`` keep-until-success fix: the
+    SAME clear-before-commit bug lived in the pause/drain path. ``_drain_pipeline``
+    (the engine PAUSE path, ``Executor.drain``) calls ``_drain_spec``, which used
+    to clear ``self._pending_spec`` BEFORE ``_commit_spec(pending)`` ran. But
+    ``_commit_spec`` decrements each pending sequence's ``inflight_refs`` only in
+    its FINAL per-sequence loop, after resolving the lazy ``result.tokens`` and
+    running ``materialize_spec_tokens`` -- either of which can raise (a fail-fast
+    hook, a deferred-D2H error: the same mode now guarded in ``_spec_decode_step``).
+    On such a raise the OLD pending refs stayed on the sequences with no
+    ``_pending_spec`` record left to ever commit them, so the scheduler lost the
+    only handle to retry that pending result -- stranding a finishing row in
+    ``FINALIZING`` and leaking its decoder row + LoRA slot, with subsequent
+    launches from device state never staged.
+
+    Unlike ``test_spec_commit_failure_keeps_pending_refs_until_committed`` (which
+    drives the failure through ``_spec_decode_step``'s overlap commit), this drives
+    the failure through ``_drain_pipeline`` -> ``_drain_spec`` -- the exact path
+    the P2 names -- and asserts that:
+
+    * the first drain's commit-time raise propagates but ``_pending_spec`` is STILL
+      installed (the pending step is not lost), the row keeps exactly its one
+      in-flight ref, and nothing was retired / released / finalized -- the refs are
+      not orphaned and the drain can retry; and
+    * once the hook stops failing, draining AGAIN commits that same pending step,
+      the row finishes, retires EXACTLY once, ends ``COMPLETED`` with
+      ``inflight_refs`` back at 0, its LoRA slot released exactly once, no
+      ``active_sequences`` entry, and the pool row back at baseline.
+    """
+    from kestrel.runtime.sampling import SamplingHooks
+
+    @dataclass
+    class _TypedToken:
+        token_id: int
+
+    # Arm the spec typing hook to raise on its FIRST commit call (emulating a
+    # fail-fast materialize / lazy-result error inside the drain), then succeed on
+    # every later call so the retry drain can complete the pending step.
+    hook_calls = {"n": 0}
+
+    def materialize_spec_tokens(
+        token_ids_cpu, sequences, batch_idx, side_values, token_logprobs=None
+    ):
+        hook_calls["n"] += 1
+        if hook_calls["n"] == 1:
+            raise RuntimeError("materialize_spec_tokens failed mid-drain")
+        return [
+            _TypedToken(token_id=int(t)) for t in token_ids_cpu.view(-1).tolist()
+        ]
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    # admit(1) + a 1-token macro-step == max_new=2 -> the committed step finishes
+    # the row, so a botched drain commit would strand a FINALIZING row (the leak).
+    dec = _CommitSideValuesDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+        side_values=object(),  # macro-step emits side-values -> commit uses the hook
+        # admit_side_values left None: the admit token stays text-only.
+    )
+    rt = _spec_runtime(dec)
+    rt.sampling_hooks = SamplingHooks(
+        materialize_spec_tokens=materialize_spec_tokens
+    )
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    assert dec.free_slots == 1  # baseline: one row free
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=2, adapter="ft-1", lora_slot_ready=False
+    )
+
+    sched._spec_admit()
+    seq = req.lifecycle
+    acquired_slot = req.lora_slot
+    assert acquired_slot >= 1  # a real adapter slot was acquired
+    assert dec.free_slots == 0  # the row is in use
+
+    # Tick 1 launches the macro-step (no commit yet); it now lives in
+    # ``_pending_spec`` with its in-flight ref held on the sequence.
+    assert sched._spec_decode_step() is True
+    assert sched._pending_spec is not None
+    refs_with_pending = seq.inflight_refs
+    assert refs_with_pending >= 1  # the pending step's ref is held
+
+    # A pause lands here: ``_drain_pipeline`` -> ``_drain_spec`` commits the
+    # in-flight step -> the hook raises inside ``_commit_spec`` BEFORE its
+    # per-sequence decrement. The raise propagates out of the drain.
+    with pytest.raises(RuntimeError, match="materialize_spec_tokens failed"):
+        sched._drain_pipeline()
+
+    # ---- The core regression invariant: the pending refs are NOT orphaned. ----
+    # The pending record is STILL installed (old code cleared it up front in
+    # ``_drain_spec``, losing the only handle that could ever commit those refs).
+    assert sched._pending_spec is not None
+    # The row keeps EXACTLY the pending step's ref (no phantom ref, no dropped
+    # ref); the drain reserves nothing of its own to roll back.
+    assert seq.inflight_refs == refs_with_pending
+    # Nothing was retired / released / finalized by the failed drain commit: the
+    # row is not stranded in FINALIZING and holds all its resources.
+    assert dec.retired == []
+    assert rt.released_adapter_slots == []
+    assert seq.finalized is False
+    assert seq.finished is False
+    assert seq in sched.running
+    assert seq.phase != RequestPhase.FINALIZING
+    assert req.lora_slot == acquired_slot  # slot still held, not released
+    assert seq.state.batch_idx in rt.active_sequences
+    assert dec.free_slots == 0  # row still in use, not leaked-then-lost
+    # ``has_pending_work`` stays True so the executor keeps driving the commit.
+    assert sched.has_pending_work() is True
+
+    # The hook now succeeds; draining AGAIN commits that SAME pending step (its
+    # refs are consumed, not orphaned), finishing the row.
+    sched._drain_pipeline()
+
+    # The pending step was committed and the row finished cleanly.
+    assert sched._pending_spec is None
+    assert seq.finished is True
+    # Retired EXACTLY once (the committed pending refs drove the retire), back to
+    # a balanced ref count -- the leak the P2 fixes would have left this nonzero
+    # with the row never retired.
+    assert dec.retired == [0]
+    assert dec.retired.count(0) == 1
+    assert seq.inflight_refs == 0
+    assert seq.phase == RequestPhase.COMPLETED
+    # LoRA slot released exactly once (no leak, no double-release).
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1
+    # No dangling active-sequence entry and the pool row is back at baseline.
+    assert seq.state.batch_idx not in rt.active_sequences
+    assert rt.active_sequences == {}
+    assert dec.free_slots == 1
+    assert [c.finish_reason for c in sched.pop_completed()] == ["length"]

@@ -1230,11 +1230,31 @@ class GenerationScheduler:
         the runtime does not speculate (``_pending_spec`` stays ``None``).
         """
         while self._pending_spec is not None:
+            # Snapshot the in-flight step but KEEP ``self._pending_spec`` pointing
+            # at it until ``_commit_spec`` has actually consumed its in-flight refs.
+            # Mirror the keep-until-success guard in ``_spec_decode_step``:
+            # ``_commit_spec`` decrements each pending sequence's ``inflight_refs``
+            # only in its final per-sequence loop, AFTER resolving the lazy
+            # ``result.tokens`` and running ``_materialize_spec_tokens`` -- either
+            # of which can raise (a fail-fast hook, a deferred D2H error). If we
+            # cleared ``_pending_spec`` up front and the commit raised before that
+            # loop, the OLD pending refs would be left on the sequences with no
+            # ``_pending_spec`` record left to ever commit them: a finishing row
+            # would stay stuck in ``FINALIZING`` and leak its decoder row / LoRA
+            # slot, and a later launch from device state would never be staged.
+            # Leaving the record installed keeps those refs owned by
+            # ``_pending_spec`` so the next drain / retry can consume them; we clear
+            # it only once the commit SUCCEEDS (below).
             pending = self._pending_spec
-            self._pending_spec = None
             with stream_context(self._compute_stream):
                 with torch.inference_mode():
                     self._commit_spec(pending)
+            # Commit consumed the in-flight step's refs; only now is it safe to drop
+            # the record. A raise above skips this, leaving ``_pending_spec``
+            # installed so those refs are never orphaned (committed by a later
+            # drain / retry). ``has_pending_work`` still reports True via the
+            # ``_pending_spec is not None`` term, so the executor keeps driving it.
+            self._pending_spec = None
 
     def _materialize_spec_tokens(
         self,
