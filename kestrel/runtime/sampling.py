@@ -57,7 +57,33 @@ class SamplingHooks:
 
     # materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle) -> list[Token]
     # Default: TextToken-only materialisation, step_handle ignored.
+    # ``step_handle`` is the *non-spec* ``post_sample`` return value (e.g.
+    # Moondream's ``(slot, batch_size)`` aux handle). The speculative path's
+    # per-step side-values have a different shape (``SpecSideValues``) and a
+    # different decode (values come from a packed per-position hidden, not from
+    # slot-local staging), so they go through ``materialize_spec_tokens`` below
+    # rather than being forced into this hook.
     materialize_tokens: Callable[..., list] | None = None
+
+    # materialize_spec_tokens(token_ids_cpu, sequences, batch_idx, side_values,
+    #                         token_logprobs=None) -> list[Token]
+    # Speculative-decode analog of ``materialize_tokens``. ``side_values`` is the
+    # macro-step's :class:`~kestrel.runtime.spec.SpecSideValues` (the target's
+    # per-committed-position final hidden + sampling knobs), from which a spatial
+    # runtime decodes coord/size ids into ``CoordToken`` / ``SizeToken``. A
+    # runtime that does not type spatial tokens on the spec path leaves this
+    # ``None``; the scheduler then materialises plain ``TextToken``s (and never
+    # passes ``SpecSideValues`` into ``materialize_tokens``, whose handle shape it
+    # does not match).
+    #
+    # ``token_logprobs`` (optional) is the flat per-committed-position vocab-token
+    # logprob list (parallel to ``token_ids_cpu``) the scheduler staged from the
+    # spec decoder. A spatial runtime mutates it **in place** to add each spatial
+    # position's coord/size head logprob, mirroring the non-spec ``post_sample``
+    # path (where ``compute_spatial_values`` folds the spatial head logprob into
+    # the vocab logprob in-place); the spec decoder only gathers the vocab logprob.
+    # ``None`` means no request wanted logprobs (decode is value-producing only).
+    materialize_spec_tokens: Callable[..., list] | None = None
 
     # prepare_decode_inputs(slot, batch_idx, batch_size) -> None
     # Default: no-op. Runtime gathers any aux decode inputs into slot.

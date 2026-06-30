@@ -17,6 +17,7 @@ from kestrel.runtime import (
     PrefillClassification,
     PreparedSequence,
     AutoregressiveRuntime,
+    SequenceState,
     TextToken,
     Token,
 )
@@ -55,6 +56,33 @@ _SAMPLING_EPS = 1e-6
 # Prefer seeding miss-frontier work only when launch capacity is large enough to
 # absorb the short-term hit latency tradeoff.
 _MISS_FRONTIER_MIN_CAPACITY = 32
+# Marker the LoRA slot manager raises when every adapter slot is in use (see
+# ``LoRASlotManager.acquire`` -> "Out of LoRA slots: all N slots are in use").
+# Only this RuntimeError is a recoverable, retry-once-a-slot-frees deferral;
+# every other RuntimeError from adapter acquisition (e.g. a CUDA load/copy
+# failure) is unrecoverable and must fail the request, not loop forever.
+_OUT_OF_LORA_SLOTS_MARKER = "Out of LoRA slots"
+
+
+def _is_out_of_lora_slots(exc: BaseException) -> bool:
+    """True only for the recoverable out-of-LoRA-slots signal."""
+    return isinstance(exc, RuntimeError) and _OUT_OF_LORA_SLOTS_MARKER in str(exc)
+
+
+def _min_cap(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """Combine two spec ``commit_caps`` (per-row token bounds).
+
+    Each cap is an upper bound on tokens a spec macro-step may commit for a row,
+    with ``None`` meaning "no bound" (+inf). The combined cap is the tighter of
+    the two: ``min`` when both are present, the present one when only one is, and
+    ``None`` when neither bounds the row. Used to fold the stateful-mask cap and
+    the remaining-output-budget cap into a single per-row ``commit_caps`` entry.
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a <= b else b
 
 
 @dataclass(slots=True)
@@ -332,6 +360,10 @@ class GenerationScheduler:
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
         self._last_deferred_request_id: int | None = None
+        # Depth-1 spec overlap: the previously-launched macro-step's
+        # (sequences, lazy SpecStepResult) awaiting commit while the GPU runs the
+        # next step. None when no spec step is in flight.
+        self._pending_spec = None
 
     # ------------------------------------------------------------------
     # Submission
@@ -370,6 +402,14 @@ class GenerationScheduler:
             len(self.waiting) > 0
             or len(self.running) > 0
             or not self._pipeline.is_empty()
+            # Depth-1 spec overlap: a launched-but-uncommitted macro-step keeps
+            # work pending even when ``running`` is already empty. The last
+            # running sequence can finish in ``_commit_spec`` while the
+            # follow-up (zombie) step it launched stays in ``_pending_spec``;
+            # without this term the executor stops calling ``advance`` and that
+            # step is never committed, so ``decoder.retire`` never runs and the
+            # spec row leaks.
+            or self._pending_spec is not None
         )
 
     def advance(self) -> bool:
@@ -397,7 +437,14 @@ class GenerationScheduler:
         * depth-1 speculation (zombies): the next forward is launched only
           after committing the step two behind it, so a sequence that ends
           rides exactly one in-flight step — no extra zombie waste.
+
+        When the runtime advertises speculative decoding (``runtime.spec`` is
+        not ``None``) the loop drives the spec macro-step path instead; the
+        single-token pipeline below runs unchanged when ``runtime.spec`` is
+        ``None`` (byte-for-byte identical behavior).
         """
+        if self.runtime.spec is not None:
+            return self._advance_spec()
         progressed = False
         pipeline = self._pipeline
         with stream_context(self._compute_stream):
@@ -466,12 +513,25 @@ class GenerationScheduler:
         return progressed
 
     def _drain_pipeline(self) -> None:
-        """Drain the pipeline before prefill - complete all in-flight work.
+        """Drain in-flight work before prefill / before an engine pause.
 
         Respects Phase 1 commit-before-finalize ordering: complete all queued
         steps before finalizing any in-flight forward. This ensures grammar
         state is updated before computing masks for constrained decoding.
+
+        The engine PAUSE path calls this (``Executor.drain``) before mutating
+        runtime state under ``graph_capture_lock`` (e.g. rebuilding CUDA graphs).
+        The spec macro-step path commits through ``_pending_spec``, which the
+        non-spec pipeline drain below does not touch, so drain spec work first:
+        if a pause lands after a macro-step was launched (``_pending_spec`` set)
+        and before the next ``advance``, the spec result would otherwise stay
+        uncommitted while the runtime/graphs are mutated under an active spec row
+        -- corrupting that row and delaying its completion/retirement until
+        resume. ``_drain_spec`` commits the in-flight macro-step (no new launch)
+        until ``_pending_spec`` is empty. In non-spec mode it is a no-op.
         """
+        self._drain_spec()
+
         pipeline = self._pipeline
 
         # 1. Complete all queued steps first (commit-before-finalize)
@@ -493,6 +553,942 @@ class GenerationScheduler:
             if step is not None:
                 self.commit_step(step)
                 pipeline.on_step_completed()
+
+    # ------------------------------------------------------------------
+    # Speculative decode path
+    #
+    # When ``runtime.spec`` is set the runtime exposes a per-macro-step
+    # decoder (draft + verify + greedy-accept + commit, see
+    # ``kestrel.runtime.spec.SpecDecoder``). One macro-step advances each active
+    # sequence by a *variable* amount (a_i + 1 tokens). The runtime owns all
+    # device state (persistent pool + reused CUDA graphs + GDN ring buffers); the
+    # scheduler only admits/retires sequences and stages the returned tokens.
+    #
+    # This path is deliberately synchronous (the spec decoder samples + commits
+    # on the GPU itself and reads accept counts back to the host each step), so
+    # it does not use the single-token depth-1 pipeline above. The non-spec path
+    # is untouched.
+    # ------------------------------------------------------------------
+
+    def _advance_spec(self) -> bool:
+        progressed = False
+        with stream_context(self._compute_stream):
+            progressed |= self._spec_admit()
+            progressed |= self._spec_decode_step()
+        return progressed
+
+    def _spec_admit(self) -> bool:
+        """Admit waiting requests into free spec rows (prefill + first token)."""
+        decoder = self.runtime.spec.decoder
+        if decoder is None:
+            raise RuntimeError("runtime.spec set without a decoder")
+        progressed = False
+        # Requests deferred this call because their adapter slot is currently
+        # unavailable. Tracking them stops the launchable scan from re-picking
+        # the same request (it stays in ``waiting``) while still letting other
+        # waiting requests be considered for admission.
+        deferred_ids: set[int] = set()
+        # Zero-length generation finalizes WITHOUT consuming a spec row.
+        #
+        # The non-spec path has a dedicated branch (see the ``max_new_tokens <=
+        # 0`` case in ``_launch_prefill_step``) that finalizes the request as
+        # ``"length"`` WITHOUT sampling/staging a first token. ``decoder.admit``
+        # has no prefill-only mode -- its contract is to prefill *and*
+        # sample/stage token0 -- so routing a 0-token request through it would
+        # stream/return one extra token and briefly consume a spec pool row.
+        # Match the non-spec contract: finalize with zero generated tokens, no
+        # admit, no row. The spec decoder's persistently-reserved pool gains
+        # nothing from a prefill it would immediately retire, so skipping
+        # admission entirely is both correct and leaves the row free for real
+        # work.
+        #
+        # Because such a request needs NO free pool row and NO running-batch
+        # slot, drain every launchable zero-token request in a pre-pass that is
+        # NOT gated by the capacity guard below. Otherwise a zero-token request
+        # queued behind a saturated spec batch (``decoder.free_slots == 0`` or
+        # ``len(self.running) >= max_batch_size``) would wait for an unrelated
+        # row to retire before completing -- diverging from this no-row
+        # contract -- even though it consumes none of the gated resources.
+        while True:
+            request = next(
+                (
+                    r
+                    for r in self.waiting
+                    if self._is_launchable_request(r)
+                    and r.request_id not in deferred_ids
+                    and r.max_new_tokens <= 0
+                ),
+                None,
+            )
+            if request is None:
+                break
+            lifecycle = request.lifecycle
+            self.waiting.remove(request)
+            # No spec row is consumed (``decoder.admit`` is never called), but
+            # this request still carried a (possibly image-bearing) prompt, so
+            # record a minimal ``SequenceState`` purely to carry the KV prompt
+            # length for metrics -- mirroring BOTH the regular spec admit path
+            # (which sets ``prompt_length = len(prompt_tokens) + image_length``)
+            # and the non-spec 0-length path (which sets ``sequence_state`` from
+            # ``prepare_sequence``, whose ``prompt_length`` includes the image
+            # KV prefix). Without it ``build_metrics`` would fall back to the
+            # text-only ``request.prompt_length`` and under-report
+            # ``prompt_tokens`` by ``request.image_length`` for a zero-token
+            # IMAGE request. The KV prompt length is the full prompt --
+            # ``request.prompt_length + request.image_length`` (the same
+            # convention as ``request.target_length``); a zero-token request can
+            # carry no generated prefix, so the typed prefill length equals
+            # ``request.prompt_length`` here. ``batch_idx == -1`` because no pool
+            # row backs this state; it is never dereferenced --
+            # ``_finalize_sequence`` -> ``_release_sequence`` early-returns for a
+            # spec runtime before touching ``batch_idx``, and a zero-token
+            # request never enters the running/active decode paths that read it.
+            kv_prompt_length = request.prompt_length + request.image_length
+            lifecycle.sequence_state = SequenceState(
+                batch_idx=-1,
+                length=kv_prompt_length,
+                max_length=request.target_length,
+                prompt_length=kv_prompt_length,
+                image_length=request.image_length,
+                lora_slot=request.lora_slot,
+            )
+            lifecycle.prefill_started_at = time.perf_counter()
+            lifecycle.prefill_completed_at = lifecycle.prefill_started_at
+            self._finalize_sequence(lifecycle, "length")
+            progressed = True
+
+        # Admit real (>=1 token) requests into free spec rows, capping the live
+        # spec batch to the runtime's captured-graph batch size.
+        #
+        # The decoder's pool can expose MORE free rows than ``max_batch_size``
+        # (it is sized from ``max_batch_slots == max_batch_size + 2`` to keep
+        # headroom for transient prefill, see ``runtime.max_batch_slots``), so
+        # admitting ``while decoder.free_slots > 0`` alone would queue up to
+        # ``max_batch_slots`` running rows. ``_spec_decode_step`` then snapshots
+        # EVERY running row into ``active`` and hands the whole set to one
+        # ``decoder.step`` call -- but the verify/draft CUDA graphs and staging
+        # buffers are captured for ``max_batch_size`` states, so an oversized
+        # batch overruns them. The non-spec path enforces the same bound via its
+        # ``max_batch_size`` dispatch cap (``_cap_decode_dispatch``); bound the
+        # spec batch at admission so the running set -- and thus every
+        # ``decoder.step`` -- never exceeds it. Excess launchable requests stay
+        # WAITING and are admitted as running rows retire (same deferral the
+        # non-spec path applies when more rows are dispatchable than fit).
+        max_running = self.runtime.max_batch_size
+        while decoder.free_slots > 0 and len(self.running) < max_running:
+            request = next(
+                (
+                    r
+                    for r in self.waiting
+                    if self._is_launchable_request(r)
+                    and r.request_id not in deferred_ids
+                ),
+                None,
+            )
+            if request is None:
+                break
+            lifecycle = request.lifecycle
+            # Zero-token requests were already finalized in the pre-pass above
+            # (no row, no batch slot); the launchable scan there shares this
+            # filter, so none can reach here. Guard defensively so a request can
+            # never fall through to ``decoder.admit`` (which would prefill +
+            # stage an unwanted token0) if invariants ever change.
+            if request.max_new_tokens <= 0:
+                continue
+
+            # Acquire the LoRA slot before admission, mirroring the normal
+            # prefill path. Without this, adapter requests admitted to the spec
+            # path keep ``request.lora_slot == 0`` and silently run on the
+            # base-model slot, ignoring the requested finetune. A genuine load
+            # failure fails just that request; transient slot exhaustion (all
+            # LoRA slots in use) keeps the request WAITING_RESOURCES so it
+            # retries once an adapter retires, instead of admitting it wrong.
+            if not lifecycle.lora_slot_ready:
+                try:
+                    request.lora_slot = self._acquire_adapter_slot(request.adapter)
+                    lifecycle.lora_slot_ready = True
+                except RuntimeError as exc:
+                    if not _is_out_of_lora_slots(exc):
+                        # Not the recoverable out-of-slots case: a genuine
+                        # adapter load/copy failure (e.g. a CUDA error while
+                        # loading a new slot) also surfaces as a RuntimeError.
+                        # Retrying it would loop forever, so fail this request
+                        # cleanly instead of deferring it.
+                        self.waiting.remove(request)
+                        self._fail_request_early(request, exc)
+                        progressed = True
+                        continue
+                    # Out of LoRA slots: recoverable. The request is genuinely
+                    # blocked on a LoRA resource, so put it back in
+                    # WAITING_RESOURCES (it stays in the waiting queue) and try
+                    # other waiting requests; it retries once a slot frees up.
+                    _LOGGER.debug(
+                        "Deferring spec admission for request %s: %s",
+                        request.request_id,
+                        exc,
+                    )
+                    lifecycle.transition(RequestPhase.WAITING_RESOURCES)
+                    deferred_ids.add(request.request_id)
+                    continue
+                except Exception as exc:
+                    # Unrecoverable adapter load/config error (NotImplementedError
+                    # for an unconfigured provider, ValueError for a rank/device
+                    # mismatch, etc.): fail this request rather than retry it.
+                    self.waiting.remove(request)
+                    self._fail_request_early(request, exc)
+                    progressed = True
+                    continue
+
+            # Hand ``admit`` the request's *typed* prefill tokens -- exactly the
+            # ``prompt_tokens`` the non-spec ``prepare_sequence`` path receives --
+            # not a text-only ``int(t.token_id)`` projection. A launchable prefill
+            # can contain non-text tokens: multi-image chat prompts carry
+            # ``ImageMarker`` tokens, and a generated prefix (resumed request) can
+            # carry ``CoordToken`` / ``SizeToken``; none of those expose
+            # ``token_id``, so stripping every token to its id would raise
+            # ``AttributeError`` here -- *before* the per-request ``try`` below --
+            # and abort the whole scheduler instead of admitting or failing just
+            # this request. ``admit`` (like ``prepare_sequence``) expands
+            # ``ImageMarker``s with the image KV prefix and reads the typed ids.
+            prompt_tokens = list(request.prefill_tokens)
+            # Admission capacity is the decoder's free rows: the spec decoder
+            # owns a fixed, pre-reserved pool of page-table rows (its captured
+            # graphs depend on them), so ``runtime.can_reserve`` -- which gates on
+            # the shared page/slot pool those rows have already claimed -- does
+            # not apply here.
+            self.waiting.remove(request)
+            lifecycle.prefill_started_at = time.perf_counter()
+            lifecycle.transition(RequestPhase.PREFILLING)
+            # ``length`` / ``prompt_length`` must be the row's *KV* prompt length,
+            # exactly what the non-spec ``prepare_sequence`` records (it expands
+            # image markers / a single-image prefix into the KV prompt length, see
+            # ``moondream/runtime.py``). ``len(prompt_tokens)`` counts each
+            # ``ImageMarker`` as one token but the image occupies
+            # ``image_prefix_length`` KV slots, so the count excludes the image KV
+            # prefix. ``request.image_length`` is exactly that prefix
+            # (``image_prefix_length`` for a single image; ``num_images *
+            # (image_prefix_length - 1)`` for the multi-image marker layout, where
+            # each marker is already one token in ``prompt_tokens``), so
+            # ``len(prompt_tokens) + request.image_length`` reconstructs the KV
+            # prompt length for both layouts and leaves text-only requests
+            # (``image_length == 0``) unchanged. Without this, ``build_metrics``
+            # (which reports ``sequence_state.prompt_length``) under-reports image
+            # prompt tokens and ``output_length`` (``length - prompt_length``) is
+            # off by the image prefix. ``batch_idx`` is assigned by ``admit`` (it
+            # picks the spec pool row); carry ``image_length`` so downstream
+            # KV/total-length accounting on the state stays consistent.
+            kv_prompt_length = len(prompt_tokens) + request.image_length
+            state = SequenceState(
+                batch_idx=-1,
+                length=kv_prompt_length,
+                max_length=request.target_length,
+                prompt_length=kv_prompt_length,
+                image_length=request.image_length,
+                lora_slot=request.lora_slot,
+            )
+            # The spec decoder reads ``return_logprobs`` off the state to decide
+            # whether ``step`` computes per-committed-token logprobs for this row
+            # (matching the non-spec sampler, which gates the logprob gather on
+            # the request). ``SequenceState`` is a plain dataclass, so attach it
+            # as an extra attribute the decoder picks up via ``getattr``.
+            state.return_logprobs = request.return_logprobs is True
+
+            # Run the skill's prefill hook BEFORE building the mask + admitting:
+            # ``admit`` prefills *and* samples the first (bonus) token in one
+            # call, so the row's skill mask has to be installed before that
+            # sample -- and some skills (e.g. query) initialise the ids their
+            # ``allowed_token_ids`` depends on inside ``on_prefill``. The hook
+            # only reads ``runtime.prompt_template`` (no dependency on the
+            # forward having run), so running it here is safe.
+            #
+            # The ``on_prefill`` hook and the mask queries below run INSIDE the
+            # same ``try`` as ``admit``: a skill whose ``on_prefill`` /
+            # ``allowed_token_ids`` / ``suppressed_token_ids`` raises does so
+            # after this request has already left ``waiting``, transitioned to
+            # ``PREFILLING``, and acquired its LoRA slot. Outside the ``try`` that
+            # would bypass the admit-failure cleanup -- leaking the LoRA slot and
+            # leaving the request stuck in ``PREFILLING`` (it is gone from
+            # ``waiting`` and ``lifecycle.sequence_state`` is never set, so no
+            # finish/zombie path retires it) until the scheduler later crashes on
+            # it. The ``except`` below already releases the slot and fails the
+            # request cleanly; ``admit`` has not run yet so ``state.batch_idx`` is
+            # still its ``-1`` sentinel and no pool row is retired.
+            try:
+                # Prefix-cache image hit: materialize the overlap crop tiles
+                # before ``admit``.
+                #
+                # The admission coordinator (``engine/executor.py``) short-circuits
+                # a single-image request whose prompt HITS the prefix cache --
+                # ``_AdmissionCoordinator.submit`` returns ``prefix_cache_hit=True``
+                # *without* running image preprocessing, so ``_admit_ready`` marks
+                # the request launchable (``crops_ready=True``) with
+                # ``request.image_crops`` still ``None``. The NON-spec prefill path
+                # is safe with no crops because ``prepare_sequence`` takes the
+                # cache-reuse branch (``_prepare_append_prefill_inputs``) and never
+                # re-encodes the image -- it reuses the cached KV prefix pages.
+                #
+                # The spec ``decoder.admit`` has no cache-reuse path: it
+                # *re-prefills* the prompt into a fresh pool row and splices the
+                # image KV prefix by running the vision encoder
+                # (``encode_image(image, overlap=image_crops)``). Handing it
+                # ``image_crops=None`` for a multi-crop image would encode only the
+                # global/thumbnail image (the no-overlap ``prepare_crops`` path),
+                # giving an incomplete image prefill that diverges from the
+                # non-spec output -- or, on a decoder build that requires the crop
+                # tiles, fail outright. So a prefix-cache image hit must never
+                # reach ``admit`` with an image and ``image_crops=None``: run the
+                # SAME overlap-crop preprocessing the coordinator skipped (the
+                # async future, resolved synchronously here -- the spec path is
+                # already synchronous) and populate ``request.image_crops`` so the
+                # decoder prefills the full multi-crop image.
+                #
+                # Gated narrowly on a *single* image with no crops: multi-image
+                # chat (``image`` is a list/tuple) is never a single-image
+                # prefix-cache hit and crops each image inline inside the encoder,
+                # so it legitimately carries no precomputed overlap and must be
+                # left untouched. A non-cache-hit single-image request already had
+                # its crops materialized by the coordinator before becoming
+                # launchable, so ``request.image_crops`` is already set and this is
+                # a no-op. This preprocessing runs INSIDE the per-request ``try``
+                # so a decode/crop failure fails just this request via
+                # ``_fail_admitted_spec_request`` (no pool row reserved yet --
+                # ``state.batch_idx`` is still its ``-1`` sentinel -- so it only
+                # releases the LoRA slot and fails the request cleanly).
+                if (
+                    request.image is not None
+                    and request.image_crops is None
+                    and not isinstance(request.image, (list, tuple))
+                ):
+                    request.image_crops = self.runtime.preprocess_image_async(
+                        request.image
+                    ).result()
+
+                request.skill_state.on_prefill(self.runtime)
+
+                # Per-sequence constrained-decode mask (skill whitelist/blacklist),
+                # forwarded into ``admit`` so the spec path constrains the drafter +
+                # verify exactly like the non-spec sampler's whitelist-then-blacklist
+                # -- no gating to a text-only/unconstrained fallback. ``None`` leaves
+                # the row unmasked.
+                allowed_token_ids = request.skill_state.allowed_token_ids(
+                    self.runtime
+                )
+                suppressed_token_ids = request.skill_state.suppressed_token_ids(
+                    self.runtime
+                )
+                # Request-level *one-shot* suppression. The non-spec path applies
+                # ``suppress_next_token_ids`` to a request's first generated token
+                # only (``_build_mask_spec`` gates it on
+                # ``token_count == generated_prefix_length``). ``admit`` samples that
+                # exact first token, so forward the suppression here -- otherwise a
+                # suppressed id can be sampled at admit, staged, and the one-shot
+                # window closes (``token_count`` advances) before ``step`` could ever
+                # apply it. ``None`` when the request set no one-shot suppression or
+                # already generated past its prefix (resumed request).
+                suppress_next_token_ids = None
+                if (
+                    request.suppress_next_token_ids
+                    and request.skill_state.token_count
+                    == request.generated_prefix_length
+                ):
+                    suppress_next_token_ids = request.suppress_next_token_ids
+                with torch.inference_mode():
+                    # Pass the request's image AND its multi-crop tiles
+                    # (``image_crops``) -- exactly what the non-spec
+                    # ``prepare_sequence`` forwards (it hands both to the vision
+                    # encoder, which reads ``image_crops`` as the ``overlap`` so
+                    # the high-res crop tiles are encoded, not just the
+                    # global/thumbnail image). Forwarding ``image`` alone would
+                    # give a multi-crop request an incomplete image prefill on
+                    # the spec path and diverge from the non-spec output. Skill
+                    # mask, one-shot suppression, and sampling params
+                    # (temperature/top_p) likewise go through ``admit`` so image
+                    # + constrained + non-greedy requests run on the spec path
+                    # with no fallback. ``admit`` returns ``(first_token_id,
+                    # first_logprob)``: the real selected-token logprob for a
+                    # ``return_logprobs`` request, or ``None`` otherwise.
+                    first_token_id, first_logprob = decoder.admit(
+                        state,
+                        prompt_tokens,
+                        image=request.image,
+                        image_crops=request.image_crops,
+                        allowed_token_ids=allowed_token_ids,
+                        suppressed_token_ids=suppressed_token_ids,
+                        suppress_next_token_ids=suppress_next_token_ids,
+                        temperature=float(request.temperature),
+                        top_p=float(request.top_p),
+                    )
+            except Exception as exc:
+                # ``admit`` prefills into a free spec pool row and assigns
+                # ``state.batch_idx`` before the prefill's image/CUDA work
+                # runs, so a mid-admit failure can leave the row reserved
+                # (and ``batch_idx`` set) even though no token was staged.
+                # This request has already left ``waiting`` and
+                # ``lifecycle.sequence_state`` is not set yet, so no later
+                # finish/zombie path will ever call ``decoder.retire`` for
+                # it -- the row would leak permanently and repeated failures
+                # would drain ``decoder.free_slots`` and stall unrelated spec
+                # requests. ``_fail_admitted_spec_request`` retires the row
+                # (when ``admit`` got far enough to reserve one) and releases
+                # the LoRA slot before failing the request cleanly.
+                self._fail_admitted_spec_request(request, state, exc)
+                progressed = True
+                continue
+
+            lifecycle.sequence_state = state
+            lifecycle.prefill_completed_at = time.perf_counter()
+            self.runtime.active_sequences[state.batch_idx] = state
+
+            # Stage the first (prefill/bonus) token exactly like the non-spec
+            # prefill path: consume_step + streaming + finish check.
+            #
+            # Type the admit token through the runtime hook -- not a hard-coded
+            # ``TextToken``. On a spatial runtime the first generated id can be
+            # ``coord_id`` / ``size_id`` (point/detect apply the skill mask before
+            # this first sample), so it must become a ``CoordToken`` /
+            # ``SizeToken`` the way the non-spec prefill path does via
+            # ``post_sample`` -> ``materialize_tokens``; otherwise the first
+            # coordinate/box component is dropped. ``admit`` surfaces the
+            # admit-position side-values (the target's last hidden + sampling
+            # knobs the spatial hook needs to decode the coord/size value) on
+            # ``state.admit_side_values`` -- a :class:`SpecSideValues`, so
+            # ``_materialize_spec_tokens`` routes it through the spec-aware
+            # ``materialize_spec_tokens`` hook (not the non-spec one). A text-only
+            # runtime leaves it ``None`` and the id materialises as a plain
+            # ``TextToken`` (unchanged).
+            admit_side_values = getattr(state, "admit_side_values", None)
+            # ``admit`` returns the real first-token logprob for a
+            # ``return_logprobs`` request (the sampler's selected-token logprob,
+            # matching the non-spec prefill path's transferred ``sampled_logprobs``
+            # for token0) and ``None`` otherwise. Thread it through the hook so a
+            # spatial admit token (``coord_id`` / ``size_id`` -- point/detect apply
+            # the skill mask before this first sample) gets its coord/size head
+            # logprob folded in, exactly as the non-spec prefill ``post_sample``
+            # path does. ``None`` (no logprobs requested) stays ``None``.
+            #
+            # Materialising/staging the admit token must share the SAME
+            # admit-failure cleanup as ``decoder.admit`` above. ``admit`` has
+            # already succeeded -- the row is reserved, ``sequence_state`` is
+            # set, and the state is registered in ``active_sequences`` -- but the
+            # request is not yet ``running`` and has no finish/zombie path. If
+            # ``_materialize_spec_tokens`` raises here (a spatial admit token
+            # whose runtime emits ``admit_side_values`` but exposes no
+            # ``materialize_spec_tokens`` hook, or a hook that rejects the side
+            # values), an unguarded raise would propagate out of ``_spec_admit``
+            # and leak the spec pool row + LoRA slot + ``active_sequences`` entry,
+            # leaving the request stuck with no scheduler path to finish. Wrap the
+            # materialize/stage path in the same ``_fail_admitted_spec_request``
+            # cleanup so a single bad spatial admit retires the row, releases the
+            # slot, and fails the request cleanly instead.
+            try:
+                admit_logprobs = None if first_logprob is None else [[first_logprob]]
+                (typed_first,), typed_first_logprobs = self._materialize_spec_tokens(
+                    [lifecycle],
+                    [[int(first_token_id)]],
+                    admit_side_values,
+                    admit_logprobs,
+                )
+                token = typed_first[0]
+                staged_first_logprob = (
+                    typed_first_logprobs[0][0]
+                    if typed_first_logprobs is not None
+                    else first_logprob
+                )
+                # Stage the (spatial-augmented) first-token logprob through
+                # unchanged -- no 0.0 greedy-approximation placeholder. The
+                # macro-step supplies real per-token logprobs for every
+                # subsequently committed token.
+                self._spec_stage_token(
+                    lifecycle, token, logprob=staged_first_logprob
+                )
+            except Exception as exc:
+                self._fail_admitted_spec_request(request, state, exc)
+                progressed = True
+                continue
+            progressed = True
+            if self._mark_finished_if_needed(lifecycle):
+                lifecycle.finalized = True
+                self._retire_spec_row(state)
+                continue
+            self.running.push(lifecycle)
+        return progressed
+
+    def _spec_stage_token(
+        self,
+        seq: RequestLifecycle,
+        token: Token,
+        *,
+        logprob: float | None,
+    ) -> None:
+        """Stage one spec-committed token onto ``seq``.
+
+        Mirrors ``RequestLifecycle.stage_token`` but is the single spec-path
+        staging point. ``logprob`` is the macro-step's per-committed-token
+        logprob (``SpecStepResult.logprobs``) for a ``return_logprobs`` request,
+        or ``None`` when the request did not ask for logprobs; it flows through
+        to ``stage_token`` exactly like the non-spec single-token path.
+        """
+        seq.stage_token(self.runtime, token, logprob=logprob)
+
+    def _fail_admitted_spec_request(
+        self,
+        request: GenerationRequest,
+        state: SequenceState,
+        exc: Exception,
+    ) -> None:
+        """Clean up after a spec admission that failed *after* reserving a row.
+
+        The single cleanup point for an admission that has already run far
+        enough through ``_spec_admit`` to claim resources -- ``decoder.admit``
+        reserving a pool row, and/or the post-admit admit-token
+        materialization/staging registering the state in ``active_sequences``.
+        Both failure sites (a raising ``decoder.admit`` and a raising
+        ``_materialize_spec_tokens`` for the admit token) route here so a partly
+        admitted request never leaks the spec pool row, the
+        ``active_sequences`` entry, or the LoRA slot, and is always failed
+        cleanly (it has already left ``waiting`` and is not yet ``running``, so
+        no finish/zombie path would otherwise retire it).
+
+        Each resource is released exactly once and per-resource (mirroring the
+        non-spec admit-failure path): the pool row via ``decoder.retire`` and
+        the adapter slot via ``release_adapter_slot``. This is deliberately NOT
+        ``_retire_spec_row`` -- that also releases ``state.lora_slot`` (the same
+        slot freed here via ``request.lora_slot``), which would double-release
+        it.
+        """
+        decoder = self.runtime.spec.decoder
+        # ``admit`` reserves a free pool row and assigns ``state.batch_idx``
+        # before its prefill image/CUDA work runs, so the row can be reserved
+        # even though no token was staged. ``batch_idx`` left at its ``-1``
+        # sentinel means ``admit`` never reserved one, so there is nothing to
+        # retire.
+        if state.batch_idx >= 0:
+            if decoder is not None:
+                try:
+                    decoder.retire(state)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            # ``active_sequences[batch_idx]`` is populated only once the admit
+            # token has been materialized/staged. On the ``decoder.admit``
+            # failure path it is absent; on the admit-token materialization
+            # failure path it was registered just before -- pop it
+            # unconditionally so neither leaves a dangling entry.
+            self.runtime.active_sequences.pop(state.batch_idx, None)
+        lifecycle = request.lifecycle
+        if lifecycle.lora_slot_ready and request.lora_slot:
+            # Release the LoRA slot we acquired for this failed admission so its
+            # refcount does not leak.
+            try:
+                self.runtime.release_adapter_slot(request.lora_slot)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            request.lora_slot = 0
+            lifecycle.lora_slot_ready = False
+        self._fail_request_early(request, exc)
+
+    def _retire_spec_row(self, state: SequenceState) -> None:
+        """Release every resource a finished spec row holds.
+
+        The single spec-path retire point. The spec decoder owns the pool's
+        page-table rows, so ``decoder.retire`` (not ``runtime.release_sequence``)
+        reclaims the row; ``_release_sequence`` deliberately early-returns for a
+        spec runtime to avoid erasing those persistently-reserved pages. But the
+        adapter slot is *not* part of that pool -- ``_spec_admit`` acquires it via
+        ``_acquire_adapter_slot`` exactly like the non-spec prefill path, which
+        releases it in ``runtime.release_sequence`` -> ``release_adapter_slot``.
+        Since the spec path skips ``release_sequence``, release the slot here too;
+        otherwise every completed adapter spec request leaks its LoRA slot until
+        the adapter pool starves. ``release_adapter_slot`` is a no-op for
+        ``lora_slot == 0`` (a base-model request), so this is unconditional.
+        """
+        decoder = self.runtime.spec.decoder
+        decoder.retire(state)
+        self.runtime.active_sequences.pop(state.batch_idx, None)
+        self.runtime.release_adapter_slot(state.lora_slot)
+
+    def _spec_decode_step(self) -> bool:
+        """Run one spec macro-step, overlapped depth-1.
+
+        Ordering per tick: snapshot membership -> reserve in-flight refs ->
+        commit the previous macro-step -> build this step's masks -> launch.
+
+        Membership is an *optimistic* snapshot taken BEFORE the commit. The
+        commit can FINALIZE a sequence (it hit ``max_new_tokens`` / EOS); because
+        the snapshot predates the commit, such a row is still in ``active`` but
+        must NOT be launched into another macro-step -- its ``state.length`` can
+        already equal ``max_length`` and a real decoder that reserves only the
+        request budget would advance/write past the row. So after the commit the
+        snapshot is filtered: rows the commit finalized are dropped from this
+        launch and retired SYNCHRONOUSLY (their reserved ref is released and the
+        row retired here, mirroring ``_commit_spec``'s zombie branch), exactly
+        like the non-spec launch set, which excludes finalized rows via
+        ``_can_dispatch``. Only continuing rows are launched. The depth-1
+        ``has_pending_work`` leak-guard (``_pending_spec is not None``) still
+        covers a launched-but-uncommitted step for those continuing rows.
+
+        Why the commit happens before the launch (and before the mask build):
+        ``_commit_spec`` advances each committed sequence's skill state via
+        ``consume_step``, and STATEFUL constrained skills evolve their allowed-
+        token set per committed token (e.g. point toggles ``[coord,eos]`` <->
+        ``[coord]`` every coordinate; detect cycles x->y->size). The mask handed
+        to ``decoder.step`` must therefore be recomputed from the skill state
+        *after* the prior run is committed -- exactly the non-spec
+        commit-before-finalize invariant (``advance`` docstring), where
+        ``_build_mask`` re-queries ``allowed_token_ids`` post-commit.
+        Snapshotting once at ``admit`` and reusing it (as the spec path did)
+        left stateful skills with a stale mask for every later position.
+
+        ``inflight_refs`` is reserved for this launch BEFORE the commit so a
+        sequence present in both the previous step and this one (the common
+        continuing case) never drops to zero refs mid-commit and is not retired
+        out from under the relaunch; its ref is decremented again when this
+        launch is itself committed next tick, keeping the count balanced.
+        """
+        decoder = self.runtime.spec.decoder
+        # Snapshot the previous macro-step but KEEP ``self._pending_spec``
+        # pointing at it until ``_commit_spec`` has actually consumed its
+        # in-flight refs. ``_commit_spec`` decrements each pending sequence's
+        # ``inflight_refs`` only in its final per-sequence loop, AFTER resolving
+        # the lazy ``result.tokens`` and running ``_materialize_spec_tokens`` --
+        # either of which can raise (a fail-fast hook, a deferred D2H error). If
+        # we cleared ``_pending_spec`` up front and the commit raised before that
+        # loop, the OLD pending refs would be left on the sequences with no
+        # ``_pending_spec`` record left to ever commit them: a finishing row would
+        # stay stuck in ``FINALIZING`` and leak its decoder row / LoRA slot. By
+        # leaving the record installed, a failed commit's pending refs stay owned
+        # by ``_pending_spec`` for a later ``_drain_spec`` / retry to consume; we
+        # clear it only once the commit SUCCEEDS (below).
+        pending = self._pending_spec
+
+        active = [
+            seq
+            for seq in self.running
+            if not seq.finished and seq.sequence_state is not None
+        ]
+        # Reserve this launch's ref before the commit (see docstring): protects
+        # continuing sequences from a premature retire when the commit drops
+        # their previous-step ref.
+        for seq in active:
+            seq.inflight_refs += 1
+        # Tracks whether this launch's reservation has been handed to a freshly
+        # installed ``_pending_spec`` (the next step). Until it is, the ``except``
+        # path owns the rollback of exactly that reservation.
+        launch_committed = False
+
+        # The commit + launch below can raise (e.g. ``decoder.step`` on a CUDA
+        # error). Until this launch's reservation is handed to a new
+        # ``_pending_spec`` those reserved refs are owned by nothing -- no future
+        # ``_commit_spec`` will decrement them -- so a finishing row would stay
+        # stuck in ``FINALIZING`` and its pool row / adapter slot would leak.
+        # Mirror the non-spec launch path (``launch_decode_step``): on any failure
+        # before the new pending step is installed, roll back exactly the
+        # reservation added above, then re-raise. The OLD pending step's refs are
+        # NOT this method's to roll back -- they stay owned by ``_pending_spec``
+        # (still installed on a commit failure) for a later drain/retry.
+        try:
+            if pending is not None:
+                self._commit_spec(pending)
+                # Commit consumed the old pending step's refs; only now is it safe
+                # to drop the record. A raise above skips this, leaving
+                # ``_pending_spec`` installed so those refs are never orphaned.
+                self._pending_spec = None
+
+            # The commit above can FINALIZE a row (its last allowed token was
+            # ``length``-committed), which sets ``finalized`` and removes it from
+            # ``running`` but cannot retire it yet because the ref reserved above
+            # keeps ``inflight_refs > 0``. That row is still in ``active`` (the
+            # snapshot predates the commit), so it must NOT be launched into
+            # another macro-step: its ``SequenceState.length`` can already equal
+            # ``max_length``, and ``_build_spec_step_masks`` returns ``None`` caps
+            # for a finalized row, so the decoder would be asked to advance/write
+            # past a row that has no budget left (the non-spec launch set excludes
+            # finalized rows via ``_can_dispatch``). Drop those rows from the
+            # launch and turn each one's reserved ref into an immediate retire
+            # (mirrors ``_commit_spec``'s zombie branch: COMPLETED then retire when
+            # the last ref clears).
+            launchable = []
+            for seq in active:
+                if seq.finalized:
+                    seq.inflight_refs -= 1
+                    if seq.inflight_refs == 0:
+                        seq.transition(RequestPhase.COMPLETED)
+                        self._retire_spec_row(seq.state)
+                else:
+                    launchable.append(seq)
+            active = launchable
+
+            if active:
+                # Recompute each row's skill mask from the now-current skill
+                # state (post-commit), so stateful skills constrain the drafter +
+                # verify with the up-to-date allowed/suppressed set this step --
+                # not the admit-time snapshot. ``commit_caps`` is the per-row min
+                # of two accept-truncations: the STATEFUL-mask cap (a row whose
+                # allowed/suppressed set changes per committed token is held to one
+                # token this step, since the single per-step mask is only exact for
+                # one constraint transition per run -- then re-masked from the
+                # now-current skill state next step), and the REMAINING-BUDGET cap
+                # (``max_new_tokens - token_count``) so the decoder's KV/proposer
+                # state never advances past the request's output limit. Rows
+                # finalized by the commit above were already dropped from
+                # ``active``. See ``_build_spec_step_masks`` / ``decoder.step``.
+                (
+                    allowed_token_ids,
+                    suppressed_token_ids,
+                    commit_caps,
+                ) = self._build_spec_step_masks(active)
+                with torch.inference_mode():
+                    result = decoder.step(
+                        [seq.state for seq in active],
+                        allowed_token_ids=allowed_token_ids,
+                        suppressed_token_ids=suppressed_token_ids,
+                        commit_caps=commit_caps,
+                    )
+                self._pending_spec = (active, result)
+                launch_committed = True
+        except Exception:
+            # Failure before this launch's reservation was handed to a new
+            # ``_pending_spec``: undo exactly that reservation so the count stays
+            # balanced and no row is left with a phantom ref (mirrors
+            # ``launch_decode_step``'s rollback). ``active`` is the only set whose
+            # refs this method added; ``_commit_spec`` already decremented whatever
+            # it committed before raising, and a commit that did NOT reach its
+            # decrement loop leaves the OLD pending refs owned by the still-
+            # installed ``_pending_spec`` (committed later by drain/retry) -- not
+            # this method's to touch. ``launch_committed`` (not ``_pending_spec``
+            # being unset) gates the rollback, because on a commit failure
+            # ``_pending_spec`` is deliberately left set to the OLD step.
+            if not launch_committed:
+                for seq in active:
+                    seq.inflight_refs -= 1
+            raise
+
+        return bool(active) or pending is not None
+
+    def _drain_spec(self) -> None:
+        """Commit any in-flight spec macro-step, launching no new work.
+
+        ``_spec_decode_step`` overlaps depth-1 by launching the next macro-step
+        *before* committing the previous one, so between ticks a launched-but-
+        uncommitted step lives in ``_pending_spec``. Unlike ``_spec_decode_step``
+        this deliberately does NOT launch a new step -- it only flushes the
+        outstanding one -- so it is safe to call from the pause/drain path
+        (``_drain_pipeline``) without admitting more spec work while the engine is
+        trying to quiesce. ``_commit_spec`` finalizes/retires any sequence that
+        ended in the committed run and never repopulates ``_pending_spec``, so a
+        single commit empties it; the loop is defensive and converges. No-op when
+        the runtime does not speculate (``_pending_spec`` stays ``None``).
+        """
+        while self._pending_spec is not None:
+            # Snapshot the in-flight step but KEEP ``self._pending_spec`` pointing
+            # at it until ``_commit_spec`` has actually consumed its in-flight refs.
+            # Mirror the keep-until-success guard in ``_spec_decode_step``:
+            # ``_commit_spec`` decrements each pending sequence's ``inflight_refs``
+            # only in its final per-sequence loop, AFTER resolving the lazy
+            # ``result.tokens`` and running ``_materialize_spec_tokens`` -- either
+            # of which can raise (a fail-fast hook, a deferred D2H error). If we
+            # cleared ``_pending_spec`` up front and the commit raised before that
+            # loop, the OLD pending refs would be left on the sequences with no
+            # ``_pending_spec`` record left to ever commit them: a finishing row
+            # would stay stuck in ``FINALIZING`` and leak its decoder row / LoRA
+            # slot, and a later launch from device state would never be staged.
+            # Leaving the record installed keeps those refs owned by
+            # ``_pending_spec`` so the next drain / retry can consume them; we clear
+            # it only once the commit SUCCEEDS (below).
+            pending = self._pending_spec
+            with stream_context(self._compute_stream):
+                with torch.inference_mode():
+                    self._commit_spec(pending)
+            # Commit consumed the in-flight step's refs; only now is it safe to drop
+            # the record. A raise above skips this, leaving ``_pending_spec``
+            # installed so those refs are never orphaned (committed by a later
+            # drain / retry). ``has_pending_work`` still reports True via the
+            # ``_pending_spec is not None`` term, so the executor keeps driving it.
+            self._pending_spec = None
+
+    def _materialize_spec_tokens(
+        self,
+        active: List[RequestLifecycle],
+        runs: Sequence[Sequence[int]],
+        side_values: object | None,
+        logprobs: Sequence[Sequence[float]] | None = None,
+    ) -> tuple[list[list[Token]], list[list[float]] | None]:
+        """Type each sequence's committed run via the runtime hook.
+
+        ``runs[i]`` is the committed id list for ``active[i]``.
+
+        ``logprobs`` (optional) is the per-committed-token vocab logprob, parallel
+        to ``runs`` (``logprobs[i][j]`` for ``runs[i][j]``). It is the spec
+        decoder's verify-logit logprob -- the vocab head only. A spatial runtime
+        also has a coord/size head whose logprob the non-spec ``post_sample`` path
+        folds into the token logprob in-place; the spec ``materialize_spec_tokens``
+        hook mirrors that, mutating the flat logprob list to add each spatial
+        position's head logprob. We flatten ``logprobs`` into that hook (sequences-
+        major, parallel to the flat ids), then re-group the (now-augmented) values
+        so the caller stages the combined vocab + coord/size logprob for spatial
+        tokens, matching the non-spec convention. ``None`` (no request wanted
+        logprobs) skips this and returns ``None`` for the regrouped logprobs.
+
+        Dispatch is on ``side_values`` (the macro-step's :class:`SpecSideValues`),
+        which carries the target's per-committed-position final hidden + sampling
+        knobs a spatial runtime decodes coord/size ids from. It must NOT be handed
+        to the non-spec ``materialize_tokens`` hook: that hook's step-handle is the
+        ``post_sample`` aux handle (Moondream unpacks it as ``(slot, batch_size)``
+        and synchronises slot-local staging), so feeding it a ``SpecSideValues``
+        raises (cannot unpack) or reads the wrong layout. So:
+
+        * ``side_values`` set -> route through the dedicated
+          ``materialize_spec_tokens`` hook (the spec analog that decodes coord/size
+          from the packed hidden). If the runtime emits spatial side-values but
+          exposes no such hook, *fail fast* (``RuntimeError``) -- never silently
+          materialise the committed ids as plain ``TextToken``s (that would DROP
+          the decoded coordinates/sizes and corrupt spatial-skill results), and
+          never misuse the non-spec hook (whose handle shape ``SpecSideValues``
+          does not match). A text-only runtime leaves ``side_values`` ``None`` and
+          takes the branch below, so it never reaches this guard.
+        * ``side_values is None`` -> a text-only macro-step; use the normal
+          ``materialize_tokens`` path with a ``None`` handle (its plain-text
+          branch), matching the non-spec single-token commit.
+
+        Returns the typed tokens re-grouped per sequence (parallel to ``runs``)
+        plus the per-sequence logprobs (augmented with the spatial head logprob
+        when a spatial hook ran), or ``None`` for the logprobs when ``logprobs``
+        was ``None``.
+        """
+        flat_ids: list[int] = [int(t) for run in runs for t in run]
+        if not flat_ids:
+            empty_lp: list[list[float]] | None = (
+                [[] for _ in runs] if logprobs is not None else None
+            )
+            return [[] for _ in runs], empty_lp
+        # Flatten the per-sequence logprobs parallel to the flat ids. The spec hook
+        # may mutate this list in place to fold in each spatial position's
+        # coord/size head logprob (mirroring the non-spec ``post_sample`` path).
+        flat_logprobs: list[float] | None = None
+        if logprobs is not None:
+            flat_logprobs = [float(lp) for run in logprobs for lp in run]
+            if len(flat_logprobs) != len(flat_ids):
+                raise ValueError(
+                    "_materialize_spec_tokens: logprobs length "
+                    f"{len(flat_logprobs)} != committed token count "
+                    f"{len(flat_ids)}"
+                )
+        token_ids_cpu = torch.tensor(flat_ids, dtype=torch.long)
+        # ``batch_idx`` parallel to the flattened ids (the spec batch row each
+        # committed token belongs to); a spatial hook indexes side-values by the
+        # active-sequence order, but keep the row ids aligned for hooks that key
+        # off them.
+        batch_indices: list[int] = [
+            seq.state.batch_idx for seq, run in zip(active, runs) for _ in run
+        ]
+        batch_idx = torch.tensor(batch_indices, dtype=torch.long)
+        if side_values is not None:
+            spec_hook = self._hooks.materialize_spec_tokens
+            if spec_hook is None:
+                # Fail fast (no silent fallback). ``side_values`` is produced ONLY
+                # when the runtime decoded spatial values that MUST be typed into
+                # ``CoordToken`` / ``SizeToken`` from the target's per-position
+                # final hidden (the spatial-skill spec path: detect/point). The
+                # non-spec ``materialize_tokens`` hook cannot consume a
+                # ``SpecSideValues`` (its handle is the ``post_sample``
+                # ``(slot, batch_size)`` aux value), and materialising the
+                # committed ids as plain ``TextToken``s would silently DROP the
+                # decoded coordinates/sizes and corrupt the result. A runtime that
+                # emits spatial side-values must expose ``materialize_spec_tokens``
+                # (see ``MoondreamRuntime.sampling_hooks``); a text-only runtime
+                # leaves ``side_values`` ``None`` and never reaches here.
+                raise RuntimeError(
+                    "Speculative macro-step returned spatial SpecSideValues but "
+                    "the runtime's SamplingHooks expose no materialize_spec_tokens "
+                    "hook; refusing to silently drop decoded coord/size values to "
+                    "TextToken. Implement materialize_spec_tokens on the runtime "
+                    "(mirror its non-spec materialize_tokens spatial decode) to "
+                    "enable spec for spatial skills."
+                )
+            # The spatial hook folds each coord/size position's head logprob into
+            # ``flat_logprobs`` in place (no-op when ``flat_logprobs`` is ``None``).
+            flat_tokens = spec_hook(
+                token_ids_cpu, active, batch_idx, side_values, flat_logprobs
+            )
+        else:
+            # Text-only macro-step: the non-spec hook's ``step_handle is None``
+            # branch (plain text) applies. No spatial head, so the vocab logprobs
+            # pass through unchanged.
+            flat_tokens = self._materialize_tokens(
+                token_ids_cpu,
+                active,
+                batch_idx,
+                None,
+            )
+        # Re-group the flat typed tokens (and augmented logprobs) into per-sequence
+        # runs parallel to ``runs``.
+        grouped: list[list[Token]] = []
+        grouped_logprobs: list[list[float]] | None = (
+            [] if flat_logprobs is not None else None
+        )
+        cursor = 0
+        for run in runs:
+            n = len(run)
+            grouped.append(list(flat_tokens[cursor:cursor + n]))
+            if grouped_logprobs is not None:
+                assert flat_logprobs is not None
+                grouped_logprobs.append(list(flat_logprobs[cursor:cursor + n]))
+            cursor += n
+        return grouped, grouped_logprobs
+
+    def _commit_spec(self, pending) -> None:
+        """Commit one previously-launched spec macro-step (depth-1).
+
+        Resolving ``result.tokens`` blocks on the macro-step's deferred D2H, but
+        that transfer completed while the GPU ran the step launched after it, so
+        the wait is hidden. Mirrors ``commit_step``'s decode commit: decrement
+        ``inflight_refs``, skip + retire zombies, else stage the variable run of
+        committed tokens (typed via the runtime hook, each with its macro-step
+        logprob) and finish/retire on EOS or length cap.
+        """
+        active, result = pending
+        # ``tokens``/``logprobs`` resolve lazily off the (already-landed) D2H;
+        # ``side_values`` holds device tensors read at ``step`` time.
+        tokens = result.tokens
+        logprobs = result.logprobs  # None when nobody requested logprobs
+        side_values = result.side_values
+        # Type the whole step's committed ids up front (coord/size via the
+        # runtime hook using ``side_values``), then stage each typed token below
+        # so a mid-run EOS still drops the trailing typed tokens correctly.
+        # Passing ``logprobs`` lets the spatial hook fold each coord/size head
+        # logprob into the staged value (mirroring the non-spec ``post_sample``
+        # path); ``typed_logprobs`` is the augmented per-sequence logprobs (or
+        # ``None`` when no request wanted logprobs), which we stage instead of the
+        # raw vocab-only ``logprobs``.
+        typed, typed_logprobs = self._materialize_spec_tokens(
+            active, tokens, side_values, logprobs
+        )
+        if typed_logprobs is not None:
+            logprobs = typed_logprobs
+        for i, (seq, typed_run) in enumerate(zip(active, typed)):
+            seq.inflight_refs -= 1
+            if seq.finalized:
+                # Zombie: finished by an earlier commit while still in flight here.
+                # When its last in-flight ref drops, mark the lifecycle COMPLETED
+                # *before* retiring the row, mirroring the non-spec zombie path in
+                # ``commit_step`` (``seq.transition(COMPLETED)`` then release). The
+                # finishing commit left it FINALIZING because ``inflight_refs > 0``;
+                # without this transition a normally-completed spec request stays
+                # stuck in FINALIZING forever after its row is retired.
+                if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
+                    self._retire_spec_row(seq.state)
+                continue
+            seq_logprobs = logprobs[i] if logprobs is not None else None
+            for j, token in enumerate(typed_run):
+                seq.state.advance()  # KV length mirrors the committed token
+                logprob = seq_logprobs[j] if seq_logprobs is not None else None
+                self._spec_stage_token(seq, token, logprob=logprob)
+                if self._mark_finished_if_needed(seq):
+                    seq.finalized = True
+                    self.running.remove(seq)
+                    if seq.inflight_refs == 0:
+                        self._retire_spec_row(seq.state)
+                    break
 
     def pop_completed(self) -> List[SchedulerResult]:
         """Retrieve all completed results accumulated so far."""
@@ -1326,6 +2322,12 @@ class GenerationScheduler:
         was finalized earlier (in _mark_finished_if_needed or schedule_decode_step)
         but resource release was deferred because inflight_refs > 0.
         """
+        # Speculative decoding: the spec decoder owns the page-table rows (a
+        # fixed, persistently-reserved pool backing its captured CUDA graphs).
+        # Releasing the batch_idx here would erase pages out from under those
+        # graphs; row reuse is handled by ``decoder.retire`` at finish instead.
+        if self.runtime.spec is not None:
+            return
         if seq.state.batch_idx in self.runtime.active_sequences:
             try:
                 # The generated prefix was part of prefill, so only tokens
@@ -1386,6 +2388,161 @@ class GenerationScheduler:
             all_greedy,
             any_return_logprobs,
         )
+
+    def _build_spec_step_masks(
+        self, sequences: List[RequestLifecycle]
+    ) -> tuple[
+        list[Optional[Sequence[int]]],
+        list[Optional[Sequence[int]]],
+        list[Optional[int]],
+    ]:
+        """Per-row skill masks (+ commit caps) for a spec macro-step.
+
+        The spec-decode analog of ``_build_mask_spec``'s allowed/suppressed
+        re-query. ``_spec_decode_step`` calls this AFTER committing the previous
+        macro-step (so ``skill_state`` reflects every token committed through the
+        prior run), then threads the result into ``decoder.step`` so the drafter
+        + verify constrain to the *current* allowed/suppressed set instead of the
+        snapshot taken once at ``admit``. This is what keeps STATEFUL skills
+        correct on the spec path (point toggles ``[coord,eos]`` <-> ``[coord]``
+        every coordinate; detect cycles x->y->size), mirroring how the non-spec
+        ``_build_mask`` refreshes the mask each step.
+
+        Finalized/zombie rows come back unconstrained (``None``), exactly like
+        ``_build_mask_spec`` -- their tokens are dropped at commit, so masking
+        them is moot.
+
+        Deliberately does NOT re-apply the request-level one-shot
+        ``suppress_next_token_ids``: that suppression targets a request's *first*
+        generated token only and is applied once, at ``admit`` (which samples
+        that token); re-applying it here would wrongly suppress past the one-shot
+        window.
+
+        The third return is the per-row ``commit_caps`` (parallel to
+        ``sequences``): the per-row upper bound on tokens this macro-step may
+        commit, the ``min`` of two independent accept-truncation caps (``None``
+        in either slot means that cap is absent / +inf):
+
+        * the STATEFUL-mask cap -- ``1`` for a row whose skill mask changes per
+          committed token, else absent. The single per-step mask is exact only
+          for one constraint transition per committed run: a macro-step commits a
+          *variable* run of ``a_i + 1`` tokens under ONE mask, so a stateful
+          row's 2nd..Nth positions would be verified under the stale
+          1st-position mask (e.g. a detect run could suppress the required
+          ``size_id`` or accept a ``coord`` where ``size`` is required). Capping
+          such a row to one committed token forces exactly one transition per run
+          -- the regime where the per-step mask IS exact, identical to the
+          non-spec one-token-per-step path -- and the next step re-queries the
+          mask from the now-current skill state.
+
+        * the REMAINING-BUDGET cap -- ``max_new_tokens - token_count``, the
+          number of output tokens the request may still emit. ``_commit_spec``
+          already stops *staging* once ``max_new_tokens`` is reached, but the
+          decoder advances its KV / proposer state through the *whole* committed
+          run regardless, so without this cap the row's pool state (and the
+          optimistic depth-1 zombie step launched off it) runs past the request's
+          target length even though the extra tokens are never emitted. Capping
+          the committed run to the remaining budget makes the decoder finish the
+          row at exactly ``max_new_tokens`` -- the same hard stop the non-spec
+          path hits -- so this step's commit lands the final token and
+          ``_commit_spec`` marks it ``length``-finished. A continuing (not
+          finalized) row always has ``token_count < max_new_tokens`` here (else a
+          prior commit would have finished it), so the budget is ``>= 1``.
+
+        A non-stateful row with budget to spare stays uncapped (``None``) so it
+        keeps the full multi-token speculative accept. Finalized/zombie rows come
+        back ``None`` (their tokens are dropped at commit). Returns
+        ``(allowed_per_row, suppressed_per_row, commit_caps_per_row)``.
+        """
+        allowed_tokens: list[Optional[Sequence[int]]] = []
+        suppressed_tokens: list[Optional[Sequence[int]]] = []
+        commit_caps: list[Optional[int]] = []
+        for seq in sequences:
+            if seq.finalized:
+                allowed_tokens.append(None)
+                suppressed_tokens.append(None)
+                commit_caps.append(None)
+                continue
+            allowed = seq.skill_state.allowed_token_ids(self.runtime)
+            suppressed = seq.skill_state.suppressed_token_ids(self.runtime)
+            allowed_tokens.append(allowed)
+            suppressed_tokens.append(suppressed)
+            stateful_cap = (
+                1 if self._mask_is_stateful(seq, allowed, suppressed) else None
+            )
+            budget_cap = self._remaining_commit_budget(seq)
+            commit_caps.append(_min_cap(stateful_cap, budget_cap))
+        return allowed_tokens, suppressed_tokens, commit_caps
+
+    def _remaining_commit_budget(self, seq: RequestLifecycle) -> Optional[int]:
+        """Tokens ``seq`` may still emit this macro-step before ``max_new_tokens``.
+
+        The committed run must not advance the decoder past the request's output
+        budget (the non-spec path stops sampling exactly at ``max_new_tokens``).
+        ``skill_state.token_count`` already reflects every token committed through
+        the prior macro-step (this runs post-commit), so the remaining budget is
+        ``max_new_tokens - token_count``. Returns ``None`` (uncapped) only when
+        ``max_new_tokens`` is unset; otherwise the live remaining count, which is
+        ``>= 1`` for any not-yet-finalized row (a row that had already reached the
+        limit would have been finished + retired at the prior commit and is not in
+        this step's ``active`` set).
+        """
+        max_new = seq.request.max_new_tokens
+        if max_new is None:
+            return None
+        return max(0, max_new - seq.skill_state.token_count)
+
+    def _mask_is_stateful(
+        self,
+        seq: RequestLifecycle,
+        allowed: Optional[Sequence[int]],
+        suppressed: Optional[Sequence[int]],
+    ) -> bool:
+        """Whether ``seq``'s skill mask can change WITHIN one committed run.
+
+        A spec macro-step commits a variable run of tokens under a single
+        per-step mask, so a row whose allowed/suppressed set evolves per
+        committed token (point cycles coord/eos; detect cycles x->y->size; query
+        injects a fixed post-reasoning prefix one id at a time, and toggles its
+        suppression as it leaves reasoning) must be capped to one committed token
+        per step -- otherwise the run's later positions verify under the stale
+        first-position mask. This decides that cap from the live skill state,
+        model-agnostically (the scheduler never imports a model's skills).
+
+        A skill MUST declare its mask precisely via the ``mask_is_stateful``
+        attribute / property on its ``SkillState`` (``True`` => evolving,
+        ``False`` => provably constant) whenever its mask is anything other than
+        a single constant set held for the whole generation; when present that
+        declaration wins. The behavioural fallback below is only a safety net for
+        states that never declare, and it is NOT sufficient on its own for an
+        important class of stateful masks: it inspects the constraint at the run's
+        FIRST position, so it cannot see a mask that is INACTIVE at step start but
+        transitions to ACTIVE within the committed run. Reasoning skills do
+        exactly this -- ``QuerySkillState`` / ``ChatSkillState`` hold no
+        constraint while collecting reasoning (for non-moondream2 query, and for
+        chat, both ``allowed`` and ``suppressed`` are ``None``), then force a
+        ``post_reasoning_prefix`` AFTER the model emits ``answer_id``; if a run
+        committed ``answer_id`` plus following tokens under that None-at-start
+        mask, the post-boundary tokens would be accepted WITHOUT the required
+        prefix constraint. Those states therefore declare ``mask_is_stateful =
+        True`` so they are always capped (see their class comments); the fallback
+        alone would wrongly return ``False`` for them.
+
+        In the absence of a declaration the conservative behavioural rule is: any
+        ACTIVE constraint (a non-empty ``allowed`` whitelist or ``suppressed``
+        blacklist this step) is treated as potentially stateful and capped,
+        because the scheduler cannot prove the set is position-independent without
+        model knowledge. Correctness-first: over-capping a constant-mask skill
+        only costs that row's intra-step speculation (it still advances one token
+        per step), while under-capping a stateful one corrupts constrained
+        output. A row with no active constraint AND no stateful declaration is
+        treated as non-stateful and keeps the full multi-token accept -- which is
+        why a transitions-from-None mask must not rely on the fallback.
+        """
+        declared = getattr(seq.skill_state, "mask_is_stateful", None)
+        if declared is not None:
+            return bool(declared)
+        return bool(allowed) or bool(suppressed)
 
     def _build_mask(
         self, sequences: List[RequestLifecycle], slot

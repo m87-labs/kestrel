@@ -111,6 +111,19 @@ class PointSkill(SkillSpec):
 class PointSkillState(SkillState):
     """Skill state that aggregates emitted points from coord tokens."""
 
+    # The point mask is stateful: ``allowed_token_ids`` is always ACTIVE (a
+    # non-empty whitelist at every position, so the row never starts
+    # unconstrained) and toggles per committed coord token between
+    # ``[coord_id]`` (awaiting y) and ``[coord_id, eos_id]`` (awaiting the next
+    # x / end). A single spec macro-step commits a variable run under ONE mask,
+    # so the run's 2nd..Nth positions would verify under the stale 1st-position
+    # whitelist (e.g. accepting an ``eos_id`` where only ``coord_id`` is
+    # allowed). The scheduler's behavioural fallback already caps this row (its
+    # allowed set is always truthy), but declare it explicitly so the verdict is
+    # pinned on the class rather than relying on that fallback: capped to one
+    # committed token per macro-step, the per-step mask is exact.
+    mask_is_stateful = True
+
     def __init__(
         self,
         spec: SkillSpec,

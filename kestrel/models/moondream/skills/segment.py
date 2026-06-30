@@ -118,6 +118,13 @@ class SegmentSkill(SkillSpec):
 class SegmentSkillState(SkillState):
     """Skill state that interprets coord/size tokens and SVG path text."""
 
+    # Segment never constrains decoding: it overrides neither
+    # ``allowed_token_ids`` nor ``suppressed_token_ids`` (both stay the base
+    # ``None``), so its mask is trivially position-independent. Declare it
+    # non-stateful so the spec scheduler keeps the full multi-token speculative
+    # accept rather than ever capping the row to one committed token per step.
+    mask_is_stateful = False
+
     def __init__(
         self,
         spec: SkillSpec,

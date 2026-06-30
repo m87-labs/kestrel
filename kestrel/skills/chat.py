@@ -268,6 +268,28 @@ class ChatSkill(SkillSpec):
 class ChatSkillState(SkillState):
     """Buffers an assistant turn (optional thinking block) into a chat message."""
 
+    # The chat mask is genuinely stateful: it transitions INACTIVE -> ACTIVE
+    # mid-run. While collecting reasoning, ``allowed_token_ids`` is ``None`` and
+    # this state overrides no ``suppressed_token_ids`` (base returns ``None``) --
+    # no active constraint. Once the model emits ``answer_id``, the state flips
+    # to forcing ``post_reasoning_prefix`` one id at a time via
+    # ``allowed_token_ids``. A single spec macro-step commits a variable run
+    # under ONE mask, so a run that begins in reasoning (mask = None) and crosses
+    # ``answer_id`` would verify the post-boundary tokens under the stale,
+    # unconstrained first-position mask -- accepting them WITHOUT the required
+    # prefix constraint and corrupting the output. The scheduler's behavioural
+    # fallback ("any ACTIVE constraint is stateful") cannot see this transition
+    # because the mask is ``None`` at the run's first position, so declare the
+    # mask stateful explicitly: the scheduler then caps such a row to one
+    # committed token per macro-step, forcing exactly one constraint transition
+    # per run (the regime where the per-step mask is exact). Always-cap is the
+    # correctness-first verdict; a transition-only cap is not expressible here
+    # because the boundary (when the model emits ``answer_id``) is model-decided
+    # and unknowable before the run commits. Tradeoff (follow-up): this also caps
+    # the long unconstrained answer/reasoning phases, costing intra-step
+    # speculation on those rows.
+    mask_is_stateful = True
+
     def __init__(
         self,
         spec: SkillSpec,
