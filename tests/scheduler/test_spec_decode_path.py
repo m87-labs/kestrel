@@ -8,6 +8,7 @@ non-spec path stays untouched when ``runtime.spec`` is ``None``.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -963,6 +964,125 @@ def test_spec_admit_forwards_image_crops_for_multicrop_request() -> None:
     # request.
     assert kw["image"] is img
     assert kw["image_crops"] is crops
+
+
+def test_spec_admit_materializes_crops_for_prefix_cache_image_hit() -> None:
+    """A prefix-cache image hit never reaches ``admit`` with ``image_crops=None``.
+
+    Regression for the codex P1 @ scheduler.py:865. The admission coordinator
+    (``engine/executor.py``) short-circuits a single-image request whose prompt
+    HITS the prefix cache: ``_AdmissionCoordinator.submit`` returns
+    ``prefix_cache_hit=True`` WITHOUT running image preprocessing, so
+    ``_admit_ready`` marks the request launchable (``crops_ready=True``) with
+    ``image_crops`` still ``None``. The non-spec ``prepare_sequence`` path is safe
+    (it reuses the cached KV prefix and never re-encodes the image), but the spec
+    ``decoder.admit`` has no cache-reuse path -- it re-prefills the image by
+    running the vision encoder, which needs the overlap crop tiles. So
+    ``_spec_admit`` must materialize the crops (the preprocessing the coordinator
+    skipped) BEFORE ``admit`` -- otherwise a multi-crop image gets an incomplete
+    prefill (only the global image) or a decoder that requires the tiles fails.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+
+    # Stand-in for the OverlapCropOutput the runtime's overlap-crop preprocessing
+    # produces; assert exactly THIS object reaches ``admit`` so we know the
+    # scheduler ran the preprocessing rather than forwarding the bare image.
+    materialized_crops = object()
+    preprocess_calls: list[object] = []
+
+    def _fake_preprocess(image: object) -> Future:
+        preprocess_calls.append(image)
+        fut: Future = Future()
+        fut.set_result(materialized_crops)
+        return fut
+
+    rt.preprocess_image_async = _fake_preprocess  # type: ignore[method-assign]
+    sched = _make_scheduler(rt)
+
+    img = object()
+    # Model the prefix-cache image hit exactly as the coordinator leaves it:
+    # a single image, launchable (crops_ready), but image_crops still None.
+    req = _enqueue(sched, 0, prompt_len=3, max_new=8, image=img)
+    assert req.image_crops is None  # coordinator skipped preprocessing on the hit
+    req.lifecycle.prefix_cache_hit = True
+
+    assert sched._spec_admit() is True
+
+    # The scheduler ran the overlap-crop preprocessing the coordinator skipped...
+    assert preprocess_calls == [img]
+    # ...and forwarded the materialized crops (NOT None) into admit alongside the
+    # image, so the decoder prefills the full multi-crop image.
+    kw = dec.admit_kwargs[0]
+    assert kw["image"] is img
+    assert kw["image_crops"] is materialized_crops
+    assert kw["image_crops"] is not None
+    # The request now carries the crops for any later re-prefill too.
+    assert req.image_crops is materialized_crops
+
+
+def test_spec_admit_does_not_preprocess_when_crops_already_present() -> None:
+    """A single-image request that already has crops is NOT re-preprocessed.
+
+    The non-cache-hit single-image path already had its overlap crops
+    materialized by the admission coordinator before the request became
+    launchable, so ``_spec_admit`` must forward the existing
+    ``request.image_crops`` unchanged and not run preprocessing a second time.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    preprocess_calls: list[object] = []
+
+    def _fake_preprocess(image: object) -> Future:
+        preprocess_calls.append(image)
+        fut: Future = Future()
+        fut.set_result(object())
+        return fut
+
+    rt.preprocess_image_async = _fake_preprocess  # type: ignore[method-assign]
+    sched = _make_scheduler(rt)
+
+    img = object()
+    crops = object()  # the coordinator already tiled this image
+    _enqueue(sched, 0, prompt_len=3, max_new=8, image=img, image_crops=crops)
+
+    assert sched._spec_admit() is True
+    # No re-preprocessing, and the original crops reach admit unchanged.
+    assert preprocess_calls == []
+    kw = dec.admit_kwargs[0]
+    assert kw["image"] is img
+    assert kw["image_crops"] is crops
+
+
+def test_spec_admit_skips_crop_materialization_for_multi_image_request() -> None:
+    """A multi-image (list) request is left untouched -- crops happen inline.
+
+    Multi-image chat is never a single-image prefix-cache hit and the encoder
+    crops each image inline (no precomputed overlap), so ``_spec_admit`` must NOT
+    run single-image overlap preprocessing on it: ``image_crops`` stays ``None``
+    and the image list reaches ``admit`` unchanged.
+    """
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    preprocess_calls: list[object] = []
+
+    def _fake_preprocess(image: object) -> Future:
+        preprocess_calls.append(image)
+        fut: Future = Future()
+        fut.set_result(object())
+        return fut
+
+    rt.preprocess_image_async = _fake_preprocess  # type: ignore[method-assign]
+    sched = _make_scheduler(rt)
+
+    images = [object(), object()]  # multi-image chat payload
+    _enqueue(sched, 0, prompt_len=3, max_new=8, image=images)
+
+    assert sched._spec_admit() is True
+    assert preprocess_calls == []  # single-image preprocessing must not run
+    kw = dec.admit_kwargs[0]
+    assert kw["image"] is images
+    assert kw["image_crops"] is None
 
 
 def test_spec_commit_routes_committed_ids_through_materialize_hook() -> None:

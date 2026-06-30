@@ -814,6 +814,55 @@ class GenerationScheduler:
             # request cleanly; ``admit`` has not run yet so ``state.batch_idx`` is
             # still its ``-1`` sentinel and no pool row is retired.
             try:
+                # Prefix-cache image hit: materialize the overlap crop tiles
+                # before ``admit``.
+                #
+                # The admission coordinator (``engine/executor.py``) short-circuits
+                # a single-image request whose prompt HITS the prefix cache --
+                # ``_AdmissionCoordinator.submit`` returns ``prefix_cache_hit=True``
+                # *without* running image preprocessing, so ``_admit_ready`` marks
+                # the request launchable (``crops_ready=True``) with
+                # ``request.image_crops`` still ``None``. The NON-spec prefill path
+                # is safe with no crops because ``prepare_sequence`` takes the
+                # cache-reuse branch (``_prepare_append_prefill_inputs``) and never
+                # re-encodes the image -- it reuses the cached KV prefix pages.
+                #
+                # The spec ``decoder.admit`` has no cache-reuse path: it
+                # *re-prefills* the prompt into a fresh pool row and splices the
+                # image KV prefix by running the vision encoder
+                # (``encode_image(image, overlap=image_crops)``). Handing it
+                # ``image_crops=None`` for a multi-crop image would encode only the
+                # global/thumbnail image (the no-overlap ``prepare_crops`` path),
+                # giving an incomplete image prefill that diverges from the
+                # non-spec output -- or, on a decoder build that requires the crop
+                # tiles, fail outright. So a prefix-cache image hit must never
+                # reach ``admit`` with an image and ``image_crops=None``: run the
+                # SAME overlap-crop preprocessing the coordinator skipped (the
+                # async future, resolved synchronously here -- the spec path is
+                # already synchronous) and populate ``request.image_crops`` so the
+                # decoder prefills the full multi-crop image.
+                #
+                # Gated narrowly on a *single* image with no crops: multi-image
+                # chat (``image`` is a list/tuple) is never a single-image
+                # prefix-cache hit and crops each image inline inside the encoder,
+                # so it legitimately carries no precomputed overlap and must be
+                # left untouched. A non-cache-hit single-image request already had
+                # its crops materialized by the coordinator before becoming
+                # launchable, so ``request.image_crops`` is already set and this is
+                # a no-op. This preprocessing runs INSIDE the per-request ``try``
+                # so a decode/crop failure fails just this request via
+                # ``_fail_admitted_spec_request`` (no pool row reserved yet --
+                # ``state.batch_idx`` is still its ``-1`` sentinel -- so it only
+                # releases the LoRA slot and fails the request cleanly).
+                if (
+                    request.image is not None
+                    and request.image_crops is None
+                    and not isinstance(request.image, (list, tuple))
+                ):
+                    request.image_crops = self.runtime.preprocess_image_async(
+                        request.image
+                    ).result()
+
                 request.skill_state.on_prefill(self.runtime)
 
                 # Per-sequence constrained-decode mask (skill whitelist/blacklist),
