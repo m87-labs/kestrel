@@ -1384,6 +1384,122 @@ def test_spec_pre_admit_hook_failure_releases_lora_slot_and_fails_cleanly() -> N
     assert len(sched.running) == 0
 
 
+class _AdmitSideValuesDecoder(_FakeDecoder):
+    """``SpecDecoder`` whose ``admit`` SUCCEEDS -- reserving a pool row, assigning
+    ``batch_idx``, and attaching spatial ``admit_side_values`` to the state -- but
+    whose row is returned to the free pool by ``retire`` so a test can prove the
+    post-admit cleanup did not leak the row.
+
+    This drives the failure site that the base ``_RaisingAdmitDecoder`` does NOT:
+    ``decoder.admit`` returns cleanly, the request is registered in
+    ``active_sequences`` and ``sequence_state`` is set, and the failure happens
+    LATER when the scheduler types the admit token via ``_materialize_spec_tokens``
+    (a spatial ``admit_side_values`` with no ``materialize_spec_tokens`` hook fails
+    fast). That materialization runs OUTSIDE the original admit ``try``/cleanup, so
+    without the fix it leaks the spec row + LoRA slot + ``active_sequences`` entry
+    and strands the request.
+    """
+
+    def retire(self, state) -> None:
+        row = self._row_of.pop(id(state))
+        self.retired.append(row)
+        # Return the row to the free pool so the test can prove no leak.
+        self._free.append(row)
+
+
+def test_spec_admit_token_materialize_failure_retires_row_no_leak() -> None:
+    """P2 codex finding @ scheduler.py:950: a raising admit-token
+    materialization retires the spec row and frees the LoRA slot, no leak.
+
+    The admit-token typing/staging path runs AFTER ``decoder.admit`` has reserved
+    the pool row, set ``sequence_state``, and registered the state in
+    ``active_sequences`` -- but BEFORE the request is pushed to ``running`` and
+    while it has no finish/zombie path. It also sits OUTSIDE the admit ``try`` that
+    retires the row + releases the LoRA slot. If ``_materialize_spec_tokens``
+    raises here (a spatial admit token whose runtime emits ``admit_side_values``
+    but exposes no ``materialize_spec_tokens`` hook -> fail-fast ``RuntimeError``),
+    an unguarded raise would leak the spec pool row + adapter slot +
+    ``active_sequences`` entry and strand the request with no scheduler path to
+    finish. Asserts the bad spatial admit (a) retires the reserved row, (b)
+    releases the LoRA slot exactly once, (c) fails the request cleanly (error
+    result, COMPLETED -- not stuck PREFILLING), (d) leaves no ``active_sequences``
+    leak and ``free_slots`` back at baseline, and (e) lets a SUBSEQUENT request
+    admit into the reclaimed row.
+    """
+
+    class _FakeAdapterProvider:
+        def config(self) -> dict:
+            return {"max_lora_rank": 16}
+
+        def get(self, adapter: str) -> object:
+            return object()
+
+    # ``admit`` succeeds and attaches spatial side-values; the runtime exposes NO
+    # ``materialize_spec_tokens`` hook (the default ``_spec_runtime`` SamplingHooks
+    # are empty), so typing the admit token fails fast inside ``_spec_admit``.
+    admit_side_values = object()
+    dec = _AdmitSideValuesDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+        admit_side_values=admit_side_values,
+    )
+    rt = _spec_runtime(dec)
+    assert dec.free_slots == 1  # baseline: one row free
+    sched = GenerationScheduler(
+        rt,
+        compute_stream=None,
+        skill_registry=__import__(
+            "kestrel.skills", fromlist=["SkillRegistry"]
+        ).SkillRegistry([]),
+        adapter_provider=_FakeAdapterProvider(),
+    )
+    req = _enqueue(
+        sched, 0, prompt_len=3, max_new=8, adapter="ft-1", lora_slot_ready=False
+    )
+
+    # The scheduler does not crash out -- it cleans up and reports progress.
+    assert sched._spec_admit() is True
+    # ``admit`` reserved the row; the admit-token materialization then failed and
+    # the row was retired -> no leak (free pool back at baseline).
+    assert dec.admitted == [0]
+    assert dec.retired == [0]
+    assert dec.free_slots == 1
+    # The LoRA slot acquired for the adapter request was released exactly once
+    # (not leaked, not double-released) and zeroed so no later path re-releases it.
+    assert len(rt.acquired_adapter_slots) == 1
+    acquired_slot = len(rt.acquired_adapter_slots)  # FakeRuntime numbers from 1
+    assert rt.released_adapter_slots == [acquired_slot]
+    assert rt.released_adapter_slots.count(acquired_slot) == 1
+    assert req.lora_slot == 0
+    assert req.lifecycle.lora_slot_ready is False
+    # The request failed cleanly -- COMPLETED, error result, not stuck PREFILLING,
+    # never pushed to running, and no token staged.
+    assert req.lifecycle.finished is True
+    assert req.lifecycle.finish_reason == "error"
+    assert req.lifecycle.phase == RequestPhase.COMPLETED
+    assert len(req.lifecycle.skill_state.tokens) == 0
+    assert len(sched.running) == 0
+    assert len(sched.waiting) == 0
+    # No dangling active row: the state registered just before the failed
+    # materialization was popped on cleanup.
+    assert rt.active_sequences == {}
+    completed = sched.pop_completed()
+    assert [c.request_id for c in completed] == [0]
+    assert completed[0].finish_reason == "error"
+
+    # The reclaimed row is genuinely reusable: a fresh (non-spatial) request admits
+    # into it rather than starving on a permanently-drained pool. Clear the admit
+    # side-values so the next admit token types as a plain TextToken (no hook
+    # needed) and succeeds.
+    dec._admit_side_values = None
+    req2 = _enqueue(sched, 1, prompt_len=2, max_new=8)
+    assert sched._spec_admit() is True
+    assert req2.lifecycle.finished is False
+    assert req2.lifecycle.state.batch_idx in rt.active_sequences
+    assert dec.free_slots == 0  # the single row is now in use by req2
+
+
 def test_spec_side_values_fails_fast_when_no_spec_hook() -> None:
     """Spatial ``SpecSideValues`` without a spec hook must FAIL FAST, not degrade.
 

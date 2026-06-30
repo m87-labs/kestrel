@@ -879,39 +879,10 @@ class GenerationScheduler:
                 # finish/zombie path will ever call ``decoder.retire`` for
                 # it -- the row would leak permanently and repeated failures
                 # would drain ``decoder.free_slots`` and stall unrelated spec
-                # requests. Retire the row here when ``admit`` got far enough
-                # to reserve one (``batch_idx`` left at its ``-1`` sentinel
-                # means it never did, so there is nothing to retire).
-                #
-                # This is NOT ``_retire_spec_row``: that also calls
-                # ``release_adapter_slot(state.lora_slot)``, which would
-                # double-release the LoRA slot the block below already frees
-                # via ``request.lora_slot`` (the same slot). Each resource is
-                # released exactly once -- pool row via ``decoder.retire``,
-                # adapter slot via the ``release_adapter_slot`` below --
-                # mirroring the per-resource cleanup the non-spec
-                # admit-failure path performs.
-                if state.batch_idx >= 0:
-                    try:
-                        decoder.retire(state)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-                    # ``active_sequences[batch_idx]`` is only populated AFTER
-                    # the ``try`` (on the success path), so on this failure
-                    # path it is normally absent; pop defensively in case a
-                    # future reorder registers it earlier, leaving no dangling
-                    # entry.
-                    self.runtime.active_sequences.pop(state.batch_idx, None)
-                if lifecycle.lora_slot_ready and request.lora_slot:
-                    # Release the LoRA slot we acquired for this failed admission
-                    # so its refcount does not leak.
-                    try:
-                        self.runtime.release_adapter_slot(request.lora_slot)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-                    request.lora_slot = 0
-                    lifecycle.lora_slot_ready = False
-                self._fail_request_early(request, exc)
+                # requests. ``_fail_admitted_spec_request`` retires the row
+                # (when ``admit`` got far enough to reserve one) and releases
+                # the LoRA slot before failing the request cleanly.
+                self._fail_admitted_spec_request(request, state, exc)
                 progressed = True
                 continue
 
@@ -945,20 +916,46 @@ class GenerationScheduler:
             # the skill mask before this first sample) gets its coord/size head
             # logprob folded in, exactly as the non-spec prefill ``post_sample``
             # path does. ``None`` (no logprobs requested) stays ``None``.
-            admit_logprobs = None if first_logprob is None else [[first_logprob]]
-            (typed_first,), typed_first_logprobs = self._materialize_spec_tokens(
-                [lifecycle], [[int(first_token_id)]], admit_side_values, admit_logprobs
-            )
-            token = typed_first[0]
-            staged_first_logprob = (
-                typed_first_logprobs[0][0]
-                if typed_first_logprobs is not None
-                else first_logprob
-            )
-            # Stage the (spatial-augmented) first-token logprob through unchanged --
-            # no 0.0 greedy-approximation placeholder. The macro-step supplies
-            # real per-token logprobs for every subsequently committed token.
-            self._spec_stage_token(lifecycle, token, logprob=staged_first_logprob)
+            #
+            # Materialising/staging the admit token must share the SAME
+            # admit-failure cleanup as ``decoder.admit`` above. ``admit`` has
+            # already succeeded -- the row is reserved, ``sequence_state`` is
+            # set, and the state is registered in ``active_sequences`` -- but the
+            # request is not yet ``running`` and has no finish/zombie path. If
+            # ``_materialize_spec_tokens`` raises here (a spatial admit token
+            # whose runtime emits ``admit_side_values`` but exposes no
+            # ``materialize_spec_tokens`` hook, or a hook that rejects the side
+            # values), an unguarded raise would propagate out of ``_spec_admit``
+            # and leak the spec pool row + LoRA slot + ``active_sequences`` entry,
+            # leaving the request stuck with no scheduler path to finish. Wrap the
+            # materialize/stage path in the same ``_fail_admitted_spec_request``
+            # cleanup so a single bad spatial admit retires the row, releases the
+            # slot, and fails the request cleanly instead.
+            try:
+                admit_logprobs = None if first_logprob is None else [[first_logprob]]
+                (typed_first,), typed_first_logprobs = self._materialize_spec_tokens(
+                    [lifecycle],
+                    [[int(first_token_id)]],
+                    admit_side_values,
+                    admit_logprobs,
+                )
+                token = typed_first[0]
+                staged_first_logprob = (
+                    typed_first_logprobs[0][0]
+                    if typed_first_logprobs is not None
+                    else first_logprob
+                )
+                # Stage the (spatial-augmented) first-token logprob through
+                # unchanged -- no 0.0 greedy-approximation placeholder. The
+                # macro-step supplies real per-token logprobs for every
+                # subsequently committed token.
+                self._spec_stage_token(
+                    lifecycle, token, logprob=staged_first_logprob
+                )
+            except Exception as exc:
+                self._fail_admitted_spec_request(request, state, exc)
+                progressed = True
+                continue
             progressed = True
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
@@ -983,6 +980,62 @@ class GenerationScheduler:
         to ``stage_token`` exactly like the non-spec single-token path.
         """
         seq.stage_token(self.runtime, token, logprob=logprob)
+
+    def _fail_admitted_spec_request(
+        self,
+        request: GenerationRequest,
+        state: SequenceState,
+        exc: Exception,
+    ) -> None:
+        """Clean up after a spec admission that failed *after* reserving a row.
+
+        The single cleanup point for an admission that has already run far
+        enough through ``_spec_admit`` to claim resources -- ``decoder.admit``
+        reserving a pool row, and/or the post-admit admit-token
+        materialization/staging registering the state in ``active_sequences``.
+        Both failure sites (a raising ``decoder.admit`` and a raising
+        ``_materialize_spec_tokens`` for the admit token) route here so a partly
+        admitted request never leaks the spec pool row, the
+        ``active_sequences`` entry, or the LoRA slot, and is always failed
+        cleanly (it has already left ``waiting`` and is not yet ``running``, so
+        no finish/zombie path would otherwise retire it).
+
+        Each resource is released exactly once and per-resource (mirroring the
+        non-spec admit-failure path): the pool row via ``decoder.retire`` and
+        the adapter slot via ``release_adapter_slot``. This is deliberately NOT
+        ``_retire_spec_row`` -- that also releases ``state.lora_slot`` (the same
+        slot freed here via ``request.lora_slot``), which would double-release
+        it.
+        """
+        decoder = self.runtime.spec.decoder
+        # ``admit`` reserves a free pool row and assigns ``state.batch_idx``
+        # before its prefill image/CUDA work runs, so the row can be reserved
+        # even though no token was staged. ``batch_idx`` left at its ``-1``
+        # sentinel means ``admit`` never reserved one, so there is nothing to
+        # retire.
+        if state.batch_idx >= 0:
+            if decoder is not None:
+                try:
+                    decoder.retire(state)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            # ``active_sequences[batch_idx]`` is populated only once the admit
+            # token has been materialized/staged. On the ``decoder.admit``
+            # failure path it is absent; on the admit-token materialization
+            # failure path it was registered just before -- pop it
+            # unconditionally so neither leaves a dangling entry.
+            self.runtime.active_sequences.pop(state.batch_idx, None)
+        lifecycle = request.lifecycle
+        if lifecycle.lora_slot_ready and request.lora_slot:
+            # Release the LoRA slot we acquired for this failed admission so its
+            # refcount does not leak.
+            try:
+                self.runtime.release_adapter_slot(request.lora_slot)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            request.lora_slot = 0
+            lifecycle.lora_slot_ready = False
+        self._fail_request_early(request, exc)
 
     def _retire_spec_row(self, state: SequenceState) -> None:
         """Release every resource a finished spec row holds.
