@@ -6,7 +6,6 @@ import functools
 import json
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Sequence, cast
 
 import warnings
@@ -16,8 +15,6 @@ import numpy as np
 import torch
 from torch import Tensor
 
-
-from tokenizers import Tokenizer
 
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
@@ -80,6 +77,7 @@ from .region import (
     encode_coordinate,
     encode_size,
 )
+from .tokenizer import load_tokenizer
 from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
@@ -655,7 +653,10 @@ class MoondreamRuntime:
                     )
             self.kv_cache_dtype = self.dtype
 
-        self.tokenizer = Tokenizer.from_pretrained(self._spec.tokenizer_id)
+        self.tokenizer = load_tokenizer(
+            self._spec.tokenizer_id,
+            cfg.tokenizer_path,
+        )
         # TokenizerConfig satisfies the PromptTemplate protocol directly.
         self.prompt_template = self.config.tokenizer
 

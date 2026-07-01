@@ -168,6 +168,7 @@ class RuntimeConfig:
     # Model name registered in kestrel.models (see kestrel.models.known_models()).
     model: str = "moondream3-preview"
     service_name: str = "local"
+    tokenizer_path: str | Path | None = None
 
     def __post_init__(self):
         normalized_service_name = self.service_name.strip()

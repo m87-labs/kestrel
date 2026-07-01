@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import pytest
 
+from kestrel.models import get_spec, known_models
+from kestrel.models.moondream import (
+    DEFAULT_MOONDREAM3_CONFIG,
+    MoondreamRuntime,
+    build_skill_registry,
+)
 from kestrel.models.registry import ModelSpec
 from kestrel.skills import SkillRegistry
 
@@ -51,3 +57,16 @@ def test_modelspec_skills_factory_is_honored() -> None:
     sentinel = SkillRegistry([])
     spec = _spec(skills=lambda: sentinel)
     assert spec.skills() is sentinel
+
+
+def test_moondream31_a2b_uses_md3_runtime_metadata() -> None:
+    spec = get_spec("moondream3.1-9B-A2B")
+
+    assert "moondream3.1-9B-A2B" in known_models()
+    assert spec.repo_id == "moondream/moondream3.1-9B-A2B"
+    assert spec.filename == "model.safetensors"
+    assert spec.checkpoint_format == "md3"
+    assert spec.default_config == DEFAULT_MOONDREAM3_CONFIG
+    assert spec.tokenizer_id == "moondream/starmie-v1"
+    assert spec.runtime is MoondreamRuntime
+    assert spec.skills is build_skill_registry
