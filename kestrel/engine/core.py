@@ -447,12 +447,12 @@ class InferenceEngine:
 
         The default model reuses ``runtime_cfg`` (already resolved for it).
         A co-hosted model gets a per-model config — its own ``model`` id, and
-        ``model_path`` reset so it resolves for that model (a single-pass
-        spec declares no weight file, so its path stays ``None`` and the
-        factory owns loading). Runtime factories receive common engine-owned
-        resources such as the compute stream and KV pool. ``max_lora_rank`` is
-        the default autoregressive model's concern, supplied by the adapter
-        provider only for that model.
+        ``model_path``/``tokenizer_path`` reset so it resolves for that model
+        (a single-pass spec declares no weight file, so its path stays
+        ``None`` and the factory owns loading). Runtime factories receive
+        common engine-owned resources such as the compute stream and KV pool.
+        ``max_lora_rank`` is the default autoregressive model's concern,
+        supplied by the adapter provider only for that model.
         """
         from kestrel.models import get_spec
 
@@ -467,7 +467,12 @@ class InferenceEngine:
                 max_lora_rank=max_lora_rank,
                 **kwargs,
             )
-        cfg = replace(self._runtime_cfg, model=model_id, model_path=None)
+        cfg = replace(
+            self._runtime_cfg,
+            model=model_id,
+            model_path=None,
+            tokenizer_path=None,
+        )
         return spec.runtime(cfg, **kwargs)
 
     def _shared_kv_pool(self):

@@ -153,6 +153,7 @@ class RuntimeConfig:
     """Knobs controlling the text-only inference prototype."""
 
     model_path: str | Path | None = None
+    tokenizer_path: str | Path | None = None
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     # Effective batch size (excluding reserved batch_idx 0).

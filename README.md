@@ -241,6 +241,26 @@ RuntimeConfig(
 )
 ```
 
+To run from local files instead of the registered HuggingFace weights or
+tokenizer, keep `model` set to the matching registered architecture and pass
+local paths:
+
+```python
+RuntimeConfig(
+    model="moondream3-preview",
+    model_path="/models/moondream/model.safetensors",
+    tokenizer_path="/models/moondream/tokenizer.json",
+)
+```
+
+`model_path` points to the local checkpoint file and skips the automatic
+HuggingFace weight download. `tokenizer_path` is optional and only applies to
+models whose runtime uses a tokenizer; tokenizer-free models do not need one.
+When provided, it can point directly to a `tokenizer.json` file or to a
+directory containing `tokenizer.json`. When omitted, Kestrel uses the tokenizer
+declared by the registered model. Local files must match the selected model
+architecture and checkpoint format.
+
 ### Environment Variables
 
 | Variable | Description |
