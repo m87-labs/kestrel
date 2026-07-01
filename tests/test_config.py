@@ -29,6 +29,14 @@ def test_runtime_config_rejects_invalid_service_name_before_download(
     assert calls == []
 
 
+def test_runtime_config_preserves_model_path_device_positional_args() -> None:
+    cfg = RuntimeConfig("/weights/model.safetensors", "cpu")
+
+    assert cfg.model_path == "/weights/model.safetensors"
+    assert cfg.device == "cpu"
+    assert cfg.tokenizer_path is None
+
+
 def test_torch_cuda_driver_version_falls_back_to_libcuda(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

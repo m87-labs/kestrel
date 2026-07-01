@@ -74,13 +74,16 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
     tokenizer-free single-pass spec — with a per-model config, and
     max_lora_rank goes only to the default AR model."""
     built_kwargs: dict[str, dict[str, Any]] = {}
+    built_tokenizer_paths: dict[str, object] = {}
 
     def ar_factory(cfg: RuntimeConfig, **kwargs: Any) -> FakeRuntime:
         built_kwargs[cfg.model] = dict(kwargs)
+        built_tokenizer_paths[cfg.model] = cfg.tokenizer_path
         return FakeRuntime(model_name=cfg.model)
 
     def sp_factory(cfg: RuntimeConfig, **kwargs: Any) -> _SPStub:
         built_kwargs[cfg.model] = dict(kwargs)
+        built_tokenizer_paths[cfg.model] = cfg.tokenizer_path
         return _SPStub(cfg.model)
 
     # Tokenizer-free specs: no tokenizer_id / checkpoint_format / filename /
@@ -89,7 +92,11 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
     register(ModelSpec(name="mm-sp", runtime=sp_factory))
     try:
         eng = object.__new__(InferenceEngine)
-        eng._runtime_cfg = RuntimeConfig(model="mm-ar", device="cpu")
+        eng._runtime_cfg = RuntimeConfig(
+            model="mm-ar",
+            device="cpu",
+            tokenizer_path="/tmp/tokenizer.json",
+        )
         eng._default_model = "mm-ar"
         eng._model_ids = ["mm-ar", "mm-sp"]
         eng._runtimes = {}
@@ -103,6 +110,10 @@ def test_build_configured_runtimes_builds_all_from_specs() -> None:
         assert eng._runtimes["mm-sp"].execution_shape is ExecutionShape.SINGLE_PASS
         # Each runtime is built with a per-model config carrying its own id.
         assert eng._runtimes["mm-sp"].model_name == "mm-sp"
+        assert built_tokenizer_paths == {
+            "mm-ar": "/tmp/tokenizer.json",
+            "mm-sp": None,
+        }
         # max_lora_rank → default AR only; compute_stream is supplied to
         # every runtime factory so both execution shapes share the engine
         # stream. The engine-owned kv_pool is also supplied via the common

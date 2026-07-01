@@ -46,6 +46,18 @@ register(
         skills=build_skill_registry,
     )
 )
+register(
+    ModelSpec(
+        name="moondream3.1-9B-A2B",
+        repo_id="moondream/moondream3.1-9B-A2B",
+        filename="model.safetensors",
+        checkpoint_format="md3",
+        default_config=DEFAULT_MOONDREAM3_CONFIG,
+        tokenizer_id="moondream/starmie-v1",
+        runtime=MoondreamRuntime,
+        skills=build_skill_registry,
+    )
+)
 
 __all__ = [
     "DEFAULT_MOONDREAM2_CONFIG",

@@ -44,6 +44,7 @@ Kestrel supports both Moondream 3 and Moondream 2:
 |-------|------------|-------|
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
 | Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Requires access approval |
+| Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Private repository |
 
 For Moondream 3, request access (automatically granted) then authenticate with `huggingface-cli login` or set `HF_TOKEN`.
 
@@ -58,7 +59,7 @@ from kestrel.engine import InferenceEngine
 
 async def main():
     # Weights are automatically downloaded from HuggingFace on first run.
-    # Use model="moondream2" or model="moondream3-preview".
+    # Use model="moondream2", "moondream3-preview", or "moondream3.1-9B-A2B".
     cfg = RuntimeConfig(model="moondream2")
 
     # Create the engine (loads model and warms up). No API key needed for
@@ -236,10 +237,30 @@ Adapters are automatically downloaded and cached on first use.
 
 ```python
 RuntimeConfig(
-    model="moondream3-preview",  # or "moondream2"
+    model="moondream3-preview",  # or "moondream2" / "moondream3.1-9B-A2B"
     max_batch_size=4,            # Max concurrent requests
 )
 ```
+
+To run from local files instead of the registered HuggingFace weights or
+tokenizer, keep `model` set to the matching registered architecture and pass
+local paths:
+
+```python
+RuntimeConfig(
+    model="moondream3.1-9B-A2B",
+    model_path="/models/moondream/model.safetensors",
+    tokenizer_path="/models/moondream/tokenizer.json",
+)
+```
+
+`model_path` points to the local checkpoint file and skips the automatic
+HuggingFace weight download. `tokenizer_path` is optional and only applies to
+models whose runtime uses a tokenizer; tokenizer-free models do not need one.
+When provided, it can point directly to a `tokenizer.json` file or to a
+directory containing `tokenizer.json`. When omitted, Kestrel uses the tokenizer
+declared by the registered model. Local files must match the selected model
+architecture and checkpoint format.
 
 ### Environment Variables
 
