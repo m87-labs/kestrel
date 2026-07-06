@@ -15,9 +15,9 @@ How it works:
   * Variant selection ``(model_kind, arch, num_sms, bucket)``. The megakernel is
     built for a specific persistent-grid size (``num_sms``); an oversubscribed grid
     deadlocks, so we run the largest shipped same-arch ``num_sms`` that is <= the
-    device SM count (``_select_num_ctas``), or fall back to native. The deploy set
-    (``_DEPLOY_SM_COUNTS``) is listed here directly so the engine depends only on
-    ``kestrel_kernels``.
+    device SM count (``bridge.select_num_ctas``), or fall back to native. The deploy set
+    lives once in ``kestrel_kernels.megakernel`` (single source of truth) and is imported,
+    so the engine depends only on ``kestrel_kernels``.
 
   * Enable table. Being buildable is not the same as being faster: on H100 SXM the
     megakernel is 1.38x at batch 1 but 0.86x at batch 8. ``_ENABLE_TABLE`` records,
@@ -59,35 +59,23 @@ logger = logging.getLogger(__name__)
 # always runs native. The enable table restricts further within this range.
 _MAX_MEGAKERNEL_BUCKET = 8
 
-# Persistent-grid sizes the megakernel is shipped for, per arch. A variant is valid
-# only when its grid size is <= the device SM count (an oversubscribed persistent
-# grid deadlocks), and we ship one variant per distinct deploy SM count. Listed here
-# directly so the engine depends only on kestrel_kernels.
-_DEPLOY_SM_COUNTS: dict[int, tuple[int, ...]] = {
-    90: (132, 114),  # 132: H100 SXM5/NVL, H200, GH200 ; 114: H100 PCIe
-    100: (148,),  # 148: B200
-    # 120: (188,) -- RTX PRO 6000 Blackwell Server: not shipped yet (native fallback).
-}
-
-
-def _select_num_ctas(arch: int, device_sms: int) -> Optional[int]:
-    """Return the grid size of the megakernel variant to run on this device, or
-    ``None`` if none is supported here (the caller then runs native decode).
-
-    Returns the largest shipped same-arch grid size <= ``device_sms`` (never
-    oversubscribe the persistent grid). ``None`` when nothing fits -- an SM count we
-    have not built yet, or an arch with no variants."""
-    candidates = [n for n in _DEPLOY_SM_COUNTS.get(int(arch), ()) if n <= int(device_sms)]
-    return max(candidates) if candidates else None
+# The persistent-grid deploy-SM policy (``select_num_ctas`` / ``DEPLOY_SM_COUNTS``) is the SINGLE
+# SOURCE OF TRUTH in ``kestrel_kernels.megakernel``; this manager imports it from the same ``bridge``
+# handle it already loads, so the table is never re-encoded on the engine side (it used to be a
+# hand-copied literal here).
 
 
 @dataclass(frozen=True)
 class _EnableRow:
     """One ``(model, arch, num_sms)`` row of the enable table: which decode buckets
-    are enabled, and the measurement that justifies them."""
+    are enabled, the measurement that justifies them, and the per-variant qmma NS."""
 
     buckets: frozenset[int] = field(default_factory=frozenset)
     note: str = ""
+    # qmma NS (num-stages) compile constexpr for this variant's decode. Per-(bucket,SKU): the value
+    # flips sign by die, so it rides the enable table (not a process-global env var). Default 3 is
+    # the H100 SXM winner; passed into ``MegakernelDecodeConfig.qmma_num_stages`` at build.
+    qmma_num_stages: int = 3
 
 
 # Which decode buckets route through the megakernel, per (model, arch, grid size,
@@ -102,10 +90,14 @@ _ENABLE_TABLE: dict[str, dict[int, dict[int, _EnableRow]]] = {
         90: {
             132: _EnableRow(
                 buckets=frozenset({1}),
+                # NS=3 is the H100 SXM winner (the shipped die + bucket): NS=2 REGRESSES SXM
+                # +70.7us @ B8. NS=2 was the historical H100-PCIe bs1 winner (B1 -51us,
+                # B8 -35.8us) but regresses B2 (+83us) -- preserved here as SKU table data only.
+                qmma_num_stages=3,
                 note=(
                     "H100 SXM: batch 1 is 1.38x (~1917us vs 2306us native). Batches "
                     "2/4 are ~1.0x and deferred (need a per-request KV copy). Batch 8 "
-                    "is 0.86x -> native."
+                    "is 0.86x -> native. NS=3 (SXM winner; PCIe bs1 wanted NS=2, historical)."
                 ),
             ),
         },
@@ -137,10 +129,15 @@ def _model_kind(model_name: str) -> Optional[str]:
     return None
 
 
+def _enable_row(model_kind: str, arch: int, num_sms: int) -> Optional[_EnableRow]:
+    """The enable-table row for this exact ``(model, arch, grid size)`` variant, or ``None``."""
+    return _ENABLE_TABLE.get(model_kind, {}).get(int(arch), {}).get(int(num_sms))
+
+
 def _enabled_buckets(model_kind: str, arch: int, num_sms: int) -> frozenset[int]:
     """The decode buckets enabled for this exact ``(model, arch, grid size)``
     variant. Missing entry means an empty set (native)."""
-    row = _ENABLE_TABLE.get(model_kind, {}).get(int(arch), {}).get(int(num_sms))
+    row = _enable_row(model_kind, arch, num_sms)
     if row is None:
         return frozenset()
     return frozenset(b for b in row.buckets if 1 <= int(b) <= _MAX_MEGAKERNEL_BUCKET)
@@ -183,6 +180,7 @@ class MegakernelDecodeManager:
         # re-copied before the next launch (see ``_needs_seed``).
         self._session_state: dict[int, tuple] = {}
         self._enabled_buckets: frozenset[int] = frozenset()
+        self._enable_row: Optional[_EnableRow] = None
         self._num_ctas: Optional[int] = None
         self._bridge = None
         self._disabled_reason: Optional[str] = None
@@ -203,13 +201,14 @@ class MegakernelDecodeManager:
 
         props = torch.cuda.get_device_properties(device.index or 0)
         arch = props.major * 10
-        num_ctas = _select_num_ctas(arch, props.multi_processor_count)
+        num_ctas = bridge.select_num_ctas(arch, props.multi_processor_count)
         if num_ctas is None:
             self._disabled_reason = (
                 f"no shipped variant for sm{arch} / {props.multi_processor_count} SMs"
             )
             return
         self._num_ctas = int(num_ctas)
+        self._enable_row = _enable_row(self._model_kind, arch, self._num_ctas)
         self._enabled_buckets = _enabled_buckets(self._model_kind, arch, self._num_ctas)
         if not self._enabled_buckets:
             self._disabled_reason = (
@@ -266,13 +265,14 @@ class MegakernelDecodeManager:
         self._maybe_seed(bucket, sess, batch_idx=batch_idx, input_pos_gpu=input_pos_gpu)
 
     def _config_for_model(self) -> Optional[Any]:
-        """The backend config for this model, or ``None`` for the default (MD3:
-        qmma up-projection, streamed tensor-core down-projection, num_splits=1). MD2
-        (dense, no MoE) uses num_splits=2 -- the KV split its batch-1 win was
-        measured at (1.48x at seqlen 16); the MoE knobs are ignored."""
+        """The backend config for this model. Carries the per-variant qmma NS from the enable row
+        (die- and bucket-specific; default 3 = the H100 SXM winner). MD2 (dense, no MoE) also uses
+        num_splits=2 -- the KV split its batch-1 win was measured at (1.48x at seqlen 16); the MoE
+        knobs (including NS) are ignored by MD2."""
+        ns = self._enable_row.qmma_num_stages if self._enable_row is not None else 3
         if self._model_kind == "moondream2":
-            return self._bridge.MegakernelDecodeConfig(num_splits=2)
-        return None
+            return self._bridge.MegakernelDecodeConfig(num_splits=2, qmma_num_stages=ns)
+        return self._bridge.MegakernelDecodeConfig(qmma_num_stages=ns)
 
     def _ensure_session(
         self,
@@ -289,19 +289,17 @@ class MegakernelDecodeManager:
             return sess
         # History (prefill length) for the initial build. The captured graph is
         # position-agnostic, so this only sizes the single-position build; kv_capacity
-        # covers the full sequence so one graph advances every step. The build-time
-        # embedding is a zero placeholder -- decode() overwrites the resident embedding
-        # buffer every step, so the placeholder never reaches an output.
+        # covers the full sequence so one graph advances every step. The build takes
+        # dec_embed0=None (shape/dtype, not a fabricated placeholder): decode() overwrites
+        # the resident embedding buffer every step, so it never reaches an output.
         history = int(input_pos_gpu[0].item())
         seqlen = history + 1
-        dec_embed0 = torch.zeros(
-            (int(bucket), 1, self._tc.dim), device=self._device, dtype=torch.bfloat16)
         try:
             sess = self._bridge.build_decode_session(
                 self._model_kind,
                 self._text,
                 self._tc,
-                dec_embed0,
+                None,
                 self._page_table,
                 batch_idx[: int(bucket)],
                 batch_bucket=int(bucket),
