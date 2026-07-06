@@ -31,7 +31,7 @@ from kestrel.prefix_cache import (
     RadixPrefixCache,
     TreeNode,
 )
-from kestrel.runtime.decode_graph import DecodeGraphManager
+from kestrel.runtime.decode_graph import DecodeGraphManager, make_decode_graph_batch_sizes
 from kestrel.runtime import (
     CoordToken,
     ExecutionShape,
@@ -876,6 +876,14 @@ class MoondreamRuntime:
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
             self._ensure_cuda_graphs_ready()
+        else:
+            # Graphs OFF (eager serve): there is no capture pass to warm the megakernel, so build the
+            # served buckets' sessions HERE, at init. The first megakernel decode is a multi-minute
+            # in-process CuTe JIT trace; deferring it to the first LIVE decode step pegs the scheduler
+            # thread (0% GPU, one core busy) mid-serve and reads as a concurrency stall. Warming at init
+            # moves that one-time build out of the serving loop (mirrors the graphs-on warmup that
+            # ``_plan_megakernel_buckets`` runs at capture time).
+            self._warm_megakernel_eager()
 
         # Allocate vision encoder buffers (always, for consistency)
         self._allocate_vision_buffers()
@@ -2656,6 +2664,50 @@ class MoondreamRuntime:
             served.add(batch_size)
         self._megakernel_served_buckets |= served
         return served
+
+    def _warm_megakernel_eager(self) -> None:
+        """Graphs OFF: build the megakernel session for every served decode bucket NOW, at init.
+
+        On the eager (non-graph) serve path ``_run_decode_forward`` routes a bucket through the
+        megakernel and builds its session lazily on the FIRST call (``_megakernel_eager_unwarmed``).
+        That first build is a multi-minute, single-threaded CuTe JIT trace of the whole-model VM -- if
+        it lands on the first live decode step it blocks the scheduler thread (0% GPU, one core pegged,
+        no completions) and looks exactly like a concurrency stall. Warming here does that one-time
+        build off the serving path, at the same point the graphs-on path warms via
+        ``_plan_megakernel_buckets``. Non-fatal: a build failure just leaves the bucket to the lazy
+        per-step route (which falls back to native on the same exception), so this never blocks startup.
+        """
+        target = self._megakernel_target
+        if target is None or self._decode_graphs.enabled:
+            return
+        served = [
+            batch_size
+            for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
+            if megakernel_decode.has_megakernel(*target, batch_size)
+        ]
+        if not served:
+            return
+        slot = self._decode_slots[0]
+        for batch_size in served:
+            try:
+                # Zero the slot buffers (valid token id 0 / positions), stage host-side metadata, then
+                # run one session-building megakernel decode -- the same warmup shape the capture path
+                # uses. ``inference_mode`` matches the scheduler's per-step launch context.
+                self._zero_decode_graph_capture_buffers(slot)
+                self._prepare_decode_graph_step(slot, batch_size)
+                embeds = self._embed_packed_token_batch(
+                    slot.decode_token_ids[:batch_size],
+                    slot.decode_coord_values[:batch_size],
+                    slot.decode_size_values[:batch_size],
+                )
+                with torch.inference_mode():
+                    self._megakernel_decode_hidden(slot, batch_size, embeds)
+            except Exception as exc:  # non-fatal: fall back to the lazy per-step build (native on fail)
+                _LOGGER.warning(
+                    "eager megakernel warmup failed for decode bucket %d; will build lazily on the "
+                    "first decode step (%s)",
+                    batch_size, exc,
+                )
 
     def acquire_adapter_slot(self, adapter_id: str, adapter: LoRA) -> int:
         """Acquire a slot for an adapter, loading weights if necessary.
