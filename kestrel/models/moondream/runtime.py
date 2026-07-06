@@ -81,7 +81,7 @@ from .tokenizer import load_tokenizer
 from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
-from .megakernel_decode import MegakernelDecodeManager
+from kestrel_kernels import megakernel as megakernel_decode
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -847,20 +847,6 @@ class MoondreamRuntime:
 
         # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
         self._preallocate_workspaces()
-
-        # Whole-model decode megakernel. Non-fatal: the manager disables itself (native
-        # decode everywhere) when the model/arch/SM-count is not in the shipped set,
-        # when no bucket is enabled, or when the megakernel backend is absent. When
-        # enabled it routes eligible decode buckets through the megakernel in
-        # `_run_decode_forward`.
-        self._megakernel_decode = MegakernelDecodeManager(
-            model_name=self.model_name,
-            text=self.model.text,
-            text_config=self.config.text,
-            device=self.device,
-            page_table=self.page_table,
-            max_seq_length=self.max_seq_length,
-        )
 
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
@@ -2381,17 +2367,6 @@ class MoondreamRuntime:
         # built inside the captured decode graph (see _run_decode_forward).
         if self._lora_workspace is not None:
             self._prepare_decode_lora_metadata(slot, batch_size)
-        # Whole-model megakernel: the eager per-step hook. It lazily builds the
-        # session at the pre-capture warmup, and on each between-replay prep it copies
-        # the contiguous KV only when a new sequence starts decoding on a row. No-op
-        # for a non-megakernel bucket, under capture, or on a steady step (the buffer
-        # grows by one per step). Reads only batch_idx/input_pos; the KV copy is
-        # internal to the manager.
-        self._megakernel_decode.prepare(
-            batch_size,
-            batch_idx=slot.meta.batch_idx.gpu[:batch_size],
-            input_pos_gpu=slot.meta.input_pos.gpu[:batch_size],
-        )
 
     def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
         # Use batch index 0 for all entries: page-table row 0 is initialized and
@@ -2489,19 +2464,22 @@ class MoondreamRuntime:
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
             moe_lora_metadata = slot.meta.moe_lora_metadata
 
-        # Route this bucket through the whole-model decode megakernel when it is
-        # enabled and a session has been built (lazily, by `prepare` at the pre-capture
-        # warmup) for this batch size. `decode` returns None for a non-enabled or
-        # unbuilt bucket, so this falls back to the native decoder -- never an error,
-        # never a deadlock. The megakernel owns a contiguous KV, copied from the paged
-        # cache when the sequence starts decoding (internal, via `prepare`); it reads
-        # the engine-written input_pos and the token embeds from resident buffers, so
-        # one captured graph per bucket serves every step.
-        hidden = self._megakernel_decode.decode(
-            batch_size,
+        # Route this bucket through the whole-model decode megakernel. Returns None for
+        # any ineligibility (model/GPU/bucket), a missing backend, or a build miss, so
+        # this falls back to the native decoder -- never an error, never a deadlock. All
+        # policy + the (lazy) session lifecycle live in kestrel_kernels.megakernel; the
+        # first call for a bucket builds/loads the session (slower than a steady step).
+        hidden = megakernel_decode.decode_or_none(
+            model_name=self.model_name,
+            text=self.model.text,
+            text_config=self.config.text,
+            device=self.device,
+            page_table=self.page_table,
+            max_seq_length=self.max_seq_length,
+            batch_size=batch_size,
             embeds=embeds,
-            input_pos_gpu=slot.meta.input_pos.gpu[:batch_size],
-            lora_slot_ids=lora_slot_ids,
+            batch_idx=slot.meta.batch_idx.gpu[:batch_size],
+            input_pos=slot.meta.input_pos.gpu[:batch_size],
         )
         if hidden is None:
             hidden = text_decoder(
