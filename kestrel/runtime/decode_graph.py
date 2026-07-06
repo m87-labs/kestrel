@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any, Generic, TypeVar
 
@@ -9,6 +10,8 @@ import torch
 
 from kestrel.device import resolve_device
 
+
+logger = logging.getLogger(__name__)
 
 SlotT = TypeVar("SlotT")
 
@@ -40,6 +43,7 @@ class DecodeGraphManager(Generic[SlotT]):
         prepare_step: Callable[[SlotT, int], None],
         zero_padding: Callable[[SlotT, int, int], None] | None = None,
         zero_for_capture: Callable[[SlotT], None] | None = None,
+        plan_eager: Callable[[SlotT, list[int]], set[int]] | None = None,
     ) -> None:
         self.enabled = enabled
         self.device = resolve_device(device)
@@ -50,8 +54,17 @@ class DecodeGraphManager(Generic[SlotT]):
         self._prepare_step = prepare_step
         self._zero_padding = zero_padding or _noop_padding
         self._zero_for_capture = zero_for_capture
+        # Optional: given a slot and the batch buckets about to be captured, return the SUBSET this
+        # runtime will serve EAGERLY instead of a captured native graph (the whole-model decode
+        # megakernel). Those buckets are NOT captured (no graph, no graph-pool memory) and ``run``
+        # routes them to the eager ``run_forward`` instead of a graph replay. The callback also
+        # WARMS the eager path (builds its session) and MUST exclude any bucket whose warmup fails,
+        # so a build failure transparently falls back to native capture.
+        self._plan_eager = plan_eager
         self._batch_sizes: list[int] = []
         self._graphs: dict[int, dict[int, Any]] = {}
+        # Per-slot buckets served eagerly (megakernel), so no native graph was captured for them.
+        self._eager_buckets: dict[int, frozenset[int]] = {}
 
     @property
     def batch_sizes(self) -> list[int]:
@@ -60,7 +73,13 @@ class DecodeGraphManager(Generic[SlotT]):
     def clear(self) -> None:
         """Drop all captured decode graphs."""
         self._graphs.clear()
+        self._eager_buckets.clear()
         self._batch_sizes = []
+
+    def eager_buckets(self, slot: SlotT) -> frozenset[int]:
+        """Buckets served eagerly (megakernel) for ``slot`` -- i.e. buckets for which NO native decode
+        graph was captured. Empty when there is no eager plan or graphs are disabled."""
+        return self._eager_buckets.get(id(slot), frozenset())
 
     def ensure_ready(self, slots: Sequence[SlotT]) -> None:
         """Capture missing graph sets for ``slots`` when graph replay is enabled."""
@@ -86,6 +105,7 @@ class DecodeGraphManager(Generic[SlotT]):
     def run(self, slot: SlotT, batch_size: int) -> None:
         """Prepare one decode step and execute via graph replay or eager forward."""
         graphs = self._graphs.get(id(slot)) if self.enabled else None
+        eager = self._eager_buckets.get(id(slot), frozenset())
         if graphs is None:
             graph_batch_size = batch_size
         else:
@@ -95,7 +115,8 @@ class DecodeGraphManager(Generic[SlotT]):
                     f"Batch size {batch_size} exceeds max graph capacity "
                     f"{self._batch_sizes[-1] if self._batch_sizes else 0}"
                 )
-            if graph_batch_size not in graphs:
+            # A bucket served eagerly (megakernel) has NO captured graph by design; run it eager.
+            if graph_batch_size not in graphs and graph_batch_size not in eager:
                 raise RuntimeError(
                     f"No CUDA graph captured for batch size {graph_batch_size}"
                 )
@@ -105,7 +126,9 @@ class DecodeGraphManager(Generic[SlotT]):
 
         self._prepare_step(slot, graph_batch_size)
 
-        if graphs is None:
+        if graphs is None or graph_batch_size in eager:
+            # Eager: no graph (globally disabled) or an eager-served bucket -> run the forward, which
+            # routes the megakernel-served bucket through the megakernel each step.
             self._run_forward(slot, graph_batch_size)
         else:
             graphs[graph_batch_size].replay()
@@ -133,7 +156,23 @@ class DecodeGraphManager(Generic[SlotT]):
                 zero_for_capture(slot)
                 try:
                     torch.cuda.synchronize(device=self.device)
+                    # Decide (and WARM) the eager megakernel buckets BEFORE any capture. This runs
+                    # OUTSIDE ``torch.cuda.graph`` (it builds a session + does one eager launch, both
+                    # illegal under capture) and at the SAME warmup point capture used to touch these
+                    # buckets. Any bucket whose warmup fails is excluded -> it is captured native.
+                    eager = self._plan_eager(slot, list(self._batch_sizes)) if self._plan_eager else set()
+                    eager = frozenset(int(b) for b in eager)
+                    self._eager_buckets[id(slot)] = eager
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(device=self.device)
+                    reserved_before = (
+                        torch.cuda.memory_reserved(self.device) if self.device.type == "cuda" else 0
+                    )
                     for batch_size in reversed(self._batch_sizes):
+                        if batch_size in eager:
+                            # Served eagerly by the megakernel: capture no native graph, allocate no
+                            # graph pool for this bucket.
+                            continue
                         graph = torch.cuda.CUDAGraph()
                         with torch.inference_mode():
                             self._prepare_step(slot, batch_size)
@@ -148,6 +187,18 @@ class DecodeGraphManager(Generic[SlotT]):
                         torch.cuda.synchronize(device=self.device)
                 finally:
                     zero_for_capture(slot)
+
+        if eager:
+            reserved_after = (
+                torch.cuda.memory_reserved(self.device) if self.device.type == "cuda" else 0
+            )
+            logger.info(
+                "decode-graph capture: %d bucket(s) served eagerly by the megakernel %s "
+                "(no native graph captured); captured %d native bucket(s) using %.1f MiB of graph "
+                "pool. Skipping capture for the eager buckets avoids their graph pools entirely.",
+                len(eager), sorted(eager), len(cuda_graphs),
+                max(0, reserved_after - reserved_before) / (1024 * 1024),
+            )
 
         return cuda_graphs
 
