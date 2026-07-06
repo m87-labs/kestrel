@@ -629,12 +629,24 @@ class MoondreamRuntime:
         device_sm = device_cc_major * 10 + device_cc_minor
         fp8_kv_supported_sms = {87, 89, 90, 100, 110, 120}
 
+        # Whole-model decode megakernel: its direct paged-KV read/append path
+        # (``kv_pool_layer``) addresses the engine's KV pool as **bf16** and does not carry the
+        # per-layer fp8 k/v dequant scales into the fused attention. So when a megakernel variant
+        # serves this model on this device, the pool MUST be bf16: an fp8 pool would be read/appended
+        # at the wrong stride (2x), silently corrupting the decode output AND running a physical page
+        # past the (1-byte) pool end into an illegal access. Force bf16 KV in that case (native decode
+        # is unaffected -- it reads bf16 correctly too). A true fp8-aware megakernel KV path (fp8 view
+        # + scale dequant in attn_partial / the qkv-epi append) is the follow-up that restores the
+        # fp8 KV memory saving; until then the megakernel gates the KV dtype to bf16.
+        megakernel_serves_kv = self._megakernel_forces_bf16_kv()
+
         if (
             self._kv_layer_k_scales is not None
             and self._kv_layer_v_scales is not None
             and self.page_size == 1
             and hasattr(torch, "float8_e4m3fn")
             and device_sm in fp8_kv_supported_sms
+            and not megakernel_serves_kv
         ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
@@ -2487,6 +2499,53 @@ class MoondreamRuntime:
             return False
         return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
 
+    def _megakernel_forces_bf16_kv(self) -> bool:
+        """Whether a whole-model decode megakernel variant serves this model on this device (so the KV
+        pool must be bf16, not fp8 -- see the KV-dtype selection in ``__init__``). Cheap + never raises:
+        a deploy-target probe (device-props read only) plus the no-build enable-table lookup over the
+        decode buckets, so an unshipped SKU / disabled model returns ``False`` and keeps fp8 KV."""
+        try:
+            target = megakernel_decode.deploy_target(self.model_name, self.device)
+            if target is None:
+                return False
+            return any(
+                megakernel_decode.has_megakernel(*target, bucket)
+                for bucket in range(1, 9)
+            )
+        except Exception:  # a props/table surprise -> keep the fp8 default, never a hard error
+            return False
+
+    def _reserve_megakernel_pages(self, slot: DecodeSlot, batch_size: int) -> None:
+        """Reserve + commit the appending KV page for every active row BEFORE the eager megakernel
+        launch reads the page table (the per-step ``input_pos``-parallel contract).
+
+        The megakernel decode grows the paged KV one token per step: the new token appends at logical
+        position ``input_pos`` (== the row's current sequence length, page_size=1), and the direct
+        paged-KV session's per-step ``refresh_pages`` copies ``page_table.page_table[batch_idx, :]``
+        straight off the GPU page table into the logical->physical map the kernel indexes. A logical
+        slot the engine has not reserved reads the ``-1`` sentinel on the GPU table, so the qkv-epi
+        append then indexes ``mK[-1]`` (a negative gmem offset) -> ``cudaErrorIllegalAddress``. The
+        native decode path never trips this because it only ever READS the pre-reserved window, but the
+        megakernel APPENDS and self-extends, so the eager route must grow the page table itself,
+        exactly like a native per-step reserve would. (This is the correct paged-growth contract; it
+        lets the session build stop over-reserving the whole ``kv_cap`` window. It is NOT what caused
+        the ChartQA step-3 crash -- that was root-caused to the megakernel reading the fp8 KV pool as
+        bf16; see the KV-dtype gate above and MEGAKERNEL_SHIP_INTEGRATION.md.)
+
+        ``reserve`` only allocates past the current per-row capacity (a no-op once the window is
+        covered), and ``commit_block_table`` flushes just the rows it actually dirtied H2D -- so this
+        is a couple of host ops per step, and free once the sequence's window is fully reserved. Eager
+        only (never under CUDA-graph capture -- served megakernel buckets skip capture)."""
+        idx_np = slot.meta.batch_idx.np
+        pos_np = slot.meta.input_pos.np
+        rows: list[int] = []
+        for i in range(batch_size):
+            batch_idx = int(idx_np[i])
+            # Appending logical slot == input_pos; page_size=1 -> capacity must reach input_pos + 1.
+            self.page_table.reserve(batch_idx, int(pos_np[i]) + 1)
+            rows.append(batch_idx)
+        self.page_table.commit_block_table(rows)
+
     def _megakernel_decode_hidden(
         self, slot: DecodeSlot, batch_size: int, embeds: Tensor
     ) -> Tensor:
@@ -2495,6 +2554,9 @@ class MoondreamRuntime:
         engine performs that first call at graph-build time via ``_plan_megakernel_buckets`` instead of
         capturing a native graph, so by production steady-state it is warm. Raises on a genuine
         megakernel error (the caller only reaches here for a bucket whose warmup succeeded)."""
+        # Grow + commit the paged KV for this step's appending slot before the launch reads the page
+        # table (the direct paged-KV per-step reserve contract; see _reserve_megakernel_pages).
+        self._reserve_megakernel_pages(slot, batch_size)
         return megakernel_decode.decode(
             model_name=self.model_name,
             text=self.model.text,
