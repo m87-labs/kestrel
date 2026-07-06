@@ -848,11 +848,11 @@ class MoondreamRuntime:
         # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
         self._preallocate_workspaces()
 
-        # Whole-model decode megakernel (THE ENGINE SWITCH). Non-fatal: the manager
-        # self-disables (native decode everywhere) when the model/arch/SM-count is not
-        # in the shipped deploy set, when no bucket is enabled in the config table, or
-        # when the mkl build dependency is absent. When enabled it routes eligible
-        # decode buckets through the fused megakernel VM in `_run_decode_forward`.
+        # Whole-model decode megakernel. Non-fatal: the manager disables itself (native
+        # decode everywhere) when the model/arch/SM-count is not in the shipped set,
+        # when no bucket is enabled, or when the megakernel backend is absent. When
+        # enabled it routes eligible decode buckets through the megakernel in
+        # `_run_decode_forward`.
         self._megakernel_decode = MegakernelDecodeManager(
             model_name=self.model_name,
             text=self.model.text,
@@ -2381,12 +2381,12 @@ class MoondreamRuntime:
         # built inside the captured decode graph (see _run_decode_forward).
         if self._lora_workspace is not None:
             self._prepare_decode_lora_metadata(slot, batch_size)
-        # Whole-model megakernel: the single eager seam. It lazily builds the megakernel
-        # session at the pre-capture warmup (JIT), and on each between-replay prep it
-        # re-seeds the contiguous KV only on a detected prefill->decode transition (a new
-        # sequence taking over a row). No-op for a non-megakernel bucket, under capture,
-        # or on a steady contiguous step (the cache self-extends across replays). Reads
-        # only batch_idx/input_pos -- the KV seam is fully internal to the manager.
+        # Whole-model megakernel: the eager per-step hook. It lazily builds the
+        # session at the pre-capture warmup, and on each between-replay prep it copies
+        # the contiguous KV only when a new sequence starts decoding on a row. No-op
+        # for a non-megakernel bucket, under capture, or on a steady step (the buffer
+        # grows by one per step). Reads only batch_idx/input_pos; the KV copy is
+        # internal to the manager.
         self._megakernel_decode.prepare(
             batch_size,
             batch_idx=slot.meta.batch_idx.gpu[:batch_size],
@@ -2489,15 +2489,14 @@ class MoondreamRuntime:
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
             moe_lora_metadata = slot.meta.moe_lora_metadata
 
-        # THE ENGINE SWITCH: route this bucket through the whole-model decode
-        # megakernel when it is enabled AND a session has been built (lazily, by
-        # `prepare` at the pre-capture warmup) for this batch size. `decode` returns
-        # None for a non-enabled/unbuilt bucket, so this is a NON-FATAL fallback to the
-        # native decoder -- never an error, never a deadlock. The megakernel owns a
-        # contiguous KV seeded from the paged cache at the sequence's decode start
-        # (internal, via `prepare`); it reads the engine-written input_pos and the token
-        # embeds from resident buffers, so one captured graph per bucket serves every
-        # step.
+        # Route this bucket through the whole-model decode megakernel when it is
+        # enabled and a session has been built (lazily, by `prepare` at the pre-capture
+        # warmup) for this batch size. `decode` returns None for a non-enabled or
+        # unbuilt bucket, so this falls back to the native decoder -- never an error,
+        # never a deadlock. The megakernel owns a contiguous KV, copied from the paged
+        # cache when the sequence starts decoding (internal, via `prepare`); it reads
+        # the engine-written input_pos and the token embeds from resident buffers, so
+        # one captured graph per bucket serves every step.
         hidden = self._megakernel_decode.decode(
             batch_size,
             embeds=embeds,
