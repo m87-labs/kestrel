@@ -81,6 +81,7 @@ from .tokenizer import load_tokenizer
 from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
+from .megakernel_decode import MegakernelDecodeManager
 
 
 DEFAULT_MAX_TOKENS = 768
@@ -846,6 +847,19 @@ class MoondreamRuntime:
 
         # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
         self._preallocate_workspaces()
+
+        # Whole-model decode megakernel (THE ENGINE SWITCH). Non-fatal: the manager
+        # self-disables (native decode everywhere) when the model/arch/SM-count is not
+        # in the shipped deploy set, when no bucket is enabled in the config table, or
+        # when the mkl build dependency is absent. When enabled it routes eligible
+        # decode buckets through the fused megakernel VM in `_run_decode_forward`.
+        self._megakernel_decode = MegakernelDecodeManager(
+            model_name=self.model_name,
+            text=self.model.text,
+            text_config=self.config.text,
+            device=self.device,
+            page_table=self.page_table,
+        )
 
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
@@ -2463,21 +2477,36 @@ class MoondreamRuntime:
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
             moe_lora_metadata = slot.meta.moe_lora_metadata
 
-        hidden = text_decoder(
-            embeds,
-            self.model.text,
-            attn_mask=None,
-            position_ids=position_ids,
-            config=self.config.text,
-            mode="decode",
-            slot_mapping=slot_mapping,
-            page_table=slot.paged_kv_page_table[:batch_size],
-            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
-            lora_workspace=lora_workspace,
+        # THE ENGINE SWITCH: route this bucket through the whole-model decode
+        # megakernel when it is enabled AND a session has been built (pre-capture)
+        # for this batch size. `decode` returns None for a non-enabled/unbuilt
+        # bucket, so this is a NON-FATAL fallback to the native decoder -- never an
+        # error, never a deadlock. The megakernel owns a contiguous KV seeded from
+        # the paged cache at the sequence's decode start (see MegakernelDecodeManager.
+        # seed_kv); it reads the engine-written input_pos and the token embeds from
+        # resident buffers, so one captured graph per bucket serves every step.
+        hidden = self._megakernel_decode.decode(
+            batch_size,
+            embeds=embeds,
+            input_pos_gpu=slot.meta.input_pos.gpu[:batch_size],
             lora_slot_ids=lora_slot_ids,
-            moe_lora_metadata=moe_lora_metadata,
-            dense_lora_scratch=self._dense_lora_decode_scratch,
         )
+        if hidden is None:
+            hidden = text_decoder(
+                embeds,
+                self.model.text,
+                attn_mask=None,
+                position_ids=position_ids,
+                config=self.config.text,
+                mode="decode",
+                slot_mapping=slot_mapping,
+                page_table=slot.paged_kv_page_table[:batch_size],
+                paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
+                lora_workspace=lora_workspace,
+                lora_slot_ids=lora_slot_ids,
+                moe_lora_metadata=moe_lora_metadata,
+                dense_lora_scratch=self._dense_lora_decode_scratch,
+            )
         logits = lm_head(hidden, self.model.text)
 
         # Write to slot output buffers (stable addresses for graph capture)
