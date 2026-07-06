@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Whole-model decode megakernel enable table (config-driven, env-free -- see the",
+    "no-flags rule and mkl/docs/MEGAKERNEL_SHIP_INTEGRATION.md).",
+    "",
+    "Eligibility (a shipped variant fits the device) is decided by",
+    "select_megakernel_num_ctas(arch, device_sms); this table is the *perf* on/off",
+    "decision layered on top of eligibility -- per (model, arch, device_sms, bucket).",
+    "The megakernel is NOT a universal win: p2/H100-SXM measured B1 1.38x but B8 0.86x,",
+    "so only buckets that are >=1.0x AND fingerprint-gated are enabled here.",
+    "",
+    "Key = model kind. 'arch' is the SM major*10 (90 = sm90, 100 = sm100).",
+    "'device_sms' is the shipped variant num_sms (must match the device SM count",
+    "closest-<=-match; 132 = H100 SXM5/NVL/H200/GH200). 'buckets' = the decode batch",
+    "sizes routed through the megakernel; every other bucket runs the native decode.",
+    "An empty / missing entry => native everywhere (non-fatal fallback)."
+  ],
+  "moondream3": {
+    "90": {
+      "132": {
+        "buckets": [1],
+        "note": "SXM: B1 1.38x (~1917us vs 2306us native). B2/B4 ~1.0x (deferred, needs B>1 per-request KV re-seed). B8 0.86x -> native."
+      }
+    }
+  }
+}
