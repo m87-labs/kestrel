@@ -859,6 +859,7 @@ class MoondreamRuntime:
             text_config=self.config.text,
             device=self.device,
             page_table=self.page_table,
+            max_seq_length=self.max_seq_length,
         )
 
         if self._use_cuda_graphs:
@@ -2380,6 +2381,17 @@ class MoondreamRuntime:
         # built inside the captured decode graph (see _run_decode_forward).
         if self._lora_workspace is not None:
             self._prepare_decode_lora_metadata(slot, batch_size)
+        # Whole-model megakernel: the single eager seam. It lazily builds the megakernel
+        # session at the pre-capture warmup (JIT), and on each between-replay prep it
+        # re-seeds the contiguous KV only on a detected prefill->decode transition (a new
+        # sequence taking over a row). No-op for a non-megakernel bucket, under capture,
+        # or on a steady contiguous step (the cache self-extends across replays). Reads
+        # only batch_idx/input_pos -- the KV seam is fully internal to the manager.
+        self._megakernel_decode.prepare(
+            batch_size,
+            batch_idx=slot.meta.batch_idx.gpu[:batch_size],
+            input_pos_gpu=slot.meta.input_pos.gpu[:batch_size],
+        )
 
     def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
         # Use batch index 0 for all entries: page-table row 0 is initialized and
@@ -2478,13 +2490,14 @@ class MoondreamRuntime:
             moe_lora_metadata = slot.meta.moe_lora_metadata
 
         # THE ENGINE SWITCH: route this bucket through the whole-model decode
-        # megakernel when it is enabled AND a session has been built (pre-capture)
-        # for this batch size. `decode` returns None for a non-enabled/unbuilt
-        # bucket, so this is a NON-FATAL fallback to the native decoder -- never an
-        # error, never a deadlock. The megakernel owns a contiguous KV seeded from
-        # the paged cache at the sequence's decode start (see MegakernelDecodeManager.
-        # seed_kv); it reads the engine-written input_pos and the token embeds from
-        # resident buffers, so one captured graph per bucket serves every step.
+        # megakernel when it is enabled AND a session has been built (lazily, by
+        # `prepare` at the pre-capture warmup) for this batch size. `decode` returns
+        # None for a non-enabled/unbuilt bucket, so this is a NON-FATAL fallback to the
+        # native decoder -- never an error, never a deadlock. The megakernel owns a
+        # contiguous KV seeded from the paged cache at the sequence's decode start
+        # (internal, via `prepare`); it reads the engine-written input_pos and the token
+        # embeds from resident buffers, so one captured graph per bucket serves every
+        # step.
         hidden = self._megakernel_decode.decode(
             batch_size,
             embeds=embeds,
