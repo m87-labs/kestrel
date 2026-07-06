@@ -12,6 +12,7 @@ import safetensors
 import torch
 import torch.nn as nn
 
+from ._moe_layout import _interleave_gate_up_rows8
 from .rope import precompute_freqs_cis
 from .text import build_tau_pos_tables
 
@@ -188,6 +189,16 @@ def _assign_md3_text_weights(
             up_weight_uint8 = up_weight_fp8.view(torch.uint8)
             down_weight_uint8 = down_weight_fp8.view(torch.uint8)
 
+            # Store the up-projection rows (and their per-channel scale) in the
+            # 8-row gate/up interleave -- gate[0:8], up[0:8], ... -- THE layout
+            # for MD3's FP8 MoE. The gated-GELU always reads this ordering and
+            # the up weight is now the same physical bytes the megakernel
+            # consumes, so it is no longer duplicated. Pure row permutation of
+            # the 2*inter axis; the down projection is untouched (the GELU emits
+            # standard [0:inter] order).
+            inter = fused_mlp.hidden_size
+            up_weight_uint8 = _interleave_gate_up_rows8(up_weight_uint8, inter)
+
             # Replace weight data with uint8 FP8 bits
             # First resize the weight tensor to match uint8 storage
             up_experts = fused_mlp.up_experts
@@ -202,10 +213,11 @@ def _assign_md3_text_weights(
                 down_weight_uint8.to(device), requires_grad=False
             )
 
-            # Register scale buffers
+            # Register scale buffers (up scale carries the same row interleave)
             up_scale = moe_scales.up_scales[layer_idx]
             down_scale = moe_scales.down_scales[layer_idx]
             assert up_scale is not None and down_scale is not None
+            up_scale = _interleave_gate_up_rows8(up_scale, inter)
             up_experts.register_buffer("scale", up_scale.to(device))
             down_experts.register_buffer("scale", down_scale.to(device))
 
