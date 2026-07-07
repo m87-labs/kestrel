@@ -629,24 +629,19 @@ class MoondreamRuntime:
         device_sm = device_cc_major * 10 + device_cc_minor
         fp8_kv_supported_sms = {87, 89, 90, 100, 110, 120}
 
-        # Whole-model decode megakernel: its direct paged-KV read/append path
-        # (``kv_pool_layer``) addresses the engine's KV pool as **bf16** and does not carry the
-        # per-layer fp8 k/v dequant scales into the fused attention. So when a megakernel variant
-        # serves this model on this device, the pool MUST be bf16: an fp8 pool would be read/appended
-        # at the wrong stride (2x), silently corrupting the decode output AND running a physical page
-        # past the (1-byte) pool end into an illegal access. Force bf16 KV in that case (native decode
-        # is unaffected -- it reads bf16 correctly too). A true fp8-aware megakernel KV path (fp8 view
-        # + scale dequant in attn_partial / the qkv-epi append) is the follow-up that restores the
-        # fp8 KV memory saving; until then the megakernel gates the KV dtype to bf16.
-        megakernel_serves_kv = self._megakernel_forces_bf16_kv()
-
+        # The whole-model decode megakernel now reads/appends the engine's fp8 (e4m3) KV pool
+        # DIRECTLY: its ``kv_pool_layer`` builds a Uint8 (e4m3-byte) pool view and its attention read
+        # + qkv-epi append carry the per-layer k/v dequant scales (bit-compatible with native
+        # ``reshape_and_cache_flash`` -- proven by ``mkl/tests/test_fp8_kv_interop.py``). So the pool
+        # is fp8 whenever the checkpoint carries scales on a supported SM, regardless of whether a
+        # megakernel serves the model; the bf16-pool stopgap (which doubled KV bytes + pool memory)
+        # is retired. Native decode reads the same fp8 pool correctly too.
         if (
             self._kv_layer_k_scales is not None
             and self._kv_layer_v_scales is not None
             and self.page_size == 1
             and hasattr(torch, "float8_e4m3fn")
             and device_sm in fp8_kv_supported_sms
-            and not megakernel_serves_kv
         ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
@@ -2506,22 +2501,6 @@ class MoondreamRuntime:
         if self._decode_graphs.enabled or self._megakernel_target is None:
             return False
         return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
-
-    def _megakernel_forces_bf16_kv(self) -> bool:
-        """Whether a whole-model decode megakernel variant serves this model on this device (so the KV
-        pool must be bf16, not fp8 -- see the KV-dtype selection in ``__init__``). Cheap + never raises:
-        a deploy-target probe (device-props read only) plus the no-build enable-table lookup over the
-        decode buckets, so an unshipped SKU / disabled model returns ``False`` and keeps fp8 KV."""
-        try:
-            target = megakernel_decode.deploy_target(self.model_name, self.device)
-            if target is None:
-                return False
-            return any(
-                megakernel_decode.has_megakernel(*target, bucket)
-                for bucket in range(1, 9)
-            )
-        except Exception:  # a props/table surprise -> keep the fp8 default, never a hard error
-            return False
 
     def _megakernel_decode_hidden(
         self, slot: DecodeSlot, batch_size: int, embeds: Tensor
