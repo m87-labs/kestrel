@@ -10,6 +10,7 @@ the whole-model cos/argmax gates catch any drift from the megakernel's layout.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 
 def _interleave_gate_up_rows8(gate_up: torch.Tensor, inter: int) -> torch.Tensor:
@@ -43,3 +44,64 @@ def _interleave_up_b_rows8(up_b: torch.Tensor, inter: int) -> torch.Tensor:
     flat = up_b.reshape(-1, two_i, rank)
     out = _interleave_gate_up_rows8(flat, inter)
     return out.reshape(*lead, two_i, rank).contiguous()
+
+
+# THE ENGINE-OWNED MoE up-weight slab (kestrel#121 completion / kestrel-proprietary#384).
+#
+# The MD3 FP8 MoE up-projection is the largest duplicated tensor in the running model: the native
+# gated-GELU reads it per layer AND the whole-model megakernel reads it as one stacked
+# ``[NL, E, 2I, H]`` descriptor indexed by the GLOBAL layer field. To store it exactly once, the
+# engine allocates that stacked slab UP FRONT at weight load and points each MoE layer's
+# ``up_experts.weight``/``scale`` at a layer-view of it; the megakernel then consumes the same slab
+# byte-for-byte (see md3 session / bundle backend), no per-session stack + copy. ``NL`` is the FULL
+# text-block count (global layer indexing) -- the dense pre-MoE layers keep zero rows they never
+# read, which is the padding the megakernel's global ``FIELD_LAYER`` tile coordinate requires. Both
+# the loader (:mod:`.weights`) and the megakernel bench/test builders share these two helpers so the
+# slab-and-views contract is defined once.
+
+
+def build_md3_moe_up_slab(
+    text: nn.Module,
+    *,
+    num_experts: int,
+    two_inter: int,
+    hidden: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate the engine-owned ``[NL, E, 2I, H]`` uint8 up-weight slab (fp8 bits) and the
+    ``[NL, E, 2I]`` float32 up-scale slab, and stash them on ``text`` so the megakernel can consume
+    them directly. ``NL == len(text.blocks)`` (global layer indexing). Rows for dense pre-MoE layers
+    stay zero (the megakernel never tiles them). Returns ``(up_w_slab, up_scale_slab)``; the caller
+    fills each MoE layer's view via :func:`set_md3_moe_up_layer`."""
+    n_layers = len(text.blocks)
+    up_w_slab = torch.zeros(
+        n_layers, num_experts, two_inter, hidden, dtype=torch.uint8, device=device)
+    up_scale_slab = torch.zeros(
+        n_layers, num_experts, two_inter, dtype=torch.float32, device=device)
+    # Stash the slabs on the text module: THE contract the megakernel session asserts against (each
+    # MoE layer's up_experts view must alias these). Plain attributes -- not buffers -- so they do
+    # not appear twice in the state_dict (the per-layer views already round-trip the bytes).
+    text.moe_up_w_slab = up_w_slab
+    text.moe_up_scale_slab = up_scale_slab
+    return up_w_slab, up_scale_slab
+
+
+def set_md3_moe_up_layer(
+    fused: nn.Module,
+    up_w_slab: torch.Tensor,
+    up_scale_slab: torch.Tensor,
+    layer_idx: int,
+    up_weight_uint8: torch.Tensor,
+    up_scale: torch.Tensor,
+    inter: int,
+) -> None:
+    """Interleave-by-8 a single MoE layer's raw up weight/scale into slab row ``layer_idx`` and
+    re-point ``fused.up_experts.weight``/``scale`` at the (zero-copy) layer-view. After this the
+    layer's up bytes live ONLY in the slab -- no private per-layer copy."""
+    up_w_slab[layer_idx].copy_(_interleave_gate_up_rows8(up_weight_uint8, inter))
+    up_scale_slab[layer_idx].copy_(_interleave_gate_up_rows8(up_scale, inter).float())
+    up_experts = fused.up_experts
+    up_experts.weight = nn.Parameter(up_w_slab[layer_idx], requires_grad=False)
+    # register_buffer overwrites an existing "scale" buffer in place; the view keeps the slab
+    # resident, so the engine co-owns it regardless of any later megakernel session lifetime.
+    up_experts.register_buffer("scale", up_scale_slab[layer_idx])
