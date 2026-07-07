@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from kestrel.models.moondream.moe import MoEConfig, MoEModule
@@ -166,3 +167,72 @@ def test_decode_lora_metadata_uses_compact_graph_stable_buffers() -> None:
         slot.meta.active_lora_meta.gpu[:7],
         torch.zeros((7,), dtype=torch.int32),
     )
+
+
+# ---------------------------------------------------------------------------
+# Non-FP8 MoE checkpoints are unrepresentable (kestrel#121)
+#
+# The MD3 MoE up-projection base is stored in the 8-row gate/up interleave and
+# every MoE LoRA up-B adapter is interleaved to match by construction. A non-FP8
+# MoE checkpoint would land the up weight half-split under an interleaved
+# adapter -> scrambled expand. The loader hard-fails instead of loading it, so
+# the base-vs-adapter layout coupling can never be violated. This test pins that
+# error path (delete-not-gate: the mismatch is unrepresentable).
+# ---------------------------------------------------------------------------
+
+
+class _Node(dict):
+    """Dict that also exposes its keys as attributes (mirrors the model tree's
+    dual item/attribute access used by the weight loader)."""
+
+    def __getattr__(self, key: str):
+        try:
+            return self[key]
+        except KeyError as exc:  # pragma: no cover - attribute miss path
+            raise AttributeError(key) from exc
+
+
+def _leaf(*, bias: bool = True) -> _Node:
+    node = _Node(weight=torch.zeros(1))
+    if bias:
+        node["bias"] = torch.zeros(1)
+    return node
+
+
+def _moe_block() -> _Node:
+    # is_moe is detected via ``hasattr(block.mlp, "router")``.
+    mlp = _Node(router=_leaf())
+    return _Node(
+        ln=_leaf(),
+        attn=_Node(qkv=_leaf(), proj=_leaf()),
+        mlp=mlp,
+    )
+
+
+def _fake_md3_model_with_moe() -> _Node:
+    text = _Node(
+        blocks=[_moe_block()],
+        wte=torch.zeros(1),
+        post_ln=_leaf(),
+        lm_head=_leaf(),
+    )
+    return _Node(text=text)
+
+
+def test_non_fp8_moe_checkpoint_raises() -> None:
+    from kestrel.models.moondream.weights import _assign_md3_text_weights
+
+    model = _fake_md3_model_with_moe()
+
+    with pytest.raises(ValueError, match="Non-FP8 MoE checkpoints are not supported"):
+        # No captured moe_quant scales -> the (deleted) non-FP8 MoE branch.
+        _assign_md3_text_weights(lambda name: torch.zeros(1), model, moe_scales=None)
+
+
+def test_non_fp8_moe_error_names_offending_tensor() -> None:
+    from kestrel.models.moondream.weights import _assign_md3_text_weights
+
+    model = _fake_md3_model_with_moe()
+
+    with pytest.raises(ValueError, match=r"mlp\.experts\.weight"):
+        _assign_md3_text_weights(lambda name: torch.zeros(1), model, moe_scales=None)

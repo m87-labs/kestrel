@@ -154,16 +154,21 @@ def _assign_md3_text_weights(
                 }
             )
             layer_has_fp8 = has_fp8_moe_scales and moe_scales.has_scales_for_layer(i)
-            if layer_has_fp8 and use_fp8_moe:
-                # FP8 MoE runtime path: keep raw FP8 bits + scales.
-                moe_layers_fp8.append((i, block))
-            else:
-                weight_map.update(
-                    {
-                        f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].up_experts.weight,
-                        f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].down_experts.weight,
-                    }
+            if not (layer_has_fp8 and use_fp8_moe):
+                # MD3's MoE is FP8-only: the up-projection base is stored in the 8-row
+                # gate/up interleave (THE layout the megakernel consumes) and every MoE
+                # LoRA up-B adapter is interleaved to match by construction. A non-FP8
+                # MoE checkpoint would land the up weight half-split (gate[0:inter],
+                # up[0:inter]) under an interleaved adapter -> scrambled expand output.
+                # That mismatch is unrepresentable: hard-fail instead of loading it.
+                raise ValueError(
+                    f"Non-FP8 MoE checkpoints are not supported: layer {i} "
+                    f"({prefix}.mlp.experts.weight) has no captured FP8 moe_quant "
+                    f"scales. MD3 MoE requires FP8 up/down scales so the up-projection "
+                    f"base can be stored in the interleaved gate/up layout."
                 )
+            # FP8 MoE runtime path: keep raw FP8 bits + scales.
+            moe_layers_fp8.append((i, block))
         else:
             weight_map.update(
                 {
