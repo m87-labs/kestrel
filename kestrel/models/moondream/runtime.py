@@ -996,11 +996,26 @@ class MoondreamRuntime:
             top_ps: Tensor | None,
             token_logprobs: Tensor | None,
             ready_event: "torch.cuda.Event",
-        ) -> tuple[object, int]:
+        ) -> tuple[object, int] | None:
             if hidden_last is None:
                 raise RuntimeError(
                     "Moondream post_sample requires hidden_last for spatial decode"
                 )
+            # Spatial-head gate. The coord/size decode head (a ~12.6MB matvec +
+            # the coord/size sample launches, then a D2H) only produces values a
+            # skill consumes when the sampled id can be ``coord_id`` / ``size_id``.
+            # When NO sequence in this batch is in a spatial-emitting phase -- a
+            # plain query answer, a caption: pure text -- the head is dead weight,
+            # so skip it and take the documented opt-out fast path (returning
+            # ``None`` => ``materialize_tokens`` types every id as text, exactly as
+            # a runtime that owns no spatial decode). Point/detect/segment and the
+            # grounded-reasoning phase of a query keep the head, byte-identical.
+            # ``skill_state is None`` (capability unknown) conservatively keeps it.
+            if not any(
+                seq.skill_state is None or seq.skill_state.emits_spatial_tokens
+                for seq in sequences
+            ):
+                return None
             batch_size = int(sampled_ids.shape[0])
             coord_out = slot.coord_staging[:batch_size]
             size_out = slot.size_staging[:batch_size]

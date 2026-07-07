@@ -183,6 +183,16 @@ class QuerySkillState(SkillState):
         self._post_reasoning_tokens: Optional[List[int]] = None
         self._post_reasoning_idx: int = 0
 
+    @property
+    def emits_spatial_tokens(self) -> bool:
+        # A query only consumes coord tokens while collecting *grounded*
+        # reasoning (``consume_step`` folds CoordToken values into the
+        # reasoning chunk's points). The answer phase and every non-reasoning
+        # query are pure text -- they only handle TextToken -- so the spatial
+        # head is dead weight there and the runtime skips it. Byte-identical:
+        # this is exactly the phase in which a coord/size value is consumed.
+        return self._collecting_reasoning
+
     def allowed_token_ids(
         self, runtime: "MoondreamRuntime"
     ) -> Optional[Sequence[int]]:

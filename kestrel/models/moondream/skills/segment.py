@@ -125,6 +125,12 @@ class SegmentSkillState(SkillState):
     # accept rather than ever capping the row to one committed token per step.
     mask_is_stateful = False
 
+    @property
+    def emits_spatial_tokens(self) -> bool:
+        # Segment interleaves free text with coord/size tokens (the bbox +
+        # polygon), so it consumes spatial values throughout its run.
+        return True
+
     def __init__(
         self,
         spec: SkillSpec,

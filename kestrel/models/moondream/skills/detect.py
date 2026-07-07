@@ -173,6 +173,12 @@ class DetectSkillState(SkillState):
             return [pt.coord_id]
         return [pt.size_id]
 
+    @property
+    def emits_spatial_tokens(self) -> bool:
+        # Detect cycles coord (x) -> coord (y) -> size, so every decode step
+        # consumes a spatial value.
+        return True
+
 
 def _extract_objects(tokens: Sequence[Token]) -> list[Dict[str, float]]:
     objects: list[Dict[str, float]] = []
