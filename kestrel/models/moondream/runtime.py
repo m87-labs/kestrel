@@ -2523,37 +2523,6 @@ class MoondreamRuntime:
         except Exception:  # a props/table surprise -> keep the fp8 default, never a hard error
             return False
 
-    def _reserve_megakernel_pages(self, slot: DecodeSlot, batch_size: int) -> None:
-        """Reserve + commit the appending KV page for every active row BEFORE the eager megakernel
-        launch reads the page table (the per-step ``input_pos``-parallel contract).
-
-        The megakernel decode grows the paged KV one token per step: the new token appends at logical
-        position ``input_pos`` (== the row's current sequence length, page_size=1), and the direct
-        paged-KV session's per-step ``refresh_pages`` copies ``page_table.page_table[batch_idx, :]``
-        straight off the GPU page table into the logical->physical map the kernel indexes. A logical
-        slot the engine has not reserved reads the ``-1`` sentinel on the GPU table, so the qkv-epi
-        append then indexes ``mK[-1]`` (a negative gmem offset) -> ``cudaErrorIllegalAddress``. The
-        native decode path never trips this because it only ever READS the pre-reserved window, but the
-        megakernel APPENDS and self-extends, so the eager route must grow the page table itself,
-        exactly like a native per-step reserve would. (This is the correct paged-growth contract; it
-        lets the session build stop over-reserving the whole ``kv_cap`` window. It is NOT what caused
-        the ChartQA step-3 crash -- that was root-caused to the megakernel reading the fp8 KV pool as
-        bf16; see the KV-dtype gate above and MEGAKERNEL_SHIP_INTEGRATION.md.)
-
-        ``reserve`` only allocates past the current per-row capacity (a no-op once the window is
-        covered), and ``commit_block_table`` flushes just the rows it actually dirtied H2D -- so this
-        is a couple of host ops per step, and free once the sequence's window is fully reserved. Eager
-        only (never under CUDA-graph capture -- served megakernel buckets skip capture)."""
-        idx_np = slot.meta.batch_idx.np
-        pos_np = slot.meta.input_pos.np
-        rows: list[int] = []
-        for i in range(batch_size):
-            batch_idx = int(idx_np[i])
-            # Appending logical slot == input_pos; page_size=1 -> capacity must reach input_pos + 1.
-            self.page_table.reserve(batch_idx, int(pos_np[i]) + 1)
-            rows.append(batch_idx)
-        self.page_table.commit_block_table(rows)
-
     def _megakernel_decode_hidden(
         self, slot: DecodeSlot, batch_size: int, embeds: Tensor
     ) -> Tensor:
@@ -2561,10 +2530,13 @@ class MoondreamRuntime:
         (one launch, never captured). The session is built lazily on the first call for a bucket -- the
         engine performs that first call at graph-build time via ``_plan_megakernel_buckets`` instead of
         capturing a native graph, so by production steady-state it is warm. Raises on a genuine
-        megakernel error (the caller only reaches here for a bucket whose warmup succeeded)."""
-        # Grow + commit the paged KV for this step's appending slot before the launch reads the page
-        # table (the direct paged-KV per-step reserve contract; see _reserve_megakernel_pages).
-        self._reserve_megakernel_pages(slot, batch_size)
+        megakernel error (the caller only reaches here for a bucket whose warmup succeeded).
+
+        The KV page reserve/commit is NOT done per step here anymore: the megakernel session reserves
+        every active row through the baked ``kv_capacity`` on a batch-composition change
+        (``session.rebase_pages``, driven by the manager off the host-mirror composition check) and the
+        kernel appends into the pre-reserved pages every steady step. The host mirrors
+        (``slot.meta.*.np``) are threaded so that composition check stays device-sync-free."""
         return megakernel_decode.decode(
             model_name=self.model_name,
             text=self.model.text,
@@ -2576,6 +2548,8 @@ class MoondreamRuntime:
             embeds=embeds,
             batch_idx=slot.meta.batch_idx.gpu[:batch_size],
             input_pos=slot.meta.input_pos.gpu[:batch_size],
+            batch_idx_host=slot.meta.batch_idx.np[:batch_size],
+            input_pos_host=slot.meta.input_pos.np[:batch_size],
         )
 
     def _native_decode_hidden(
