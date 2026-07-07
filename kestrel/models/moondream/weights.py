@@ -12,6 +12,10 @@ import safetensors
 import torch
 import torch.nn as nn
 
+from ._moe_layout import (
+    build_md3_moe_up_slab,
+    set_md3_moe_up_layer,
+)
 from .rope import precompute_freqs_cis
 from .text import build_tau_pos_tables
 
@@ -150,16 +154,21 @@ def _assign_md3_text_weights(
                 }
             )
             layer_has_fp8 = has_fp8_moe_scales and moe_scales.has_scales_for_layer(i)
-            if layer_has_fp8 and use_fp8_moe:
-                # FP8 MoE runtime path: keep raw FP8 bits + scales.
-                moe_layers_fp8.append((i, block))
-            else:
-                weight_map.update(
-                    {
-                        f"{prefix}.mlp.experts.weight": block["mlp"]["mlp"].up_experts.weight,
-                        f"{prefix}.mlp.output_experts.weight": block["mlp"]["mlp"].down_experts.weight,
-                    }
+            if not (layer_has_fp8 and use_fp8_moe):
+                # MD3's MoE is FP8-only: the up-projection base is stored in the 8-row
+                # gate/up interleave (THE layout the megakernel consumes) and every MoE
+                # LoRA up-B adapter is interleaved to match by construction. A non-FP8
+                # MoE checkpoint would land the up weight half-split (gate[0:inter],
+                # up[0:inter]) under an interleaved adapter -> scrambled expand output.
+                # That mismatch is unrepresentable: hard-fail instead of loading it.
+                raise ValueError(
+                    f"Non-FP8 MoE checkpoints are not supported: layer {i} "
+                    f"({prefix}.mlp.experts.weight) has no captured FP8 moe_quant "
+                    f"scales. MD3 MoE requires FP8 up/down scales so the up-projection "
+                    f"base can be stored in the interleaved gate/up layout."
                 )
+            # FP8 MoE runtime path: keep raw FP8 bits + scales.
+            moe_layers_fp8.append((i, block))
         else:
             weight_map.update(
                 {
@@ -173,41 +182,52 @@ def _assign_md3_text_weights(
     for key, tensor in weight_map.items():
         tensor.data.copy_(get_tensor(key))
 
-    # Handle FP8 MoE weights: load raw FP8 tensors and attach scales
+    # Handle FP8 MoE weights: load raw FP8 tensors and attach scales.
+    #
+    # The up-projection weight (and its per-channel scale) is stored ONCE in a single engine-owned
+    # ``[NL, E, 2I, H]`` slab (see :mod:`._moe_layout`): each MoE layer's up rows land in the 8-row
+    # gate/up interleave -- gate[0:8], up[0:8], ... -- THE layout for MD3's FP8 MoE, which is also
+    # exactly the physical bytes the whole-model megakernel consumes (global layer indexing). So the
+    # native gated-GELU and the megakernel share one copy -- no per-layer duplicate, no per-session
+    # stack. The slab allocates once up front (peak vs 20 separate per-layer allocations improves).
+    # The down projection is untouched (the GELU emits standard [0:inter] order), so it keeps private
+    # per-layer buffers.
     if use_fp8_moe and get_raw_tensor is not None:
         assert moe_scales is not None
+        # Size + place the slab from the first MoE layer's up weight ([E, 2I, H] fp8-as-uint8).
+        first_layer_idx, first_block = moe_layers_fp8[0]
+        first_up = get_raw_tensor(
+            f"text_model.transformer.h.{first_layer_idx}.mlp.experts.weight")
+        E, two_inter, hidden = (
+            int(first_up.shape[0]), int(first_up.shape[1]), int(first_up.shape[2]))
+        device = first_block["mlp"]["mlp"].up_experts.weight.device
+        up_w_slab, up_scale_slab = build_md3_moe_up_slab(
+            text, num_experts=E, two_inter=two_inter, hidden=hidden, device=device)
+
         for layer_idx, block in moe_layers_fp8:
             prefix = f"text_model.transformer.h.{layer_idx}"
             fused_mlp = block["mlp"]["mlp"]
+            inter = fused_mlp.hidden_size
 
-            # Load FP8 weights (stored as float8_e4m3fn, viewed as uint8)
-            up_weight_fp8 = get_raw_tensor(f"{prefix}.mlp.experts.weight")
-            down_weight_fp8 = get_raw_tensor(f"{prefix}.mlp.output_experts.weight")
+            # Load FP8 weights (stored as float8_e4m3fn, viewed as uint8).
+            up_weight_uint8 = get_raw_tensor(
+                f"{prefix}.mlp.experts.weight").view(torch.uint8).to(device)
+            down_weight_uint8 = get_raw_tensor(
+                f"{prefix}.mlp.output_experts.weight").view(torch.uint8)
 
-            # Convert to uint8 view for storage
-            up_weight_uint8 = up_weight_fp8.view(torch.uint8)
-            down_weight_uint8 = down_weight_fp8.view(torch.uint8)
-
-            # Replace weight data with uint8 FP8 bits
-            # First resize the weight tensor to match uint8 storage
-            up_experts = fused_mlp.up_experts
-            down_experts = fused_mlp.down_experts
-
-            # Create new uint8 weight parameter and copy FP8 bits
-            device = up_experts.weight.device
-            up_experts.weight = nn.Parameter(
-                up_weight_uint8.to(device), requires_grad=False
-            )
-            down_experts.weight = nn.Parameter(
-                down_weight_uint8.to(device), requires_grad=False
-            )
-
-            # Register scale buffers
             up_scale = moe_scales.up_scales[layer_idx]
             down_scale = moe_scales.down_scales[layer_idx]
             assert up_scale is not None and down_scale is not None
-            up_experts.register_buffer("scale", up_scale.to(device))
-            down_experts.register_buffer("scale", down_scale.to(device))
+
+            # Up weight + scale -> interleaved slab views (the ONLY copy of the up bytes).
+            set_md3_moe_up_layer(
+                fused_mlp, up_w_slab, up_scale_slab, layer_idx,
+                up_weight_uint8, up_scale.to(device), inter)
+
+            # Down projection: private per-layer uint8 weight + scale buffer.
+            fused_mlp.down_experts.weight = nn.Parameter(
+                down_weight_uint8.to(device), requires_grad=False)
+            fused_mlp.down_experts.register_buffer("scale", down_scale.to(device))
 
     # Tau weights (q/v scaling). Kestrel stores these fused as a single wqwv matrix
     # for performance, but older checkpoints store tau_wq and tau_wv separately.

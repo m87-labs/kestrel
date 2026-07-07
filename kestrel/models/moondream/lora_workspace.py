@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 
+from ._moe_layout import _interleave_up_b_rows8
 from .config import TextConfig
 from .lora import LoRA
 
@@ -296,9 +297,16 @@ class TextLoRAWorkspace:
                 layer.up_a[ws_idx, :adapter_rank_per_expert, :].copy_(
                     adapter_layer.up_a[expert_id]
                 )
-                layer.up_b[ws_idx, :, :adapter_rank_per_expert].copy_(
-                    adapter_layer.up_b[expert_id]
+                # The base up-projection weights are stored interleaved-by-8 on
+                # the 2*inter axis (THE layout for MD3's FP8 MoE). Column-
+                # interleave the up-B rows the SAME way so the expand's RMW into
+                # the interleaved base_up is an identity map -- no kernel change,
+                # the rank columns are carried along untouched. Down adapters are
+                # untouched (the GELU emits standard [0:inter] order).
+                up_b_src = _interleave_up_b_rows8(
+                    adapter_layer.up_b[expert_id], layer.up_b.shape[1] // 2
                 )
+                layer.up_b[ws_idx, :, :adapter_rank_per_expert].copy_(up_b_src)
                 layer.down_a[ws_idx, :adapter_rank_per_expert, :].copy_(
                     adapter_layer.down_a[expert_id]
                 )
