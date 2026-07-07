@@ -86,6 +86,23 @@ def build_md3_moe_up_slab(
     return up_w_slab, up_scale_slab
 
 
+def _bind_md3_moe_up_view(
+    up_experts: nn.Module,
+    up_w_slab: torch.Tensor,
+    up_scale_slab: torch.Tensor,
+    layer_idx: int,
+) -> None:
+    """Point ``up_experts.weight``/``scale`` at the zero-copy ``layer_idx`` view of the slabs.
+
+    THE single source of truth for the slab-view aliasing (used by the initial load in
+    :func:`set_md3_moe_up_layer` and by the post-move rebind in
+    :func:`rebind_md3_moe_up_views`). After this the layer's up bytes live ONLY in the slab."""
+    up_experts.weight = nn.Parameter(up_w_slab[layer_idx], requires_grad=False)
+    # register_buffer overwrites an existing "scale" buffer in place; the view keeps the slab
+    # resident, so the engine co-owns it regardless of any later megakernel session lifetime.
+    up_experts.register_buffer("scale", up_scale_slab[layer_idx])
+
+
 def set_md3_moe_up_layer(
     fused: nn.Module,
     up_w_slab: torch.Tensor,
@@ -100,8 +117,53 @@ def set_md3_moe_up_layer(
     layer's up bytes live ONLY in the slab -- no private per-layer copy."""
     up_w_slab[layer_idx].copy_(_interleave_gate_up_rows8(up_weight_uint8, inter))
     up_scale_slab[layer_idx].copy_(_interleave_gate_up_rows8(up_scale, inter).float())
-    up_experts = fused.up_experts
-    up_experts.weight = nn.Parameter(up_w_slab[layer_idx], requires_grad=False)
-    # register_buffer overwrites an existing "scale" buffer in place; the view keeps the slab
-    # resident, so the engine co-owns it regardless of any later megakernel session lifetime.
-    up_experts.register_buffer("scale", up_scale_slab[layer_idx])
+    _bind_md3_moe_up_view(fused.up_experts, up_w_slab, up_scale_slab, layer_idx)
+
+
+def rebind_md3_moe_up_views(
+    text: nn.Module,
+    up_w_slab: torch.Tensor,
+    up_scale_slab: torch.Tensor,
+) -> None:
+    """Re-point every MoE layer's ``up_experts`` view at the (already-filled) slabs.
+
+    The slab data is untouched -- only the per-layer views are rebound, at their GLOBAL
+    ``layer_idx`` offset. Used after a module move (:class:`MoEUpSlabModuleDict._apply`) once the
+    slabs themselves have been moved, to restore the aliasing PyTorch tears apart when it moves the
+    per-layer views independently."""
+    for layer_idx, blk in enumerate(text.blocks):
+        # MoE blocks carry a router (dense pre-MoE layers do not) -- same probe the megakernel
+        # session uses to skip the zero-padded rows it never tiles.
+        if not hasattr(blk.mlp, "router"):
+            continue
+        _bind_md3_moe_up_view(
+            blk.mlp["mlp"].up_experts, up_w_slab, up_scale_slab, layer_idx)
+
+
+class MoEUpSlabModuleDict(nn.ModuleDict):
+    """``nn.ModuleDict`` that keeps the engine-owned MoE up-weight slab aliased through moves.
+
+    The slab (stashed as a plain attribute in :func:`build_md3_moe_up_slab`) is deliberately NOT a
+    parameter or buffer -- it must not double the state_dict. But that also means PyTorch's
+    ``Module._apply`` (the engine behind ``.to()`` / ``.cuda()`` / ``.float()`` / ``to_empty()``)
+    never visits it: it walks only registered params/buffers, moving each per-layer
+    ``up_experts.weight``/``scale`` view INDEPENDENTLY and never preserving cross-tensor storage
+    aliasing. So a post-load ``model.to(device)`` would leave the slab on the old device while the 20
+    views become 20 private copies -- silently losing the native dedup, and tripping the megakernel
+    session's alias assert. This override moves the slab with the SAME ``fn`` and re-points every MoE
+    layer's view back at it. Idempotent: a device/dtype-preserving ``fn`` returns the same tensors,
+    so the rebind is skipped (the normal no-move path is untouched)."""
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        slab_w = getattr(self, "moe_up_w_slab", None)
+        slab_s = getattr(self, "moe_up_scale_slab", None)
+        if slab_w is None or slab_s is None:
+            return self  # dense / non-FP8 model: no slab to keep aliased
+        new_w, new_s = fn(slab_w), fn(slab_s)
+        if new_w is slab_w and new_s is slab_s:
+            return self  # no-op move: views already alias the resident slab
+        self.moe_up_w_slab = new_w
+        self.moe_up_scale_slab = new_s
+        rebind_md3_moe_up_views(self, new_w, new_s)
+        return self

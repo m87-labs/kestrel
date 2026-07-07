@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._moe_layout import MoEUpSlabModuleDict
 from .config import TextConfig
 from .layers import (
     build_dense_mlp,
@@ -302,7 +303,7 @@ def build_text_model(
     if config.group_size is not None:
         raise NotImplementedError("Quantized linear layers are not supported yet")
 
-    text = nn.ModuleDict(
+    text = MoEUpSlabModuleDict(
         {
             "blocks": nn.ModuleList(
                 [
