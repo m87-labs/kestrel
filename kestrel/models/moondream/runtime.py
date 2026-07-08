@@ -821,6 +821,11 @@ class MoondreamRuntime:
         # and RenderBuffer, but they share the decode compute stream and copy stream.
         vocab_size = self.model.text.lm_head.weight.shape[0]
         hidden_dim = self.model.text.lm_head.weight.shape[1]
+        dflash_hidden_layers = (
+            self.dflash_drafter.config.target_layer_count
+            if self.dflash_drafter is not None
+            else 0
+        )
         self._decode_slots: list[DecodeSlot] = [
             create_decode_slot(
                 slot_id=slot_id,
@@ -834,6 +839,7 @@ class MoondreamRuntime:
                 size_dtype=size_dtype,
                 compute_stream=self._compute_stream,
                 copy_stream=self._copy_stream,
+                dflash_hidden_layers=dflash_hidden_layers,
             )
             for slot_id in range(2)
         ]
@@ -975,6 +981,33 @@ class MoondreamRuntime:
         """Capability names this model serves (Runtime protocol)."""
         return self.skills().names()
 
+    def _dflash_target_layer_indices(self) -> tuple[int, ...]:
+        drafter = self.dflash_drafter
+        if drafter is None:
+            return ()
+        return tuple(drafter.config.target_layer_indices)
+
+    def _ensure_dflash_hidden_window(self, state: SequenceState):
+        drafter = self.dflash_drafter
+        if drafter is None:
+            return None
+        window = getattr(state, "dflash_hidden_window", None)
+        if window is None:
+            from .dflash import DFlashHiddenWindow
+
+            window = DFlashHiddenWindow(
+                drafter.config,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            state.dflash_hidden_window = window
+        return window
+
+    def _append_dflash_hidden(self, state: SequenceState, rows: Tensor) -> None:
+        window = self._ensure_dflash_hidden_window(state)
+        if window is not None:
+            window.append(rows)
+
     # --- Sampling hooks (kestrel.runtime.sampling.SamplingHooks) ----
     # Moondream's per-step "post-sample" work is a coord/size decode
     # from hidden states. We own all the bytes (per-slot GPU staging +
@@ -1007,6 +1040,10 @@ class MoondreamRuntime:
                 raise RuntimeError(
                     "Moondream post_sample requires hidden_last for spatial decode"
                 )
+            dflash_hidden_last = getattr(slot, "dflash_hidden_last", None)
+            if dflash_hidden_last is not None:
+                for row, seq in enumerate(sequences):
+                    self._append_dflash_hidden(seq.state, dflash_hidden_last[row])
             # Spatial-head gate. The coord/size decode head (a ~12.6MB matvec +
             # the coord/size sample launches, then a D2H) only produces values a
             # skill consumes when the sampled id can be ``coord_id`` / ``size_id``.
@@ -2129,6 +2166,9 @@ class MoondreamRuntime:
             self.page_table.commit_block_table(batch_indices)
 
             lora_slot = lora_slots[0] if lora_slots else 0
+            dflash_captured: list[Tensor] | None = (
+                [] if self.dflash_drafter is not None else None
+            )
             hidden, logits = self._prefill_impl(
                 inputs_embeds,
                 None,  # attention_mask
@@ -2141,6 +2181,8 @@ class MoondreamRuntime:
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
                 input_staging=input_staging,
+                capture_hidden_layers=self._dflash_target_layer_indices(),
+                captured_hidden_states=dflash_captured,
             )
 
             gather_idx = last_token_positions.to(dtype=torch.long).view(
@@ -2148,8 +2190,33 @@ class MoondreamRuntime:
             )
             gather_idx = gather_idx.expand(batch_size, 1, hidden.shape[-1])
             hidden_last = hidden.gather(1, gather_idx).squeeze(1)
+            if dflash_captured is not None:
+                dflash_hidden = torch.stack(dflash_captured, dim=2)
+                dflash_gather_idx = last_token_positions.to(dtype=torch.long).view(
+                    batch_size,
+                    1,
+                    1,
+                    1,
+                )
+                dflash_gather_idx = dflash_gather_idx.expand(
+                    batch_size,
+                    1,
+                    dflash_hidden.shape[2],
+                    dflash_hidden.shape[3],
+                )
+                dflash_hidden_last = dflash_hidden.gather(
+                    1,
+                    dflash_gather_idx,
+                ).squeeze(1)
+            else:
+                dflash_hidden_last = None
             for row, prepared in enumerate(prepared_sequences):
                 prepared.state.last_hidden = hidden_last[row].detach()
+                if dflash_hidden_last is not None:
+                    self._append_dflash_hidden(
+                        prepared.state,
+                        dflash_hidden_last[row],
+                    )
 
         return logits
 
@@ -2266,6 +2333,8 @@ class MoondreamRuntime:
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
         input_staging: PrefillInputStaging,
+        capture_hidden_layers: Sequence[int] = (),
+        captured_hidden_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         if batch_idx.ndim != 2:
             raise ValueError("batch_idx must be rank-2")
@@ -2371,6 +2440,8 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
             scratch_pool=scratch_pool,
+            capture_hidden_layers=capture_hidden_layers,
+            captured_hidden_states=captured_hidden_states,
         )
 
         batch_size = int(hidden.shape[0])
@@ -2411,6 +2482,8 @@ class MoondreamRuntime:
         slot.decode_token_ids[batch_size:graph_batch_size].zero_()
         slot.decode_coord_values[batch_size:graph_batch_size].zero_()
         slot.decode_size_values[batch_size:graph_batch_size].zero_()
+        if slot.dflash_hidden_last is not None:
+            slot.dflash_hidden_last[batch_size:graph_batch_size].zero_()
         slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
@@ -2428,6 +2501,8 @@ class MoondreamRuntime:
         slot.decode_token_ids.zero_()
         slot.decode_coord_values.zero_()
         slot.decode_size_values.zero_()
+        if slot.dflash_hidden_last is not None:
+            slot.dflash_hidden_last.zero_()
         slot.meta.batch_idx.gpu.zero_()
         slot.meta.input_pos.gpu.zero_()
         slot.meta.input_pos.cpu.zero_()
@@ -2496,7 +2571,18 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
-        if batch_size in self._megakernel_served_buckets:
+        dflash_captured: list[Tensor] | None = (
+            [] if slot.dflash_hidden_last is not None else None
+        )
+        if dflash_captured is not None:
+            hidden = self._native_decode_hidden(
+                slot,
+                batch_size,
+                embeds,
+                capture_hidden_layers=self._dflash_target_layer_indices(),
+                captured_hidden_states=dflash_captured,
+            )
+        elif batch_size in self._megakernel_served_buckets:
             # Graphs on: a bucket warmed + capture-skipped at graph-build time. The session is built,
             # so this is the real production decode; a failure here is a genuine error.
             hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
@@ -2518,6 +2604,9 @@ class MoondreamRuntime:
         # Write to slot output buffers (stable addresses for graph capture)
         slot.logits[:batch_size].copy_(logits)
         slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
+        if dflash_captured is not None:
+            dflash_hidden_last = torch.stack(dflash_captured, dim=2)[:, 0]
+            slot.dflash_hidden_last[:batch_size].copy_(dflash_hidden_last)
 
     def _megakernel_eager_unwarmed(self, batch_size: int) -> bool:
         """Whether to serve ``batch_size`` through the megakernel on the NON-graph path (graphs
@@ -2558,7 +2647,13 @@ class MoondreamRuntime:
         )
 
     def _native_decode_hidden(
-        self, slot: DecodeSlot, batch_size: int, embeds: Tensor
+        self,
+        slot: DecodeSlot,
+        batch_size: int,
+        embeds: Tensor,
+        *,
+        capture_hidden_layers: Sequence[int] = (),
+        captured_hidden_states: list[Tensor] | None = None,
     ) -> Tensor:
         """Run one native ``text_decoder`` decode step; return hidden ``[B, 1, H]``. Built inside the
         captured decode graph and replayed bit-identically (the paged-KV metadata + slot mapping are
@@ -2602,6 +2697,8 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
             dense_lora_scratch=self._dense_lora_decode_scratch,
+            capture_hidden_layers=capture_hidden_layers,
+            captured_hidden_states=captured_hidden_states,
         )
 
     def _plan_megakernel_buckets(
@@ -2618,6 +2715,8 @@ class MoondreamRuntime:
         the manager captures native for it) -- the non-fatal fallback is preserved as an engine-side
         try/except, not a silent ``None`` on the hot path."""
         target = self._megakernel_target
+        if self.dflash_drafter is not None:
+            return set()
         if target is None:
             return set()
         served: set[int] = set()
@@ -2657,7 +2756,7 @@ class MoondreamRuntime:
         per-step route (which falls back to native on the same exception), so this never blocks startup.
         """
         target = self._megakernel_target
-        if target is None or self._decode_graphs.enabled:
+        if target is None or self._decode_graphs.enabled or self.dflash_drafter is not None:
             return
         served = [
             batch_size

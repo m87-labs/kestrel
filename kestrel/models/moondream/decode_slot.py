@@ -122,6 +122,7 @@ class DecodeSlot:
         # Forward output buffers (per-slot for delayed sampling in constrained mode)
         logits: GPU buffer for forward output logits.
         hidden_last: GPU buffer for last hidden states (spatial decode).
+        dflash_hidden_last: optional selected-layer hidden rows for DFlash.
 
         # Decode input staging (per-slot, also used as CUDA graph capture buffers)
         decode_token_ids: GPU buffer for decode token inputs.
@@ -155,6 +156,7 @@ class DecodeSlot:
     # Forward outputs (also used as graph output buffers)
     logits: Tensor
     hidden_last: Tensor
+    dflash_hidden_last: Tensor | None
 
     # Decode input staging (also used as graph input buffers).
     decode_token_ids: Tensor
@@ -193,6 +195,7 @@ def create_decode_slot(
     size_dtype: torch.dtype,
     compute_stream: torch.cuda.Stream | None,
     copy_stream: torch.cuda.Stream | None,
+    dflash_hidden_layers: int = 0,
 ) -> DecodeSlot:
     """Create a DecodeSlot with all per-slot resources allocated.
 
@@ -204,6 +207,8 @@ def create_decode_slot(
         kv_cache_pages: Total number of KV cache pages.
         vocab_size: Vocabulary size for logits buffer.
         hidden_dim: Hidden dimension for hidden_last buffer.
+        dflash_hidden_layers: Number of selected hidden layers to capture for
+            DFlash; zero disables the optional capture buffer.
         coord_dtype: Dtype for coord values.
         size_dtype: Dtype for size values.
         compute_stream: Shared decode compute stream (same for both slots).
@@ -290,6 +295,15 @@ def create_decode_slot(
         dtype=dtype,
         device=device,
     )
+    dflash_hidden_last = (
+        torch.empty(
+            (max_batch_slots, int(dflash_hidden_layers), hidden_dim),
+            dtype=dtype,
+            device=device,
+        )
+        if int(dflash_hidden_layers) > 0
+        else None
+    )
 
     # Decode input staging
     decode_token_ids = torch.empty(
@@ -343,6 +357,7 @@ def create_decode_slot(
         aux_done_event=aux_done_event,
         logits=logits,
         hidden_last=hidden_last,
+        dflash_hidden_last=dflash_hidden_last,
         decode_token_ids=decode_token_ids,
         decode_coord_values=decode_coord_values,
         decode_size_values=decode_size_values,

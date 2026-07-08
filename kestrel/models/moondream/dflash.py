@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -119,6 +119,89 @@ class DFlashOutput:
     confidence_logits: Tensor | None
     first_pass_token_logits: Tensor | None
     target_hidden: Tensor
+
+
+class DFlashHiddenWindow:
+    """Right-aligned target-hidden context for one active sequence."""
+
+    def __init__(
+        self,
+        config: DFlashConfig,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.config = config
+        self.hidden = torch.zeros(
+            (
+                config.max_context_tokens,
+                config.target_layer_count,
+                config.target_hidden_size,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        self.mask = torch.zeros(
+            (config.max_context_tokens,),
+            device=device,
+            dtype=torch.bool,
+        )
+        self.segment_ids = torch.full(
+            (config.max_context_tokens,),
+            DFLASH_CONDITION_SEGMENT_GENERATED,
+            device=device,
+            dtype=torch.long,
+        )
+        self.count = 0
+
+    def append(self, rows: Tensor) -> None:
+        """Append one or more captured target rows shaped ``[N, L, C]``."""
+        if rows.dim() == 2:
+            rows = rows.unsqueeze(0)
+        if rows.dim() != 3:
+            raise ValueError("DFlash hidden rows must have shape [N, L, C]")
+        expected = (
+            self.config.target_layer_count,
+            self.config.target_hidden_size,
+        )
+        if tuple(rows.shape[1:]) != expected:
+            raise ValueError(
+                f"DFlash hidden row shape mismatch: {tuple(rows.shape[1:])} != {expected}"
+            )
+
+        capacity = int(self.config.max_context_tokens)
+        rows = rows.detach().to(device=self.hidden.device, dtype=self.hidden.dtype)
+        if int(rows.shape[0]) > capacity:
+            rows = rows[-capacity:]
+
+        if self.count:
+            current = self.hidden[capacity - self.count :]
+            combined = torch.cat([current, rows], dim=0)
+        else:
+            combined = rows
+        if int(combined.shape[0]) > capacity:
+            combined = combined[-capacity:]
+
+        count = int(combined.shape[0])
+        start = capacity - count
+        self.hidden.zero_()
+        self.mask.zero_()
+        self.hidden[start:].copy_(combined)
+        self.mask[start:] = True
+        self.segment_ids.fill_(DFLASH_CONDITION_SEGMENT_GENERATED)
+        self.count = count
+
+
+def stack_dflash_hidden_windows(
+    windows: Sequence[DFlashHiddenWindow],
+) -> tuple[Tensor, Tensor, Tensor]:
+    if not windows:
+        raise ValueError("windows must be non-empty")
+    return (
+        torch.stack([window.hidden for window in windows], dim=0),
+        torch.stack([window.mask for window in windows], dim=0),
+        torch.stack([window.segment_ids for window in windows], dim=0),
+    )
 
 
 def inspect_dflash_checkpoint(path: str | Path) -> DFlashMetadata:
@@ -603,8 +686,10 @@ class MoondreamDFlashDrafter(nn.Module):
 __all__ = [
     "DFlashBatch",
     "DFlashConfig",
+    "DFlashHiddenWindow",
     "DFlashMetadata",
     "DFlashOutput",
     "MoondreamDFlashDrafter",
     "inspect_dflash_checkpoint",
+    "stack_dflash_hidden_windows",
 ]

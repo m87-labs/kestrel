@@ -14,8 +14,10 @@ from torch import nn
 from kestrel.models.moondream.config import RegionConfig
 from kestrel.models.moondream.dflash import (
     DFlashBatch,
+    DFlashHiddenWindow,
     inspect_dflash_checkpoint,
     MoondreamDFlashDrafter,
+    stack_dflash_hidden_windows,
 )
 from kestrel.models.moondream.region import (
     build_region_module,
@@ -90,6 +92,22 @@ def main() -> None:
         ),
     )
     out = drafter(batch)
+
+    window = DFlashHiddenWindow(cfg, device=device, dtype=dtype)
+    window.append(target_hidden[0, :2])
+    stacked_hidden, stacked_mask, stacked_segments = stack_dflash_hidden_windows(
+        [window]
+    )
+    assert stacked_hidden.shape == (
+        1,
+        cfg.max_context_tokens,
+        cfg.target_layer_count,
+        cfg.target_hidden_size,
+    )
+    assert stacked_mask.shape == (1, cfg.max_context_tokens)
+    assert stacked_segments.shape == (1, cfg.max_context_tokens)
+    assert stacked_mask[0, -2:].all()
+    assert not stacked_mask[0, :-2].any()
 
     expected = (batch_size, cfg.target_width)
     assert out.token_logits.shape == (

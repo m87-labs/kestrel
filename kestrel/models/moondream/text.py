@@ -4,7 +4,7 @@ Adapted from the Moondream project (Apache-2.0).
 """
 
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -213,7 +213,17 @@ def text_decoder(
     moe_lora_metadata: Any | None = None,
     dense_lora_scratch: DenseLoRATorchMLPScratch | None = None,
     scratch_pool: dict | None = None,
+    capture_hidden_layers: Sequence[int] = (),
+    captured_hidden_states: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
+    capture_layer_set = (
+        {int(layer_idx) for layer_idx in capture_hidden_layers}
+        if capture_hidden_layers
+        else None
+    )
+    if capture_layer_set is not None and captured_hidden_states is None:
+        raise ValueError("captured_hidden_states is required when capturing layers")
+
     # Activate scratch pool to avoid per-layer tensor allocations in linear ops.
     if scratch_pool is not None:
         from kestrel_kernels.linear_ops import set_scratch_pool, clear_scratch_pool
@@ -273,6 +283,9 @@ def text_decoder(
             )
 
         x = x + mlp_out
+        if capture_layer_set is not None and i in capture_layer_set:
+            assert captured_hidden_states is not None
+            captured_hidden_states.append(x.clone())
 
     if scratch_pool is not None:
         clear_scratch_pool()
