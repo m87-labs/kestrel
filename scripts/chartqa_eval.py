@@ -52,21 +52,10 @@ PREFIX = (
     "and provide a precise answer without any additional explanation or formatting. "
 )
 POT_PREFIX = "Write a Python program to answer the following question: "
-# CoT output cap, per-model. This matters beyond truncation: the engine reserves
-# prompt + max_tokens of paged KV at admission (scheduler reserve_length), so an
-# oversized cap cuts batch concurrency and can exceed a small model's context
-# window. Moondream 2/3 reasoning is short (<300 tokens); Gemma 4's CoT channel
-# is verbose and needs the larger budget — hence per-model rather than a single
-# global value.
-COT_MAX_TOKENS_DEFAULT = 1536  # Gemma 4 / unknown models: verbose CoT channel
-COT_MAX_TOKENS_BY_MODEL = {
-    "moondream2": 512,
-    "moondream3-preview": 512,
-}
-
-
-def cot_max_tokens(model: str) -> int:
-    return COT_MAX_TOKENS_BY_MODEL.get(model, COT_MAX_TOKENS_DEFAULT)
+# CoT output cap. This is intentionally generous for verbose reasoning models;
+# runtimes that reserve KV incrementally no longer need model-specific lower caps
+# just to avoid admission over-reservation.
+COT_MAX_TOKENS = 1536
 DEFAULT_MAX_TOKENS = 10
 POT_MAX_TOKENS = 200
 
@@ -252,7 +241,7 @@ def build_prompt_and_settings(
     if cot_samples > 0:
         prompt = question.strip()
         reasoning = True
-        max_tokens = cot_max_tokens(model)
+        max_tokens = COT_MAX_TOKENS
         if cot_samples > 1 and temperature == 0.0:
             # Preserve legacy behaviour of injecting small stochasticity for CoT@N
             temperature = 1.0
