@@ -124,6 +124,19 @@ def test_make_prefill_candidate_uses_initial_reserve_for_large_cap() -> None:
     assert candidate.reserve_length < request.target_length
 
 
+def test_make_prefill_candidate_clamps_over_context_cap() -> None:
+    request = _make_request(max_new_tokens=100)
+    runtime = FakeRuntime(max_seq_length=12)
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    candidate = GenerationScheduler._make_prefill_candidate(scheduler, request)
+
+    assert candidate is not None
+    assert candidate.reserve_length == runtime.max_seq_length
+    assert candidate.reserve_length < request.target_length
+
+
 def test_make_prefill_candidate_rejects_initial_reserve_below_prompt() -> None:
     request = _make_request()
     runtime = FakeRuntime()

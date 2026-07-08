@@ -1731,8 +1731,22 @@ class InferenceEngine:
             suppress_next_token_ids=req.suppress_next_token_ids,
         )
         limit = runtime.max_seq_length
+        prompt_total = len(request_obj.prefill_tokens) + request_obj.image_length
+        if prompt_total > limit:
+            raise ValueError(
+                "Prompt length exceeds runtime max_seq_length: "
+                f"needs {prompt_total} tokens but limit is {limit}."
+            )
+        if prompt_total == limit and request_obj.remaining_new_tokens > 0:
+            raise ValueError(
+                "Prompt length leaves no room for generation: "
+                f"prompt uses {prompt_total} tokens and limit is {limit}."
+            )
         target_total = request_obj.target_length
-        if target_total > limit:
+        if (
+            target_total > limit
+            and not runtime.supports_context_clamped_generation
+        ):
             raise ValueError(
                 "Request length exceeds runtime max_seq_length: "
                 f"needs {target_total} tokens but limit is {limit}."

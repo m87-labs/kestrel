@@ -96,6 +96,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     max_seq_length: int
     image_prefix_length: int
     vocab_size: int
+    supports_context_clamped_generation: bool
 
     # Speculative decoding capability. ``None`` (the default on every runtime
     # today) means one token per decode step, identical to non-speculative

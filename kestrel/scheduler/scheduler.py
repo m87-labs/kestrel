@@ -667,7 +667,7 @@ class GenerationScheduler:
             lifecycle.sequence_state = SequenceState(
                 batch_idx=-1,
                 length=kv_prompt_length,
-                max_length=request.target_length,
+                max_length=self._request_max_length(request),
                 prompt_length=kv_prompt_length,
                 image_length=request.image_length,
                 lora_slot=request.lora_slot,
@@ -801,7 +801,7 @@ class GenerationScheduler:
             state = SequenceState(
                 batch_idx=-1,
                 length=kv_prompt_length,
-                max_length=request.target_length,
+                max_length=self._request_max_length(request),
                 prompt_length=kv_prompt_length,
                 image_length=request.image_length,
                 lora_slot=request.lora_slot,
@@ -1591,6 +1591,8 @@ class GenerationScheduler:
             request.lifecycle.crops_ready = True
 
     def _request_max_length(self, request: GenerationRequest) -> int:
+        if self.runtime.supports_context_clamped_generation:
+            return min(request.target_length, self.runtime.max_seq_length)
         return request.target_length
 
     def _prefill_reserve_length(

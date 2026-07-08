@@ -119,6 +119,7 @@ class FakeRuntime:
         self.max_seq_length = max_seq_length
         self.image_prefix_length = image_prefix_length
         self.vocab_size = vocab_size
+        self.supports_context_clamped_generation = True
         self.decode_reserve_tokens = 16
 
         # Device + streams

@@ -286,6 +286,18 @@ def test_spec_admit_stages_first_token_and_queues() -> None:
     assert r0.lifecycle.state.batch_idx in rt.active_sequences
 
 
+def test_spec_admit_clamps_oversized_generation_cap() -> None:
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    rt.max_seq_length = 8
+    sched = _make_scheduler(rt)
+    request = _enqueue(sched, 0, prompt_len=3, max_new=20)
+
+    assert sched._spec_admit() is True
+    assert request.target_length > rt.max_seq_length
+    assert request.lifecycle.state.max_length == rt.max_seq_length
+
+
 def test_spec_step_variable_advance_and_state_length() -> None:
     dec = _FakeDecoder(
         n_rows=2,
