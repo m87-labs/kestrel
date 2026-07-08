@@ -498,6 +498,7 @@ class MoondreamRuntime:
         # Speculative decoding is not wired for Moondream; decode one token per
         # step as before. See kestrel.runtime.spec / the spec-decode design doc.
         self.spec = None
+        self.dflash_drafter = None
         self.dtype = cfg.resolved_dtype()
         set_device(self.device)
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
@@ -611,6 +612,16 @@ class MoondreamRuntime:
         # concatenated weights/biases depend on random init/seed rather than the
         # checkpoint.
         self.spatial_tables = build_spatial_decode_tables(self.region)
+        if cfg.dflash_drafter_path is not None:
+            from .dflash import MoondreamDFlashDrafter
+
+            self.dflash_drafter = MoondreamDFlashDrafter.from_checkpoint(
+                cfg.dflash_drafter_path,
+                target_text=self.model.text,
+                spatial_tables=self.spatial_tables,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         if all(val is not None for val in captured_k_scales) and all(
             val is not None for val in captured_v_scales
