@@ -58,6 +58,8 @@ class RequestLifecycle:
     prefill_completed_at: Optional[float] = None
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
+    accumulated_prefill_time_ms: float = 0.0
+    accumulated_decode_time_ms: float = 0.0
 
     # Output
     finish_reason: Optional[str] = None
@@ -83,6 +85,26 @@ class RequestLifecycle:
             raise RuntimeError("sequence_state is not set")
         return self.sequence_state
 
+    def accumulate_current_timing(self, now: float) -> None:
+        """Fold the current prefill/decode segment into cumulative metrics."""
+        if self.prefill_started_at is None:
+            return
+        prefill_completed_at = self.prefill_completed_at
+        if prefill_completed_at is None:
+            self.accumulated_prefill_time_ms += max(
+                (now - self.prefill_started_at) * 1000.0,
+                0.0,
+            )
+            return
+        self.accumulated_prefill_time_ms += max(
+            (prefill_completed_at - self.prefill_started_at) * 1000.0,
+            0.0,
+        )
+        self.accumulated_decode_time_ms += max(
+            (now - prefill_completed_at) * 1000.0,
+            0.0,
+        )
+
     def build_metrics(
         self,
         *,
@@ -95,20 +117,31 @@ class RequestLifecycle:
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
         request_time_ms = max((completed_at - queued_at) * 1000.0, 0.0)
+        prefill_time_ms = self.accumulated_prefill_time_ms + max(
+            (prefill_completed_at - prefill_started_at) * 1000.0,
+            0.0,
+        )
+        decode_time_ms = self.accumulated_decode_time_ms + max(
+            (completed_at - prefill_completed_at) * 1000.0,
+            0.0,
+        )
+        prompt_tokens = (
+            self.request.prompt_length
+            + self.request.image_length
+            + self.request.initial_generated_prefix_length
+        )
         if self.sequence_state is not None:
-            prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
         else:
-            prompt_tokens = self.request.prompt_length
             cached = 0
         if cached_tokens is None:
             cached_tokens = cached
         return RequestMetrics(
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
-            prefill_time_ms=max((prefill_completed_at - prefill_started_at) * 1000.0, 0.0),
+            prefill_time_ms=prefill_time_ms,
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),
-            decode_time_ms=max((completed_at - prefill_completed_at) * 1000.0, 0.0),
+            decode_time_ms=decode_time_ms,
             request_time_ms=request_time_ms,
             cached_tokens=cached_tokens,
         )
@@ -196,6 +229,7 @@ class GenerationRequest:
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
 
     prompt_length: int = field(init=False)
+    initial_generated_prefix_length: int = field(init=False)
 
     def __post_init__(self) -> None:
         tokens = list(self.prompt_tokens)
@@ -222,6 +256,7 @@ class GenerationRequest:
         # Prompt tokens are already materialized (including BOS if required by
         # the template), so prompt_length is the list length.
         self.prompt_length = len(tokens)
+        self.initial_generated_prefix_length = len(prefix_tokens)
         if self.request_context is None:
             raise ValueError("request_context must be provided")
         if self.temperature < 0.0:

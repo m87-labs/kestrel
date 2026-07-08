@@ -29,6 +29,7 @@ from kestrel.skills import (
 
 from .queues import RequestQueue, RunningQueue
 from .types import (
+    GeneratedPrefix,
     GenerationRequest,
     RequestLifecycle,
     RequestPhase,
@@ -360,6 +361,7 @@ class GenerationScheduler:
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
         self._last_deferred_request_id: int | None = None
+        self._preempted_request_ids: set[int] = set()
         # Depth-1 spec overlap: the previously-launched macro-step's
         # (sequences, lazy SpecStepResult) awaiting commit while the GPU runs the
         # next step. None when no spec step is in flight.
@@ -625,21 +627,10 @@ class GenerationScheduler:
             lifecycle = request.lifecycle
             self.waiting.remove(request)
             # No spec row is consumed (``decoder.admit`` is never called), but
-            # this request still carried a (possibly image-bearing) prompt, so
-            # record a minimal ``SequenceState`` purely to carry the KV prompt
-            # length for metrics -- mirroring BOTH the regular spec admit path
-            # (which sets ``prompt_length = len(prompt_tokens) + image_length``)
-            # and the non-spec 0-length path (which sets ``sequence_state`` from
-            # ``prepare_sequence``, whose ``prompt_length`` includes the image
-            # KV prefix). Without it ``build_metrics`` would fall back to the
-            # text-only ``request.prompt_length`` and under-report
-            # ``prompt_tokens`` by ``request.image_length`` for a zero-token
-            # IMAGE request. The KV prompt length is the full prompt --
-            # ``request.prompt_length + request.image_length`` (the same
-            # convention as ``request.target_length``); a zero-token request can
-            # carry no generated prefix, so the typed prefill length equals
-            # ``request.prompt_length`` here. ``batch_idx == -1`` because no pool
-            # row backs this state; it is never dereferenced --
+            # keep a minimal ``SequenceState`` so the zero-token fast path still
+            # has the same KV-length bookkeeping as regular spec admission and
+            # the non-spec ``prepare_sequence`` path. ``batch_idx == -1``
+            # because no pool row backs this state; it is never dereferenced --
             # ``_finalize_sequence`` -> ``_release_sequence`` early-returns for a
             # spec runtime before touching ``batch_idx``, and a zero-token
             # request never enters the running/active decode paths that read it.
@@ -771,12 +762,12 @@ class GenerationScheduler:
             # each marker is already one token in ``prompt_tokens``), so
             # ``len(prompt_tokens) + request.image_length`` reconstructs the KV
             # prompt length for both layouts and leaves text-only requests
-            # (``image_length == 0``) unchanged. Without this, ``build_metrics``
-            # (which reports ``sequence_state.prompt_length``) under-reports image
-            # prompt tokens and ``output_length`` (``length - prompt_length``) is
-            # off by the image prefix. ``batch_idx`` is assigned by ``admit`` (it
-            # picks the spec pool row); carry ``image_length`` so downstream
-            # KV/total-length accounting on the state stays consistent.
+            # (``image_length == 0``) unchanged. Without this,
+            # ``output_length`` (``length - prompt_length``) is off by the image
+            # prefix, and downstream KV/total-length accounting on the state
+            # diverges from the non-spec path. ``batch_idx`` is assigned by
+            # ``admit`` (it picks the spec pool row); carry ``image_length`` for
+            # the same reason.
             kv_prompt_length = len(prompt_tokens) + request.image_length
             state = SequenceState(
                 batch_idx=-1,
@@ -877,19 +868,20 @@ class GenerationScheduler:
                     self.runtime
                 )
                 # Request-level *one-shot* suppression. The non-spec path applies
-                # ``suppress_next_token_ids`` to a request's first generated token
-                # only (``_build_mask_spec`` gates it on
-                # ``token_count == generated_prefix_length``). ``admit`` samples that
-                # exact first token, so forward the suppression here -- otherwise a
-                # suppressed id can be sampled at admit, staged, and the one-shot
-                # window closes (``token_count`` advances) before ``step`` could ever
-                # apply it. ``None`` when the request set no one-shot suppression or
-                # already generated past its prefix (resumed request).
+                # ``suppress_next_token_ids`` to a request's first caller-visible
+                # generated token only (``_build_mask_spec`` gates it on
+                # ``token_count == request.initial_generated_prefix_length``).
+                # ``admit`` samples that exact first token, so forward the
+                # suppression here -- otherwise a suppressed id can be sampled at
+                # admit, staged, and the one-shot window closes (``token_count``
+                # advances) before ``step`` could ever apply it. ``None`` when
+                # the request set no one-shot suppression or already generated
+                # past its prefix (resumed request).
                 suppress_next_token_ids = None
                 if (
                     request.suppress_next_token_ids
                     and request.skill_state.token_count
-                    == request.generated_prefix_length
+                    == request.initial_generated_prefix_length
                 ):
                     suppress_next_token_ids = request.suppress_next_token_ids
                 with torch.inference_mode():
@@ -1523,6 +1515,7 @@ class GenerationScheduler:
 
     def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
         """Fail a request that couldn't be admitted (e.g., adapter load failure)."""
+        self._preempted_request_ids.discard(request.request_id)
         _LOGGER.exception(
             "Failed to admit request %s: %s", request.request_id, exc
         )
@@ -1595,7 +1588,10 @@ class GenerationScheduler:
             return []
 
         candidates = []
+        preempted_ids = self._preempted_request_ids
         for request in self.waiting:
+            if preempted_ids and request.request_id not in preempted_ids:
+                continue
             if exclude_request_ids and request.request_id in exclude_request_ids:
                 continue
             candidate = self._make_prefill_candidate(request)
@@ -1838,6 +1834,7 @@ class GenerationScheduler:
                 lifecycle.sequence_state = prepared.state
 
                 self.waiting.remove(request)
+                self._preempted_request_ids.discard(request.request_id)
                 bound_batch.append(
                     _BoundPrefill(
                         candidate=candidate,
@@ -2006,6 +2003,45 @@ class GenerationScheduler:
             ):
                 return False
         return True
+
+    def _preempt_request(self, seq: RequestLifecycle) -> None:
+        """Release an idle row and requeue the request for prefill."""
+        if seq.inflight_refs != 0:
+            raise AssertionError("cannot preempt a row with in-flight decode work")
+        _LOGGER.info(
+            "Preempting request %s to free KV capacity",
+            seq.request.request_id,
+        )
+        self.running.remove(seq)
+
+        state = seq.state
+        self.runtime.release_sequence(state)
+        seq.accumulate_current_timing(time.perf_counter())
+
+        prefix_tokens = tuple(seq.skill_state.tokens)
+        prefix_logprobs = None
+        if seq.request.return_logprobs is True:
+            prefix_logprobs = tuple(seq.logprobs)
+        seq.request.generated_prefix = GeneratedPrefix(
+            tokens=prefix_tokens,
+            logprobs=prefix_logprobs,
+        )
+
+        seq.sequence_state = None
+        seq.packed_pending_ready = False
+        seq.uncommitted_prefill_token = False
+        seq.prefill_started_at = None
+        seq.prefill_completed_at = None
+        seq.prefix_cache_hit = False
+        seq.request.lora_slot = 0
+        seq.lora_slot_ready = False
+        seq.transition(
+            RequestPhase.READY_FOR_PREFILL
+            if (not seq.has_image or seq.crops_ready)
+            else RequestPhase.WAITING_RESOURCES
+        )
+        self._preempted_request_ids.add(seq.request.request_id)
+        self.waiting.push_front(seq.request)
 
     def _cap_decode_dispatch(
         self,
@@ -2396,7 +2432,8 @@ class GenerationScheduler:
             if (
                 seq.finalized
                 or not suppress
-                or seq.skill_state.token_count != seq.request.generated_prefix_length
+                or seq.skill_state.token_count
+                != seq.request.initial_generated_prefix_length
             ):
                 continue
             suppress_rows.append((i, suppress))
@@ -2894,7 +2931,8 @@ class GenerationScheduler:
 
         decode_tokens = max(
             0,
-            seq.skill_state.token_count - seq.request.generated_prefix_length,
+            seq.skill_state.token_count
+            - seq.request.initial_generated_prefix_length,
         )
         metrics = seq.build_metrics(decode_tokens=decode_tokens)
         return SchedulerResult(

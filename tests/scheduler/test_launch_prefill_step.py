@@ -82,6 +82,7 @@ def _make_scheduler(
     scheduler.waiting.push(request)
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
+    scheduler._preempted_request_ids = set()
     scheduler._select_prefill_batch = lambda capacity_remaining, **kwargs: [
         _make_candidate(request)
     ]
@@ -191,6 +192,7 @@ def test_launch_prefill_step_allows_base_request_past_exhausted_lora() -> None:
     scheduler.waiting.push(base)
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
+    scheduler._preempted_request_ids = set()
     scheduler._compute_stream = None
     scheduler._acquire_adapter_slot = lambda adapter_id: (_ for _ in ()).throw(
         RuntimeError("Out of LoRA slots: all slots are in use.")

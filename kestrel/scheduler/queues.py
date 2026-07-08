@@ -16,6 +16,9 @@ class FIFOQueue(Generic[T]):
     def push(self, item: T) -> None:
         self._items.append(item)
 
+    def push_front(self, item: T) -> None:
+        self._items.appendleft(item)
+
     def pop(self) -> T:
         return self._items.popleft()
 

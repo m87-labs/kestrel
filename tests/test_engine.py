@@ -17,6 +17,7 @@ from kestrel.engine import (
 )
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
+from kestrel.scheduler.types import GenerationRequest, RequestLifecycle, SchedulerResult
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
 
 
@@ -379,6 +380,34 @@ def test_build_generation_request_consumes_generated_prefix() -> None:
     assert generation_req.remaining_new_tokens == 2
     assert list(skill_state.tokens) == [TextToken(10), TextToken(11)]
     assert skill_state.positions == [0, 1]
+
+
+def test_engine_result_counts_generated_prefix_as_input_tokens() -> None:
+    engine = object.__new__(InferenceEngine)
+    request = GenerationRequest(
+        request_id=7,
+        prompt="prompt",
+        prompt_tokens=[TextToken(1), TextToken(2)],
+        max_new_tokens=4,
+        skill=object(),
+        request_context=object(),
+        generated_prefix=GeneratedPrefix(tokens=(TextToken(10), TextToken(11))),
+    )
+    lifecycle = RequestLifecycle(request=request, skill_state=object())
+    request.lifecycle = lifecycle
+    metrics = lifecycle.build_metrics(decode_tokens=1)
+    result = SchedulerResult(
+        request_id=request.request_id,
+        tokens=[TextToken(12)],
+        finish_reason="stop",
+        metrics=metrics,
+        output={},
+    )
+
+    engine_result = engine._to_engine_result(result)
+
+    assert engine_result.metrics.input_tokens == 4
+    assert engine_result.metrics.output_tokens == 1
 
 
 def test_extract_private_suppress_next_token_ids_setting() -> None:
