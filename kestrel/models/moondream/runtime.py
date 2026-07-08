@@ -84,6 +84,7 @@ from .decode_slot import DecodeSlot, create_decode_slot
 
 
 DEFAULT_MAX_TOKENS = 768
+DEFAULT_INITIAL_DECODE_RESERVE_TOKENS = 16
 
 
 @contextlib.contextmanager
@@ -478,6 +479,8 @@ class _LayerPagedCache(torch.nn.Module):
 
 
 class MoondreamRuntime:
+    supports_context_clamped_generation = True
+
     """High-level runtime for paged text-only Moondream inference."""
 
     def __init__(
@@ -874,6 +877,27 @@ class MoondreamRuntime:
         """Return True if a request of ``total_length`` tokens can be admitted."""
 
         return self.page_table.can_reserve_with_eviction(total_length)
+
+    def initial_reserve_length(self, prompt_length: int, max_length: int) -> int:
+        """Return the logical KV length to reserve before prefill launch."""
+
+        if max_length <= prompt_length:
+            return max_length
+        decode_reserve = max(
+            int(self.page_table.page_size),
+            DEFAULT_INITIAL_DECODE_RESERVE_TOKENS,
+        )
+        return min(max_length, prompt_length + decode_reserve)
+
+    def expand_kv_reservation(
+        self, state: SequenceState, tokens: int = 1
+    ) -> bool:
+        """Grow a sequence's KV reservation for an upcoming decode write."""
+
+        target_length = min(state.max_length, state.length + tokens)
+        if target_length <= state.length:
+            return True
+        return self.page_table.reserve(state.batch_idx, target_length)
 
     def prefill_budget(self) -> tuple[int, int]:
         """Return `(pages, batch_slots)` available for launch-time prefill binding."""
@@ -1785,7 +1809,7 @@ class MoondreamRuntime:
         - validate inputs
         - allocate a batch slot
         - perform prefix cache lookup + map cached pages (if enabled)
-        - reserve KV capacity up to target_length
+        - reserve KV capacity for the prompt plus a small decode window
 
         The returned PreparedSequence can be launched later via
         `launch_prepared_batch` and finalized via
@@ -1832,10 +1856,16 @@ class MoondreamRuntime:
 
         max_new = max_new_tokens or DEFAULT_MAX_TOKENS
         target_length = prompt_len + max_new
-        if target_length > self.max_seq_length:
+        if prompt_len > self.max_seq_length:
             raise ValueError(
-                f"Requested length {target_length} exceeds max_seq_length={self.max_seq_length}."
+                f"Prompt length {prompt_len} exceeds max_seq_length={self.max_seq_length}."
             )
+        if prompt_len == self.max_seq_length and max_new > 0:
+            raise ValueError(
+                "Prompt length leaves no room for generation: "
+                f"prompt uses {prompt_len} tokens and limit is {self.max_seq_length}."
+            )
+        target_length = min(target_length, self.max_seq_length)
 
         # 4. Build cache tokens (skip when prefix cache is disabled, or for the
         # multi-image marker layout which the single-image cache doesn't cover).
@@ -1854,11 +1884,13 @@ class MoondreamRuntime:
             cache_tokens, adapter_id, image_hash, image_kv_length, prompt_len, batch_idx
         )
 
-        # 7. Reserve remaining pages for decode. On cache hit, map_pages() in step 6
-        # already set capacity to skip_positions, so reserve() only allocates suffix
-        # pages (target_length - skip_positions), not the full target_length.
+        # 7. Reserve prompt pages plus a small decode window. On cache hit,
+        # map_pages() in step 6 already set capacity to skip_positions, so
+        # reserve() allocates only the suffix pages needed to reach the initial
+        # reservation length. Decode grows this row later as tokens are launched.
+        initial_reserve_length = self.initial_reserve_length(prompt_len, target_length)
         try:
-            self.page_table.reserve(batch_idx, target_length)
+            self.page_table.reserve(batch_idx, initial_reserve_length)
         except Exception:
             # Release temp cache lock if held
             if self.prefix_cache is not None and cache_result.temp_lock_node is not None:
