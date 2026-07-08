@@ -1818,6 +1818,7 @@ class InferenceEngine:
             ttft_ms=ttft_ms,
             request_time_ms=request_time_ms,
             cached_tokens=sched_metrics.cached_tokens,
+            kv_preemptions=sched_metrics.kv_preemptions,
         )
         return EngineResult(
             request_id=result.request_id,

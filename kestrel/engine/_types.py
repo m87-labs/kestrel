@@ -42,6 +42,7 @@ class EngineMetrics:
     ttft_ms: float
     request_time_ms: float = 0.0
     cached_tokens: int = 0  # KV positions reused from prefix cache
+    kv_preemptions: int = 0  # Number of KV preemptions for this request
 
 
 @dataclass(slots=True)

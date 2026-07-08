@@ -385,6 +385,8 @@ def test_preempt_request_preserves_logprobs() -> None:
     assert seq.request.generated_prefix.tokens == (TextToken(20), TextToken(21))
     assert seq.request.generated_prefix.logprobs == (-0.5, -0.25)
     assert seq.request.initial_generated_prefix_length == 0
+    assert seq.kv_preemptions == 1
+    assert seq.build_metrics(decode_tokens=2).kv_preemptions == 1
     assert runtime.released_sequences == [state]
 
 

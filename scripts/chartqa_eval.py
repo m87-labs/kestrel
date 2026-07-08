@@ -339,6 +339,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     request_count = 0
     request_times_ms: List[float] = []  # end-to-end request latency
     cache_hit_count = 0  # requests with cached_tokens > 0
+    total_kv_preemptions = 0
     dump_handle = None
     if cfg.dump_jsonl is not None:
         dump_path = cfg.dump_jsonl.expanduser()
@@ -348,11 +349,12 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     def record_metrics(metrics: EngineMetrics) -> None:
         nonlocal total_input_tokens, total_output_tokens
         nonlocal total_prefill_ms, total_decode_ms, request_count
-        nonlocal cache_hit_count
+        nonlocal cache_hit_count, total_kv_preemptions
         total_input_tokens += metrics.input_tokens
         total_output_tokens += metrics.output_tokens
         total_prefill_ms += metrics.prefill_time_ms
         total_decode_ms += metrics.decode_time_ms
+        total_kv_preemptions += metrics.kv_preemptions
         request_count += 1
         request_times_ms.append(metrics.request_time_ms)
         if metrics.cached_tokens > 0:
@@ -483,6 +485,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     "ttft_ms": metrics_for_dump.ttft_ms,
                     "request_time_ms": metrics_for_dump.request_time_ms,
                     "cached_tokens": metrics_for_dump.cached_tokens,
+                    "kv_preemptions": metrics_for_dump.kv_preemptions,
                 }
             dump_handle.write(
                 json.dumps(
@@ -581,6 +584,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "total_decode_ms": total_decode_ms,
             "request_times_ms": request_times_ms,
             "cache_hit_count": cache_hit_count,
+            "total_kv_preemptions": total_kv_preemptions,
         },
         "wall_time_s": wall_time_s,
         "prefix_cache_enabled": cfg.enable_prefix_cache,
@@ -716,6 +720,7 @@ def print_results(results: Dict[str, Any]) -> None:
         total_prefill_ms = usage.get("total_prefill_ms", 0.0)
         total_decode_ms = usage.get("total_decode_ms", 0.0)
         request_times_ms = usage.get("request_times_ms", [])
+        total_kv_preemptions = usage.get("total_kv_preemptions", 0)
 
         avg_input_tokens = (
             total_input_tokens / request_count if request_count else 0.0
@@ -728,6 +733,13 @@ def print_results(results: Dict[str, Any]) -> None:
         if wall_time_s > 0:
             print(f"Prefill Throughput: {total_input_tokens / wall_time_s:.2f} tok/s")
             print(f"Decode Throughput: {total_output_tokens / wall_time_s:.2f} tok/s")
+        avg_kv_preemptions = (
+            total_kv_preemptions / request_count if request_count else 0.0
+        )
+        print(
+            "KV preemptions: "
+            f"{total_kv_preemptions} total, {avg_kv_preemptions:.3f} / request"
+        )
         # Prefix cache stats (only when enabled)
         if results.get("prefix_cache_enabled", False) and request_count > 0:
             cache_hit_count = usage.get("cache_hit_count", 0)

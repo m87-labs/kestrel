@@ -65,6 +65,7 @@ class RequestLifecycle:
     finish_reason: Optional[str] = None
     error: Optional[BaseException] = None
     logprobs: List[float] = field(default_factory=list)
+    kv_preemptions: int = 0
 
     def __post_init__(self) -> None:
         prefix_logprobs = self.request.generated_prefix.logprobs
@@ -144,6 +145,7 @@ class RequestLifecycle:
             decode_time_ms=decode_time_ms,
             request_time_ms=request_time_ms,
             cached_tokens=cached_tokens,
+            kv_preemptions=self.kv_preemptions,
         )
 
     def stage_token(
@@ -315,6 +317,7 @@ class RequestMetrics:
     decode_time_ms: float
     request_time_ms: float = 0.0
     cached_tokens: int = 0  # KV positions reused from prefix cache
+    kv_preemptions: int = 0  # Number of KV preemptions for this request
 
 
 @dataclass

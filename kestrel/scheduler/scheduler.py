@@ -2112,6 +2112,7 @@ class GenerationScheduler:
 
         state = seq.state
         self.runtime.release_sequence(state)
+        seq.kv_preemptions += 1
         seq.accumulate_current_timing(time.perf_counter())
 
         prefix_tokens = tuple(seq.skill_state.tokens)
