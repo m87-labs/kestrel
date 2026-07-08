@@ -1795,12 +1795,14 @@ class InferenceEngine:
         prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
         decode_time_ms = max(sched_metrics.decode_time_ms, 0.0)
         ttft_ms = max(sched_metrics.ttft_ms, 0.0)
+        request_time_ms = max(sched_metrics.request_time_ms, 0.0)
         metrics = EngineMetrics(
             input_tokens=sched_metrics.prompt_tokens,
             output_tokens=sched_metrics.decode_tokens,
             prefill_time_ms=prefill_time_ms,
             decode_time_ms=decode_time_ms,
             ttft_ms=ttft_ms,
+            request_time_ms=request_time_ms,
             cached_tokens=sched_metrics.cached_tokens,
         )
         return EngineResult(

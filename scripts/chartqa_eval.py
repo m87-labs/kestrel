@@ -348,7 +348,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     total_prefill_ms = 0.0
     total_decode_ms = 0.0
     request_count = 0
-    request_times_ms: List[float] = []  # prefill + decode per request
+    request_times_ms: List[float] = []  # end-to-end request latency
     cache_hit_count = 0  # requests with cached_tokens > 0
     dump_handle = None
     if cfg.dump_jsonl is not None:
@@ -365,7 +365,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         total_prefill_ms += metrics.prefill_time_ms
         total_decode_ms += metrics.decode_time_ms
         request_count += 1
-        request_times_ms.append(metrics.prefill_time_ms + metrics.decode_time_ms)
+        request_times_ms.append(metrics.request_time_ms)
         if metrics.cached_tokens > 0:
             cache_hit_count += 1
 
@@ -492,6 +492,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     "prefill_time_ms": metrics_for_dump.prefill_time_ms,
                     "decode_time_ms": metrics_for_dump.decode_time_ms,
                     "ttft_ms": metrics_for_dump.ttft_ms,
+                    "request_time_ms": metrics_for_dump.request_time_ms,
                     "cached_tokens": metrics_for_dump.cached_tokens,
                 }
             dump_handle.write(
@@ -748,12 +749,12 @@ def print_results(results: Dict[str, Any]) -> None:
             requests_per_second = request_count / wall_time_s
             print(f"Requests per second: {requests_per_second:.2f}")
 
-        # Request latency stats (prefill + decode)
+        # Request latency stats (submit to completion)
         if request_times_ms:
             p50_ms = percentile(request_times_ms, 50)
             p90_ms = percentile(request_times_ms, 90)
             p99_ms = percentile(request_times_ms, 99)
-            print(f"\nRequest Latency (prefill + decode):")
+            print(f"\nRequest Latency (end-to-end):")
             print(f"  P50:  {p50_ms:.2f} ms")
             print(f"  P90:  {p90_ms:.2f} ms")
             print(f"  P99:  {p99_ms:.2f} ms")

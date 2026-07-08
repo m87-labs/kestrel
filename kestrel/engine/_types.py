@@ -40,6 +40,7 @@ class EngineMetrics:
     prefill_time_ms: float
     decode_time_ms: float
     ttft_ms: float
+    request_time_ms: float = 0.0
     cached_tokens: int = 0  # KV positions reused from prefix cache
 
 

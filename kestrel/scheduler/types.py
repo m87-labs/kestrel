@@ -94,6 +94,7 @@ class RequestLifecycle:
         prefill_completed_at = self.prefill_completed_at or prefill_started_at
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
+        request_time_ms = max((completed_at - queued_at) * 1000.0, 0.0)
         if self.sequence_state is not None:
             prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
@@ -108,6 +109,7 @@ class RequestLifecycle:
             prefill_time_ms=max((prefill_completed_at - prefill_started_at) * 1000.0, 0.0),
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),
             decode_time_ms=max((completed_at - prefill_completed_at) * 1000.0, 0.0),
+            request_time_ms=request_time_ms,
             cached_tokens=cached_tokens,
         )
 
@@ -276,6 +278,7 @@ class RequestMetrics:
     prefill_time_ms: float
     ttft_ms: float
     decode_time_ms: float
+    request_time_ms: float = 0.0
     cached_tokens: int = 0  # KV positions reused from prefix cache
 
 
