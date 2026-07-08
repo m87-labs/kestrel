@@ -22,6 +22,36 @@ The scheduler owns batched prefill/decode for Moondream inference. It sits betwe
 3. **Decode Loop** (pipelined in `advance`): batches active sequences, feeds pending tokens into `runtime.decode_with_slot`, stages new tokens on each `SkillState`, and re-queues sequences until they finish or hit limits.
 4. **Finalization** (`_finalize_sequence`): once a sequence ends, the scheduler releases runtime resources, asks the `SkillState` to `finalize`, and records a `SchedulerResult`.
 
+## KV Reservation and Recompute Preemption
+
+Requests reserve KV cache incrementally. Prefill reserves the prompt plus a
+runtime-chosen decode window, not the full generation cap. Before each decode
+launch, `schedule_decode_step` asks the runtime to grow every selected row for
+the upcoming write; a row enters the GPU launch batch only after that reservation
+succeeds.
+
+If decode growth fails, the scheduler recovers by recompute preemption. A row is
+preemptible only when speculative decoding is disabled, it has no in-flight
+decode work, it is not finished or finalized, it owns a live `SequenceState`, and
+it still has generation budget left. The scheduler first preempts newer idle rows
+so older work keeps priority. If no newer idle row can help and decode work is
+still in flight, the scheduler waits for that work to commit. If no other row
+can free capacity, the blocked row preempts itself.
+
+Preemption releases the row's KV pages, records the committed generated tokens
+and logprobs in `request.generated_prefix`, resets runtime-owned lifecycle
+state, and pushes the request to the front of the waiting queue. When that
+request launches again, prefill recomputes the prompt plus generated prefix and
+decode resumes from the committed tokens.
+
+This makes incremental reservation deadlock-free for the scheduler as long as
+launched GPU work eventually commits or fails and the runtime releases KV for
+completed or preempted rows. Each failed decode-growth attempt either reserves
+capacity, frees capacity by preempting a finite idle row, waits for finite
+in-flight work, or removes the blocked row from the running set so it no longer
+holds KV while waiting. A request whose recompute prefill can never fit is a hard
+capacity error, not a scheduler deadlock.
+
 ## Internal API Summary
 
 - `GenerationScheduler.enqueue_request(request, skill_state)`: enqueue a fully prepared request/skill state duo. Used by the engine when it wants full control over state creation.

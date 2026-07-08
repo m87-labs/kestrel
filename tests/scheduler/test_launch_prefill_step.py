@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import dataclass
 
 import pytest
@@ -57,13 +58,17 @@ def _make_request(
     return request
 
 
-def _make_candidate(request: GenerationRequest) -> _PrefillCandidate:
+def _make_candidate(
+    request: GenerationRequest,
+    *,
+    can_reuse: bool = False,
+) -> _PrefillCandidate:
     return _PrefillCandidate(
         request=request,
         classification=PrefillClassification(
             prompt_length=request.prompt_length,
-            skip_positions=0,
-            can_reuse=False,
+            skip_positions=1 if can_reuse else 0,
+            can_reuse=can_reuse,
             use_prefix_attn=False,
         ),
         reserve_length=request.target_length,
@@ -83,6 +88,7 @@ def _make_scheduler(
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
     scheduler._preempted_request_ids = set()
+    scheduler._decode_kv_recovery_request_id = None
     scheduler._select_prefill_batch = lambda capacity_remaining, **kwargs: [
         _make_candidate(request)
     ]
@@ -100,6 +106,44 @@ def test_make_prefill_candidate_classifies_prompt_and_generated_prefix() -> None
     assert candidate is not None
     assert runtime.classify_calls == [[TextToken(1), TextToken(10), TextToken(11)]]
     assert candidate.reserve_length == request.target_length
+
+
+def test_make_prefill_candidate_uses_initial_reserve_for_large_cap() -> None:
+    request = _make_request(max_new_tokens=100)
+    runtime = FakeRuntime()
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    candidate = GenerationScheduler._make_prefill_candidate(scheduler, request)
+
+    assert candidate is not None
+    assert (
+        candidate.reserve_length
+        == request.prompt_length + runtime.decode_reserve_tokens
+    )
+    assert candidate.reserve_length < request.target_length
+
+
+def test_make_prefill_candidate_rejects_initial_reserve_below_prompt() -> None:
+    request = _make_request()
+    runtime = FakeRuntime()
+    runtime.initial_reserve_length = lambda prompt, max_length: prompt - 1
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    with pytest.raises(AssertionError, match="at least the prompt"):
+        GenerationScheduler._make_prefill_candidate(scheduler, request)
+
+
+def test_make_prefill_candidate_rejects_initial_reserve_above_row_max() -> None:
+    request = _make_request()
+    runtime = FakeRuntime()
+    runtime.initial_reserve_length = lambda prompt, max_length: max_length + 1
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    with pytest.raises(AssertionError, match="row max length"):
+        GenerationScheduler._make_prefill_candidate(scheduler, request)
 
 
 def test_launch_prefill_step_prefills_generated_prefix_then_remaining_tokens() -> None:
@@ -122,6 +166,70 @@ def test_launch_prefill_step_prefills_generated_prefix_then_remaining_tokens() -
         TextToken(11),
     ]
     assert runtime.prepare_calls[0]["max_new_tokens"] == 3
+
+
+def test_launch_prefill_step_materializes_crops_when_image_cache_not_reused() -> None:
+    request = _make_request()
+    image = object()
+    crops = object()
+    request.image = image
+    request.image_hash = b"image-hash"
+    request.lifecycle.has_image = True
+    request.lifecycle.crops_ready = True
+    request.lifecycle.prefix_cache_hit = True
+    request.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(prepare_exc=RuntimeError("prepare failed"))
+    preprocess_calls: list[object] = []
+
+    def preprocess(image_arg: object) -> Future[object]:
+        preprocess_calls.append(image_arg)
+        future: Future[object] = Future()
+        future.set_result(crops)
+        return future
+
+    runtime.preprocess_image_async = preprocess  # type: ignore[method-assign]
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._acquire_adapter_slot = lambda adapter_id: 0
+    pipeline = PipelineState()
+
+    GenerationScheduler._launch_prefill_step(scheduler, pipeline)
+
+    assert preprocess_calls == [image]
+    assert request.image_crops is crops
+    assert runtime.prepare_calls[0]["image_crops"] is crops
+
+
+def test_launch_prefill_step_skips_crop_work_when_image_cache_reused() -> None:
+    request = _make_request()
+    image = object()
+    request.image = image
+    request.image_hash = b"image-hash"
+    request.lifecycle.has_image = True
+    request.lifecycle.crops_ready = True
+    request.lifecycle.prefix_cache_hit = True
+    request.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(prepare_exc=RuntimeError("prepare failed"))
+    preprocess_calls: list[object] = []
+
+    def preprocess(image_arg: object) -> Future[object]:
+        preprocess_calls.append(image_arg)
+        future: Future[object] = Future()
+        future.set_result(object())
+        return future
+
+    runtime.preprocess_image_async = preprocess  # type: ignore[method-assign]
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._select_prefill_batch = lambda capacity_remaining, **kwargs: [
+        _make_candidate(request, can_reuse=True)
+    ]
+    scheduler._acquire_adapter_slot = lambda adapter_id: 0
+    pipeline = PipelineState()
+
+    GenerationScheduler._launch_prefill_step(scheduler, pipeline)
+
+    assert preprocess_calls == []
+    assert request.image_crops is None
+    assert runtime.prepare_calls[0]["image_crops"] is None
 
 
 @pytest.mark.parametrize("failure_stage", ["adapter", "prepare"])
@@ -193,6 +301,8 @@ def test_launch_prefill_step_allows_base_request_past_exhausted_lora() -> None:
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
     scheduler._preempted_request_ids = set()
+    scheduler._decode_kv_recovery_pending = False
+    scheduler._decode_kv_recovery_request_id = None
     scheduler._compute_stream = None
     scheduler._acquire_adapter_slot = lambda adapter_id: (_ for _ in ()).throw(
         RuntimeError("Out of LoRA slots: all slots are in use.")

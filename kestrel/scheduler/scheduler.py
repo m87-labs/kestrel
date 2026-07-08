@@ -70,6 +70,10 @@ def _is_out_of_lora_slots(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and _OUT_OF_LORA_SLOTS_MARKER in str(exc)
 
 
+def _pages_for_length(length: int, page_size: int) -> int:
+    return max((int(length) + int(page_size) - 1) // int(page_size), 0)
+
+
 def _min_cap(a: Optional[int], b: Optional[int]) -> Optional[int]:
     """Combine two spec ``commit_caps`` (per-row token bounds).
 
@@ -258,7 +262,7 @@ def _plan_prefill_launch_batch(
 
 
 class GenerationScheduler:
-    """Batched prefill+decode driver that mirrors flex-nano-vllm semantics."""
+    """Batched prefill+decode driver."""
 
     def __init__(
         self,
@@ -362,6 +366,10 @@ class GenerationScheduler:
         self._pipeline = PipelineState()
         self._last_deferred_request_id: int | None = None
         self._preempted_request_ids: set[int] = set()
+        self._decode_kv_recovery_pending = False
+        self._decode_kv_recovery_request_id: int | None = None
+        self._decode_kv_recovery_progressed = False
+        self._decode_kv_recovery_deferred = False
         # Depth-1 spec overlap: the previously-launched macro-step's
         # (sequences, lazy SpecStepResult) awaiting commit while the GPU runs the
         # next step. None when no spec step is in flight.
@@ -495,6 +503,7 @@ class GenerationScheduler:
                     launched_forward = pipeline.has_launch_in_flight()
                     if not launched_forward:
                         plan = self.schedule_decode_step()
+                        progressed |= self._decode_kv_recovery_progressed
                         if plan is not None:
                             slot_id = pipeline.free_slot_id()
                             if slot_id is None:  # pragma: no cover - defensive
@@ -506,12 +515,32 @@ class GenerationScheduler:
                             progressed = True
 
         if not progressed:
-            stalled = next((request for request in self.waiting if self._is_launchable_request(request)), None)
-            if stalled is not None and not self.runtime.can_reserve(stalled.target_length):
-                raise RuntimeError(
-                    "Scheduler stalled: insufficient KV cache capacity for request "
-                    f"{stalled.request_id} (needs {stalled.target_length} tokens)."
+            stalled = next(
+                (
+                    request
+                    for request in self.waiting
+                    if self._is_prefill_ready_request(request)
+                ),
+                None,
+            )
+            if stalled is not None:
+                # A prefill-ready request with no scheduler progress should only
+                # be stuck on KV. Check the initial prefill reservation, not the
+                # full generation cap, before surfacing a hard stall.
+                classification = self.runtime.classify_prefill(
+                    stalled.prefill_tokens,
+                    has_image=stalled.lifecycle.has_image,
+                    image_hash=stalled.image_hash,
+                    adapter_id=stalled.adapter,
                 )
+                reserve_length = self._prefill_reserve_length(stalled, classification)
+                page_budget, _ = self.runtime.prefill_budget()
+                reserve_pages = _pages_for_length(reserve_length, self.runtime.page_table.page_size,)
+                if reserve_pages > page_budget or not self.runtime.can_reserve(reserve_length):
+                    raise RuntimeError(
+                        "Scheduler stalled: insufficient KV cache capacity for request "
+                        f"{stalled.request_id} (needs {reserve_pages} pages)."
+                    )
         return progressed
 
     def _drain_pipeline(self) -> None:
@@ -845,14 +874,7 @@ class GenerationScheduler:
                 # ``_fail_admitted_spec_request`` (no pool row reserved yet --
                 # ``state.batch_idx`` is still its ``-1`` sentinel -- so it only
                 # releases the LoRA slot and fails the request cleanly).
-                if (
-                    request.image is not None
-                    and request.image_crops is None
-                    and not isinstance(request.image, (list, tuple))
-                ):
-                    request.image_crops = self.runtime.preprocess_image_async(
-                        request.image
-                    ).result()
+                self._ensure_single_image_crops(request)
 
                 request.skill_state.on_prefill(self.runtime)
 
@@ -1516,6 +1538,7 @@ class GenerationScheduler:
     def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
         """Fail a request that couldn't be admitted (e.g., adapter load failure)."""
         self._preempted_request_ids.discard(request.request_id)
+        self._clear_decode_kv_recovery_if_current(request.request_id)
         _LOGGER.exception(
             "Failed to admit request %s: %s", request.request_id, exc
         )
@@ -1546,6 +1569,67 @@ class GenerationScheduler:
             return False
         return True
 
+    def _is_prefill_ready_request(self, request: GenerationRequest) -> bool:
+        lifecycle = request.lifecycle
+        if not self._is_launchable_request(request):
+            return False
+        if lifecycle.phase != RequestPhase.READY_FOR_PREFILL:
+            return False
+        if not lifecycle.lora_slot_ready:
+            return False
+        return True
+
+    def _ensure_single_image_crops(self, request: GenerationRequest) -> None:
+        if (
+            request.image is not None
+            and request.image_crops is None
+            and not isinstance(request.image, (list, tuple))
+        ):
+            request.image_crops = self.runtime.preprocess_image_async(
+                request.image
+            ).result()
+            request.lifecycle.crops_ready = True
+
+    def _request_max_length(self, request: GenerationRequest) -> int:
+        return request.target_length
+
+    def _prefill_reserve_length(
+        self,
+        request: GenerationRequest,
+        classification: PrefillClassification,
+    ) -> int:
+        """Return launch-time fresh KV tokens needed for this prefill."""
+        max_row_length = self._request_max_length(request)
+        if classification.prompt_length > max_row_length:
+            raise AssertionError(
+                "prefill prompt length exceeds row max length: "
+                f"prompt={classification.prompt_length}, max={max_row_length}"
+            )
+
+        # Ask the runtime how much prompt plus decode runway it wants initially.
+        initial_row_length = int(
+            self.runtime.initial_reserve_length(
+                classification.prompt_length,
+                max_row_length,
+            )
+        )
+        if initial_row_length < classification.prompt_length:
+            raise AssertionError(
+                "initial_reserve_length must reserve at least the prompt: "
+                f"initial={initial_row_length}, prompt={classification.prompt_length}"
+            )
+        if initial_row_length > max_row_length:
+            raise AssertionError(
+                "initial_reserve_length must not exceed row max length: "
+                f"initial={initial_row_length}, max={max_row_length}"
+            )
+
+        # Prefix-cache hits are already mapped, so admission budgets only fresh KV.
+        uncached_reserve_length = (
+            initial_row_length - classification.skip_positions
+        )
+        return max(uncached_reserve_length, 1)
+
     def _make_prefill_candidate(
         self,
         request: GenerationRequest,
@@ -1560,7 +1644,7 @@ class GenerationScheduler:
             image_hash=request.image_hash,
             adapter_id=request.adapter,
         )
-        reserve_length = max(request.target_length - classification.skip_positions, 1)
+        reserve_length = self._prefill_reserve_length(request, classification)
         if not self.runtime.can_reserve(reserve_length):
             return None
 
@@ -1573,7 +1657,7 @@ class GenerationScheduler:
             request=request,
             classification=classification,
             reserve_length=reserve_length,
-            pages_needed=(reserve_length + page_size - 1) // page_size,
+            pages_needed=_pages_for_length(reserve_length, page_size),
             cohort_key=cohort_key,
         )
 
@@ -1589,6 +1673,13 @@ class GenerationScheduler:
 
         candidates = []
         preempted_ids = self._preempted_request_ids
+        # A decode row failed to grow KV. Until a preempted request is ready to
+        # resume, do not spend newly freed capacity on unrelated prefills.
+        if (
+            self._decode_kv_recovery_pending
+            and not preempted_ids
+        ):
+            return []
         for request in self.waiting:
             if preempted_ids and request.request_id not in preempted_ids:
                 continue
@@ -1800,6 +1891,8 @@ class GenerationScheduler:
                         continue
 
                 try:
+                    if not candidate.can_reuse:
+                        self._ensure_single_image_crops(request)
                     prefill_start = time.perf_counter()
                     lifecycle.prefill_started_at = prefill_start
                     lifecycle.transition(RequestPhase.PREFILLING)
@@ -1835,6 +1928,7 @@ class GenerationScheduler:
 
                 self.waiting.remove(request)
                 self._preempted_request_ids.discard(request.request_id)
+                self._clear_decode_kv_recovery_if_current(request.request_id)
                 bound_batch.append(
                     _BoundPrefill(
                         candidate=candidate,
@@ -2034,7 +2128,7 @@ class GenerationScheduler:
         seq.prefill_completed_at = None
         seq.prefix_cache_hit = False
         seq.request.lora_slot = 0
-        seq.lora_slot_ready = False
+        seq.lora_slot_ready = seq.request.adapter is None
         seq.transition(
             RequestPhase.READY_FOR_PREFILL
             if (not seq.has_image or seq.crops_ready)
@@ -2042,6 +2136,106 @@ class GenerationScheduler:
         )
         self._preempted_request_ids.add(seq.request.request_id)
         self.waiting.push_front(seq.request)
+        self._decode_kv_recovery_progressed = True
+
+    def _expand_kv_reservation(
+        self,
+        seq: RequestLifecycle,
+        tokens: int = 1,
+    ) -> bool:
+        try:
+            return bool(self.runtime.expand_kv_reservation(seq.state, tokens))
+        except RuntimeError as exc:
+            if "Cannot reserve" in str(exc):
+                return False
+            raise
+
+    def _preemption_victim(
+        self,
+        seq: RequestLifecycle,
+        protected_ids: set[int],
+    ) -> RequestLifecycle | None:
+        """Choose a younger idle row to free KV so ``seq`` can grow."""
+        for candidate in reversed(self.running):
+            # Preserve older work when a newer row is the one that needs space.
+            if candidate.request.request_id <= seq.request.request_id:
+                continue
+            if not self._is_preemptible(candidate, protected_ids):
+                continue
+            return candidate
+        return None
+
+    def _is_preemptible(
+        self,
+        seq: RequestLifecycle,
+        protected_ids: set[int],
+        *,
+        ignore_protected: bool = False,
+    ) -> bool:
+        if self.runtime.spec is not None:
+            return False
+        if not ignore_protected and id(seq) in protected_ids:
+            return False
+        if seq.finished or seq.finalized:
+            return False
+        if seq.inflight_refs != 0:
+            return False
+        if seq.uncommitted_prefill_token:
+            return False
+        if seq.sequence_state is None:
+            return False
+        if seq.skill_state.token_count >= seq.request.max_new_tokens:
+            return False
+        return seq.state.batch_idx in self.runtime.active_sequences
+
+    def _has_inflight_decode_work(self) -> bool:
+        return (
+            not self._pipeline.is_empty()
+            or any(seq.inflight_refs != 0 for seq in self.running)
+        )
+
+    def _clear_decode_kv_recovery_if_current(self, request_id: int) -> None:
+        if self._decode_kv_recovery_request_id == request_id:
+            self._decode_kv_recovery_pending = False
+            self._decode_kv_recovery_request_id = None
+
+    def _ensure_decode_capacity(
+        self,
+        seq: RequestLifecycle,
+        protected_ids: set[int],
+    ) -> bool:
+        """Grow this row's KV reservation, preempting newer rows if needed."""
+        # Most rows already have decode runway; skip the runtime growth hook then.
+        state = seq.state
+        if state.length + 1 <= self.runtime.page_table.capacity[state.batch_idx]:
+            self._clear_decode_kv_recovery_if_current(seq.request.request_id)
+            return True
+
+        while not self._expand_kv_reservation(seq):
+            self._decode_kv_recovery_pending = True
+            self._decode_kv_recovery_request_id = seq.request.request_id
+
+            # First reclaim newer idle rows; they can resume from recompute.
+            victim = self._preemption_victim(seq, protected_ids)
+            if victim is not None:
+                self._preempt_request(victim)
+                protected_ids.add(id(victim))
+                continue
+
+            # In-flight rows may release KV when committed; wait for them.
+            if self._has_inflight_decode_work():
+                self._decode_kv_recovery_deferred = True
+                return False
+
+            # With no other reclaimable row, requeue this row instead of
+            # launching without KV or reporting a dropped request.
+            if not self._is_preemptible(seq, protected_ids, ignore_protected=True):
+                raise AssertionError("decode row cannot grow or be preempted")
+            self._preempt_request(seq)
+            protected_ids.add(id(seq))
+            return False
+        self._clear_decode_kv_recovery_if_current(seq.request.request_id)
+        return True
 
     def _cap_decode_dispatch(
         self,
@@ -2069,8 +2263,10 @@ class GenerationScheduler:
     def schedule_decode_step(self) -> Optional[StepPlan]:
         """Select sequences for the next decode step.
 
-        This is a pure selector that examines the running queue and returns a
-        StepPlan containing sequences ready for decoding, or None if no work.
+        This examines the running queue and returns a StepPlan containing
+        sequences ready for decoding, or None if no work. Runtimes that reserve
+        KV cache incrementally may expand per-row KV reservations here before
+        the forward is launched.
 
         Per design doc §4.7: This method does NOT finalize sequences based on
         GPU-progress (seq.state.length). Finalization happens in commit_step()
@@ -2078,25 +2274,58 @@ class GenerationScheduler:
         predicate uses budgeted counts to exclude sequences that would exceed
         their limits if dispatched.
         """
+        # Clear per-attempt recovery flags before considering this decode launch.
+        self._decode_kv_recovery_progressed = False
+        self._decode_kv_recovery_deferred = False
         if not len(self.running):
+            self._decode_kv_recovery_pending = False
+            self._decode_kv_recovery_request_id = None
             return None
 
-        active: list[RequestLifecycle] = []
+        # Gather rows that have committed state and budget for another token.
+        dispatchable: list[RequestLifecycle] = []
         for seq in self.running:
             if not seq.needs_decode():
                 continue
             if not self._can_dispatch(seq):
                 continue
+            dispatchable.append(seq)
+
+        if not dispatchable:
+            return None
+
+        # Keep the launch within the runtime batch size while preserving fairness.
+        decode_limit = self.runtime.max_batch_size
+        if len(dispatchable) > decode_limit:
+            selected = self._cap_decode_dispatch(list(dispatchable), decode_limit)
+        else:
+            selected = dispatchable
+            self._last_deferred_request_id = None
+
+        # Reserve KV for each row before it can enter the GPU launch batch.
+        active: list[RequestLifecycle] = []
+        selected_ids = {id(seq) for seq in selected}
+        overflow = [seq for seq in dispatchable if id(seq) not in selected_ids]
+        for seq in list(selected) + overflow:
+            if len(active) >= decode_limit:
+                break
+            if (
+                seq.sequence_state is None
+                or seq.phase != RequestPhase.RUNNING
+                or not seq.needs_decode()
+                or not self._can_dispatch(seq)
+            ):
+                continue
+            protected_ids = {id(item) for item in active}
+            protected_ids.add(id(seq))
+            if not self._ensure_decode_capacity(seq, protected_ids):
+                if self._decode_kv_recovery_deferred:
+                    break
+                continue
             active.append(seq)
 
         if not active:
             return None
-
-        decode_limit = self.runtime.max_batch_size
-        if len(active) > decode_limit:
-            active = self._cap_decode_dispatch(active, decode_limit)
-        else:
-            self._last_deferred_request_id = None
 
         return StepPlan(sequences=active)
 

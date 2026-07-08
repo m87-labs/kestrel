@@ -321,10 +321,9 @@ class RequestMetrics:
 class StepPlan:
     """Decode step plan returned by schedule_decode_step.
 
-    This is a pure selection of which requests to include in the next decode
-    step. It does not mutate any state - the scheduler remains a stateless
-    selector. Actual state changes (inflight_refs increment, GPU dispatch)
-    happen when the plan is executed via launch_forward_async.
+    The scheduler may reserve KV or preempt idle rows before returning a plan,
+    but the plan itself only names the rows to launch. Refcount increments,
+    sequence length advances, and GPU dispatch happen in launch_forward_async.
     """
 
     sequences: List["RequestLifecycle"]
