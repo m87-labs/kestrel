@@ -86,6 +86,25 @@ from .decode_slot import DecodeSlot, create_decode_slot
 DEFAULT_MAX_TOKENS = 768
 
 
+def _block_ids_to_bidirectional_ranges(
+    block_ids: Sequence[int], device: torch.device | str
+) -> Tensor | None:
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    current = -1
+    for idx, block_id in enumerate([*block_ids, -1]):
+        if block_id >= 0 and start is None:
+            start = idx
+            current = block_id
+        elif start is not None and block_id != current:
+            ranges.append((start, idx))
+            start = idx if block_id >= 0 else None
+            current = block_id
+    if not ranges:
+        return None
+    return torch.tensor(ranges, dtype=torch.int32, device=device)
+
+
 @contextlib.contextmanager
 def _disable_parameter_initialization():
     """Temporarily skip default parameter init during model construction.
@@ -1620,14 +1639,15 @@ class MoondreamRuntime:
     ) -> tuple[Tensor, int, Optional[Tensor]]:
         """Prepare inputs for full prefill (cache-miss path).
 
-        Returns ``(inputs_embeds, position_start, block_sequence_ids)``. Images
+        Returns ``(inputs_embeds, position_start, bidirectional_ranges)``. Images
         are spliced in as image-patch embedding blocks: at each ``ImageMarker``
         sentinel (multi-image chat path), or after BOS (single-image query
-        path). ``block_sequence_ids`` (int32, one entry per expanded position:
-        image-block id >= 0, or -1 for text) drives the block-bidirectional
-        attention mask; it is ``None`` when there is no image. BOS joins the
-        first image block when the image starts right after it, reproducing the
-        retired ``prefix_lm_730`` mask for a single front image.
+        path). ``bidirectional_ranges`` has shape ``[num_ranges, 2]`` and
+        carries the inclusive-start/exclusive-end image blocks for the
+        block-bidirectional attention overlay. It is ``None`` when there is no
+        image. BOS joins the first image block when the image starts right after
+        it, reproducing the retired ``prefix_lm_730`` mask for a single front
+        image.
         """
         marker_positions = [
             i for i, t in enumerate(tokens_list) if isinstance(t, ImageMarker)
@@ -1687,12 +1707,10 @@ class MoondreamRuntime:
             block_ids[0] = block_ids[1]
 
         inputs_embeds = torch.cat(segments, dim=1)
-        block_sequence_ids = None
-        if any(b >= 0 for b in block_ids):
-            block_sequence_ids = torch.tensor(
-                block_ids, dtype=torch.int32, device=self.device
-            )
-        return inputs_embeds, 0, block_sequence_ids
+        bidirectional_ranges = _block_ids_to_bidirectional_ranges(
+            block_ids, self.device
+        )
+        return inputs_embeds, 0, bidirectional_ranges
 
     def _finalize_cache_after_prefill(
         self,
@@ -1899,7 +1917,7 @@ class MoondreamRuntime:
         image_crops: Optional[OverlapCropOutput],
         staging: PrefillInputStaging,
         row: int,
-    ) -> tuple[Tensor, int, bool]:
+    ) -> tuple[Tensor, int, bool, Tensor | None]:
         """Build per-sequence prefill inputs for a prepared sequence."""
         tokens_list = prepared.tokens_list
         state = prepared.state
@@ -1907,7 +1925,7 @@ class MoondreamRuntime:
         prompt_len = state.prompt_length or state.length
         image_kv_length = state.image_length
 
-        block_sequence_ids = None
+        bidirectional_ranges = None
         if cache_result.can_reuse:
             # Append/cache-reuse path: prefix is already cached, attention is
             # plain causal over the new suffix (no image-block mask).
@@ -1929,7 +1947,7 @@ class MoondreamRuntime:
                 images = list(image)
             else:
                 images = [image]
-            inputs_embeds, position_start, block_sequence_ids = (
+            inputs_embeds, position_start, bidirectional_ranges = (
                 self._prepare_full_prefill_inputs(
                     tokens_list,
                     images,
@@ -1941,7 +1959,7 @@ class MoondreamRuntime:
             )
 
         use_prefix_attn = bool(image_kv_length) and not cache_result.can_reuse
-        return inputs_embeds, position_start, use_prefix_attn, block_sequence_ids
+        return inputs_embeds, position_start, use_prefix_attn, bidirectional_ranges
 
     def launch_prepared_batch(
         self,
@@ -1986,12 +2004,12 @@ class MoondreamRuntime:
         with stream_context(self._compute_stream):
             per_inputs: list[Tensor] = []
             position_starts: list[int] = []
-            per_block_ids: list[Optional[Tensor]] = []
+            per_bidirectional_ranges: list[Optional[Tensor]] = []
             use_prefix_attn: bool | None = None
             for row, (prepared, image, image_crops) in enumerate(zip(
                 prepared_sequences, images, image_crops_list
             )):
-                inputs_embeds, position_start, seq_use_prefix_attn, seq_block_ids = (
+                inputs_embeds, position_start, seq_use_prefix_attn, seq_ranges = (
                     self._build_prefill_inputs_for_prepared(
                         prepared,
                         image=image,
@@ -2010,7 +2028,7 @@ class MoondreamRuntime:
                     )
                 per_inputs.append(inputs_embeds)
                 position_starts.append(position_start)
-                per_block_ids.append(seq_block_ids)
+                per_bidirectional_ranges.append(seq_ranges)
 
             assert use_prefix_attn is not None
             hidden_dim = self.bos_embed.shape[-1]
@@ -2056,18 +2074,24 @@ class MoondreamRuntime:
                     )
                 inputs_embeds[row, :seq_len, :].copy_(embed_row[0, :, :])
 
-            block_sequence_ids = None
+            bidirectional_ranges = None
             if use_prefix_attn:
-                # Assemble per-row image-block ids into [batch, max_seq_len]; the
-                # padded (seqlen-masked) tail stays -1.
-                block_sequence_ids = torch.full(
-                    (batch_size, max_seq_len), -1,
+                max_ranges = max(
+                    (
+                        int(seq_ranges.shape[0])
+                        for seq_ranges in per_bidirectional_ranges
+                        if seq_ranges is not None
+                    ),
+                    default=0,
+                )
+                bidirectional_ranges = torch.zeros(
+                    (batch_size, max_ranges, 2),
                     dtype=torch.int32, device=self.device,
                 )
-                for r, seq_block_ids in enumerate(per_block_ids):
-                    if seq_block_ids is not None:
-                        block_sequence_ids[r, : int(seq_block_ids.shape[0])].copy_(
-                            seq_block_ids
+                for r, seq_ranges in enumerate(per_bidirectional_ranges):
+                    if seq_ranges is not None:
+                        bidirectional_ranges[r, : int(seq_ranges.shape[0]), :].copy_(
+                            seq_ranges
                         )
 
             # Commit page table rows for all batch indices before forward pass.
@@ -2081,7 +2105,7 @@ class MoondreamRuntime:
                 batch_idx=slot_batch_idx,
                 lora_slot=lora_slot,
                 use_prefix_attn=use_prefix_attn,
-                block_sequence_ids=block_sequence_ids,
+                bidirectional_ranges=bidirectional_ranges,
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
@@ -2206,7 +2230,7 @@ class MoondreamRuntime:
         lora_slot: int = 0,
         *,
         use_prefix_attn: bool,
-        block_sequence_ids: Tensor | None = None,
+        bidirectional_ranges: Tensor | None = None,
         paged_kv_seqlens_q: Tensor | None,
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
@@ -2308,7 +2332,7 @@ class MoondreamRuntime:
             slot_mapping=slot_mapping,
             mode="prefill",
             use_prefix_attn=use_prefix_attn,
-            block_sequence_ids=block_sequence_ids,
+            bidirectional_ranges=bidirectional_ranges,
             page_table=paged_kv_page_table,
             paged_kv_seqlens_q=paged_kv_seqlens_q,
             paged_kv_seqlens_k=paged_kv_seqlens_k,

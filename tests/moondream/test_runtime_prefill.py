@@ -45,7 +45,7 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
         del image, image_crops
         seq_len = seq_lens[prepared.state.batch_idx]
         hidden = torch.full((1, seq_len, 4), float(prepared.state.batch_idx))
-        # (inputs_embeds, position_start, use_prefix_attn, block_sequence_ids);
+        # (inputs_embeds, position_start, use_prefix_attn, bidirectional_ranges);
         # None = no image blocks for these single-/uniform-token prefill cases.
         return hidden, 0, False, None
 
@@ -61,12 +61,12 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
         paged_kv_seqlens_k,
         last_token_positions,
         input_staging,
-        block_sequence_ids=None,
+        bidirectional_ranges=None,
     ):
         captured["position_ids_contiguous"] = position_ids.is_contiguous()
         captured["batch_idx_contiguous"] = batch_idx.is_contiguous()
         del attn_mask, position_ids, batch_idx, lora_slot, use_prefix_attn
-        del input_staging, block_sequence_ids
+        del input_staging, bidirectional_ranges
         captured["paged_kv_seqlens_q"] = paged_kv_seqlens_q
         captured["paged_kv_seqlens_k"] = paged_kv_seqlens_k
         captured["last_token_positions"] = last_token_positions

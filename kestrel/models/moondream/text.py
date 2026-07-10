@@ -29,7 +29,6 @@ from kestrel_kernels import get_runtime
 
 _KERNELS = get_runtime()
 _flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
-cute_block_bidirectional_mask = _KERNELS.attention.block_bidirectional_mask
 tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
 rotary_embedding = _KERNELS.rotary.rotary_embedding
 _fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
@@ -82,7 +81,7 @@ def attn(
     *,
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
-    block_sequence_ids: torch.Tensor | None = None,
+    bidirectional_ranges: torch.Tensor | None = None,
     page_table: torch.Tensor | None = None,
     paged_kv_seqlens_q: torch.Tensor | None = None,
     paged_kv_seqlens_k: torch.Tensor | None = None,
@@ -144,18 +143,13 @@ def attn(
         causal = True
         pack_gqa = False
         aux_tensors = None
+        bidirectional_ranges_arg = None
         if use_prefix_attn:
             # Image-block bidirectional (prefix-LM) attention: every image block
-            # attends bidirectionally within itself, the rest is causal. The
-            # per-token `block_sequence_ids` aux tensor (image-block id >= 0, or
-            # -1 for text) drives the mask, so this is dynamic in the number and
-            # position of image blocks (one image after BOS, or several
-            # interleaved across turns) rather than a fixed front prefix.
-            if block_sequence_ids is None:
-                raise RuntimeError("use_prefix_attn requires block_sequence_ids")
-            causal = False
-            mask_mod = cute_block_bidirectional_mask
-            aux_tensors = [block_sequence_ids]
+            # attends bidirectionally within itself, the rest is causal.
+            if bidirectional_ranges is None:
+                raise RuntimeError("use_prefix_attn requires bidirectional_ranges")
+            bidirectional_ranges_arg = bidirectional_ranges
         out, _ = _flash_attn_fwd(
             q,
             k_cache,
@@ -168,6 +162,7 @@ def attn(
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
+            bidirectional_ranges=bidirectional_ranges_arg,
             k_scale=k_scale,
             v_scale=v_scale,
         )
@@ -204,7 +199,7 @@ def text_decoder(
     *,
     slot_mapping: torch.Tensor,
     use_prefix_attn: bool = False,
-    block_sequence_ids: torch.Tensor | None = None,
+    bidirectional_ranges: torch.Tensor | None = None,
     mode: Literal["prefill", "decode"] = "decode",
     page_table: torch.Tensor | None = None,
     paged_kv_seqlens_q: torch.Tensor | None = None,
@@ -237,7 +232,7 @@ def text_decoder(
             mode=mode,
             slot_mapping=slot_mapping,
             use_prefix_attn=use_prefix_attn,
-            block_sequence_ids=block_sequence_ids,
+            bidirectional_ranges=bidirectional_ranges,
             page_table=page_table,
             paged_kv_seqlens_q=paged_kv_seqlens_q,
             paged_kv_seqlens_k=paged_kv_seqlens_k,

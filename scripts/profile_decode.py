@@ -112,6 +112,7 @@ def patch_text_decoder_with_nvtx():
     def instrumented_text_decoder(
         x, module, attn_mask, position_ids, config, *,
         slot_mapping, use_prefix_attn=False, mode="decode",
+        bidirectional_ranges=None,
         page_table=None, paged_kv_seqlens_q=None, paged_kv_seqlens_k=None,
         lora_workspace=None, lora_slot_ids=None, single_lora_id=None,
         dense_lora_scratch=None,
@@ -148,6 +149,7 @@ def patch_text_decoder_with_nvtx():
                     mode=mode,
                     slot_mapping=slot_mapping,
                     use_prefix_attn=use_prefix_attn,
+                    bidirectional_ranges=bidirectional_ranges,
                     page_table=page_table,
                     paged_kv_seqlens_q=paged_kv_seqlens_q,
                     paged_kv_seqlens_k=paged_kv_seqlens_k,
