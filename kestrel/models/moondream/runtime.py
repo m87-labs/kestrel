@@ -2389,6 +2389,8 @@ class MoondreamRuntime:
         slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
+        slot.meta.routed_storage_ids.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.routed_storage_ids.cpu[batch_size:graph_batch_size].zero_()
 
     def _prepare_decode_graph_step(self, slot: DecodeSlot, batch_size: int) -> None:
         # Only host-side LoRA metadata stays live here; the paged-KV metadata is
@@ -2406,6 +2408,7 @@ class MoondreamRuntime:
         slot.meta.input_pos.gpu.zero_()
         slot.meta.input_pos.cpu.zero_()
         slot.meta.lora_slot_ids.gpu.zero_()
+        slot.meta.routed_storage_ids.gpu.zero_()
         slot.meta.active_token_ids.gpu.zero_()
         slot.meta.active_token_ids.cpu.zero_()
         slot.meta.active_lora_ids.gpu.zero_()
@@ -2520,6 +2523,12 @@ class MoondreamRuntime:
         (``session.rebase_pages``, driven by the manager off the host-mirror composition check) and the
         kernel appends into the pre-reserved pages every steady step. The host mirrors
         (``slot.meta.*.np``) are threaded so that composition check stays device-sync-free."""
+        runtime_tensors = None
+        if self._lora_workspace is not None:
+            runtime_tensors = self._lora_workspace.megakernel_runtime_tensors(
+                adapter_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
+                routed_storage_ids=slot.meta.routed_storage_ids.gpu[:batch_size],
+            )
         return megakernel_decode.decode(
             model_name=self.model_name,
             text=self.model.text,
@@ -2533,6 +2542,7 @@ class MoondreamRuntime:
             input_pos=slot.meta.input_pos.gpu[:batch_size],
             batch_idx_host=slot.meta.batch_idx.np[:batch_size],
             input_pos_host=slot.meta.input_pos.np[:batch_size],
+            runtime_tensors=runtime_tensors,
         )
 
     def _native_decode_hidden(

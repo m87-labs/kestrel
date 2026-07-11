@@ -130,6 +130,12 @@ class TextLoRAWorkspace:
         self.moe_lora_ranks = torch.zeros(
             max(0, max_slots - 1), dtype=torch.int32, device=device
         )
+        # Compiler/runtime metadata is indexed by the logical adapter slot, including
+        # slot 0. The native MoE kernels retain their compact zero-based rank table
+        # above; adapter loading updates both from the same physical rank.
+        self.routed_rank_by_slot = torch.zeros(
+            max_slots, dtype=torch.int32, device=device
+        )
         self._moe_lora_ranks_host = [0] * max(0, max_slots - 1)
 
         d_model = text_config.dim
@@ -153,25 +159,42 @@ class TextLoRAWorkspace:
             num_experts = moe_cfg.num_experts
             d_expert = moe_cfg.expert_inner_dim
             total_super_experts = (max_slots - 1) * num_experts
+            n_layers = text_config.n_layers
+            # One allocation per weight family gives the whole-model runtime a
+            # fixed-address slab while native per-layer workspaces remain views.
+            # Dense-prefix rows are unused and stay zero; retaining the absolute
+            # model-layer axis keeps the compiler/runtime binding mechanical.
+            self._moe_up_a = torch.zeros(
+                n_layers, total_super_experts, self.max_rank_per_expert, d_model,
+                device=device, dtype=dtype
+            )
+            self._moe_up_b = torch.zeros(
+                n_layers, total_super_experts, d_expert * 2, self.max_rank_per_expert,
+                device=device, dtype=dtype
+            )
+            self._moe_down_a = torch.zeros(
+                n_layers, total_super_experts, self.max_rank_per_expert, d_expert,
+                device=device, dtype=dtype
+            )
+            self._moe_down_b = torch.zeros(
+                n_layers, total_super_experts, d_model, self.max_rank_per_expert,
+                device=device, dtype=dtype
+            )
+            # The megakernel's route-owned down consumer reads rank-major slices.
+            # Native consumes output-major down-B, so this one family has a paired
+            # physical layout updated at adapter load time.
+            self._megakernel_moe_down_b = torch.zeros(
+                max_slots - 1, n_layers, num_experts,
+                self.max_rank_per_expert, d_model,
+                device=device, dtype=dtype
+            )
 
-            for _ in range(text_config.n_layers - self.start_layer):
+            for layer_idx in range(self.start_layer, n_layers):
                 workspace = MoELoRALayerWorkspace(
-                    up_a=torch.zeros(
-                        total_super_experts, self.max_rank_per_expert, d_model,
-                        device=device, dtype=dtype
-                    ),
-                    up_b=torch.zeros(
-                        total_super_experts, d_expert * 2, self.max_rank_per_expert,
-                        device=device, dtype=dtype
-                    ),
-                    down_a=torch.zeros(
-                        total_super_experts, self.max_rank_per_expert, d_expert,
-                        device=device, dtype=dtype
-                    ),
-                    down_b=torch.zeros(
-                        total_super_experts, d_model, self.max_rank_per_expert,
-                        device=device, dtype=dtype
-                    ),
+                    up_a=self._moe_up_a[layer_idx],
+                    up_b=self._moe_up_b[layer_idx],
+                    down_a=self._moe_down_a[layer_idx],
+                    down_b=self._moe_down_b[layer_idx],
                     lora_ranks=self.moe_lora_ranks,
                     num_experts=num_experts,
                 )
@@ -232,8 +255,12 @@ class TextLoRAWorkspace:
             layer.down_a[start:end].zero_()
             layer.down_b[start:end].zero_()
 
+        if self.moe:
+            self._megakernel_moe_down_b[slot - 1].zero_()
+
         self._moe_lora_ranks_host[slot - 1] = 0
         self.moe_lora_ranks[slot - 1].zero_()
+        self.routed_rank_by_slot[slot].zero_()
 
     def load_slot_(self, slot: int, adapter: LoRA) -> None:
         """Load adapter weights into a slot.
@@ -313,9 +340,48 @@ class TextLoRAWorkspace:
                 layer.down_b[ws_idx, :, :adapter_rank_per_expert].copy_(
                     adapter_layer.down_b[expert_id]
                 )
+                self._megakernel_moe_down_b[
+                    slot - 1, layer_idx, expert_id,
+                    :adapter_rank_per_expert, :
+                ].copy_(adapter_layer.down_b[expert_id].transpose(0, 1))
 
         self._moe_lora_ranks_host[slot - 1] = adapter_rank_per_expert
         self.moe_lora_ranks[slot - 1] = adapter_rank_per_expert
+        self.routed_rank_by_slot[slot] = adapter_rank_per_expert
+
+    def megakernel_runtime_tensors(
+        self,
+        *,
+        adapter_slot_ids: torch.Tensor,
+        routed_storage_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return the traced runtime inputs for indexed routed contractions.
+
+        The weight views preserve the engine-owned allocation and expose the
+        compiler's ``[storage, layer, expert, ...]`` logical axes. No adapter
+        dimension transform or rank sharding occurs in the compiler.
+        """
+        if not self.moe:
+            return {}
+        slots = self.max_slots - 1
+        layers = self._moe_up_a.shape[0]
+        experts = self.moe[0].num_experts
+        rank = self.max_rank_per_expert
+        return {
+            "adapter_slot_ids": adapter_slot_ids,
+            "routed_storage_ids": routed_storage_ids,
+            "routed_rank_by_slot": self.routed_rank_by_slot,
+            "moe_lora_a_up": self._moe_up_a.view(
+                layers, slots, experts, rank, self._moe_up_a.shape[-1]
+            ).permute(1, 0, 2, 3, 4),
+            "moe_lora_b_up": self._moe_up_b.view(
+                layers, slots, experts, self._moe_up_b.shape[-2], rank
+            ).permute(1, 0, 2, 3, 4),
+            "moe_lora_a_down": self._moe_down_a.view(
+                layers, slots, experts, rank, self._moe_down_a.shape[-1]
+            ).permute(1, 0, 2, 3, 4),
+            "moe_lora_b_down": self._megakernel_moe_down_b,
+        }
 
 
 # -----------------------------------------------------------------------------

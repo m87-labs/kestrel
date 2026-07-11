@@ -140,6 +140,34 @@ class TestWorkspaceAllocation:
             assert torch.all(layer.down_a[0] == 0)
             assert torch.all(layer.down_b[0] == 0)
 
+    def test_megakernel_runtime_tensors_are_workspace_views(
+        self, moe_config: TextConfig, device: torch.device
+    ):
+        workspace = TextLoRAWorkspace(
+            moe_config, max_slots=4, max_rank=8, device=device
+        )
+        logical = torch.tensor([0, 2], dtype=torch.int32, device=device)
+        storage = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+        tensors = workspace.megakernel_runtime_tensors(
+            adapter_slot_ids=logical,
+            routed_storage_ids=storage,
+        )
+
+        moe_cfg = moe_config.moe
+        assert moe_cfg is not None
+        rank = workspace.max_rank_per_expert
+        slots = workspace.max_slots - 1
+        assert tensors["moe_lora_a_up"].shape == (
+            slots, moe_config.n_layers, moe_cfg.num_experts, rank, moe_config.dim
+        )
+        assert tensors["moe_lora_b_down"].shape == (
+            slots, moe_config.n_layers, moe_cfg.num_experts, rank, moe_config.dim
+        )
+        assert tensors["adapter_slot_ids"] is logical
+        assert tensors["routed_storage_ids"] is storage
+        assert tensors["routed_rank_by_slot"] is workspace.routed_rank_by_slot
+
     def test_max_rank_per_expert_calculation(self, device: torch.device):
         """max_rank_per_expert is correctly computed as max_rank // experts_per_token."""
         config = TextConfig(
@@ -367,6 +395,14 @@ class TestLoadSlot:
                     layer.down_b[ws_idx, :, :rank_per_expert],
                     adapter_layer.down_b[expert_id],
                 )
+                assert torch.allclose(
+                    workspace._megakernel_moe_down_b[
+                        1, layer_idx, expert_id, :rank_per_expert
+                    ],
+                    adapter_layer.down_b[expert_id].transpose(0, 1),
+                )
+
+        assert workspace.routed_rank_by_slot.tolist() == [0, 0, rank_per_expert, 0]
 
     def test_moe_rank_not_divisible_by_experts_per_token_raises(
         self, moe_config: TextConfig, device: torch.device
