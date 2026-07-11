@@ -334,6 +334,9 @@ async def query_engine(
 
 
 async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
+    from kestrel_kernels import megakernel
+
+    megakernel_launches_before = megakernel.launch_count()
     dataset = load_dataset("vikhyatk/chartqa", split=cfg.dataset_split)
     dataset = dataset.cast_column("image", HFImage(decode=False))
     limit = cfg.limit
@@ -579,6 +582,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         await engine.shutdown()
 
     wall_time_s = max(time.perf_counter() - start_time, 0.0)
+    megakernel_launches = megakernel.launch_count() - megakernel_launches_before
 
     results = [
         [entry for entry in chart_entries if entry is not None]
@@ -609,6 +613,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         "prefix_cache_enabled": cfg.enable_prefix_cache,
         "adapter": cfg.adapter,
         "megakernel_enabled": cfg.enable_megakernel,
+        "megakernel_launches": megakernel_launches,
     }
 
 
@@ -742,6 +747,7 @@ def print_results(results: Dict[str, Any]) -> None:
         f"Human Accuracy: {results['human_acc']:.2f}% "
         f"({results['human_correct']} / {results['human_total']})"
     )
+    print(f"Megakernel Launches: {results.get('megakernel_launches', 0)}")
 
     wall_time_s = results.get("wall_time_s", 0.0) or 0.0
     usage = results.get("token_usage")
