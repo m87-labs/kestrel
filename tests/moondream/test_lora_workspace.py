@@ -168,6 +168,18 @@ class TestWorkspaceAllocation:
         assert tensors["adapter_slot_ids"] is logical
         assert tensors["routed_storage_ids"] is storage
         assert tensors["routed_rank_by_slot"] is workspace.routed_rank_by_slot
+        assert tensors["dense_rank_by_slot"] is workspace.dense_rank_by_slot
+        assert tensors["dense_lora_a_up"].shape == (
+            workspace.max_slots, workspace.start_layer, workspace.max_rank,
+            moe_config.dim,
+        )
+        assert tensors["dense_lora_b_down"].shape == (
+            workspace.max_slots, workspace.start_layer, moe_config.dim,
+            workspace.max_rank,
+        )
+        assert tensors["dense_lora_a_up"].untyped_storage().data_ptr() == (
+            workspace.dense[0].up_a.untyped_storage().data_ptr()
+        )
 
     def test_max_rank_per_expert_calculation(self, device: torch.device):
         """max_rank_per_expert is correctly computed as max_rank // experts_per_token."""
@@ -236,6 +248,7 @@ class TestClearSlot:
             layer.down_b[start:end].fill_(1.0)
 
         # Clear slot 1
+        workspace.dense_rank_by_slot[1] = 8
         workspace.clear_slot_(1)
 
         # Verify slot 1 is now zero
@@ -253,6 +266,7 @@ class TestClearSlot:
             assert torch.all(layer.up_b[start:end] == 0)
             assert torch.all(layer.down_a[start:end] == 0)
             assert torch.all(layer.down_b[start:end] == 0)
+        assert workspace.dense_rank_by_slot[1].item() == 0
 
     def test_clear_slot_preserves_other_slots(
         self, moe_config: TextConfig, device: torch.device
@@ -410,6 +424,7 @@ class TestLoadSlot:
                 )
 
         assert workspace.routed_rank_by_slot.tolist() == [0, 0, rank_per_expert, 0]
+        assert workspace.dense_rank_by_slot.tolist() == [0, 0, max_rank, 0]
 
     def test_moe_up_b_is_stored_in_the_slab_row_order(
         self, moe_config: TextConfig, device: torch.device
@@ -480,6 +495,8 @@ class TestLoadSlot:
         )
 
         workspace.load_slot_(1, adapter)
+
+        assert workspace.dense_rank_by_slot[1].item() == adapter_rank
 
         for layer_idx, layer in enumerate(workspace.dense):
             adapter_layer = adapter.text.get_dense_lora(layer_idx)

@@ -2504,7 +2504,7 @@ class MoondreamRuntime:
         if (
             self._decode_graphs.enabled
             or self._megakernel_target is None
-            or self._lora_workspace is not None
+            or (self._lora_workspace is not None and batch_size != 1)
         ):
             return False
         return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
@@ -2606,14 +2606,12 @@ class MoondreamRuntime:
         the manager captures native for it) -- the non-fatal fallback is preserved as an engine-side
         try/except, not a silent ``None`` on the hot path."""
         target = self._megakernel_target
-        # The rank-zero session has no adapter tensors or row-routing ABI. Skipping
-        # native capture while an adapter workspace is live would make later adapter
-        # requests silently execute the base model. The dynamic indexed-contraction
-        # runtime removes this guard only once those inputs are part of decode().
-        if target is None or self._lora_workspace is not None:
+        if target is None:
             return set()
         served: set[int] = set()
         for batch_size in batch_sizes:
+            if self._lora_workspace is not None and batch_size != 1:
+                continue
             if not megakernel_decode.has_megakernel(*target, batch_size):
                 continue
             try:
@@ -2652,12 +2650,12 @@ class MoondreamRuntime:
         if (
             target is None
             or self._decode_graphs.enabled
-            or self._lora_workspace is not None
         ):
             return
         served = [
             batch_size
             for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
+            if self._lora_workspace is None or batch_size == 1
             if megakernel_decode.has_megakernel(*target, batch_size)
         ]
         if not served:
