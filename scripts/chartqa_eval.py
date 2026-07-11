@@ -74,6 +74,7 @@ POT_MAX_TOKENS = 200
 @dataclass(slots=True)
 class EvalConfig:
     model: str
+    adapter: Optional[str]
     max_batch_size: int
     kv_cache_pages: Optional[int]
     dataset_split: str
@@ -302,15 +303,19 @@ async def query_engine(
     reasoning: bool,
     max_tokens: int,
     temperature: float,
+    adapter: Optional[str],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]], EngineMetrics]:
+    settings: Dict[str, Any] = {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if adapter is not None:
+        settings["adapter"] = adapter
     response = await engine.query(
         image=image,
         question=prompt,
         reasoning=reasoning,
-        settings={
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
+        settings=settings,
     )
     output = response.output
     answer = str(output.get("answer", "")).strip()
@@ -408,6 +413,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     reasoning=True,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    adapter=cfg.adapter,
                 )
                 record_metrics(candidate_metrics)
                 candidate_answer = strip_trailing_percent(candidate_answer)
@@ -434,6 +440,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                 reasoning=cfg.cot_samples > 0,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                adapter=cfg.adapter,
             )
             record_metrics(metrics)
             metrics_for_dump = metrics
@@ -533,6 +540,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                 reasoning=warmup_reasoning,
                 max_tokens=warmup_max_tokens,
                 temperature=warmup_temp,
+                adapter=cfg.adapter,
             )
 
     tasks: List[asyncio.Task[Tuple[int, int, Dict[str, Any], bool, bool]]] = []
@@ -594,6 +602,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         },
         "wall_time_s": wall_time_s,
         "prefix_cache_enabled": cfg.enable_prefix_cache,
+        "adapter": cfg.adapter,
     }
 
 
@@ -614,6 +623,11 @@ def parse_args() -> EvalConfig:
         type=int,
         default=4,
         help="Maximum batch size for the inference engine.",
+    )
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Optional finetune checkpoint ID in {finetune_id}@{step} form.",
     )
     parser.add_argument(
         "--kv-cache-pages",
@@ -680,6 +694,7 @@ def parse_args() -> EvalConfig:
 
     cfg = EvalConfig(
         model=args.model,
+        adapter=args.adapter,
         max_batch_size=args.max_batch_size,
         kv_cache_pages=args.kv_cache_pages,
         dataset_split=args.split,
