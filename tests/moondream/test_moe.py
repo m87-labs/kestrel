@@ -170,6 +170,21 @@ def test_decode_lora_metadata_uses_compact_graph_stable_buffers() -> None:
     )
 
 
+def test_adapter_workspace_serves_only_b1_megakernel_until_rows_are_emitted(
+    monkeypatch,
+) -> None:
+    runtime = runtime_mod.MoondreamRuntime.__new__(runtime_mod.MoondreamRuntime)
+    runtime._decode_graphs = SimpleNamespace(enabled=False)
+    runtime._megakernel_target = ("moondream3", 2048, 24)
+    runtime._lora_workspace = object()
+    monkeypatch.setattr(
+        runtime_mod.megakernel_decode, "has_megakernel", lambda *args: True
+    )
+
+    assert runtime._megakernel_eager_unwarmed(1)
+    assert not runtime._megakernel_eager_unwarmed(2)
+
+
 # ---------------------------------------------------------------------------
 # Non-FP8 MoE checkpoints are unrepresentable (kestrel#121)
 #

@@ -136,19 +136,41 @@ class TextLoRAWorkspace:
         self.routed_rank_by_slot = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
+        self.dense_rank_by_slot = torch.zeros(
+            max_slots, dtype=torch.int32, device=device
+        )
         self._moe_lora_ranks_host = [0] * max(0, max_slots - 1)
 
         d_model = text_config.dim
         d_ffn = text_config.ff_dim
 
+        # One fixed-address allocation per dense weight family. Native per-layer
+        # workspaces and the whole-model compiler ABI are views of these same slabs.
+        self._dense_up_a = torch.zeros(
+            self.start_layer, max_slots, max_rank, d_model,
+            device=device, dtype=dtype,
+        )
+        self._dense_up_b = torch.zeros(
+            self.start_layer, max_slots, d_ffn, max_rank,
+            device=device, dtype=dtype,
+        )
+        self._dense_down_a = torch.zeros(
+            self.start_layer, max_slots, max_rank, d_ffn,
+            device=device, dtype=dtype,
+        )
+        self._dense_down_b = torch.zeros(
+            self.start_layer, max_slots, d_model, max_rank,
+            device=device, dtype=dtype,
+        )
+
         # Allocate dense layer workspaces: [0, start_layer)
         self.dense: list[DenseLoRALayerWorkspace] = []
-        for _ in range(self.start_layer):
+        for layer_idx in range(self.start_layer):
             workspace = DenseLoRALayerWorkspace(
-                up_a=torch.zeros(max_slots, max_rank, d_model, device=device, dtype=dtype),
-                up_b=torch.zeros(max_slots, d_ffn, max_rank, device=device, dtype=dtype),
-                down_a=torch.zeros(max_slots, max_rank, d_ffn, device=device, dtype=dtype),
-                down_b=torch.zeros(max_slots, d_model, max_rank, device=device, dtype=dtype),
+                up_a=self._dense_up_a[layer_idx],
+                up_b=self._dense_up_b[layer_idx],
+                down_a=self._dense_down_a[layer_idx],
+                down_b=self._dense_down_b[layer_idx],
             )
             self.dense.append(workspace)
 
@@ -261,6 +283,7 @@ class TextLoRAWorkspace:
         self._moe_lora_ranks_host[slot - 1] = 0
         self.moe_lora_ranks[slot - 1].zero_()
         self.routed_rank_by_slot[slot].zero_()
+        self.dense_rank_by_slot[slot].zero_()
 
     def load_slot_(self, slot: int, adapter: LoRA) -> None:
         """Load adapter weights into a slot.
@@ -348,6 +371,7 @@ class TextLoRAWorkspace:
         self._moe_lora_ranks_host[slot - 1] = adapter_rank_per_expert
         self.moe_lora_ranks[slot - 1] = adapter_rank_per_expert
         self.routed_rank_by_slot[slot] = adapter_rank_per_expert
+        self.dense_rank_by_slot[slot] = adapter_rank
 
     def megakernel_runtime_tensors(
         self,
@@ -361,16 +385,23 @@ class TextLoRAWorkspace:
         compiler's ``[storage, layer, expert, ...]`` logical axes. No adapter
         dimension transform or rank sharding occurs in the compiler.
         """
+        tensors = {
+            "adapter_slot_ids": adapter_slot_ids,
+            "routed_storage_ids": routed_storage_ids,
+            "routed_rank_by_slot": self.routed_rank_by_slot,
+            "dense_rank_by_slot": self.dense_rank_by_slot,
+            "dense_lora_a_up": self._dense_up_a.permute(1, 0, 2, 3),
+            "dense_lora_b_up": self._dense_up_b.permute(1, 0, 2, 3),
+            "dense_lora_a_down": self._dense_down_a.permute(1, 0, 2, 3),
+            "dense_lora_b_down": self._dense_down_b.permute(1, 0, 2, 3),
+        }
         if not self.moe:
-            return {}
+            return tensors
         slots = self.max_slots - 1
         layers = self._moe_up_a.shape[0]
         experts = self.moe[0].num_experts
         rank = self.max_rank_per_expert
-        return {
-            "adapter_slot_ids": adapter_slot_ids,
-            "routed_storage_ids": routed_storage_ids,
-            "routed_rank_by_slot": self.routed_rank_by_slot,
+        tensors.update({
             "moe_lora_a_up": self._moe_up_a.view(
                 layers, slots, experts, rank, self._moe_up_a.shape[-1]
             ).permute(1, 0, 2, 3, 4),
@@ -381,7 +412,8 @@ class TextLoRAWorkspace:
                 layers, slots, experts, rank, self._moe_down_a.shape[-1]
             ).permute(1, 0, 2, 3, 4),
             "moe_lora_b_down": self._megakernel_moe_down_b,
-        }
+        })
+        return tensors
 
 
 # -----------------------------------------------------------------------------
