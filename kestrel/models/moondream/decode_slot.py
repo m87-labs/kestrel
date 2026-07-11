@@ -49,7 +49,8 @@ class DecodeMetaBuffers:
             [
                 ("batch_idx", (max_batch_slots,), torch.int64),  # sequence batch idx
                 ("input_pos", (max_batch_slots,), torch.int32),  # token positions
-                ("lora_slot_ids", (max_batch_slots,), torch.int32),  # LoRA slots
+                ("lora_slot_ids", (max_batch_slots,), torch.int32),  # logical adapter slots
+                ("routed_storage_ids", (max_batch_slots,), torch.int32),
             ],
             device=device,
             pin_memory=True,
@@ -84,8 +85,12 @@ class DecodeMetaBuffers:
     def lora_slot_ids(self):
         return self._inputs.lora_slot_ids
 
+    @property
+    def routed_storage_ids(self):
+        return self._inputs.routed_storage_ids
+
     def copy_inputs_to_gpu(self) -> None:
-        """Stage batch_idx/input_pos/lora_slot_ids to the GPU in one H2D copy."""
+        """Stage the per-row decode metadata to the GPU in one H2D copy."""
         self._inputs.copy_to_gpu()
 
 

@@ -2082,10 +2082,15 @@ class GenerationScheduler:
             idx_np = slot.meta.batch_idx.np
             pos_np = slot.meta.input_pos.np
             lora_np = slot.meta.lora_slot_ids.np
+            routed_storage_np = slot.meta.routed_storage_ids.np
             for i, seq in enumerate(sequences):
                 idx_np[i] = seq.state.batch_idx
                 pos_np[i] = seq.state.length
                 lora_np[i] = seq.state.lora_slot
+                # Slot 0 means no adapter. Routed slabs exclude that sentinel, so
+                # logical slot N maps to physical storage N-1; rank 0 prevents the
+                # sentinel row from dereferencing the placeholder storage id 0.
+                routed_storage_np[i] = max(0, seq.state.lora_slot - 1)
 
             # One H2D copy stages batch_idx/input_pos/lora_slot_ids together
             # (they share a packed buffer) instead of three separate launches.
