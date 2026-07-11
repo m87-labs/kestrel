@@ -2524,7 +2524,8 @@ class MoondreamRuntime:
         kernel appends into the pre-reserved pages every steady step. The host mirrors
         (``slot.meta.*.np``) are threaded so that composition check stays device-sync-free."""
         runtime_tensors = None
-        if self._lora_workspace is not None:
+        adapter_slots_cpu = slot.meta.lora_slot_ids.cpu[:batch_size]
+        if self._lora_workspace is not None and bool(torch.any(adapter_slots_cpu != 0)):
             runtime_tensors = self._lora_workspace.megakernel_runtime_tensors(
                 adapter_slot_ids=slot.meta.lora_slot_ids.gpu[:batch_size],
                 routed_storage_ids=slot.meta.routed_storage_ids.gpu[:batch_size],
