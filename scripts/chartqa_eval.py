@@ -84,6 +84,7 @@ class EvalConfig:
     temperature: float
     debug: bool
     enable_prefix_cache: bool
+    enable_megakernel: bool
     dump_jsonl: Optional[Path] = None
     device: str | None = None
 
@@ -221,6 +222,10 @@ def execute_program_source(source: str, timeout: float = 10.0) -> str:
 
 
 async def create_engine(cfg: EvalConfig) -> InferenceEngine:
+    if not cfg.enable_megakernel:
+        from kestrel_kernels import megakernel
+
+        megakernel.deploy_target = lambda model_name, device: None
     runtime_kwargs: Dict[str, Any] = dict(
         model=cfg.model,
         max_batch_size=cfg.max_batch_size,
@@ -603,6 +608,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
         "wall_time_s": wall_time_s,
         "prefix_cache_enabled": cfg.enable_prefix_cache,
         "adapter": cfg.adapter,
+        "megakernel_enabled": cfg.enable_megakernel,
     }
 
 
@@ -676,6 +682,11 @@ def parse_args() -> EvalConfig:
         help="Disable prefix caching (enabled by default).",
     )
     parser.add_argument(
+        "--disable-megakernel",
+        action="store_true",
+        help="Force native decode for same-script before/after evaluation.",
+    )
+    parser.add_argument(
         "--dump-jsonl",
         type=Path,
         default=None,
@@ -704,6 +715,7 @@ def parse_args() -> EvalConfig:
         temperature=float(args.temperature),
         debug=bool(args.debug),
         enable_prefix_cache=not args.disable_prefix_cache,
+        enable_megakernel=not args.disable_megakernel,
         dump_jsonl=args.dump_jsonl,
         device=args.device,
     )
