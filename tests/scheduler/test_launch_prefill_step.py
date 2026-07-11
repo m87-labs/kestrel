@@ -82,7 +82,9 @@ def _make_scheduler(
     scheduler.waiting.push(request)
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
-    scheduler._select_prefill_batch = lambda capacity_remaining: [_make_candidate(request)]
+    scheduler._select_prefill_batch = lambda capacity_remaining, **kwargs: [
+        _make_candidate(request)
+    ]
     return scheduler
 
 
@@ -148,3 +150,57 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
     assert scheduler._completed[0].request_id == request.request_id
     assert request.lifecycle.phase == RequestPhase.COMPLETED
     assert len(runtime.released_prefill_slots) == 1
+
+
+def test_launch_prefill_step_defers_when_lora_slots_exhausted() -> None:
+    request = _make_request()
+    request.adapter = "ft-1"
+    runtime = FakeRuntime()
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._acquire_adapter_slot = lambda adapter_id: (_ for _ in ()).throw(
+        RuntimeError("Out of LoRA slots: all slots are in use.")
+    )
+    pipeline = PipelineState()
+
+    progressed = GenerationScheduler._launch_prefill_step(scheduler, pipeline)
+
+    assert progressed is False
+    assert list(scheduler.waiting) == [request]
+    assert not scheduler._completed
+    assert request.lifecycle.phase == RequestPhase.WAITING_RESOURCES
+    assert request.lifecycle.lora_slot_ready is False
+    assert request.lora_slot == 0
+    assert len(runtime.prepare_calls) == 0
+    assert len(runtime.released_prefill_slots) == 1
+
+
+def test_launch_prefill_step_allows_base_request_past_exhausted_lora() -> None:
+    adapter = _make_request(request_id=1)
+    adapter.adapter = "ft-1"
+    base = _make_request(request_id=2)
+    base.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(
+        max_batch_size=2,
+        max_batch_slots=3,
+        prepare_exc=RuntimeError("prepare failed"),
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler.waiting = RequestQueue()
+    scheduler.waiting.push(adapter)
+    scheduler.waiting.push(base)
+    scheduler.running = RunningQueue()
+    scheduler._completed = deque()
+    scheduler._compute_stream = None
+    scheduler._acquire_adapter_slot = lambda adapter_id: (_ for _ in ()).throw(
+        RuntimeError("Out of LoRA slots: all slots are in use.")
+    )
+    pipeline = PipelineState()
+
+    progressed = GenerationScheduler._launch_prefill_step(scheduler, pipeline)
+
+    assert progressed is True
+    assert list(scheduler.waiting) == [adapter]
+    assert adapter.lifecycle.phase == RequestPhase.WAITING_RESOURCES
+    assert runtime.prepare_calls[0]["prompt_tokens"] == base.prefill_tokens
+    assert scheduler._completed[0].request_id == base.request_id

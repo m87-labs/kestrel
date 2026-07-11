@@ -1584,13 +1584,20 @@ class GenerationScheduler:
             cohort_key=cohort_key,
         )
 
-    def _select_prefill_batch(self, capacity_remaining: int) -> list[_PrefillCandidate]:
+    def _select_prefill_batch(
+        self,
+        capacity_remaining: int,
+        *,
+        exclude_request_ids: set[int] | None = None,
+    ) -> list[_PrefillCandidate]:
         page_budget, slot_budget = self.runtime.prefill_budget()
         if capacity_remaining <= 0 or slot_budget <= 0 or page_budget <= 0:
             return []
 
         candidates = []
         for request in self.waiting:
+            if exclude_request_ids and request.request_id in exclude_request_ids:
+                continue
             candidate = self._make_prefill_candidate(request)
             if candidate is not None:
                 candidates.append(candidate)
@@ -1762,6 +1769,7 @@ class GenerationScheduler:
         if capacity_remaining <= 0:
             return False
 
+        deferred_lora_ids: set[int] = set()
         launch_candidates = self._select_prefill_batch(capacity_remaining)
         if not launch_candidates:
             return False
@@ -1774,63 +1782,77 @@ class GenerationScheduler:
 
         bound_batch: list[_BoundPrefill] = []
         progress = False
-        for candidate in launch_candidates:
-            request = candidate.request
-            lifecycle = request.lifecycle
-            acquired_lora = False
-            if not lifecycle.lora_slot_ready:
+        while True:
+            deferred_count_before = len(deferred_lora_ids)
+            for candidate in launch_candidates:
+                request = candidate.request
+                lifecycle = request.lifecycle
+                acquired_lora = False
+                if not lifecycle.lora_slot_ready:
+                    try:
+                        request.lora_slot = self._acquire_adapter_slot(request.adapter)
+                        lifecycle.lora_slot_ready = True
+                        acquired_lora = True
+                    except Exception as exc:
+                        if _is_out_of_lora_slots(exc):
+                            lifecycle.transition(RequestPhase.WAITING_RESOURCES)
+                            deferred_lora_ids.add(request.request_id)
+                            continue
+                        self.waiting.remove(request)
+                        self._fail_request_early(request, exc)
+                        progress = True
+                        continue
+
                 try:
-                    request.lora_slot = self._acquire_adapter_slot(request.adapter)
-                    lifecycle.lora_slot_ready = True
-                    acquired_lora = True
+                    prefill_start = time.perf_counter()
+                    lifecycle.prefill_started_at = prefill_start
+                    lifecycle.transition(RequestPhase.PREFILLING)
+                    prepared = self.runtime.prepare_sequence(
+                        prompt_tokens=request.prefill_tokens,
+                        image=request.image,
+                        image_crops=request.image_crops,
+                        max_new_tokens=request.remaining_new_tokens,
+                        lora_slot=request.lora_slot,
+                        image_hash=request.image_hash,
+                        adapter_id=request.adapter,
+                    )
                 except Exception as exc:
+                    lifecycle.prefill_started_at = None
+                    lifecycle.prefill_completed_at = None
+                    if acquired_lora:
+                        self.runtime.release_adapter_slot(request.lora_slot)
+                        request.lora_slot = 0
+                        lifecycle.lora_slot_ready = False
+                    lifecycle.transition(
+                        RequestPhase.READY_FOR_PREFILL
+                        if (lifecycle.crops_ready and lifecycle.lora_slot_ready)
+                        else RequestPhase.WAITING_RESOURCES
+                    )
+                    if isinstance(exc, RuntimeError) and "Cannot reserve" in str(exc):
+                        continue
                     self.waiting.remove(request)
                     self._fail_request_early(request, exc)
                     progress = True
                     continue
 
-            try:
-                prefill_start = time.perf_counter()
-                lifecycle.prefill_started_at = prefill_start
-                lifecycle.transition(RequestPhase.PREFILLING)
-                prepared = self.runtime.prepare_sequence(
-                    prompt_tokens=request.prefill_tokens,
-                    image=request.image,
-                    image_crops=request.image_crops,
-                    max_new_tokens=request.remaining_new_tokens,
-                    lora_slot=request.lora_slot,
-                    image_hash=request.image_hash,
-                    adapter_id=request.adapter,
-                )
-            except Exception as exc:
-                lifecycle.prefill_started_at = None
-                lifecycle.prefill_completed_at = None
-                if acquired_lora:
-                    self.runtime.release_adapter_slot(request.lora_slot)
-                    request.lora_slot = 0
-                    lifecycle.lora_slot_ready = False
-                lifecycle.transition(
-                    RequestPhase.READY_FOR_PREFILL
-                    if (lifecycle.crops_ready and lifecycle.lora_slot_ready)
-                    else RequestPhase.WAITING_RESOURCES
-                )
-                if isinstance(exc, RuntimeError) and "Cannot reserve" in str(exc):
-                    continue
+                lifecycle.sequence_state = prepared.state
+
                 self.waiting.remove(request)
-                self._fail_request_early(request, exc)
-                progress = True
-                continue
-
-            lifecycle.sequence_state = prepared.state
-
-            self.waiting.remove(request)
-            bound_batch.append(
-                _BoundPrefill(
-                    candidate=candidate,
-                    prepared=prepared,
-                    acquired_lora=acquired_lora,
+                bound_batch.append(
+                    _BoundPrefill(
+                        candidate=candidate,
+                        prepared=prepared,
+                        acquired_lora=acquired_lora,
+                    )
                 )
+            if bound_batch or len(deferred_lora_ids) == deferred_count_before:
+                break
+            launch_candidates = self._select_prefill_batch(
+                capacity_remaining,
+                exclude_request_ids=deferred_lora_ids,
             )
+            if not launch_candidates:
+                break
 
         if not bound_batch:
             self.runtime.release_prefill_slot(prefill_slot)
