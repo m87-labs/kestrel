@@ -165,6 +165,10 @@ class TestWorkspaceAllocation:
         assert tensors["moe_lora_b_down"].shape == (
             slots, moe_config.n_layers, moe_cfg.num_experts, rank, moe_config.dim
         )
+        assert tensors["moe_lora_b_up_t"].shape == (
+            slots, moe_config.n_layers, moe_cfg.num_experts, rank,
+            moe_cfg.expert_inner_dim * 2,
+        )
         assert tensors["adapter_slot_ids"] is logical
         assert tensors["routed_storage_ids"] is storage
         assert tensors["routed_rank_by_slot"] is workspace.routed_rank_by_slot
@@ -421,6 +425,12 @@ class TestLoadSlot:
                         1, layer_idx, expert_id, :rank_per_expert
                     ],
                     adapter_layer.down_b[expert_id].transpose(0, 1),
+                )
+                assert torch.allclose(
+                    workspace._megakernel_moe_up_b_t[
+                        1, layer_idx, expert_id, :rank_per_expert
+                    ],
+                    layer.up_b[ws_idx, :, :rank_per_expert].transpose(0, 1),
                 )
 
         assert workspace.routed_rank_by_slot.tolist() == [0, 0, rank_per_expert, 0]
