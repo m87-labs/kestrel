@@ -363,3 +363,105 @@ def test_moe_up_slab_survives_cuda_move() -> None:
     for li, up in _moe_up_views(text):
         assert up.weight.is_cuda
         assert torch.equal(up.weight.cpu(), before[li])
+
+
+# ---------------------------------------------------------------------------
+# THE PERMUTATION ITSELF (kestrel #121).
+#
+# The 8-row gate/up interleave is SHAPE-PRESERVING: gate row n lands at physical
+# row 16*(n//8) + n%8 and up row n at that + 8. No shape or dtype check can tell
+# a correct interleave from an inverted, by-16, or dropped one -- only the index
+# math can. Every downstream kernel (kestrel-kernels compact/warpgemv, the mkl
+# megakernel MoE consumers) assumes exactly this map, so it is pinned here rather
+# than left to whole-model cosine gates to notice.
+# ---------------------------------------------------------------------------
+
+def _expected_rows(inter: int) -> list[int]:
+    """Physical row for each logical row of a [gate | up] slab, per the contract."""
+    gate = [16 * (n // 8) + n % 8 for n in range(inter)]
+    return gate + [r + 8 for r in gate]
+
+
+def test_interleave_gate_up_rows8_matches_the_row_contract() -> None:
+    from kestrel.models.moondream._moe_layout import _interleave_gate_up_rows8
+
+    experts, inter, hidden = 2, 24, 3
+    # Row-identifying values: element (e, j, :) == j, so a permuted row is
+    # readable straight off the output.
+    plain = (torch.arange(2 * inter, dtype=torch.float32)[None, :, None]
+             .expand(experts, 2 * inter, hidden).contiguous())
+
+    out = _interleave_gate_up_rows8(plain, inter)
+
+    assert out.shape == plain.shape
+    for logical, physical in enumerate(_expected_rows(inter)):
+        assert torch.equal(out[:, physical], plain[:, logical]), (
+            f"logical row {logical} should land at physical row {physical}")
+    # Spot-check the contract literally: gate[8:16] occupies rows 16..23,
+    # up[8:16] occupies rows 24..31.
+    assert out[0, 16, 0] == 8 and out[0, 23, 0] == 15
+    assert out[0, 24, 0] == inter + 8 and out[0, 31, 0] == inter + 15
+
+
+def test_interleave_gate_up_rows8_permutes_scales_identically() -> None:
+    """Per-channel scales are [E, 2I] (no hidden tail) and MUST carry the same
+    permutation as the weight rows, or every neuron gets the wrong scale."""
+    from kestrel.models.moondream._moe_layout import _interleave_gate_up_rows8
+
+    experts, inter = 3, 16
+    plain = (torch.arange(2 * inter, dtype=torch.float32)[None, :]
+             .expand(experts, 2 * inter).contiguous())
+
+    out = _interleave_gate_up_rows8(plain, inter)
+
+    assert out.shape == plain.shape
+    for logical, physical in enumerate(_expected_rows(inter)):
+        assert torch.equal(out[:, physical], plain[:, logical])
+
+
+def test_interleave_up_b_rows8_permutes_rows_and_carries_rank() -> None:
+    """LoRA up-B is [*lead, 2I, rank]: rows follow the slab, rank is untouched
+    (the expand is column-independent, so a wrong row order lands every delta on
+    the wrong neuron while passing all shape checks)."""
+    from kestrel.models.moondream._moe_layout import _interleave_up_b_rows8
+
+    slots, experts, inter, rank = 2, 3, 16, 5
+    plain = (torch.arange(2 * inter, dtype=torch.float32)[None, None, :, None]
+             .expand(slots, experts, 2 * inter, rank).contiguous())
+    # Make the rank axis distinguishable so a rank/row transpose cannot pass.
+    plain = plain * 100 + torch.arange(rank, dtype=torch.float32)
+
+    out = _interleave_up_b_rows8(plain, inter)
+
+    assert out.shape == plain.shape
+    for logical, physical in enumerate(_expected_rows(inter)):
+        assert torch.equal(out[..., physical, :], plain[..., logical, :])
+
+
+def test_set_md3_moe_up_layer_writes_the_interleaved_slab() -> None:
+    """The loader entry point stores the PERMUTED bytes -- pinned end to end, so
+    a regression in the loader (not just the helper) is caught."""
+    from kestrel.models.moondream._moe_layout import (
+        MoEUpSlabModuleDict,
+        build_md3_moe_up_slab,
+        set_md3_moe_up_layer,
+    )
+
+    text = _build_moe_slab_text(MoEUpSlabModuleDict)
+    two_inter = 2 * _MOVE_INTER
+    up_w_slab, up_scale_slab = build_md3_moe_up_slab(
+        text, num_experts=_MOVE_E, two_inter=two_inter, hidden=_MOVE_HIDDEN, device="cpu")
+
+    raw_up = (torch.arange(two_inter, dtype=torch.uint8)[None, :, None]
+              .expand(_MOVE_E, two_inter, _MOVE_HIDDEN).contiguous())
+    raw_scale = (torch.arange(two_inter, dtype=torch.float32)[None, :]
+                 .expand(_MOVE_E, two_inter).contiguous())
+    layer = _MOVE_START
+    fused = text.blocks[layer].mlp["mlp"]
+    set_md3_moe_up_layer(
+        fused, up_w_slab, up_scale_slab, layer, raw_up, raw_scale, _MOVE_INTER)
+
+    weight, scale = fused.up_experts.weight, fused.up_experts.scale
+    for logical, physical in enumerate(_expected_rows(_MOVE_INTER)):
+        assert torch.equal(weight[:, physical], raw_up[:, logical])
+        assert torch.equal(scale[:, physical], raw_scale[:, logical])

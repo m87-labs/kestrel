@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from kestrel.models.moondream._moe_layout import _interleave_up_b_rows8
 from kestrel.models.moondream.config import TextConfig, TextMoeConfig
 from kestrel.models.moondream.lora import LoRA, TextLoRA, TextLoRAConfig
 from kestrel.models.moondream.lora_workspace import (
@@ -355,9 +356,15 @@ class TestLoadSlot:
                     layer.up_a[ws_idx, :rank_per_expert],
                     adapter_layer.up_a[expert_id],
                 )
+                # up_b's rows are interleaved into the base up slab's row order
+                # at load (see test_moe_up_b_is_stored_in_the_slab_row_order --
+                # this adapter's constant fill cannot see the permutation).
                 assert torch.allclose(
                     layer.up_b[ws_idx, :, :rank_per_expert],
-                    adapter_layer.up_b[expert_id],
+                    _interleave_up_b_rows8(
+                        adapter_layer.up_b[expert_id],
+                        adapter_layer.up_b.shape[-2] // 2,
+                    ),
                 )
                 assert torch.allclose(
                     layer.down_a[ws_idx, :rank_per_expert],
@@ -367,6 +374,54 @@ class TestLoadSlot:
                     layer.down_b[ws_idx, :, :rank_per_expert],
                     adapter_layer.down_b[expert_id],
                 )
+
+    def test_moe_up_b_is_stored_in_the_slab_row_order(
+        self, moe_config: TextConfig, device: torch.device
+    ):
+        """MoE up-B rows must land in the base up slab's 8-row gate/up order.
+
+        The LoRA expand is column-independent, so up_b's row order IS the
+        contract (kestrel-kernels MoeLoraState): a wrong order lands every
+        delta on the wrong neuron while passing every shape check. The other
+        load_slot tests fill up_b with a constant, which makes the permutation
+        invisible -- give each row a distinct value so it cannot hide.
+        """
+        max_rank = 8
+        workspace = TextLoRAWorkspace(
+            moe_config, max_slots=4, max_rank=max_rank, device=device
+        )
+        adapter = create_test_adapter(
+            moe_config, rank=max_rank, device=device, fill_value=1.0
+        )
+        moe_cfg = moe_config.moe
+        assert moe_cfg is not None
+
+        # Row-identifying values: up_b[..., row, :] == row.
+        for layer in adapter.text.moe:
+            rows = layer.up_b.shape[-2]
+            layer.up_b.data.copy_(
+                torch.arange(rows, dtype=layer.up_b.dtype, device=device)
+                .reshape(1, rows, 1)
+                .expand_as(layer.up_b)
+            )
+
+        workspace.load_slot_(2, adapter)
+
+        rank_per_expert = adapter.text.rank_per_expert
+        for moe_idx, layer in enumerate(workspace.moe):
+            adapter_layer = adapter.text.get_moe_lora(workspace.start_layer + moe_idx)
+            assert adapter_layer is not None
+            inter = adapter_layer.up_b.shape[-2] // 2
+            for expert_id in range(moe_cfg.num_experts):
+                ws_idx = (2 - 1) * moe_cfg.num_experts + expert_id
+                stored = layer.up_b[ws_idx, :, :rank_per_expert]
+                logical = adapter_layer.up_b[expert_id]
+                for n in range(inter):
+                    gate_row = 16 * (n // 8) + n % 8
+                    assert torch.allclose(stored[gate_row], logical[n])
+                    assert torch.allclose(stored[gate_row + 8], logical[inter + n])
+                # The plain half-split order must NOT be what was stored.
+                assert not torch.allclose(stored, logical)
 
     def test_moe_rank_not_divisible_by_experts_per_token_raises(
         self, moe_config: TextConfig, device: torch.device
