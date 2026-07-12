@@ -96,6 +96,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     max_seq_length: int
     image_prefix_length: int
     vocab_size: int
+    supports_context_clamped_generation: bool
 
     # Speculative decoding capability. ``None`` (the default on every runtime
     # today) means one token per decode step, identical to non-speculative
@@ -127,6 +128,12 @@ class AutoregressiveRuntime(Runtime, Protocol):
     def can_reserve(self, total_length: int) -> bool: ...
 
     def prefill_budget(self) -> tuple[int, int]: ...
+
+    def initial_reserve_length(self, prompt_length: int, max_length: int) -> int: ...
+
+    def expand_kv_reservation(
+        self, state: SequenceState, tokens: int = ...
+    ) -> bool: ...
 
     # Image preprocessing. The engine receives raw images (np.ndarray
     # or bytes) and needs them converted to whatever opaque payload the

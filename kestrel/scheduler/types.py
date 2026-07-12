@@ -58,11 +58,14 @@ class RequestLifecycle:
     prefill_completed_at: Optional[float] = None
     first_token_time: Optional[float] = None
     completed_at: Optional[float] = None
+    accumulated_prefill_time_ms: float = 0.0
+    accumulated_decode_time_ms: float = 0.0
 
     # Output
     finish_reason: Optional[str] = None
     error: Optional[BaseException] = None
     logprobs: List[float] = field(default_factory=list)
+    kv_preemptions: int = 0
 
     def __post_init__(self) -> None:
         prefix_logprobs = self.request.generated_prefix.logprobs
@@ -83,6 +86,26 @@ class RequestLifecycle:
             raise RuntimeError("sequence_state is not set")
         return self.sequence_state
 
+    def accumulate_current_timing(self, now: float) -> None:
+        """Fold the current prefill/decode segment into cumulative metrics."""
+        if self.prefill_started_at is None:
+            return
+        prefill_completed_at = self.prefill_completed_at
+        if prefill_completed_at is None:
+            self.accumulated_prefill_time_ms += max(
+                (now - self.prefill_started_at) * 1000.0,
+                0.0,
+            )
+            return
+        self.accumulated_prefill_time_ms += max(
+            (prefill_completed_at - self.prefill_started_at) * 1000.0,
+            0.0,
+        )
+        self.accumulated_decode_time_ms += max(
+            (now - prefill_completed_at) * 1000.0,
+            0.0,
+        )
+
     def build_metrics(
         self,
         *,
@@ -94,21 +117,35 @@ class RequestLifecycle:
         prefill_completed_at = self.prefill_completed_at or prefill_started_at
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
+        request_time_ms = max((completed_at - queued_at) * 1000.0, 0.0)
+        prefill_time_ms = self.accumulated_prefill_time_ms + max(
+            (prefill_completed_at - prefill_started_at) * 1000.0,
+            0.0,
+        )
+        decode_time_ms = self.accumulated_decode_time_ms + max(
+            (completed_at - prefill_completed_at) * 1000.0,
+            0.0,
+        )
+        prompt_tokens = (
+            self.request.prompt_length
+            + self.request.image_length
+            + self.request.initial_generated_prefix_length
+        )
         if self.sequence_state is not None:
-            prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
         else:
-            prompt_tokens = self.request.prompt_length
             cached = 0
         if cached_tokens is None:
             cached_tokens = cached
         return RequestMetrics(
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
-            prefill_time_ms=max((prefill_completed_at - prefill_started_at) * 1000.0, 0.0),
+            prefill_time_ms=prefill_time_ms,
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),
-            decode_time_ms=max((completed_at - prefill_completed_at) * 1000.0, 0.0),
+            decode_time_ms=decode_time_ms,
+            request_time_ms=request_time_ms,
             cached_tokens=cached_tokens,
+            kv_preemptions=self.kv_preemptions,
         )
 
     def stage_token(
@@ -194,6 +231,7 @@ class GenerationRequest:
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
 
     prompt_length: int = field(init=False)
+    initial_generated_prefix_length: int = field(init=False)
 
     def __post_init__(self) -> None:
         tokens = list(self.prompt_tokens)
@@ -220,6 +258,7 @@ class GenerationRequest:
         # Prompt tokens are already materialized (including BOS if required by
         # the template), so prompt_length is the list length.
         self.prompt_length = len(tokens)
+        self.initial_generated_prefix_length = len(prefix_tokens)
         if self.request_context is None:
             raise ValueError("request_context must be provided")
         if self.temperature < 0.0:
@@ -276,17 +315,18 @@ class RequestMetrics:
     prefill_time_ms: float
     ttft_ms: float
     decode_time_ms: float
+    request_time_ms: float = 0.0
     cached_tokens: int = 0  # KV positions reused from prefix cache
+    kv_preemptions: int = 0  # Number of KV preemptions for this request
 
 
 @dataclass
 class StepPlan:
     """Decode step plan returned by schedule_decode_step.
 
-    This is a pure selection of which requests to include in the next decode
-    step. It does not mutate any state - the scheduler remains a stateless
-    selector. Actual state changes (inflight_refs increment, GPU dispatch)
-    happen when the plan is executed via launch_forward_async.
+    The scheduler may reserve KV or preempt idle rows before returning a plan,
+    but the plan itself only names the rows to launch. Refcount increments,
+    sequence length advances, and GPU dispatch happen in launch_forward_async.
     """
 
     sequences: List["RequestLifecycle"]

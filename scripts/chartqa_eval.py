@@ -52,21 +52,10 @@ PREFIX = (
     "and provide a precise answer without any additional explanation or formatting. "
 )
 POT_PREFIX = "Write a Python program to answer the following question: "
-# CoT output cap, per-model. This matters beyond truncation: the engine reserves
-# prompt + max_tokens of paged KV at admission (scheduler reserve_length), so an
-# oversized cap cuts batch concurrency and can exceed a small model's context
-# window. Moondream 2/3 reasoning is short (<300 tokens); Gemma 4's CoT channel
-# is verbose and needs the larger budget — hence per-model rather than a single
-# global value.
-COT_MAX_TOKENS_DEFAULT = 1536  # Gemma 4 / unknown models: verbose CoT channel
-COT_MAX_TOKENS_BY_MODEL = {
-    "moondream2": 512,
-    "moondream3-preview": 512,
-}
-
-
-def cot_max_tokens(model: str) -> int:
-    return COT_MAX_TOKENS_BY_MODEL.get(model, COT_MAX_TOKENS_DEFAULT)
+# CoT output cap. This is intentionally generous for verbose reasoning models;
+# runtimes that reserve KV incrementally no longer need model-specific lower caps
+# just to avoid admission over-reservation.
+COT_MAX_TOKENS = 1536
 DEFAULT_MAX_TOKENS = 10
 POT_MAX_TOKENS = 200
 
@@ -252,7 +241,7 @@ def build_prompt_and_settings(
     if cot_samples > 0:
         prompt = question.strip()
         reasoning = True
-        max_tokens = cot_max_tokens(model)
+        max_tokens = COT_MAX_TOKENS
         if cot_samples > 1 and temperature == 0.0:
             # Preserve legacy behaviour of injecting small stochasticity for CoT@N
             temperature = 1.0
@@ -348,8 +337,9 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     total_prefill_ms = 0.0
     total_decode_ms = 0.0
     request_count = 0
-    request_times_ms: List[float] = []  # prefill + decode per request
+    request_times_ms: List[float] = []  # end-to-end request latency
     cache_hit_count = 0  # requests with cached_tokens > 0
+    total_kv_preemptions = 0
     dump_handle = None
     if cfg.dump_jsonl is not None:
         dump_path = cfg.dump_jsonl.expanduser()
@@ -359,13 +349,14 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
     def record_metrics(metrics: EngineMetrics) -> None:
         nonlocal total_input_tokens, total_output_tokens
         nonlocal total_prefill_ms, total_decode_ms, request_count
-        nonlocal cache_hit_count
+        nonlocal cache_hit_count, total_kv_preemptions
         total_input_tokens += metrics.input_tokens
         total_output_tokens += metrics.output_tokens
         total_prefill_ms += metrics.prefill_time_ms
         total_decode_ms += metrics.decode_time_ms
+        total_kv_preemptions += metrics.kv_preemptions
         request_count += 1
-        request_times_ms.append(metrics.prefill_time_ms + metrics.decode_time_ms)
+        request_times_ms.append(metrics.request_time_ms)
         if metrics.cached_tokens > 0:
             cache_hit_count += 1
 
@@ -492,7 +483,9 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
                     "prefill_time_ms": metrics_for_dump.prefill_time_ms,
                     "decode_time_ms": metrics_for_dump.decode_time_ms,
                     "ttft_ms": metrics_for_dump.ttft_ms,
+                    "request_time_ms": metrics_for_dump.request_time_ms,
                     "cached_tokens": metrics_for_dump.cached_tokens,
+                    "kv_preemptions": metrics_for_dump.kv_preemptions,
                 }
             dump_handle.write(
                 json.dumps(
@@ -591,6 +584,7 @@ async def eval_chartqa(cfg: EvalConfig) -> Dict[str, Any]:
             "total_decode_ms": total_decode_ms,
             "request_times_ms": request_times_ms,
             "cache_hit_count": cache_hit_count,
+            "total_kv_preemptions": total_kv_preemptions,
         },
         "wall_time_s": wall_time_s,
         "prefix_cache_enabled": cfg.enable_prefix_cache,
@@ -726,6 +720,7 @@ def print_results(results: Dict[str, Any]) -> None:
         total_prefill_ms = usage.get("total_prefill_ms", 0.0)
         total_decode_ms = usage.get("total_decode_ms", 0.0)
         request_times_ms = usage.get("request_times_ms", [])
+        total_kv_preemptions = usage.get("total_kv_preemptions", 0)
 
         avg_input_tokens = (
             total_input_tokens / request_count if request_count else 0.0
@@ -738,6 +733,13 @@ def print_results(results: Dict[str, Any]) -> None:
         if wall_time_s > 0:
             print(f"Prefill Throughput: {total_input_tokens / wall_time_s:.2f} tok/s")
             print(f"Decode Throughput: {total_output_tokens / wall_time_s:.2f} tok/s")
+        avg_kv_preemptions = (
+            total_kv_preemptions / request_count if request_count else 0.0
+        )
+        print(
+            "KV preemptions: "
+            f"{total_kv_preemptions} total, {avg_kv_preemptions:.3f} / request"
+        )
         # Prefix cache stats (only when enabled)
         if results.get("prefix_cache_enabled", False) and request_count > 0:
             cache_hit_count = usage.get("cache_hit_count", 0)
@@ -748,12 +750,12 @@ def print_results(results: Dict[str, Any]) -> None:
             requests_per_second = request_count / wall_time_s
             print(f"Requests per second: {requests_per_second:.2f}")
 
-        # Request latency stats (prefill + decode)
+        # Request latency stats (submit to completion)
         if request_times_ms:
             p50_ms = percentile(request_times_ms, 50)
             p90_ms = percentile(request_times_ms, 90)
             p99_ms = percentile(request_times_ms, 99)
-            print(f"\nRequest Latency (prefill + decode):")
+            print(f"\nRequest Latency (end-to-end):")
             print(f"  P50:  {p50_ms:.2f} ms")
             print(f"  P90:  {p90_ms:.2f} ms")
             print(f"  P99:  {p99_ms:.2f} ms")

@@ -1731,8 +1731,22 @@ class InferenceEngine:
             suppress_next_token_ids=req.suppress_next_token_ids,
         )
         limit = runtime.max_seq_length
+        prompt_total = len(request_obj.prefill_tokens) + request_obj.image_length
+        if prompt_total > limit:
+            raise ValueError(
+                "Prompt length exceeds runtime max_seq_length: "
+                f"needs {prompt_total} tokens but limit is {limit}."
+            )
+        if prompt_total == limit and request_obj.remaining_new_tokens > 0:
+            raise ValueError(
+                "Prompt length leaves no room for generation: "
+                f"prompt uses {prompt_total} tokens and limit is {limit}."
+            )
         target_total = request_obj.target_length
-        if target_total > limit:
+        if (
+            target_total > limit
+            and not runtime.supports_context_clamped_generation
+        ):
             raise ValueError(
                 "Request length exceeds runtime max_seq_length: "
                 f"needs {target_total} tokens but limit is {limit}."
@@ -1795,13 +1809,16 @@ class InferenceEngine:
         prefill_time_ms = max(sched_metrics.prefill_time_ms, 0.0)
         decode_time_ms = max(sched_metrics.decode_time_ms, 0.0)
         ttft_ms = max(sched_metrics.ttft_ms, 0.0)
+        request_time_ms = max(sched_metrics.request_time_ms, 0.0)
         metrics = EngineMetrics(
             input_tokens=sched_metrics.prompt_tokens,
             output_tokens=sched_metrics.decode_tokens,
             prefill_time_ms=prefill_time_ms,
             decode_time_ms=decode_time_ms,
             ttft_ms=ttft_ms,
+            request_time_ms=request_time_ms,
             cached_tokens=sched_metrics.cached_tokens,
+            kv_preemptions=sched_metrics.kv_preemptions,
         )
         return EngineResult(
             request_id=result.request_id,

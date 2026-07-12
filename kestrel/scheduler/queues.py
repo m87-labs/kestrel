@@ -16,6 +16,9 @@ class FIFOQueue(Generic[T]):
     def push(self, item: T) -> None:
         self._items.append(item)
 
+    def push_front(self, item: T) -> None:
+        self._items.appendleft(item)
+
     def pop(self) -> T:
         return self._items.popleft()
 
@@ -27,6 +30,9 @@ class FIFOQueue(Generic[T]):
 
     def __iter__(self) -> Iterator[T]:
         return iter(self._items)
+
+    def __reversed__(self) -> Iterator[T]:
+        return reversed(self._items)
 
     def extend(self, items: Iterable[T]) -> None:
         self._items.extend(items)

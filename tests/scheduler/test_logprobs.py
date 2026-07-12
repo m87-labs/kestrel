@@ -101,6 +101,7 @@ def _sequence(
         request=SimpleNamespace(
             temperature=temperature,
             return_logprobs=return_logprobs,
+            initial_generated_prefix_length=generated_prefix_length,
             generated_prefix_length=generated_prefix_length,
             suppress_next_token_ids=suppress_next_token_ids,
         ),
@@ -181,6 +182,7 @@ def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
 
     assert result.tokens == [TextToken(10), TextToken(11), TextToken(12)]
     assert result.logprobs == [-0.1, -0.2, -0.3]
+    assert result.metrics.prompt_tokens == 3
     assert result.metrics.decode_tokens == 1
 
 
@@ -197,6 +199,7 @@ def test_generation_request_tracks_generated_prefix_prefill_shape() -> None:
 
     assert request.prompt_length == 1
     assert request.generated_prefix_length == 2
+    assert request.initial_generated_prefix_length == 2
     assert request.remaining_new_tokens == 2
     assert request.prefill_tokens == [TextToken(1), TextToken(10), TextToken(11)]
     assert request.target_length == 5

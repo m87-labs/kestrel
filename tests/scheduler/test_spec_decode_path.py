@@ -286,6 +286,18 @@ def test_spec_admit_stages_first_token_and_queues() -> None:
     assert r0.lifecycle.state.batch_idx in rt.active_sequences
 
 
+def test_spec_admit_clamps_oversized_generation_cap() -> None:
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
+    rt = _spec_runtime(dec)
+    rt.max_seq_length = 8
+    sched = _make_scheduler(rt)
+    request = _enqueue(sched, 0, prompt_len=3, max_new=20)
+
+    assert sched._spec_admit() is True
+    assert request.target_length > rt.max_seq_length
+    assert request.lifecycle.state.max_length == rt.max_seq_length
+
+
 def test_spec_step_variable_advance_and_state_length() -> None:
     dec = _FakeDecoder(
         n_rows=2,
@@ -765,9 +777,11 @@ def test_spec_admit_applies_one_shot_suppression() -> None:
 def test_spec_admit_no_one_shot_suppression_past_prefix() -> None:
     """One-shot suppression is *not* forwarded once past a request's prefix.
 
-    Mirrors the non-spec gate (``token_count == generated_prefix_length``): a
-    resumed request that already generated its prefix is not on its first
-    generated token, so the one-shot suppression must not re-fire at admit.
+    Mirrors the non-spec gate
+    (``token_count == request.initial_generated_prefix_length``): a resumed
+    request that already generated past its original prefix is not on its first
+    caller-visible generated token, so the one-shot suppression must not re-fire
+    at admit.
     """
 
     class _PrefixState(_RecordingState):
@@ -786,7 +800,7 @@ def test_spec_admit_no_one_shot_suppression_past_prefix() -> None:
     req.skill_state = prefix_state
 
     assert sched._spec_admit() is True
-    # token_count (1) != generated_prefix_length (0) -> suppression not applied.
+    # token_count (1) != request.initial_generated_prefix_length (0), so no suppression.
     assert dec.admit_kwargs[0]["suppress_next_token_ids"] is None
 
 
@@ -2063,9 +2077,10 @@ def test_spec_admit_image_sequence_state_includes_image_kv_length() -> None:
     non-spec ``prepare_sequence`` (which expands a single-image prefix /
     ``ImageMarker``s into the KV prompt length). Initializing ``length`` /
     ``prompt_length`` from the typed token count alone (leaving ``image_length``
-    at 0) made ``build_metrics`` under-report prompt tokens by the image prefix
-    and skewed ``output_length`` (``length - prompt_length``). Assert the state
-    carries ``len(prompt_tokens) + request.image_length`` and ``image_length``.
+    at 0) skewed ``output_length`` (``length - prompt_length``) and made the
+    spec row disagree with the rest of the scheduler's KV accounting. Assert the
+    state carries ``len(prompt_tokens) + request.image_length`` and
+    ``image_length``.
     """
     dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
     rt = _spec_runtime(dec)
@@ -2130,9 +2145,10 @@ def test_spec_admit_zero_token_request_admits_and_samples_nothing() -> None:
     assert dec.admitted == []
     assert dec.retired == []
     assert rt.active_sequences == {}
-    # Not queued into running. A metrics-only ``SequenceState`` is attached so
-    # ``build_metrics`` reports the KV prompt length (no spec pool row backs it:
-    # ``batch_idx == -1`` and ``_release_sequence`` early-returns for spec).
+    # Not queued into running. An unbacked ``SequenceState`` is attached so
+    # KV-length bookkeeping matches the regular admission path (no spec pool row
+    # backs it: ``batch_idx == -1`` and ``_release_sequence`` early-returns for
+    # spec).
     assert len(sched.running) == 0
     assert len(sched.waiting) == 0
     assert req.lifecycle.sequence_state is not None
@@ -2155,13 +2171,12 @@ def test_spec_admit_zero_token_image_request_reports_image_prompt_tokens() -> No
     The ``max_new_tokens <= 0`` spec fast-path finalizes WITHOUT calling
     ``decoder.admit`` (no pool row), so it does not go through the regular spec
     admit path that records ``prompt_length = len(prompt_tokens) + image_length``.
-    Earlier it left ``sequence_state`` unset, so ``build_metrics`` fell back to
-    the TEXT-ONLY ``request.prompt_length`` and under-reported ``prompt_tokens``
-    by the image KV prefix -- even though the request carried image context. The
-    fast-path now attaches a metrics-only ``SequenceState`` whose KV prompt
-    length includes ``image_length`` (matching the regular spec path and the
-    non-spec 0-length path, whose ``prepare_sequence`` state also includes the
-    image prefix). Assert a zero-token IMAGE request reports
+    Earlier it left ``sequence_state`` unset, so the fast path had no
+    image-inclusive KV state even though the request carried image context. The
+    fast-path now attaches an unbacked ``SequenceState`` whose KV prompt length
+    includes ``image_length`` (matching the regular spec path and the non-spec
+    0-length path, whose ``prepare_sequence`` state also includes the image
+    prefix). Assert a zero-token IMAGE request reports
     ``prompt_tokens == prompt_len + image_length``.
     """
     dec = _FakeDecoder(n_rows=1, first_tokens={0: 11}, plans={0: [[12]]})
@@ -2181,7 +2196,7 @@ def test_spec_admit_zero_token_image_request_reports_image_prompt_tokens() -> No
     assert rt.active_sequences == {}
     assert len(sched.running) == 0
     assert len(sched.waiting) == 0
-    # Metrics-only state carries the image-inclusive KV prompt length; no pool
+    # Unbacked state carries the image-inclusive KV prompt length; no pool
     # row backs it (batch_idx == -1).
     state = req.lifecycle.sequence_state
     assert state is not None
@@ -2947,9 +2962,9 @@ def test_spec_admit_zero_token_request_bypasses_saturated_batch() -> None:
     # was never called for it (row 99's id is not among the admitted pool rows;
     # admitted rows are the 4 real ones [0..3]).
     assert 99 not in dec.admitted
-    # No spec POOL ROW is assigned (``decoder.admit`` never ran), but a
-    # metrics-only ``SequenceState`` is attached so ``build_metrics`` reports the
-    # KV prompt length; it is unbacked (``batch_idx == -1``).
+    # No spec POOL ROW is assigned (``decoder.admit`` never ran), but an
+    # unbacked ``SequenceState`` is attached so KV-length bookkeeping matches the
+    # regular admission path.
     assert rz.lifecycle.sequence_state is not None
     assert rz.lifecycle.sequence_state.batch_idx == -1
     assert rz.lifecycle.sequence_state.prompt_length == rz.prompt_length

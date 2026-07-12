@@ -40,12 +40,14 @@ from kestrel.runtime.tokens import Token
 class _FakePageTable:
     """Stand-in for :class:`kestrel.kv_cache.PageTable`.
 
-    Exposes the attributes the scheduler reads (``page_size``) plus a
-    ``commit_block_table`` no-op so decode-step tests can run.
+    Exposes the attributes the scheduler reads (``page_size`` and
+    ``capacity``) plus a ``commit_block_table`` no-op so decode-step tests can
+    run.
     """
 
-    def __init__(self, *, page_size: int = 1) -> None:
+    def __init__(self, *, page_size: int = 1, max_batch_slots: int = 2) -> None:
         self.page_size = page_size
+        self.capacity = [0 for _ in range(max_batch_slots)]
         self.commit_block_table_calls: list[list[int] | None] = []
 
     def commit_block_table(self, batch_indices: list[int] | None = None) -> None:
@@ -117,6 +119,8 @@ class FakeRuntime:
         self.max_seq_length = max_seq_length
         self.image_prefix_length = image_prefix_length
         self.vocab_size = vocab_size
+        self.supports_context_clamped_generation = True
+        self.decode_reserve_tokens = 16
 
         # Device + streams
         self.device: torch.device = (
@@ -151,7 +155,11 @@ class FakeRuntime:
         self.config: Any = None
         self.region: Any = None
         self.spatial_tables: Any = None
-        self.page_table = _FakePageTable(page_size=page_size)
+        page_table_slots = max(max_batch_slots, max_batch_size)
+        self.page_table = _FakePageTable(
+            page_size=page_size,
+            max_batch_slots=page_table_slots,
+        )
 
         # Engine + scheduler infrastructure
         self.prefix_cache: Any = None
@@ -175,6 +183,8 @@ class FakeRuntime:
         self.retained_prefixes: list[dict[str, Any]] = []
         self.released_sequences: list[SequenceState] = []
         self.decode_calls: list[tuple[Any, int]] = []
+        self.expand_kv_reservation_calls: list[tuple[SequenceState, int]] = []
+        self.kv_reservation_failures: set[int] = set()
 
     # Capacity queries -------------------------------------------------
     def can_reserve(self, total_length: int) -> bool:
@@ -182,6 +192,19 @@ class FakeRuntime:
 
     def prefill_budget(self) -> tuple[int, int]:
         return (self.max_seq_length, self.max_batch_slots)
+
+    def initial_reserve_length(self, prompt_length: int, max_length: int) -> int:
+        if max_length <= prompt_length:
+            return max_length
+        return min(max_length, prompt_length + self.decode_reserve_tokens)
+
+    def expand_kv_reservation(
+        self, state: SequenceState, tokens: int = 1
+    ) -> bool:
+        self.expand_kv_reservation_calls.append((state, tokens))
+        if state.batch_idx in self.kv_reservation_failures:
+            return False
+        return True
 
     # Image preprocessing ----------------------------------------------
     def preprocess_image_async(self, image: Any) -> Future:

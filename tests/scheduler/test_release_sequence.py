@@ -38,6 +38,7 @@ def _make_lifecycle(
     runtime: FakeRuntime,
     *,
     request_id: int = 7,
+    generated_prefix: GeneratedPrefix | None = None,
 ) -> RequestLifecycle:
     state = SequenceState(
         batch_idx=0,
@@ -56,6 +57,7 @@ def _make_lifecycle(
         request_context=object(),
         image_hash=b"0123456789abcdef",
         adapter="adapter-a",
+        generated_prefix=generated_prefix or GeneratedPrefix(),
     )
     lifecycle = RequestLifecycle(
         request=request,
@@ -89,10 +91,12 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
 
 def test_release_sequence_retains_only_decoded_suffix_after_generated_prefix() -> None:
     runtime = FakeRuntime()
-    lifecycle = _make_lifecycle(runtime)
+    lifecycle = _make_lifecycle(
+        runtime,
+        generated_prefix=GeneratedPrefix(tokens=(TextToken(10),)),
+    )
     lifecycle.state.length = 4
     lifecycle.state.prompt_length = 2
-    lifecycle.request.generated_prefix = GeneratedPrefix(tokens=(TextToken(10),))
     lifecycle.skill_state.tokens = [TextToken(10), TextToken(11), TextToken(12)]
 
     scheduler = object.__new__(GenerationScheduler)
@@ -103,6 +107,32 @@ def test_release_sequence_retains_only_decoded_suffix_after_generated_prefix() -
     assert len(runtime.retained_prefixes) == 1
     retain_call = runtime.retained_prefixes[0]
     assert retain_call["generated_tokens"] == [TextToken(11), TextToken(12)]
+    assert runtime.released_sequences == [lifecycle.state]
+
+
+def test_release_sequence_retains_only_suffix_after_preemption_generated_prefix() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    lifecycle.state.length = 5
+    lifecycle.state.prompt_length = 3
+    lifecycle.request.generated_prefix = GeneratedPrefix(
+        tokens=(TextToken(10), TextToken(11)),
+    )
+    lifecycle.skill_state.tokens = [
+        TextToken(10),
+        TextToken(11),
+        TextToken(12),
+        TextToken(13),
+    ]
+
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    GenerationScheduler._release_sequence(scheduler, lifecycle)
+
+    assert len(runtime.retained_prefixes) == 1
+    retain_call = runtime.retained_prefixes[0]
+    assert retain_call["generated_tokens"] == [TextToken(12), TextToken(13)]
     assert runtime.released_sequences == [lifecycle.state]
 
 
