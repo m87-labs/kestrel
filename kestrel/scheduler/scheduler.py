@@ -1870,6 +1870,7 @@ class GenerationScheduler:
             return False
 
         bound_batch: list[_BoundPrefill] = []
+        bound_use_prefix_attn: bool | None = None
         progress = False
         while True:
             deferred_count_before = len(deferred_lora_ids)
@@ -1892,6 +1893,7 @@ class GenerationScheduler:
                         progress = True
                         continue
 
+                prepared: PreparedSequence | None = None
                 try:
                     if not candidate.can_reuse:
                         self._ensure_single_image_crops(request)
@@ -1907,7 +1909,11 @@ class GenerationScheduler:
                         image_hash=request.image_hash,
                         adapter_id=request.adapter,
                     )
+                    if not prepared.cache_result.can_reuse:
+                        self._ensure_single_image_crops(request)
                 except Exception as exc:
+                    if prepared is not None:
+                        self.runtime.abort_prepared_sequence(prepared)
                     lifecycle.prefill_started_at = None
                     lifecycle.prefill_completed_at = None
                     if acquired_lora:
@@ -1924,6 +1930,29 @@ class GenerationScheduler:
                     self.waiting.remove(request)
                     self._fail_request_early(request, exc)
                     progress = True
+                    continue
+
+                actual_use_prefix_attn = (
+                    bool(prepared.state.image_length)
+                    and not prepared.cache_result.can_reuse
+                )
+                if bound_use_prefix_attn is None:
+                    bound_use_prefix_attn = actual_use_prefix_attn
+                elif actual_use_prefix_attn != bound_use_prefix_attn:
+                    # Prefix-cache state can change between planning and binding;
+                    # retry rows whose actual prefill mode no longer matches.
+                    self.runtime.abort_prepared_sequence(prepared)
+                    lifecycle.prefill_started_at = None
+                    lifecycle.prefill_completed_at = None
+                    if acquired_lora:
+                        self.runtime.release_adapter_slot(request.lora_slot)
+                        request.lora_slot = 0
+                        lifecycle.lora_slot_ready = False
+                    lifecycle.transition(
+                        RequestPhase.READY_FOR_PREFILL
+                        if (lifecycle.crops_ready and lifecycle.lora_slot_ready)
+                        else RequestPhase.WAITING_RESOURCES
+                    )
                     continue
 
                 lifecycle.sequence_state = prepared.state
