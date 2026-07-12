@@ -2288,9 +2288,11 @@ class GenerationScheduler:
         if defer_idx is None:
             defer_idx = len(dispatchable) - 1
 
-        deferred = dispatchable.pop(defer_idx)
+        deferred = dispatchable[defer_idx]
         self._last_deferred_request_id = deferred.request.request_id
-        return dispatchable[:limit]
+        if defer_idx >= limit:
+            return dispatchable[:limit]
+        return dispatchable[:defer_idx] + dispatchable[defer_idx + 1 : limit + 1]
 
     def schedule_decode_step(self) -> Optional[StepPlan]:
         """Select sequences for the next decode step.
@@ -2329,7 +2331,7 @@ class GenerationScheduler:
         # Keep the launch within the runtime batch size while preserving fairness.
         decode_limit = self.runtime.max_batch_size
         if len(dispatchable) > decode_limit:
-            selected = self._cap_decode_dispatch(list(dispatchable), decode_limit)
+            selected = self._cap_decode_dispatch(dispatchable, decode_limit)
         else:
             selected = dispatchable
             self._last_deferred_request_id = None
