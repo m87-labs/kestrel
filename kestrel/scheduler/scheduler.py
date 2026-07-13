@@ -359,7 +359,6 @@ class GenerationScheduler:
         self._sampling_rng = torch.Generator(device=runtime.device)
         self._sampling_rng.manual_seed(torch.seed())
         self._pipeline = PipelineState()
-        self._last_deferred_request_id: int | None = None
         # Depth-1 spec overlap: the previously-launched macro-step's
         # (sequences, lazy SpecStepResult) awaiting commit while the GPU runs the
         # next step. None when no spec step is in flight.
@@ -669,11 +668,11 @@ class GenerationScheduler:
         # ``decoder.step`` call -- but the verify/draft CUDA graphs and staging
         # buffers are captured for ``max_batch_size`` states, so an oversized
         # batch overruns them. The non-spec path enforces the same bound via its
-        # ``max_batch_size`` dispatch cap (``_cap_decode_dispatch``); bound the
-        # spec batch at admission so the running set -- and thus every
-        # ``decoder.step`` -- never exceeds it. Excess launchable requests stay
-        # WAITING and are admitted as running rows retire (same deferral the
-        # non-spec path applies when more rows are dispatchable than fit).
+        # ``max_batch_size`` decode cohort; bound the spec batch at admission so
+        # the running set -- and thus every ``decoder.step`` -- never exceeds it.
+        # Excess launchable requests stay WAITING and are admitted as running
+        # rows retire. The non-spec path can instead keep one extra prefilled
+        # request resident because its page-table rows are allocated on demand.
         max_running = self.runtime.max_batch_size
         while decoder.free_slots > 0 and len(self.running) < max_running:
             request = next(
@@ -1985,29 +1984,6 @@ class GenerationScheduler:
                 return False
         return True
 
-    def _cap_decode_dispatch(
-        self,
-        dispatchable: List[RequestLifecycle],
-        limit: int,
-    ) -> List[RequestLifecycle]:
-        """Cap decode dispatch size while keeping deterministic, fair ordering."""
-        if len(dispatchable) <= limit:
-            self._last_deferred_request_id = None
-            return dispatchable
-
-        last_deferred = self._last_deferred_request_id
-        defer_idx: int | None = None
-        for idx in range(len(dispatchable) - 1, -1, -1):
-            if dispatchable[idx].request.request_id != last_deferred:
-                defer_idx = idx
-                break
-        if defer_idx is None:
-            defer_idx = len(dispatchable) - 1
-
-        deferred = dispatchable.pop(defer_idx)
-        self._last_deferred_request_id = deferred.request.request_id
-        return dispatchable[:limit]
-
     def schedule_decode_step(self) -> Optional[StepPlan]:
         """Select sequences for the next decode step.
 
@@ -2023,8 +1999,22 @@ class GenerationScheduler:
         if not len(self.running):
             return None
 
-        active: list[RequestLifecycle] = []
+        # Keep decode membership stable until a cohort member retires. Prefill
+        # may leave one additional request resident in ``running`` to preserve
+        # prefill headroom, but that tail request waits for a cohort slot instead
+        # of rotating into alternate token steps. Select the cohort BEFORE
+        # checking temporary dispatchability: otherwise a pipelined member with
+        # two in-flight references would let the resident tail slip into one
+        # launch, reintroducing composition churn and irregular inter-token
+        # latency.
+        cohort: list[RequestLifecycle] = []
         for seq in self.running:
+            if len(cohort) >= self.runtime.max_batch_size:
+                break
+            cohort.append(seq)
+
+        active: list[RequestLifecycle] = []
+        for seq in cohort:
             if not seq.needs_decode():
                 continue
             if not self._can_dispatch(seq):
@@ -2033,12 +2023,6 @@ class GenerationScheduler:
 
         if not active:
             return None
-
-        decode_limit = self.runtime.max_batch_size
-        if len(active) > decode_limit:
-            active = self._cap_decode_dispatch(active, decode_limit)
-        else:
-            self._last_deferred_request_id = None
 
         return StepPlan(sequences=active)
 
