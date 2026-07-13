@@ -839,14 +839,12 @@ class MoondreamRuntime:
             plan_eager=self._plan_megakernel_buckets,
         )
         # Whole-model decode megakernel: the deploy target (model_kind, arch, num_sms) for this
-        # loaded model, resolved once (None => no megakernel here), and the decode buckets it serves
-        # eagerly (populated at graph-build time by ``_plan_megakernel_buckets``). A served bucket
-        # SKIPS native graph capture (see decode_graph.py) and routes each step to the eager
-        # megakernel, so the megakernel actually runs in production instead of a replayed native graph.
+        # loaded model, resolved once (None => no megakernel here). DecodeGraphManager owns each
+        # slot's eager-bucket plan: a served bucket skips native capture and routes each step to the
+        # eager megakernel instead of a replayed native graph.
         self._megakernel_target: tuple[str, int, int] | None = megakernel_decode.deploy_target(
             self.model_name, self.device
         )
-        self._megakernel_served_buckets: set[int] = set()
         self._megakernel_failed_buckets: set[int] = set()
 
         # Shared pending coord/size values, indexed by batch_idx. These
@@ -2406,9 +2404,11 @@ class MoondreamRuntime:
         slot.decode_coord_values.zero_()
         slot.decode_size_values.zero_()
         slot.meta.batch_idx.gpu.zero_()
+        slot.meta.batch_idx.cpu.zero_()
         slot.meta.input_pos.gpu.zero_()
         slot.meta.input_pos.cpu.zero_()
         slot.meta.lora_slot_ids.gpu.zero_()
+        slot.meta.lora_slot_ids.cpu.zero_()
         slot.meta.active_token_ids.gpu.zero_()
         slot.meta.active_token_ids.cpu.zero_()
         slot.meta.active_lora_ids.gpu.zero_()
@@ -2458,11 +2458,11 @@ class MoondreamRuntime:
     ) -> None:
         """Run decode forward pass and write results to slot output buffers.
 
-        This is the core forward computation. For a bucket the whole-model decode megakernel serves
-        (``batch_size in self._megakernel_served_buckets``, decided + warmed at graph-build time) it
-        runs the megakernel EAGERLY -- these buckets have no captured native graph, so this is the
-        real production decode, not a warmup. Every other bucket runs the native decoder and is
-        captured into / replayed from its CUDA graph exactly as before.
+        This is the core forward computation. For a bucket in this slot's eager capture plan
+        (decided + warmed at graph-build time) it runs the megakernel EAGERLY -- these buckets have
+        no captured native graph, so this is the real production decode, not a warmup. Every other
+        bucket runs the native decoder and is captured into / replayed from its CUDA graph exactly
+        as before.
 
         Args:
             slot: DecodeSlot with inputs in its buffers.
@@ -2473,7 +2473,7 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
-        if batch_size in self._megakernel_served_buckets:
+        if batch_size in self._decode_graphs.eager_buckets(slot):
             # Graphs on: a bucket warmed + capture-skipped at graph-build time. The session is built,
             # so this is the real production decode. Capacity is dynamic per active row even though
             # bucket eligibility is static: a request can outgrow the compiled KV extent, or this
@@ -2515,9 +2515,9 @@ class MoondreamRuntime:
 
     def _megakernel_eager_unwarmed(self, batch_size: int) -> bool:
         """Whether to serve ``batch_size`` through the megakernel on the NON-graph path (graphs
-        disabled). With graphs on, the served buckets are decided + warmed at graph-build time
-        (``_megakernel_served_buckets``); with graphs off there is no capture to skip, so gate
-        directly on ``has_megakernel`` and build lazily on the first step (with a native fallback)."""
+        disabled). With graphs on, the per-slot served buckets are decided + warmed at graph-build
+        time; with graphs off there is no capture to skip, so gate directly on ``has_megakernel``
+        and build lazily on the first step (with a native fallback)."""
         if (
             self._decode_graphs.enabled
             or self._megakernel_target is None
@@ -2644,7 +2644,6 @@ class MoondreamRuntime:
                 )
                 continue
             served.add(batch_size)
-        self._megakernel_served_buckets |= served
         return served
 
     def _warm_megakernel_eager(self) -> None:
