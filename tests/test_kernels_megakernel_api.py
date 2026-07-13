@@ -1,4 +1,5 @@
 import importlib
+import inspect
 
 import pytest
 
@@ -21,3 +22,6 @@ def test_pinned_kernels_exposes_megakernel_runtime_api() -> None:
     }
     missing = sorted(required - set(dir(megakernel)))
     assert not missing, f"kestrel-kernels megakernel API is missing {missing}"
+    decode_parameters = inspect.signature(megakernel.decode).parameters
+    assert "batch_idx_cpu" in decode_parameters
+    assert "input_pos_cpu" in decode_parameters

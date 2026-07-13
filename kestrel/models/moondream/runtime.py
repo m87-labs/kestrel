@@ -2473,8 +2473,18 @@ class MoondreamRuntime:
         )
         if batch_size in self._megakernel_served_buckets:
             # Graphs on: a bucket warmed + capture-skipped at graph-build time. The session is built,
-            # so this is the real production decode; a failure here is a genuine error.
-            hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
+            # so this is the real production decode. Capacity is dynamic per active row even though
+            # bucket eligibility is static: a request can outgrow the compiled KV extent, or this
+            # composition can select a shorter reservation. That expected ineligibility runs native
+            # eagerly for this step; kernel/build failures still surface.
+            try:
+                hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
+            except megakernel_decode.MegakernelNotEligible as exc:
+                _LOGGER.info(
+                    "megakernel decode ineligible for bucket %d this step; native (%s)",
+                    batch_size, exc,
+                )
+                hidden = self._native_decode_hidden(slot, batch_size, embeds)
         elif self._megakernel_eager_unwarmed(batch_size):
             # Graphs off: there is no capture to skip, so route the megakernel here, building lazily
             # on the first step and falling back to native on a build/kernel failure (the non-fatal
@@ -2519,8 +2529,9 @@ class MoondreamRuntime:
         megakernel error (the caller only reaches here for a bucket whose warmup succeeded).
 
         Native and megakernel decode consume the same authoritative global page table plus the
-        engine's device ``batch_idx`` and ``input_pos`` tensors. The VM applies compact-row
-        indirection directly."""
+        engine's ``batch_idx`` and ``input_pos`` controls. Their canonical CPU staging views guard
+        compiled/allocation extents without a device sync; the VM consumes the corresponding device
+        views and applies compact-row indirection directly."""
         return megakernel_decode.decode(
             model_name=self.model_name,
             text=self.model.text,
@@ -2532,6 +2543,8 @@ class MoondreamRuntime:
             embeds=embeds,
             batch_idx=slot.meta.batch_idx.gpu[:batch_size],
             input_pos=slot.meta.input_pos.gpu[:batch_size],
+            batch_idx_cpu=slot.meta.batch_idx.cpu[:batch_size],
+            input_pos_cpu=slot.meta.input_pos.cpu[:batch_size],
         )
 
     def _native_decode_hidden(

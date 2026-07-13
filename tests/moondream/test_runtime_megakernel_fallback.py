@@ -7,6 +7,56 @@ from kestrel.models.moondream import runtime as runtime_mod
 from kestrel.models.moondream.runtime import MoondreamRuntime
 
 
+def _forward_runtime(monkeypatch: pytest.MonkeyPatch):
+    runtime = MoondreamRuntime.__new__(MoondreamRuntime)
+    runtime._megakernel_served_buckets = {1}
+    runtime.model = SimpleNamespace(text=object())
+    runtime._embed_packed_token_batch = lambda *args: torch.ones(1, 1, 2)
+    slot = SimpleNamespace(
+        decode_token_ids=torch.zeros(1, dtype=torch.int64),
+        decode_coord_values=torch.zeros(1, 1),
+        decode_size_values=torch.zeros(1, 2),
+        logits=torch.zeros(1, 3),
+        hidden_last=torch.zeros(1, 2),
+    )
+    monkeypatch.setattr(runtime_mod, "lm_head", lambda hidden, text: torch.ones(1, 3))
+    return runtime, slot
+
+
+def test_graphs_on_capacity_ineligibility_falls_back_for_only_this_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, slot = _forward_runtime(monkeypatch)
+    native_calls = []
+    runtime._megakernel_decode_hidden = lambda *args: (_ for _ in ()).throw(
+        runtime_mod.megakernel_decode.MegakernelNotEligible("position exceeds baked extent")
+    )
+    runtime._native_decode_hidden = lambda *args: (
+        native_calls.append(args) or torch.full((1, 1, 2), 2.0)
+    )
+
+    runtime._run_decode_forward(slot, 1)
+
+    assert len(native_calls) == 1
+    assert torch.equal(slot.hidden_last, torch.full((1, 2), 2.0))
+    assert runtime._megakernel_served_buckets == {1}
+
+
+def test_graphs_on_genuine_megakernel_failure_remains_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, slot = _forward_runtime(monkeypatch)
+    runtime._megakernel_decode_hidden = lambda *args: (_ for _ in ()).throw(
+        RuntimeError("kernel failed")
+    )
+    runtime._native_decode_hidden = lambda *args: pytest.fail(
+        "genuine megakernel failures must not be hidden by native fallback"
+    )
+
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        runtime._run_decode_forward(slot, 1)
+
+
 def test_failed_eager_warmup_disables_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = MoondreamRuntime.__new__(MoondreamRuntime)
     runtime._megakernel_target = ("moondream3", 90, 132)
