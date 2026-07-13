@@ -3,6 +3,7 @@
 
 from collections import Counter, deque
 from dataclasses import dataclass
+from itertools import islice
 from typing import Deque, List, Optional, Sequence
 
 import time
@@ -2007,7 +2008,7 @@ class GenerationScheduler:
         # two in-flight references would let the resident tail slip into one
         # launch, reintroducing composition churn and irregular inter-token
         # latency.
-        cohort = list(self.running)[: self.runtime.max_batch_size]
+        cohort = list(islice(self.running, self.runtime.max_batch_size))
 
         active: list[RequestLifecycle] = []
         for seq in cohort:
