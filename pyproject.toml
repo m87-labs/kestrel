@@ -12,7 +12,7 @@ dependencies = [
     "torch-c-dlpack-ext>=0.1.3",
     "httpx>=0.27",
     "kestrel-native==0.1.5",
-    "kestrel-kernels==0.4.7",
+    "kestrel-kernels==0.4.8",
     "huggingface-hub>=0.20",
 ]
 
