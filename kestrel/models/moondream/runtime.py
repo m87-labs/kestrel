@@ -2386,9 +2386,7 @@ class MoondreamRuntime:
         slot.decode_coord_values[batch_size:graph_batch_size].zero_()
         slot.decode_size_values[batch_size:graph_batch_size].zero_()
         slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.batch_idx.cpu[batch_size:graph_batch_size].zero_()
         slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.input_pos.cpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
@@ -2533,8 +2531,6 @@ class MoondreamRuntime:
             embeds=embeds,
             batch_idx=slot.meta.batch_idx.gpu[:batch_size],
             input_pos=slot.meta.input_pos.gpu[:batch_size],
-            batch_idx_host=slot.meta.batch_idx.np[:batch_size],
-            input_pos_host=slot.meta.input_pos.np[:batch_size],
         )
 
     def _native_decode_hidden(
