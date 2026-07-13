@@ -2387,7 +2387,9 @@ class MoondreamRuntime:
         slot.decode_coord_values[batch_size:graph_batch_size].zero_()
         slot.decode_size_values[batch_size:graph_batch_size].zero_()
         slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.batch_idx.cpu[batch_size:graph_batch_size].zero_()
         slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
+        slot.meta.input_pos.cpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
@@ -2491,7 +2493,13 @@ class MoondreamRuntime:
             # fallback the warmup try/except gives the graphs-on path).
             try:
                 hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
-            except Exception as exc:  # non-fatal: any megakernel failure -> native
+            except megakernel_decode.MegakernelNotEligible as exc:
+                _LOGGER.info(
+                    "megakernel decode ineligible for bucket %d this step; native (%s)",
+                    batch_size, exc,
+                )
+                hidden = self._native_decode_hidden(slot, batch_size, embeds)
+            except Exception as exc:  # non-fatal: a build/kernel failure -> native
                 self._megakernel_failed_buckets.add(batch_size)
                 _LOGGER.warning(
                     "megakernel decode failed for bucket %d; native (%s)", batch_size, exc

@@ -57,6 +57,51 @@ def test_graphs_on_genuine_megakernel_failure_remains_fatal(
         runtime._run_decode_forward(slot, 1)
 
 
+def test_padding_clears_host_and_device_megakernel_metadata() -> None:
+    runtime = MoondreamRuntime.__new__(MoondreamRuntime)
+    slot = SimpleNamespace(
+        decode_token_ids=torch.ones(4, dtype=torch.int64),
+        decode_coord_values=torch.ones(4, 1),
+        decode_size_values=torch.ones(4, 2),
+        meta=SimpleNamespace(
+            batch_idx=SimpleNamespace(cpu=torch.ones(4), gpu=torch.ones(4)),
+            input_pos=SimpleNamespace(cpu=torch.ones(4), gpu=torch.ones(4)),
+            lora_slot_ids=SimpleNamespace(cpu=torch.ones(4), gpu=torch.ones(4)),
+        ),
+    )
+
+    runtime._zero_decode_graph_padding(slot, batch_size=3, graph_batch_size=4)
+
+    for mirrored in (slot.meta.batch_idx, slot.meta.input_pos, slot.meta.lora_slot_ids):
+        assert mirrored.cpu.tolist() == [1, 1, 1, 0]
+        assert mirrored.gpu.tolist() == [1, 1, 1, 0]
+
+
+def test_eager_capacity_ineligibility_does_not_disable_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, slot = _forward_runtime(monkeypatch)
+    runtime._megakernel_served_buckets = set()
+    runtime._megakernel_target = ("moondream3", 90, 132)
+    runtime._megakernel_failed_buckets = set()
+    runtime._decode_graphs = SimpleNamespace(enabled=False)
+    runtime._lora_workspace = None
+    native_calls = []
+    runtime._megakernel_decode_hidden = lambda *args: (_ for _ in ()).throw(
+        runtime_mod.megakernel_decode.MegakernelNotEligible("position exceeds baked extent")
+    )
+    runtime._native_decode_hidden = lambda *args: (
+        native_calls.append(args) or torch.full((1, 1, 2), 2.0)
+    )
+    monkeypatch.setattr(runtime_mod.megakernel_decode, "has_megakernel", lambda *args: True)
+
+    runtime._run_decode_forward(slot, 1)
+
+    assert len(native_calls) == 1
+    assert runtime._megakernel_failed_buckets == set()
+    assert runtime._megakernel_eager_unwarmed(1)
+
+
 def test_failed_eager_warmup_disables_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = MoondreamRuntime.__new__(MoondreamRuntime)
     runtime._megakernel_target = ("moondream3", 90, 132)
