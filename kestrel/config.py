@@ -169,6 +169,9 @@ class RuntimeConfig:
     model: str = "moondream3-preview"
     service_name: str = "local"
     tokenizer_path: str | Path | None = None
+    # Optional Moondream DFlash drafter serving checkpoint. When unset, the
+    # runtime keeps the existing one-token decode path.
+    dflash_drafter_path: str | Path | None = None
 
     def __post_init__(self):
         normalized_service_name = self.service_name.strip()

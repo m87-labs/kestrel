@@ -168,6 +168,12 @@ class PointSkillState(SkillState):
             return [pt.coord_id]
         return [pt.coord_id, pt.eos_id]
 
+    @property
+    def emits_spatial_tokens(self) -> bool:
+        # Point decoding is coord tokens end-to-end (x/y), so the spatial head
+        # is live every step.
+        return True
+
 
 def _extract_points(tokens: Sequence[Token]) -> list[Dict[str, float]]:
     points: list[Dict[str, float]] = []

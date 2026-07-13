@@ -225,6 +225,26 @@ class SkillState:
         """
         return None
 
+    @property
+    def emits_spatial_tokens(self) -> bool:
+        """Whether this skill can emit/consume a coord/size token *right now*.
+
+        Drives the runtime's ``post_sample`` spatial-head gate: the coord/size
+        decode head (a ~12.6MB matvec + several sample launches per step) only
+        produces values the skill actually consumes when the sampled id can be
+        ``coord_id`` / ``size_id``. Text-only phases (a plain query answer, a
+        caption) never consume those values, so the head is pure waste there and
+        the runtime skips it. This mirrors "the mode the masks already encode":
+        the same grammar state that gates the coord/size masks gates the compute.
+
+        Default ``False`` (text-only). Spatial skills (point/detect/segment) and
+        the grounded-reasoning phase of a query override this. The property is
+        host-side (no GPU sync) and phase-aware where the skill's grammar is
+        stateful, so gating on it is byte-identical for every skill that can
+        consume a coord/size value.
+        """
+        return False
+
     def stop_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
         """Optional per-skill token ids that end generation.
 

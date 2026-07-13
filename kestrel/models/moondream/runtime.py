@@ -4,6 +4,7 @@
 import contextlib
 import functools
 import json
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional, Sequence, cast
@@ -17,6 +18,7 @@ from torch import Tensor
 
 
 from kestrel_kernels import get_runtime
+from kestrel_kernels import megakernel as megakernel_decode
 from kestrel.config import RuntimeConfig
 from kestrel.device import NoopEvent, empty_cache, get_device_capability, make_event, make_stream, set_device, stream_context
 from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
@@ -29,7 +31,7 @@ from kestrel.prefix_cache import (
     RadixPrefixCache,
     TreeNode,
 )
-from kestrel.runtime.decode_graph import DecodeGraphManager
+from kestrel.runtime.decode_graph import DecodeGraphManager, make_decode_graph_batch_sizes
 from kestrel.runtime import (
     CoordToken,
     ExecutionShape,
@@ -82,6 +84,8 @@ from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot
 
+
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 768
 
@@ -494,6 +498,7 @@ class MoondreamRuntime:
         # Speculative decoding is not wired for Moondream; decode one token per
         # step as before. See kestrel.runtime.spec / the spec-decode design doc.
         self.spec = None
+        self.dflash_drafter = None
         self.dtype = cfg.resolved_dtype()
         set_device(self.device)
         # Guards CUDA graph capture so other threads avoid device-wide sync during capture.
@@ -607,6 +612,16 @@ class MoondreamRuntime:
         # concatenated weights/biases depend on random init/seed rather than the
         # checkpoint.
         self.spatial_tables = build_spatial_decode_tables(self.region)
+        if cfg.dflash_drafter_path is not None:
+            from .dflash import MoondreamDFlashDrafter
+
+            self.dflash_drafter = MoondreamDFlashDrafter.from_checkpoint(
+                cfg.dflash_drafter_path,
+                target_text=self.model.text,
+                spatial_tables=self.spatial_tables,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         if all(val is not None for val in captured_k_scales) and all(
             val is not None for val in captured_v_scales
@@ -625,6 +640,13 @@ class MoondreamRuntime:
         device_sm = device_cc_major * 10 + device_cc_minor
         fp8_kv_supported_sms = {87, 89, 90, 100, 110, 120}
 
+        # The whole-model decode megakernel now reads/appends the engine's fp8 (e4m3) KV pool
+        # DIRECTLY: its ``kv_pool_layer`` builds a Uint8 (e4m3-byte) pool view and its attention read
+        # + qkv-epi append carry the per-layer k/v dequant scales (bit-compatible with native
+        # ``reshape_and_cache_flash`` -- proven by ``mkl/tests/test_fp8_kv_interop.py``). So the pool
+        # is fp8 whenever the checkpoint carries scales on a supported SM, regardless of whether a
+        # megakernel serves the model; the bf16-pool stopgap (which doubled KV bytes + pool memory)
+        # is retired. Native decode reads the same fp8 pool correctly too.
         if (
             self._kv_layer_k_scales is not None
             and self._kv_layer_v_scales is not None
@@ -799,6 +821,11 @@ class MoondreamRuntime:
         # and RenderBuffer, but they share the decode compute stream and copy stream.
         vocab_size = self.model.text.lm_head.weight.shape[0]
         hidden_dim = self.model.text.lm_head.weight.shape[1]
+        dflash_hidden_layers = (
+            self.dflash_drafter.config.target_layer_count
+            if self.dflash_drafter is not None
+            else 0
+        )
         self._decode_slots: list[DecodeSlot] = [
             create_decode_slot(
                 slot_id=slot_id,
@@ -812,6 +839,7 @@ class MoondreamRuntime:
                 size_dtype=size_dtype,
                 compute_stream=self._compute_stream,
                 copy_stream=self._copy_stream,
+                dflash_hidden_layers=dflash_hidden_layers,
             )
             for slot_id in range(2)
         ]
@@ -825,7 +853,17 @@ class MoondreamRuntime:
             prepare_step=self._prepare_decode_graph_step,
             zero_padding=self._zero_decode_graph_padding,
             zero_for_capture=self._zero_decode_graph_capture_buffers,
+            plan_eager=self._plan_megakernel_buckets,
         )
+        # Whole-model decode megakernel: the deploy target (model_kind, arch, num_sms) for this
+        # loaded model, resolved once (None => no megakernel here), and the decode buckets it serves
+        # eagerly (populated at graph-build time by ``_plan_megakernel_buckets``). A served bucket
+        # SKIPS native graph capture (see decode_graph.py) and routes each step to the eager
+        # megakernel, so the megakernel actually runs in production instead of a replayed native graph.
+        self._megakernel_target: tuple[str, int, int] | None = megakernel_decode.deploy_target(
+            self.model_name, self.device
+        )
+        self._megakernel_served_buckets: set[int] = set()
 
         # Shared pending coord/size values, indexed by batch_idx. These
         # are the runtime-side equivalent of the scheduler's
@@ -850,6 +888,14 @@ class MoondreamRuntime:
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
             self._ensure_cuda_graphs_ready()
+        else:
+            # Graphs OFF (eager serve): there is no capture pass to warm the megakernel, so build the
+            # served buckets' sessions HERE, at init. The first megakernel decode is a multi-minute
+            # in-process CuTe JIT trace; deferring it to the first LIVE decode step pegs the scheduler
+            # thread (0% GPU, one core busy) mid-serve and reads as a concurrency stall. Warming at init
+            # moves that one-time build out of the serving loop (mirrors the graphs-on warmup that
+            # ``_plan_megakernel_buckets`` runs at capture time).
+            self._warm_megakernel_eager()
 
         # Allocate vision encoder buffers (always, for consistency)
         self._allocate_vision_buffers()
@@ -935,6 +981,33 @@ class MoondreamRuntime:
         """Capability names this model serves (Runtime protocol)."""
         return self.skills().names()
 
+    def _dflash_target_layer_indices(self) -> tuple[int, ...]:
+        drafter = self.dflash_drafter
+        if drafter is None:
+            return ()
+        return tuple(drafter.config.target_layer_indices)
+
+    def _ensure_dflash_hidden_window(self, state: SequenceState):
+        drafter = self.dflash_drafter
+        if drafter is None:
+            return None
+        window = getattr(state, "dflash_hidden_window", None)
+        if window is None:
+            from .dflash import DFlashHiddenWindow
+
+            window = DFlashHiddenWindow(
+                drafter.config,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            state.dflash_hidden_window = window
+        return window
+
+    def _append_dflash_hidden(self, state: SequenceState, rows: Tensor) -> None:
+        window = self._ensure_dflash_hidden_window(state)
+        if window is not None:
+            window.append(rows)
+
     # --- Sampling hooks (kestrel.runtime.sampling.SamplingHooks) ----
     # Moondream's per-step "post-sample" work is a coord/size decode
     # from hidden states. We own all the bytes (per-slot GPU staging +
@@ -962,11 +1035,30 @@ class MoondreamRuntime:
             top_ps: Tensor | None,
             token_logprobs: Tensor | None,
             ready_event: "torch.cuda.Event",
-        ) -> tuple[object, int]:
+        ) -> tuple[object, int] | None:
             if hidden_last is None:
                 raise RuntimeError(
                     "Moondream post_sample requires hidden_last for spatial decode"
                 )
+            dflash_hidden_last = getattr(slot, "dflash_hidden_last", None)
+            if dflash_hidden_last is not None:
+                for row, seq in enumerate(sequences):
+                    self._append_dflash_hidden(seq.state, dflash_hidden_last[row])
+            # Spatial-head gate. The coord/size decode head (a ~12.6MB matvec +
+            # the coord/size sample launches, then a D2H) only produces values a
+            # skill consumes when the sampled id can be ``coord_id`` / ``size_id``.
+            # When NO sequence in this batch is in a spatial-emitting phase -- a
+            # plain query answer, a caption: pure text -- the head is dead weight,
+            # so skip it and take the documented opt-out fast path (returning
+            # ``None`` => ``materialize_tokens`` types every id as text, exactly as
+            # a runtime that owns no spatial decode). Point/detect/segment and the
+            # grounded-reasoning phase of a query keep the head, byte-identical.
+            # ``skill_state is None`` (capability unknown) conservatively keeps it.
+            if not any(
+                seq.skill_state is None or seq.skill_state.emits_spatial_tokens
+                for seq in sequences
+            ):
+                return None
             batch_size = int(sampled_ids.shape[0])
             coord_out = slot.coord_staging[:batch_size]
             size_out = slot.size_staging[:batch_size]
@@ -2074,6 +2166,9 @@ class MoondreamRuntime:
             self.page_table.commit_block_table(batch_indices)
 
             lora_slot = lora_slots[0] if lora_slots else 0
+            dflash_captured: list[Tensor] | None = (
+                [] if self.dflash_drafter is not None else None
+            )
             hidden, logits = self._prefill_impl(
                 inputs_embeds,
                 None,  # attention_mask
@@ -2086,6 +2181,8 @@ class MoondreamRuntime:
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
                 input_staging=input_staging,
+                capture_hidden_layers=self._dflash_target_layer_indices(),
+                captured_hidden_states=dflash_captured,
             )
 
             gather_idx = last_token_positions.to(dtype=torch.long).view(
@@ -2093,8 +2190,33 @@ class MoondreamRuntime:
             )
             gather_idx = gather_idx.expand(batch_size, 1, hidden.shape[-1])
             hidden_last = hidden.gather(1, gather_idx).squeeze(1)
+            if dflash_captured is not None:
+                dflash_hidden = torch.stack(dflash_captured, dim=2)
+                dflash_gather_idx = last_token_positions.to(dtype=torch.long).view(
+                    batch_size,
+                    1,
+                    1,
+                    1,
+                )
+                dflash_gather_idx = dflash_gather_idx.expand(
+                    batch_size,
+                    1,
+                    dflash_hidden.shape[2],
+                    dflash_hidden.shape[3],
+                )
+                dflash_hidden_last = dflash_hidden.gather(
+                    1,
+                    dflash_gather_idx,
+                ).squeeze(1)
+            else:
+                dflash_hidden_last = None
             for row, prepared in enumerate(prepared_sequences):
                 prepared.state.last_hidden = hidden_last[row].detach()
+                if dflash_hidden_last is not None:
+                    self._append_dflash_hidden(
+                        prepared.state,
+                        dflash_hidden_last[row],
+                    )
 
         return logits
 
@@ -2211,6 +2333,8 @@ class MoondreamRuntime:
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
         input_staging: PrefillInputStaging,
+        capture_hidden_layers: Sequence[int] = (),
+        captured_hidden_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         if batch_idx.ndim != 2:
             raise ValueError("batch_idx must be rank-2")
@@ -2316,6 +2440,8 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
             scratch_pool=scratch_pool,
+            capture_hidden_layers=capture_hidden_layers,
+            captured_hidden_states=captured_hidden_states,
         )
 
         batch_size = int(hidden.shape[0])
@@ -2356,6 +2482,8 @@ class MoondreamRuntime:
         slot.decode_token_ids[batch_size:graph_batch_size].zero_()
         slot.decode_coord_values[batch_size:graph_batch_size].zero_()
         slot.decode_size_values[batch_size:graph_batch_size].zero_()
+        if slot.dflash_hidden_last is not None:
+            slot.dflash_hidden_last[batch_size:graph_batch_size].zero_()
         slot.meta.batch_idx.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
@@ -2373,6 +2501,8 @@ class MoondreamRuntime:
         slot.decode_token_ids.zero_()
         slot.decode_coord_values.zero_()
         slot.decode_size_values.zero_()
+        if slot.dflash_hidden_last is not None:
+            slot.dflash_hidden_last.zero_()
         slot.meta.batch_idx.gpu.zero_()
         slot.meta.input_pos.gpu.zero_()
         slot.meta.input_pos.cpu.zero_()
@@ -2426,8 +2556,11 @@ class MoondreamRuntime:
     ) -> None:
         """Run decode forward pass and write results to slot output buffers.
 
-        This is the core forward computation, used by both eager decode and
-        CUDA graph replay.
+        This is the core forward computation. For a bucket the whole-model decode megakernel serves
+        (``batch_size in self._megakernel_served_buckets``, decided + warmed at graph-build time) it
+        runs the megakernel EAGERLY -- these buckets have no captured native graph, so this is the
+        real production decode, not a warmup. Every other bucket runs the native decoder and is
+        captured into / replayed from its CUDA graph exactly as before.
 
         Args:
             slot: DecodeSlot with inputs in its buffers.
@@ -2438,6 +2571,93 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
+        dflash_captured: list[Tensor] | None = (
+            [] if slot.dflash_hidden_last is not None else None
+        )
+        if dflash_captured is not None:
+            hidden = self._native_decode_hidden(
+                slot,
+                batch_size,
+                embeds,
+                capture_hidden_layers=self._dflash_target_layer_indices(),
+                captured_hidden_states=dflash_captured,
+            )
+        elif batch_size in self._megakernel_served_buckets:
+            # Graphs on: a bucket warmed + capture-skipped at graph-build time. The session is built,
+            # so this is the real production decode; a failure here is a genuine error.
+            hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
+        elif self._megakernel_eager_unwarmed(batch_size):
+            # Graphs off: there is no capture to skip, so route the megakernel here, building lazily
+            # on the first step and falling back to native on a build/kernel failure (the non-fatal
+            # fallback the warmup try/except gives the graphs-on path).
+            try:
+                hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
+            except Exception as exc:  # non-fatal: any megakernel failure -> native
+                _LOGGER.warning(
+                    "megakernel decode failed for bucket %d; native (%s)", batch_size, exc
+                )
+                hidden = self._native_decode_hidden(slot, batch_size, embeds)
+        else:
+            hidden = self._native_decode_hidden(slot, batch_size, embeds)
+        logits = lm_head(hidden, self.model.text)
+
+        # Write to slot output buffers (stable addresses for graph capture)
+        slot.logits[:batch_size].copy_(logits)
+        slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
+        if dflash_captured is not None:
+            dflash_hidden_last = torch.stack(dflash_captured, dim=2)[:, 0]
+            slot.dflash_hidden_last[:batch_size].copy_(dflash_hidden_last)
+
+    def _megakernel_eager_unwarmed(self, batch_size: int) -> bool:
+        """Whether to serve ``batch_size`` through the megakernel on the NON-graph path (graphs
+        disabled). With graphs on, the served buckets are decided + warmed at graph-build time
+        (``_megakernel_served_buckets``); with graphs off there is no capture to skip, so gate
+        directly on ``has_megakernel`` and build lazily on the first step (with a native fallback)."""
+        if self._decode_graphs.enabled or self._megakernel_target is None:
+            return False
+        return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
+
+    def _megakernel_decode_hidden(
+        self, slot: DecodeSlot, batch_size: int, embeds: Tensor
+    ) -> Tensor:
+        """Run one whole-model decode step through the megakernel; return hidden ``[B, 1, H]``. Eager
+        (one launch, never captured). The session is built lazily on the first call for a bucket -- the
+        engine performs that first call at graph-build time via ``_plan_megakernel_buckets`` instead of
+        capturing a native graph, so by production steady-state it is warm. Raises on a genuine
+        megakernel error (the caller only reaches here for a bucket whose warmup succeeded).
+
+        The KV page reserve/commit is NOT done per step here anymore: the megakernel session reserves
+        every active row through the baked ``kv_capacity`` on a batch-composition change
+        (``session.rebase_pages``, driven by the manager off the host-mirror composition check) and the
+        kernel appends into the pre-reserved pages every steady step. The host mirrors
+        (``slot.meta.*.np``) are threaded so that composition check stays device-sync-free."""
+        return megakernel_decode.decode(
+            model_name=self.model_name,
+            text=self.model.text,
+            text_config=self.config.text,
+            device=self.device,
+            page_table=self.page_table,
+            max_seq_length=self.max_seq_length,
+            batch_size=batch_size,
+            embeds=embeds,
+            batch_idx=slot.meta.batch_idx.gpu[:batch_size],
+            input_pos=slot.meta.input_pos.gpu[:batch_size],
+            batch_idx_host=slot.meta.batch_idx.np[:batch_size],
+            input_pos_host=slot.meta.input_pos.np[:batch_size],
+        )
+
+    def _native_decode_hidden(
+        self,
+        slot: DecodeSlot,
+        batch_size: int,
+        embeds: Tensor,
+        *,
+        capture_hidden_layers: Sequence[int] = (),
+        captured_hidden_states: list[Tensor] | None = None,
+    ) -> Tensor:
+        """Run one native ``text_decoder`` decode step; return hidden ``[B, 1, H]``. Built inside the
+        captured decode graph and replayed bit-identically (the paged-KV metadata + slot mapping are
+        rebuilt here for the same reason)."""
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
         # Build the paged-KV metadata here, inside the captured decode graph,
         # rather than eagerly each step. It reads the static (pre-reserved) page
@@ -2463,7 +2683,7 @@ class MoondreamRuntime:
             lora_slot_ids = slot.meta.lora_slot_ids.gpu[:batch_size]
             moe_lora_metadata = slot.meta.moe_lora_metadata
 
-        hidden = text_decoder(
+        return text_decoder(
             embeds,
             self.model.text,
             attn_mask=None,
@@ -2477,12 +2697,95 @@ class MoondreamRuntime:
             lora_slot_ids=lora_slot_ids,
             moe_lora_metadata=moe_lora_metadata,
             dense_lora_scratch=self._dense_lora_decode_scratch,
+            capture_hidden_layers=capture_hidden_layers,
+            captured_hidden_states=captured_hidden_states,
         )
-        logits = lm_head(hidden, self.model.text)
 
-        # Write to slot output buffers (stable addresses for graph capture)
-        slot.logits[:batch_size].copy_(logits)
-        slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
+    def _plan_megakernel_buckets(
+        self, slot: DecodeSlot, batch_sizes: list[int]
+    ) -> set[int]:
+        """Decide + WARM the decode buckets the whole-model megakernel serves for ``slot``, called
+        once per slot at graph-build time (see ``DecodeGraphManager._capture_slot_graphs``). Returns
+        the subset of ``batch_sizes`` that will be served eagerly -- those buckets are NOT captured as
+        native graphs; ``_run_decode_forward`` routes them through the megakernel each step.
+
+        The decision is the cheap ``has_megakernel`` gate; a gated-in bucket is then WARMED by
+        actually running the first (session-building) megakernel decode on the zeroed capture buffers
+        (the same warmup point native capture used). If that build raises, the bucket is EXCLUDED (and
+        the manager captures native for it) -- the non-fatal fallback is preserved as an engine-side
+        try/except, not a silent ``None`` on the hot path."""
+        target = self._megakernel_target
+        if self.dflash_drafter is not None:
+            return set()
+        if target is None:
+            return set()
+        served: set[int] = set()
+        for batch_size in batch_sizes:
+            if not megakernel_decode.has_megakernel(*target, batch_size):
+                continue
+            try:
+                # Host-side LoRA metadata (matches the per-step prepare) then one eager,
+                # session-building megakernel launch on the zeroed capture buffers.
+                self._prepare_decode_graph_step(slot, batch_size)
+                embeds = self._embed_packed_token_batch(
+                    slot.decode_token_ids[:batch_size],
+                    slot.decode_coord_values[:batch_size],
+                    slot.decode_size_values[:batch_size],
+                )
+                self._megakernel_decode_hidden(slot, batch_size, embeds)
+            except Exception as exc:  # a warmup/build failure -> capture native for this bucket
+                _LOGGER.warning(
+                    "megakernel warmup failed for decode bucket %d; capturing native instead (%s)",
+                    batch_size, exc,
+                )
+                continue
+            served.add(batch_size)
+        self._megakernel_served_buckets |= served
+        return served
+
+    def _warm_megakernel_eager(self) -> None:
+        """Graphs OFF: build the megakernel session for every served decode bucket NOW, at init.
+
+        On the eager (non-graph) serve path ``_run_decode_forward`` routes a bucket through the
+        megakernel and builds its session lazily on the FIRST call (``_megakernel_eager_unwarmed``).
+        That first build is a multi-minute, single-threaded CuTe JIT trace of the whole-model VM -- if
+        it lands on the first live decode step it blocks the scheduler thread (0% GPU, one core pegged,
+        no completions) and looks exactly like a concurrency stall. Warming here does that one-time
+        build off the serving path, at the same point the graphs-on path warms via
+        ``_plan_megakernel_buckets``. Non-fatal: a build failure just leaves the bucket to the lazy
+        per-step route (which falls back to native on the same exception), so this never blocks startup.
+        """
+        target = self._megakernel_target
+        if target is None or self._decode_graphs.enabled or self.dflash_drafter is not None:
+            return
+        served = [
+            batch_size
+            for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
+            if megakernel_decode.has_megakernel(*target, batch_size)
+        ]
+        if not served:
+            return
+        slot = self._decode_slots[0]
+        for batch_size in served:
+            try:
+                # Zero the slot buffers (valid token id 0 / positions), stage host-side metadata, then
+                # run one session-building megakernel decode -- the same warmup shape the capture path
+                # uses. ``inference_mode`` matches the scheduler's per-step launch context.
+                self._zero_decode_graph_capture_buffers(slot)
+                self._prepare_decode_graph_step(slot, batch_size)
+                embeds = self._embed_packed_token_batch(
+                    slot.decode_token_ids[:batch_size],
+                    slot.decode_coord_values[:batch_size],
+                    slot.decode_size_values[:batch_size],
+                )
+                with torch.inference_mode():
+                    self._megakernel_decode_hidden(slot, batch_size, embeds)
+            except Exception as exc:  # non-fatal: fall back to the lazy per-step build (native on fail)
+                _LOGGER.warning(
+                    "eager megakernel warmup failed for decode bucket %d; will build lazily on the "
+                    "first decode step (%s)",
+                    batch_size, exc,
+                )
 
     def acquire_adapter_slot(self, adapter_id: str, adapter: LoRA) -> int:
         """Acquire a slot for an adapter, loading weights if necessary.
