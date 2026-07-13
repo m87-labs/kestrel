@@ -847,6 +847,7 @@ class MoondreamRuntime:
             self.model_name, self.device
         )
         self._megakernel_served_buckets: set[int] = set()
+        self._megakernel_failed_buckets: set[int] = set()
 
         # Shared pending coord/size values, indexed by batch_idx. These
         # are the runtime-side equivalent of the scheduler's
@@ -2481,6 +2482,7 @@ class MoondreamRuntime:
             try:
                 hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
             except Exception as exc:  # non-fatal: any megakernel failure -> native
+                self._megakernel_failed_buckets.add(batch_size)
                 _LOGGER.warning(
                     "megakernel decode failed for bucket %d; native (%s)", batch_size, exc
                 )
@@ -2502,6 +2504,7 @@ class MoondreamRuntime:
             self._decode_graphs.enabled
             or self._megakernel_target is None
             or self._lora_workspace is not None
+            or batch_size in self._megakernel_failed_buckets
         ):
             return False
         return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
@@ -2613,6 +2616,7 @@ class MoondreamRuntime:
                 )
                 self._megakernel_decode_hidden(slot, batch_size, embeds)
             except Exception as exc:  # a warmup/build failure -> capture native for this bucket
+                self._megakernel_failed_buckets.add(batch_size)
                 _LOGGER.warning(
                     "megakernel warmup failed for decode bucket %d; capturing native instead (%s)",
                     batch_size, exc,
@@ -2631,8 +2635,8 @@ class MoondreamRuntime:
         it lands on the first live decode step it blocks the scheduler thread (0% GPU, one core pegged,
         no completions) and looks exactly like a concurrency stall. Warming here does that one-time
         build off the serving path, at the same point the graphs-on path warms via
-        ``_plan_megakernel_buckets``. Non-fatal: a build failure just leaves the bucket to the lazy
-        per-step route (which falls back to native on the same exception), so this never blocks startup.
+        ``_plan_megakernel_buckets``. A build failure disables that bucket for this runtime, so later
+        steps use native directly instead of retrying the failed build.
         """
         target = self._megakernel_target
         if (
@@ -2663,10 +2667,10 @@ class MoondreamRuntime:
                 )
                 with torch.inference_mode():
                     self._megakernel_decode_hidden(slot, batch_size, embeds)
-            except Exception as exc:  # non-fatal: fall back to the lazy per-step build (native on fail)
+            except Exception as exc:  # non-fatal: keep this bucket native for the runtime lifetime
+                self._megakernel_failed_buckets.add(batch_size)
                 _LOGGER.warning(
-                    "eager megakernel warmup failed for decode bucket %d; will build lazily on the "
-                    "first decode step (%s)",
+                    "eager megakernel warmup failed for decode bucket %d; using native (%s)",
                     batch_size, exc,
                 )
 
