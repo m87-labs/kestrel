@@ -2509,17 +2509,16 @@ class MoondreamRuntime:
     def _megakernel_decode_hidden(
         self, slot: DecodeSlot, batch_size: int, embeds: Tensor
     ) -> Tensor:
-        """Run one whole-model decode step through the megakernel; return hidden ``[B, 1, H]``. Eager
-        (one launch, never captured). The session is built lazily on the first call for a bucket -- the
+        """Run one eager whole-model megakernel decode step; return hidden ``[B, 1, H]``. The session
+        is built lazily on the first call for a bucket -- the
         engine performs that first call at graph-build time via ``_plan_megakernel_buckets`` instead of
         capturing a native graph, so by production steady-state it is warm. Raises on a genuine
         megakernel error (the caller only reaches here for a bucket whose warmup succeeded).
 
-        The KV page reserve/commit is NOT done per step here anymore: the megakernel session reserves
-        every active row through the baked ``kv_capacity`` on a batch-composition change
-        (``session.rebase_pages``, driven by the manager off the host-mirror composition check) and the
-        kernel appends into the pre-reserved pages every steady step. The host mirrors
-        (``slot.meta.*.np``) are threaded so that composition check stays device-sync-free."""
+        Native and megakernel decode consume the same authoritative global page table plus the
+        engine's device ``batch_idx`` and ``input_pos`` tensors. The VM applies compact-row
+        indirection directly; this adapter owns no page-map copy, position state, or host-mirror
+        composition protocol."""
         return megakernel_decode.decode(
             model_name=self.model_name,
             text=self.model.text,
