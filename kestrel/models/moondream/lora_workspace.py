@@ -210,12 +210,6 @@ class TextLoRAWorkspace:
                 self.max_rank_per_expert, d_model,
                 device=device, dtype=dtype
             )
-            self._megakernel_moe_up_b_t = torch.zeros(
-                max_slots - 1, n_layers, num_experts,
-                self.max_rank_per_expert, d_expert * 2,
-                device=device, dtype=dtype,
-            )
-
             for layer_idx in range(self.start_layer, n_layers):
                 workspace = MoELoRALayerWorkspace(
                     up_a=self._moe_up_a[layer_idx],
@@ -284,7 +278,6 @@ class TextLoRAWorkspace:
 
         if self.moe:
             self._megakernel_moe_down_b[slot - 1].zero_()
-            self._megakernel_moe_up_b_t[slot - 1].zero_()
 
         self._moe_lora_ranks_host[slot - 1] = 0
         self.moe_lora_ranks[slot - 1].zero_()
@@ -363,10 +356,6 @@ class TextLoRAWorkspace:
                     adapter_layer.up_b[expert_id], layer.up_b.shape[1] // 2
                 )
                 layer.up_b[ws_idx, :, :adapter_rank_per_expert].copy_(up_b_src)
-                self._megakernel_moe_up_b_t[
-                    slot - 1, layer_idx, expert_id,
-                    :adapter_rank_per_expert, :
-                ].copy_(up_b_src.transpose(0, 1))
                 layer.down_a[ws_idx, :adapter_rank_per_expert, :].copy_(
                     adapter_layer.down_a[expert_id]
                 )
@@ -415,10 +404,9 @@ class TextLoRAWorkspace:
             "moe_lora_a_up": self._moe_up_a.view(
                 layers, slots, experts, rank, self._moe_up_a.shape[-1]
             ).permute(1, 0, 2, 3, 4),
-            "moe_lora_b_up": self._moe_up_b.view(
+            "moe_lora_b_up_interleaved": self._moe_up_b.view(
                 layers, slots, experts, self._moe_up_b.shape[-2], rank
             ).permute(1, 0, 2, 3, 4),
-            "moe_lora_b_up_t": self._megakernel_moe_up_b_t,
             "moe_lora_a_down": self._moe_down_a.view(
                 layers, slots, experts, rank, self._moe_down_a.shape[-1]
             ).permute(1, 0, 2, 3, 4),

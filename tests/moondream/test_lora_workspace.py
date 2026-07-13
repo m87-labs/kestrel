@@ -165,9 +165,9 @@ class TestWorkspaceAllocation:
         assert tensors["moe_lora_b_down"].shape == (
             slots, moe_config.n_layers, moe_cfg.num_experts, rank, moe_config.dim
         )
-        assert tensors["moe_lora_b_up_t"].shape == (
-            slots, moe_config.n_layers, moe_cfg.num_experts, rank,
-            moe_cfg.expert_inner_dim * 2,
+        assert tensors["moe_lora_b_up_interleaved"].shape == (
+            slots, moe_config.n_layers, moe_cfg.num_experts,
+            moe_cfg.expert_inner_dim * 2, rank,
         )
         assert tensors["adapter_slot_ids"] is logical
         assert tensors["routed_storage_ids"] is storage
@@ -184,6 +184,59 @@ class TestWorkspaceAllocation:
         assert tensors["dense_lora_a_up"].untyped_storage().data_ptr() == (
             workspace.dense[0].up_a.untyped_storage().data_ptr()
         )
+
+    def test_mixed_rows_and_rank_change_keep_runtime_binding_signatures(
+        self, moe_config: TextConfig, device: torch.device
+    ):
+        """Row selectors may differ while workspace addresses remain replay-stable."""
+        workspace = TextLoRAWorkspace(
+            moe_config, max_slots=4, max_rank=8, device=device
+        )
+        workspace.load_slot_(
+            1, create_test_adapter(moe_config, rank=2, device=device, fill_value=1.0)
+        )
+        workspace.load_slot_(
+            2, create_test_adapter(moe_config, rank=8, device=device, fill_value=2.0)
+        )
+        logical = torch.tensor([1, 2], dtype=torch.int32, device=device)
+        storage = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+        first = workspace.megakernel_runtime_tensors(
+            adapter_slot_ids=logical, routed_storage_ids=storage
+        )
+        stable_names = set(first) - {"adapter_slot_ids", "routed_storage_ids"}
+        signatures = {
+            name: (
+                tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
+            )
+            for name, tensor in first.items()
+            if name in stable_names
+        }
+        assert first["dense_rank_by_slot"].tolist() == [0, 2, 8, 0]
+        assert first["routed_rank_by_slot"].tolist() == [0, 1, 4, 0]
+
+        # A later batch may swap row ownership, and an adapter reload may change
+        # rank, without changing any stable ABI signature.
+        workspace.load_slot_(
+            2, create_test_adapter(moe_config, rank=4, device=device, fill_value=3.0)
+        )
+        logical.copy_(torch.tensor([2, 1], dtype=torch.int32, device=device))
+        storage.copy_(torch.tensor([1, 0], dtype=torch.int32, device=device))
+        replay = workspace.megakernel_runtime_tensors(
+            adapter_slot_ids=logical, routed_storage_ids=storage
+        )
+
+        assert replay["adapter_slot_ids"].tolist() == [2, 1]
+        assert replay["routed_storage_ids"].tolist() == [1, 0]
+        assert replay["dense_rank_by_slot"].tolist() == [0, 2, 4, 0]
+        assert replay["routed_rank_by_slot"].tolist() == [0, 1, 2, 0]
+        assert {
+            name: (
+                replay[name].data_ptr(), tuple(replay[name].shape),
+                tuple(replay[name].stride()), replay[name].dtype,
+            )
+            for name in stable_names
+        } == signatures
 
     def test_max_rank_per_expert_calculation(self, device: torch.device):
         """max_rank_per_expert is correctly computed as max_rank // experts_per_token."""
@@ -426,13 +479,6 @@ class TestLoadSlot:
                     ],
                     adapter_layer.down_b[expert_id].transpose(0, 1),
                 )
-                assert torch.allclose(
-                    workspace._megakernel_moe_up_b_t[
-                        1, layer_idx, expert_id, :rank_per_expert
-                    ],
-                    layer.up_b[ws_idx, :, :rank_per_expert].transpose(0, 1),
-                )
-
         assert workspace.routed_rank_by_slot.tolist() == [0, 0, rank_per_expert, 0]
         assert workspace.dense_rank_by_slot.tolist() == [0, 0, max_rank, 0]
 
