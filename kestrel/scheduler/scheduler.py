@@ -2007,11 +2007,7 @@ class GenerationScheduler:
         # two in-flight references would let the resident tail slip into one
         # launch, reintroducing composition churn and irregular inter-token
         # latency.
-        cohort: list[RequestLifecycle] = []
-        for seq in self.running:
-            if len(cohort) >= self.runtime.max_batch_size:
-                break
-            cohort.append(seq)
+        cohort = list(self.running)[: self.runtime.max_batch_size]
 
         active: list[RequestLifecycle] = []
         for seq in cohort:
