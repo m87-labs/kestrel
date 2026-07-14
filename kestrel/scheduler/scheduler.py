@@ -506,10 +506,13 @@ class GenerationScheduler:
         if not progressed:
             stalled = next((request for request in self.waiting if self._is_launchable_request(request)), None)
             if stalled is not None and not self.runtime.can_reserve(stalled.target_length):
-                raise RuntimeError(
-                    "Scheduler stalled: insufficient KV cache capacity for request "
+                error = RuntimeError(
+                    "Insufficient KV cache capacity for request "
                     f"{stalled.request_id} (needs {stalled.target_length} tokens)."
                 )
+                self.waiting.remove(stalled)
+                self._fail_request_early(stalled, error)
+                progressed = True
         return progressed
 
     def _drain_pipeline(self) -> None:
@@ -1523,8 +1526,11 @@ class GenerationScheduler:
 
     def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
         """Fail a request that couldn't be admitted (e.g., adapter load failure)."""
-        _LOGGER.exception(
-            "Failed to admit request %s: %s", request.request_id, exc
+        _LOGGER.error(
+            "Failed to admit request %s: %s",
+            request.request_id,
+            exc,
+            exc_info=exc,
         )
         lifecycle = request.lifecycle
         lifecycle.finish_reason = "error"
@@ -1538,7 +1544,7 @@ class GenerationScheduler:
             tokens=[],
             finish_reason="error",
             metrics=metrics,
-            output={"error": "Request failed during admission"},
+            output={"error": str(exc)},
         )
         self._completed.append(result)
 

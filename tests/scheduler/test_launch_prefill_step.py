@@ -148,3 +148,32 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
     assert scheduler._completed[0].request_id == request.request_id
     assert request.lifecycle.phase == RequestPhase.COMPLETED
     assert len(runtime.released_prefill_slots) == 1
+
+
+def test_advance_rejects_only_request_that_cannot_fit_kv_cache() -> None:
+    oversized = _make_request(request_id=42, max_new_tokens=8)
+    admissible = _make_request(request_id=43, max_new_tokens=2)
+    scheduler = _make_scheduler(oversized, FakeRuntime(max_seq_length=4))
+    scheduler._compute_stream = None
+    scheduler.waiting.push(admissible)
+    scheduler._pipeline = PipelineState()
+    scheduler._pending_spec = None
+    scheduler._launch_prefill_step = lambda pipeline: False
+    scheduler.schedule_decode_step = lambda: None
+
+    progressed = GenerationScheduler.advance(scheduler)
+
+    assert progressed is True
+    assert list(scheduler.waiting) == [admissible]
+    assert oversized.lifecycle.phase == RequestPhase.COMPLETED
+    assert admissible.lifecycle.phase == RequestPhase.READY_FOR_PREFILL
+    completed = scheduler.pop_completed()
+    assert len(completed) == 1
+    assert completed[0].request_id == oversized.request_id
+    assert completed[0].finish_reason == "error"
+    assert completed[0].output == {
+        "error": (
+            "Insufficient KV cache capacity for request 42 "
+            "(needs 9 tokens)."
+        )
+    }
