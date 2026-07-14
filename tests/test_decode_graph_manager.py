@@ -33,15 +33,9 @@ class FakeDecodeGraphManager(DecodeGraphManager[FakeSlot]):
         self.events = events
 
     def _capture_slot_graphs(self, slot: FakeSlot) -> dict[int, FakeGraph]:
-        # Mirror the real method's capture-skip: buckets the plan serves eagerly get no captured
-        # graph (the real path also runs the CUDA graph mechanics + memory log, which need a GPU).
-        eager = (
-            frozenset(int(b) for b in self._plan_eager(slot, list(self.batch_sizes)))
-            if self._plan_eager is not None
-            else frozenset()
+        captured = tuple(
+            b for b in self.batch_sizes if b not in self._eager_batch_sizes
         )
-        self._eager_buckets[id(slot)] = eager
-        captured = tuple(b for b in self.batch_sizes if b not in eager)
         self.events.append(("capture", slot.slot_id, captured))
         return {
             batch_size: FakeGraph(self.events, slot.slot_id, batch_size)
@@ -55,7 +49,7 @@ def _make_manager(
     enabled: bool,
     max_batch: int,
     capture: bool = False,
-    plan_eager=None,
+    eager_batch_sizes=(),
 ) -> DecodeGraphManager[FakeSlot]:
     cls = FakeDecodeGraphManager if capture else DecodeGraphManager
     kwargs = {"events": events} if capture else {}
@@ -75,7 +69,7 @@ def _make_manager(
         zero_padding=lambda slot, batch_size, graph_batch_size: events.append(
             ("pad", slot.slot_id, batch_size, graph_batch_size)
         ),
-        plan_eager=plan_eager,
+        eager_batch_sizes=eager_batch_sizes,
         **kwargs,
     )
 
@@ -147,25 +141,14 @@ def test_clear_forces_recapture() -> None:
     ]
 
 
-def test_plan_eager_skips_capture_and_routes_bucket_to_forward() -> None:
-    # An eager-served bucket (the megakernel B1) is NOT captured, and run() routes it to the eager
-    # forward instead of a graph replay; a non-eager bucket still replays its captured graph.
+def test_eager_batch_skips_capture_and_routes_to_forward() -> None:
     events: list[tuple] = []
-    planned: list[tuple] = []
-
-    def plan_eager(slot, batch_sizes):
-        planned.append((slot.slot_id, tuple(batch_sizes)))
-        return {1}
-
     manager = _make_manager(
-        events, enabled=True, max_batch=8, capture=True, plan_eager=plan_eager
+        events, enabled=True, max_batch=8, capture=True, eager_batch_sizes={1}
     )
     slot = FakeSlot(slot_id=0)
     manager.ensure_ready([slot])
 
-    # Bucket 1 was warmed + skipped: no captured graph, tracked as eager.
-    assert planned == [(0, (1, 2, 4, 8))]
-    assert manager.eager_buckets(slot) == frozenset({1})
     assert ("capture", 0, (2, 4, 8)) in events
 
     # B1 decode step routes eager (forward), NOT a replay.
@@ -179,33 +162,32 @@ def test_plan_eager_skips_capture_and_routes_bucket_to_forward() -> None:
     assert events == [("prepare", 0, 4), ("replay", 0, 4)]
 
 
-def test_plan_eager_exclusion_falls_back_to_native_capture() -> None:
-    # A bucket the plan does NOT serve (e.g. warmup build failed, or ineligible B8) keeps the
-    # captured native path exactly as before.
+def test_empty_eager_set_captures_every_bucket() -> None:
     events: list[tuple] = []
-    manager = _make_manager(
-        events, enabled=True, max_batch=8, capture=True, plan_eager=lambda s, bs: set()
-    )
+    manager = _make_manager(events, enabled=True, max_batch=8, capture=True)
     slot = FakeSlot(slot_id=0)
     manager.ensure_ready([slot])
 
-    assert manager.eager_buckets(slot) == frozenset()
     assert ("capture", 0, (1, 2, 4, 8)) in events
     events.clear()
     manager.run(slot, 8)
     assert events == [("prepare", 0, 8), ("replay", 0, 8)]
 
 
-def test_clear_drops_eager_buckets() -> None:
+def test_clear_keeps_static_eager_configuration() -> None:
     events: list[tuple] = []
     manager = _make_manager(
-        events, enabled=True, max_batch=2, capture=True, plan_eager=lambda s, bs: {1}
+        events, enabled=True, max_batch=2, capture=True, eager_batch_sizes={1}
     )
     slot = FakeSlot(slot_id=0)
     manager.ensure_ready([slot])
-    assert manager.eager_buckets(slot) == frozenset({1})
     manager.clear()
-    assert manager.eager_buckets(slot) == frozenset()
+    manager.ensure_ready([slot])
+
+    assert events == [
+        ("capture", 0, (2,)),
+        ("capture", 0, (2,)),
+    ]
 
 
 def test_run_raises_when_batch_exceeds_graph_capacity() -> None:

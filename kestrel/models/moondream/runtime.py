@@ -826,6 +826,18 @@ class MoondreamRuntime:
             )
             for slot_id in range(2)
         ]
+        # A shipped megakernel is already a single eager launch. Resolve its AOT
+        # buckets once and omit only their redundant native CUDA graphs.
+        megakernel_target = megakernel_decode.deploy_target(
+            self.model_name, self.device
+        )
+        self._megakernel_buckets = frozenset(
+            batch_size
+            for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
+            if megakernel_target is not None
+            and self._lora_workspace is None
+            and megakernel_decode.has_megakernel(*megakernel_target, batch_size)
+        )
         self._decode_graphs = DecodeGraphManager[DecodeSlot](
             enabled=self._use_cuda_graphs,
             device=self.device,
@@ -836,16 +848,8 @@ class MoondreamRuntime:
             prepare_step=self._prepare_decode_graph_step,
             zero_padding=self._zero_decode_graph_padding,
             zero_for_capture=self._zero_decode_graph_capture_buffers,
-            plan_eager=self._plan_megakernel_buckets,
+            eager_batch_sizes=self._megakernel_buckets,
         )
-        # Whole-model decode megakernel: the deploy target (model_kind, arch, num_sms) for this
-        # loaded model, resolved once (None => no megakernel here). DecodeGraphManager owns each
-        # slot's eager-bucket plan: a served bucket skips native capture and routes each step to the
-        # eager megakernel instead of a replayed native graph.
-        self._megakernel_target: tuple[str, int, int] | None = megakernel_decode.deploy_target(
-            self.model_name, self.device
-        )
-        self._megakernel_failed_buckets: set[int] = set()
 
         # Shared pending coord/size values, indexed by batch_idx. These
         # are the runtime-side equivalent of the scheduler's
@@ -870,14 +874,6 @@ class MoondreamRuntime:
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
             self._ensure_cuda_graphs_ready()
-        else:
-            # Graphs OFF (eager serve): there is no capture pass to warm the megakernel, so build the
-            # served buckets' sessions HERE, at init. The first megakernel decode is a multi-minute
-            # in-process CuTe JIT trace; deferring it to the first LIVE decode step pegs the scheduler
-            # thread (0% GPU, one core busy) mid-serve and reads as a concurrency stall. Warming at init
-            # moves that one-time build out of the serving loop (mirrors the graphs-on warmup that
-            # ``_plan_megakernel_buckets`` runs at capture time).
-            self._warm_megakernel_eager()
 
         # Allocate vision encoder buffers (always, for consistency)
         self._allocate_vision_buffers()
@@ -2458,11 +2454,8 @@ class MoondreamRuntime:
     ) -> None:
         """Run decode forward pass and write results to slot output buffers.
 
-        This is the core forward computation. For a bucket in this slot's eager capture plan
-        (decided + warmed at graph-build time) it runs the megakernel EAGERLY -- these buckets have
-        no captured native graph, so this is the real production decode, not a warmup. Every other
-        bucket runs the native decoder and is captured into / replayed from its CUDA graph exactly
-        as before.
+        Megakernel buckets run as one eager launch and have no redundant CUDA
+        graph. Every other bucket runs the native decoder inside its graph.
 
         Args:
             slot: DecodeSlot with inputs in its buffers.
@@ -2473,36 +2466,13 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
-        if batch_size in self._decode_graphs.eager_buckets(slot):
-            # Graphs on: a bucket warmed + capture-skipped at graph-build time. The session is built,
-            # so this is the real production decode. Capacity is dynamic per active row even though
-            # bucket eligibility is static: a request can outgrow the compiled KV extent, or this
-            # composition can select a shorter reservation. That expected ineligibility runs native
-            # eagerly for this step; kernel/build failures still surface.
+        if batch_size in self._megakernel_buckets:
             try:
                 hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
             except megakernel_decode.MegakernelNotEligible as exc:
                 _LOGGER.info(
                     "megakernel decode ineligible for bucket %d this step; native (%s)",
                     batch_size, exc,
-                )
-                hidden = self._native_decode_hidden(slot, batch_size, embeds)
-        elif self._megakernel_eager_unwarmed(batch_size):
-            # Graphs off: there is no capture to skip, so route the megakernel here, building lazily
-            # on the first step and falling back to native on a build/kernel failure (the non-fatal
-            # fallback the warmup try/except gives the graphs-on path).
-            try:
-                hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
-            except megakernel_decode.MegakernelNotEligible as exc:
-                _LOGGER.info(
-                    "megakernel decode ineligible for bucket %d this step; native (%s)",
-                    batch_size, exc,
-                )
-                hidden = self._native_decode_hidden(slot, batch_size, embeds)
-            except Exception as exc:  # non-fatal: a build/kernel failure -> native
-                self._megakernel_failed_buckets.add(batch_size)
-                _LOGGER.warning(
-                    "megakernel decode failed for bucket %d; native (%s)", batch_size, exc
                 )
                 hidden = self._native_decode_hidden(slot, batch_size, embeds)
         else:
@@ -2513,28 +2483,12 @@ class MoondreamRuntime:
         slot.logits[:batch_size].copy_(logits)
         slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
 
-    def _megakernel_eager_unwarmed(self, batch_size: int) -> bool:
-        """Whether to serve ``batch_size`` through the megakernel on the NON-graph path (graphs
-        disabled). With graphs on, the per-slot served buckets are decided + warmed at graph-build
-        time; with graphs off there is no capture to skip, so gate directly on ``has_megakernel``
-        and build lazily on the first step (with a native fallback)."""
-        if (
-            self._decode_graphs.enabled
-            or self._megakernel_target is None
-            or self._lora_workspace is not None
-            or batch_size in self._megakernel_failed_buckets
-        ):
-            return False
-        return megakernel_decode.has_megakernel(*self._megakernel_target, batch_size)
-
     def _megakernel_decode_hidden(
         self, slot: DecodeSlot, batch_size: int, embeds: Tensor
     ) -> Tensor:
-        """Run one eager whole-model megakernel decode step; return hidden ``[B, 1, H]``. The session
-        is built lazily on the first call for a bucket -- the
-        engine performs that first call at graph-build time via ``_plan_megakernel_buckets`` instead of
-        capturing a native graph, so by production steady-state it is warm. Raises on a genuine
-        megakernel error (the caller only reaches here for a bucket whose warmup succeeded).
+        """Run one whole-model megakernel launch; return hidden ``[B, 1, H]``.
+
+        The packaged AOT session is loaded lazily on the first real decode.
 
         Native and megakernel decode consume the same authoritative global page table plus the
         engine's ``batch_idx`` and ``input_pos`` controls. Their canonical CPU staging views guard
@@ -2601,98 +2555,6 @@ class MoondreamRuntime:
             moe_lora_metadata=moe_lora_metadata,
             dense_lora_scratch=self._dense_lora_decode_scratch,
         )
-
-    def _plan_megakernel_buckets(
-        self, slot: DecodeSlot, batch_sizes: list[int]
-    ) -> set[int]:
-        """Decide + WARM the decode buckets the whole-model megakernel serves for ``slot``, called
-        once per slot at graph-build time (see ``DecodeGraphManager._capture_slot_graphs``). Returns
-        the subset of ``batch_sizes`` that will be served eagerly -- those buckets are NOT captured as
-        native graphs; ``_run_decode_forward`` routes them through the megakernel each step.
-
-        The decision is the cheap ``has_megakernel`` gate; a gated-in bucket is then WARMED by
-        actually running the first (session-building) megakernel decode on the zeroed capture buffers
-        (the same warmup point native capture used). If that build raises, the bucket is EXCLUDED (and
-        the manager captures native for it) -- the non-fatal fallback is preserved as an engine-side
-        try/except, not a silent ``None`` on the hot path."""
-        target = self._megakernel_target
-        # The rank-zero session has no adapter tensors or row-routing ABI. Skipping
-        # native capture while an adapter workspace is live would make later adapter
-        # requests silently execute the base model. The dynamic indexed-contraction
-        # runtime removes this guard only once those inputs are part of decode().
-        if target is None or self._lora_workspace is not None:
-            return set()
-        served: set[int] = set()
-        for batch_size in batch_sizes:
-            if not megakernel_decode.has_megakernel(*target, batch_size):
-                continue
-            try:
-                # Host-side LoRA metadata (matches the per-step prepare) then one eager,
-                # session-building megakernel launch on the zeroed capture buffers.
-                self._prepare_decode_graph_step(slot, batch_size)
-                embeds = self._embed_packed_token_batch(
-                    slot.decode_token_ids[:batch_size],
-                    slot.decode_coord_values[:batch_size],
-                    slot.decode_size_values[:batch_size],
-                )
-                self._megakernel_decode_hidden(slot, batch_size, embeds)
-            except Exception as exc:  # a warmup/build failure -> capture native for this bucket
-                self._megakernel_failed_buckets.add(batch_size)
-                _LOGGER.warning(
-                    "megakernel warmup failed for decode bucket %d; capturing native instead (%s)",
-                    batch_size, exc,
-                )
-                continue
-            served.add(batch_size)
-        return served
-
-    def _warm_megakernel_eager(self) -> None:
-        """Graphs OFF: build the megakernel session for every served decode bucket NOW, at init.
-
-        On the eager (non-graph) serve path ``_run_decode_forward`` routes a bucket through the
-        megakernel and builds its session lazily on the FIRST call (``_megakernel_eager_unwarmed``).
-        That first build is a multi-minute, single-threaded CuTe JIT trace of the whole-model VM -- if
-        it lands on the first live decode step it blocks the scheduler thread (0% GPU, one core pegged,
-        no completions) and looks exactly like a concurrency stall. Warming here does that one-time
-        build off the serving path, at the same point the graphs-on path warms via
-        ``_plan_megakernel_buckets``. A build failure disables that bucket for this runtime, so later
-        steps use native directly instead of retrying the failed build.
-        """
-        target = self._megakernel_target
-        if (
-            target is None
-            or self._decode_graphs.enabled
-            or self._lora_workspace is not None
-        ):
-            return
-        served = [
-            batch_size
-            for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
-            if megakernel_decode.has_megakernel(*target, batch_size)
-        ]
-        if not served:
-            return
-        slot = self._decode_slots[0]
-        for batch_size in served:
-            try:
-                # Zero the slot buffers (valid token id 0 / positions), stage host-side metadata, then
-                # run one session-building megakernel decode -- the same warmup shape the capture path
-                # uses. ``inference_mode`` matches the scheduler's per-step launch context.
-                self._zero_decode_graph_capture_buffers(slot)
-                self._prepare_decode_graph_step(slot, batch_size)
-                embeds = self._embed_packed_token_batch(
-                    slot.decode_token_ids[:batch_size],
-                    slot.decode_coord_values[:batch_size],
-                    slot.decode_size_values[:batch_size],
-                )
-                with torch.inference_mode():
-                    self._megakernel_decode_hidden(slot, batch_size, embeds)
-            except Exception as exc:  # non-fatal: keep this bucket native for the runtime lifetime
-                self._megakernel_failed_buckets.add(batch_size)
-                _LOGGER.warning(
-                    "eager megakernel warmup failed for decode bucket %d; using native (%s)",
-                    batch_size, exc,
-                )
 
     def acquire_adapter_slot(self, adapter_id: str, adapter: LoRA) -> int:
         """Acquire a slot for an adapter, loading weights if necessary.
