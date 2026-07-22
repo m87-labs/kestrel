@@ -1742,6 +1742,14 @@ class InferenceEngine:
             request_obj,
             request_context=request_obj.request_context,
         )
+        stop_token_ids = set(skill_state.stop_token_ids(runtime) or ())
+        if any(
+            isinstance(token, TextToken) and token.token_id in stop_token_ids
+            for token in request_obj.generated_prefix.tokens
+        ):
+            raise ValueError(
+                "settings._generated_prefix.tokens must not contain stop tokens"
+            )
         for token in request_obj.generated_prefix.tokens:
             skill_state.consume_step(
                 runtime,

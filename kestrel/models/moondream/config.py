@@ -100,6 +100,7 @@ class TokenizerConfig:
                 if prefix_when_reasoning is not None
                 else None
             ),
+            stop_token_ids=list(template.get("stop_token_ids", [])),
         )
 
     def chat(self) -> Optional[ChatTemplate]:

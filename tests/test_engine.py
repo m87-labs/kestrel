@@ -42,9 +42,15 @@ def _make_request(
 
 
 class _PrefixSkillState(SkillState):
-    def __init__(self, spec: SkillSpec, request: object) -> None:
+    def __init__(
+        self,
+        spec: SkillSpec,
+        request: object,
+        stop_token_ids: tuple[int, ...],
+    ) -> None:
         super().__init__(spec, request)
         self.positions: list[int] = []
+        self._stop_token_ids = stop_token_ids
 
     def consume_step(self, runtime: object, step: DecodeStep) -> None:
         self.positions.append(step.position)
@@ -53,10 +59,14 @@ class _PrefixSkillState(SkillState):
     def finalize(self, runtime: object, *, reason: str) -> SkillFinalizeResult:
         return SkillFinalizeResult(text="", tokens=list(self.tokens), output={})
 
+    def stop_token_ids(self, runtime: object) -> tuple[int, ...] | None:
+        return self._stop_token_ids or None
+
 
 class _PrefixSkill(SkillSpec):
-    def __init__(self) -> None:
+    def __init__(self, stop_token_ids: tuple[int, ...] = ()) -> None:
         super().__init__(name="prefix")
+        self._stop_token_ids = stop_token_ids
 
     def build_prompt_tokens(
         self, runtime: object, request_context: object
@@ -69,7 +79,7 @@ class _PrefixSkill(SkillSpec):
         request: object,
         request_context: object,
     ) -> _PrefixSkillState:
-        return _PrefixSkillState(self, request)
+        return _PrefixSkillState(self, request, self._stop_token_ids)
 
 
 class _FakeImagePreprocessor:
@@ -379,6 +389,19 @@ def test_build_generation_request_consumes_generated_prefix() -> None:
     assert generation_req.remaining_new_tokens == 2
     assert list(skill_state.tokens) == [TextToken(10), TextToken(11)]
     assert skill_state.positions == [0, 1]
+
+
+def test_build_generation_request_rejects_skill_stop_in_generated_prefix() -> None:
+    engine = object.__new__(InferenceEngine)
+    req = _make_request()
+    req.prompt_tokens = [TextToken(1)]
+    req.max_new_tokens = 4
+    req.skill = _PrefixSkill(stop_token_ids=(11,))
+    req.generated_prefix = GeneratedPrefix(tokens=(TextToken(10), TextToken(11)))
+    runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
+
+    with pytest.raises(ValueError, match="must not contain stop tokens"):
+        engine._build_generation_request(runtime, req, None)
 
 
 def test_extract_private_suppress_next_token_ids_setting() -> None:

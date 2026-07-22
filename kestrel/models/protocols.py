@@ -24,12 +24,11 @@ class QueryTemplate:
     answer_prefix: List[int]
     reasoning_prefix: List[int]
     post_reasoning_prefix: List[int]
-    # Optional override for ``prefix`` when ``reasoning=True``. Set this
-    # for models whose CoT mode needs a different *pre-question* structure
-    # (e.g. Gemma 4 emits an extra ``<|turn>system\n<|think|>`` block to
-    # activate thinking). ``None`` (default) keeps ``prefix`` for both
-    # modes — Moondream's pre-question layout is reasoning-independent.
+    # Optional override for ``prefix`` when ``reasoning=True``. ``None``
+    # keeps ``prefix`` for both modes, as Moondream's pre-question layout is
+    # reasoning-independent.
     prefix_when_reasoning: Optional[List[int]] = None
+    stop_token_ids: List[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

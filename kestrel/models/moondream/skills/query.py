@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..runtime import CoordToken, TextToken, Token
+from kestrel.models.protocols import QueryTemplate
 from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
 from kestrel.skills.base import (
@@ -103,9 +104,8 @@ class QuerySkill(SkillSpec):
             if request_context.reasoning
             else template.answer_prefix
         )
-        # ``prefix_when_reasoning`` lets a model swap in a different pre-question
-        # structure for CoT (Gemma 4: extra ``<|turn>system\n<|think|>`` block
-        # to activate thinking). When None, the same ``prefix`` covers both.
+        # ``prefix_when_reasoning`` lets a prompt template swap in a different
+        # pre-question structure for CoT. When None, both modes use ``prefix``.
         pre_question: Sequence[int] = (
             template.prefix_when_reasoning
             if request_context.reasoning and template.prefix_when_reasoning is not None
@@ -165,6 +165,7 @@ class QuerySkillState(SkillState):
     ) -> None:
         super().__init__(spec, request)
         self._request = query_request
+        self._query_template: Optional[QueryTemplate] = None
         self._reasoning_enabled = bool(query_request.reasoning)
         self._collecting_reasoning = self._reasoning_enabled
         self._reasoning_tokens: List[int] = []
@@ -182,6 +183,12 @@ class QuerySkillState(SkillState):
         # post_reasoning_prefix one token at a time via allowed_token_ids.
         self._post_reasoning_tokens: Optional[List[int]] = None
         self._post_reasoning_idx: int = 0
+
+    def stop_token_ids(
+        self, runtime: "MoondreamRuntime"
+    ) -> Optional[Sequence[int]]:
+        stop_token_ids = self._get_query_template(runtime).stop_token_ids
+        return stop_token_ids or None
 
     def allowed_token_ids(
         self, runtime: "MoondreamRuntime"
@@ -220,6 +227,13 @@ class QuerySkillState(SkillState):
             self._ensure_token_ids(runtime)
         self.append_token(step.token)
 
+        template = self._get_query_template(runtime)
+        if isinstance(step.token, TextToken) and (
+            step.token.token_id == runtime.prompt_template.eos_id
+            or step.token.token_id in template.stop_token_ids
+        ):
+            return None
+
         # Track post-reasoning injection progress
         if (
             self._post_reasoning_tokens is not None
@@ -246,9 +260,8 @@ class QuerySkillState(SkillState):
                     # Replay the model's post-reasoning opener before the answer.
                     # Empty for models without the trained-in answer_id artifact
                     # (e.g. MD3); MD2 declares [answer_id] here.
-                    template = runtime.prompt_template.query()
-                    self._post_reasoning_tokens = (
-                        list(template.post_reasoning_prefix) if template else []
+                    self._post_reasoning_tokens = list(
+                        template.post_reasoning_prefix
                     )
                     self._post_reasoning_idx = 0
                     return None
@@ -362,3 +375,13 @@ class QuerySkillState(SkillState):
         self._answer_id = pt.answer_id
         self._start_ground_id = pt.start_ground_points_id
         self._end_ground_id = pt.end_ground_id
+
+    def _get_query_template(
+        self, runtime: "MoondreamRuntime"
+    ) -> QueryTemplate:
+        if self._query_template is None:
+            template = runtime.prompt_template.query()
+            if template is None:
+                raise ValueError("Model does not include a query template")
+            self._query_template = template
+        return self._query_template
