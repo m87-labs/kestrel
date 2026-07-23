@@ -96,6 +96,8 @@ class RequestLifecycle:
         prefill_started_at = self.prefill_started_at or queued_at
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
+        if decode_tokens == 0:
+            first_token_time = completed_at
         if self.sequence_state is not None:
             prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count

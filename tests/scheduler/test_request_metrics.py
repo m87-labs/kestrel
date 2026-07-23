@@ -66,6 +66,7 @@ def test_metrics_without_generated_tokens_assigns_work_to_prefill() -> None:
     lifecycle.submitted_at = 1.0
     lifecycle.prefill_started_at = 2.0
     lifecycle.prefill_completed_at = 3.0
+    lifecycle.first_token_time = 2.0
     lifecycle.completed_at = 5.0
 
     metrics = lifecycle.build_metrics(decode_tokens=0)
