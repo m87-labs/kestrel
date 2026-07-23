@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import pytest
 
 from kestrel.models.moondream.runtime import TextToken
-from kestrel.scheduler.types import GenerationRequest, RequestLifecycle
+from kestrel.scheduler.types import (
+    MODEL_PREFILL_TIMING_BOUNDARY,
+    GenerationRequest,
+    RequestLifecycle,
+)
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillState
 
 
@@ -41,6 +45,8 @@ def _lifecycle() -> RequestLifecycle:
 
 
 def test_metrics_split_model_prefill_at_first_token_ready() -> None:
+    assert MODEL_PREFILL_TIMING_BOUNDARY == "scheduled_to_first_model_token"
+
     lifecycle = _lifecycle()
     lifecycle.submitted_at = 1.0
     lifecycle.prefill_started_at = 3.0

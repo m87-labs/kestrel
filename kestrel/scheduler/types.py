@@ -12,6 +12,9 @@ from kestrel.models.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
+MODEL_PREFILL_TIMING_BOUNDARY = "scheduled_to_first_model_token"
+
+
 @dataclass(frozen=True, slots=True)
 class GeneratedPrefix:
     """Generated tokens that should be treated as already decoded."""
