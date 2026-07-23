@@ -98,6 +98,9 @@ class RequestLifecycle:
         first_token_time = self.first_token_time or completed_at
         if decode_tokens == 0:
             first_token_time = completed_at
+        prefill_ended_at = first_token_time
+        if self.prefill_started_at is None:
+            prefill_ended_at = prefill_started_at
         if self.sequence_state is not None:
             prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
@@ -110,7 +113,7 @@ class RequestLifecycle:
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
             prefill_time_ms=max(
-                (first_token_time - prefill_started_at) * 1000.0,
+                (prefill_ended_at - prefill_started_at) * 1000.0,
                 0.0,
             ),
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),

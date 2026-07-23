@@ -74,3 +74,15 @@ def test_metrics_without_generated_tokens_assigns_work_to_prefill() -> None:
     assert metrics.prefill_time_ms == pytest.approx(3_000.0)
     assert metrics.decode_time_ms == 0.0
     assert metrics.ttft_ms == pytest.approx(4_000.0)
+
+
+def test_metrics_before_prefill_does_not_assign_queue_time_to_prefill() -> None:
+    lifecycle = _lifecycle()
+    lifecycle.submitted_at = 1.0
+    lifecycle.completed_at = 5.0
+
+    metrics = lifecycle.build_metrics(decode_tokens=0)
+
+    assert metrics.prefill_time_ms == 0.0
+    assert metrics.decode_time_ms == 0.0
+    assert metrics.ttft_ms == pytest.approx(4_000.0)
