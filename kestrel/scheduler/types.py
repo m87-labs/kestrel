@@ -12,6 +12,9 @@ from kestrel.models.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
+MODEL_PREFILL_TIMING_BOUNDARY = "scheduled_to_first_model_token"
+
+
 @dataclass(frozen=True, slots=True)
 class GeneratedPrefix:
     """Generated tokens that should be treated as already decoded."""
@@ -91,9 +94,13 @@ class RequestLifecycle:
     ) -> "RequestMetrics":
         queued_at = self.submitted_at
         prefill_started_at = self.prefill_started_at or queued_at
-        prefill_completed_at = self.prefill_completed_at or prefill_started_at
         completed_at = self.completed_at or time.perf_counter()
         first_token_time = self.first_token_time or completed_at
+        if decode_tokens == 0:
+            first_token_time = completed_at
+        prefill_ended_at = first_token_time
+        if self.prefill_started_at is None:
+            prefill_ended_at = prefill_started_at
         if self.sequence_state is not None:
             prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
@@ -105,9 +112,12 @@ class RequestLifecycle:
         return RequestMetrics(
             prompt_tokens=prompt_tokens,
             decode_tokens=decode_tokens,
-            prefill_time_ms=max((prefill_completed_at - prefill_started_at) * 1000.0, 0.0),
+            prefill_time_ms=max(
+                (prefill_ended_at - prefill_started_at) * 1000.0,
+                0.0,
+            ),
             ttft_ms=max((first_token_time - queued_at) * 1000.0, 0.0),
-            decode_time_ms=max((completed_at - prefill_completed_at) * 1000.0, 0.0),
+            decode_time_ms=max((completed_at - first_token_time) * 1000.0, 0.0),
             cached_tokens=cached_tokens,
         )
 
@@ -271,6 +281,13 @@ StreamCallback = Callable[[StreamUpdate], None]
 
 @dataclass
 class RequestMetrics:
+    """Per-request token counts and model-phase timings.
+
+    Prefill ends when the first model token is ready, while decode covers the
+    remaining interval through request completion. Queue time is included only
+    in TTFT.
+    """
+
     prompt_tokens: int
     decode_tokens: int
     prefill_time_ms: float
