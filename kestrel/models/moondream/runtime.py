@@ -2505,8 +2505,8 @@ class MoondreamRuntime:
             embeds=embeds,
             batch_idx=slot.meta.batch_idx.gpu[:batch_size],
             input_pos=slot.meta.input_pos.gpu[:batch_size],
-            batch_idx_cpu=slot.meta.batch_idx.cpu[:batch_size],
-            input_pos_cpu=slot.meta.input_pos.cpu[:batch_size],
+            batch_idx_host=slot.meta.batch_idx.np[:batch_size],
+            input_pos_host=slot.meta.input_pos.np[:batch_size],
         )
 
     def _native_decode_hidden(
