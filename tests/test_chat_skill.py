@@ -359,6 +359,7 @@ class _MdPromptTemplate:
     size_id: int = 6
     start_ground_points_id: int = 7
     end_ground_id: int = 9
+    query_stop_token_ids: tuple[int, ...] = ()
 
     def chat(self) -> None:
         return None
@@ -367,12 +368,17 @@ class _MdPromptTemplate:
         return QueryTemplate(
             prefix=[10, 11], answer_prefix=[20], reasoning_prefix=[21],
             post_reasoning_prefix=[3],
+            stop_token_ids=list(self.query_stop_token_ids),
         )
 
 
-def _md_runtime(model_name: str = "moondream2") -> SimpleNamespace:
+def _md_runtime(
+    model_name: str = "moondream2",
+    *,
+    stop_token_ids: tuple[int, ...] = (),
+) -> SimpleNamespace:
     return SimpleNamespace(
-        prompt_template=_MdPromptTemplate(),
+        prompt_template=_MdPromptTemplate(query_stop_token_ids=stop_token_ids),
         tokenizer=_Tokenizer(),
         model_name=model_name,
     )
@@ -469,6 +475,20 @@ def test_moondream_chat_finalizes_as_message() -> None:
         "message": {"role": "assistant", "content": "Paris"},
         "finish_reason": "stop",
     }
+
+
+def test_moondream_chat_uses_query_stop_ids() -> None:
+    from kestrel.models.moondream.skills.chat import MoondreamChatSkill
+
+    runtime = _md_runtime(stop_token_ids=(88,))
+    state = MoondreamChatSkill().create_state(
+        runtime, SimpleNamespace(), _md_ctx([{"role": "user", "content": "hi"}])
+    )
+
+    assert tuple(state.stop_token_ids(runtime)) == (88,)
+    _drive(state, runtime, _ords("A") + [88])
+    result = state.finalize(runtime, reason="stop")
+    assert result.output["message"]["content"] == "A"
 
 
 def test_moondream_chat_inherits_query_suppression() -> None:
