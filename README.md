@@ -191,7 +191,7 @@ result = await stream.result()
 print(f"\n\nGenerated {result.metrics.output_tokens} tokens")
 ```
 
-Streaming is supported for `query` and `caption` methods.
+Streaming is supported for `query`, `caption`, and `segment` methods.
 
 ## Response Format
 
