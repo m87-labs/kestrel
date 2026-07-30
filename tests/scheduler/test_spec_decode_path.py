@@ -3006,7 +3006,7 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
     behavioural fallback inspects the constraint at the committed run's FIRST
     position only, so it cannot see a mask that is INACTIVE at step start but
     transitions to ACTIVE within the run. Reasoning skills do exactly that --
-    while collecting reasoning, ``QuerySkillState`` (non-moondream2) and
+    while collecting reasoning, ``QuerySkillState`` and
     ``ChatSkillState`` expose NO constraint (both ``allowed_token_ids`` and
     ``suppressed_token_ids`` return ``None``); once the model emits ``answer_id``
     they force ``post_reasoning_prefix`` one id at a time. If a spec macro-step
@@ -3016,7 +3016,7 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
     scheduler must cap them to one committed token per step EVEN THOUGH both
     masks read ``None`` this step -- the verdict the bare fallback would miss.
 
-    The contrast row is caption: under the same non-moondream2 runtime its mask
+    The contrast row is caption: under the same runtime its mask
     is also unconstrained (no allowed/suppressed), and it declares
     ``mask_is_stateful = False``, so it must STAY uncapped. Same None/None
     step-start signature, opposite cap verdict -- proving the declaration (not
@@ -3027,6 +3027,7 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
         CaptionSkill,
         CaptionSkillState,
     )
+    from kestrel.models.protocols import QueryTemplate
     from kestrel.skills.query import (
         QueryRequest,
         QuerySkill,
@@ -3040,15 +3041,23 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
         ChatSkillState,
     )
 
-    # A NON-moondream2 runtime: this is the case the bug lived in -- query's
-    # ``suppressed_token_ids`` returns ``None`` off-model, so a reasoning row's
-    # mask is fully None at step start. ``answer_id`` is only read once a step is
+    # An empty declarative suppression policy leaves the reasoning row's mask
+    # fully None at step start. ``answer_id`` is only read once a step is
     # consumed (not on the bare mask query this test drives), but provide it for
     # completeness.
     ANSWER = 7
+    query_template = QueryTemplate(
+        prefix=[],
+        answer_prefix=[],
+        reasoning_prefix=[],
+        post_reasoning_prefix=[ANSWER],
+    )
     runtime = SimpleNamespace(
         model_name="qwen3",
-        prompt_template=SimpleNamespace(answer_id=ANSWER),
+        prompt_template=SimpleNamespace(
+            answer_id=ANSWER,
+            query=lambda: query_template,
+        ),
     )
 
     dec = _FakeDecoder(
