@@ -40,7 +40,6 @@ from .prompt_template import (
     _USER_ID,
 )
 from .qwen_image import preprocess_image
-from .qwen_loader import load_qwen35_model
 
 
 _PREFILL_SCRATCH_TOKENS = 1024
@@ -742,6 +741,8 @@ class Qwen35Runtime:
         return build_skill_registry()
 
     def _load_model(self, repo_id: str) -> nn.Module:
+        from .qwen_loader import load_qwen35_model
+
         attn_impl = os.environ.get("KESTREL_QWEN35_ATTN_IMPL", "sdpa")
         return load_qwen35_model(
             repo_id,

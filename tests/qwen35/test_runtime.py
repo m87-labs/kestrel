@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -34,6 +35,12 @@ from kestrel.models.qwen35.runtime import (
     _QwenForwardCache,
 )
 from kestrel.models.qwen35.skills import Qwen35QuerySkill
+
+
+requires_mkl = pytest.mark.skipif(
+    importlib.util.find_spec("mkl") is None,
+    reason="requires the optional generated-decode compiler",
+)
 
 
 _MODEL_ID = "Qwen/Qwen3.5-2B"
@@ -377,7 +384,7 @@ def test_runtime_constructs():
     assert callable(rt.tokenizer.encode)
     assert callable(rt.tokenizer.decode)
     assert rt.prompt_template.bos_id == 248045
-    assert rt.region.coord_features.dtype == rt.dtype
+    assert not hasattr(rt, "region")
     assert len(rt.prefill_slots) == 2
     assert rt.page_table.page_size == 1
     padding_batch_idx = int(rt._padding_batch_idx)
@@ -1149,6 +1156,7 @@ def test_decode_with_slot_runs_bound_megakernel_for_b1(monkeypatch):
     ]
 
 
+@requires_mkl
 def test_decode_path_switch_prepares_compiler_declared_state(monkeypatch):
     from mkl.megakernel.state_runtime import StateRepresentationRequirement
 
@@ -1210,6 +1218,7 @@ def test_decode_path_switch_prepares_compiler_declared_state(monkeypatch):
     ]
 
 
+@requires_mkl
 def test_native_state_requirement_uses_pool_owned_replay_form():
     from kestrel.models.qwen35.runtime import _native_decode_state_requirements
     from mkl.megakernel.state_runtime import (
@@ -1313,6 +1322,7 @@ def test_zero_replay_cursor_ignores_stale_payload_when_materializing():
     torch.testing.assert_close(layer.replay_checkpoint_states, checkpoint)
 
 
+@requires_mkl
 def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
@@ -1361,6 +1371,7 @@ def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
     assert storage.replay_lengths.tolist() == [0, 4, 0]
 
 
+@requires_mkl
 def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
@@ -1400,6 +1411,7 @@ def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
     assert storage.replay_lengths.tolist() == [0, 4, 0]
 
 
+@requires_mkl
 def test_linear_state_pool_selects_compiler_required_recurrent_storage():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
@@ -1430,6 +1442,7 @@ def test_linear_state_pool_selects_compiler_required_recurrent_storage():
     assert selected_value_major[1] is None
 
 
+@requires_mkl
 def test_linear_state_pool_refuses_unsupported_in_place_layout_change():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
@@ -1456,6 +1469,7 @@ def test_linear_state_pool_refuses_unsupported_in_place_layout_change():
             key_major, value_major, (0,))
 
 
+@requires_mkl
 def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
     from mkl.compiler import frontend
@@ -1717,6 +1731,7 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     ]
 
 
+@requires_mkl
 def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
     from mkl.megakernel.device_runtime import DeviceRuntimeError
@@ -1788,6 +1803,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     ]
 
 
+@requires_mkl
 def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
     from mkl.compiler.frontend.models import qwen as qwen_frontend
@@ -1854,6 +1870,7 @@ def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
     }]
 
 
+@requires_mkl
 def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
 
@@ -1900,6 +1917,7 @@ def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch)
     assert set(result.programs) == {1, 2}
 
 
+@requires_mkl
 def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
     monkeypatch,
 ):
@@ -2019,6 +2037,7 @@ def test_decode_megakernel_factory_uses_native_without_compiler(monkeypatch):
     assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
 
 
+@requires_mkl
 def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
 
@@ -2054,6 +2073,7 @@ def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch
     assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
 
 
+@requires_mkl
 def test_decode_megakernel_factory_fails_closed_without_device_calibration(
     monkeypatch,
 ):
