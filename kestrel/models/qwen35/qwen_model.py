@@ -1,0 +1,2500 @@
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import itertools
+import warnings
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from .qwen_compat import (
+    ACT2FN,
+    ALL_ATTENTION_FUNCTIONS,
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    Cache,
+    FlashAttentionKwargs,
+    PreTrainedModel,
+    ROPE_INIT_FUNCTIONS,
+    TransformersKwargs,
+    Unpack,
+    create_causal_mask,
+    eager_attention_forward,
+    get_vision_bilinear_indices_and_weights,
+    get_vision_cu_seqlens,
+    get_vision_position_ids,
+    is_flash_attention_requested,
+    torch_compilable_check,
+)
+from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+
+from kestrel_kernels import get_runtime
+from kestrel_kernels import moe as _MOE_API
+from kestrel_kernels.moe.errors import FP8_MOE_REQUIRES_COMPACT_CONFIG
+
+_kestrel_runtime = get_runtime()
+_flash_attn_fwd = _kestrel_runtime.attention.flash_attn_fwd
+_kestrel_causal_conv1d_packed = _kestrel_runtime.gated_delta.causal_conv1d_packed
+_kestrel_causal_conv1d_update_indexed = (
+    _kestrel_runtime.gated_delta.causal_conv1d_update_indexed
+)
+_kestrel_packed_prefill_prepare = _kestrel_runtime.gated_delta.packed_prefill_prepare
+_kestrel_packed_recurrent_decode_replay_indexed = (
+    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_decode_replay_indexed
+)
+_kestrel_packed_recurrent_decode_replay_indexed_gqa = (
+    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_decode_replay_indexed_gqa
+)
+_kestrel_packed_recurrent_verify_replay_indexed = (
+    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_verify_replay_indexed
+)
+_kestrel_packed_recurrent_prefill = (
+    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_prefill
+)
+_kestrel_gated_rmsnorm = _kestrel_runtime.gated_delta.gated_rmsnorm
+_kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
+_kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
+_kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
+_kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
+_kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
+_kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
+_kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
+_kestrel_moe_runtime = _kestrel_runtime.moe
+_kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
+_KESTREL_RMSNORM_HIDDEN_SIZES = {128, 256, 1024, 2048, 2560, 4096, 5120}
+_KESTREL_MOE_DECODE_MAX_TOKENS = 16
+_KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
+_KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
+def _as_torch_dtype(dtype: Any) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        resolved = getattr(torch, dtype.removeprefix("torch."), None)
+        if isinstance(resolved, torch.dtype):
+            return resolved
+    return torch.get_default_dtype()
+
+
+def _kestrel_moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
+    tokens = int(tokens)
+    if tokens <= 0:
+        raise ValueError("tokens must be positive")
+    if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS:
+        return tokens, "decode"
+    return (
+        max(_KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
+        "prefill",
+    )
+
+
+class Qwen3_5VisionRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
+
+
+class Qwen3_5TextRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, config: Qwen3_5TextConfig, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        self.mrope_section = config.rope_parameters.get("mrope_section", [11, 11, 10])
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: Qwen3_5TextConfig | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config:
+                The model configuration.
+            device (`torch.device`):
+                The device to use for initialization of the inverse frequencies.
+            seq_len (`int`, *optional*):
+                The current sequence length. Unused for this type of RoPE.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters["rope_theta"]
+        partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # In contrast to other models, Qwen3_5 has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1).to(x.device)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
+
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """Apply interleaved MRoPE to 3D rotary embeddings.
+        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+        interleaved [THWTHWTHW...TT], preserving frequency continuity.
+        args:
+            x: (3, bs, seq_len, head_dim // 2)
+            mrope_section: (3,)
+        returns:
+            x_t: (bs, seq_len, head_dim // 2)
+        """
+        freqs_t = freqs[0]  # just overwrite the first dimension T
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+
+class Qwen3_5RMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.gated_rmsnorm = _kestrel_gated_rmsnorm
+
+    def forward(self, hidden_states, gate=None):
+        return self.gated_rmsnorm(
+            hidden_states,
+            gate,
+            self.weight,
+            self.variance_epsilon,
+        )
+
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    # NOTE: attention mask is a 2D boolean tensor
+    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """This function is intended to align with the l2norm implementation in the FLA library."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+
+
+def torch_chunk_gated_delta_rule(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    **kwargs,
+):
+    cu_seqlens = kwargs.get("cu_seqlens")
+    # Single-sequence (numel==2: [0, T]) falls through to the core chunk math so the
+    # host read below is skipped under CUDA-graph capture (graph-safety).
+    if cu_seqlens is not None and int(cu_seqlens.numel()) > 2:
+        offsets = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
+        outputs = []
+        final_states = []
+        for row, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+            row_initial_state = None
+            if initial_state is not None:
+                row_initial_state = initial_state[row : row + 1]
+            out, state = torch_chunk_gated_delta_rule(
+                query[:, start:end],
+                key[:, start:end],
+                value[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                chunk_size=chunk_size,
+                initial_state=row_initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            outputs.append(out)
+            if state is not None:
+                final_states.append(state)
+        core_attn_out = torch.cat(outputs, dim=1)
+        last_recurrent_state = (
+            torch.cat(final_states, dim=0) if final_states else None
+        )
+        return core_attn_out, last_recurrent_state
+
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    # reshape to chunks
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+
+    # chunk decay
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+
+    # for each chunk
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+def _packed_seq_idx_from_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32).contiguous()
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    sequence_ids = torch.arange(lengths.numel(), device=device, dtype=torch.int32)
+    return torch.repeat_interleave(
+        sequence_ids,
+        lengths,
+        output_size=total_tokens,
+    )[None, :]
+
+
+def _install_linear_conv_state(layer: Any, conv_states: torch.Tensor) -> None:
+    layer.dtype = conv_states.dtype
+    layer.device = conv_states.device
+    layer.max_batch_size = conv_states.shape[0]
+    layer.conv_kernel_size = conv_states.shape[-1]
+    layer.conv_states = conv_states
+    layer.is_conv_states_initialized = True
+
+
+class Qwen3_5GatedDeltaNet(nn.Module):
+    def __init__(self, config: Qwen3_5Config, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.layer_idx = layer_idx
+        self.activation = config.hidden_act
+        self.act = ACT2FN[config.hidden_act]
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        # QKV
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        # time step projection (discretization)
+        # instantiate once and copy inv_dt in init_weights of PretrainedModel
+        ssm_dtype = _as_torch_dtype(config.mamba_ssm_dtype)
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads, dtype=ssm_dtype))
+
+        A = torch.empty(self.num_v_heads, dtype=ssm_dtype).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+        self.causal_conv1d_packed = _kestrel_causal_conv1d_packed
+        self.causal_conv1d_update_indexed = _kestrel_causal_conv1d_update_indexed
+        self.packed_prefill_prepare = _kestrel_packed_prefill_prepare
+        self.packed_recurrent_decode_replay_indexed = (
+            _kestrel_packed_recurrent_decode_replay_indexed
+        )
+        self.packed_recurrent_decode_replay_indexed_gqa = (
+            _kestrel_packed_recurrent_decode_replay_indexed_gqa
+        )
+        self.packed_recurrent_verify_replay_indexed = (
+            _kestrel_packed_recurrent_verify_replay_indexed
+        )
+        self.packed_recurrent_prefill = _kestrel_packed_recurrent_prefill
+        self.supports_packed_gdn = _kestrel_supports_packed_gdn
+
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            self.conv_dim + self.value_dim + 2 * self.num_v_heads,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Cache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ):
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+
+        # Set up dimensions for reshapes later
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # We have cached `conv_state` / `recurrent_state` to continue from. The two cached modes
+        # (single-token decode and chunk-tokens continuation) share the state read here; they only
+        # diverge in how the conv input is assembled and which kernel consumes the states below,
+        # which we gate locally on `seq_len`.
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
+        cu_seqlens_q = kwargs.get("cu_seq_lens_q")
+        supports_native_packed_gdn = (
+            self.supports_packed_gdn(
+                hidden_states.device,
+                hidden_states.dtype,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+            )
+            and self.num_v_heads % self.num_k_heads == 0
+            and self.head_v_dim == self.head_k_dim
+        )
+        packed_prefill = (
+            cu_seqlens_q is not None
+            and batch_size == 1
+            and cache_params is not None
+            and not use_precomputed_states
+        )
+        native_prefill = packed_prefill and supports_native_packed_gdn
+
+        # getting projected states from cache if it exists
+        if use_precomputed_states:
+            layer_cache = cache_params.layers[self.layer_idx]
+            conv_state = layer_cache.conv_states
+            recurrent_state = layer_cache.recurrent_states
+            state_indices = kwargs.get("gdn_state_indices")
+            if state_indices is not None:
+                state_indices = state_indices.to(
+                    device=conv_state.device,
+                    dtype=torch.long,
+                ).view(-1)
+
+        in_proj = self.in_proj(hidden_states)
+        mixed_qkv, z, b, a = torch.split(
+            in_proj,
+            [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads],
+            dim=-1,
+        )
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+
+        if use_precomputed_states and seq_len > 1 and kwargs.get("spec_verify"):
+            # Cache the block's pre-conv input [B, conv_dim, T] so the spec-loop
+            # commit can roll the conv window over only the accepted prefix:
+            # conv_state = [committed_conv ++ block_preconv[:, :, :a+1]][-K_conv:].
+            layer_cache.spec_block_preconv = mixed_qkv.clone()
+
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        core_attn_out = None
+        last_recurrent_state = None
+        packed_recurrent_state = None
+
+        if use_precomputed_states and seq_len == 1:
+            # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
+            if state_indices is None:
+                raise RuntimeError("Qwen cached GDN decode requires gdn_state_indices")
+            mixed_qkv_decode = self.causal_conv1d_update_indexed(
+                mixed_qkv.squeeze(-1),
+                conv_state,
+                self.conv1d.weight.squeeze(1),
+                state_indices,
+                self.conv1d.bias,
+                self.activation,
+            )
+            if supports_native_packed_gdn:
+                # ReplaySSM is the only single-token GDN decode path. The ring
+                # buffers are seeded at prefill (native packed prefill here, or
+                # the state-pool capture for the captured path) and bound to the
+                # cache before decode, so they are always present.
+                #
+                # The replay ring is indexed by VALUE head (num_v_heads) -- both
+                # the symmetric and GQA kernels read it that way (the GQA kernel
+                # applies the k->v fan-out to q/k internally). On a GQA layer
+                # (num_v_heads != num_k_heads) the symmetric
+                # ``packed_recurrent_decode_replay_indexed`` validates replay_k
+                # as num_k_heads-shaped, so after the value-head ring allocation
+                # it rejects the (correct) v-head ring and its torch fallback
+                # raises ``bad replay_k shape``. Route GQA shapes to the GQA
+                # decode kernel, which expects the v-head ring; keep the
+                # symmetric kernel for symmetric (num_v_heads == num_k_heads)
+                # layers.
+                replay_checkpoint = layer_cache.replay_checkpoint_states
+                replay_k = layer_cache.replay_k
+                replay_u = layer_cache.replay_u
+                replay_g = layer_cache.replay_g
+                replay_lengths = layer_cache.replay_lengths
+                assert (
+                    replay_checkpoint is not None
+                    and replay_k is not None
+                    and replay_u is not None
+                    and replay_g is not None
+                    and replay_lengths is not None
+                ), "ReplaySSM decode state was not seeded before GDN decode"
+                decode_fn = (
+                    self.packed_recurrent_decode_replay_indexed_gqa
+                    if self.num_v_heads != self.num_k_heads
+                    else self.packed_recurrent_decode_replay_indexed
+                )
+                core_attn_out, last_recurrent_state = decode_fn(
+                    mixed_qkv_decode,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    replay_checkpoint,
+                    replay_k,
+                    replay_u,
+                    replay_g,
+                    replay_lengths,
+                    state_indices,
+                )
+            else:
+                mixed_qkv = mixed_qkv_decode[:, :, None]
+        else:
+            # Multi-token forward (prefill, or chunked-tokens decode when the cache has prior state).
+            packed_conv_state = None
+            if use_precomputed_states:
+                # Prior single-token decode may have run the ReplaySSM path, which
+                # advances the replay ring buffer but not recurrent_states. Fold
+                # the buffer back in so this chunk continuation starts from the
+                # true current state instead of a stale recurrent_state. Spec
+                # verify blocks consume the replay ring directly, so only an
+                # explicit overflow flush should materialize them.
+                if not kwargs.get("spec_verify"):
+                    layer_cache.materialize_recurrent_from_replay(state_indices)
+                recurrent_state = layer_cache.recurrent_states
+                if state_indices is not None:
+                    conv_state = conv_state.index_select(0, state_indices)
+                    recurrent_state = recurrent_state.index_select(0, state_indices)
+                elif conv_state.shape[0] != batch_size:
+                    raise RuntimeError(
+                        "Qwen cached chunk decode requires gdn_state_indices "
+                        "when state batch differs from token batch"
+                    )
+                # Cached chunked-tokens decode: prepend the cached conv context so the causal conv
+                # sees the correct left-context rather than zero-padding. Dropped from the output
+                # at the end of this branch.
+                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
+            if cache_params is not None:
+                if native_prefill:
+                    num_sequences = (
+                        int(cu_seqlens_q.numel() - 1)
+                        if packed_prefill
+                        else batch_size
+                    )
+                    layer = cache_params.layers[self.layer_idx]
+                    conv_shape = (
+                        num_sequences,
+                        self.conv_dim,
+                        self.conv_kernel_size,
+                    )
+                    if (
+                        not layer.is_conv_states_initialized
+                        or layer.conv_states is None
+                        or tuple(layer.conv_states.shape) != conv_shape
+                    ):
+                        _install_linear_conv_state(
+                            layer,
+                            torch.empty(
+                                conv_shape,
+                                device=mixed_qkv.device,
+                                dtype=mixed_qkv.dtype,
+                            ),
+                        )
+                    packed_conv_state = layer.conv_states
+                    recurrent_shape = (
+                        num_sequences,
+                        self.num_v_heads,
+                        self.head_k_dim,
+                        self.head_v_dim,
+                    )
+                    if (
+                        not layer.is_recurrent_states_initialized
+                        or layer.recurrent_states is None
+                        or tuple(layer.recurrent_states.shape) != recurrent_shape
+                    ):
+                        layer.recurrent_states = torch.empty(
+                            recurrent_shape,
+                            device=mixed_qkv.device,
+                            dtype=torch.float32,
+                        )
+                        layer.is_recurrent_states_initialized = True
+                    packed_recurrent_state = layer.recurrent_states
+                    layer.has_previous_state = True
+                elif not packed_prefill:
+                    new_conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                    cache_params.update_conv_state(
+                        new_conv_state,
+                        self.layer_idx,
+                        state_indices=state_indices if use_precomputed_states else None,
+                    )
+            if native_prefill:
+                seq_idx = kwargs.get("seq_idx")
+                if seq_idx is None:
+                    seq_idx = _packed_seq_idx_from_cu_seqlens(
+                        cu_seqlens_q,
+                        mixed_qkv.shape[-1],
+                        mixed_qkv.device,
+                    )
+                recurrence_cu_seqlens = cu_seqlens_q
+                # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
+                # Triton Bench on H100 was 0.0358 ms vs 0.0250 ms at seq=384,
+                # and 0.0515 ms vs 0.0333 ms at seq=768,chunks=2; keeping the
+                # separate kernels.
+                mixed_qkv = self.causal_conv1d_packed(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    seq_idx=seq_idx,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    final_state=packed_conv_state,
+                )
+            elif packed_prefill:
+                seq_idx = kwargs.get("seq_idx")
+                if seq_idx is None:
+                    seq_idx = _packed_seq_idx_from_cu_seqlens(
+                        cu_seqlens_q,
+                        mixed_qkv.shape[-1],
+                        mixed_qkv.device,
+                    )
+                recurrence_cu_seqlens = cu_seqlens_q
+                if cache_params is not None:
+                    num_sequences = int(cu_seqlens_q.numel() - 1)
+                    layer = cache_params.layers[self.layer_idx]
+                    conv_shape = (
+                        num_sequences,
+                        self.conv_dim,
+                        self.conv_kernel_size,
+                    )
+                    if (
+                        not layer.is_conv_states_initialized
+                        or layer.conv_states is None
+                        or tuple(layer.conv_states.shape) != conv_shape
+                    ):
+                        _install_linear_conv_state(
+                            layer,
+                            torch.empty(
+                                conv_shape,
+                                device=mixed_qkv.device,
+                                dtype=mixed_qkv.dtype,
+                            ),
+                        )
+                    packed_conv_state = layer.conv_states
+                mixed_qkv = self.causal_conv1d_packed(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    seq_idx=seq_idx,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    final_state=packed_conv_state,
+                    out=None,
+                )
+                if cache_params is not None and packed_conv_state is not None:
+                    cache_params.update_conv_state(
+                        packed_conv_state,
+                        self.layer_idx,
+                        state_indices=state_indices if use_precomputed_states else None,
+                    )
+            else:
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
+            if use_precomputed_states:
+                mixed_qkv = mixed_qkv[:, :, -seq_len:]
+
+        if core_attn_out is None:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            if kwargs.get("spec_verify") and use_precomputed_states and seq_len > 1:
+                # Multi-token ReplaySSM spec-verify (Algorithm 4): read all T draft
+                # outputs from the committed checkpoint + ring buffer and append them;
+                # the spec loop's commit advances the cursor. The checkpoint is kept
+                # current by the prefill/decode commit (update_recurrent_state ->
+                # _reset_replay_rows seeds replay_checkpoint_states from recurrent_states).
+                _lc = cache_params.layers[self.layer_idx]
+                core_attn_out, last_recurrent_state = self.packed_recurrent_verify_replay_indexed(
+                    mixed_qkv, a, b, self.A_log, self.dt_bias,
+                    _lc.replay_checkpoint_states, _lc.replay_k, _lc.replay_u,
+                    _lc.replay_g, _lc.replay_lengths, state_indices,
+                )
+            prepped_qk = (
+                native_prefill
+                and supports_native_packed_gdn
+                and not use_precomputed_states
+            )
+            if prepped_qk:
+                query, key, value, g, beta = self.packed_prefill_prepare(
+                    mixed_qkv,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [
+                        self.key_dim,
+                        self.key_dim,
+                        self.value_dim,
+                    ],
+                    dim=-1,
+                )
+
+                query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+                key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+                value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+                beta = b.sigmoid()
+                # If the model is loaded in fp16, without the .float() here, A might be -inf
+                g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+                if self.num_v_heads // self.num_k_heads > 1:
+                    query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+                    key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+            if core_attn_out is None and prepped_qk:
+                # Native serial prefill recurrence beats Kestrel-prep+FLA on
+                # most Qwen packed shapes (for example seq=384,chunks=1:
+                # 0.252 ms vs 0.433 ms on H100). It still loses at
+                # seq=768,chunks=1 (0.489 ms vs 0.441 ms); closing that
+                # remaining case needs a native chunk/WY-parallel recurrence.
+                core_attn_out, last_recurrent_state = self.packed_recurrent_prefill(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    recurrence_cu_seqlens,
+                    output_final_state=cache_params is not None,
+                    final_state=packed_recurrent_state,
+                )
+            elif core_attn_out is None:
+                initial_recurrent_state = (
+                    recurrent_state if use_precomputed_states else None
+                )
+                if initial_recurrent_state is not None:
+                    if (
+                        state_indices is not None
+                        and initial_recurrent_state.shape[0] != batch_size
+                    ):
+                        initial_recurrent_state = initial_recurrent_state.index_select(
+                            0,
+                            state_indices,
+                        )
+                    elif initial_recurrent_state.shape[0] != batch_size:
+                        raise RuntimeError(
+                            "Qwen cached recurrent decode requires gdn_state_indices "
+                            "when state batch differs from token batch"
+                        )
+                core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_recurrent_state,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                    # The chunked FLA kernel takes a single `cu_seqlens` arg; for packed self-attention this matches q-side lengths.
+                    cu_seqlens=cu_seqlens_q,
+                )
+
+        # Update cache
+        if (
+            cache_params is not None
+            and last_recurrent_state is not None
+            and last_recurrent_state is not packed_recurrent_state
+        ):
+            cache_params.update_recurrent_state(
+                last_recurrent_state,
+                self.layer_idx,
+                state_indices=state_indices if use_precomputed_states else None,
+            )
+        elif cache_params is not None and native_prefill:
+            # Native packed prefill writes recurrent_states in place, bypassing
+            # update_recurrent_state -> _reset_replay_rows. Seed the ReplaySSM
+            # ring buffer from the committed state here so single-token decode
+            # takes the replay path in eager mode too (the captured path seeds
+            # the same checkpoint via the state-pool capture).
+            seed_layer = cache_params.layers[self.layer_idx]
+            if (
+                hasattr(seed_layer, "_reset_replay_rows")
+                and getattr(seed_layer, "recurrent_states", None) is not None
+            ):
+                seed_layer._reset_replay_rows(seed_layer.recurrent_states, None)
+
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+
+        output = self.out_proj(core_attn_out)
+        return output
+
+
+# Adapted from GLM's rotary embedding helper.
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Removes the interleaving of cos and sin from GLM
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    if unsqueeze_dim != 1:
+        raise ValueError("Qwen text rotary expects [B, H, S, D] query/key tensors")
+    return _kestrel_text_mrope_apply(q, k, cos, sin)
+
+
+def paged_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    *,
+    paged_kv_layer: Any,
+    page_table: torch.Tensor | None,
+    paged_kv_seqlens_k: torch.Tensor | None,
+    dropout: float = 0.0,
+    paged_kv_seqlens_q: torch.Tensor | None = None,
+    cu_seq_lens_q: torch.Tensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    if page_table is None or paged_kv_seqlens_k is None:
+        raise RuntimeError("Qwen paged attention requires page_table and seqused_k")
+
+    q_bshd = query.transpose(1, 2).contiguous()
+    q_for_attention = q_bshd
+    seqused_q = paged_kv_seqlens_q
+    if cu_seq_lens_q is not None:
+        # Packed query layout: cu_seq_lens_q describes the per-sequence block
+        # boundaries over a flat [total_q, H, D] tensor. The single-sequence /
+        # production-prefill callers already pass batch dim 1 ([1, total, H, D]);
+        # the batched spec-verify caller passes [B, T, H, D] (equal-length blocks)
+        # so the FlashAttention varlen path takes the shipped packed cubin (the
+        # batched seqused_q path is JIT-only and unsafe under graph capture).
+        # Flatten the batch into the packed token axis either way.
+        q_for_attention = q_bshd.reshape(-1, q_bshd.shape[-2], q_bshd.shape[-1]).contiguous()
+        seqused_q = None
+    if q_for_attention.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            f"Qwen paged attention requires fp16/bf16 tensors, got {q_for_attention.dtype}"
+        )
+
+    k_cache = paged_kv_layer.k_cache.permute(0, 2, 1, 3)
+    v_cache = paged_kv_layer.v_cache.permute(0, 2, 1, 3)
+    out, _ = _flash_attn_fwd(
+        q_for_attention,
+        k_cache,
+        v_cache,
+        page_table=page_table,
+        cu_seqlens_q=cu_seq_lens_q,
+        seqused_q=seqused_q,
+        seqused_k=paged_kv_seqlens_k,
+        paged_kv_non_tma=True,
+        causal=True,
+        k_scale=getattr(paged_kv_layer, "k_scale", None),
+        v_scale=getattr(paged_kv_layer, "v_scale", None),
+    )
+    if cu_seq_lens_q is not None:
+        # Restore the [B, T, H, D] (or [1, total, H, D]) shape the caller expects.
+        out = out.reshape(q_bshd.shape[0], q_bshd.shape[1], *out.shape[-2:])
+    return out, None
+
+
+class Qwen3_5Attention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: Qwen3_5Config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.is_causal = True
+        self.q_gate_size = config.num_attention_heads * self.head_dim * 2
+        self.kv_size = config.num_key_value_heads * self.head_dim
+        self.qkv_proj = nn.Linear(
+            config.hidden_size,
+            self.q_gate_size + 2 * self.kv_size,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        q_gate, key_states, value_states = self.qkv_proj(hidden_states).split(
+            [self.q_gate_size, self.kv_size, self.kv_size],
+            dim=-1,
+        )
+        query_states, gate = torch.chunk(
+            q_gate.reshape(*input_shape, -1, self.head_dim * 2),
+            2,
+            dim=-1,
+        )
+
+        query_states = self.q_norm(query_states.reshape(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(key_states.reshape(hidden_shape)).transpose(1, 2)
+        value_states = value_states.reshape(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        paged_kv_layer = None
+        if past_key_values is not None and hasattr(past_key_values, "get_paged_layer"):
+            paged_kv_layer = past_key_values.get_paged_layer(self.layer_idx)
+
+        if past_key_values is not None:
+            if paged_kv_layer is not None:
+                cache_position_ids = kwargs.get("cache_position_ids")
+                slot_mapping = kwargs.get("slot_mapping")
+                if cache_position_ids is None or slot_mapping is None:
+                    raise RuntimeError(
+                        "Qwen paged KV update requires cache_position_ids and slot_mapping"
+                    )
+                paged_kv_layer.update(
+                    input_pos=cache_position_ids,
+                    k_val=key_states.transpose(1, 2),
+                    v_val=value_states.transpose(1, 2),
+                    slot_mapping=slot_mapping,
+                )
+            else:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        if paged_kv_layer is not None:
+            attn_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                not in {
+                    "cache_position_ids",
+                    "slot_mapping",
+                    "page_table",
+                    "paged_kv_seqlens_q",
+                    "paged_kv_seqlens_k",
+                    "cu_seq_lens_q",
+                }
+            }
+            attn_output, attn_weights = paged_attention_forward(
+                self,
+                query_states,
+                attention_mask,
+                dropout=0.0,
+                scaling=self.scaling,
+                paged_kv_layer=paged_kv_layer,
+                page_table=kwargs.get("page_table"),
+                paged_kv_seqlens_q=kwargs.get("paged_kv_seqlens_q"),
+                paged_kv_seqlens_k=kwargs.get("paged_kv_seqlens_k"),
+                cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+                **attn_kwargs,
+            )
+        else:
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+        attn_output = attn_output * torch.sigmoid(gate)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class Qwen3_5MLP(nn.Module):
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        intermediate_size: int,
+    ):
+        super().__init__()
+        self.config = config
+        if config.hidden_act != "silu":
+            raise ValueError(
+                "Qwen3_5MLP only supports hidden_act='silu', "
+                f"got {config.hidden_act!r}"
+            )
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size,
+            2 * self.intermediate_size,
+            bias=False,
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+        )
+
+    def forward(self, x):
+        gate_up = self.gate_up_proj(x)
+        hidden = torch.empty(
+            (*gate_up.shape[:-1], self.intermediate_size),
+            device=gate_up.device,
+            dtype=gate_up.dtype,
+        )
+        _kestrel_gated_activation_into(
+            hidden,
+            gate_up,
+            activation="silu",
+            layout="interleaved_i8",
+        )
+        return self.down_proj(hidden)
+
+
+class Qwen3_5Experts(nn.Module):
+    """Packed Qwen 3.5 MoE expert weights, matching HF safetensor keys."""
+
+    def __init__(self, config: Qwen3_5TextConfig):
+        super().__init__()
+        if config.num_experts is None or config.moe_intermediate_size is None:
+            raise ValueError("MoE config must define num_experts and moe_intermediate_size")
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.expert_weight_format = config.expert_weight_format
+        if self.expert_weight_format not in ("bf16", "fp8_e4m3"):
+            raise ValueError(
+                f"unsupported Qwen expert weight format: {self.expert_weight_format!r}"
+            )
+        if self.intermediate_dim % 8 != 0:
+            raise ValueError(
+                "Qwen expert interleaved gate/up layout requires "
+                f"moe_intermediate_size divisible by 8, got {self.intermediate_dim}"
+            )
+        param_dtype = (
+            torch.uint8
+            if self.expert_weight_format == "fp8_e4m3"
+            else torch.get_default_dtype()
+        )
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                2 * self.intermediate_dim,
+                self.hidden_dim,
+                dtype=param_dtype,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                self.hidden_dim,
+                self.intermediate_dim,
+                dtype=param_dtype,
+            ),
+            requires_grad=False,
+        )
+        if self.expert_weight_format == "fp8_e4m3":
+            self.register_buffer(
+                "gate_up_proj_scale",
+                torch.empty(
+                    self.num_experts,
+                    2,
+                    (self.intermediate_dim + 127) // 128,
+                    (self.hidden_dim + 127) // 128,
+                    dtype=torch.float32,
+                ),
+            )
+            self.register_buffer(
+                "down_proj_scale",
+                torch.empty(
+                    self.num_experts,
+                    (self.hidden_dim + 127) // 128,
+                    (self.intermediate_dim + 127) // 128,
+                    dtype=torch.float32,
+                ),
+            )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def _expert_gate_up(self, expert_idx: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj[expert_idx]
+        if gate_up.dtype != torch.uint8:
+            return gate_up
+        scale = self.gate_up_proj_scale[expert_idx]
+        gate_scale = scale[0].repeat_interleave(128, dim=0).repeat_interleave(
+            128, dim=1
+        )[: self.intermediate_dim, : self.hidden_dim]
+        up_scale = scale[1].repeat_interleave(128, dim=0).repeat_interleave(
+            128, dim=1
+        )[: self.intermediate_dim, : self.hidden_dim]
+        expanded_scale = torch.stack(
+            (
+                gate_scale.reshape(self.intermediate_dim // 8, 8, self.hidden_dim),
+                up_scale.reshape(self.intermediate_dim // 8, 8, self.hidden_dim),
+            ),
+            dim=1,
+        ).reshape(
+            2 * self.intermediate_dim,
+            self.hidden_dim,
+        )
+        return (
+            gate_up.view(torch.float8_e4m3fn).to(torch.float32)
+            * expanded_scale
+        ).to(torch.bfloat16)
+
+    def _expert_down(self, expert_idx: torch.Tensor) -> torch.Tensor:
+        down = self.down_proj[expert_idx]
+        if down.dtype != torch.uint8:
+            return down
+        scale = self.down_proj_scale[expert_idx]
+        expanded_scale = scale.repeat_interleave(128, dim=0).repeat_interleave(
+            128, dim=1
+        )
+        return (
+            down.view(torch.float8_e4m3fn).to(torch.float32)
+            * expanded_scale[: self.hidden_dim, : self.intermediate_dim]
+        ).to(torch.bfloat16)
+
+    def _split_interleaved_gate_up(
+        self, gate_up: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_up = gate_up.reshape(
+            gate_up.shape[0],
+            self.intermediate_dim // 8,
+            2,
+            8,
+        )
+        gate = gate_up[:, :, 0, :].reshape(gate_up.shape[0], self.intermediate_dim)
+        up = gate_up[:, :, 1, :].reshape(gate_up.shape[0], self.intermediate_dim)
+        return gate, up
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and top_k_weights.dtype == torch.bfloat16
+            and self.top_k is not None
+        ):
+            try:
+                return self._forward_kestrel(
+                    hidden_states,
+                    top_k_index,
+                    top_k_weights,
+                )
+            except ValueError as exc:
+                if (
+                    self.expert_weight_format != "fp8_e4m3"
+                    or str(exc) != FP8_MOE_REQUIRES_COMPACT_CONFIG
+                ):
+                    raise
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        expert_ids_for_mask = (
+            top_k_index if top_k_index.dtype == torch.long else top_k_index.to(torch.long)
+        )
+        expert_mask = F.one_hot(expert_ids_for_mask, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx_tensor in expert_hits:
+            expert_idx = expert_idx_tensor[0]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate_up = F.linear(current_state, self._expert_gate_up(expert_idx))
+            gate, up = self._split_interleaved_gate_up(gate_up)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(
+                current_hidden_states,
+                self._expert_down(expert_idx),
+            )
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(
+                0,
+                token_idx,
+                current_hidden_states.to(final_hidden_states.dtype),
+            )
+
+        return final_hidden_states
+
+    def _forward_kestrel(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = int(hidden_states.shape[0])
+        capacity_tokens, capacity_mode = _kestrel_moe_capacity_for_tokens(tokens)
+        if top_k_index.dtype != torch.int32:
+            top_k_index = top_k_index.to(torch.int32)
+        spec = _MOE_API.MoeSpec(
+            num_experts=self.num_experts,
+            top_k=int(self.top_k),
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_dim,
+            activation="swiglu",
+            weight_format=self.expert_weight_format,
+            dtype=hidden_states.dtype,
+            backend="auto" if self.expert_weight_format == "fp8_e4m3" else "triton",
+        )
+        handle = _kestrel_moe_runtime.prepare(
+            spec,
+            _MOE_API.MoeCapacity(
+                max_tokens=capacity_tokens,
+                mode=capacity_mode,
+            ),
+            device=hidden_states.device,
+        )
+        pack_kwargs: dict[str, Any] = {}
+        if self.expert_weight_format == "fp8_e4m3":
+            pack_kwargs = {
+                "up_scale": self.gate_up_proj_scale,
+                "down_scale": self.down_proj_scale,
+                "weight_scale_layout": _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT,
+            }
+        weights = _MOE_API.pack_weights(
+            handle.spec,
+            up=self.gate_up_proj,
+            down=self.down_proj,
+            **pack_kwargs,
+        )
+        return _kestrel_moe_runtime.forward(
+            handle,
+            x=hidden_states,
+            topk_ids=top_k_index,
+            topk_weights=top_k_weights,
+            weights=weights,
+        )
+
+
+class Qwen3_5TopKRouter(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig):
+        super().__init__()
+        if config.num_experts is None or config.num_experts_per_tok is None:
+            raise ValueError("MoE config must define num_experts and num_experts_per_tok")
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight)
+        if (
+            router_logits.is_cuda
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.is_contiguous()
+            and self.top_k == 8
+            and self.num_experts in (64, 256)
+        ):
+            return _kestrel_moe_topk_fwd(
+                router_logits,
+                self.top_k,
+                softmax=True,
+            )
+        router_top_logits, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        router_scores = F.softmax(router_top_logits, dtype=torch.float, dim=-1).to(
+            router_logits.dtype
+        )
+        return router_scores, router_indices
+
+
+class Qwen3_5SparseMoeBlock(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig):
+        super().__init__()
+        if config.shared_expert_intermediate_size is None:
+            raise ValueError("MoE config must define shared_expert_intermediate_size")
+        self.gate = Qwen3_5TopKRouter(config)
+        self.experts = Qwen3_5Experts(config)
+        self.shared_expert = Qwen3_5MLP(
+            config,
+            intermediate_size=config.shared_expert_intermediate_size,
+        )
+        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.reshape(-1, hidden_dim)
+        shared_expert_output = self.shared_expert(hidden_states_reshaped)
+        routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        expert_output = self.experts(
+            hidden_states_reshaped,
+            selected_experts,
+            routing_weights,
+        )
+        shared_expert_output = torch.sigmoid(
+            self.shared_expert_gate(hidden_states_reshaped)
+        ) * shared_expert_output
+        expert_output = expert_output + shared_expert_output
+        return expert_output.reshape(batch_size, sequence_length, hidden_dim)
+
+
+def qwen_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    # Qwen/Gemma RMSNorm keeps normalization and scale in fp32 before casting
+    # back. The loader folds checkpoint offset weights into the runtime scale.
+    if (
+        x.is_cuda
+        and weight.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.float32
+        and x.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
+        and abs(float(eps) - 1.0e-6) < 1.0e-12
+    ):
+        return _kestrel_rmsnorm(x, weight, eps)
+    if (
+        x.is_mps
+        and weight.is_mps
+        and x.dtype == torch.float16
+        and weight.dtype == torch.float32
+        and x.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
+        and abs(float(eps) - 1.0e-6) < 1.0e-12
+    ):
+        return _kestrel_rmsnorm(x, weight, eps)
+    return F.rms_norm(x.float(), weight.shape, weight, eps).to(x.dtype)
+
+
+def qwen_add_rms_norm(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.is_cuda
+        and x.is_cuda
+        and weight.is_cuda
+        and residual.shape == x.shape
+        and residual.dtype == torch.bfloat16
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.float32
+        and residual.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
+        and abs(float(eps) - 1.0e-6) < 1.0e-12
+    ):
+        return residual, _kestrel_add_rmsnorm(residual, x, weight, eps)
+    # Tried MPS _kestrel_add_rmsnorm: standalone [1, 2048] add-RMSNorm was
+    # 1.65x faster, but Qwen 64-token median fell to 16.8 tok/s vs 17.4 with
+    # in-place add + PyTorch RMSNorm; keep the end-to-end winner.
+    residual.add_(x)
+    return residual, F.rms_norm(residual.float(), weight.shape, weight, eps).to(
+        residual.dtype
+    )
+
+
+class Qwen3_5RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x):
+        return qwen_rms_norm(x, self.weight, self.eps)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+class Qwen3_5DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.layer_type = config.layer_types[layer_idx]
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+        elif self.layer_type == "full_attention":
+            self.self_attn = Qwen3_5Attention(config, layer_idx)
+        self.mlp = (
+            Qwen3_5SparseMoeBlock(config)
+            if config.is_moe
+            else Qwen3_5MLP(
+                config,
+                config.intermediate_size,
+            )
+        )
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def _forward_from_normalized(
+        self,
+        residual: torch.Tensor,
+        normalized_hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        output_layernorm: Qwen3_5RMSNorm | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_states = normalized_hidden_states
+
+        # Token Mixer
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        elif self.layer_type == "full_attention":
+            # Self Attention
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        # Fully Connected
+        residual, hidden_states = qwen_add_rms_norm(
+            residual,
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        hidden_states = self.mlp(hidden_states)
+        if output_layernorm is not None:
+            residual, normalized_output = qwen_add_rms_norm(
+                residual,
+                hidden_states,
+                output_layernorm.weight,
+                output_layernorm.eps,
+            )
+            return residual, normalized_output
+
+        hidden_states = residual + hidden_states
+
+        return hidden_states, None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.FloatTensor:
+        hidden_states, _ = self._forward_from_normalized(
+            hidden_states,
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
+            output_layernorm=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        return hidden_states
+
+
+class Qwen3_5VisionMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+        self.act_fn = ACT2FN[config.hidden_act]
+        # cuBLASLt fused-MLP GELU epilogue mode that matches ``config.hidden_act``.
+        # The vision encoder uses ``gelu_pytorch_tanh`` (tanh approximation); plain
+        # ``gelu`` maps to the exact (erf) GELU.
+        if config.hidden_act == "gelu_pytorch_tanh":
+            self._gelu_approximate = "tanh"
+        elif config.hidden_act == "gelu":
+            self._gelu_approximate = "none"
+        else:
+            self._gelu_approximate = None
+    def forward(self, hidden_state, residual=None, hidden_workspace=None):
+        """``linear_fc2(act_fn(linear_fc1(hidden_state)))``, plus ``residual``.
+
+        When ``residual`` is given on CUDA bf16/fp16, fc1+GELU+fc2+bias+residual
+        fuse into a single cuBLASLt call (one kernel instead of the eager
+        fc1/GELU/fc2/add chain), eliminating the per-block GELU launch. Every
+        other case falls back to eager. Called through ``__call__`` so module
+        forward hooks (e.g. the profiler's ``vision.mlp``) still fire.
+        """
+        if (
+            residual is not None
+            and self._gelu_approximate is not None
+            and hidden_state.is_cuda
+            and hidden_state.ndim == 2
+            and hidden_state.dtype in (torch.bfloat16, torch.float16)
+            and self.linear_fc1.weight.dtype == hidden_state.dtype
+            and self.linear_fc2.weight.dtype == hidden_state.dtype
+        ):
+            x = hidden_state.contiguous()
+            residual = residual.contiguous()
+            m = x.shape[0]
+            out = torch.empty_like(residual)
+            if hidden_workspace is not None and hidden_workspace.shape[0] >= m:
+                hidden = hidden_workspace[:m]
+            else:
+                hidden = torch.empty(
+                    (m, self.intermediate_size), device=x.device, dtype=x.dtype
+                )
+            _kestrel_fused_mlp_gelu_bias_residual(
+                out,
+                hidden,
+                x,
+                self.linear_fc1.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.weight,
+                self.linear_fc2.bias,
+                residual,
+                approximate=self._gelu_approximate,
+            )
+            return out
+        out = self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
+        return out if residual is None else residual + out
+
+
+class Qwen3_5VisionPatchEmbed(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
+
+        self.proj = nn.Linear(
+            self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size,
+            self.embed_dim,
+            bias=True,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.proj(hidden_states)
+
+
+class Qwen3_5VisionPatchMerger(nn.Module):
+    def __init__(self, config: Qwen3_5VisionConfig, use_postshuffle_norm=False) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        return x
+
+
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _kestrel_spatial_rope_apply(q, k, cos, sin, axis_blocks=1)
+
+
+class Qwen3_5VisionAttention(nn.Module):
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
+        super().__init__()
+        self.dim = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.num_key_value_groups = 1  # needed for eager attention
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim)
+        self.scaling = self.head_dim**-0.5
+        self.config = config
+        self.is_causal = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+        query_states = query_states.transpose(0, 1).unsqueeze(0)
+        key_states = key_states.transpose(0, 1).unsqueeze(0)
+        value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        if is_flash_attention_requested(self.config):
+            # Flash Attention: Use cu_seqlens for variable length attention
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                is_causal=False,
+                **kwargs,
+            )
+        else:
+            # Other implementations: Process each chunk separately
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+            ]
+
+            attn_outputs = [
+                attention_interface(
+                    self,
+                    q,
+                    k,
+                    v,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=0.0,
+                    is_causal=False,
+                    **kwargs,
+                )[0]
+                for q, k, v in zip(*splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=1)
+
+        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        attn_output = self.proj(attn_output)
+        return attn_output
+
+
+class Qwen3_5VisionBlock(nn.Module):
+    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.attn = Qwen3_5VisionAttention(config=config)
+        self.mlp = Qwen3_5VisionMLP(config=config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        mlp_workspace: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        cu_seqlens (`torch.Tensor`):
+            Cumulative sequence lengths used for packed variable-length attention in Flash Attention kernels.
+        """
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = self.mlp(
+            self.norm2(hidden_states), hidden_states, mlp_workspace
+        )
+        return hidden_states
+
+
+class Qwen3_5VisionModel(PreTrainedModel):
+    config: Qwen3_5VisionConfig
+    input_modalities = ("image", "video")
+
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.spatial_merge_size = config.spatial_merge_size
+        self.patch_size = config.patch_size
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+        self.patch_embed = Qwen3_5VisionPatchEmbed(
+            config=config,
+        )
+
+        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+
+        head_dim = config.hidden_size // config.num_heads
+        self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = nn.ModuleList([Qwen3_5VisionBlock(config) for _ in range(config.depth)])
+        self.merger = Qwen3_5VisionPatchMerger(
+            config=config,
+            use_postshuffle_norm=False,
+        )
+        # One shared fused-MLP fc1/gelu workspace for all blocks (the intermediate
+        # is consumed within each block's fused call and the blocks run
+        # sequentially, so a single buffer suffices instead of one per block).
+        self._mlp_hidden_workspace: torch.Tensor | None = None
+
+    def _mlp_workspace(self, num_tokens, dtype, device) -> torch.Tensor:
+        ws = self._mlp_hidden_workspace
+        if (
+            ws is None
+            or ws.shape[0] < num_tokens
+            or ws.dtype != dtype
+            or ws.device != device
+        ):
+            ws = torch.empty(
+                num_tokens, self.config.intermediate_size, dtype=dtype, device=device
+            )
+            self._mlp_hidden_workspace = ws
+        return ws[:num_tokens]
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        warnings.warn(
+            f"`{self.__class__.__name__}.rot_pos_emb` is deprecated. Use the local `get_vision_position_ids` helper and apply the rotary embedding module.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size)
+        rotary_pos_emb = self.rotary_pos_emb(position_ids)
+        return rotary_pos_emb
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        warnings.warn(
+            f"`{self.__class__.__name__}.fast_pos_embed_interpolate` is deprecated. Use the local `get_vision_bilinear_indices_and_weights` helper and apply `self.pos_embed`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
+            grid_thw,
+            num_grid_per_side=self.num_grid_per_side,
+            spatial_merge_size=self.config.spatial_merge_size,
+        )
+        return (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
+
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
+                The final hidden states of the model.
+            grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
+                The temporal, height and width of feature shape of each image in LLM.
+
+        Returns:
+            `torch.Tensor`: hidden_states.
+        """
+        bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
+            grid_thw,
+            num_grid_per_side=self.num_grid_per_side,
+            spatial_merge_size=self.config.spatial_merge_size,
+            kwargs=kwargs,
+        )
+        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
+        cu_seqlens = get_vision_cu_seqlens(grid_thw, kwargs=kwargs)
+
+        hidden_states = self.patch_embed(hidden_states)
+        pos_embeds = (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
+        hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
+        rotary_pos_emb = self.rotary_pos_emb(position_ids)
+
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        # Only the fused (CUDA bf16/fp16) MLP path consumes the workspace; skip
+        # the allocation entirely on eager/CPU/MPS fallbacks.
+        if hidden_states.is_cuda and hidden_states.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            mlp_workspace = self._mlp_workspace(
+                seq_len, hidden_states.dtype, hidden_states.device
+            )
+        else:
+            mlp_workspace = None
+        for blk in self.blocks:
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                mlp_workspace=mlp_workspace,
+                **kwargs,
+            )
+
+        merged_hidden_states = self.merger(hidden_states)
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=hidden_states,
+            pooler_output=merged_hidden_states,
+        )
+
+
+@dataclass
+class Qwen3_5ModelOutputWithPast(BaseModelOutputWithPast):
+    r"""
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+        The attribute is deprecated and will be removed in v5.20, use `model.base_model.rope_deltas` instead.
+    """
+
+    rope_deltas: torch.LongTensor | None = None
+
+
+class Qwen3_5TextModel(PreTrainedModel):
+    config: Qwen3_5TextConfig
+
+    def __init__(self, config: Qwen3_5TextConfig):
+        super().__init__(config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.layers = nn.ModuleList(
+            [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        # the hard coded `4` is for text, temporal, height and width.
+        if position_ids is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = None
+
+        uses_paged_kv = (
+            past_key_values is not None
+            and getattr(past_key_values, "uses_paged_kv", lambda: False)()
+        )
+        causal_mask = (
+            None
+            if uses_paged_kv and attention_mask is None
+            else create_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=text_position_ids,
+            )
+        )
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        decoder_layers = self.layers[: self.config.num_hidden_layers]
+
+        if decoder_layers:
+            normalized_hidden_states = decoder_layers[0].input_layernorm(hidden_states)
+
+        for i, decoder_layer in enumerate(decoder_layers):
+            layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
+            output_layernorm = (
+                decoder_layers[i + 1].input_layernorm
+                if i + 1 < len(decoder_layers)
+                else self.norm
+            )
+
+            hidden_states, normalized_hidden_states = decoder_layer._forward_from_normalized(
+                hidden_states,
+                normalized_hidden_states,
+                position_embeddings=position_embeddings,
+                output_layernorm=output_layernorm,
+                attention_mask=layer_mask,
+                position_ids=text_position_ids,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        hidden_states = (
+            normalized_hidden_states
+            if decoder_layers
+            else self.norm(hidden_states)
+        )
+
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
+        """
+        NOTE: Left-padding is used for linear attention mask.
+        No need for zeroing states when
+            1. Cached forward
+            2. Attending to all inputs
+        """
+        linear_attn_mask = attention_mask
+        if (past_key_values is not None and past_key_values.has_previous_state()) or (
+            attention_mask is not None and torch.all(attention_mask == 1)
+        ):
+            linear_attn_mask = None
+        return linear_attn_mask
+
+
+class Qwen3_5Model(PreTrainedModel):
+    config: Qwen3_5Config
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.visual = Qwen3_5VisionModel(config.vision_config)
+        self.language_model = Qwen3_5TextModel(config.text_config)
+        self.rope_deltas = None  # cache rope_deltas here
+
+    def get_vision_position_ids(
+        self,
+        start_position: int,
+        grid_thw: list[int, int, int] | torch.Tensor,
+        temp_merge_size: int = 1,
+        spatial_merge_size: int = 1,
+        time_interval: int = 1,
+        device: str | torch.device | None = None,
+    ):
+        """
+        Compute 3D positional indices for vision tokens derived from a single image or video input.
+
+        The positions are generated from the input grid defined by temporal (T), height (H), and
+        width (W) dimensions. Temporal and spatial dimensions can be downscaled according to the
+        merge sizes used in the vision backbone. The resulting positions are offset by `start_position`.
+
+        Args:
+            start_position (`int`):
+                Offset added to all computed positional indices.
+            grid_thw (`Sequence[int]` or `torch.Tensor` of shape `(3,)`):
+                The (T, H, W) grid representing the feature layout of the current image or video after patch embedding.
+            temp_merge_size (`int`, *optional*):
+                Factor by which the temporal dimension is reduced in the backbone. The temporal grid size is divided
+                by this value. Defaults to 1.
+            spatial_merge_size (`int`, *optional*):
+                Factor by which the spatial dimensions (H and W) are reduced in the backbone. Both H and W are divided
+                by this value. Defaults to 1.
+            time_interval (`int`, *optional*):
+                Spacing factor applied between consecutive temporal position indices.Defaults to 1.
+            device (`str` or `torch.device`, *optional*):
+                Device on which the resulting tensor is allocated. If `None`, uses the current default device.
+
+        Returns:
+            torch.LongTensor of shape (3, sequence_length):
+                Positional indices for temporal, height, and width dimensions,
+                flattened into sequence form and offset by `start_position`.
+        """
+        llm_grid_t, llm_grid_h, llm_grid_w = (
+            grid_thw[0].item() // temp_merge_size,
+            grid_thw[1].item() // spatial_merge_size,
+            grid_thw[2].item() // spatial_merge_size,
+        )
+
+        # Add `start_position` after arange for compile
+        position_temporal = torch.arange(llm_grid_t, device=device) * time_interval
+        position_width = torch.arange(llm_grid_w, device=device) + start_position
+        position_height = torch.arange(llm_grid_h, device=device) + start_position
+
+        # Repeat the positions per each grid and per video frame. Repeat patterns are important
+        # do not modify without checking values!
+        position_width = position_width.repeat(llm_grid_h * llm_grid_t)
+        position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
+        # Important: add `start_positions` after applying `time_interval`, order matters
+        position_temporal = position_temporal.repeat_interleave(llm_grid_h * llm_grid_w) + start_position
+        vision_position_ids = torch.stack([position_temporal, position_height, position_width], dim=0)
+
+        return vision_position_ids
+
+    def get_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        mm_token_type_ids: torch.IntTensor,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Difference from Qwen2VL/Qwen2.5VL's get_rope_index:
+        - Since Qwen3.5 use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split too.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
+                it.
+            mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`):
+                Token type ids matching each modality to a different value in the input sequence, i.e. text (0), image (1), video (2).
+            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+                The temporal, height and width of feature shape of each image in LLM.
+            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+                The temporal, height and width of feature shape of each video in LLM.
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+
+        Returns:
+            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
+            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
+        """
+
+        # Separate video grid thw into multiple grids because timestamps are used to separate videos.
+        if video_grid_thw is not None:
+            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw[:, 0] = 1
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+
+        mrope_position_deltas = []
+        position_ids = torch.zeros(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        grid_iters = {
+            1: iter(image_grid_thw) if image_grid_thw is not None else None,
+            2: iter(video_grid_thw) if video_grid_thw is not None else None,
+        }
+
+        for batch_idx, current_input_ids in enumerate(input_ids):
+            input_token_type = mm_token_type_ids[batch_idx]
+            if attention_mask is not None:
+                current_input_ids = current_input_ids[attention_mask[batch_idx].bool()]
+                input_token_type = input_token_type[attention_mask[batch_idx].bool()]
+
+            input_type_group = []
+            for key, group in itertools.groupby(enumerate(input_token_type.tolist()), lambda x: x[1]):
+                group = list(group)
+                start_index = group[0][0]
+                end_index = group[-1][0] + 1
+                input_type_group.append((key, start_index, end_index))
+
+            current_pos = 0
+            llm_pos_ids_list = []
+            for modality_type, start_idx, end_idx in input_type_group:
+                # text == 0
+                if modality_type == 0:
+                    text_len = end_idx - start_idx
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos
+                    )
+                    current_pos += text_len
+                # image == 1, video == 2
+                else:
+                    grid_thw = next(grid_iters[modality_type])
+                    vision_position_ids = self.get_vision_position_ids(
+                        current_pos, grid_thw, 1, spatial_merge_size, device=input_ids.device
+                    )
+                    llm_pos_ids_list.append(vision_position_ids)
+                    current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            if attention_mask is not None:
+                position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions.to(position_ids.device)
+            else:
+                position_ids[:, batch_idx] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(current_input_ids))
+        mrope_position_deltas = torch.stack(mrope_position_deltas).to(
+            device=input_ids.device, dtype=input_ids.dtype
+        ).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        r"""
+        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input videos.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
+        # Same implementation as for images
+        return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
+
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        r"""
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input images.
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        """
+        pixel_values = pixel_values.type(self.visual.dtype)
+        kwargs.pop("return_dict", None)
+        vision_output: BaseModelOutputWithPooling = self.visual(
+            pixel_values, grid_thw=image_grid_thw, **kwargs
+        )
+        image_embeds = vision_output.pooler_output
+        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        image_embeds = torch.split(image_embeds, split_sizes)
+        vision_output.pooler_output = image_embeds
+
+        return vision_output
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        image_features: torch.FloatTensor | None = None,
+        video_features: torch.FloatTensor | None = None,
+    ):
+        """
+        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        """
+        if input_ids is None:
+            input_embeddings = self.get_input_embeddings()
+            image_embedding = input_embeddings.weight[self.config.image_token_id].to(
+                dtype=inputs_embeds.dtype
+            )
+            special_image_mask = inputs_embeds == image_embedding
+            special_image_mask = special_image_mask.all(-1)
+            video_embedding = input_embeddings.weight[self.config.video_token_id].to(
+                dtype=inputs_embeds.dtype
+            )
+            special_video_mask = inputs_embeds == video_embedding
+            special_video_mask = special_video_mask.all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
+            special_video_mask = input_ids == self.config.video_token_id
+
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if image_features is not None:
+            torch_compilable_check(
+                inputs_embeds[special_image_mask].numel() == image_features.numel(),
+                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
+            )
+
+        n_video_tokens = special_video_mask.sum()
+        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if video_features is not None:
+            torch_compilable_check(
+                inputs_embeds[special_video_mask].numel() == video_features.numel(),
+                f"Video features and video tokens do not match, tokens: {n_video_tokens}, features: {video_features.shape[0]}",
+            )
+        return special_image_mask, special_video_mask
+
+    def compute_3d_position_ids(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: torch.Tensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+    ) -> torch.Tensor | None:
+        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+        has_multimodal = image_grid_thw is not None or video_grid_thw is not None
+        if has_multimodal and mm_token_type_ids is None and input_ids is not None:
+            raise ValueError(
+                "Multimodal data was passed (via `image_grid_thw` or `video_grid_thw`) but `mm_token_type_ids` is "
+                "missing. Please pass `mm_token_type_ids` to the model so that multimodal RoPE (M-RoPE) can be "
+                "computed correctly. `mm_token_type_ids` is returned by the processor alongside `input_ids`."
+            )
+        can_compute_mrope = input_ids is not None and mm_token_type_ids is not None and has_multimodal
+
+        if can_compute_mrope and (self.rope_deltas is None or past_key_values_length == 0):
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+            self.rope_deltas = rope_deltas
+        # Use pre-calculated rope-deltas to infer correct 3D position ids during incremental
+        # generation (past_key_values_length > 0) or when only inputs_embeds is provided (no input_ids
+        # to recompute from). Skip when input_ids is provided without past_key_values to avoid shape
+        # mismatches from stale rope_deltas (e.g., training forward pass after generation).
+        elif self.rope_deltas is not None and (past_key_values_length > 0 or input_ids is None):
+            batch_size, seq_length, _ = inputs_embeds.shape
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+                position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
+            else:
+                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
+                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
+            delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
+            position_ids = position_ids + delta.to(device=inputs_embeds.device)
+        else:
+            # Can't build correct 3D positions. Let the model infer it
+            position_ids = None
+        return position_ids
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Qwen3_5ModelOutputWithPast:
+        r"""
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        vision_metadata_keys = {
+            "vision_bilinear_indices",
+            "vision_bilinear_weights",
+            "vision_position_ids",
+            "vision_cu_seqlens",
+            "bilinear_indices",
+            "bilinear_weights",
+            "cu_seqlens",
+        }
+        language_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in vision_metadata_keys
+        }
+        vision_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            not in {
+                "cache_position_ids",
+                "slot_mapping",
+                "page_table",
+                "paged_kv_seqlens_q",
+                "paged_kv_seqlens_k",
+                "cu_seq_lens_q",
+                "seq_idx",
+            }
+        }
+        for external_key, vision_key in (
+            ("vision_bilinear_indices", "bilinear_indices"),
+            ("vision_bilinear_weights", "bilinear_weights"),
+            ("vision_position_ids", "position_ids"),
+            ("vision_cu_seqlens", "cu_seqlens"),
+        ):
+            value = vision_kwargs.pop(external_key, None)
+            if value is not None:
+                vision_kwargs[vision_key] = value
+
+        if pixel_values is not None:
+            image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True, **vision_kwargs
+            )
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
+            )
+            video_embeds = video_outputs.pooler_output
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        outputs = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            **language_kwargs,
+        )
+
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=self.rope_deltas,
+        )
+
+
+@dataclass
+class Qwen3_5LMOutputWithPast:
+    logits: torch.Tensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
+    rope_deltas: torch.LongTensor | None = None
+
+
+class Qwen3_5ForConditionalGeneration(PreTrainedModel):
+    config: Qwen3_5Config
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen3_5Model(config)
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        r"""
+        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input videos.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
+        return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
+
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        r"""
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input images.
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        """
+        return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Qwen3_5LMOutputWithPast:
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            mm_token_type_ids=mm_token_type_ids,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        return Qwen3_5LMOutputWithPast(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas,
+        )
+
+
+__all__ = [
+    "Qwen3_5VisionModel",
+    "Qwen3_5TextModel",
+    "Qwen3_5Model",
+    "Qwen3_5ForConditionalGeneration",
+]

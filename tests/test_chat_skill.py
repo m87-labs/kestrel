@@ -360,6 +360,8 @@ class _MdPromptTemplate:
     start_ground_points_id: int = 7
     end_ground_id: int = 9
     query_stop_token_ids: tuple[int, ...] = ()
+    reasoning_suppressed_token_ids: tuple[int, ...] = ()
+    answer_suppressed_token_ids: tuple[int, ...] = ()
 
     def chat(self) -> None:
         return None
@@ -369,6 +371,12 @@ class _MdPromptTemplate:
             prefix=[10, 11], answer_prefix=[20], reasoning_prefix=[21],
             post_reasoning_prefix=[3],
             stop_token_ids=list(self.query_stop_token_ids),
+            reasoning_suppressed_token_ids=list(
+                self.reasoning_suppressed_token_ids
+            ),
+            answer_suppressed_token_ids=list(
+                self.answer_suppressed_token_ids
+            ),
         )
 
 
@@ -377,8 +385,13 @@ def _md_runtime(
     *,
     stop_token_ids: tuple[int, ...] = (),
 ) -> SimpleNamespace:
+    md2 = model_name == "moondream2"
     return SimpleNamespace(
-        prompt_template=_MdPromptTemplate(query_stop_token_ids=stop_token_ids),
+        prompt_template=_MdPromptTemplate(
+            query_stop_token_ids=stop_token_ids,
+            reasoning_suppressed_token_ids=(0, 6) if md2 else (),
+            answer_suppressed_token_ids=(3,) if md2 else (),
+        ),
         tokenizer=_Tokenizer(),
         model_name=model_name,
     )
@@ -492,7 +505,7 @@ def test_moondream_chat_uses_query_stop_ids() -> None:
 
 
 def test_moondream_chat_inherits_query_suppression() -> None:
-    """Codex P2: flattened chat must mirror the query skill's md2 masking."""
+    """: flattened chat must mirror the query skill's md2 masking."""
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
     skill = MoondreamChatSkill()
