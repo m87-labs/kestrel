@@ -155,10 +155,7 @@ class Gemma4DecodeMegakernel:
             missing = str(exc.name or "")
             if missing != "mkl" and not missing.startswith("mkl."):
                 raise
-            raise RuntimeError(
-                "generated Gemma decode requires the installed mkl "
-                "compiler/runtime package"
-            ) from exc
+            return None
 
         properties = torch.cuda.get_device_properties(runtime.device)
         arch = f"sm{properties.major}{properties.minor}"

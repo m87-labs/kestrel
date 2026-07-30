@@ -711,7 +711,7 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
 
 
 @pytest.mark.parametrize("missing_name", ["mkl", "mkl.megakernel"])
-def test_decode_factory_fails_closed_without_compiler(monkeypatch, missing_name):
+def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_name):
     import builtins
 
     from kestrel.models.gemma4 import megakernel_decode
@@ -735,11 +735,7 @@ def test_decode_factory_fails_closed_without_compiler(monkeypatch, missing_name)
 
     monkeypatch.setattr(builtins, "__import__", import_without_mkl)
 
-    with pytest.raises(
-        RuntimeError,
-        match="requires the installed mkl compiler/runtime package",
-    ):
-        megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime)
+    assert megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime) is None
 
 
 def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
