@@ -29,7 +29,7 @@ def load_config(repo_id: str) -> Gemma4Config:
         return Gemma4Config.from_dict(json.load(handle))
 
 
-def load_gemma4_weights(repo_id: str, model: torch.nn.Module) -> None:
+def load_weights(repo_id: str, model: torch.nn.Module) -> None:
     snapshot = Path(
         snapshot_download(
             repo_id,
@@ -102,6 +102,8 @@ def load_gemma4_weights(repo_id: str, model: torch.nn.Module) -> None:
                     state_dict.pop(up_bound)
             break
 
+    # Published checkpoints retain K/V tensors for layers whose config reuses
+    # an earlier layer's cache, while tied checkpoints omit ``lm_head.weight``.
     model.load_state_dict(state_dict, strict=False)
 
 
@@ -121,7 +123,7 @@ def load_model(
     finally:
         torch.set_default_dtype(old_dtype)
 
-    load_gemma4_weights(repo_id, model)
+    load_weights(repo_id, model)
     if config.tie_word_embeddings:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
     return model.to(device=device).eval()
@@ -130,5 +132,5 @@ def load_model(
 __all__ = [
     "load_config",
     "load_model",
-    "load_gemma4_weights",
+    "load_weights",
 ]

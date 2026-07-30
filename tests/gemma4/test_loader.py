@@ -59,7 +59,7 @@ class _TinyGemma4(torch.nn.Module):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
 
-def test_load_gemma4_weights_streams_compatible_keys(tmp_path, monkeypatch):
+def test_load_weights_accepts_compatible_keys(tmp_path, monkeypatch):
     save_file(
         {
             "a": torch.ones(2),
@@ -76,13 +76,13 @@ def test_load_gemma4_weights_streams_compatible_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "snapshot_download", fake_snapshot_download)
 
     model = _TinyModel()
-    loader.load_gemma4_weights("repo", model)
+    loader.load_weights("repo", model)
 
     assert torch.equal(model.a, torch.ones(2))
     assert torch.equal(model.b, torch.zeros(2))
 
 
-def test_load_gemma4_weights_does_not_materialize_unsupported_towers(
+def test_load_weights_does_not_materialize_unsupported_towers(
     tmp_path,
     monkeypatch,
 ):
@@ -110,12 +110,12 @@ def test_load_gemma4_weights_does_not_materialize_unsupported_towers(
     monkeypatch.setattr(loader, "safe_open", lambda *args, **kwargs: FakeSafeOpen())
 
     model = _TinyModel()
-    loader.load_gemma4_weights("repo", model)
+    loader.load_weights("repo", model)
 
     assert torch.equal(model.a, torch.ones(2))
 
 
-def test_load_gemma4_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
+def test_load_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
     gate = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     up = gate + 10
     save_file(
@@ -128,7 +128,7 @@ def test_load_gemma4_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "snapshot_download", lambda *args, **kwargs: str(tmp_path))
 
     model = _TinyFusedMlpModel()
-    loader.load_gemma4_weights("repo", model)
+    loader.load_weights("repo", model)
 
     torch.testing.assert_close(
         model.block.mlp.gate_up_proj.weight,
@@ -136,7 +136,7 @@ def test_load_gemma4_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
     )
 
 
-def test_load_gemma4_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypatch):
+def test_load_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypatch):
     gate = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     up = gate + 10
     bounds = {
@@ -156,7 +156,7 @@ def test_load_gemma4_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypa
     monkeypatch.setattr(loader, "snapshot_download", lambda *args, **kwargs: str(tmp_path))
 
     model = _TinyFusedClippedMlpModel()
-    loader.load_gemma4_weights("repo", model)
+    loader.load_weights("repo", model)
 
     torch.testing.assert_close(
         model.block.mlp.gate_up_proj.linear.weight,
@@ -169,7 +169,7 @@ def test_load_gemma4_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypa
         )
 
 
-def test_load_gemma4_weights_refuses_different_clipping_bounds(tmp_path, monkeypatch):
+def test_load_weights_refuses_different_clipping_bounds(tmp_path, monkeypatch):
     weights = {
         "block.mlp.gate_proj.linear.weight": torch.zeros((2, 2)),
         "block.mlp.up_proj.linear.weight": torch.zeros((2, 2)),
@@ -183,7 +183,7 @@ def test_load_gemma4_weights_refuses_different_clipping_bounds(tmp_path, monkeyp
     monkeypatch.setattr(loader, "snapshot_download", lambda *args, **kwargs: str(tmp_path))
 
     with pytest.raises(ValueError, match="different output_max bounds"):
-        loader.load_gemma4_weights(
+        loader.load_weights(
             "repo",
             _TinyFusedClippedMlpModel(),
         )
