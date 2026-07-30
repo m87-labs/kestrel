@@ -1,4 +1,4 @@
-"""Local Gemma 4 image preprocessing."""
+"""Gemma 4 image preprocessing."""
 
 from __future__ import annotations
 

@@ -9,7 +9,7 @@ import torch
 from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
 
 from ._model_utils import SimpleDynamicCache
-from .gemma4_config import attention_kv_heads
+from .config import attention_kv_heads
 
 
 def _first_shared_layer(config: Any) -> int:

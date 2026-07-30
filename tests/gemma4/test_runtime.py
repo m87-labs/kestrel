@@ -13,10 +13,10 @@ from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import KVMemoryPool
 from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
-from kestrel.models.gemma4 import gemma4_model
+from kestrel.models.gemma4 import model as gemma_model
 from kestrel.models.gemma4.decode_slot import GemmaDecodeSlot
-from kestrel.models.gemma4.gemma4_config import Gemma4TextConfig, Gemma4VisionConfig
-from kestrel.models.gemma4.gemma4_model import Gemma4TextModel
+from kestrel.models.gemma4.config import Gemma4TextConfig, Gemma4VisionConfig
+from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import _paged_layer_config, _stores_shared_kv
 from kestrel.models.gemma4.prompt_template import (
     END_OF_TURN_ID,
@@ -103,9 +103,9 @@ def test_rmsnorm_uses_dense_runtime_with_uniform_fp32_weight(monkeypatch):
         calls.append((x, weight, eps))
         return x
 
-    monkeypatch.setattr(gemma4_model, "_kestrel_rmsnorm", fake_rmsnorm)
-    scaled = gemma4_model.Gemma4RMSNorm(1536)
-    unscaled = gemma4_model.Gemma4RMSNorm(512, with_scale=False)
+    monkeypatch.setattr(gemma_model, "_kestrel_rmsnorm", fake_rmsnorm)
+    scaled = gemma_model.Gemma4RMSNorm(1536)
+    unscaled = gemma_model.Gemma4RMSNorm(512, with_scale=False)
     x_scaled = torch.zeros((2, 1536), dtype=torch.bfloat16)
     x_unscaled = torch.zeros((2, 512), dtype=torch.bfloat16)
 
@@ -128,16 +128,16 @@ def test_text_rotary_runtime_preserves_existing_cpu_math():
     angles = torch.randn(2, 5, 4)
     cos = torch.cat((angles.cos(), angles.cos()), dim=-1)
     sin = torch.cat((angles.sin(), angles.sin()), dim=-1)
-    rotary = gemma4_model._prepare_neox_rotary(cos, sin)
+    rotary = gemma_model._prepare_neox_rotary(cos, sin)
 
-    actual_query, actual_key = gemma4_model._apply_neox_rotary(
+    actual_query, actual_key = gemma_model._apply_neox_rotary(
         query, key, rotary
     )
 
-    expected_query = gemma4_model._apply_rope(
+    expected_query = gemma_model._apply_rope(
         query, cos, sin, unsqueeze_dim=2
     )
-    expected_key = gemma4_model._apply_rope(
+    expected_key = gemma_model._apply_rope(
         key, cos, sin, unsqueeze_dim=2
     )
     torch.testing.assert_close(actual_query, expected_query)
@@ -199,7 +199,7 @@ def test_text_attention_emits_typed_runtime_attention(monkeypatch):
         return output, None
 
     monkeypatch.setattr(
-        gemma4_model,
+        gemma_model,
         "get_runtime",
         lambda: SimpleNamespace(
             attention=SimpleNamespace(flash_attn_fwd=fake_flash)
@@ -207,7 +207,7 @@ def test_text_attention_emits_typed_runtime_attention(monkeypatch):
     )
     q, k, v = FakeTensor("q"), FakeTensor("k"), FakeTensor("v")
 
-    result = gemma4_model._attention_forward(
+    result = gemma_model._attention_forward(
         q,
         k,
         v,
@@ -235,7 +235,7 @@ def test_text_attention_cpu_causal_gqa_matches_reference():
     key = torch.randn(1, 1, 3, 8)
     value = torch.randn(1, 1, 3, 8)
 
-    actual = gemma4_model._attention_forward(
+    actual = gemma_model._attention_forward(
         query,
         key,
         value,
@@ -266,7 +266,7 @@ def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
         head_dim=4,
         hidden_activation="gelu_pytorch_tanh",
     )
-    mlp = gemma4_model.Gemma4TextMLP(cfg, layer_idx=0)
+    mlp = gemma_model.Gemma4TextMLP(cfg, layer_idx=0)
     calls = []
 
     def fake_gated_activation(out, gate_up, *, activation, layout):
@@ -275,7 +275,7 @@ def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
         out.copy_(torch.nn.functional.gelu(gate, approximate="tanh") * up)
 
     monkeypatch.setattr(
-        gemma4_model,
+        gemma_model,
         "_kestrel_gated_activation_into",
         fake_gated_activation,
     )
@@ -298,7 +298,7 @@ def test_vision_mlp_uses_generic_gated_activation_provider(monkeypatch):
         hidden_activation="gelu_pytorch_tanh",
         use_clipped_linears=True,
     )
-    mlp = gemma4_model.Gemma4VisionMLP(cfg)
+    mlp = gemma_model.Gemma4VisionMLP(cfg)
     calls = []
 
     def fake_gated_activation(out, gate_up, *, activation, layout):
@@ -307,7 +307,7 @@ def test_vision_mlp_uses_generic_gated_activation_provider(monkeypatch):
         out.copy_(torch.nn.functional.gelu(gate, approximate="tanh") * up)
 
     monkeypatch.setattr(
-        gemma4_model,
+        gemma_model,
         "_kestrel_gated_activation_into",
         fake_gated_activation,
     )
@@ -336,7 +336,7 @@ def test_vision_attention_cpu_matches_additive_padding_mask():
     )
     scale = 0.5
 
-    actual = gemma4_model._vision_attention_forward(
+    actual = gemma_model._vision_attention_forward(
         query,
         key,
         value,
@@ -345,7 +345,7 @@ def test_vision_attention_cpu_matches_additive_padding_mask():
         scaling=scale,
     )
 
-    mask = gemma4_model._build_bidirectional_mask(valid, dtype=query.dtype)
+    mask = gemma_model._build_bidirectional_mask(valid, dtype=query.dtype)
     query_bhsd = query.transpose(1, 2)
     key_bhsd = key.transpose(1, 2)
     value_bhsd = value.transpose(1, 2)
@@ -372,14 +372,14 @@ def test_vision_attention_mps_uses_uniform_runtime(monkeypatch):
     runtime = SimpleNamespace(
         attention=SimpleNamespace(flash_attn_fwd=fake_flash_attn_fwd),
     )
-    monkeypatch.setattr(gemma4_model, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(gemma_model, "get_runtime", lambda: runtime)
 
     with FakeTensorMode():
         query = torch.empty((2, 5, 2, 4), dtype=torch.float16, device="mps")
         key = torch.empty_like(query)
         value = torch.empty_like(query)
         seqused_k = torch.empty((2,), dtype=torch.int32, device="mps")
-        out = gemma4_model._vision_attention_forward(
+        out = gemma_model._vision_attention_forward(
             query,
             key,
             value,
@@ -409,7 +409,7 @@ def test_vision_position_embeddings_match_one_hot_reference(dtype):
         hidden_size=8,
         position_embedding_size=16,
     )
-    embedder = gemma4_model.Gemma4VisionPatchEmbedder(cfg).to(dtype=dtype)
+    embedder = gemma_model.Gemma4VisionPatchEmbedder(cfg).to(dtype=dtype)
     pixel_position_ids = torch.tensor(
         [
             [[0, 1], [5, 9], [-1, -1]],
@@ -503,7 +503,7 @@ def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
 
 
 def test_decode_compile_translates_model_config(monkeypatch):
-    from kestrel.models.gemma4 import megakernel_decode
+    from kestrel.models.gemma4 import generated_decode
     from mkl.compiler.frontend.models import gemma as gemma_frontend
 
     calls = []
@@ -535,7 +535,7 @@ def test_decode_compile_translates_model_config(monkeypatch):
         use_double_wide_mlp=True,
     )
 
-    assert megakernel_decode._compile_from_config(
+    assert generated_decode._compile_from_config(
         config, max_kv_len=256, num_ctas=132, gpu="test-gpu"
     ) == "compiled"
     assert calls == [{
@@ -566,7 +566,7 @@ def test_decode_compile_translates_model_config(monkeypatch):
 
 
 def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
-    from kestrel.models.gemma4 import megakernel_decode
+    from kestrel.models.gemma4 import generated_decode
     from mkl.megakernel.device_runtime import DeviceRuntimeError
 
     config = SimpleNamespace()
@@ -599,7 +599,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
             kwargs["batch_capacity"], dynamic=True)
 
     monkeypatch.setattr(
-        megakernel_decode, "_compile_from_config", compile_config)
+        generated_decode, "_compile_from_config", compile_config)
     monkeypatch.setattr(
         "mkl.compiler.frontend.validate_program.validate_compiled_tape",
         lambda artifact: SimpleNamespace(program=artifact),
@@ -616,7 +616,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
         DeviceRuntimeError,
         match=r"missing active extents \[1\].*unresolved artifacts",
     ):
-        megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime)
+        generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
     assert calls[0] == ("properties", torch.device("cuda:0"))
     assert calls[1:] == [
         call
@@ -641,7 +641,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
 
 
 def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch):
-    from kestrel.models.gemma4 import megakernel_decode
+    from kestrel.models.gemma4 import generated_decode
 
     compiled_capacities = []
     resolved_capacities = []
@@ -677,7 +677,7 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
         return compiled
 
     monkeypatch.setattr(
-        megakernel_decode, "_compile_from_config", compile_config)
+        generated_decode, "_compile_from_config", compile_config)
     monkeypatch.setattr(
         "mkl.compiler.frontend.validate_program.validate_compiled_tape",
         lambda artifact: SimpleNamespace(
@@ -693,13 +693,13 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
         resolve_bundle,
     )
     monkeypatch.setattr(
-        megakernel_decode.Gemma4DecodeMegakernel,
+        generated_decode.Gemma4DecodeMegakernel,
         "__init__",
         lambda self, bound_runtime, *, programs: setattr(
             self, "_programs", programs),
     )
 
-    result = megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime)
+    result = generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
 
     assert result is not None
     assert compiled_capacities == [1, 2, 4, 8]
@@ -714,7 +714,7 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
 def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_name):
     import builtins
 
-    from kestrel.models.gemma4 import megakernel_decode
+    from kestrel.models.gemma4 import generated_decode
 
     runtime = SimpleNamespace(
         device=torch.device("cuda:0"),
@@ -735,11 +735,11 @@ def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_n
 
     monkeypatch.setattr(builtins, "__import__", import_without_mkl)
 
-    assert megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.Gemma4DecodeMegakernel.try_create(runtime) is None
 
 
 def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
-    from kestrel.models.gemma4 import megakernel_decode
+    from kestrel.models.gemma4 import generated_decode
     from mkl.compiler.frontend.gpu_model import CalibrationUnavailable
     from mkl.megakernel.device_runtime import DeviceRuntimeError
 
@@ -769,7 +769,7 @@ def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             CalibrationUnavailable("NVIDIA H200 has no calibration")
@@ -780,12 +780,12 @@ def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
         DeviceRuntimeError,
         match="no calibration for 'NVIDIA H200'",
     ):
-        megakernel_decode.Gemma4DecodeMegakernel.try_create(runtime)
+        generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
 
 
 @pytest.mark.parametrize("batch_size", [11, 16])
 def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_size):
-    from kestrel.models.gemma4.megakernel_decode import (
+    from kestrel.models.gemma4.generated_decode import (
         Gemma4DecodeMegakernel,
         _SlotInvocation,
     )
@@ -814,7 +814,7 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
 
 
 def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
-    from kestrel.models.gemma4.megakernel_decode import Gemma4DecodeMegakernel
+    from kestrel.models.gemma4.generated_decode import Gemma4DecodeMegakernel
 
     megakernel = Gemma4DecodeMegakernel.__new__(Gemma4DecodeMegakernel)
     megakernel._programs = {
@@ -899,7 +899,7 @@ def test_prefill_batches_uncached_images_and_splits_active_tokens():
 
 
 def test_decode_state_tables_keep_local_and_global_storage_disjoint():
-    from kestrel.models.gemma4.megakernel_decode import _paged_tensors
+    from kestrel.models.gemma4.generated_decode import _paged_tensors
 
     layers = [
         SimpleNamespace(
@@ -939,7 +939,7 @@ def test_runtime_constructs():
     assert rt.max_seq_length > 0
     assert rt.vocab_size == rt._config.text_config.vocab_size
     assert rt.tasks() == ("query",)
-    from kestrel.models.gemma4.gemma4_image import MAX_IMAGE_TOKENS
+    from kestrel.models.gemma4.image import MAX_IMAGE_TOKENS
     assert rt.image_prefix_length == MAX_IMAGE_TOKENS + 2
 
     assert callable(rt.tokenizer.encode)
@@ -1107,7 +1107,7 @@ def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
         return torch.zeros(b, s, h, d, dtype=query.dtype, device=query.device)
 
     monkeypatch.setattr(
-        gemma4_model,
+        gemma_model,
         "_paged_attention_forward",
         fake_paged_attention_forward,
     )
@@ -1157,7 +1157,7 @@ def test_query_skill_defaults_to_direct_answer_mode():
 def test_float_image_arrays_are_scaled_before_uint8_conversion():
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import preprocess_image
+    from kestrel.models.gemma4.image import preprocess_image
 
     image = np.ones((32, 32, 3), dtype=np.float32)
     inputs = preprocess_image(image)
@@ -1171,7 +1171,7 @@ def test_float_image_arrays_are_scaled_before_uint8_conversion():
 def test_image_preprocessing_matches_official_rescale_domain(pixel):
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import preprocess_image
+    from kestrel.models.gemma4.image import preprocess_image
 
     image = np.full((32, 32, 3), pixel, dtype=np.uint8)
     inputs = preprocess_image(image)
@@ -1187,7 +1187,7 @@ def test_image_preprocessing_matches_official_rescale_domain(pixel):
 def test_image_preprocessing_uses_consumer_dtype():
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import preprocess_image
+    from kestrel.models.gemma4.image import preprocess_image
 
     inputs = preprocess_image(
         np.zeros((32, 32, 3), dtype=np.uint8),
@@ -1200,7 +1200,7 @@ def test_image_preprocessing_uses_consumer_dtype():
 def test_image_preprocessing_preserves_patch_order_and_padding():
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import (
+    from kestrel.models.gemma4.image import (
         Gemma4ImageProcessorConfig,
         preprocess_image,
     )
@@ -1240,7 +1240,7 @@ def test_image_preprocessing_preserves_patch_order_and_padding():
 def test_image_preprocessing_preserves_grid_larger_than_configured_max():
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import (
+    from kestrel.models.gemma4.image import (
         Gemma4ImageProcessorConfig,
         preprocess_image,
     )
@@ -1262,7 +1262,7 @@ def test_image_preprocessing_preserves_grid_larger_than_configured_max():
 def test_image_preprocessing_rescale_ignores_default_dtype(default_dtype):
     import numpy as np
 
-    from kestrel.models.gemma4.gemma4_image import preprocess_image
+    from kestrel.models.gemma4.image import preprocess_image
 
     image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
     expected = preprocess_image(image, dtype=torch.float32)

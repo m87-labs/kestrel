@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from kestrel.models.gemma4 import gemma4_loader as loader
+from kestrel.models.gemma4 import loader
 
 
 class _TinyModel(torch.nn.Module):
@@ -189,7 +189,7 @@ def test_load_gemma4_weights_refuses_different_clipping_bounds(tmp_path, monkeyp
         )
 
 
-def test_load_gemma4_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
+def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -231,7 +231,7 @@ def test_load_gemma4_model_loads_config_and_ties_embeddings(tmp_path, monkeypatc
     monkeypatch.setattr(loader, "snapshot_download", fake_snapshot_download)
     monkeypatch.setattr(loader, "Gemma4ForConditionalGeneration", _TinyGemma4)
 
-    model = loader.load_gemma4_model(
+    model = loader.load_model(
         "repo",
         device=torch.device("cpu"),
         dtype=torch.bfloat16,

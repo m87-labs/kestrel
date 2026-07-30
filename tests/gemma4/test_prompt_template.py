@@ -6,7 +6,7 @@ from functools import lru_cache
 from types import SimpleNamespace
 
 from kestrel.models.protocols import PromptTemplate
-from kestrel.models.gemma4.gemma4_image import preprocess_image
+from kestrel.models.gemma4.image import preprocess_image
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 from kestrel.models.gemma4.prompt_template import (
     BOS_ID,

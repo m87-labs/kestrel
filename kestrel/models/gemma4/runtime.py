@@ -27,15 +27,15 @@ from kestrel.runtime.preprocessing import (
 )
 
 from .decode_slot import GemmaDecodeSlot, create_gemma_decode_slot
-from .gemma4_loader import load_gemma4_model
-from .gemma4_image import (
+from .loader import load_model
+from .image import (
     Gemma4ImagePreprocessor,
     GemmaImageInputs,
     IMAGE_SEQ_LENGTH,
     MAX_PATCHES,
 )
 from .prompt_template import Gemma4PromptTemplate
-from .gemma4_model import SimpleDynamicCache
+from .model import SimpleDynamicCache
 from .paged_cache import Gemma4PagedHybridCache
 
 
@@ -442,7 +442,7 @@ class Gemma4Runtime:
         from tokenizers import Tokenizer
 
         repo_id = cfg.model
-        self.model = load_gemma4_model(
+        self.model = load_model(
             repo_id,
             device=self.device,
             dtype=self.dtype,
@@ -631,7 +631,7 @@ class Gemma4Runtime:
         )
         self._decode_megakernel = None
         if self.device.type == "cuda":
-            from .megakernel_decode import Gemma4DecodeMegakernel
+            from .generated_decode import Gemma4DecodeMegakernel
 
             self._decode_megakernel = Gemma4DecodeMegakernel.try_create(self)
         if self._use_cuda_graphs and not self._use_paged_kv:

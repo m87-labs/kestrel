@@ -14,7 +14,7 @@ from kestrel.runtime.bounded_projection import (
 from torch import nn
 from torch.nn import functional as F
 
-from .gemma4_config import (
+from .config import (
     Gemma4Config,
     Gemma4TextConfig,
     Gemma4VisionConfig,
