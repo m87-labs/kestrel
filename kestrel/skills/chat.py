@@ -35,6 +35,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_TOP_P,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -169,6 +170,7 @@ class ChatSkill(SkillSpec):
             temperature=s.temperature,
             top_p=s.top_p,
             image=tuple(images) if images else None,
+            media=tuple(MediaInput(kind="image", data=img) for img in images),
         )
 
     def prompt_text(self, request_context: object) -> str:

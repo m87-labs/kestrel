@@ -13,6 +13,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -72,6 +73,7 @@ class PointSkill(SkillSpec):
             max_new_tokens=max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
+            media=(MediaInput(kind="image", data=image),),
         )
 
     def prompt_text(self, request_context: object) -> str:
