@@ -147,7 +147,7 @@ class Qwen35DecodeMegakernel:
             )
         except ModuleNotFoundError as exc:
             missing = str(exc.name or "")
-            if missing != "mkl" and not missing.startswith("mkl."):
+            if missing != "mkl":
                 raise
             return None
 

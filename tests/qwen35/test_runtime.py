@@ -2037,6 +2037,31 @@ def test_decode_megakernel_factory_uses_native_without_compiler(monkeypatch):
     assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
 
 
+def test_decode_megakernel_factory_rejects_incomplete_compiler(monkeypatch):
+    import builtins
+
+    from kestrel.models.qwen35 import megakernel_decode
+
+    runtime = SimpleNamespace(device=torch.device("cuda:0"))
+    real_import = builtins.__import__
+
+    def import_with_incomplete_mkl(name, *args, **kwargs):
+        if name == "mkl.compiler.frontend.gpu_model":
+            raise ModuleNotFoundError(
+                "No module named 'mkl.compiler.frontend.gpu_model'",
+                name="mkl.compiler.frontend.gpu_model",
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_incomplete_mkl)
+
+    with pytest.raises(
+        ModuleNotFoundError,
+        match="mkl.compiler.frontend.gpu_model",
+    ):
+        megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime)
+
+
 @requires_mkl
 def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch):
     from kestrel.models.qwen35 import megakernel_decode
