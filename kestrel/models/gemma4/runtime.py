@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -14,7 +13,6 @@ from kestrel.kv_cache import KVMemoryPool, PageTable
 from kestrel.device import make_event, make_stream
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, TextToken
-from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -122,39 +120,6 @@ def _build_batched_decode_masks(
                 raise ValueError(f"Unsupported layer_type {layer_type!r}")
             mask[row, 0, 0, max_past] = 0
         masks[layer_type] = mask
-    return masks
-
-
-def _build_fixed_decode_masks(
-    layer_types: Sequence[str],
-    *,
-    input_pos: torch.Tensor,
-    fixed_past: int,
-    sliding_window: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    neg = torch.finfo(dtype).min
-    batch_size = int(input_pos.shape[0])
-    cols = torch.arange(
-        fixed_past + 1, dtype=input_pos.dtype, device=device
-    ).view(1, 1, 1, -1)
-    pos = input_pos.view(batch_size, 1, 1, 1)
-    current = cols == fixed_past
-    masks: dict[str, torch.Tensor] = {}
-    for layer_type in set(layer_types):
-        if layer_type == "full_attention":
-            keep = (cols < pos) | current
-        elif layer_type == "sliding_attention":
-            start = torch.clamp(pos - int(sliding_window) + 1, min=0)
-            keep = ((cols >= start) & (cols < pos)) | current
-        else:
-            raise ValueError(f"Unsupported layer_type {layer_type!r}")
-        masks[layer_type] = torch.where(
-            keep.expand(batch_size, 1, 1, fixed_past + 1),
-            torch.zeros((), dtype=dtype, device=device),
-            torch.full((), neg, dtype=dtype, device=device),
-        )
     return masks
 
 
@@ -291,15 +256,6 @@ class _SlotKVState:
     ) -> "_ActiveSlotKVCache":
         return _ActiveSlotKVCache(self, batch_indices, seq_lengths, max_past, paged_layers)
 
-    def make_fixed_decode_cache(
-        self,
-        batch_indices: torch.Tensor,
-        seq_positions: torch.Tensor,
-        fixed_past: int,
-    ) -> "_FixedSlotKVCache":
-        return _FixedSlotKVCache(self, batch_indices, seq_positions, fixed_past)
-
-
 class _ActiveSlotKVCache(SimpleDynamicCache):
     def __init__(
         self,
@@ -365,57 +321,6 @@ class _ActiveSlotKVCache(SimpleDynamicCache):
             self._batch_indices,
             torch.ones_like(self._batch_indices, dtype=self._state.seq_lens.dtype),
         )
-
-
-class _FixedSlotKVCache(SimpleDynamicCache):
-    def __init__(
-        self,
-        state: _SlotKVState,
-        batch_indices: torch.Tensor,
-        seq_positions: torch.Tensor,
-        fixed_past: int,
-    ) -> None:
-        super().__init__()
-        self._state = state
-        self._batch_indices = batch_indices.to(device=state.seq_lens.device, dtype=torch.long)
-        self._seq_positions = seq_positions.to(device=state.seq_lens.device, dtype=torch.long)
-        self._fixed_past = int(fixed_past)
-        self._new_k: list[tuple[int, torch.Tensor]] = []
-        self._new_v: list[tuple[int, torch.Tensor]] = []
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        past_k = self._state.k[layer_idx][:, :, : self._fixed_past, :].index_select(
-            0, self._batch_indices
-        )
-        past_v = self._state.v[layer_idx][:, :, : self._fixed_past, :].index_select(
-            0, self._batch_indices
-        )
-        self._new_k.append((layer_idx, key_states.detach()))
-        self._new_v.append((layer_idx, value_states.detach()))
-        return torch.cat([past_k, key_states], dim=-2), torch.cat([past_v, value_states], dim=-2)
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return self._fixed_past
-
-    def write_back(self) -> None:
-        rows = torch.arange(
-            self._batch_indices.shape[0],
-            device=self._batch_indices.device,
-            dtype=torch.long,
-        )
-        for (layer_idx, key_states), (_, value_states) in zip(self._new_k, self._new_v):
-            self._state.k[layer_idx][self._batch_indices, :, self._seq_positions, :] = (
-                key_states[rows, :, 0, :]
-            )
-            self._state.v[layer_idx][self._batch_indices, :, self._seq_positions, :] = (
-                value_states[rows, :, 0, :]
-            )
-        self._state.seq_lens.index_copy_(0, self._batch_indices, self._seq_positions + 1)
 
 
 class Gemma4Runtime:
@@ -518,20 +423,6 @@ class Gemma4Runtime:
         self._compute_stream = self._primary_stream
         self._copy_stream = make_stream(self.device)
         self.graph_capture_lock = threading.RLock()
-        requested_cuda_graphs = bool(getattr(cfg, "enable_cuda_graphs", False))
-        self._use_cuda_graphs = (
-            requested_cuda_graphs
-            and torch.cuda.is_available()
-            and self.device.type == "cuda"
-        )
-        decode_graph_past_len = int(
-            getattr(
-                cfg,
-                "decode_graph_past_len",
-                os.environ.get("KESTREL_GEMMA4_DECODE_GRAPH_PAST_LEN", 384),
-            )
-        )
-        self._decode_graph_past_len = min(decode_graph_past_len, self.max_seq_length - 1)
         self.page_table = PageTable(
             n_pages=self._kv_cache_pages,
             page_size=self.page_size,
@@ -618,25 +509,11 @@ class Gemma4Runtime:
             )
         )
 
-        self._decode_graphs = DecodeGraphManager[GemmaDecodeSlot](
-            enabled=self._use_cuda_graphs and not self._use_paged_kv,
-            device=self.device,
-            max_batch=self.max_batch_size,
-            graph_capture_lock=self.graph_capture_lock,
-            compute_stream=self._primary_stream,
-            run_forward=self._run_decode_forward_graph,
-            prepare_step=self._prepare_decode_graph_step,
-            zero_padding=self._zero_decode_graph_padding,
-            zero_for_capture=self._zero_decode_graph_capture_buffers,
-        )
         self._decode_megakernel = None
         if self.device.type == "cuda":
             from .generated_decode import Gemma4DecodeMegakernel
 
             self._decode_megakernel = Gemma4DecodeMegakernel.try_create(self)
-        if self._use_cuda_graphs and not self._use_paged_kv:
-            self._decode_graphs.ensure_ready(self._decode_slots)
-
         self.prefix_cache = None
 
     def _stage_vision_inputs(
@@ -773,7 +650,7 @@ class Gemma4Runtime:
 
     @property
     def cuda_graphs_enabled(self) -> bool:
-        return self._use_cuda_graphs and not self._use_paged_kv
+        return False
 
     def skills(self):
         return get_spec(self.model_name).skills()
@@ -1198,14 +1075,6 @@ class Gemma4Runtime:
             with torch.cuda.stream(slot.compute_stream):
                 self._decode_megakernel.run(slot, batch_size)
             return
-        if (
-            self._use_cuda_graphs
-            and not self._use_paged_kv
-            and max(int(x) for x in slot.meta.input_pos.np[:batch_size])
-            <= self._decode_graph_past_len
-        ):
-            self._decode_graphs.run(slot, batch_size)
-            return
         self._run_decode_eager(slot, batch_size)
 
     def _run_decode_eager(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
@@ -1266,81 +1135,4 @@ class Gemma4Runtime:
             slot.logits[:batch_size].div_(softcap).tanh_().mul_(softcap)
         slot.hidden_last[:batch_size].copy_(last_hidden)
 
-    def _zero_decode_graph_padding(
-        self,
-        slot: GemmaDecodeSlot,
-        batch_size: int,
-        graph_batch_size: int,
-    ) -> None:
-        padding_batch_idx = int(self._padding_batch_idx)
-        slot.decode_token_ids[batch_size:graph_batch_size].zero_()
-        slot.meta.batch_idx.gpu[batch_size:graph_batch_size].fill_(padding_batch_idx)
-        slot.meta.batch_idx.cpu[batch_size:graph_batch_size].fill_(padding_batch_idx)
-        slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.input_pos.cpu[batch_size:graph_batch_size].zero_()
-        slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
-
-    def _zero_decode_graph_capture_buffers(self, slot: GemmaDecodeSlot) -> None:
-        if self._kv_state is None:
-            raise RuntimeError("CUDA graph capture requires contiguous K/V storage")
-        slot.decode_token_ids.zero_()
-        slot.meta.batch_idx.gpu.zero_()
-        slot.meta.batch_idx.cpu.zero_()
-        slot.meta.input_pos.gpu.zero_()
-        slot.meta.input_pos.cpu.zero_()
-        slot.meta.lora_slot_ids.gpu.zero_()
-        slot.meta.lora_slot_ids.cpu.zero_()
-        slot.cache_position_ids.zero_()
-        slot.position_ids.zero_()
-        slot.sampled_ids.zero_()
-        slot.sampled_logprobs.zero_()
-        slot.logits.zero_()
-        slot.hidden_last.zero_()
-        for tensor in self._kv_state.k:
-            if tensor is not None:
-                tensor.zero_()
-        for tensor in self._kv_state.v:
-            if tensor is not None:
-                tensor.zero_()
-        self._kv_state.seq_lens.zero_()
-
-    def _prepare_decode_graph_step(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
-        pass
-
-    def _run_decode_forward_graph(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
-        if self._kv_state is None:
-            raise RuntimeError("CUDA graph replay requires contiguous K/V storage")
-        text_cfg = self._config.text_config
-        softcap = text_cfg.final_logit_softcapping
-        batch_indices = slot.meta.batch_idx.gpu[:batch_size]
-        input_pos = slot.meta.input_pos.gpu[:batch_size]
-        slot.cache_position_ids[:batch_size, 0].copy_(input_pos)
-        slot.position_ids[:batch_size, 0].copy_(input_pos)
-        cache = self._kv_state.make_fixed_decode_cache(
-            batch_indices,
-            slot.cache_position_ids[:batch_size, 0],
-            self._decode_graph_past_len,
-        )
-        masks = _build_fixed_decode_masks(
-            text_cfg.layer_types,
-            input_pos=input_pos,
-            fixed_past=self._decode_graph_past_len,
-            sliding_window=text_cfg.sliding_window,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        outputs = self.model.model(
-            input_ids=slot.decode_token_ids[:batch_size].view(batch_size, 1),
-            position_ids=slot.position_ids[:batch_size],
-            past_key_values=cache,
-            prebuilt_masks=masks,
-            use_cache=True,
-        )
-        cache.write_back()
-        last_hidden = outputs.last_hidden_state[:, 0]
-        torch.mm(last_hidden, self.model.lm_head.weight.t(), out=slot.logits[:batch_size])
-        if softcap is not None:
-            slot.logits[:batch_size].div_(softcap).tanh_().mul_(softcap)
-        slot.hidden_last[:batch_size].copy_(last_hidden)
 __all__ = ["Gemma4Runtime"]
