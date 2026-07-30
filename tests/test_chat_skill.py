@@ -394,7 +394,7 @@ def _md_ctx(messages, reasoning: bool = False) -> ChatRequest:
 
 def test_moondream_single_turn_equals_query() -> None:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
-    from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
+    from kestrel.skills.query import QueryRequest, QuerySkill
 
     runtime = _md_runtime()
     ctx = _md_ctx([{"role": "user", "content": "hi"}])

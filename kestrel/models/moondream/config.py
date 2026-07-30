@@ -101,6 +101,12 @@ class TokenizerConfig:
                 else None
             ),
             stop_token_ids=list(template.get("stop_token_ids", [])),
+            reasoning_suppressed_token_ids=list(
+                template.get("reasoning_suppressed_token_ids", [])
+            ),
+            answer_suppressed_token_ids=list(
+                template.get("answer_suppressed_token_ids", [])
+            ),
         )
 
     def chat(self) -> Optional[ChatTemplate]:
@@ -276,6 +282,8 @@ DEFAULT_MOONDREAM2_CONFIG = {
                 "answer_prefix": [3, 3],
                 "reasoning_prefix": [3, 4],
                 "post_reasoning_prefix": [3],
+                "reasoning_suppressed_token_ids": [0, 6],
+                "answer_suppressed_token_ids": [3],
             },
         },
     },

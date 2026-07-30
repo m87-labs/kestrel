@@ -29,6 +29,10 @@ class QueryTemplate:
     # reasoning-independent.
     prefix_when_reasoning: Optional[List[int]] = None
     stop_token_ids: List[int] = field(default_factory=list)
+    # Decode constraints are prompt semantics, so models declare their
+    # concrete token ids here instead of teaching the shared skill model names.
+    reasoning_suppressed_token_ids: List[int] = field(default_factory=list)
+    answer_suppressed_token_ids: List[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

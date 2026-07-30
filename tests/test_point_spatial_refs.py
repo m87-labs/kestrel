@@ -10,10 +10,11 @@ from kestrel.engine import InferenceEngine
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
 from kestrel.skills import SkillRegistry
 from kestrel.models.moondream.skills import (
-    CaptionSkill, DetectSkill, PointSkill, QuerySkill, SegmentSkill,
+    CaptionSkill, DetectSkill, PointSkill, SegmentSkill,
 )
+from kestrel.skills import QuerySkill
 from kestrel.models.moondream.skills.point import PointRequest
-from kestrel.models.moondream.skills.query import QueryRequest
+from kestrel.skills.query import QueryRequest
 
 
 def _ALL_SKILLS() -> SkillRegistry:

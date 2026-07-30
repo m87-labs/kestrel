@@ -3027,7 +3027,7 @@ def test_spec_inactive_to_active_reasoning_mask_is_capped() -> None:
         CaptionSkill,
         CaptionSkillState,
     )
-    from kestrel.models.moondream.skills.query import (
+    from kestrel.skills.query import (
         QueryRequest,
         QuerySkill,
         QuerySkillState,

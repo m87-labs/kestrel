@@ -11,7 +11,7 @@ import pytest
 
 from kestrel.models.moondream.config import TokenizerConfig
 from kestrel.models.protocols import QueryTemplate
-from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
+from kestrel.skills.query import QueryRequest, QuerySkill
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills.base import DecodeStep
 
@@ -121,6 +121,8 @@ def test_tokenizer_config_preserves_query_stop_ids() -> None:
                 "reasoning_prefix": [21],
                 "post_reasoning_prefix": [],
                 "stop_token_ids": [88],
+                "reasoning_suppressed_token_ids": [89, 90],
+                "answer_suppressed_token_ids": [91],
             }
         }
     )
@@ -129,6 +131,8 @@ def test_tokenizer_config_preserves_query_stop_ids() -> None:
 
     assert template is not None
     assert template.stop_token_ids == [88]
+    assert template.reasoning_suppressed_token_ids == [89, 90]
+    assert template.answer_suppressed_token_ids == [91]
 
 
 @pytest.mark.parametrize("stop_id", [88, 99])

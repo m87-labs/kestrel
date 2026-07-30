@@ -18,7 +18,8 @@ import pytest
 from kestrel.engine import InferenceEngine, ModelHandle
 from kestrel.runtime import ExecutionShape
 from kestrel.skills import SkillRegistry
-from kestrel.models.moondream.skills import QuerySkill, CaptionSkill, SegmentSkill
+from kestrel.models.moondream.skills import CaptionSkill, SegmentSkill
+from kestrel.skills import QuerySkill
 
 
 class _StubSinglePass:
