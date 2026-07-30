@@ -1,15 +1,12 @@
 """Model-agnostic question-answering skill."""
 
-
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from kestrel.models.protocols import QueryTemplate
 from kestrel.runtime.tokens import CoordToken, TextToken, Token
-from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
-
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
     AR_DEFAULT_TEMPERATURE,
@@ -21,7 +18,7 @@ from kestrel.skills.base import (
     SkillState,
     parse_settings,
 )
-from typing import Mapping
+from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
 if False:  # pragma: no cover - type-checking imports
     from kestrel.runtime.protocol import AutoregressiveRuntime
