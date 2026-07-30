@@ -15,6 +15,7 @@ dependencies = [
     "kestrel-kernels==0.4.8",
     "huggingface-hub>=0.20",
     "numpy>=1.26",
+    "pillow>=10.0",
 ]
 
 [tool.setuptools.packages.find]
