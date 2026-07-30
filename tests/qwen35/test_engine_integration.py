@@ -24,6 +24,7 @@ def test_engine_query_returns_text() -> None:
             return await engine.query(
                 image=None,
                 question="What is 2+2?",
+                reasoning=False,
                 settings={"max_tokens": 64},
             )
         finally:
@@ -50,6 +51,7 @@ def test_engine_image_query_returns_text() -> None:
             return await engine.query(
                 image=np.full((64, 64, 3), (255, 0, 0), dtype=np.uint8),
                 question="What color is the image?",
+                reasoning=False,
                 settings={"max_tokens": 64},
             )
         finally:
@@ -76,11 +78,13 @@ def test_engine_batches_distinct_qwen_queries() -> None:
                 engine.query(
                     image=None,
                     question="Answer with just the number. What is 2+2?",
+                    reasoning=False,
                     settings={"max_tokens": 16},
                 ),
                 engine.query(
                     image=None,
                     question="Answer with just the number. What is 3+5?",
+                    reasoning=False,
                     settings={"max_tokens": 16},
                 ),
             )

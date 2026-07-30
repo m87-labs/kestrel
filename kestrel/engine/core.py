@@ -1,27 +1,8 @@
-"""Async coordination layer for Moondream inference.
+"""Model-agnostic asynchronous inference coordination.
 
-The engine is the high-level entry point for clients. It owns:
-
-- Lifecycle of the shared :class:`~kestrel.models.moondream.runtime.MoondreamRuntime`, including warmup and shutdown.
-- A micro-batching worker that pulls pending requests, prepares image crops, and runs the scheduler.
-- Skill orchestration — resolving the active :class:`~kestrel.skills.base.SkillSpec`, building prompt tokens when necessary, instantiating :class:`~kestrel.skills.base.SkillState` with skill-specific request contexts, and bridging streaming callbacks back to callers.
-- Conversion between scheduler outputs (``SchedulerResult``) and user-facing ``EngineResult`` objects augmented with metrics and per-skill output payloads.
-
-Relationship to other components:
-
-- Receives raw prompts or structured skill requests from clients (CLI, HTTP, etc.).
-- Uses :class:`GenerationScheduler` to multiplex work across the runtime while keeping the scheduler skill-agnostic.
-- Delegates low-level execution to :class:`MoondreamRuntime` for prefill/decode and to :mod:`kestrel.models.moondream.vision` for optional image preprocessing.
-
-Internal API overview:
-
-- :meth:`InferenceEngine.create` / :meth:`InferenceEngine.shutdown`: manage runtime instantiation and cleanup.
-- :meth:`InferenceEngine.submit` / :meth:`InferenceEngine.submit_streaming`: enqueue non-streaming or streaming requests.
-- :meth:`InferenceEngine.query`: helper that mirrors ``moondream.query`` while internally materialising the skill request context.
-- `_submit_request`: normalises parameters, resolves the skill, builds prompt tokens, and stashes the per-request context so the scheduler receives a fully initialised ``SkillState``.
-- `_worker_loop`: background task that batches queued requests, invokes the scheduler, and delivers results or stream completions back to callers.
-
-Callers provide raw questions/objects; the engine derives skill-specific contexts and validation before handing work to the scheduler.
+The engine owns runtime lifecycle, skill orchestration, request micro-batching,
+and conversion from scheduler outputs to user-facing results. Model runtimes
+own preprocessing and device execution behind the shared runtime protocols.
 """
 
 
@@ -57,8 +38,12 @@ from kestrel.config import RuntimeConfig
 from kestrel.device import make_stream, set_device, synchronize
 from kestrel.runtime import (
     AutoregressiveRuntime,
+    CoordToken,
     ExecutionShape,
     Runtime,
+    SizeToken,
+    TextToken,
+    Token,
 )
 from kestrel.scheduler import (
     GeneratedPrefix,
@@ -75,7 +60,6 @@ from kestrel.skills import (
     SkillSpec,
     SkillState,
 )
-from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
 

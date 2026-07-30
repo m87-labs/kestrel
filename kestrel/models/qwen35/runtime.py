@@ -65,17 +65,6 @@ def _native_decode_state_requirements(generated, linear_state_pool):
     return tuple(native)
 
 
-class _NullRegion(nn.Module):
-    def __init__(self, dtype: torch.dtype, device: torch.device) -> None:
-        super().__init__()
-        self.register_buffer(
-            "coord_features", torch.empty(0, dtype=dtype, device=device)
-        )
-        self.register_buffer(
-            "size_features", torch.empty(0, dtype=dtype, device=device)
-        )
-
-
 @dataclass
 class _EncodeResult:
     ids: list[int]
@@ -492,7 +481,6 @@ class Qwen35Runtime:
         self.active_sequences: dict[int, Any] = {}
         self._caches: dict[int, Any] = {}
 
-        self.region = _NullRegion(dtype=self.dtype, device=self.device)
         self.spatial_tables = None
 
         # Size the persistent GDN (ReplaySSM) pool for spec decode BEFORE the
