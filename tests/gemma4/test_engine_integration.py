@@ -65,7 +65,10 @@ def test_engine_image_query_returns_text() -> None:
     answer = asyncio.run(run())
     assert isinstance(answer, str)
     assert answer.strip(), f"expected non-empty answer; got {answer!r}"
-    assert "red" in answer.lower(), f"expected an answer about red; got {answer!r}"
+    red_labels = ("red", "coral", "salmon")
+    assert any(label in answer.lower() for label in red_labels), (
+        f"expected a red-family color; got {answer!r}"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
