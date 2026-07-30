@@ -7,7 +7,7 @@ types they exchange with the kernel. Concrete skills live with their model.
 
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Literal, Mapping, Optional, Sequence
 
 if False:  # pragma: no cover - type-checking imports
     import numpy as np
@@ -43,6 +43,21 @@ class SkillSettings:
     max_tokens: int
 
 
+MediaKind = Literal["image", "audio", "video"]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class MediaInput:
+    """One ordered media item a skill extracted from its prompt.
+
+    ``data`` is the raw, model-defined payload (e.g. an ``np.ndarray`` or
+    encoded ``bytes`` for an image).
+    """
+
+    kind: MediaKind
+    data: object = field(repr=False)
+
+
 @dataclass(frozen=True, slots=True)
 class BuiltRequest:
     """What a skill's ``build_request`` hands back to the engine.
@@ -62,6 +77,10 @@ class BuiltRequest:
     # the image pipeline instead of the top-level ``image`` argument; ``None``
     # leaves any caller-supplied ``image`` in force.
     image: "Optional[np.ndarray | bytes]" = None
+    # The ordered media of this request, as the skill parsed it from the
+    # complete capability prompt. This is the engine-authoritative channel;
+    # ``image`` above is legacy and on its way out.
+    media: tuple[MediaInput, ...] = ()
 
 
 def parse_settings(
