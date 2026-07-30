@@ -8,7 +8,7 @@ import torch
 
 from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
 
-from .gemma4_compat import SimpleDynamicCache
+from ._model_utils import SimpleDynamicCache
 from .gemma4_config import attention_kv_heads
 
 

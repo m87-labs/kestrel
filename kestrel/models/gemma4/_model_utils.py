@@ -1,4 +1,4 @@
-"""Small local compatibility layer for Gemma 4."""
+"""Activation and cache utilities used by the Gemma 4 inference model."""
 
 from __future__ import annotations
 

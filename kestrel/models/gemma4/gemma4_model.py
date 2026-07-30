@@ -20,7 +20,7 @@ from .gemma4_config import (
     Gemma4VisionConfig,
     attention_kv_heads,
 )
-from .gemma4_compat import SimpleDynamicCache, get_activation
+from ._model_utils import SimpleDynamicCache, get_activation
 
 _dense_runtime = get_runtime().dense
 _rotary_runtime = get_runtime().rotary

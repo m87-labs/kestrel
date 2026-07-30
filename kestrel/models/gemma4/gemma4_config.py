@@ -110,10 +110,7 @@ class Gemma4TextConfig:
         if self.num_global_key_value_heads is None:
             self.num_global_key_value_heads = self.num_key_value_heads
 
-    # --- HF-config compatibility shims ---
-    # ``Gemma4PreTrainedModel.config`` is sometimes accessed via these
-    # convenience methods. Implementing them keeps weight-loading helpers
-    # and HF config-json deserialization simple.
+    # HF-compatible config serialization.
     def get_text_config(self) -> "Gemma4TextConfig":
         return self
 
