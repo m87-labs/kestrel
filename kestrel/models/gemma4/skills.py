@@ -42,9 +42,8 @@ class Gemma4QuerySkill(QuerySkill):
             top_p=1.0,
             max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
         )
-        # Engine.query() is model-agnostic and defaults ``reasoning=True`` for
-        # Moondream. Gemma 4 uses its direct-answer template by default; opt in
-        # through settings={"reasoning": True}.
+        # Gemma 4 uses its direct-answer template by default; callers opt in
+        # to its reasoning template through settings={"reasoning": True}.
         reasoning = bool(settings.get("reasoning", False)) if settings else False
         request = QueryRequest(
             question=question,

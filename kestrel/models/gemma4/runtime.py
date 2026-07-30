@@ -55,7 +55,7 @@ def _decode_slot_rows(max_batch_size: int) -> int:
 
 @dataclass
 class _SimplePrefillSlot:
-    """Stand-in for Moondream's ``PrefillSlot``."""
+    """Scheduler-facing state for Gemma prefill."""
 
     slot_id: int
     batch_idx: torch.Tensor
