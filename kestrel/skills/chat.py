@@ -169,7 +169,6 @@ class ChatSkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
-            image=tuple(images) if images else None,
             media=tuple(MediaInput(kind="image", data=img) for img in images),
         )
 

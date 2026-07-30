@@ -10,6 +10,7 @@ from kestrel.models.moondream.runtime import SequenceState, Token
 from kestrel.runtime import AutoregressiveRuntime
 from kestrel.models.moondream.image_crops import OverlapCropOutput
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
+from kestrel.utils.image import LegacyImageInput
 
 
 MODEL_PREFILL_TIMING_BOUNDARY = "scheduled_to_first_model_token"
@@ -190,7 +191,7 @@ class GenerationRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stream_callback: Optional["StreamCallback"] = None
-    image: Optional[np.ndarray | bytes] = None
+    image: Optional[LegacyImageInput] = None
     image_hash: Optional[bytes] = None  # SHA256 hash for prefix caching
     image_crops: Optional[OverlapCropOutput] = None
     image_length: int = 0

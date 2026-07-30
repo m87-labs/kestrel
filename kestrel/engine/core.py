@@ -71,10 +71,12 @@ from kestrel.skills import (
     AR_DEFAULT_TEMPERATURE,
     AR_DEFAULT_TOP_P,
     DecodeStep,
+    MediaInput,
     SkillRegistry,
     SkillSpec,
     SkillState,
 )
+from kestrel.utils.image import LegacyImageInput
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
@@ -526,6 +528,26 @@ class InferenceEngine:
         for runtime in self._runtimes.values():
             runtime.shutdown()
 
+    @staticmethod
+    def _media_to_legacy_image(
+        media: "tuple[MediaInput, ...]",
+    ) -> object | None:
+        """Adapt ordered ``BuiltRequest.media`` to the legacy image value.
+
+        This helper validates modality only. Concrete image payload validation
+        remains in ``_submit_request``.
+        """
+        if not media:
+            return None
+        kinds = {item.kind for item in media}
+        if kinds != {"image"}:
+            raise NotImplementedError(
+                "non-image request media is unsupported"
+            )
+        if len(media) == 1:
+            return media[0].data
+        return tuple(item.data for item in media)
+
     async def _run_skill(
         self,
         skill_name: str,
@@ -550,9 +572,10 @@ class InferenceEngine:
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        # A skill may carry media it pulled out of its own prompt (e.g. an
-        # image inside chat messages); prefer it over the top-level argument.
-        effective_image = built.image if built.image is not None else image
+        effective_image = cast(
+            Optional[LegacyImageInput],
+            self._media_to_legacy_image(built.media),
+        )
         submit_fn = self.submit_streaming if stream else self.submit
         return await submit_fn(
             built.request_context,
@@ -574,7 +597,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[np.ndarray | bytes] = None,
+        image: Optional[LegacyImageInput] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -779,7 +802,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[np.ndarray | bytes] = None,
+        image: Optional[LegacyImageInput] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -1011,7 +1034,7 @@ class InferenceEngine:
         max_new_tokens: int,
         request_context: object,
         adapter: Optional[str],
-        image: Optional[np.ndarray | bytes],
+        image: Optional[LegacyImageInput],
         temperature: Optional[float],
         top_p: Optional[float],
         return_logprobs: Optional[bool],

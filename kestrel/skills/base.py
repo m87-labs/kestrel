@@ -64,22 +64,19 @@ class BuiltRequest:
 
     Carries the assembled per-capability ``request_context`` plus the
     sampling params the skill resolved (the engine threads these into the
-    scheduler). The skill owns all of it — token budget included
-    (detect/point derive ``max_new_tokens`` from ``max_objects``).
+    scheduler). ``request_context`` is the skill-owned, complete validated
+    request and may retain its media. ``media`` is the ordered engine-facing
+    projection used to enter preprocessing and scheduling. The skill owns the
+    complete request — token budget included (detect/point derive
+    ``max_new_tokens`` from ``max_objects``).
     """
 
     request_context: object
     max_new_tokens: int
     temperature: float
     top_p: float
-    # Media the skill extracted from its own prompt (e.g. an image carried
-    # inside OpenAI chat messages). When set, the engine sends this through
-    # the image pipeline instead of the top-level ``image`` argument; ``None``
-    # leaves any caller-supplied ``image`` in force.
-    image: "Optional[np.ndarray | bytes]" = None
-    # The ordered media of this request, as the skill parsed it from the
-    # complete capability prompt. This is the engine-authoritative channel;
-    # ``image`` above is legacy and on its way out.
+    # Ordered engine-facing projection of media in the skill-owned request.
+    # The engine consumes media only through this field.
     media: tuple[MediaInput, ...] = ()
 
 

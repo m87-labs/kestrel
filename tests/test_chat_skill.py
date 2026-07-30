@@ -176,7 +176,7 @@ def test_build_request_collects_multiple_images_in_order() -> None:
     built = ChatSkill().build_request(None, {"messages": msgs}, None)
     ctx = built.request_context
     assert len(ctx.images) == 2
-    assert built.image == (b"hi", b"hi")
+    assert [(m.kind, m.data) for m in built.media] == [("image", b"hi"), ("image", b"hi")]
     # parts carry image indices in conversation order
     assert ctx.messages[0].parts[0].image_index == 0
     assert ctx.messages[2].parts[1].image_index == 1

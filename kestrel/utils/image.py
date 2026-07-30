@@ -7,6 +7,10 @@ import binascii
 import numpy as np
 
 
+ImagePayload = np.ndarray | bytes
+LegacyImageInput = ImagePayload | list[ImagePayload] | tuple[ImagePayload, ...]
+
+
 def load_image_bytes_from_base64(data: str) -> bytes:
     """Decode a base64 string (raw or ``data:image/...``) into raw bytes."""
 
