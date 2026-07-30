@@ -144,11 +144,12 @@ class ModelHandle:
 
         A single-pass model interprets the whole prompt in its forward pass
         (via ``run``); an autoregressive model validates and builds it
-        through the model's skill. For the AR path, the engine-level concerns
-        are separated from the model prompt: ``settings`` (sampling) is lifted
-        out as its own argument, and ``image`` is pulled out for the image
-        pipeline; ``stream`` selects streaming delivery but stays in the
-        prompt, since the skill reads it to configure its streaming state.
+        through the model's skill, which receives the complete prompt —
+        media included. For the AR path, the only engine-level concern
+        separated from the model prompt is ``settings`` (sampling), lifted
+        out as its own argument; ``stream`` selects streaming delivery but
+        stays in the prompt, since the skill reads it to configure its
+        streaming state.
 
         Starts the engine first so shape dispatch sees a built runtime: a
         co-hosted single-pass model isn't in ``_runtimes`` until startup, and
@@ -165,9 +166,8 @@ class ModelHandle:
         self._require_default_ar(task)
         settings = prompt.pop("settings", None)
         stream = bool(prompt.get("stream", False))
-        image = prompt.pop("image", None)
         return await self._engine._run_skill(
-            task, image=image, prompt=prompt, settings=settings, stream=stream
+            task, prompt=prompt, settings=settings, stream=stream
         )
 
     async def chat(

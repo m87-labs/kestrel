@@ -552,21 +552,24 @@ class InferenceEngine:
         self,
         skill_name: str,
         *,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
         stream: bool = False,
     ) -> "EngineResult | EngineStream":
         """Validate + build via the model's skill, then submit.
 
-        The skill (model-owned) validates the raw ``prompt``/``settings``
-        and assembles its request + sampling params; the engine adds the
+        ``prompt`` is the complete capability prompt — media included. The
+        skill (model-owned) validates the raw ``prompt``/``settings`` and
+        assembles its request + sampling params; the engine adds the
         decode-pipeline concerns it owns (adapter, logprobs, generated
         prefix, suppressed tokens) and submits. The kernel never builds or
         inspects a model's request type.
         """
+        # Temporary: the skill contract still takes image as a separate
+        # argument; extract it from the complete prompt until build_request
+        # moves to (prompt, settings).
         built = self._skill_registry().resolve(skill_name).build_request(
-            image, prompt, settings
+            prompt.get("image"), prompt, settings
         )
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
@@ -671,8 +674,8 @@ class InferenceEngine:
     ) -> Union[EngineResult, EngineStream]:
         return await self._run_skill(
             "query",
-            image=image,
             prompt={
+                "image": image,
                 "question": question,
                 "reasoning": reasoning,
                 "stream": stream,
@@ -700,7 +703,6 @@ class InferenceEngine:
             prompt["reasoning"] = reasoning
         return await self._run_skill(
             "chat",
-            image=None,
             prompt=prompt,
             settings=settings,
             stream=stream,
@@ -716,8 +718,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "point",
-            image=image,
-            prompt={"object": object, "spatial_refs": spatial_refs},
+            prompt={"image": image, "object": object, "spatial_refs": spatial_refs},
             settings=settings,
         )
 
@@ -761,8 +762,7 @@ class InferenceEngine:
     ) -> Union[EngineResult, EngineStream]:
         return await self._run_skill(
             "caption",
-            image=image,
-            prompt={"length": length, "stream": stream},
+            prompt={"image": image, "length": length, "stream": stream},
             settings=settings,
             stream=stream,
         )
@@ -775,8 +775,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "detect",
-            image=image,
-            prompt={"object": object},
+            prompt={"image": image, "object": object},
             settings=settings,
         )
 
@@ -790,8 +789,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "segment",
-            image=image,
-            prompt={"object": object, "spatial_refs": spatial_refs},
+            prompt={"image": image, "object": object, "spatial_refs": spatial_refs},
             settings=settings,
         )
 
