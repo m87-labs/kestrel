@@ -45,10 +45,10 @@ class QuerySkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         question = prompt.get("question")
         if question is None:
             raise ValueError("question must be provided")

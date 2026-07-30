@@ -46,10 +46,10 @@ class CaptionSkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         if image is None:
             raise ValueError("image must be provided for captioning")
         length = str(prompt.get("length", "normal")).strip().lower() or "normal"

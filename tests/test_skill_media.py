@@ -39,7 +39,7 @@ def _image_prompt_cases():
 )
 def test_image_skill_input_produces_media(skill, prompt) -> None:
     image = np.zeros((2, 2, 3), dtype=np.uint8)
-    built = skill.build_request(image, prompt, None)
+    built = skill.build_request({"image": image, **prompt}, None)
     assert len(built.media) == 1
     (item,) = built.media
     assert isinstance(item, MediaInput)
@@ -58,13 +58,13 @@ def test_image_skill_input_produces_media(skill, prompt) -> None:
     ids=lambda c: getattr(c, "name", None),
 )
 def test_text_only_input_produces_empty_media(skill, prompt) -> None:
-    built = skill.build_request(None, prompt, None)
+    built = skill.build_request(prompt, None)
     assert built.media == ()
 
 
 def test_chat_without_images_produces_empty_media() -> None:
     built = ChatSkill().build_request(
-        None, {"messages": [{"role": "user", "content": "hi"}]}, None
+        {"messages": [{"role": "user", "content": "hi"}]}, None
     )
     assert built.media == ()
 
@@ -87,7 +87,7 @@ def test_chat_media_order_matches_image_index_order() -> None:
             ],
         },
     ]
-    built = ChatSkill().build_request(None, {"messages": msgs}, None)
+    built = ChatSkill().build_request({"messages": msgs}, None)
     ctx = built.request_context
     assert all(m.kind == "image" for m in built.media)
     assert len(built.media) == len(ctx.images)

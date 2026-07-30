@@ -565,11 +565,8 @@ class InferenceEngine:
         prefix, suppressed tokens) and submits. The kernel never builds or
         inspects a model's request type.
         """
-        # Temporary: the skill contract still takes image as a separate
-        # argument; extract it from the complete prompt until build_request
-        # moves to (prompt, settings).
         built = self._skill_registry().resolve(skill_name).build_request(
-            prompt.get("image"), prompt, settings
+            prompt, settings
         )
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)

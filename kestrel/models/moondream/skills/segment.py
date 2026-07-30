@@ -52,10 +52,10 @@ class SegmentSkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         obj = str(prompt.get("object", "")).strip()
         if not obj:
             raise ValueError("object must be a non-empty string")

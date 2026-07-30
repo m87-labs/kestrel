@@ -126,17 +126,19 @@ class SkillSpec:
 
     def build_request(
         self,
-        image: "Optional[np.ndarray | bytes]",
         prompt: "Mapping[str, object]",
         settings: "Optional[Mapping[str, object]]",
     ) -> "BuiltRequest":
         """Validate raw inputs and build this capability's request.
 
         Both ``prompt`` and ``settings`` are raw, model-defined maps — the
-        seam carries no model assumptions. ``prompt`` is the per-capability
-        payload (e.g. ``{"object": ...}`` for detect/point/segment,
-        ``{"question": ..., "reasoning": ...}`` for query, ``{"length":
-        ...}`` for caption). AR skills parse ``settings`` with
+        seam carries no model assumptions. ``prompt`` is the *complete*
+        per-capability payload, media included (e.g. ``{"image": ...,
+        "object": ...}`` for detect/point/segment, ``{"image": ...,
+        "question": ..., "reasoning": ...}`` for query, images inside
+        ``messages`` for chat). The skill parses any media out of the
+        prompt and returns it as ordered :class:`MediaInput` items on
+        ``BuiltRequest.media``. AR skills parse ``settings`` with
         :func:`parse_settings`; a single-pass capability reads whatever its
         model defines. Returns a :class:`BuiltRequest` (the request_context
         plus resolved sampling params). Raises ``ValueError`` on invalid

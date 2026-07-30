@@ -26,8 +26,6 @@ from collections.abc import Mapping as _Mapping, Sequence as _Sequence
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
-
 from kestrel.runtime.tokens import TextToken, Token
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
@@ -114,7 +112,6 @@ class ChatSkill(SkillSpec):
 
     def build_request(
         self,
-        image: "Optional[np.ndarray | bytes]",
         prompt: "_Mapping",
         settings: "Optional[_Mapping]",
     ) -> BuiltRequest:
