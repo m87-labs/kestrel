@@ -20,6 +20,7 @@ from kestrel.runtime.prefill import project_packed_last_rows
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 from kestrel.runtime.preprocessing import derive_preprocessing_workers
 from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
+from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
 from .generated_decode import create_generated_decode
@@ -59,17 +60,21 @@ class Gemma4Runtime(UncachedPagedRuntime):
                 f"device ({self.device})"
             )
 
-        from tokenizers import Tokenizer
-
         self._model_name = cfg.model
+        from kestrel.models.registry import get_spec
+
+        model_spec = get_spec(self._model_name)
+        model_source = cfg.model_path if cfg.model_path is not None else model_spec.repo_id
+        if model_source is None:
+            raise ValueError("Gemma model spec must declare repo_id")
         self.model = load_model(
-            self._model_name,
+            model_source,
             device=self.device,
             dtype=self.dtype,
         )
         self._config = self.model.config
         self._configure_model(cfg)
-        self.tokenizer = Tokenizer.from_pretrained(self._model_name)
+        self.tokenizer = load_tokenizer(model_spec.tokenizer_id, cfg.tokenizer_path)
         self.tokenizer.post_processor = None
         self.prompt_template = Gemma4PromptTemplate(self._model_name)
 

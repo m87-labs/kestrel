@@ -178,6 +178,7 @@ def test_modelspecs_register_on_import():
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)
+    assert spec.filename is None
     assert spec.runtime is Gemma4Runtime
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
@@ -514,7 +515,7 @@ def test_generated_decode_binds_named_paged_kv_sets():
 
 
 def test_engine_adopts_externally_supplied_runtime_kv_pool():
-    cfg = RuntimeConfig(device="cuda", model=_MODEL_ID)
+    cfg = RuntimeConfig(device="cpu", model=_MODEL_ID)
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = cfg.resolved_device()
     runtime._kv_pool = object()

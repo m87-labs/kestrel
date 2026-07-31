@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 from kestrel.runtime.bounded_projection import (
@@ -23,16 +23,26 @@ _UNSUPPORTED_WEIGHT_PREFIXES = (
 )
 
 
-def load_weights(repo_id: str, model: torch.nn.Module) -> None:
-    snapshot = Path(
+def _snapshot(source: str | Path) -> Path:
+    path = Path(source).expanduser()
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError(f"Gemma model_path must be a directory, got {path}")
+        return path
+    return Path(
         snapshot_download(
-            repo_id,
+            str(source),
             allow_patterns=[
+                "config.json",
                 "*.safetensors",
                 "model.safetensors.index.json",
             ],
         )
     )
+
+
+def load_weights(source: str | Path, model: torch.nn.Module) -> None:
+    snapshot = _snapshot(source)
 
     index_path = snapshot / "model.safetensors.index.json"
     if index_path.exists():
@@ -87,12 +97,13 @@ def load_weights(repo_id: str, model: torch.nn.Module) -> None:
 
 
 def load_model(
-    repo_id: str,
+    source: str | Path,
     *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Gemma4InferenceModel:
-    config_path = hf_hub_download(repo_id, filename="config.json")
+    snapshot = _snapshot(source)
+    config_path = snapshot / "config.json"
     with open(config_path, "r", encoding="utf-8") as handle:
         config = Gemma4Config.from_dict(json.load(handle))
 
@@ -104,7 +115,7 @@ def load_model(
     finally:
         torch.set_default_dtype(old_dtype)
 
-    load_weights(repo_id, model)
+    load_weights(snapshot, model)
     model.lm_head.weight = model.model.language_model.embed_tokens.weight
     return model.to(device=device).eval()
 

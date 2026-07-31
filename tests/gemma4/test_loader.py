@@ -115,7 +115,7 @@ def test_load_weights_rejects_unknown_keys(tmp_path, monkeypatch):
         loader.load_weights("repo", _TinyModel())
 
 
-def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
+def test_load_model_accepts_local_snapshot_and_ties_embeddings(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -190,20 +190,15 @@ def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
         tmp_path / "model.safetensors",
     )
 
-    def fake_hf_hub_download(repo_id: str, filename: str) -> str:
-        assert repo_id == "repo"
-        return str(tmp_path / filename)
-
-    def fake_snapshot_download(repo_id: str, allow_patterns: list[str]) -> str:
-        assert repo_id == "repo"
-        return str(tmp_path)
-
-    monkeypatch.setattr(loader, "hf_hub_download", fake_hf_hub_download)
-    monkeypatch.setattr(loader, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        loader,
+        "snapshot_download",
+        lambda *_args, **_kwargs: pytest.fail("local snapshots must not hit the hub"),
+    )
     monkeypatch.setattr(loader, "Gemma4InferenceModel", _TinyGemma4)
 
     model = loader.load_model(
-        "repo",
+        tmp_path,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
@@ -217,3 +212,11 @@ def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
         model.model.language_model.embed_tokens.weight.detach(),
         torch.full((2, 2), 7.0, dtype=torch.bfloat16),
     )
+
+
+def test_local_model_source_must_be_a_directory(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a directory"):
+        loader.load_weights(config, _TinyModel())
