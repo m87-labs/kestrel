@@ -1,4 +1,4 @@
-"""Gemma4Runtime smoke and registration tests."""
+"""Gemma 4 runtime smoke and registration tests."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
+from kestrel.runtime.paged_model import PagedMultimodalRuntime
 from kestrel.runtime.paged_resources import decode_slot_rows
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
@@ -29,9 +30,7 @@ from kestrel.models.gemma4.config import (
 )
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
-from kestrel.models.gemma4.runtime import (
-    Gemma4Runtime,
-)
+from kestrel.models.gemma4.runtime import _OPS, create_gemma4_runtime
 from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
 
 
@@ -501,7 +500,7 @@ def test_modelspecs_register_on_import():
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)
-    assert spec.runtime is Gemma4Runtime
+    assert spec.runtime is create_gemma4_runtime
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
     assert spec.skills().names() == ("query",)
@@ -520,7 +519,7 @@ def test_decode_slot_rows_cover_non_bucket_compiled_capacity():
 
 
 def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
-    rt = Gemma4Runtime.__new__(Gemma4Runtime)
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
     calls = []
     slot = SimpleNamespace(compute_stream="decode-stream")
 
@@ -537,7 +536,7 @@ def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
         run=lambda bound_slot, batch_size: calls.append(
             ("generated", bound_slot, batch_size)))
 
-    Gemma4Runtime.decode_with_slot(rt, slot, batch_size=1)
+    rt.decode_with_slot(slot, batch_size=1)
 
     assert calls == [
         ("enter", "decode-stream"),
@@ -871,7 +870,8 @@ def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
 
 
 def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
-    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
+    runtime = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    runtime._ops = _OPS
     runtime.device = torch.device("cpu")
     runtime.max_batch_size = 4
     runtime._vision_stager = BatchedTensorStager(
@@ -965,7 +965,7 @@ def test_decode_state_tables_keep_local_and_global_storage_disjoint():
 
 def test_engine_adopts_externally_supplied_runtime_kv_pool():
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID)
-    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
+    runtime = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
     runtime.device = cfg.resolved_device()
     runtime._kv_pool = object()
     runtime._compute_stream = object()
@@ -979,7 +979,7 @@ def test_engine_adopts_externally_supplied_runtime_kv_pool():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_runtime_constructs():
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
-    rt = Gemma4Runtime(
+    rt = create_gemma4_runtime(
         cfg,
         kv_pool=KVMemoryPool(device=cfg.resolved_device()),
         compute_stream=torch.cuda.Stream(),
@@ -1027,7 +1027,7 @@ def test_disabling_tokenizer_postprocessor_preserves_no_special_token_ids():
 
 
 def test_batch_index_allocation_gates_capacity():
-    rt = Gemma4Runtime.__new__(Gemma4Runtime)
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
     rt.max_batch_size = 2
     rt.max_seq_length = 4096
     rt.active_sequences = {}
@@ -1049,7 +1049,7 @@ def test_batch_index_allocation_gates_capacity():
 
 
 def test_active_sequence_lifecycle_registers_and_frees_batch_index():
-    rt = Gemma4Runtime.__new__(Gemma4Runtime)
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
     rt.active_sequences = {}
     rt.page_table = _FakePageTable([])
 

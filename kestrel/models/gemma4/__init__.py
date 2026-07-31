@@ -3,7 +3,7 @@
 from kestrel.models.registry import ModelSpec, register
 
 from .prompt_template import Gemma4PromptTemplate
-from .runtime import Gemma4Runtime
+from .runtime import create_gemma4_runtime
 from .skills import build_skill_registry
 
 
@@ -25,10 +25,10 @@ for _repo_id in _VARIANTS:
             checkpoint_format="gemma4",
             default_config={},
             tokenizer_id=_repo_id,
-            runtime=Gemma4Runtime,
+            runtime=create_gemma4_runtime,
             skills=build_skill_registry,
         )
     )
 
 
-__all__ = ["Gemma4PromptTemplate", "Gemma4Runtime"]
+__all__ = ["Gemma4PromptTemplate", "create_gemma4_runtime"]
