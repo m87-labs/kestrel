@@ -2,36 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
-
-def _required_kwargs(
-    cls: type,
-    data: dict[str, Any],
-    *,
-    scope: str,
-    transformed: frozenset[str] = frozenset(),
-) -> dict[str, Any]:
-    result = {}
-    missing = []
-    for field in fields(cls):
-        if field.name in transformed or field.default is not MISSING:
-            continue
-        if field.name not in data:
-            missing.append(field.name)
-        else:
-            result[field.name] = data[field.name]
-    if missing:
-        raise ValueError(f"{scope} config is missing required fields: {missing}")
-    return result
-
-
-def _required(data: dict[str, Any], name: str, scope: str) -> Any:
-    try:
-        return data[name]
-    except KeyError as exc:
-        raise ValueError(f"{scope} config is missing required field {name!r}") from exc
+from kestrel.models.config import required_config, required_config_kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,24 +82,24 @@ class Qwen3_5TextConfig:
         tie_word_embeddings: bool,
         expert_weight_format: str,
     ) -> "Qwen3_5TextConfig":
-        if _required(data, "hidden_act", "Qwen text") != "silu":
+        if required_config(data, "hidden_act", "Qwen text") != "silu":
             raise ValueError("Qwen text inference requires hidden_act='silu'")
-        if _required(data, "mamba_ssm_dtype", "Qwen text") != "float32":
+        if required_config(data, "mamba_ssm_dtype", "Qwen text") != "float32":
             raise ValueError("Qwen GDN inference requires mamba_ssm_dtype='float32'")
-        if bool(_required(data, "attention_bias", "Qwen text")):
+        if bool(required_config(data, "attention_bias", "Qwen text")):
             raise ValueError("Qwen inference requires attention_bias=false")
 
-        rope = dict(_required(data, "rope_parameters", "Qwen text"))
-        if _required(rope, "rope_type", "Qwen RoPE") != "default":
+        rope = dict(required_config(data, "rope_parameters", "Qwen text"))
+        if required_config(rope, "rope_type", "Qwen RoPE") != "default":
             raise ValueError("Qwen inference only supports default RoPE")
-        if not bool(_required(rope, "mrope_interleaved", "Qwen RoPE")):
+        if not bool(required_config(rope, "mrope_interleaved", "Qwen RoPE")):
             raise ValueError("Qwen inference requires interleaved M-RoPE")
 
         if "layer_types" in data:
             layer_types = tuple(data["layer_types"])
         else:
             interval = int(
-                _required(data, "full_attention_interval", "Qwen text")
+                required_config(data, "full_attention_interval", "Qwen text")
             )
             if interval <= 0:
                 raise ValueError("full_attention_interval must be positive")
@@ -144,7 +118,7 @@ class Qwen3_5TextConfig:
                 "layer_types",
             }
         )
-        kwargs = _required_kwargs(
+        kwargs = required_config_kwargs(
             cls,
             data,
             scope="Qwen text",
@@ -154,16 +128,16 @@ class Qwen3_5TextConfig:
             intermediate_size=(
                 data.get("intermediate_size")
                 if is_moe
-                else _required(data, "intermediate_size", "Qwen dense text")
+                else required_config(data, "intermediate_size", "Qwen dense text")
             ),
             tie_word_embeddings=bool(tie_word_embeddings),
-            rope_theta=float(_required(rope, "rope_theta", "Qwen RoPE")),
+            rope_theta=float(required_config(rope, "rope_theta", "Qwen RoPE")),
             partial_rotary_factor=float(
-                _required(rope, "partial_rotary_factor", "Qwen RoPE")
+                required_config(rope, "partial_rotary_factor", "Qwen RoPE")
             ),
             mrope_section=tuple(
                 int(value)
-                for value in _required(rope, "mrope_section", "Qwen RoPE")
+                for value in required_config(rope, "mrope_section", "Qwen RoPE")
             ),
             layer_types=layer_types,
             expert_weight_format=expert_weight_format,
@@ -175,7 +149,7 @@ class Qwen3_5TextConfig:
                 "num_experts_per_tok",
                 "num_experts",
             ):
-                kwargs[name] = _required(data, name, "Qwen MoE")
+                kwargs[name] = required_config(data, name, "Qwen MoE")
         return cls(**kwargs)
 
     @property
@@ -211,7 +185,7 @@ class Qwen3_5VisionConfig:
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3_5VisionConfig":
         if data.get("deepstack_visual_indexes"):
             raise ValueError("Qwen inference does not support deepstack vision")
-        return cls(**_required_kwargs(cls, data, scope="Qwen vision"))
+        return cls(**required_config_kwargs(cls, data, scope="Qwen vision"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,8 +196,8 @@ class Qwen3_5Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3_5Config":
-        model_type = str(_required(data, "model_type", "Qwen"))
-        text_data = dict(_required(data, "text_config", "Qwen"))
+        model_type = str(required_config(data, "model_type", "Qwen"))
+        text_data = dict(required_config(data, "text_config", "Qwen"))
         quantization = data.get("quantization_config") or {}
         expert_weight_format = (
             "fp8_e4m3"
@@ -236,16 +210,16 @@ class Qwen3_5Config:
             is_moe=model_type == "qwen3_5_moe"
             or str(text_data.get("model_type", "")).startswith("qwen3_5_moe"),
             tie_word_embeddings=bool(
-                _required(data, "tie_word_embeddings", "Qwen")
+                required_config(data, "tie_word_embeddings", "Qwen")
             ),
             expert_weight_format=expert_weight_format,
         )
         return cls(
             text_config=text,
             vision_config=Qwen3_5VisionConfig.from_dict(
-                dict(_required(data, "vision_config", "Qwen"))
+                dict(required_config(data, "vision_config", "Qwen"))
             ),
-            image_token_id=int(_required(data, "image_token_id", "Qwen")),
+            image_token_id=int(required_config(data, "image_token_id", "Qwen")),
         )
 
 
