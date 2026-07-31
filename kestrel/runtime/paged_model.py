@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
-from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV
+from kestrel.device import make_event, make_stream
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
-from kestrel.runtime.paged_resources import create_paged_runtime_resources
+from kestrel.runtime.decode_slot import create_decode_slot
+from kestrel.runtime.paged_resources import PrefillSlot, decode_slot_rows
 from kestrel.runtime.preprocessing import derive_preprocessing_workers
 from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
 
@@ -46,7 +49,6 @@ class PagedMultimodalRuntime:
     ) -> None:
         del max_lora_rank
         self._ops = ops
-        self._cfg = cfg
         self.device = cfg.resolved_device()
         self.dtype = cfg.resolved_dtype()
         if self.device.type != "cuda" or self.dtype is not torch.bfloat16:
@@ -92,28 +94,56 @@ class PagedMultimodalRuntime:
         )
 
         text_config = self._config.text_config
-        resources = create_paged_runtime_resources(
-            device=self.device,
-            dtype=self.dtype,
-            max_batch_size=self.max_batch_size,
-            page_size=self.page_size,
-            kv_cache_pages=self._kv_cache_pages,
-            vocab_size=text_config.vocab_size,
-            hidden_dim=text_config.hidden_size,
-            compute_stream=compute_stream,
+        self.max_batch_slots = self.max_batch_size + 2
+        decode_rows = decode_slot_rows(self.max_batch_size)
+        self._padding_batch_idx = self.max_batch_slots - 1
+        self._compute_stream = (
+            compute_stream if compute_stream is not None else make_stream(self.device)
         )
-        self._compute_stream = resources.compute_stream
-        self._copy_stream = resources.copy_stream
-        self.graph_capture_lock = resources.graph_capture_lock
-        self.page_table = resources.page_table
-        self.max_batch_slots = resources.max_batch_slots
-        self._decode_slot_rows = resources.decode_rows
-        self._padding_batch_idx = resources.padding_batch_idx
-        self._prefill_slot = resources.prefill_slot
+        self._copy_stream = make_stream(self.device)
+        self.graph_capture_lock = threading.RLock()
+        self.page_table = PageTable(
+            n_pages=self._kv_cache_pages,
+            page_size=self.page_size,
+            max_batch_size=self.max_batch_slots,
+            device=str(self.device),
+            prefix_cache=None,
+            h2d_stream=self._compute_stream,
+        )
+        self.page_table.free_batch_idx.remove(self._padding_batch_idx)
+        self.page_table.reserve(self._padding_batch_idx, 1)
+        self.page_table.commit_block_table([self._padding_batch_idx])
+        self._prefill_slot = PrefillSlot(
+            slot_id=0,
+            batch_idx=torch.zeros(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            step_done_event=make_event(
+                self.device, enable_timing=False, blocking=False
+            ),
+            commit_done_event=make_event(
+                self.device, enable_timing=False, blocking=False
+            ),
+        )
         self._prefill_slot_in_use = False
-        self.prefill_slots = (resources.prefill_slot,)
-        self._decode_slots = resources.decode_slots
-        self.decode_slots = resources.decode_slots
+        self.prefill_slots = (self._prefill_slot,)
+        self.decode_slots = tuple(
+            create_decode_slot(
+                slot_id=index,
+                device=self.device,
+                dtype=self.dtype,
+                max_batch_slots=decode_rows,
+                kv_cache_pages=self._kv_cache_pages,
+                vocab_size=text_config.vocab_size,
+                hidden_dim=text_config.hidden_size,
+                position_shape=(decode_rows, 1),
+                compute_stream=self._compute_stream,
+                copy_stream=self._copy_stream,
+            )
+            for index in range(2)
+        )
         self.active_sequences: dict[int, SequenceState] = {}
 
         layer_specs, source_layers = ops.paged_kv_layout(text_config)
