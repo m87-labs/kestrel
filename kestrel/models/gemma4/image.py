@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from kestrel.utils.image import decode_to_srgb
 from PIL import Image
 
 
@@ -29,23 +30,6 @@ class GemmaImageInputs:
 DEFAULT_IMAGE_CONFIG = Gemma4ImageProcessorConfig()
 MAX_PATCHES = DEFAULT_IMAGE_CONFIG.max_patches
 MAX_IMAGE_TOKENS = MAX_PATCHES // (DEFAULT_IMAGE_CONFIG.pooling_kernel_size**2)
-
-
-def _to_pil_rgb(image: Any) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    if isinstance(image, (bytes, bytearray)):
-        return Image.open(io.BytesIO(image)).convert("RGB")
-    if isinstance(image, np.ndarray):
-        array = image
-        if array.dtype != np.uint8:
-            if np.issubdtype(array.dtype, np.floating) and array.size:
-                finite = array[np.isfinite(array)]
-                if finite.size and finite.min() >= 0.0 and finite.max() <= 1.0:
-                    array = array * 255.0
-            array = np.clip(array, 0, 255).astype(np.uint8)
-        return Image.fromarray(array).convert("RGB")
-    raise TypeError(f"Unsupported Gemma 4 image input type: {type(image)!r}")
 
 
 def _pick_grid(
@@ -73,13 +57,20 @@ def preprocess_image(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> GemmaImageInputs:
-    pil = _to_pil_rgb(image)
-    grid_h, grid_w = _pick_grid(pil.height, pil.width, config)
+    if isinstance(image, (bytes, bytearray)):
+        image = Image.open(io.BytesIO(image)).convert("RGB")
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGB"))
+    if np.issubdtype(image.dtype, np.floating) and image.size:
+        finite = image[np.isfinite(image)]
+        if finite.size and finite.min() >= 0.0 and finite.max() <= 1.0:
+            image = image * 255.0
+    array = decode_to_srgb(image)
+    grid_h, grid_w = _pick_grid(*array.shape[:2], config)
     resized_h = grid_h * config.patch_size
     resized_w = grid_w * config.patch_size
 
     num_valid = grid_h * grid_w
-    array = np.asarray(pil, dtype=np.uint8)
     if not array.flags.writeable:
         array = array.copy()
     pixels = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)

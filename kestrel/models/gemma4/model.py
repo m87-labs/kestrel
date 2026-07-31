@@ -33,91 +33,38 @@ _prepare_neox_rotary = _rotary_runtime.prepare_neox
 _apply_neox_rotary = _rotary_runtime.apply_neox
 
 
-def _rope_proportional_inv_freq(
-    head_dim: int,
-    base: float,
-    *,
-    partial_rotary_factor: float = 1.0,
-    factor: float = 1.0,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Proportional RoPE used by Gemma 4 for the global-attention layers.
-
-    Rotates the first ``rope_angles = int(partial_rotary_factor * head_dim // 2)``
-    frequency pairs and leaves the remaining ``head_dim // 2 - rope_angles``
-    pairs un-rotated (zero inv_freq → cos=1, sin=0 → identity). The
-    rotated frequencies use ``head_dim`` (not the truncated dim) in the
-    denominator — that's the key difference from "default" partial RoPE.
-
-    Output tensor has length ``head_dim // 2``.
-    """
-    rope_angles = int(partial_rotary_factor * head_dim // 2)
-    inv_rot = 1.0 / (
-        base
-        ** (
-            torch.arange(0, 2 * rope_angles, 2, dtype=torch.int64, device=device).float()
-            / head_dim
-        )
-    )
-    nope_angles = head_dim // 2 - rope_angles
-    if nope_angles > 0:
-        inv = torch.cat(
-            (inv_rot, torch.zeros(nope_angles, dtype=torch.float32, device=device)), dim=0
-        )
-    else:
-        inv = inv_rot
-    return inv / float(factor)
-
-
 class Gemma4TextRotaryEmbedding(nn.Module):
 
-    def __init__(self, config: Gemma4TextConfig, device: Optional[torch.device] = None) -> None:
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        device: torch.device | None = None,
+    ) -> None:
         super().__init__()
-        self.config = config
-        # Plain attribute (not a buffer) — see class docstring.
         self.inv_freq: dict[str, torch.Tensor] = {}
-        self._init_tables(device=device)
-
-    def _init_tables(self, device: Optional[torch.device] = None) -> None:
-        for layer_type in sorted(set(self.config.layer_types)):
-            params = self.config.rope[layer_type]
-            rope_type = params.kind
-            base = params.theta
-            partial = params.partial_rotary_factor
-            factor = params.factor
-
-            # HF: only "proportional" RoPE uses global_head_dim; "default"
-            # always uses head_dim (even on full_attention layers).
-            if layer_type == "full_attention" and rope_type == "proportional":
-                head_dim = self.config.global_head_dim
-            else:
-                head_dim = self.config.head_dim
-
-            if rope_type == "default":
-                inv = rotary_ops.default_inv_freq(
-                    head_dim,
-                    base,
-                    partial_rotary_factor=partial,
-                    factor=factor,
-                    device=device,
-                )
-            elif rope_type == "proportional":
-                inv = _rope_proportional_inv_freq(
-                    head_dim,
-                    base,
-                    partial_rotary_factor=partial,
-                    factor=factor,
-                    device=device,
-                )
-            else:
-                raise ValueError(f"Unsupported rope_type {rope_type!r} for layer_type {layer_type!r}")
-
-            self.inv_freq[layer_type] = inv
-
-    def _ensure_device(self, device: torch.device) -> None:
-        for k, v in self.inv_freq.items():
-            if v.device != device:
-                self.inv_freq[k] = v.to(device)
+        schedules = {
+            "default": rotary_ops.default_inv_freq,
+            "proportional": rotary_ops.proportional_inv_freq,
+        }
+        for layer_type in set(config.layer_types):
+            params = config.rope[layer_type]
+            head_dim = (
+                config.global_head_dim
+                if layer_type == "full_attention"
+                and params.kind == "proportional"
+                else config.head_dim
+            )
+            try:
+                schedule = schedules[params.kind]
+            except KeyError as exc:
+                raise ValueError(f"unsupported RoPE schedule {params.kind!r}") from exc
+            self.inv_freq[layer_type] = schedule(
+                head_dim,
+                params.theta,
+                partial_rotary_factor=params.partial_rotary_factor,
+                factor=params.factor,
+                device=device,
+            )
 
     @torch.no_grad()
     def forward(
@@ -126,21 +73,14 @@ class Gemma4TextRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         layer_type: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self._ensure_device(x.device)
-        inv = self.inv_freq[layer_type]
-
-        inv_expanded = inv[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        pos_expanded = position_ids[:, None, :].float()
-
-        # Force float32 for the rotary math — Gemma's downstream
-        # numerics are sensitive to bf16 rounding in this region.
+        inv = self.inv_freq[layer_type].to(x.device)
+        self.inv_freq[layer_type] = inv
         device_type = x.device.type if x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_expanded @ pos_expanded).transpose(1, 2)
+            freqs = position_ids.float()[..., None] * inv.float()
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+            cos, sin = emb.cos(), emb.sin()
+        return cos.to(x.dtype), sin.to(x.dtype)
 
 
 class Gemma4TextAttention(nn.Module):
@@ -411,33 +351,21 @@ class Gemma4TextDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Gemma4TextScaledWordEmbedding(nn.Embedding):
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int,
-        embed_scale: float = 1.0,
-    ) -> None:
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
-
-
 class Gemma4TextModel(nn.Module):
 
     def __init__(self, config: Gemma4TextConfig) -> None:
         super().__init__()
         self.config = config
 
-        self.embed_tokens = Gemma4TextScaledWordEmbedding(
+        self.embed_tokens = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
-            0,
-            embed_scale=config.hidden_size**0.5,
+            padding_idx=0,
+        )
+        self.register_buffer(
+            "embed_scale",
+            torch.tensor(config.hidden_size**0.5),
+            persistent=False,
         )
         sources = kv_source_layers(config)
         published = {
@@ -460,11 +388,15 @@ class Gemma4TextModel(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = nn.Embedding(
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                0,
-                embed_scale=config.hidden_size_per_layer_input**0.5,
+                padding_idx=0,
+            )
+            self.register_buffer(
+                "per_layer_embed_scale",
+                torch.tensor(config.hidden_size_per_layer_input**0.5),
+                persistent=False,
             )
             self.register_buffer(
                 "per_layer_input_scale",
@@ -481,8 +413,11 @@ class Gemma4TextModel(nn.Module):
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
             )
 
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids) * self.embed_scale
+
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
-        per = self.embed_tokens_per_layer(input_ids)
+        per = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
         return per.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
@@ -524,7 +459,7 @@ class Gemma4TextModel(nn.Module):
             raise ValueError("per_layer_inputs requires inputs_embeds (not input_ids)")
 
         if input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed(input_ids)
 
         if self.hidden_size_per_layer_input:
             if per_layer_inputs is None:

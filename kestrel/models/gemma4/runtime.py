@@ -110,13 +110,13 @@ def _embed_row(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     language_model = model.model.language_model
     if image is None or crops is None:
-        return language_model.embed_tokens(input_ids), input_ids
+        return language_model.embed(input_ids), input_ids
     if image_features is None:
         raise RuntimeError("missing encoded features for image row")
     image_mask = input_ids == config.image_token_id
     model_ids = input_ids.clone()
     model_ids[image_mask] = 0
-    embeds = language_model.embed_tokens(model_ids)
+    embeds = language_model.embed(model_ids)
     return (
         embeds.masked_scatter(
             image_mask.unsqueeze(-1).expand_as(embeds),
