@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
-from torch.nn import functional as F
 
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV
 from kestrel.models.registry import get_spec
@@ -363,22 +362,50 @@ class PagedMultimodalRuntime:
             embed_rows.append(embeds)
             id_rows.append(model_ids)
 
-        max_length = max(lengths)
-        for index, length in enumerate(lengths):
-            pad = max_length - length
-            if pad:
-                embed_rows[index] = F.pad(embed_rows[index], (0, 0, 0, pad))
-                id_rows[index] = F.pad(id_rows[index], (0, pad), value=0)
-        inputs_embeds = torch.cat(embed_rows)
-        input_ids = torch.cat(id_rows)
-        position_ids = torch.arange(
-            max_length,
+        inputs_embeds = torch.cat(embed_rows, dim=1)
+        input_ids = torch.cat(id_rows, dim=1)
+        positions = [
+            torch.arange(
+                length,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for length in lengths
+        ]
+        position_ids = torch.cat(positions).unsqueeze(0)
+        token_batch_indices = torch.cat(
+            [
+                torch.full(
+                    (length,),
+                    batch_idx,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for batch_idx, length in zip(
+                    batch_indices,
+                    lengths,
+                    strict=True,
+                )
+            ]
+        ).unsqueeze(0)
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=token_batch_indices,
+            positions=position_ids,
+        )
+        if bool((slot_mapping < 0).any()):
+            raise RuntimeError("packed prefill resolved an unreserved KV slot")
+        cumulative = [0]
+        for length in lengths:
+            cumulative.append(cumulative[-1] + length)
+        cu_seqlens = torch.tensor(
+            cumulative,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        last_token_offsets = torch.tensor(
+            [end - 1 for end in cumulative[1:]],
             dtype=torch.long,
             device=self.device,
-        ).unsqueeze(0).expand(batch_size, -1)
-        slot_mapping = self.page_table.build_slot_mapping(
-            batch_idx=prefill_slot.batch_idx[:batch_size],
-            positions=position_ids,
         )
         hidden_rows, logits = self._ops.prefill(
             self,
@@ -386,7 +413,8 @@ class PagedMultimodalRuntime:
             input_ids,
             position_ids,
             slot_mapping,
-            lengths,
+            last_token_offsets,
+            cu_seqlens,
         )
         for row, prepared in enumerate(prepared_sequences):
             prepared.state.last_hidden = hidden_rows[row].detach()

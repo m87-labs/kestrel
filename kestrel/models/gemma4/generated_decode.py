@@ -123,9 +123,9 @@ def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
 
 
 def _runtime_extents(runtime: Any, capacity: int) -> dict[str, int]:
+    del capacity
     page_table = runtime.page_table.page_table
     return {
-        "active_batch": capacity,
         "n_pages": runtime.page_table.n_pages,
         "page_table_capacity": page_table.shape[1],
         "position_capacity": runtime.max_seq_length,

@@ -8,6 +8,47 @@ from torch import nn
 from kestrel.runtime.compilation import _scalar_buffer_key
 
 
+class BoundedLinear(nn.Module):
+    """Bias-free linear with optional checkpoint-provided input/output bounds."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bounds: bool,
+    ) -> None:
+        super().__init__()
+        self.use_bounds = bool(use_bounds)
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        if self.use_bounds:
+            self.register_buffer("input_min", torch.tensor(-float("inf")))
+            self.register_buffer("input_max", torch.tensor(float("inf")))
+            self.register_buffer("output_min", torch.tensor(-float("inf")))
+            self.register_buffer("output_max", torch.tensor(float("inf")))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_bounds:
+            hidden_states = torch.clamp(
+                hidden_states,
+                self.input_min,
+                self.input_max,
+            )
+        return self.forward_bounded_input(hidden_states)
+
+    def forward_bounded_input(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        projected = self.linear(hidden_states)
+        if self.use_bounds:
+            projected = torch.clamp(
+                projected,
+                self.output_min,
+                self.output_max,
+            )
+        return projected
+
 class PackedBoundedProjections(nn.Module):
     """One packed linear with independently bounded output views."""
 

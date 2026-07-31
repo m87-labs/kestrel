@@ -14,7 +14,7 @@ from kestrel.runtime.compilation import (
     materialize_dynamic_batch_domain,
 )
 from kestrel.runtime.paged_model import PagedModelOps, PagedMultimodalRuntime
-from kestrel.runtime.prefill import project_padded_last_rows
+from kestrel.runtime.prefill import project_packed_last_rows
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 
 from .generated_decode import create_generated_decode
@@ -132,7 +132,8 @@ def _prefill(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     slot_mapping: torch.Tensor,
-    lengths: Sequence[int],
+    last_token_offsets: torch.Tensor,
+    cu_seqlens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     text_config = runtime._config.text_config
     language_model = runtime.model.model.language_model
@@ -149,8 +150,13 @@ def _prefill(
         kv_cache=runtime._kv_cache,
         cache_position_ids=position_ids,
         slot_mapping=slot_mapping,
+        cu_seqlens=cu_seqlens,
     )
-    rows, logits = project_padded_last_rows(hidden, lengths, runtime.model.lm_head)
+    rows, logits = project_packed_last_rows(
+        hidden,
+        last_token_offsets,
+        runtime.model.lm_head,
+    )
     cap = text_config.final_logit_softcapping
     return rows, torch.tanh(logits / cap) * cap
 

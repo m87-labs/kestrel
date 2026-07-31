@@ -56,3 +56,22 @@ def project_padded_last_rows(
 
     rows = gather_padded_last_rows(hidden_states, lengths)
     return rows, projection(rows)
+
+
+def project_packed_last_rows(
+    hidden_states: torch.Tensor,
+    last_token_offsets: torch.Tensor,
+    projection: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed sequence boundaries and project them together."""
+    if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+        raise ValueError(
+            "packed hidden states must have shape [1, tokens, channels]"
+        )
+    if (
+        last_token_offsets.ndim != 1
+        or last_token_offsets.dtype != torch.long
+    ):
+        raise ValueError("packed last-token offsets must be a long vector")
+    rows = hidden_states[0].index_select(0, last_token_offsets)
+    return rows, projection(rows)

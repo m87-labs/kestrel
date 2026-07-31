@@ -17,7 +17,10 @@ from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
-from kestrel.runtime import ExecutionShape
+from kestrel.ops import attention as attention_ops
+from kestrel.ops import norm as norm_ops
+from kestrel.ops import rotary as rotary_ops
+from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
 from kestrel.runtime.paged_model import PagedMultimodalRuntime
@@ -132,9 +135,9 @@ def test_rmsnorm_uses_dense_runtime_with_uniform_fp32_weight(monkeypatch):
         calls.append((x, weight, eps))
         return x
 
-    monkeypatch.setattr(gemma_model, "_kestrel_rmsnorm", fake_rmsnorm)
-    scaled = gemma_model.Gemma4RMSNorm(1536)
-    unscaled = gemma_model.Gemma4RMSNorm(512, with_scale=False)
+    monkeypatch.setattr(norm_ops, "_rmsnorm", fake_rmsnorm)
+    scaled = gemma_model.norm_ops.RMSNorm(1536)
+    unscaled = gemma_model.norm_ops.RMSNorm(512, with_scale=False)
     x_scaled = torch.zeros((2, 1536), dtype=torch.bfloat16)
     x_unscaled = torch.zeros((2, 512), dtype=torch.bfloat16)
 
@@ -163,11 +166,17 @@ def test_text_rotary_runtime_preserves_existing_cpu_math():
         query, key, rotary
     )
 
-    expected_query = gemma_model._apply_rope(
-        query, cos, sin, unsqueeze_dim=2
+    expected_query = rotary_ops.apply_rotary(
+        query,
+        cos,
+        sin,
+        unsqueeze_dim=2,
     )
-    expected_key = gemma_model._apply_rope(
-        key, cos, sin, unsqueeze_dim=2
+    expected_key = rotary_ops.apply_rotary(
+        key,
+        cos,
+        sin,
+        unsqueeze_dim=2,
     )
     torch.testing.assert_close(actual_query, expected_query)
     torch.testing.assert_close(actual_key, expected_key)
@@ -197,7 +206,7 @@ def test_text_attention_emits_typed_runtime_attention(monkeypatch):
         return output, None
 
     monkeypatch.setattr(
-        gemma_model,
+        attention_ops,
         "get_runtime",
         lambda: SimpleNamespace(
             attention=SimpleNamespace(flash_attn_fwd=fake_flash)
@@ -205,7 +214,7 @@ def test_text_attention_emits_typed_runtime_attention(monkeypatch):
     )
     q, k, v = FakeTensor("q"), FakeTensor("k"), FakeTensor("v")
 
-    result = gemma_model._attention_forward(
+    result = attention_ops.dense_attention(
         q,
         k,
         v,
@@ -235,7 +244,7 @@ def test_paged_local_attention_retains_window_while_global_retains_history(monke
         return query, None
 
     monkeypatch.setattr(
-        "kestrel_kernels.get_runtime",
+        "kestrel.ops.attention.get_runtime",
         lambda: SimpleNamespace(
             attention=SimpleNamespace(flash_attn_fwd=fake_flash)
         ),
@@ -254,8 +263,8 @@ def test_paged_local_attention_retains_window_while_global_retains_history(monke
         "scaling": 1.0,
     }
 
-    gemma_model._paged_attention_forward(query, **metadata, sliding_window=512)
-    gemma_model._paged_attention_forward(query, **metadata, sliding_window=None)
+    attention_ops.paged_attention(query, **metadata, sliding_window=512)
+    attention_ops.paged_attention(query, **metadata, sliding_window=None)
 
     assert calls[0]["seqused_k"].item() == 600
     assert calls[0]["window_size_left"] == 511
@@ -272,7 +281,7 @@ def test_text_attention_cpu_causal_gqa_matches_reference():
     key = torch.randn(1, 1, 3, 8)
     value = torch.randn(1, 1, 3, 8)
 
-    actual = gemma_model._attention_forward(
+    actual = attention_ops.dense_attention(
         query,
         key,
         value,
@@ -293,19 +302,105 @@ def test_text_attention_cpu_causal_gqa_matches_reference():
     torch.testing.assert_close(actual, expected)
 
 
-def test_padded_text_prefill_matches_individual_active_rows():
+def test_packed_text_attention_matches_individual_rows_on_cpu():
+    torch.manual_seed(1)
+    query = torch.randn(1, 2, 7, 8)
+    key = torch.randn(1, 1, 7, 8)
+    value = torch.randn(1, 1, 7, 8)
+    cu_seqlens = torch.tensor([0, 2, 7], dtype=torch.int32)
+
+    packed = attention_ops.dense_attention(
+        query,
+        key,
+        value,
+        num_key_value_groups=2,
+        attention_mask=None,
+        scaling=0.5,
+        causal=True,
+        cu_seqlens=cu_seqlens,
+    )
+    expected = torch.cat(
+        [
+            attention_ops.dense_attention(
+                query[..., start:end, :],
+                key[..., start:end, :],
+                value[..., start:end, :],
+                num_key_value_groups=2,
+                attention_mask=None,
+                scaling=0.5,
+                causal=True,
+            )
+            for start, end in ((0, 2), (2, 7))
+        ],
+        dim=1,
+    )
+
+    torch.testing.assert_close(packed, expected)
+
+
+def test_packed_text_prefill_matches_individual_rows():
     torch.manual_seed(11)
     model = Gemma4TextModel(
         _text_config(layer_types=["sliding_attention", "full_attention"])
     )
-    batch = torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]])
+    packed = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+    position_ids = torch.tensor([[0, 1, 0, 1, 2, 3]])
 
-    batched = model(input_ids=batch)
-    short = model(input_ids=batch[:1, :2])
-    long = model(input_ids=batch[1:])
+    actual = model(
+        input_ids=packed,
+        position_ids=position_ids,
+        cu_seqlens=cu_seqlens,
+    )
+    short = model(input_ids=packed[:, :2])
+    long = model(input_ids=packed[:, 2:])
 
-    torch.testing.assert_close(batched[0, :2], short[0])
-    torch.testing.assert_close(batched[1], long[0])
+    torch.testing.assert_close(actual[0, :2], short[0])
+    torch.testing.assert_close(actual[0, 2:], long[0])
+
+
+def test_packed_flash_attention_receives_varlen_abi(monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    calls = []
+
+    def fake_flash_attn_fwd(query, key, value, **kwargs):
+        calls.append((query, key, value, kwargs))
+        return torch.empty_like(query), None
+
+    monkeypatch.setattr(
+        attention_ops,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            attention=SimpleNamespace(flash_attn_fwd=fake_flash_attn_fwd)
+        ),
+    )
+    with FakeTensorMode():
+        query = torch.empty((1, 2, 7, 8), dtype=torch.bfloat16, device="cuda")
+        key = torch.empty((1, 1, 7, 8), dtype=torch.bfloat16, device="cuda")
+        value = torch.empty_like(key)
+        cu_seqlens = torch.tensor(
+            [0, 2, 7],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        out = attention_ops.dense_attention(
+            query,
+            key,
+            value,
+            num_key_value_groups=2,
+            attention_mask=None,
+            scaling=0.5,
+            causal=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+    q, k, v, kwargs = calls[0]
+    assert q.shape == (7, 2, 8)
+    assert k.shape == v.shape == (7, 1, 8)
+    assert kwargs["cu_seqlens_q"] is cu_seqlens
+    assert kwargs["cu_seqlens_k"] is cu_seqlens
+    assert out.shape == (1, 7, 2, 8)
 
 
 def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
@@ -379,16 +474,16 @@ def test_vision_attention_cpu_matches_additive_padding_mask():
     )
     scale = 0.5
 
-    actual = gemma_model._vision_attention_forward(
+    actual = attention_ops.variable_length_attention(
         query,
         key,
         value,
         num_key_value_groups=1,
-        seqused_k=valid.sum(dim=-1, dtype=torch.int32),
+        used_key_lengths=valid.sum(dim=-1, dtype=torch.int32),
         scaling=scale,
     )
 
-    mask = gemma_model._build_bidirectional_mask(valid, dtype=query.dtype)
+    mask = attention_ops.bidirectional_padding_mask(valid, dtype=query.dtype)
     query_bhsd = query.transpose(1, 2)
     key_bhsd = key.transpose(1, 2)
     value_bhsd = value.transpose(1, 2)
@@ -415,19 +510,19 @@ def test_vision_attention_mps_uses_uniform_runtime(monkeypatch):
     runtime = SimpleNamespace(
         attention=SimpleNamespace(flash_attn_fwd=fake_flash_attn_fwd),
     )
-    monkeypatch.setattr(gemma_model, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(attention_ops, "get_runtime", lambda: runtime)
 
     with FakeTensorMode():
         query = torch.empty((2, 5, 2, 4), dtype=torch.float16, device="mps")
         key = torch.empty_like(query)
         value = torch.empty_like(query)
         seqused_k = torch.empty((2,), dtype=torch.int32, device="mps")
-        out = gemma_model._vision_attention_forward(
+        out = attention_ops.variable_length_attention(
             query,
             key,
             value,
             num_key_value_groups=1,
-            seqused_k=seqused_k,
+            used_key_lengths=seqused_k,
             scaling=0.5,
         )
 
@@ -542,6 +637,89 @@ def test_launch_prepared_batch_rejects_misaligned_image_rows():
             images=[],
             image_crops_list=[None],
         )
+
+
+def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
+    class _PackedPageTable:
+        capacity = {1: 24, 2: 528}
+
+        def commit_block_table(self, batch_indices):
+            assert batch_indices == [1, 2]
+
+        def build_slot_mapping(self, batch_idx, positions):
+            slots = batch_idx * 1_000 + positions
+            valid = torch.tensor(
+                [
+                    position < self.capacity[int(row)]
+                    for row, position in zip(
+                        batch_idx.flatten().tolist(),
+                        positions.flatten().tolist(),
+                        strict=True,
+                    )
+                ],
+                dtype=torch.bool,
+            ).view_as(positions)
+            return torch.where(valid, slots, -1)
+
+    captured = {}
+
+    def embed_row(model, config, input_ids, **kwargs):
+        del model, config, kwargs
+        return input_ids.unsqueeze(-1).float(), input_ids
+
+    def prefill(
+        runtime,
+        inputs_embeds,
+        input_ids,
+        position_ids,
+        slot_mapping,
+        last_token_offsets,
+        cu_seqlens,
+    ):
+        del runtime
+        captured.update(
+            inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            slot_mapping=slot_mapping,
+            last_token_offsets=last_token_offsets,
+            cu_seqlens=cu_seqlens,
+        )
+        return torch.ones((2, 1)), torch.zeros((2, 4))
+
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt.max_batch_size = 2
+    rt.device = torch.device("cpu")
+    rt.model = object()
+    rt._config = object()
+    rt._ops = SimpleNamespace(embed_row=embed_row, prefill=prefill)
+    rt.page_table = _PackedPageTable()
+    rows = [
+        SimpleNamespace(
+            state=SimpleNamespace(batch_idx=1, last_hidden=None),
+            tokens_list=[TextToken(token_id=index) for index in range(8)],
+        ),
+        SimpleNamespace(
+            state=SimpleNamespace(batch_idx=2, last_hidden=None),
+            tokens_list=[TextToken(token_id=index) for index in range(512)],
+        ),
+    ]
+    slot = SimpleNamespace(batch_idx=torch.zeros(2, dtype=torch.long))
+
+    logits = rt.launch_prepared_batch(rows, slot)
+
+    assert logits.shape == (2, 4)
+    assert captured["inputs_embeds"].shape == (1, 520, 1)
+    assert captured["input_ids"].shape == (1, 520)
+    assert captured["position_ids"][0, :8].tolist() == list(range(8))
+    assert captured["position_ids"][0, 8:].tolist() == list(range(512))
+    assert captured["cu_seqlens"].tolist() == [0, 8, 520]
+    assert captured["last_token_offsets"].tolist() == [7, 519]
+    assert int(captured["slot_mapping"].min()) >= 0
+    assert captured["slot_mapping"][0, 7].item() == 1_007
+    assert captured["slot_mapping"][0, 8].item() == 2_000
+    assert rows[0].state.last_hidden.item() == 1
+    assert rows[1].state.last_hidden.item() == 1
 
 
 def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
@@ -851,6 +1029,7 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
     state = SimpleNamespace(
         invocation=SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs)),
         argument_names={"active_batch", "kv_len"},
+        required_launch_extents={"active_batch", "kv_len"},
     )
     megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {1: (object(),) * 3, 8: (object(),) * 3,
@@ -858,6 +1037,7 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
     megakernel._slots = {(7, batch_capacity): state}
     megakernel._input_preparation_plan = ()
     megakernel._spec = SimpleNamespace(
+        label="Gemma",
         launch_extents=lambda slot, extent: {
             "active_batch": extent,
             "kv_len": int(slot.meta.input_pos.cpu[:extent].max()) + 1,
@@ -874,6 +1054,71 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
     megakernel.run(slot, batch_size)
 
     assert calls == [{"active_batch": batch_size, "kv_len": batch_size}]
+
+
+def test_generated_decode_rejects_input_namespace_collisions():
+    from kestrel.runtime.generated_decode import _merge_disjoint_inputs
+
+    with pytest.raises(RuntimeError, match="owned by both shared and slot"):
+        _merge_disjoint_inputs(
+            "test",
+            shared={"page_table": object()},
+            capacity={"active_rows": object()},
+            slot={"page_table": object()},
+        )
+
+
+def test_generated_decode_rejects_cross_capacity_weight_abi_drift():
+    from kestrel.runtime.generated_decode import _require_uniform_weight_contract
+
+    programs = {
+        1: (SimpleNamespace(contract=("weight", "bf16")), None, None),
+        8: (SimpleNamespace(contract=("weight", "fp8")), None, None),
+    }
+
+    with pytest.raises(RuntimeError, match="weight storage ABI"):
+        _require_uniform_weight_contract(
+            "test",
+            programs,
+            lambda compiled: compiled.contract,
+        )
+
+
+def test_generated_decode_accepts_uniform_cross_capacity_weight_abi():
+    from kestrel.runtime.generated_decode import _require_uniform_weight_contract
+
+    programs = {
+        1: (SimpleNamespace(contract=("weight", "bf16")), None, None),
+        8: (SimpleNamespace(contract=("weight", "bf16")), None, None),
+    }
+
+    _require_uniform_weight_contract(
+        "test",
+        programs,
+        lambda compiled: compiled.contract,
+    )
+
+
+def test_generated_decode_run_rejects_missing_dynamic_launch_extent():
+    from kestrel.runtime.generated_decode import GeneratedDecode
+
+    generated = GeneratedDecode.__new__(GeneratedDecode)
+    generated._programs = {1: (object(),) * 3}
+    generated._slots = {
+        (0, 1): SimpleNamespace(
+            invocation=SimpleNamespace(launch=lambda **_kwargs: None),
+            argument_names={"active_batch"},
+            required_launch_extents={"active_batch"},
+        )
+    }
+    generated._input_preparation_plan = ()
+    generated._spec = SimpleNamespace(
+        label="test",
+        launch_extents=lambda _slot, _batch_size: {},
+    )
+
+    with pytest.raises(RuntimeError, match="active_batch"):
+        generated.run(SimpleNamespace(slot_id=0), 1)
 
 
 def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
@@ -1169,8 +1414,8 @@ def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
         return torch.zeros(b, s, h, d, dtype=query.dtype, device=query.device)
 
     monkeypatch.setattr(
-        gemma_model,
-        "_paged_attention_forward",
+        attention_ops,
+        "paged_attention",
         fake_paged_attention_forward,
     )
 
@@ -1193,7 +1438,7 @@ def test_nonpaged_local_attention_truncates_history_beyond_window():
     value = torch.zeros((1, 1, 600, 2))
     value[:, :, 0] = 1.0
 
-    local = gemma_model._attention_forward(
+    local = attention_ops.dense_attention(
         query,
         key,
         value,
@@ -1204,7 +1449,7 @@ def test_nonpaged_local_attention_truncates_history_beyond_window():
         window_size_left=511,
         window_size_right=0,
     )
-    global_ = gemma_model._attention_forward(
+    global_ = attention_ops.dense_attention(
         query,
         key,
         value,
