@@ -1998,23 +1998,6 @@ class Qwen3_5Model(nn.Module):
         ).tolist()
         return torch.split(image_embeds, split_sizes)
 
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor | None = None,
-    ) -> torch.Tensor:
-        special_image_mask = input_ids == self.config.image_token_id
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None:
-            torch_compilable_check(
-                inputs_embeds[special_image_mask].numel() == image_features.numel(),
-                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
-            )
-
-        return special_image_mask
-
     def compute_3d_position_ids(
         self,
         input_ids: torch.Tensor | None,
@@ -2092,8 +2075,15 @@ class Qwen3_5Model(nn.Module):
                 cu_seqlens=vision_cu_seqlens,
             )
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            image_token_mask = input_ids == self.config.image_token_id
+            image_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
+                inputs_embeds.device
+            )
+            torch_compilable_check(
+                inputs_embeds[image_mask].numel() == image_embeds.numel(),
+                "Image features and image tokens do not match, "
+                f"tokens: {image_token_mask.sum()}, "
+                f"features: {image_embeds.shape[0]}",
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
