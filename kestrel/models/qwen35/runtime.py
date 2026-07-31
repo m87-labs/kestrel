@@ -51,7 +51,7 @@ _PREFILL_SCRATCH_TOKENS = 1024
 
 
 def _native_decode_state_requirements(generated, linear_state_pool):
-    from mkl.megakernel.state_runtime import StateRepresentationRequirement
+    from kestrel.runtime.carried_state import StateRepresentationRequirement
 
     native = []
     for requirement in generated:
@@ -449,7 +449,7 @@ class Qwen35Runtime:
         self._decode_state_coordinator = None
         self._native_decode_state_requirements = ()
         if self._decode_megakernel is not None:
-            from mkl.megakernel.state_runtime import CarriedStateCoordinator
+            from kestrel.runtime.carried_state import CarriedStateCoordinator
 
             native_requirements = {
                 _native_decode_state_requirements(

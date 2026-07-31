@@ -544,9 +544,8 @@ def test_decode_with_slot_runs_bound_megakernel_for_b1(monkeypatch):
     ]
 
 
-@requires_mkl
 def test_decode_path_switch_prepares_compiler_declared_state(monkeypatch):
-    from mkl.megakernel.state_runtime import StateRepresentationRequirement
+    from kestrel.runtime.carried_state import StateRepresentationRequirement
 
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     calls = []
@@ -615,10 +614,9 @@ def test_decode_path_switch_prepares_compiler_declared_state(monkeypatch):
     ]
 
 
-@requires_mkl
 def test_native_state_requirement_uses_pool_owned_replay_form():
     from kestrel.models.qwen35.runtime import _native_decode_state_requirements
-    from mkl.megakernel.state_runtime import (
+    from kestrel.runtime.carried_state import (
         StatePhysicalForm,
         StateRepresentationRequirement,
     )
@@ -720,11 +718,10 @@ def test_zero_replay_cursor_ignores_stale_payload_when_materializing():
     torch.testing.assert_close(layer.replay_checkpoint_states, checkpoint)
 
 
-@requires_mkl
 def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
     from kestrel.models.qwen35.inference_ops import LinearAttentionState
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
-    from mkl.megakernel.state_runtime import StatePhysicalForm
+    from kestrel.runtime.carried_state import StatePhysicalForm
 
     recurrent = torch.arange(3 * 2 * 2 * 3, dtype=torch.float32).reshape(3, 2, 2, 3)
     storage = LinearAttentionState(replay_capacity=4)
@@ -766,11 +763,10 @@ def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
     assert storage.replay_lengths.tolist() == [0, 4, 0]
 
 
-@requires_mkl
 def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
     from kestrel.models.qwen35.inference_ops import LinearAttentionState
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
-    from mkl.megakernel.state_runtime import StatePhysicalForm
+    from kestrel.runtime.carried_state import StatePhysicalForm
 
     checkpoint = torch.arange(3 * 2 * 3 * 2, dtype=torch.float32).reshape(3, 2, 3, 2)
     stale_recurrent = torch.full((3, 2, 2, 3), -99.0)
@@ -805,10 +801,9 @@ def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
     assert storage.replay_lengths.tolist() == [0, 4, 0]
 
 
-@requires_mkl
 def test_linear_state_pool_selects_compiler_required_recurrent_storage():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
-    from mkl.megakernel.state_runtime import StatePhysicalForm
+    from kestrel.runtime.carried_state import StatePhysicalForm
 
     key_major = torch.empty(3, 2, 2, 3)
     value_major = torch.empty(3, 2, 3, 2)
@@ -840,10 +835,9 @@ def test_linear_state_pool_selects_compiler_required_recurrent_storage():
     assert selected_value_major[1] is None
 
 
-@requires_mkl
 def test_linear_state_pool_refuses_unsupported_in_place_layout_change():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
-    from mkl.megakernel.state_runtime import StatePhysicalForm
+    from kestrel.runtime.carried_state import StatePhysicalForm
 
     pool = Qwen35LinearStatePool.__new__(Qwen35LinearStatePool)
     pool.device = torch.device("cpu")

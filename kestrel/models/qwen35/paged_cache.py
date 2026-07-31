@@ -16,7 +16,7 @@ from kestrel.kv_cache import (
 from .inference_ops import LinearAttentionLayer, LinearAttentionState
 
 if TYPE_CHECKING:
-    from mkl.megakernel.state_runtime import StatePhysicalForm
+    from kestrel.runtime.carried_state import StatePhysicalForm
 
 
 def allocate_qwen35_paged_kv(
@@ -233,7 +233,7 @@ class Qwen35LinearStatePool:
     def replay_recurrent_form(self) -> "StatePhysicalForm":
         """Return the native replay path's authoritative checkpoint form."""
 
-        from mkl.megakernel.state_runtime import StatePhysicalForm
+        from kestrel.runtime.carried_state import StatePhysicalForm
 
         return StatePhysicalForm(
             representation="replay",
