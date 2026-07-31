@@ -365,48 +365,18 @@ class LinearAttentionState:
         # cap64 != cap32 and spec != decode-kernel). The flush is ~0.3% of decode
         # time, so correctness wins: use the exact (sequential-order)
         # materializer below for the spec flush as well.
-        materialized = False
+        from kestrel_kernels.gated_delta import materialize_replay_state_indexed
 
-        try:
-            from kestrel_kernels.gated_delta import materialize_replay_state_indexed
-        except Exception:
-            materialize_replay_state_indexed = None
-
-        if not materialized and materialize_replay_state_indexed is not None:
-            materialize_replay_state_indexed(
-                self.recurrent_states,
-                self.replay_checkpoint_states,
-                self.replay_k,
-                self.replay_u,
-                self.replay_g,
-                self.replay_lengths,
-                row_indices,
-                write_recurrent=write_recurrent,
-            )
-            materialized = True
-        if not materialized:
-            capacity = int(self.replay_k.shape[1])
-            for row in row_indices.tolist():
-                state = (
-                    self.replay_checkpoint_states[row]
-                    .float()
-                    .transpose(-1, -2)
-                    .contiguous()
-                )
-                for pos in range(capacity):
-                    active = self.replay_lengths[row] > pos
-                    alpha = torch.exp(self.replay_g[row, pos].float())[:, None, None]
-                    k = self.replay_k[row, pos].float()[:, :, None]
-                    u = self.replay_u[row, pos].float()[:, None, :]
-                    updated = alpha * state + k * u
-                    state = torch.where(active, updated, state)
-                if write_recurrent:
-                    self.recurrent_states[row].copy_(
-                        state.to(self.recurrent_states.dtype)
-                    )
-                self.replay_checkpoint_states[row].copy_(
-                    state.transpose(-1, -2).to(self.replay_checkpoint_states.dtype)
-                )
+        materialize_replay_state_indexed(
+            self.recurrent_states,
+            self.replay_checkpoint_states,
+            self.replay_k,
+            self.replay_u,
+            self.replay_g,
+            self.replay_lengths,
+            row_indices,
+            write_recurrent=write_recurrent,
+        )
         self.replay_lengths.index_fill_(0, row_indices, 0)
 
 
