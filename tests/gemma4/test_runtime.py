@@ -23,7 +23,7 @@ from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
-from kestrel.runtime.paged_model import PagedMultimodalRuntime
+from kestrel.models.gemma4.runtime import Gemma4Runtime
 from kestrel.runtime.paged_resources import decode_slot_rows
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
@@ -33,7 +33,7 @@ from kestrel.models.gemma4.config import (
 )
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
-from kestrel.models.gemma4.runtime import _OPS, create_gemma4_runtime
+from kestrel.models.gemma4.runtime import create_gemma4_runtime
 from kestrel.models.gemma4.skills import build_skill_registry
 
 
@@ -614,7 +614,7 @@ def test_decode_slot_rows_cover_non_bucket_compiled_capacity():
 
 
 def test_prefill_slot_release_rejects_foreign_and_duplicate_slots():
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt._prefill_slot = object()
     rt._prefill_slot_in_use = True
 
@@ -627,7 +627,7 @@ def test_prefill_slot_release_rejects_foreign_and_duplicate_slots():
 
 
 def test_launch_prepared_batch_rejects_misaligned_image_rows():
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt.max_batch_size = 2
 
     with pytest.raises(ValueError, match="must match"):
@@ -639,7 +639,9 @@ def test_launch_prepared_batch_rejects_misaligned_image_rows():
         )
 
 
-def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
+def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots(
+    monkeypatch,
+):
     class _PackedPageTable:
         capacity = {1: 24, 2: 528}
 
@@ -663,12 +665,12 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
 
     captured = {}
 
-    def embed_row(model, config, input_ids, **kwargs):
-        del model, config, kwargs
+    def embed_row(_runtime, input_ids, **kwargs):
+        del kwargs
         return input_ids.unsqueeze(-1).float(), input_ids
 
     def prefill(
-        runtime,
+        _runtime,
         inputs_embeds,
         input_ids,
         position_ids,
@@ -676,7 +678,6 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
         last_token_offsets,
         cu_seqlens,
     ):
-        del runtime
         captured.update(
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,
@@ -687,12 +688,13 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
         )
         return torch.ones((2, 1)), torch.zeros((2, 4))
 
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt.max_batch_size = 2
     rt.device = torch.device("cpu")
     rt.model = object()
     rt._config = object()
-    rt._ops = SimpleNamespace(embed_row=embed_row, prefill=prefill)
+    monkeypatch.setattr(Gemma4Runtime, "_embed_row", embed_row)
+    monkeypatch.setattr(Gemma4Runtime, "_prefill", prefill)
     rt.page_table = _PackedPageTable()
     rows = [
         SimpleNamespace(
@@ -723,7 +725,7 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots():
 
 
 def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     calls = []
     slot = SimpleNamespace(compute_stream="decode-stream")
 
@@ -1159,8 +1161,7 @@ def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
 
 
 def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
-    runtime = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
-    runtime._ops = _OPS
+    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = torch.device("cpu")
     runtime.max_batch_size = 4
     runtime._vision_stager = BatchedTensorStager(
@@ -1254,7 +1255,7 @@ def test_decode_state_tables_keep_local_and_global_storage_disjoint():
 
 def test_engine_adopts_externally_supplied_runtime_kv_pool():
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID)
-    runtime = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = cfg.resolved_device()
     runtime._kv_pool = object()
     runtime._compute_stream = object()
@@ -1316,7 +1317,7 @@ def test_disabling_tokenizer_postprocessor_preserves_no_special_token_ids():
 
 
 def test_batch_index_allocation_gates_capacity():
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt.max_batch_size = 2
     rt.max_seq_length = 4096
     rt.active_sequences = {}
@@ -1338,7 +1339,7 @@ def test_batch_index_allocation_gates_capacity():
 
 
 def test_active_sequence_lifecycle_registers_and_frees_batch_index():
-    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt.active_sequences = {}
     rt.page_table = _FakePageTable([])
 
