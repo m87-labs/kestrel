@@ -14,7 +14,8 @@ def test_registration_does_not_import_model_implementation() -> None:
             (
                 "import sys; import kestrel; "
                 "from kestrel.models import get_spec; "
-                "get_spec('Qwen/Qwen3.5-4B'); "
+                "spec = get_spec('Qwen/Qwen3.5-4B'); "
+                "assert spec.filename is None; "
                 "assert 'kestrel.models.qwen35.qwen_model' not in sys.modules"
             ),
         ],

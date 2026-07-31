@@ -8,6 +8,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -18,6 +19,7 @@ from kestrel.kv_cache import KVMemoryPool, PageTable
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.state import SequenceState
+from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.tokens import Token
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
@@ -280,6 +282,9 @@ class Qwen35Runtime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.bfloat16)
         )
+        from kestrel.models.registry import get_spec
+
+        self._spec = get_spec(cfg.model)
         self._model_name = cfg.model
         self.max_batch_size = getattr(cfg, "max_batch_size", 1)
         self.max_batch_slots = self.max_batch_size + 2
@@ -303,15 +308,23 @@ class Qwen35Runtime:
                 stacklevel=2,
             )
 
-        self.model = self._load_model(self._model_name).eval()
+        model_source = (
+            Path(cfg.model_path).expanduser()
+            if getattr(cfg, "model_path", None) is not None
+            else self._spec.repo_id
+        )
+        if model_source is None:
+            raise ValueError("Qwen model spec must declare repo_id")
+        self.model = self._load_model(model_source).eval()
         self.architecture = self.model.config
         text_cfg = self.architecture.text_config
         self.max_seq_length = int(text_cfg.max_position_embeddings)
         self.vocab_size = int(text_cfg.vocab_size)
 
-        from tokenizers import Tokenizer
-
-        self.tokenizer = Tokenizer.from_pretrained(self._model_name)
+        self.tokenizer = load_tokenizer(
+            self._spec.tokenizer_id,
+            getattr(cfg, "tokenizer_path", None),
+        )
         self.tokenizer.post_processor = None
         self.prompt_template = Qwen35PromptTemplate()
 
@@ -493,12 +506,12 @@ class Qwen35Runtime:
 
         return build_skill_registry()
 
-    def _load_model(self, repo_id: str) -> nn.Module:
+    def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
         attn_impl = os.environ.get("KESTREL_QWEN35_ATTN_IMPL", "sdpa")
         return load_qwen35_model(
-            repo_id,
+            source,
             device=self.device,
             dtype=self.dtype,
             attn_implementation=attn_impl,

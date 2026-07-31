@@ -458,7 +458,7 @@ def test_topk_router_matches_full_softmax_renormalization():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_runtime_constructs(monkeypatch):
+def test_runtime_constructs(monkeypatch, tmp_path):
     from tokenizers import Tokenizer
     from kestrel.models.qwen35 import generated_decode
 
@@ -466,7 +466,15 @@ def test_runtime_constructs(monkeypatch):
         generated_decode, "create_generated_decode", lambda _runtime: None
     )
 
-    cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
+    reference = Tokenizer.from_pretrained(_MODEL_ID)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    reference.save(str(tokenizer_path))
+    cfg = RuntimeConfig(
+        device="cuda",
+        model=_MODEL_ID,
+        max_batch_size=1,
+        tokenizer_path=tokenizer_path,
+    )
     rt = Qwen35Runtime(cfg, kv_pool=KVMemoryPool(device=cfg.resolved_device()))
 
     assert rt.model_name == _MODEL_ID
@@ -478,7 +486,6 @@ def test_runtime_constructs(monkeypatch):
     assert rt.tokenizer.post_processor is None
     assert rt.vocab_size == rt.architecture.text_config.vocab_size
     text = "No hidden special tokens."
-    reference = Tokenizer.from_pretrained(_MODEL_ID)
     assert rt.tokenizer.encode(text).ids == reference.encode(
         text,
         add_special_tokens=False,

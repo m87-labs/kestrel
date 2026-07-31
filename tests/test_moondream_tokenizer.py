@@ -1,7 +1,7 @@
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 
-from kestrel.models.moondream.tokenizer import load_tokenizer
+from kestrel.runtime.tokenizer import load_tokenizer
 
 
 def _save_test_tokenizer(path) -> None:

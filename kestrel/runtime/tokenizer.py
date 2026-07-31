@@ -1,4 +1,4 @@
-"""Tokenizer loading helpers for Moondream runtimes."""
+"""Tokenizer source resolution shared by autoregressive runtimes."""
 
 from pathlib import Path
 
@@ -15,5 +15,8 @@ def load_tokenizer(
             path = path / "tokenizer.json"
         return Tokenizer.from_file(str(path))
     if tokenizer_id is None:
-        raise ValueError("Moondream model spec must declare tokenizer_id")
+        raise ValueError("model spec must declare tokenizer_id")
     return Tokenizer.from_pretrained(tokenizer_id)
+
+
+__all__ = ["load_tokenizer"]

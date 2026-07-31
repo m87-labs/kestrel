@@ -891,6 +891,19 @@ def test_load_qwen35_model_preserves_ssm_parameter_dtype(tmp_path, monkeypatch):
         torch.tensor([3.5, 4.75], dtype=torch.float32),
     )
 
+    def reject_hub_download(*_args, **_kwargs):
+        pytest.fail("local Qwen checkpoint loading must not access the Hub")
+
+    monkeypatch.setattr(qwen_loader, "hf_hub_download", reject_hub_download)
+    local_model = qwen_loader.load_qwen35_model(
+        tmp_path,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert local_model.gdn.A_log.dtype == torch.float32
+    assert local_model.gdn.dt_bias.dtype == torch.float32
+    assert local_model.dense.weight.dtype == torch.bfloat16
+
 
 def test_cuda_vision_attention_defaults_to_kestrel_on_sm90():
     assert (

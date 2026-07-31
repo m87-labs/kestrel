@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -365,7 +366,7 @@ def _load_ready_packed_experts(
 
 def _load_sharded_safetensors(
     model: torch.nn.Module,
-    repo_id: str,
+    source: str | Path,
     shard_names: list[str],
     *,
     device: torch.device,
@@ -380,7 +381,7 @@ def _load_sharded_safetensors(
     unexpected: list[str] = []
     device_arg = _torch_device_arg(device)
     shard_paths = [
-        (shard_name, hf_hub_download(repo_id, shard_name))
+        (shard_name, _resolve_checkpoint_file(source, shard_name))
         for shard_name in shard_names
     ]
     scale_inv_by_key = _load_scale_inv_tensors(shard_paths, device_arg=device_arg)
@@ -487,8 +488,20 @@ def _load_sharded_safetensors(
     return missing, sorted(unexpected)
 
 
+def _resolve_checkpoint_file(source: str | Path, filename: str) -> str:
+    if isinstance(source, Path):
+        root = source if source.is_dir() else source.parent
+        path = root / filename
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Qwen checkpoint is missing required file {path}"
+            )
+        return str(path)
+    return hf_hub_download(source, filename)
+
+
 def load_qwen35_model(
-    repo_id: str,
+    source: str | Path,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -498,7 +511,7 @@ def load_qwen35_model(
         raise ValueError(
             "Qwen inference text attention requires attn_implementation='sdpa'"
         )
-    config_path = hf_hub_download(repo_id, "config.json")
+    config_path = _resolve_checkpoint_file(source, "config.json")
     with open(config_path, "r", encoding="utf-8") as handle:
         config_data: dict[str, Any] = json.load(handle)
     config = Qwen3_5Config.from_dict(config_data)
@@ -518,14 +531,16 @@ def load_qwen35_model(
     finally:
         torch.set_default_dtype(old_dtype)
 
-    index_path = hf_hub_download(repo_id, "model.safetensors.index.json")
+    index_path = _resolve_checkpoint_file(
+        source, "model.safetensors.index.json"
+    )
     with open(index_path, "r", encoding="utf-8") as handle:
         index = json.load(handle)
     shard_names = sorted(set(index["weight_map"].values()))
 
     missing, unexpected = _load_sharded_safetensors(
         model,
-        repo_id,
+        source,
         shard_names,
         device=device,
     )

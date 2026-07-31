@@ -30,7 +30,6 @@ for _repo_id in _VARIANTS:
         ModelSpec(
             name=_repo_id,
             repo_id=_repo_id,
-            filename="config.json",
             checkpoint_format="qwen3_5",
             default_config={},
             tokenizer_id=_repo_id,
