@@ -36,6 +36,7 @@ def _text_config_data(**overrides):
         "num_attention_heads": heads,
         "num_key_value_heads": 1,
         "hidden_act": "silu",
+        "mamba_ssm_dtype": "float32",
         "max_position_embeddings": 128,
         "rms_norm_eps": 1e-6,
         "rope_parameters": {
@@ -55,7 +56,31 @@ def _text_config_data(**overrides):
         "layer_types": ["full_attention"],
     }
     data.update(overrides)
+    moe_fields = {
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "num_experts_per_tok",
+        "num_experts",
+    }
+    if moe_fields.intersection(overrides):
+        data.setdefault("moe_intermediate_size", 8)
+        data.setdefault("shared_expert_intermediate_size", 8)
+        data.setdefault("num_experts_per_tok", 1)
+        data.setdefault("num_experts", 1)
     return data
+
+
+def _text_config(**overrides):
+    data = _text_config_data(**overrides)
+    rope = data.pop("rope_parameters")
+    data.pop("hidden_act")
+    data.pop("mamba_ssm_dtype")
+    data.pop("attention_bias")
+    data["tie_word_embeddings"] = False
+    data["rope_theta"] = rope["rope_theta"]
+    data["partial_rotary_factor"] = rope["partial_rotary_factor"]
+    data["mrope_section"] = tuple(rope["mrope_section"])
+    return Qwen3_5TextConfig(**data)
 
 
 def _qwen_config_data(*, text=None, **overrides):
@@ -175,7 +200,7 @@ def test_decode_slot_implements_constraint_buffer_abi():
 
 
 def test_fused_qkv_attention_handles_multitoken_prefill_views():
-    cfg = Qwen3_5TextConfig(
+    cfg = _text_config(
         hidden_size=8,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -201,7 +226,7 @@ def test_fused_qkv_attention_handles_multitoken_prefill_views():
 
 
 def test_attention_updates_paged_cache_with_fused_value_view(monkeypatch):
-    cfg = Qwen3_5TextConfig(
+    cfg = _text_config(
         hidden_size=8,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -348,7 +373,7 @@ def test_moe_config_builds_sparse_mlp_with_checkpoint_keys():
 
 
 def test_text_model_fused_layer_boundaries_match_layer_loop():
-    cfg = Qwen3_5TextConfig(
+    cfg = _text_config(
         vocab_size=32,
         hidden_size=8,
         num_hidden_layers=2,
@@ -396,7 +421,7 @@ def test_text_model_fused_layer_boundaries_match_layer_loop():
 
 
 def test_topk_router_matches_full_softmax_renormalization():
-    cfg = Qwen3_5TextConfig(
+    cfg = _text_config(
         hidden_size=4,
         num_experts=5,
         num_experts_per_tok=2,
@@ -3027,7 +3052,7 @@ def test_gated_delta_net_keeps_ssm_params_in_configured_dtype():
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        config = Qwen3_5TextConfig(
+        config = _text_config(
             hidden_size=8,
             linear_num_key_heads=2,
             linear_num_value_heads=2,
@@ -3046,7 +3071,7 @@ def test_gated_delta_net_keeps_ssm_params_in_configured_dtype():
 def test_gated_delta_net_uses_kestrel_gdn_kernels():
     from kestrel_kernels import get_runtime
 
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3078,7 +3103,7 @@ def test_gated_delta_net_uses_kestrel_gdn_kernels():
 
 def test_gated_delta_net_packed_prefill_derives_seq_idx_from_cu_seqlens():
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3153,7 +3178,7 @@ def test_gated_delta_net_packed_prefill_derives_seq_idx_from_cu_seqlens():
 
 def test_gated_delta_net_packed_prefill_unequal_head_dims_matches_serial_sequences():
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3229,7 +3254,7 @@ def test_gated_delta_net_packed_prefill_unequal_head_dims_matches_serial_sequenc
 
 def test_gated_delta_net_batched_prefill_matches_serial_sequences():
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3293,7 +3318,7 @@ def test_gated_delta_net_batched_prefill_matches_serial_sequences():
 
 def test_gated_delta_net_grouped_head_decode_matches_full_sequence():
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=2,
@@ -3345,7 +3370,7 @@ def test_gated_delta_net_replay_decode_uses_replay_state():
     # ring path on CUDA -- matching how the runtime actually decodes.
     device = torch.device("cuda")
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3421,7 +3446,7 @@ def test_gated_delta_net_chunk_decode_after_replay_matches_full_prefill():
     """
     device = torch.device("cuda")
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
@@ -3508,7 +3533,7 @@ def test_gated_delta_net_chunk_decode_after_replay_matches_full_prefill():
 
 def test_gated_delta_net_chunked_decode_selects_indexed_state_rows():
     torch.manual_seed(0)
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=8,
         linear_num_key_heads=1,
         linear_num_value_heads=1,

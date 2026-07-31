@@ -23,6 +23,7 @@ def _text_config_data(**overrides):
         "num_attention_heads": heads,
         "num_key_value_heads": 1,
         "hidden_act": "silu",
+        "mamba_ssm_dtype": "float32",
         "max_position_embeddings": 128,
         "rms_norm_eps": 1e-6,
         "rope_parameters": {
@@ -42,7 +43,31 @@ def _text_config_data(**overrides):
         "layer_types": ["full_attention"],
     }
     data.update(overrides)
+    moe_fields = {
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "num_experts_per_tok",
+        "num_experts",
+    }
+    if moe_fields.intersection(overrides):
+        data.setdefault("moe_intermediate_size", 8)
+        data.setdefault("shared_expert_intermediate_size", 8)
+        data.setdefault("num_experts_per_tok", 1)
+        data.setdefault("num_experts", 1)
     return data
+
+
+def _text_config(**overrides):
+    data = _text_config_data(**overrides)
+    rope = data.pop("rope_parameters")
+    data.pop("hidden_act")
+    data.pop("mamba_ssm_dtype")
+    data.pop("attention_bias")
+    data["tie_word_embeddings"] = False
+    data["rope_theta"] = rope["rope_theta"]
+    data["partial_rotary_factor"] = rope["partial_rotary_factor"]
+    data["mrope_section"] = tuple(rope["mrope_section"])
+    return Qwen3_5TextConfig(**data)
 
 
 def _qwen_config_data(*, text=None, **overrides):
@@ -382,7 +407,7 @@ def test_load_sharded_safetensors_fuses_gdn_input_projection(tmp_path, monkeypat
 
 
 def test_qwen36_fp8_gdn_dequantizes_into_fused_projection(tmp_path, monkeypatch):
-    cfg = Qwen3_5TextConfig(
+    cfg = _text_config(
         hidden_size=128,
         linear_key_head_dim=16,
         linear_value_head_dim=16,
@@ -577,7 +602,7 @@ def test_load_sharded_safetensors_fuses_mlp_gate_up_projection(tmp_path, monkeyp
 
 
 def test_qwen35_experts_use_interleaved_gate_up_projection():
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=2,
         num_experts=1,
         num_experts_per_tok=1,
@@ -624,7 +649,7 @@ def test_qwen35_fp8_config_uses_quantized_expert_buffers():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_qwen35_fp8_experts_fallback_when_kestrel_config_missing(monkeypatch):
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=128,
         num_experts=1,
         num_experts_per_tok=1,
@@ -743,7 +768,7 @@ def test_load_sharded_safetensors_preserves_fp8_expert_weights_and_scales(
     tmp_path,
     monkeypatch,
 ):
-    config = Qwen3_5TextConfig(
+    config = _text_config(
         hidden_size=128,
         num_experts=2,
         num_experts_per_tok=1,
