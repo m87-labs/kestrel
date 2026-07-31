@@ -518,6 +518,32 @@ def test_decode_slot_rows_cover_non_bucket_compiled_capacity():
     assert decode_slot_rows(16) == 18
 
 
+def test_prefill_slot_release_rejects_foreign_and_duplicate_slots():
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt._prefill_slot = object()
+    rt._prefill_slot_in_use = True
+
+    with pytest.raises(ValueError, match="foreign"):
+        rt.release_prefill_slot(object())
+
+    rt.release_prefill_slot(rt._prefill_slot)
+    with pytest.raises(RuntimeError, match="not acquired"):
+        rt.release_prefill_slot(rt._prefill_slot)
+
+
+def test_launch_prepared_batch_rejects_misaligned_image_rows():
+    rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
+    rt.max_batch_size = 2
+
+    with pytest.raises(ValueError, match="must match"):
+        rt.launch_prepared_batch(
+            [object()],
+            object(),
+            images=[],
+            image_crops_list=[None],
+        )
+
+
 def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
     rt = PagedMultimodalRuntime.__new__(PagedMultimodalRuntime)
     calls = []

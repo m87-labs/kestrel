@@ -192,13 +192,25 @@ def _eager_decode(
     slot.hidden_last[:batch_size].copy_(hidden)
 
 
+def _encode_images(
+    model: Any,
+    staged: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return model.model.get_image_features(
+        staged["pixel_values"],
+        staged["position_ids"],
+    )
+
+
+def _image_token_count(crops: Any) -> int:
+    return int(crops.num_image_tokens)
+
+
 _OPS = PagedModelOps(
     load_model=load_model,
     configure_model=_configure_model,
     prompt_template=Gemma4PromptTemplate,
     preprocess_image=lambda dtype: partial(preprocess_image, dtype=dtype),
-    config=lambda model: model.config,
-    text_config=lambda config: config.text_config,
     max_seq_length=lambda config: min(
         config.text_config.max_position_embeddings,
         2048,
@@ -210,11 +222,8 @@ _OPS = PagedModelOps(
         "pixel_values": crops.pixel_values,
         "position_ids": crops.image_position_ids,
     },
-    encode_images=lambda model, staged: model.model.get_image_features(
-        staged["pixel_values"],
-        staged["position_ids"],
-    ),
-    image_token_count=lambda crops: int(crops.num_image_tokens),
+    encode_images=_encode_images,
+    image_token_count=_image_token_count,
     prepare_prompt=_prepare_prompt,
     embed_row=_embed_row,
     prefill=_prefill,

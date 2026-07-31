@@ -22,8 +22,6 @@ class PagedModelOps:
     configure_model: Callable[[Any, Any], None]
     prompt_template: Callable[[str], Any]
     preprocess_image: Callable[[torch.dtype], Callable[[Any], Any]]
-    config: Callable[[Any], Any]
-    text_config: Callable[[Any], Any]
     max_seq_length: Callable[[Any], int]
     image_prefix_length: int
     paged_kv_layout: Callable[[Any], tuple[Any, Any]]
@@ -71,7 +69,7 @@ class PagedMultimodalRuntime:
             device=self.device,
             dtype=self.dtype,
         )
-        self._config = ops.config(self.model)
+        self._config = self.model.config
         ops.configure_model(self, cfg)
         self.tokenizer = Tokenizer.from_pretrained(self._model_name)
         self.tokenizer.post_processor = None
@@ -94,7 +92,7 @@ class PagedMultimodalRuntime:
             workers=derive_preprocessing_workers(self.max_batch_size),
         )
 
-        text_config = ops.text_config(self._config)
+        text_config = self._config.text_config
         resources = create_paged_runtime_resources(
             device=self.device,
             dtype=self.dtype,
@@ -152,7 +150,11 @@ class PagedMultimodalRuntime:
                 f"vision encoder returned {packed.shape[0]} tokens "
                 f"for declared split {lengths}"
             )
-        for (_, rows), encoded in zip(groups, packed.split(lengths, dim=0)):
+        for (_, rows), encoded in zip(
+            groups,
+            packed.split(lengths, dim=0),
+            strict=True,
+        ):
             for row in rows:
                 features[row] = encoded
         return features
@@ -175,7 +177,7 @@ class PagedMultimodalRuntime:
 
     @property
     def vocab_size(self) -> int:
-        return int(self._ops.text_config(self._config).vocab_size)
+        return int(self._config.text_config.vocab_size)
 
     def skills(self):
         return get_spec(self.model_name).skills()
@@ -211,6 +213,10 @@ class PagedMultimodalRuntime:
         return self._prefill_slot
 
     def release_prefill_slot(self, slot: Any) -> None:
+        if slot is not self._prefill_slot:
+            raise ValueError("cannot release a foreign prefill slot")
+        if not self._prefill_slot_in_use:
+            raise RuntimeError("prefill slot is not acquired")
         self._prefill_slot_in_use = False
 
     def acquire_adapter_slot(self, adapter_id: str, adapter: Any) -> int:
@@ -257,7 +263,7 @@ class PagedMultimodalRuntime:
             prompt_template=self.prompt_template,
         )
         prompt_length = len(tokens)
-        new_tokens = max_new_tokens or 128
+        new_tokens = 128 if max_new_tokens is None else max_new_tokens
         target_length = max(
             text_length + self.image_prefix_length + new_tokens,
             prompt_length + new_tokens,
@@ -320,6 +326,10 @@ class PagedMultimodalRuntime:
             images = [None] * batch_size
         if image_crops_list is None:
             image_crops_list = [None] * batch_size
+        if len(images) != batch_size or len(image_crops_list) != batch_size:
+            raise ValueError(
+                "images and image_crops_list must match prepared_sequences"
+            )
         batch_indices = [
             int(prepared.state.batch_idx) for prepared in prepared_sequences
         ]
@@ -330,7 +340,7 @@ class PagedMultimodalRuntime:
         id_rows = []
         image_features = self._image_features_for_batch(image_crops_list)
         for row, (prepared, image, crops) in enumerate(
-            zip(prepared_sequences, images, image_crops_list)
+            zip(prepared_sequences, images, image_crops_list, strict=True)
         ):
             prefill_slot.batch_idx[row] = prepared.state.batch_idx
             tokens = prepared.tokens_list
@@ -397,7 +407,11 @@ class PagedMultimodalRuntime:
         adapter_id: str | None,
         image_hash: bytes | None,
     ) -> None:
-        pass
+        del state, generated_tokens, adapter_id, image_hash
+        if self.prefix_cache is not None:
+            raise RuntimeError(
+                "prefix retention requires a runtime with prefix-cache support"
+            )
 
     def release_sequence(self, state: SequenceState) -> None:
         self.active_sequences.pop(state.batch_idx, None)
