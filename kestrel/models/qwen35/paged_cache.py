@@ -11,7 +11,6 @@ from kestrel.kv_cache import (
     KVMemoryPool,
     LayeredPagedKV,
     PageTable,
-    PagedKVCache,
     PagedKVLayerSpec,
 )
 
@@ -97,10 +96,6 @@ class Qwen35InferenceCache:
         if isinstance(layer, LinearAttentionLayer):
             return bool(layer.has_previous_state)
         return self.seq_length > 0
-
-    def get_paged_layer(self, layer_idx: int) -> PagedKVCache | None:
-        layer = self.layers[layer_idx]
-        return layer if isinstance(layer, PagedKVCache) else None
 
     def get_seq_length(self) -> int:
         return int(self.seq_length)
@@ -193,19 +188,6 @@ class Qwen35LinearStatePool:
                 storage.replay_g.zero_()
             if storage.replay_lengths is not None:
                 storage.replay_lengths.zero_()
-
-    def capture_from_cache(
-        self,
-        batch_idx: int,
-        cache: Qwen35InferenceCache,
-    ) -> None:
-        batch_idx_tensor = torch.empty((1,), dtype=torch.long, device=self.device)
-        batch_idx_tensor.fill_(int(batch_idx))
-        self.capture_batch_from_cache(
-            batch_idx_tensor,
-            cache,
-            batch_size=1,
-        )
 
     def capture_batch_from_cache(
         self,

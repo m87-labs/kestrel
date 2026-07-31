@@ -70,13 +70,6 @@ def _native_decode_state_requirements(generated, linear_state_pool):
 
 
 @dataclass
-class _QwenForwardCache:
-    past_key_values: Any
-    rope_deltas: Optional[torch.Tensor] = None
-    linear_state_row_indices: Optional[torch.Tensor] = None
-
-
-@dataclass
 class QwenImageInputs:
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
@@ -447,7 +440,6 @@ class Qwen35Runtime:
             zero_for_capture=self._zero_decode_graph_capture_buffers,
         )
         self.active_sequences: dict[int, Any] = {}
-        self._caches: dict[int, Any] = {}
 
         self.spatial_tables = None
 
@@ -786,6 +778,7 @@ class Qwen35Runtime:
             self._store_packed_sequence_caches(
                 packed.batch_indices,
                 cache,
+                rope_deltas=packed.rope_deltas,
                 host_batch_indices=batch_indices,
             )
 
@@ -818,7 +811,6 @@ class Qwen35Runtime:
 
     def _release_batch_idx(self, batch_idx: int) -> None:
         self.active_sequences.pop(batch_idx, None)
-        self._caches.pop(batch_idx, None)
         self._chat_image_crops.pop(batch_idx, None)
         self._clear_decode_state(batch_idx)
         if batch_idx not in self.page_table.free_batch_idx:
@@ -1447,7 +1439,7 @@ class Qwen35Runtime:
     def _forward_packed_prefill(
         self,
         packed: _PackedPrefillBatch,
-    ) -> tuple[torch.Tensor, _QwenForwardCache]:
+    ) -> tuple[torch.Tensor, Qwen35InferenceCache]:
         cache = self._new_cache()
         outputs = self.model.model(
             input_ids=packed.input_ids,
@@ -1467,10 +1459,7 @@ class Qwen35Runtime:
             seq_idx=packed.seq_idx,
         )
         outputs.past_key_values.advance_to(packed.max_length)
-        return outputs.last_hidden_state, _QwenForwardCache(
-            outputs.past_key_values,
-            packed.rope_deltas,
-        )
+        return outputs.last_hidden_state, outputs.past_key_values
 
     def _new_cache(self) -> Qwen35InferenceCache:
         return Qwen35InferenceCache(
@@ -1479,39 +1468,15 @@ class Qwen35Runtime:
             replay_capacity=self._linear_state_pool.replay_capacity,
         )
 
-    def _store_sequence_cache(self, batch_idx: int, cache: Any) -> None:
-        cache_state = self._as_forward_cache(cache)
-        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
-            raise RuntimeError("Qwen engine decode requires paged hybrid caches")
-        self._linear_state_pool.capture_from_cache(
-            int(batch_idx),
-            cache_state.past_key_values,
-        )
-        self._mark_decode_state_coherent((int(batch_idx),))
-        self._decode_rope_deltas[int(batch_idx)].zero_()
-        if cache_state.rope_deltas is not None:
-            rope_deltas = cache_state.rope_deltas.to(
-                device=self.device,
-                dtype=torch.long,
-            )
-            if rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas.view(-1, 1)
-            if rope_deltas.shape != (1, 1):
-                raise RuntimeError("Qwen M-RoPE delta must have shape [1, 1]")
-            self._decode_rope_deltas[int(batch_idx) : int(batch_idx) + 1].copy_(
-                rope_deltas
-            )
-        self._caches[int(batch_idx)] = cache_state
-
     def _store_packed_sequence_caches(
         self,
         batch_idx: torch.Tensor,
-        cache: Any,
+        cache: Qwen35InferenceCache,
         *,
+        rope_deltas: torch.Tensor,
         host_batch_indices: Sequence[int],
     ) -> None:
-        cache_state = self._as_forward_cache(cache)
-        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
+        if not isinstance(cache, Qwen35InferenceCache):
             raise RuntimeError("Qwen engine decode requires paged hybrid caches")
         indices = batch_idx.to(device=self.device, dtype=torch.long).view(-1)
         batch_size = int(indices.shape[0])
@@ -1519,7 +1484,7 @@ class Qwen35Runtime:
             raise ValueError("host batch indices must match packed batch size")
         self._linear_state_pool.capture_batch_from_cache(
             indices,
-            cache_state.past_key_values,
+            cache,
             batch_size=batch_size,
             # Packed prefill starts from a fresh cache. Each GDN layer has just
             # checkpointed its final recurrent state and reset every replay
@@ -1528,29 +1493,14 @@ class Qwen35Runtime:
             copy_replay_payload=False,
         )
         self._mark_decode_state_coherent(host_batch_indices)
-        self._decode_rope_deltas.index_fill_(0, indices, 0)
-        rope_deltas = cache_state.rope_deltas
-        if rope_deltas is not None:
-            rope_deltas = rope_deltas.to(device=self.device, dtype=torch.long)
-            if rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas.view(-1, 1)
-            if rope_deltas.shape != (batch_size, 1):
-                raise RuntimeError(
-                    "Qwen packed M-RoPE deltas must have shape [batch, 1]"
-                )
-            self._decode_rope_deltas.index_copy_(0, indices, rope_deltas)
-
-        linear_state_rows = torch.arange(
-            batch_size,
-            dtype=torch.long,
-            device=self.device,
-        )
-        for row, value in enumerate(host_batch_indices):
-            self._caches[int(value)] = _QwenForwardCache(
-                cache_state.past_key_values,
-                None if rope_deltas is None else rope_deltas[row : row + 1],
-                linear_state_rows[row : row + 1],
+        rope_deltas = rope_deltas.to(device=self.device, dtype=torch.long)
+        if rope_deltas.ndim == 1:
+            rope_deltas = rope_deltas.view(-1, 1)
+        if rope_deltas.shape != (batch_size, 1):
+            raise RuntimeError(
+                "Qwen packed M-RoPE deltas must have shape [batch, 1]"
             )
+        self._decode_rope_deltas.index_copy_(0, indices, rope_deltas)
 
     def _clear_decode_state(self, batch_idx: int) -> None:
         if hasattr(self, "_decode_rope_deltas"):
@@ -1566,12 +1516,5 @@ class Qwen35Runtime:
 
     def _decode_cache_for_slot(self, slot: DecodeSlot) -> Qwen35InferenceCache:
         return self._decode_caches[int(slot.slot_id)]
-
-    def _as_forward_cache(self, cache: Any) -> _QwenForwardCache:
-        return (
-            cache
-            if isinstance(cache, _QwenForwardCache)
-            else _QwenForwardCache(cache)
-        )
 
 __all__ = ["Qwen35Runtime", "QwenImageInputs"]

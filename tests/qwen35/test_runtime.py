@@ -1657,6 +1657,7 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
     packed = SimpleNamespace(
         batch_indices=[3, 5],
         last_token_offsets=torch.tensor([1, 3], dtype=torch.long),
+        rope_deltas=torch.tensor([[2], [4]], dtype=torch.long),
     )
     hidden = torch.tensor(
         [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
@@ -1683,8 +1684,13 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
     rt._build_packed_prefill_batch = build_packed_prefill_batch
     rt._forward_packed_prefill = lambda packed_batch: (hidden, cache)
     rt._store_packed_sequence_caches = (
-        lambda batch_indices, cache_value, *, host_batch_indices: stored.append(
-            (list(batch_indices), cache_value, list(host_batch_indices))
+        lambda batch_indices, cache_value, *, rope_deltas, host_batch_indices: stored.append(
+            (
+                list(batch_indices),
+                cache_value,
+                rope_deltas.clone(),
+                list(host_batch_indices),
+            )
         )
     )
     prepared_sequences = [
@@ -1706,7 +1712,10 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
 
     expected_hidden_rows = torch.tensor([[3.0, 4.0], [7.0, 8.0]])
     assert committed == [[3, 5]]
-    assert stored == [([3, 5], cache, [3, 5])]
+    assert len(stored) == 1
+    assert stored[0][:2] == ([3, 5], cache)
+    assert torch.equal(stored[0][2], packed.rope_deltas)
+    assert stored[0][3] == [3, 5]
     assert torch.equal(prefill_slot.batch_idx[:2], torch.tensor([3, 5]))
     assert len(lm_head.calls) == 1
     assert torch.equal(lm_head.calls[0], expected_hidden_rows)
@@ -1867,7 +1876,11 @@ def test_linear_state_pool_captures_gqa_value_head_replay_ring_cpu():
     assert tuple(storage.replay_k.shape) == (4, cap, num_v_heads, key_dim)
 
     # Capture slot 2 from the layer -- this is the call that raised pre-fix.
-    pool.capture_from_cache(2, cache)
+    pool.capture_batch_from_cache(
+        torch.tensor([2], dtype=torch.long),
+        cache,
+        batch_size=1,
+    )
 
     # Captured ring rows match the layer's, at the captured slot.
     torch.testing.assert_close(storage.replay_k[2], layer.replay_k[0])
@@ -2207,8 +2220,16 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
         device=torch.device("cpu"),
         replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
-    state_pool.capture_from_cache(1, first)
-    state_pool.capture_from_cache(2, second)
+    state_pool.capture_batch_from_cache(
+        torch.tensor([1], dtype=torch.long),
+        first,
+        batch_size=1,
+    )
+    state_pool.capture_batch_from_cache(
+        torch.tensor([2], dtype=torch.long),
+        second,
+        batch_size=1,
+    )
 
     state_pool.bind_to_cache(decode_cache)
     storage = state_pool.layers[0]
@@ -2367,7 +2388,6 @@ def test_batch_index_allocation_gates_capacity():
     rt.max_batch_size = 2
     rt.max_seq_length = 4096
     rt.active_sequences = {}
-    rt._caches = {}
     rt._chat_image_crops = {}
     rt.page_table = PageTable(
         n_pages=16,
@@ -2385,11 +2405,9 @@ def test_batch_index_allocation_gates_capacity():
     with pytest.raises(IndexError):
         rt.page_table.allocate()
 
-    rt._caches[first] = object()
     rt._chat_image_crops[first] = object()
     rt._release_batch_idx(first)
     assert first in rt.page_table.free_batch_idx
-    assert first not in rt._caches
     assert first not in rt._chat_image_crops
     assert rt.prefill_budget()[1] == 1
 
