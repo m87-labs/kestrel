@@ -9,7 +9,8 @@ from safetensors.torch import save_file
 from kestrel.models.qwen35 import qwen_loader
 from kestrel.models.qwen35 import qwen_model
 from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
-from kestrel.models.qwen35.qwen_model import Qwen3_5RMSNorm, Qwen3_5RMSNormGated
+from kestrel.models.qwen35.qwen_model import Qwen3_5RMSNormGated
+from kestrel.ops.norm import RMSNorm
 
 
 def _text_config_data(**overrides):
@@ -105,7 +106,7 @@ class _TinyModel(torch.nn.Module):
 class _TinyNormModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.norm = Qwen3_5RMSNorm(2)
+        self.norm = RMSNorm(2)
         self.gated_norm = Qwen3_5RMSNormGated(2)
 
 
@@ -326,7 +327,7 @@ def test_load_sharded_safetensors_folds_qwen_rms_norm_offsets(tmp_path, monkeypa
 
 
 def test_qwen_rms_norm_uses_effective_weight_in_float32():
-    module = Qwen3_5RMSNorm(4, eps=1e-6)
+    module = RMSNorm(4, eps=1e-6)
     checkpoint_weight = torch.tensor([0.25, -0.5, 0.0, 0.75], dtype=torch.float32)
     module.weight.data.copy_(checkpoint_weight + 1.0)
     x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
@@ -340,27 +341,6 @@ def test_qwen_rms_norm_uses_effective_weight_in_float32():
 
     assert actual.dtype == x.dtype
     torch.testing.assert_close(actual, expected.to(x.dtype))
-
-
-def test_qwen_rms_norm_bypasses_runtime_for_unsupported_width(monkeypatch):
-    module = Qwen3_5RMSNorm(4096, eps=1e-6)
-    module.weight.data.copy_(torch.randn_like(module.weight) * 0.1 + 1.0)
-    x = (torch.randn(2, 1, 4096) * 0.1).to(torch.bfloat16)
-
-    def _runtime_forbidden(*_args, **_kwargs):
-        raise AssertionError("unsupported Qwen RMSNorm width reached runtime dispatcher")
-
-    monkeypatch.setattr(qwen_model, "_kestrel_rmsnorm", _runtime_forbidden)
-    actual = module(x)
-    expected = torch.nn.functional.rms_norm(
-        x.float(),
-        module.weight.shape,
-        module.weight,
-        module.eps,
-    ).to(x.dtype)
-
-    assert actual.dtype == x.dtype
-    torch.testing.assert_close(actual, expected)
 
 
 def test_load_sharded_safetensors_fuses_gdn_input_projection(tmp_path, monkeypatch):

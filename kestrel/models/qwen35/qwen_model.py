@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from kestrel.ops.norm import RMSNorm
 from kestrel.ops.rotary import default_inv_freq
 
 from .inference_ops import (
@@ -58,7 +59,6 @@ _kestrel_packed_recurrent_prefill = (
 )
 _kestrel_gated_rmsnorm = _kestrel_runtime.gated_delta.gated_rmsnorm
 _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
-_kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
 _kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
@@ -66,7 +66,6 @@ _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
 _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
 _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
-_KESTREL_RMSNORM_HIDDEN_SIZES = {128, 256, 1024, 2048, 2560, 4096, 5120}
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
@@ -872,8 +871,9 @@ class Qwen3_5Attention(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        # Unlike OLMo, these normalize only the head dimension.
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1265,30 +1265,6 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         return expert_output.reshape(batch_size, sequence_length, hidden_dim)
 
 
-def qwen_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    # Qwen/Gemma RMSNorm keeps normalization and scale in fp32 before casting
-    # back. The loader folds checkpoint offset weights into the runtime scale.
-    if (
-        x.is_cuda
-        and weight.is_cuda
-        and x.dtype == torch.bfloat16
-        and weight.dtype == torch.float32
-        and x.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
-        and abs(float(eps) - 1.0e-6) < 1.0e-12
-    ):
-        return _kestrel_rmsnorm(x, weight, eps)
-    if (
-        x.is_mps
-        and weight.is_mps
-        and x.dtype == torch.float16
-        and weight.dtype == torch.float32
-        and x.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
-        and abs(float(eps) - 1.0e-6) < 1.0e-12
-    ):
-        return _kestrel_rmsnorm(x, weight, eps)
-    return F.rms_norm(x.float(), weight.shape, weight, eps).to(x.dtype)
-
-
 def qwen_add_rms_norm(
     residual: torch.Tensor,
     x: torch.Tensor,
@@ -1303,7 +1279,6 @@ def qwen_add_rms_norm(
         and residual.dtype == torch.bfloat16
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.float32
-        and residual.shape[-1] in _KESTREL_RMSNORM_HIDDEN_SIZES
         and abs(float(eps) - 1.0e-6) < 1.0e-12
     ):
         return residual, _kestrel_add_rmsnorm(residual, x, weight, eps)
@@ -1315,15 +1290,6 @@ def qwen_add_rms_norm(
         residual.dtype
     )
 
-
-class Qwen3_5RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x):
-        return qwen_rms_norm(x, self.weight, self.eps)
 
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
@@ -1341,15 +1307,21 @@ class Qwen3_5DecoderLayer(nn.Module):
                 config.intermediate_size,
             )
         )
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
 
     def _forward_from_normalized(
         self,
         residual: torch.Tensor,
         normalized_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        output_layernorm: Qwen3_5RMSNorm | None = None,
+        output_layernorm: RMSNorm | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Qwen35InferenceCache | None = None,
@@ -1750,7 +1722,7 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
     def forward(
         self,

@@ -11,8 +11,10 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import load_file
 
+from kestrel.ops.norm import RMSNorm
+
 from .qwen_config import Qwen3_5Config
-from .qwen_model import Qwen3_5ForConditionalGeneration, Qwen3_5RMSNorm
+from .qwen_model import Qwen3_5ForConditionalGeneration
 
 
 _CUDA_VISION_ATTN_IMPLEMENTATION = "kestrel_vision_flash_attention"
@@ -98,7 +100,7 @@ def _qwen_rms_norm_weight_keys(model: torch.nn.Module) -> set[str]:
     return {
         f"{name}.weight" if name else "weight"
         for name, module in model.named_modules()
-        if isinstance(module, Qwen3_5RMSNorm)
+        if isinstance(module, RMSNorm)
     }
 
 
