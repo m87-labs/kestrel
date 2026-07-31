@@ -202,7 +202,12 @@ class AutoregressiveExecutor:
         skills: "SkillRegistry",
         adapter_provider: Optional[AdapterProvider],
         build_generation_request: Callable[
-            [AutoregressiveRuntime, "_AutoregressiveRequest", Any],
+            [
+                AutoregressiveRuntime,
+                "_AutoregressiveRequest",
+                Any,
+                Optional[LegacyImageInput],
+            ],
             "tuple[GenerationRequest, SkillState]",
         ],
         to_engine_result: Callable[[SchedulerResult], EngineResult],

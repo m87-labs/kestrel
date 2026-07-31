@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
+import pytest
 
 from kestrel.engine.core import InferenceEngine
 from kestrel.models.moondream.skills import QuerySkill
@@ -105,6 +106,20 @@ def test_skill_media_reaches_queued_request_unchanged() -> None:
     media = (MediaInput(kind="image", data=image),)
     payload = _submit(_stub_engine(), image=None, media=media)
     assert payload.media is media  # the exact tuple, not a copy
+
+
+def test_image_and_media_are_mutually_exclusive() -> None:
+    """The two engine-entry representations must not silently compete:
+    supplying both is rejected before either is normalized or queued."""
+    eng = _stub_engine()
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="image and media are mutually exclusive"):
+        _submit(
+            eng,
+            image=image,
+            media=(MediaInput(kind="image", data=image),),
+        )
+    assert eng._queue.empty()  # nothing was queued
 
 
 def test_public_query_media_reaches_queue() -> None:

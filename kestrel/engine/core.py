@@ -1026,7 +1026,10 @@ class InferenceEngine:
         # The queued request carries ordered media; a legacy ``image``
         # argument (the stable submit(image=...) surface) is projected into
         # it, and skill-originated media passes through untouched. The legacy
-        # image representation begins only at admission.
+        # image representation begins only at admission. The two entry
+        # representations are alternatives — never allowed to compete.
+        if image is not None and media is not None:
+            raise ValueError("image and media are mutually exclusive")
         if media is None:
             if image is None:
                 media = ()

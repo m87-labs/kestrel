@@ -289,17 +289,17 @@ def _coordinator(runtime=None):
     return coordinator, failures
 
 
-def test_admission_derives_legacy_image_from_media_not_image_field() -> None:
-    """Admission reads the request's media; the transitional queued image
-    field is dead to it. A request whose image field disagrees with media
-    still preprocesses the media payload."""
+def test_admission_derives_legacy_image_from_media() -> None:
+    """Admission reads the request's ordered media and hands the exact same
+    image object to preprocessing — the legacy image representation begins
+    here."""
     preprocessor = _FakeImagePreprocessor()
     runtime = _FakeRuntime(
         prefix_cache=None, prefix_hit=False, image_preprocessor=preprocessor,
     )
     coordinator, failures = _coordinator(runtime)
     image = np.zeros((4, 4, 3), dtype=np.uint8)
-    req = _make_request(image=None, media=(MediaInput(kind="image", data=image),))
+    req = _make_request(media=(MediaInput(kind="image", data=image),))
 
     ready = coordinator.submit(req)
 
