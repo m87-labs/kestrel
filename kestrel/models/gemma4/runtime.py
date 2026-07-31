@@ -18,7 +18,7 @@ from kestrel.runtime.prefill import project_packed_last_rows
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 
 from .generated_decode import create_generated_decode
-from .image import IMAGE_SEQ_LENGTH, MAX_PATCHES, preprocess_image
+from .image import MAX_IMAGE_TOKENS, MAX_PATCHES, preprocess_image
 from .loader import load_model
 from .paged_cache import paged_kv_layout
 from .prompt_template import (
@@ -190,7 +190,6 @@ def _eager_decode(
         slot_mapping=slot.slot_mapping[:batch_size],
         page_table=slot.paged_kv_page_table[:batch_size],
         paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
-        paged_kv_use_sliding_window=True,
     )[:, 0]
     torch.mm(hidden, runtime.model.lm_head.weight.t(), out=slot.logits[:batch_size])
     cap = runtime._config.text_config.final_logit_softcapping
@@ -221,7 +220,7 @@ _OPS = PagedModelOps(
         config.text_config.max_position_embeddings,
         2048,
     ),
-    image_prefix_length=IMAGE_SEQ_LENGTH + 2,
+    image_prefix_length=MAX_IMAGE_TOKENS + 2,
     paged_kv_layout=paged_kv_layout,
     create_generated_decode=create_generated_decode,
     image_record=lambda crops: {

@@ -2,10 +2,11 @@
 
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Sequence, cast
 
 import numpy as np
 
+from kestrel.models.protocols import CaptionPromptTemplate
 from ..runtime import TextToken, Token
 
 from kestrel.skills.base import (
@@ -84,7 +85,7 @@ class CaptionSkill(SkillSpec):
         if not isinstance(request_context, CaptionRequest):
             raise ValueError("CaptionSkill.build_prompt_tokens requires a CaptionRequest")
         pt = runtime.prompt_template
-        token_ids = pt.caption(request_context.length)
+        token_ids = cast(CaptionPromptTemplate, pt).caption(request_context.length)
         if token_ids is None:
             raise ValueError("Model does not include caption templates")
         tokens = [TextToken(token_id=int(pt.bos_id))]

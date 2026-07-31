@@ -107,6 +107,8 @@ class TokenizerConfig:
             answer_suppressed_token_ids=list(
                 template.get("answer_suppressed_token_ids", [])
             ),
+            start_ground_points_id=self.start_ground_points_id,
+            end_ground_id=self.end_ground_id,
         )
 
     def chat(self) -> Optional[ChatTemplate]:

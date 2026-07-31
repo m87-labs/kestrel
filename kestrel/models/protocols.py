@@ -33,6 +33,8 @@ class QueryTemplate:
     # concrete token ids here instead of teaching the shared skill model names.
     reasoning_suppressed_token_ids: List[int] = field(default_factory=list)
     answer_suppressed_token_ids: List[int] = field(default_factory=list)
+    start_ground_points_id: Optional[int] = None
+    end_ground_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -77,40 +79,36 @@ class ChatTemplate:
 
 @runtime_checkable
 class PromptTemplate(Protocol):
-    """Prompt builder + magic-token-ID surface used by skills.
+    """Universal autoregressive prompt token IDs."""
 
-    A model that does not support a given skill returns ``None`` from
-    the corresponding builder; callers must handle that.
-    """
-
-    # --- Magic token IDs ---
     bos_id: int
     eos_id: int
     answer_id: int
     thinking_id: int
-    coord_id: int
-    size_id: int
-    start_ground_points_id: int
-    end_ground_id: int
 
-    # --- Skill prompt builders ---
+
+@runtime_checkable
+class CaptionPromptTemplate(PromptTemplate, Protocol):
     def caption(self, length: str) -> Optional[List[int]]:
-        """Token sequence for the caption skill at ``length``.
+        """Token sequence for the caption skill at ``length``."""
 
-        Returns ``None`` if the model has no caption template, or raises
-        ``ValueError`` if ``length`` is not a supported variant.
-        """
 
+@runtime_checkable
+class QueryPromptTemplate(PromptTemplate, Protocol):
     def query(self) -> Optional[QueryTemplate]:
         """Token sequences for the question-answering skill."""
 
-    def chat(self) -> Optional["ChatTemplate"]:
-        """Token framing for multi-turn chat, or ``None``.
 
-        ``None`` means the model has no native multi-turn chat format; the
-        chat skill then falls back to flattening the conversation into the
-        single-turn ``query`` prompt.
-        """
+@runtime_checkable
+class ChatPromptTemplate(PromptTemplate, Protocol):
+    def chat(self) -> Optional["ChatTemplate"]:
+        """Token framing for multi-turn chat, or ``None``."""
+
+
+@runtime_checkable
+class SpatialPromptTemplate(PromptTemplate, Protocol):
+    coord_id: int
+    size_id: int
 
     def detect(self) -> Optional[PrefixSuffix]:
         """Prefix/suffix for the detect skill."""
@@ -123,8 +121,12 @@ class PromptTemplate(Protocol):
 
 
 __all__ = [
+    "CaptionPromptTemplate",
+    "ChatPromptTemplate",
     "ChatTemplate",
     "PrefixSuffix",
     "PromptTemplate",
+    "QueryPromptTemplate",
     "QueryTemplate",
+    "SpatialPromptTemplate",
 ]

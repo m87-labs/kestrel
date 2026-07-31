@@ -13,6 +13,7 @@ from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime.bounded_projection import (
     BoundedLinear,
     PackedBoundedProjections,
+    PackedLinear,
 )
 from torch import nn
 from torch.nn import functional as F
@@ -73,14 +74,12 @@ class Gemma4TextRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma4TextConfig, device: Optional[torch.device] = None) -> None:
         super().__init__()
         self.config = config
-        self.layer_types = set(config.layer_types)
         # Plain attribute (not a buffer) — see class docstring.
         self.inv_freq: dict[str, torch.Tensor] = {}
-        self.attention_scaling: dict[str, float] = {}
         self._init_tables(device=device)
 
     def _init_tables(self, device: Optional[torch.device] = None) -> None:
-        for layer_type in sorted(self.layer_types):
+        for layer_type in sorted(set(self.config.layer_types)):
             params = self.config.rope[layer_type]
             rope_type = params.kind
             base = params.theta
@@ -114,7 +113,6 @@ class Gemma4TextRotaryEmbedding(nn.Module):
                 raise ValueError(f"Unsupported rope_type {rope_type!r} for layer_type {layer_type!r}")
 
             self.inv_freq[layer_type] = inv
-            self.attention_scaling[layer_type] = 1.0
 
     def _ensure_device(self, device: torch.device) -> None:
         for k, v in self.inv_freq.items():
@@ -130,7 +128,6 @@ class Gemma4TextRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._ensure_device(x.device)
         inv = self.inv_freq[layer_type]
-        scaling = self.attention_scaling[layer_type]
 
         inv_expanded = inv[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         pos_expanded = position_ids[:, None, :].float()
@@ -141,8 +138,8 @@ class Gemma4TextRotaryEmbedding(nn.Module):
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_expanded @ pos_expanded).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * scaling
-            sin = emb.sin() * scaling
+            cos = emb.cos()
+            sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -170,9 +167,7 @@ class Gemma4TextAttention(nn.Module):
         )
         self.use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
         num_kv_heads = attention_kv_heads(config, is_sliding=self.is_sliding)
-        self.num_kv_heads = num_kv_heads
         self.num_key_value_groups = config.num_attention_heads // num_kv_heads
-        self.scaling = 1.0
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
@@ -205,7 +200,6 @@ class Gemma4TextAttention(nn.Module):
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
@@ -273,8 +267,8 @@ class Gemma4TextAttention(nn.Module):
                 paged_kv_layer=producer,
                 page_table=page_table,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window if paged_kv_use_sliding_window else None,
+                scaling=1.0,
+                sliding_window=self.sliding_window,
             )
         else:
             assert key_states is not None and value_states is not None
@@ -284,7 +278,7 @@ class Gemma4TextAttention(nn.Module):
                 value_states,
                 num_key_value_groups=self.num_key_value_groups,
                 attention_mask=None,
-                scaling=self.scaling,
+                scaling=1.0,
                 causal=not self.is_sliding,
                 window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
                 window_size_right=0 if self.is_sliding else None,
@@ -304,10 +298,10 @@ class Gemma4TextMLP(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
-        self.gate_up_proj = nn.Linear(
+        self.gate_up_proj = PackedLinear(
             self.hidden_size,
-            2 * self.intermediate_size,
-            bias=False,
+            (self.intermediate_size, self.intermediate_size),
+            source_names=("gate_proj", "up_proj"),
         )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
@@ -380,7 +374,6 @@ class Gemma4TextDecoderLayer(nn.Module):
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -394,7 +387,6 @@ class Gemma4TextDecoderLayer(nn.Module):
             slot_mapping=slot_mapping,
             page_table=page_table,
             paged_kv_seqlens_k=paged_kv_seqlens_k,
-            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
             cu_seqlens=cu_seqlens,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -524,7 +516,6 @@ class Gemma4TextModel(nn.Module):
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if (input_ids is None) == (inputs_embeds is None):
@@ -572,7 +563,6 @@ class Gemma4TextModel(nn.Module):
                 slot_mapping=slot_mapping,
                 page_table=page_table,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
-                paged_kv_use_sliding_window=paged_kv_use_sliding_window,
                 cu_seqlens=cu_seqlens,
             )
 
@@ -670,9 +660,10 @@ class Gemma4VisionMLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_up_proj = BoundedLinear(
+        self.gate_up_proj = PackedBoundedProjections(
             self.hidden_size,
-            2 * self.intermediate_size,
+            (self.intermediate_size, self.intermediate_size),
+            source_names=("gate_proj", "up_proj"),
             use_bounds=config.use_clipped_linears,
         )
         self.down_proj = BoundedLinear(
@@ -681,7 +672,7 @@ class Gemma4VisionMLP(nn.Module):
             use_bounds=config.use_clipped_linears,
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
+        gate_up = self.gate_up_proj.forward_packed(x)
         hidden = torch.empty(
             (*gate_up.shape[:-1], self.intermediate_size),
             dtype=gate_up.dtype,
@@ -702,7 +693,6 @@ class Gemma4VisionAttention(nn.Module):
         super().__init__()
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = 1.0
         self.qkv_proj = PackedBoundedProjections(
             config.hidden_size,
             (
@@ -762,7 +752,7 @@ class Gemma4VisionAttention(nn.Module):
             value_states,
             num_key_value_groups=self.num_key_value_groups,
             used_key_lengths=seqused_k,
-            scaling=self.scaling,
+            scaling=1.0,
         )
         attn_out = attn_out.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_out)

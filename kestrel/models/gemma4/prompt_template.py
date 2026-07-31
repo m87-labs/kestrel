@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
-from kestrel.models.protocols import ChatTemplate, PrefixSuffix, QueryTemplate
+from kestrel.models.protocols import QueryTemplate
 
 
 BOS_ID = 2
@@ -44,13 +44,6 @@ class Gemma4PromptTemplate:
     eos_id: int = EOS_ID
     answer_id: int = END_OF_CHANNEL_ID
     thinking_id: int = THINK_ID
-    coord_id: int = 0
-    size_id: int = 0
-    start_ground_points_id: int = 0
-    end_ground_id: int = 0
-
-    def caption(self, length: str) -> Optional[List[int]]:
-        return None
 
     def query(self) -> Optional[QueryTemplate]:
         stop_token_ids = []
@@ -64,18 +57,6 @@ class Gemma4PromptTemplate:
             prefix_when_reasoning=list(_TURN_USER_PREFIX_WITH_THINK_IDS),
             stop_token_ids=stop_token_ids,
         )
-
-    def chat(self) -> Optional[ChatTemplate]:
-        return None
-
-    def detect(self) -> Optional[PrefixSuffix]:
-        return None
-
-    def point(self) -> Optional[PrefixSuffix]:
-        return None
-
-    def segment(self) -> Optional[PrefixSuffix]:
-        return None
 
 
 __all__ = [

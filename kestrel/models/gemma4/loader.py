@@ -10,7 +10,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
 
 from kestrel.runtime.bounded_projection import (
-    bind_declared_packed_bounded_projections,
+    bind_declared_packed_projections,
 )
 
 from .config import Gemma4Config, parse_gemma4_config
@@ -57,54 +57,39 @@ def load_weights(repo_id: str, model: torch.nn.Module) -> None:
                     continue
                 state_dict[name] = handle.get_tensor(name)
 
-    bind_declared_packed_bounded_projections(model, state_dict)
-    expected_keys = set(model.state_dict())
-    projection_suffixes = (
-        ("gate_proj.weight", "up_proj.weight", "gate_up_proj.weight"),
-        (
-            "gate_proj.linear.weight",
-            "up_proj.linear.weight",
-            "gate_up_proj.linear.weight",
-        ),
-    )
-    for gate_key in list(state_dict):
-        for gate_suffix, up_suffix, fused_suffix in projection_suffixes:
-            if not gate_key.endswith(f".mlp.{gate_suffix}"):
-                continue
-            prefix = gate_key[: -len(gate_suffix)]
-            up_key = prefix + up_suffix
-            fused_key = prefix + fused_suffix
-            if up_key not in state_dict or fused_key not in expected_keys:
-                break
-            state_dict[fused_key] = torch.cat(
-                (state_dict.pop(gate_key), state_dict.pop(up_key)),
-                dim=0,
-            )
+    bind_declared_packed_projections(model, state_dict)
 
-            if ".linear." in gate_suffix:
-                for bound in ("input_min", "input_max", "output_min", "output_max"):
-                    gate_bound = prefix + "gate_proj." + bound
-                    up_bound = prefix + "up_proj." + bound
-                    fused_bound = prefix + "gate_up_proj." + bound
-                    if fused_bound not in expected_keys:
-                        continue
-                    if gate_bound not in state_dict or up_bound not in state_dict:
-                        raise KeyError(
-                            f"fused clipped projection requires {gate_bound!r} and "
-                            f"{up_bound!r}"
-                        )
-                    if not torch.equal(state_dict[gate_bound], state_dict[up_bound]):
-                        raise ValueError(
-                            f"cannot fuse projections with different {bound} bounds: "
-                            f"{gate_bound!r} vs {up_bound!r}"
-                        )
-                    state_dict[fused_bound] = state_dict.pop(gate_bound)
-                    state_dict.pop(up_bound)
+    expected = set(model.state_dict())
+    embedding_key = "model.language_model.embed_tokens.weight"
+    if "lm_head.weight" in expected and "lm_head.weight" not in state_dict:
+        try:
+            state_dict["lm_head.weight"] = state_dict[embedding_key]
+        except KeyError as exc:
+            raise KeyError(
+                "tied Gemma checkpoint is missing its text embedding"
+            ) from exc
+
+    # Published checkpoints retain K/V parameters for layers whose config
+    # explicitly reuses an earlier producer. The inference module omits those
+    # dead parameters; discard only that exact declared family.
+    shared_kv_members = ("k_proj", "v_proj", "k_norm", "v_norm")
+    for name in tuple(state_dict):
+        if name in expected:
+            continue
+        for member in shared_kv_members:
+            marker = f".self_attn.{member}."
+            if marker not in name:
+                continue
+            attention_path = name.partition(marker)[0] + ".self_attn"
+            try:
+                attention = model.get_submodule(attention_path)
+            except AttributeError:
+                break
+            if not hasattr(attention, member):
+                state_dict.pop(name)
             break
 
-    # Published checkpoints retain K/V tensors for layers whose config reuses
-    # an earlier layer's cache, while tied checkpoints omit ``lm_head.weight``.
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
 
 
 def load_model(

@@ -213,7 +213,3 @@ def test_base_query_uses_only_model_eos() -> None:
 
 def test_non_query_skills_return_none():
     pt = Gemma4PromptTemplate(_MODEL_ID)
-    assert pt.caption("short") is None
-    assert pt.detect() is None
-    assert pt.point() is None
-    assert pt.segment() is None

@@ -34,7 +34,7 @@ from kestrel.models.gemma4.config import (
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
 from kestrel.models.gemma4.runtime import _OPS, create_gemma4_runtime
-from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
+from kestrel.models.gemma4.skills import build_skill_registry
 
 
 _MODEL_ID = "google/gemma-4-E2B-it"
@@ -451,7 +451,7 @@ def test_vision_mlp_uses_generic_gated_activation_provider(monkeypatch):
     )
     x = torch.randn((2, 4))
     actual = mlp(x)
-    gate_up = mlp.gate_up_proj(x)
+    gate_up = mlp.gate_up_proj.forward_packed(x)
     gate, up = gate_up.chunk(2, dim=-1)
     expected = mlp.down_proj(
         torch.nn.functional.gelu(gate, approximate="tanh") * up
@@ -1464,7 +1464,7 @@ def test_nonpaged_local_attention_truncates_history_beyond_window():
 
 
 def test_query_skill_defaults_to_direct_answer_mode():
-    skill = Gemma4QuerySkill()
+    skill = build_skill_registry().resolve("query")
     built = skill.build_request(
         image=None,
         prompt={"question": "What is 2+2?"},

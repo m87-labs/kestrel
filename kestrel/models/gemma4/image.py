@@ -29,7 +29,6 @@ class GemmaImageInputs:
 DEFAULT_IMAGE_CONFIG = Gemma4ImageProcessorConfig()
 MAX_PATCHES = DEFAULT_IMAGE_CONFIG.max_patches
 MAX_IMAGE_TOKENS = MAX_PATCHES // (DEFAULT_IMAGE_CONFIG.pooling_kernel_size**2)
-IMAGE_SEQ_LENGTH = MAX_IMAGE_TOKENS
 
 
 def _to_pil_rgb(image: Any) -> Image.Image:
@@ -139,7 +138,6 @@ def preprocess_image(
 __all__ = [
     "Gemma4ImageProcessorConfig",
     "GemmaImageInputs",
-    "IMAGE_SEQ_LENGTH",
     "MAX_IMAGE_TOKENS",
     "MAX_PATCHES",
     "preprocess_image",

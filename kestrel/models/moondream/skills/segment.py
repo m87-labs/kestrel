@@ -3,10 +3,11 @@
 
 from dataclasses import dataclass
 import json
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
+from kestrel.models.protocols import SpatialPromptTemplate
 from ..runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 from kestrel.utils.svg import (
@@ -88,7 +89,7 @@ class SegmentSkill(SkillSpec):
         if not isinstance(request_context, SegmentRequest):
             raise ValueError("SegmentSkill.build_prompt_tokens requires a SegmentRequest")
         pt = runtime.prompt_template
-        template = pt.segment()
+        template = cast(SpatialPromptTemplate, pt).segment()
         if template is None:
             raise ValueError("Model does not include a segment template")
         object_name = request_context.object

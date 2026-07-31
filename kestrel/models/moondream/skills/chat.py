@@ -18,8 +18,9 @@ The final user turn ends with the generation opener — ``answer_prefix``, or
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, cast
 
+from kestrel.models.protocols import QueryPromptTemplate
 from kestrel.runtime.tokens import ImageMarker, TextToken
 from kestrel.skills.base import SkillFinalizeResult, SkillSpec
 from kestrel.skills.chat import ChatRequest, ChatSkill
@@ -59,7 +60,7 @@ class MoondreamChatSkill(ChatSkill):
                     f"found image content in a {m.role!r} message"
                 )
         pt = runtime.prompt_template
-        template = pt.query()
+        template = cast(QueryPromptTemplate, pt).query()
         if template is None:
             raise ValueError("Moondream prompt template has no query()")
         tokenizer = runtime.tokenizer

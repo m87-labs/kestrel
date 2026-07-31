@@ -6,6 +6,10 @@ import torch
 from safetensors.torch import save_file
 
 from kestrel.models.gemma4 import loader
+from kestrel.runtime.bounded_projection import (
+    PackedBoundedProjections,
+    PackedLinear,
+)
 
 
 class _TinyModel(torch.nn.Module):
@@ -20,7 +24,11 @@ class _TinyFusedMlpModel(torch.nn.Module):
         super().__init__()
         self.block = torch.nn.Module()
         self.block.mlp = torch.nn.Module()
-        self.block.mlp.gate_up_proj = torch.nn.Linear(2, 4, bias=False)
+        self.block.mlp.gate_up_proj = PackedLinear(
+            2,
+            (2, 2),
+            source_names=("gate_proj", "up_proj"),
+        )
 
 
 class _TinyFusedClippedMlpModel(torch.nn.Module):
@@ -28,11 +36,11 @@ class _TinyFusedClippedMlpModel(torch.nn.Module):
         super().__init__()
         self.block = torch.nn.Module()
         self.block.mlp = torch.nn.Module()
-        gate_up = torch.nn.Module()
-        gate_up.linear = torch.nn.Linear(2, 4, bias=False)
-        for name in ("input_min", "input_max", "output_min", "output_max"):
-            gate_up.register_buffer(name, torch.tensor(0.0))
-        self.block.mlp.gate_up_proj = gate_up
+        self.block.mlp.gate_up_proj = PackedBoundedProjections(
+            2,
+            (2, 2),
+            source_names=("gate_proj", "up_proj"),
+        )
 
 
 class _TinyEmbeddings(torch.nn.Module):
@@ -56,11 +64,11 @@ class _TinyGemma4(torch.nn.Module):
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
 
-def test_load_weights_accepts_compatible_keys(tmp_path, monkeypatch):
+def test_load_weights_requires_exact_keys(tmp_path, monkeypatch):
     save_file(
         {
             "a": torch.ones(2),
-            "extra": torch.full((1,), 3.0),
+            "b": torch.full((2,), 3.0),
         },
         tmp_path / "model.safetensors",
     )
@@ -76,7 +84,7 @@ def test_load_weights_accepts_compatible_keys(tmp_path, monkeypatch):
     loader.load_weights("repo", model)
 
     assert torch.equal(model.a, torch.ones(2))
-    assert torch.equal(model.b, torch.zeros(2))
+    assert torch.equal(model.b, torch.full((2,), 3.0))
 
 
 def test_load_weights_does_not_materialize_unsupported_towers(
@@ -93,10 +101,15 @@ def test_load_weights_does_not_materialize_unsupported_towers(
             return False
 
         def keys(self):
-            return ("a", "model.audio_tower.weight", "model.embed_audio.weight")
+            return (
+                "a",
+                "b",
+                "model.audio_tower.weight",
+                "model.embed_audio.weight",
+            )
 
         def get_tensor(self, name):
-            assert name == "a"
+            assert name in {"a", "b"}
             return torch.ones(2)
 
     monkeypatch.setattr(
@@ -110,6 +123,26 @@ def test_load_weights_does_not_materialize_unsupported_towers(
     loader.load_weights("repo", model)
 
     assert torch.equal(model.a, torch.ones(2))
+    assert torch.equal(model.b, torch.ones(2))
+
+
+def test_load_weights_rejects_unknown_keys(tmp_path, monkeypatch):
+    save_file(
+        {
+            "a": torch.ones(2),
+            "b": torch.ones(2),
+            "extra": torch.ones(1),
+        },
+        tmp_path / "model.safetensors",
+    )
+    monkeypatch.setattr(
+        loader,
+        "snapshot_download",
+        lambda *args, **kwargs: str(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        loader.load_weights("repo", _TinyModel())
 
 
 def test_load_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
@@ -131,6 +164,7 @@ def test_load_weights_fuses_gate_up_projection(tmp_path, monkeypatch):
         model.block.mlp.gate_up_proj.weight,
         torch.cat((gate, up), dim=0),
     )
+    assert set(model.state_dict()) == {"block.mlp.gate_up_proj.weight"}
 
 
 def test_load_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypatch):
@@ -162,11 +196,15 @@ def test_load_weights_fuses_clipped_gate_up_projection(tmp_path, monkeypatch):
     for name, value in bounds.items():
         torch.testing.assert_close(
             getattr(model.block.mlp.gate_up_proj, name),
-            value,
+            (
+                value
+                if name.startswith("input_")
+                else value.expand(4)
+            ),
         )
 
 
-def test_load_weights_refuses_different_clipping_bounds(tmp_path, monkeypatch):
+def test_load_weights_refuses_different_input_clipping_bounds(tmp_path, monkeypatch):
     weights = {
         "block.mlp.gate_proj.linear.weight": torch.zeros((2, 2)),
         "block.mlp.up_proj.linear.weight": torch.zeros((2, 2)),
@@ -174,12 +212,12 @@ def test_load_weights_refuses_different_clipping_bounds(tmp_path, monkeypatch):
     for name in ("input_min", "input_max", "output_min", "output_max"):
         weights[f"block.mlp.gate_proj.{name}"] = torch.tensor(0.0)
         weights[f"block.mlp.up_proj.{name}"] = torch.tensor(
-            1.0 if name == "output_max" else 0.0
+            1.0 if name == "input_max" else 0.0
         )
     save_file(weights, tmp_path / "model.safetensors")
     monkeypatch.setattr(loader, "snapshot_download", lambda *args, **kwargs: str(tmp_path))
 
-    with pytest.raises(ValueError, match="different output_max bounds"):
+    with pytest.raises(ValueError, match="different input_max"):
         loader.load_weights(
             "repo",
             _TinyFusedClippedMlpModel(),

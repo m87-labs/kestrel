@@ -21,7 +21,7 @@ from kestrel.models.gemma4.prompt_template import (
     Gemma4PromptTemplate,
     TOOL_RESPONSE_ID,
 )
-from kestrel.models.gemma4.skills import Gemma4QuerySkill
+from kestrel.models.gemma4.skills import build_skill_registry
 
 
 _ANSWER_ID = 42
@@ -45,7 +45,7 @@ def _runtime():
 
 
 def _request(*, stream_callback=None):
-    skill = Gemma4QuerySkill()
+    skill = build_skill_registry().resolve("query")
     context = QueryRequest(
         question="question",
         image=None,
@@ -123,7 +123,7 @@ def test_non_spec_query_stops_without_streaming_terminator(stop_id: int) -> None
 
 def test_reasoning_query_hides_instruct_stop() -> None:
     runtime = _runtime()
-    skill = Gemma4QuerySkill()
+    skill = build_skill_registry().resolve("query")
     context = QueryRequest(
         question="question",
         image=None,
