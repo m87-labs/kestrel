@@ -9,10 +9,6 @@ import torch
 from kestrel.runtime.generated_decode import GeneratedDecode, GeneratedDecodeSpec
 
 
-class _UnsupportedDecodeConfig(ValueError):
-    pass
-
-
 def _compile_from_config(
     config: Any,
     *,
@@ -21,66 +17,23 @@ def _compile_from_config(
     num_ctas: int,
     gpu: str,
 ):
-    from mkl.compiler.frontend.models.gemma import compile_gemma4_decode
+    from mkl.compiler.frontend import DecodeCompileTarget
+    from mkl.compiler.frontend.models.gemma import (
+        Gemma4DecodeTraceConfig,
+        compile_gemma4_decode,
+    )
 
-    if config.attention_k_eq_v:
-        raise _UnsupportedDecodeConfig(
-            "generated Gemma decode requires an explicit V projection"
-        )
-    ple_hidden = int(config.hidden_size_per_layer_input)
-    if ple_hidden <= 0:
-        raise _UnsupportedDecodeConfig(
-            "generated Gemma decode requires traced PLE inputs"
-        )
-    layer_types = tuple(config.layer_types)
-    supported = {"sliding_attention", "full_attention"}
-    if not layer_types or set(layer_types) - supported:
-        raise _UnsupportedDecodeConfig(
-            f"unsupported Gemma layer types {sorted(set(layer_types) - supported)}"
-        )
-    first_shared = len(layer_types) - config.num_kv_shared_layers
-    branches = {
-        (
-            "global" if layer_type == "full_attention" else "local",
-            "shared" if layer >= first_shared else "fresh",
-        )
-        for layer, layer_type in enumerate(layer_types)
-    }
-    required = {
-        ("local", "fresh"),
-        ("global", "fresh"),
-        ("local", "shared"),
-        ("global", "shared"),
-    }
-    if branches != required:
-        raise _UnsupportedDecodeConfig(
-            "generated Gemma decode requires fresh/shared local/global coverage"
-        )
-
-    return compile_gemma4_decode(
-        layer_types=list(layer_types),
-        num_kv_shared_layers=config.num_kv_shared_layers,
-        hidden=config.hidden_size,
-        inter=config.intermediate_size,
-        nh=config.num_attention_heads,
-        nkv=config.num_key_value_heads,
-        global_nkv=config.num_global_key_value_heads,
-        local_head_dim=config.head_dim,
-        global_head_dim=config.global_head_dim,
-        window=config.sliding_window,
+    trace = Gemma4DecodeTraceConfig.from_model_config(
+        config,
         max_kv_len=max_kv_len,
-        ple_hidden=ple_hidden,
-        ple_vocab=config.vocab_size_per_layer_input,
-        vocab_size=config.vocab_size,
-        rms_norm_eps=config.rms_norm_eps,
-        final_logit_softcapping=config.final_logit_softcapping,
-        tie_word_embeddings=True,
-        double_wide_mlp=config.use_double_wide_mlp,
-        num_ctas=num_ctas,
-        num_splits=None,
-        batch_tile=batch_capacity,
-        static_extent_bindings={},
-        gpu=gpu,
+    )
+    return compile_gemma4_decode(
+        trace,
+        target=DecodeCompileTarget(
+            batch_capacity=batch_capacity,
+            num_ctas=num_ctas,
+            gpu=gpu,
+        ),
     )
 
 
@@ -145,6 +98,9 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
         return None
     try:
         from mkl.compiler.frontend.models.aot import DECODE_BATCH_CAPACITIES
+        from mkl.compiler.frontend.models.gemma import (
+            UnsupportedGemma4DecodeConfig,
+        )
     except ModuleNotFoundError as exc:
         missing = str(exc.name or "")
         if missing != "mkl" and not missing.startswith("mkl."):
@@ -207,7 +163,7 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
                 "active_batch": batch_size,
                 "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
             },
-            unsupported=(_UnsupportedDecodeConfig,),
+            unsupported=(UnsupportedGemma4DecodeConfig,),
         ),
     )
 

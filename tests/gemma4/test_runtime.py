@@ -751,13 +751,15 @@ def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
 
 def test_decode_compile_translates_model_config(monkeypatch):
     from kestrel.models.gemma4 import generated_decode
+    from mkl.compiler.frontend import DecodeCompileTarget
     from mkl.compiler.frontend.models import gemma as gemma_frontend
+    from mkl.compiler.frontend.models.gemma import Gemma4DecodeTraceConfig
 
     calls = []
     monkeypatch.setattr(
         gemma_frontend,
         "compile_gemma4_decode",
-        lambda **kwargs: calls.append(kwargs) or "compiled",
+        lambda trace, *, target: calls.append((trace, target)) or "compiled",
     )
     config = SimpleNamespace(
         enable_moe_block=False,
@@ -786,31 +788,33 @@ def test_decode_compile_translates_model_config(monkeypatch):
     assert generated_decode._compile_from_config(
         config, max_kv_len=256, num_ctas=132, gpu="test-gpu"
     ) == "compiled"
-    assert calls == [{
-        "layer_types": config.layer_types,
-        "num_kv_shared_layers": 2,
-        "hidden": 64,
-        "inter": 128,
-        "nh": 4,
-        "nkv": 1,
-        "global_nkv": 1,
-        "local_head_dim": 16,
-        "global_head_dim": 32,
-        "window": 8,
-        "max_kv_len": 256,
-        "ple_hidden": 16,
-        "ple_vocab": 32,
-        "vocab_size": 48,
-        "rms_norm_eps": 1e-6,
-        "final_logit_softcapping": 30.0,
-        "tie_word_embeddings": True,
-        "double_wide_mlp": True,
-        "num_ctas": 132,
-        "num_splits": None,
-        "batch_tile": 1,
-        "static_extent_bindings": {},
-        "gpu": "test-gpu",
-    }]
+    trace, target = calls[0]
+    assert trace == Gemma4DecodeTraceConfig(
+        name="gemma4",
+        layer_types=tuple(config.layer_types),
+        num_kv_shared_layers=2,
+        hidden=64,
+        inter=128,
+        nh=4,
+        nkv=1,
+        global_nkv=1,
+        local_head_dim=16,
+        global_head_dim=32,
+        window=8,
+        max_kv_len=256,
+        ple_hidden=16,
+        ple_vocab=32,
+        vocab_size=48,
+        rms_norm_eps=1e-6,
+        final_logit_softcapping=30.0,
+        tie_word_embeddings=True,
+        double_wide_mlp=True,
+    )
+    assert target == DecodeCompileTarget(
+        batch_capacity=1,
+        num_ctas=132,
+        gpu="test-gpu",
+    )
 
 
 def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
@@ -1072,15 +1076,22 @@ def test_generated_decode_rejects_cross_capacity_weight_abi_drift():
     from kestrel.runtime.generated_decode import _require_uniform_weight_contract
 
     programs = {
-        1: (SimpleNamespace(contract=("weight", "bf16")), None, None),
-        8: (SimpleNamespace(contract=("weight", "fp8")), None, None),
+        1: (
+            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
+            None,
+            None,
+        ),
+        8: (
+            SimpleNamespace(weight_binding_contract=("weight", "fp8")),
+            None,
+            None,
+        ),
     }
 
     with pytest.raises(RuntimeError, match="weight storage ABI"):
         _require_uniform_weight_contract(
             "test",
             programs,
-            lambda compiled: compiled.contract,
         )
 
 
@@ -1088,14 +1099,21 @@ def test_generated_decode_accepts_uniform_cross_capacity_weight_abi():
     from kestrel.runtime.generated_decode import _require_uniform_weight_contract
 
     programs = {
-        1: (SimpleNamespace(contract=("weight", "bf16")), None, None),
-        8: (SimpleNamespace(contract=("weight", "bf16")), None, None),
+        1: (
+            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
+            None,
+            None,
+        ),
+        8: (
+            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
+            None,
+            None,
+        ),
     }
 
     _require_uniform_weight_contract(
         "test",
         programs,
-        lambda compiled: compiled.contract,
     )
 
 
