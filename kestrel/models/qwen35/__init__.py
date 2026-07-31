@@ -1,4 +1,4 @@
-"""Qwen 3.5 model support for the Kestrel inference engine."""
+"""Qwen 3.5/3.6 hybrid model support for the Kestrel inference engine."""
 
 from kestrel.models.registry import ModelSpec, register
 
@@ -19,6 +19,8 @@ _VARIANTS = [
     "Qwen/Qwen3.5-27B",
     "Qwen/Qwen3.5-35B-A3B",
     "Qwen/Qwen3.5-35B-A3B-Base",
+    "Qwen/Qwen3.6-27B",
+    "Qwen/Qwen3.6-35B-A3B",
 ]
 
 for _repo_id in _VARIANTS:

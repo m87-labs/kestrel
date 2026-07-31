@@ -1,4 +1,4 @@
-"""Qwen 3.5 runtime for the Kestrel inference engine."""
+"""Qwen 3.5/3.6 runtime for the Kestrel inference engine."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from kestrel.kv_cache import KVMemoryPool, PageTable
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.state import SequenceState
@@ -29,7 +29,7 @@ from kestrel.runtime.preprocessing import (
 from .paged_cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
-    allocate_qwen35_paged_kv,
+    qwen_paged_kv_layout,
 )
 from .prefill_slot import (
     Qwen35PrefillScratch,
@@ -369,8 +369,10 @@ class Qwen35Runtime:
                 f"device ({self.device})"
             )
         self._replay_capacity = 16
-        self._paged_kv = allocate_qwen35_paged_kv(
-            config=text_cfg,
+        kv_specs, kv_sources = qwen_paged_kv_layout(text_cfg)
+        self._paged_kv = LayeredPagedKV.allocate(
+            layer_specs=kv_specs,
+            source_layer_idx=kv_sources,
             page_table=self.page_table,
             pool=self._kv_pool,
             dtype=self.dtype,

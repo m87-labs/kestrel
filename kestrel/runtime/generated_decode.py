@@ -205,7 +205,10 @@ class GeneratedDecode:
             or runtime.dtype is not torch.bfloat16
         ):
             return None
-        from kestrel_kernels.generated_decode import resolve_compatible_programs
+        try:
+            from kestrel_kernels.generated_decode import resolve_compatible_programs
+        except ImportError:
+            return None
 
         properties = torch.cuda.get_device_properties(runtime.device)
         programs = resolve_compatible_programs(

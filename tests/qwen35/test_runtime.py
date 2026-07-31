@@ -8,6 +8,7 @@ import kestrel.models.qwen35  # noqa: F401
 import kestrel.models.qwen35.qwen_model as qwen_model
 from kestrel.models import get_spec, known_models
 from kestrel.models.qwen35.inference_ops import LinearAttentionLayer
+from kestrel.models.qwen35.paged_cache import qwen_paged_kv_layout
 from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
 from kestrel.models.qwen35.qwen_model import (
     Qwen3_5Attention,
@@ -84,9 +85,24 @@ def test_supported_variants_register():
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
     }
     assert expected <= set(known_models())
     assert get_spec(_MODEL_ID).runtime is Qwen35Runtime
+
+
+def test_hybrid_cache_uses_shared_paged_kv_layout():
+    specs, sources = qwen_paged_kv_layout(
+        _text_config(
+            num_hidden_layers=3,
+            layer_types=["linear_attention", "full_attention", "linear_attention"],
+        )
+    )
+
+    assert specs[0] is None and specs[2] is None
+    assert specs[1].n_heads == 1
+    assert sources == (-1, 1, -1)
 
 
 def test_fused_attention_handles_multitoken_prefill():

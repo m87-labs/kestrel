@@ -1,4 +1,4 @@
-"""Validated inference shape descriptors for Qwen 3.5."""
+"""Validated inference shape descriptors for Qwen 3.5/3.6."""
 
 from __future__ import annotations
 

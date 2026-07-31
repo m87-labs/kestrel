@@ -1,4 +1,4 @@
-"""Hybrid cache helpers for Qwen 3.5."""
+"""Hybrid attention and recurrent state for Qwen 3.5/3.6."""
 
 from __future__ import annotations
 
@@ -6,12 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from kestrel.kv_cache import (
-    KVMemoryPool,
-    LayeredPagedKV,
-    PageTable,
-    PagedKVLayerSpec,
-)
+from kestrel.kv_cache import LayeredPagedKV, PagedKVLayerSpec
 
 from .inference_ops import LinearAttentionLayer, LinearAttentionState
 
@@ -19,14 +14,10 @@ if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm
 
 
-def allocate_qwen35_paged_kv(
-    *,
+def qwen_paged_kv_layout(
     config: Any,
-    page_table: PageTable,
-    pool: KVMemoryPool,
-    dtype: torch.dtype,
-) -> LayeredPagedKV:
-    """Allocate full-attention storage through Kestrel's shared cache owner."""
+) -> tuple[tuple[PagedKVLayerSpec | None, ...], tuple[int, ...]]:
+    """Describe which hybrid layers own ordinary paged K/V storage."""
 
     head_dim = int(config.head_dim)
     specs: list[PagedKVLayerSpec | None] = []
@@ -43,13 +34,7 @@ def allocate_qwen35_paged_kv(
                 )
             )
             sources.append(layer_idx)
-    return LayeredPagedKV.allocate(
-        layer_specs=specs,
-        source_layer_idx=sources,
-        page_table=page_table,
-        pool=pool,
-        dtype=dtype,
-    )
+    return tuple(specs), tuple(sources)
 
 
 class Qwen35InferenceCache:
@@ -354,7 +339,7 @@ class Qwen35LinearStatePool:
 
 
 __all__ = [
-    "allocate_qwen35_paged_kv",
+    "qwen_paged_kv_layout",
     "Qwen35InferenceCache",
     "Qwen35LinearStatePool",
 ]
