@@ -89,7 +89,7 @@ def _chat_runtime(chat: bool = True) -> SimpleNamespace:
 
 def _ctx(messages, reasoning: bool = False) -> ChatRequest:
     built = ChatSkill().build_request(
-        None, {"messages": messages, "reasoning": reasoning}, None
+        {"messages": messages, "reasoning": reasoning}, None
     )
     return built.request_context
 
@@ -122,18 +122,18 @@ def test_build_request_accepts_minimal_conversation() -> None:
 
 def test_build_request_requires_messages() -> None:
     with pytest.raises(ValueError, match="messages must be provided"):
-        ChatSkill().build_request(None, {}, None)
+        ChatSkill().build_request({}, None)
 
 
 def test_build_request_rejects_empty_messages() -> None:
     with pytest.raises(ValueError, match="non-empty"):
-        ChatSkill().build_request(None, {"messages": []}, None)
+        ChatSkill().build_request({"messages": []}, None)
 
 
 def test_build_request_rejects_unknown_role() -> None:
     with pytest.raises(ValueError, match="role"):
         ChatSkill().build_request(
-            None, {"messages": [{"role": "tool", "content": "x"}]}, None
+            {"messages": [{"role": "tool", "content": "x"}]}, None
         )
 
 
@@ -143,7 +143,7 @@ def test_build_request_system_must_be_first() -> None:
         {"role": "system", "content": "be brief"},
     ]
     with pytest.raises(ValueError, match="first message"):
-        ChatSkill().build_request(None, {"messages": msgs}, None)
+        ChatSkill().build_request({"messages": msgs}, None)
 
 
 def test_build_request_last_must_be_user() -> None:
@@ -152,7 +152,7 @@ def test_build_request_last_must_be_user() -> None:
         {"role": "assistant", "content": "hello"},
     ]
     with pytest.raises(ValueError, match="last message must be from 'user'"):
-        ChatSkill().build_request(None, {"messages": msgs}, None)
+        ChatSkill().build_request({"messages": msgs}, None)
 
 
 def test_build_request_collects_multiple_images_in_order() -> None:
@@ -173,10 +173,10 @@ def test_build_request_collects_multiple_images_in_order() -> None:
             ],
         },
     ]
-    built = ChatSkill().build_request(None, {"messages": msgs}, None)
+    built = ChatSkill().build_request({"messages": msgs}, None)
     ctx = built.request_context
     assert len(ctx.images) == 2
-    assert built.image == (b"hi", b"hi")
+    assert [(m.kind, m.data) for m in built.media] == [("image", b"hi"), ("image", b"hi")]
     # parts carry image indices in conversation order
     assert ctx.messages[0].parts[0].image_index == 0
     assert ctx.messages[2].parts[1].image_index == 1
@@ -188,25 +188,25 @@ def test_build_request_rejects_image_in_system_message() -> None:
         {"role": "user", "content": "hi"},
     ]
     with pytest.raises(ValueError, match="system message cannot contain images"):
-        ChatSkill().build_request(None, {"messages": msgs}, None)
+        ChatSkill().build_request({"messages": msgs}, None)
 
 
 @pytest.mark.parametrize("url", ["/etc/passwd", "https://example.com/cat.png"])
 def test_build_request_rejects_non_data_image_url(url: str) -> None:
     msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]
     with pytest.raises(ValueError, match="data: URL"):
-        ChatSkill().build_request(None, {"messages": msgs}, None)
+        ChatSkill().build_request({"messages": msgs}, None)
 
 
 def test_build_request_reasoning_opt_in_via_settings() -> None:
     built = ChatSkill().build_request(
-        None, {"messages": [{"role": "user", "content": "hi"}]}, {"reasoning": True}
+        {"messages": [{"role": "user", "content": "hi"}]}, {"reasoning": True}
     )
     assert built.request_context.reasoning is True
 
 
 def test_base_reasoning_default_off() -> None:
-    built = ChatSkill().build_request(None, {"messages": [{"role": "user", "content": "hi"}]}, None)
+    built = ChatSkill().build_request({"messages": [{"role": "user", "content": "hi"}]}, None)
     assert built.request_context.reasoning is False
 
 
@@ -215,12 +215,12 @@ def test_subclass_reasoning_default_on() -> None:
         default_reasoning = True
 
     built = _ThinkingChatSkill().build_request(
-        None, {"messages": [{"role": "user", "content": "hi"}]}, None
+        {"messages": [{"role": "user", "content": "hi"}]}, None
     )
     assert built.request_context.reasoning is True
     # Explicit opt-out still wins.
     off = _ThinkingChatSkill().build_request(
-        None, {"messages": [{"role": "user", "content": "hi"}], "reasoning": False}, None
+        {"messages": [{"role": "user", "content": "hi"}], "reasoning": False}, None
     )
     assert off.request_context.reasoning is False
 
@@ -388,7 +388,7 @@ def _md_ctx(messages, reasoning: bool = False) -> ChatRequest:
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
     return MoondreamChatSkill().build_request(
-        None, {"messages": messages, "reasoning": reasoning}, None
+        {"messages": messages, "reasoning": reasoning}, None
     ).request_context
 
 
@@ -440,7 +440,7 @@ def test_moondream_accepts_multiple_images() -> None:
         {"type": "image_url", "image_url": {"url": _IMG}},
         {"type": "text", "text": "compare"},
     ]}]
-    ctx = MoondreamChatSkill().build_request(None, {"messages": msgs}, None).request_context
+    ctx = MoondreamChatSkill().build_request({"messages": msgs}, None).request_context
     assert len(ctx.images) == 2
 
 

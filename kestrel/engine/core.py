@@ -71,10 +71,12 @@ from kestrel.skills import (
     AR_DEFAULT_TEMPERATURE,
     AR_DEFAULT_TOP_P,
     DecodeStep,
+    MediaInput,
     SkillRegistry,
     SkillSpec,
     SkillState,
 )
+from kestrel.utils.image import LegacyImageInput
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.photon import PhotonReporter
@@ -526,33 +528,54 @@ class InferenceEngine:
         for runtime in self._runtimes.values():
             runtime.shutdown()
 
+    @staticmethod
+    def _media_to_legacy_image(
+        media: "tuple[MediaInput, ...]",
+    ) -> object | None:
+        """Adapt ordered ``BuiltRequest.media`` to the legacy image value.
+
+        This helper validates modality only. Concrete image payload validation
+        remains in ``_submit_request``.
+        """
+        if not media:
+            return None
+        kinds = {item.kind for item in media}
+        if kinds != {"image"}:
+            raise NotImplementedError(
+                "non-image request media is unsupported"
+            )
+        if len(media) == 1:
+            return media[0].data
+        return tuple(item.data for item in media)
+
     async def _run_skill(
         self,
         skill_name: str,
         *,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
         stream: bool = False,
     ) -> "EngineResult | EngineStream":
         """Validate + build via the model's skill, then submit.
 
-        The skill (model-owned) validates the raw ``prompt``/``settings``
-        and assembles its request + sampling params; the engine adds the
+        ``prompt`` is the complete capability prompt — media included. The
+        skill (model-owned) validates the raw ``prompt``/``settings`` and
+        assembles its request + sampling params; the engine adds the
         decode-pipeline concerns it owns (adapter, logprobs, generated
         prefix, suppressed tokens) and submits. The kernel never builds or
         inspects a model's request type.
         """
         built = self._skill_registry().resolve(skill_name).build_request(
-            image, prompt, settings
+            prompt, settings
         )
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        # A skill may carry media it pulled out of its own prompt (e.g. an
-        # image inside chat messages); prefer it over the top-level argument.
-        effective_image = built.image if built.image is not None else image
+        effective_image = cast(
+            Optional[LegacyImageInput],
+            self._media_to_legacy_image(built.media),
+        )
         submit_fn = self.submit_streaming if stream else self.submit
         return await submit_fn(
             built.request_context,
@@ -574,7 +597,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[np.ndarray | bytes] = None,
+        image: Optional[LegacyImageInput] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -648,8 +671,8 @@ class InferenceEngine:
     ) -> Union[EngineResult, EngineStream]:
         return await self._run_skill(
             "query",
-            image=image,
             prompt={
+                "image": image,
                 "question": question,
                 "reasoning": reasoning,
                 "stream": stream,
@@ -677,7 +700,6 @@ class InferenceEngine:
             prompt["reasoning"] = reasoning
         return await self._run_skill(
             "chat",
-            image=None,
             prompt=prompt,
             settings=settings,
             stream=stream,
@@ -693,8 +715,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "point",
-            image=image,
-            prompt={"object": object, "spatial_refs": spatial_refs},
+            prompt={"image": image, "object": object, "spatial_refs": spatial_refs},
             settings=settings,
         )
 
@@ -738,8 +759,7 @@ class InferenceEngine:
     ) -> Union[EngineResult, EngineStream]:
         return await self._run_skill(
             "caption",
-            image=image,
-            prompt={"length": length, "stream": stream},
+            prompt={"image": image, "length": length, "stream": stream},
             settings=settings,
             stream=stream,
         )
@@ -752,8 +772,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "detect",
-            image=image,
-            prompt={"object": object},
+            prompt={"image": image, "object": object},
             settings=settings,
         )
 
@@ -767,8 +786,7 @@ class InferenceEngine:
     ) -> EngineResult:
         return await self._run_skill(
             "segment",
-            image=image,
-            prompt={"object": object, "spatial_refs": spatial_refs},
+            prompt={"image": image, "object": object, "spatial_refs": spatial_refs},
             settings=settings,
         )
 
@@ -779,7 +797,7 @@ class InferenceEngine:
         max_new_tokens: int,
         skill: str,
         adapter: Optional[str] = None,
-        image: Optional[np.ndarray | bytes] = None,
+        image: Optional[LegacyImageInput] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -1011,7 +1029,7 @@ class InferenceEngine:
         max_new_tokens: int,
         request_context: object,
         adapter: Optional[str],
-        image: Optional[np.ndarray | bytes],
+        image: Optional[LegacyImageInput],
         temperature: Optional[float],
         top_p: Optional[float],
         return_logprobs: Optional[bool],

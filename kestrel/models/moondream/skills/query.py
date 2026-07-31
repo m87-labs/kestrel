@@ -16,6 +16,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_TOP_P,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -44,10 +45,10 @@ class QuerySkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         question = prompt.get("question")
         if question is None:
             raise ValueError("question must be provided")
@@ -75,6 +76,11 @@ class QuerySkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
+            media=(
+                (MediaInput(kind="image", data=image),)
+                if image is not None
+                else ()
+            ),
         )
 
     def prompt_text(self, request_context: object) -> str:

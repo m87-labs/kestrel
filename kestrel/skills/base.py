@@ -7,7 +7,7 @@ types they exchange with the kernel. Concrete skills live with their model.
 
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Literal, Mapping, Optional, Sequence
 
 if False:  # pragma: no cover - type-checking imports
     import numpy as np
@@ -43,25 +43,41 @@ class SkillSettings:
     max_tokens: int
 
 
+MediaKind = Literal["image", "audio", "video"]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class MediaInput:
+    """One ordered media item a skill extracted from its prompt.
+
+    ``data`` is the raw, model-defined payload (e.g. an ``np.ndarray`` or
+    encoded ``bytes`` for an image).
+    """
+
+    kind: MediaKind
+    data: object = field(repr=False)
+
+
 @dataclass(frozen=True, slots=True)
 class BuiltRequest:
     """What a skill's ``build_request`` hands back to the engine.
 
     Carries the assembled per-capability ``request_context`` plus the
     sampling params the skill resolved (the engine threads these into the
-    scheduler). The skill owns all of it — token budget included
-    (detect/point derive ``max_new_tokens`` from ``max_objects``).
+    scheduler). ``request_context`` is the skill-owned, complete validated
+    request and may retain its media. ``media`` is the ordered engine-facing
+    projection used to enter preprocessing and scheduling. The skill owns the
+    complete request — token budget included (detect/point derive
+    ``max_new_tokens`` from ``max_objects``).
     """
 
     request_context: object
     max_new_tokens: int
     temperature: float
     top_p: float
-    # Media the skill extracted from its own prompt (e.g. an image carried
-    # inside OpenAI chat messages). When set, the engine sends this through
-    # the image pipeline instead of the top-level ``image`` argument; ``None``
-    # leaves any caller-supplied ``image`` in force.
-    image: "Optional[np.ndarray | bytes]" = None
+    # Ordered engine-facing projection of media in the skill-owned request.
+    # The engine consumes media only through this field.
+    media: tuple[MediaInput, ...] = ()
 
 
 def parse_settings(
@@ -110,17 +126,19 @@ class SkillSpec:
 
     def build_request(
         self,
-        image: "Optional[np.ndarray | bytes]",
         prompt: "Mapping[str, object]",
         settings: "Optional[Mapping[str, object]]",
     ) -> "BuiltRequest":
         """Validate raw inputs and build this capability's request.
 
         Both ``prompt`` and ``settings`` are raw, model-defined maps — the
-        seam carries no model assumptions. ``prompt`` is the per-capability
-        payload (e.g. ``{"object": ...}`` for detect/point/segment,
-        ``{"question": ..., "reasoning": ...}`` for query, ``{"length":
-        ...}`` for caption). AR skills parse ``settings`` with
+        seam carries no model assumptions. ``prompt`` is the *complete*
+        per-capability payload, media included (e.g. ``{"image": ...,
+        "object": ...}`` for detect/point/segment, ``{"image": ...,
+        "question": ..., "reasoning": ...}`` for query, images inside
+        ``messages`` for chat). The skill parses any media out of the
+        prompt and returns it as ordered :class:`MediaInput` items on
+        ``BuiltRequest.media``. AR skills parse ``settings`` with
         :func:`parse_settings`; a single-pass capability reads whatever its
         model defines. Returns a :class:`BuiltRequest` (the request_context
         plus resolved sampling params). Raises ``ValueError`` on invalid

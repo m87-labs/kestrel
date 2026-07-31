@@ -11,6 +11,7 @@ from ..runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.skills.base import (
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -45,10 +46,10 @@ class DetectSkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         obj = str(prompt.get("object", "")).strip()
         if not obj:
             raise ValueError("object must be a non-empty string")
@@ -72,6 +73,11 @@ class DetectSkill(SkillSpec):
             max_new_tokens=max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
+            media=(
+                (MediaInput(kind="image", data=image),)
+                if image is not None
+                else ()
+            ),
         )
 
     def prompt_text(self, request_context: object) -> str:

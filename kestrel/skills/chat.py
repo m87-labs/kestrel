@@ -26,8 +26,6 @@ from collections.abc import Mapping as _Mapping, Sequence as _Sequence
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
-
 from kestrel.runtime.tokens import TextToken, Token
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
@@ -35,6 +33,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_TOP_P,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -113,7 +112,6 @@ class ChatSkill(SkillSpec):
 
     def build_request(
         self,
-        image: "Optional[np.ndarray | bytes]",
         prompt: "_Mapping",
         settings: "Optional[_Mapping]",
     ) -> BuiltRequest:
@@ -168,7 +166,7 @@ class ChatSkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
-            image=tuple(images) if images else None,
+            media=tuple(MediaInput(kind="image", data=img) for img in images),
         )
 
     def prompt_text(self, request_context: object) -> str:

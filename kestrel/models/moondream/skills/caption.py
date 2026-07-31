@@ -14,6 +14,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_TOP_P,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -45,10 +46,10 @@ class CaptionSkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         if image is None:
             raise ValueError("image must be provided for captioning")
         length = str(prompt.get("length", "normal")).strip().lower() or "normal"
@@ -71,6 +72,7 @@ class CaptionSkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
+            media=(MediaInput(kind="image", data=image),),
         )
 
     def prompt_text(self, request_context: object) -> str:

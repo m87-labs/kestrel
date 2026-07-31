@@ -21,6 +21,7 @@ from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
     BuiltRequest,
     DecodeStep,
+    MediaInput,
     SkillFinalizeResult,
     SkillSpec,
     SkillState,
@@ -51,10 +52,10 @@ class SegmentSkill(SkillSpec):
 
     def build_request(
         self,
-        image: Optional[np.ndarray | bytes],
         prompt: Mapping[str, object],
         settings: Optional[Mapping[str, object]],
     ) -> BuiltRequest:
+        image = prompt.get("image")
         obj = str(prompt.get("object", "")).strip()
         if not obj:
             raise ValueError("object must be a non-empty string")
@@ -75,6 +76,7 @@ class SegmentSkill(SkillSpec):
             max_new_tokens=s.max_tokens,
             temperature=s.temperature,
             top_p=s.top_p,
+            media=(MediaInput(kind="image", data=image),),
         )
 
     def prompt_text(self, request_context: object) -> str:

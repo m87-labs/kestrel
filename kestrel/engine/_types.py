@@ -30,6 +30,7 @@ import numpy as np
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
 from kestrel.models.moondream.runtime import Token
 from kestrel.skills import SkillSpec, SkillState
+from kestrel.utils.image import LegacyImageInput
 
 @dataclass(slots=True)
 class EngineMetrics:
@@ -277,7 +278,7 @@ class _AutoregressiveRequest:
     request_id: int
     prompt: str
     prompt_tokens: Sequence[Token]
-    image: Optional[np.ndarray | bytes]
+    image: Optional[LegacyImageInput]
     image_hash: Optional[bytes]  # SHA256 hash for prefix caching
     max_new_tokens: int
     temperature: float
@@ -301,7 +302,7 @@ class _ReadyAdmission:
     prefix_cache_hit: bool
 
 
-def _hash_image(image: "np.ndarray | bytes | Sequence[np.ndarray | bytes]") -> bytes:
+def _hash_image(image: LegacyImageInput) -> bytes:
     """SHA-256 over the raw image input(s) for prefix-cache keying.
 
     A chat request may carry several images (an ordered list); hash them in

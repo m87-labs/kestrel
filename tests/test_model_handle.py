@@ -135,21 +135,17 @@ def test_unsupported_capability_raises_clearly() -> None:
 def _capture_run_skill(captured: dict[str, Any]):
     """Return a stub ``_run_skill`` that records how the handle called it."""
 
-    async def run_skill(task: str, *, image: Any, prompt: Any,
-                        settings: Any, stream: Any) -> str:
-        captured.update(
-            task=task, image=image, prompt=prompt, settings=settings, stream=stream
-        )
+    async def run_skill(task: str, *, prompt: Any, settings: Any, stream: Any) -> str:
+        captured.update(task=task, prompt=prompt, settings=settings, stream=stream)
         return "RESULT"
 
     return run_skill
 
 
 def test_default_ar_verb_routes_through_skill() -> None:
-    """A default-AR capability passes its raw prompt to the model's skill via
-    the engine's skill path — the handle adds no model knowledge. ``image`` is
-    just another prompt key; the handle lifts it out for the engine's image
-    path rather than privileging it in the signature."""
+    """A default-AR capability passes its complete prompt — media included —
+    to the model's skill via the engine's skill path; the handle adds no
+    model knowledge and privileges no prompt key."""
     eng = _engine()
     captured: dict[str, Any] = {}
     eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
@@ -158,20 +154,23 @@ def test_default_ar_verb_routes_through_skill() -> None:
     out = asyncio.run(h.query(image=img, question="what is this?", reasoning=True))
     assert out == "RESULT"
     assert captured["task"] == "query"
-    assert captured["image"] is img  # lifted out of the prompt
-    assert captured["prompt"] == {"question": "what is this?", "reasoning": True}
+    assert captured["prompt"] == {
+        "image": img,
+        "question": "what is this?",
+        "reasoning": True,
+    }
+    assert captured["prompt"]["image"] is img
 
 
 def test_text_only_query_through_handle() -> None:
     """A text-only query (no image) must work through the handle — image is
-    optional and defaults to None."""
+    just an absent prompt key."""
     eng = _engine()
     captured: dict[str, Any] = {}
     eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
     h = eng.model("ar-model")
     out = asyncio.run(h.query(question="just text?"))  # no image
     assert out == "RESULT"
-    assert captured["image"] is None
     assert captured["prompt"] == {"question": "just text?"}
 
 
