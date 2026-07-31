@@ -2076,7 +2076,7 @@ class GenerationScheduler:
 
             # One H2D copy stages batch_idx/input_pos/lora_slot_ids together
             # (they share a packed buffer) instead of three separate launches.
-            slot.meta.copy_inputs_to_gpu()
+            slot.meta.inputs.copy_to_gpu()
             batch_idx = slot.meta.batch_idx.gpu[:batch_size]
 
             # Gather decode inputs from _pending_token_ids into slot staging.

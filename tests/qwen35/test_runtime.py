@@ -15,7 +15,7 @@ import kestrel.models.qwen35.qwen_model as qwen_model
 from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.models import get_spec, known_models
-from kestrel.models.qwen35.decode_slot import Qwen35DecodeSlot
+from kestrel.runtime.decode_slot import DecodeSlot
 from kestrel.models.qwen35.paged_cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
@@ -194,7 +194,7 @@ def test_modelspecs_register_on_import():
 
 
 def test_decode_slot_implements_constraint_buffer_abi():
-    names = {field.name for field in fields(Qwen35DecodeSlot)}
+    names = {field.name for field in fields(DecodeSlot)}
     assert {"disallow_mask", "mask_ready_event"} <= names
 
 
@@ -460,8 +460,13 @@ def test_topk_router_matches_full_softmax_renormalization():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_runtime_constructs():
+def test_runtime_constructs(monkeypatch):
     from tokenizers import Tokenizer
+    from kestrel.models.qwen35 import generated_decode
+
+    monkeypatch.setattr(
+        generated_decode, "create_generated_decode", lambda _runtime: None
+    )
 
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
     rt = Qwen35Runtime(cfg, kv_pool=KVMemoryPool(device=cfg.resolved_device()))
@@ -495,7 +500,13 @@ def test_runtime_constructs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_runtime_generate_produces_text():
+def test_runtime_generate_produces_text(monkeypatch):
+    from kestrel.models.qwen35 import generated_decode
+
+    monkeypatch.setattr(
+        generated_decode, "create_generated_decode", lambda _runtime: None
+    )
+
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
     rt = Qwen35Runtime(cfg, kv_pool=KVMemoryPool(device=cfg.resolved_device()))
     answer = rt.generate("What is 2+2?", max_new_tokens=32)
@@ -1058,7 +1069,8 @@ def test_linear_state_pool_refuses_unsupported_in_place_layout_change():
 
 @requires_mkl
 def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
+    from kestrel.runtime.generated_decode import GeneratedDecode
     from mkl.compiler import frontend
     from mkl.megakernel import device_runtime
     from mkl.megakernel.state_runtime import StateRepresentationRequirement
@@ -1166,8 +1178,9 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     ]
     runtime = SimpleNamespace(
         device=torch.device("cuda:0"),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         primary_stream=primary_stream,
+        compute_stream=primary_stream,
         model=SimpleNamespace(
             model=SimpleNamespace(
                 language_model=text_model
@@ -1192,6 +1205,8 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
         ),
         decode_slots=slots,
         _decode_rope_deltas=torch.zeros(1, 1, dtype=torch.int32),
+        _gather_decode_rope_deltas=lambda *_args: None,
+        _prepare_decode_position_ids=lambda *_args: None,
     )
 
     monkeypatch.setattr(
@@ -1246,8 +1261,18 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     bundle_c8 = object()
     validated_c1 = SimpleNamespace(program=compiled_c1)
     validated_c8 = SimpleNamespace(program=compiled_c8)
-    generated = megakernel_decode.Qwen35DecodeMegakernel(
+    captured = {}
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "try_create",
+        classmethod(
+            lambda cls, bound_runtime, spec: captured.setdefault("spec", spec)
+        ),
+    )
+    generated_decode.create_generated_decode(runtime)
+    generated = GeneratedDecode(
         runtime,
+        spec=captured["spec"],
         programs={
             1: (compiled_c1, validated_c1, bundle_c1),
             8: (compiled_c8, validated_c8, bundle_c8),
@@ -1320,7 +1345,7 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
 
 @requires_mkl
 def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
     from mkl.megakernel.device_runtime import DeviceRuntimeError
 
     calls = []
@@ -1334,6 +1359,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
         dtype=torch.bfloat16,
         max_batch_size=1,
         _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
         _linear_state_pool=SimpleNamespace(
             initialize_from_config=lambda *args, **kwargs: calls.append(
                 ("initialize", args, kwargs)
@@ -1355,7 +1381,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
         return _fake_capacity_compiled(batch_capacity)
 
     monkeypatch.setattr(
-        megakernel_decode, "_compile_from_config", compile_config)
+        generated_decode, "_compile_from_config", compile_config)
     # The AOT boundary requires a validation certificate -- stub the mint so bundle resolution
     # receives the ValidatedProgram rather than the raw artifact.
     monkeypatch.setattr(
@@ -1373,7 +1399,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
         DeviceRuntimeError,
         match=r"missing active extents \[1\].*unresolved artifacts",
     ):
-        megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime)
+        generated_decode.create_generated_decode(runtime)
     assert calls[0] == ("properties", torch.device("cuda:0"))
     assert [
         call for call in calls if call[0] == "compile"
@@ -1392,7 +1418,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
 
 @requires_mkl
 def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
     from mkl.compiler.frontend.models import qwen as qwen_frontend
 
     calls = []
@@ -1423,7 +1449,7 @@ def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
         layer_types=["linear_attention", "full_attention"] * 32,
     )
 
-    assert megakernel_decode._compile_from_config(
+    assert generated_decode._compile_from_config(
         config,
         num_ctas=132,
         gpu="NVIDIA H100 80GB HBM3",
@@ -1457,7 +1483,8 @@ def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
 
 @requires_mkl
 def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
     calls = []
     runtime = SimpleNamespace(
@@ -1466,6 +1493,7 @@ def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch)
         dtype=torch.bfloat16,
         device=torch.device("cuda:0"),
         _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
         _linear_state_pool=SimpleNamespace(
             initialize_from_config=lambda *_args, **_kwargs: None),
         model=SimpleNamespace(model=SimpleNamespace(
@@ -1478,7 +1506,7 @@ def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch)
             multi_processor_count=132, major=9, minor=0, name="test-gpu"),
     )
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         lambda _config, *, batch_capacity, **_kwargs: calls.append(
             batch_capacity) or _fake_capacity_compiled(batch_capacity),
@@ -1492,21 +1520,22 @@ def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch)
         lambda validated, *, arch: SimpleNamespace(validated=validated, arch=arch),
     )
     monkeypatch.setattr(
-        megakernel_decode.Qwen35DecodeMegakernel,
+        GeneratedDecode,
         "__init__",
-        lambda self, _runtime, *, programs: setattr(self, "programs", programs),
+        lambda self, _runtime, *, spec, programs: setattr(
+            self, "_programs", programs
+        ),
     )
 
-    result = megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime)
+    result = generated_decode.create_generated_decode(runtime)
     assert calls == [1, 2]
-    assert set(result.programs) == {1, 2}
+    assert set(result._programs) == {1, 2}
 
 
 @requires_mkl
 def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
-    monkeypatch,
 ):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
     launches = []
     preparation_calls = []
@@ -1516,29 +1545,30 @@ def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
         preparation_calls.append(("launch", kwargs))
 
     invocation = SimpleNamespace(launch=launch)
-    megakernel = megakernel_decode.Qwen35DecodeMegakernel.__new__(
-        megakernel_decode.Qwen35DecodeMegakernel
-    )
+    megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {
         capacity: object() for capacity in (1, 2, 4, 8, 16)
     }
     megakernel._slots = {
         (7, 16): SimpleNamespace(
             invocation=invocation,
-            uses_kv_len=True,
+            argument_names={"active_batch", "kv_len"},
         )
     }
-    megakernel._input_preparation_plan = (
-        SimpleNamespace(name="first"),
-        SimpleNamespace(name="second"),
+    megakernel._input_preparation_plan = ("first", "second")
+    megakernel._spec = SimpleNamespace(
+        preparation_callbacks={
+            name: (
+                lambda slot, batch_size, name=name:
+                preparation_calls.append((name, slot.slot_id, batch_size))
+            )
+            for name in ("first", "second")
+        },
+        launch_extents=lambda slot, batch_size: {
+            "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
+            "active_batch": batch_size,
+        },
     )
-    megakernel._input_preparation_callbacks = {
-        name: (
-            lambda slot, batch_size, name=name:
-            preparation_calls.append((name, slot.slot_id, batch_size))
-        )
-        for name in ("first", "second")
-    }
     slot = SimpleNamespace(
         slot_id=7,
         compute_stream="stream",
@@ -1549,12 +1579,6 @@ def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
         hidden_last=torch.empty((16, 3)),
         logits=torch.empty((16, 3)),
     )
-    monkeypatch.setattr(
-        torch.cuda,
-        "stream",
-        lambda _stream: contextlib.nullcontext(),
-    )
-
     assert megakernel.supports(11)
     megakernel.run(slot, batch_size=11)
 
@@ -1567,22 +1591,30 @@ def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
 
 
 def test_decode_megakernel_factory_rejects_non_bf16_runtime(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
 
-    runtime = SimpleNamespace(max_batch_size=1, dtype=torch.float16)
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        dtype=torch.float16,
+        device=torch.device("cuda:0"),
+        _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
+        model=SimpleNamespace(model=SimpleNamespace(
+            language_model=SimpleNamespace(config="config"))),
+    )
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         lambda *_args, **_kwargs: pytest.fail(
             "an ineligible runtime must not compile or resolve a B1 artifact"
         ),
     )
 
-    assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 def test_decode_megakernel_factory_rejects_non_unit_kv_pages(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
 
     runtime = SimpleNamespace(
         max_batch_size=1,
@@ -1596,22 +1628,26 @@ def test_decode_megakernel_factory_rejects_non_unit_kv_pages(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         lambda *_args, **_kwargs: pytest.fail(
             "an ineligible runtime must not compile or resolve a B1 artifact"
         ),
     )
 
-    assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 def test_decode_megakernel_factory_uses_native_without_compiler(monkeypatch):
     import builtins
 
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
 
-    runtime = SimpleNamespace(device=torch.device("cuda:0"))
+    runtime = SimpleNamespace(
+        device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        _paged_kv=SimpleNamespace(layers=()),
+    )
     real_import = builtins.__import__
 
     def import_without_mkl(name, *args, **kwargs):
@@ -1623,15 +1659,23 @@ def test_decode_megakernel_factory_uses_native_without_compiler(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", import_without_mkl)
 
-    assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 def test_decode_megakernel_factory_rejects_incomplete_compiler(monkeypatch):
     import builtins
 
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
 
-    runtime = SimpleNamespace(device=torch.device("cuda:0"))
+    runtime = SimpleNamespace(
+        device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        max_batch_size=1,
+        _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
+        model=SimpleNamespace(model=SimpleNamespace(
+            language_model=SimpleNamespace(config="config"))),
+    )
     real_import = builtins.__import__
 
     def import_with_incomplete_mkl(name, *args, **kwargs):
@@ -1644,16 +1688,12 @@ def test_decode_megakernel_factory_rejects_incomplete_compiler(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", import_with_incomplete_mkl)
 
-    with pytest.raises(
-        ModuleNotFoundError,
-        match="mkl.compiler.frontend.gpu_model",
-    ):
-        megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime)
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 @requires_mkl
 def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
 
     config = SimpleNamespace()
     runtime = SimpleNamespace(
@@ -1663,6 +1703,10 @@ def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch
             )
         ),
         device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        max_batch_size=1,
+        _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1676,22 +1720,22 @@ def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch
     )
 
     def reject_config(*_args, **_kwargs):
-        raise megakernel_decode._UnsupportedDecodeConfig("unsupported")
+        raise generated_decode._UnsupportedDecodeConfig("unsupported")
 
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         reject_config,
     )
 
-    assert megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 @requires_mkl
 def test_decode_megakernel_factory_fails_closed_without_device_calibration(
     monkeypatch,
 ):
-    from kestrel.models.qwen35 import megakernel_decode
+    from kestrel.models.qwen35 import generated_decode
     from mkl.compiler.frontend.gpu_model import CalibrationUnavailable
     from mkl.megakernel.device_runtime import DeviceRuntimeError
 
@@ -1702,6 +1746,10 @@ def test_decode_megakernel_factory_fails_closed_without_device_calibration(
             )
         ),
         device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        max_batch_size=1,
+        _paged_kv=SimpleNamespace(layers=()),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1718,7 +1766,7 @@ def test_decode_megakernel_factory_fails_closed_without_device_calibration(
         raise CalibrationUnavailable("NVIDIA H200 has no calibration")
 
     monkeypatch.setattr(
-        megakernel_decode,
+        generated_decode,
         "_compile_from_config",
         reject_uncalibrated_device,
     )
@@ -1733,7 +1781,7 @@ def test_decode_megakernel_factory_fails_closed_without_device_calibration(
         DeviceRuntimeError,
         match="no calibration for 'NVIDIA H200'",
     ):
-        megakernel_decode.Qwen35DecodeMegakernel.try_create(runtime)
+        generated_decode.create_generated_decode(runtime)
 
 
 class _FakeEvent:
@@ -1940,7 +1988,7 @@ def test_zero_decode_graph_capture_buffers_initializes_and_clears_gdn_state():
         slot_mapping=torch.ones((3, 1), dtype=torch.long),
         cache_position_ids=torch.ones((3, 1), dtype=torch.long),
         position_ids=torch.ones((4, 3, 1), dtype=torch.long),
-        rope_deltas=torch.ones((3, 1), dtype=torch.long),
+        scratch={"rope_deltas": torch.ones((3, 1), dtype=torch.long)},
         sampled_ids=torch.ones((3,), dtype=torch.long),
         sampled_logprobs=torch.ones((3,), dtype=torch.float32),
         logits=torch.ones((3, 8), dtype=torch.bfloat16),
@@ -2105,7 +2153,7 @@ def test_prepare_decode_position_ids_uses_per_row_rope_deltas():
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     slot = SimpleNamespace(
         cache_position_ids=torch.tensor([[10], [20]], dtype=torch.long),
-        rope_deltas=torch.tensor([[5], [7]], dtype=torch.long),
+        scratch={"rope_deltas": torch.tensor([[5], [7]], dtype=torch.long)},
         position_ids=torch.empty((4, 2, 1), dtype=torch.long),
     )
 

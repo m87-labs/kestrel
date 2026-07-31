@@ -1,30 +1,25 @@
-"""Per-slot decode resources for Qwen 3.5."""
+"""Model-agnostic resources for autoregressive decode slots."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor
 
+from kestrel.device import make_event
+from kestrel.scheduler.transfer import RenderBuffer
+from kestrel.utils import CpuGpuBuffer, PackedBuffer
 
-class Qwen35DecodeMetaBuffers:
-    """Per-step decode inputs packed into one staging buffer.
 
-    ``batch_idx`` / ``input_pos`` / ``lora_slot_ids`` share a single
-    :class:`PackedBuffer`, so the scheduler stages them with one H2D copy
-    (``copy_inputs_to_gpu``) instead of three. They are exposed as
-    :class:`PackedField` views, so the runtime's graph-capture zeroing and
-    forward paths read/write ``.np``/``.cpu``/``.gpu`` exactly as before.
-    """
+class DecodeMetaBuffers:
+    """Scheduler-owned per-step inputs staged by one packed H2D copy."""
 
     def __init__(
         self, *, max_batch_slots: int, device: torch.device, pin_memory: bool
     ) -> None:
-        from kestrel.utils import PackedBuffer
-
-        self._inputs = PackedBuffer(
+        self.inputs = PackedBuffer(
             [
                 ("batch_idx", (max_batch_slots,), torch.int64),
                 ("input_pos", (max_batch_slots,), torch.int32),
@@ -33,35 +28,22 @@ class Qwen35DecodeMetaBuffers:
             device=device,
             pin_memory=pin_memory,
         )
-
-    @property
-    def batch_idx(self) -> Any:
-        return self._inputs.batch_idx
-
-    @property
-    def input_pos(self) -> Any:
-        return self._inputs.input_pos
-
-    @property
-    def lora_slot_ids(self) -> Any:
-        return self._inputs.lora_slot_ids
-
-    def copy_inputs_to_gpu(self) -> None:
-        """Stage batch_idx/input_pos/lora_slot_ids to the GPU in one H2D copy."""
-        self._inputs.copy_to_gpu()
+        self.batch_idx = self.inputs.batch_idx
+        self.input_pos = self.inputs.input_pos
+        self.lora_slot_ids = self.inputs.lora_slot_ids
 
 
 @dataclass
-class Qwen35DecodeSlot:
+class DecodeSlot:
     slot_id: int
-    meta: Qwen35DecodeMetaBuffers
+    meta: DecodeMetaBuffers
     compute_stream: Any
     paged_kv_page_table: Tensor
     paged_kv_seqlens_k: Tensor
     slot_mapping: Tensor
     cache_position_ids: Tensor
     position_ids: Tensor
-    rope_deltas: Tensor
+    scratch: dict[str, Tensor]
     sampled_ids: Tensor
     sampled_logprobs: Tensor
     logits: Tensor
@@ -74,7 +56,7 @@ class Qwen35DecodeSlot:
     mask_ready_event: Any
 
 
-def create_qwen35_decode_slot(
+def create_decode_slot(
     slot_id: int,
     *,
     device: torch.device,
@@ -83,21 +65,21 @@ def create_qwen35_decode_slot(
     kv_cache_pages: int,
     vocab_size: int,
     hidden_dim: int,
+    position_shape: tuple[int, ...],
+    scratch_specs: Mapping[str, tuple[tuple[int, ...], torch.dtype]] | None = None,
     compute_stream: Any,
     copy_stream: Any,
-) -> Qwen35DecodeSlot:
-    from kestrel.device import make_event
-    from kestrel.scheduler.transfer import RenderBuffer
-    from kestrel.utils import CpuGpuBuffer
+) -> DecodeSlot:
+    """Allocate the scheduler/runtime ABI from model-derived dimensions."""
 
     pin = device.type == "cuda"
-    meta = Qwen35DecodeMetaBuffers(
-        max_batch_slots=max_batch_slots, device=device, pin_memory=pin
-    )
-
-    return Qwen35DecodeSlot(
+    return DecodeSlot(
         slot_id=slot_id,
-        meta=meta,
+        meta=DecodeMetaBuffers(
+            max_batch_slots=max_batch_slots,
+            device=device,
+            pin_memory=pin,
+        ),
         compute_stream=compute_stream,
         paged_kv_page_table=torch.empty(
             (max_batch_slots, kv_cache_pages),
@@ -119,16 +101,11 @@ def create_qwen35_decode_slot(
             dtype=torch.long,
             device=device,
         ),
-        position_ids=torch.empty(
-            (4, max_batch_slots, 1),
-            dtype=torch.long,
-            device=device,
-        ),
-        rope_deltas=torch.empty(
-            (max_batch_slots, 1),
-            dtype=torch.long,
-            device=device,
-        ),
+        position_ids=torch.empty(position_shape, dtype=torch.long, device=device),
+        scratch={
+            name: torch.empty(shape, dtype=tensor_dtype, device=device)
+            for name, (shape, tensor_dtype) in (scratch_specs or {}).items()
+        },
         sampled_ids=torch.empty((max_batch_slots,), dtype=torch.long, device=device),
         sampled_logprobs=torch.empty(
             (max_batch_slots,), dtype=torch.float32, device=device
@@ -154,8 +131,4 @@ def create_qwen35_decode_slot(
     )
 
 
-__all__ = [
-    "Qwen35DecodeMetaBuffers",
-    "Qwen35DecodeSlot",
-    "create_qwen35_decode_slot",
-]
+__all__ = ["DecodeMetaBuffers", "DecodeSlot", "create_decode_slot"]

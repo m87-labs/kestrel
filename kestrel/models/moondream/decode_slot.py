@@ -34,7 +34,7 @@ class DecodeMetaBuffers:
 
     The per-step decode inputs the scheduler stages every step — ``batch_idx``,
     ``input_pos`` and ``lora_slot_ids`` — share one :class:`PackedBuffer`, so
-    they upload in a single H2D copy (``copy_inputs_to_gpu``) instead of three.
+    they upload in a single H2D copy through ``inputs.copy_to_gpu()``.
     They are exposed as :class:`PackedField` views, so call sites read/write
     ``.np``/``.cpu``/``.gpu`` exactly as before. The MoE-LoRA ``active_*``
     buffers are staged separately (only on the LoRA path), so they stay
@@ -45,7 +45,7 @@ class DecodeMetaBuffers:
     """
 
     def __init__(self, *, max_batch_slots: int, device: torch.device) -> None:
-        self._inputs = PackedBuffer(
+        self.inputs = PackedBuffer(
             [
                 ("batch_idx", (max_batch_slots,), torch.int64),  # sequence batch idx
                 ("input_pos", (max_batch_slots,), torch.int32),  # token positions
@@ -74,19 +74,15 @@ class DecodeMetaBuffers:
 
     @property
     def batch_idx(self):
-        return self._inputs.batch_idx
+        return self.inputs.batch_idx
 
     @property
     def input_pos(self):
-        return self._inputs.input_pos
+        return self.inputs.input_pos
 
     @property
     def lora_slot_ids(self):
-        return self._inputs.lora_slot_ids
-
-    def copy_inputs_to_gpu(self) -> None:
-        """Stage batch_idx/input_pos/lora_slot_ids to the GPU in one H2D copy."""
-        self._inputs.copy_to_gpu()
+        return self.inputs.lora_slot_ids
 
 
 @dataclass

@@ -16,6 +16,7 @@ from torch import nn
 
 from kestrel.kv_cache import KVMemoryPool, PageTable
 from kestrel.runtime.decode_graph import DecodeGraphManager
+from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.state import SequenceState
 from kestrel.runtime.tokens import Token
 from kestrel.utils import CpuGpuBuffer
@@ -24,7 +25,6 @@ from kestrel.runtime.preprocessing import (
     derive_preprocessing_workers,
 )
 
-from .decode_slot import Qwen35DecodeSlot, create_qwen35_decode_slot
 from .paged_cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
@@ -380,6 +380,9 @@ class Qwen35Runtime:
             device=self.device,
             replay_capacity=self._replay_capacity,
         )
+        self._linear_state_pool.initialize_from_config(
+            text_cfg, dtype=self.dtype
+        )
         self._decode_rope_deltas = torch.zeros(
             (self.max_batch_slots, 1),
             dtype=torch.long,
@@ -407,7 +410,7 @@ class Qwen35Runtime:
         self.prefill_slots: Sequence[Any] = self._prefill_slots
 
         self._decode_slots = tuple(
-            create_qwen35_decode_slot(
+            create_decode_slot(
                 slot_id=i,
                 device=self.device,
                 dtype=self.dtype,
@@ -415,6 +418,13 @@ class Qwen35Runtime:
                 kv_cache_pages=self._kv_cache_pages,
                 vocab_size=int(text_cfg.vocab_size),
                 hidden_dim=int(text_cfg.hidden_size),
+                position_shape=(4, self.max_batch_slots, 1),
+                scratch_specs={
+                    "rope_deltas": (
+                        (self.max_batch_slots, 1),
+                        torch.long,
+                    ),
+                },
                 compute_stream=self.primary_stream,
                 copy_stream=self.copy_stream,
             )
@@ -423,7 +433,7 @@ class Qwen35Runtime:
         self.decode_slots: Sequence[Any] = self._decode_slots
         self._decode_caches = tuple(self._new_cache() for _ in self._decode_slots)
         self._decode_megakernel = None
-        self._decode_graphs = DecodeGraphManager[Qwen35DecodeSlot](
+        self._decode_graphs = DecodeGraphManager[DecodeSlot](
             enabled=self._use_cuda_graphs,
             device=self.device,
             max_batch=self.max_batch_size,
@@ -439,10 +449,9 @@ class Qwen35Runtime:
 
         self.spatial_tables = None
 
-        if self.device.type == "cuda":
-            from .megakernel_decode import Qwen35DecodeMegakernel
+        from .generated_decode import create_generated_decode
 
-            self._decode_megakernel = Qwen35DecodeMegakernel.try_create(self)
+        self._decode_megakernel = create_generated_decode(self)
         self._decode_state_coordinator = None
         self._native_decode_state_requirements = ()
         if self._decode_megakernel is not None:
@@ -813,7 +822,7 @@ class Qwen35Runtime:
             self.page_table.erase(batch_idx, 0)
 
     @torch.inference_mode()
-    def decode_with_slot(self, slot: Qwen35DecodeSlot, batch_size: int) -> None:
+    def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         if batch_size == 0:
             return
         megakernel = getattr(self, "_decode_megakernel", None)
@@ -847,7 +856,7 @@ class Qwen35Runtime:
 
     def _zero_decode_graph_padding(
         self,
-        slot: Qwen35DecodeSlot,
+        slot: DecodeSlot,
         batch_size: int,
         graph_batch_size: int,
     ) -> None:
@@ -860,7 +869,7 @@ class Qwen35Runtime:
         slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
-    def _zero_decode_graph_capture_buffers(self, slot: Qwen35DecodeSlot) -> None:
+    def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
         text_cfg = self.architecture.text_config
         self._linear_state_pool.initialize_from_config(text_cfg, dtype=self.dtype)
         self._linear_state_pool.zero_all()
@@ -877,13 +886,13 @@ class Qwen35Runtime:
         slot.slot_mapping.zero_()
         slot.cache_position_ids.zero_()
         slot.position_ids.zero_()
-        slot.rope_deltas.zero_()
+        slot.scratch["rope_deltas"].zero_()
         slot.sampled_ids.zero_()
         slot.sampled_logprobs.zero_()
         slot.logits.zero_()
         slot.hidden_last.zero_()
 
-    def _prepare_decode_slot(self, slot: Qwen35DecodeSlot, batch_size: int) -> None:
+    def _prepare_decode_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         # Pure-Python step: bind the cache's linear (GDN) layers to the
         # runtime-owned persistent state. All GPU metadata prep lives in
         # ``_build_decode_metadata`` and runs inside ``_run_decode_forward`` so
@@ -896,7 +905,7 @@ class Qwen35Runtime:
         self._linear_state_pool.bind_to_cache(cache)
 
     def _build_decode_metadata(
-        self, slot: Qwen35DecodeSlot, batch_size: int
+        self, slot: DecodeSlot, batch_size: int
     ) -> None:
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
         input_pos = slot.meta.input_pos.gpu[:batch_size]
@@ -918,19 +927,19 @@ class Qwen35Runtime:
 
     def _gather_decode_rope_deltas(
         self,
-        slot: Qwen35DecodeSlot,
+        slot: DecodeSlot,
         batch_size: int,
     ) -> None:
         torch.index_select(
             self._decode_rope_deltas,
             0,
             slot.meta.batch_idx.gpu[:batch_size],
-            out=slot.rope_deltas[:batch_size],
+            out=slot.scratch["rope_deltas"][:batch_size],
         )
 
     def _prepare_decode_position_ids(
         self,
-        slot: Qwen35DecodeSlot,
+        slot: DecodeSlot,
         batch_size: int,
     ) -> None:
         # Row 0 carries the text position; the three spatial M-RoPE rows carry
@@ -940,9 +949,9 @@ class Qwen35Runtime:
         cache_position_ids = slot.cache_position_ids[:batch_size]
         position_ids = slot.position_ids[:, :batch_size, :]
         position_ids.copy_(cache_position_ids)
-        position_ids[1:].add_(slot.rope_deltas[:batch_size])
+        position_ids[1:].add_(slot.scratch["rope_deltas"][:batch_size])
 
-    def _run_decode_forward(self, slot: Qwen35DecodeSlot, batch_size: int) -> None:
+    def _run_decode_forward(self, slot: DecodeSlot, batch_size: int) -> None:
         self._build_decode_metadata(slot, batch_size)
         cache = self._decode_cache_for_slot(slot)
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
@@ -1799,7 +1808,7 @@ class Qwen35Runtime:
         if coordinator is not None:
             coordinator.mark_coherent(rows)
 
-    def _decode_cache_for_slot(self, slot: Qwen35DecodeSlot) -> Qwen35InferenceCache:
+    def _decode_cache_for_slot(self, slot: DecodeSlot) -> Qwen35InferenceCache:
         return self._decode_caches[int(slot.slot_id)]
 
     def _as_forward_cache(self, cache: Any) -> _QwenForwardCache:
