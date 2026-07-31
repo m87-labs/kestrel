@@ -13,12 +13,75 @@ import torch
 import kestrel.models.qwen35  # noqa: F401
 import kestrel.models.qwen35.qwen_model as qwen_model
 from kestrel.config import RuntimeConfig
-from kestrel.kv_cache import KVMemoryPool, PageTable
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.models import get_spec, known_models
 from kestrel.models.qwen35.decode_slot import Qwen35DecodeSlot
-from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool, Qwen35PagedHybridCache
-from kestrel.models.qwen35.qwen_compat import LinearAttentionLayer
+from kestrel.models.qwen35.paged_cache import (
+    Qwen35InferenceCache,
+    Qwen35LinearStatePool,
+    allocate_qwen35_paged_kv,
+)
+from kestrel.models.qwen35.inference_ops import LinearAttentionLayer
 from kestrel.models.qwen35.prompt_template import IMAGE_PAD_ID
+
+
+def _text_config_data(**overrides):
+    hidden = int(overrides.get("hidden_size", 8))
+    heads = int(overrides.get("num_attention_heads", 2))
+    data = {
+        "vocab_size": 32,
+        "hidden_size": hidden,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": heads,
+        "num_key_value_heads": 1,
+        "hidden_act": "silu",
+        "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 0],
+            "mrope_interleaved": True,
+        },
+        "attention_bias": False,
+        "head_dim": hidden // heads,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 2,
+        "linear_value_head_dim": 2,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 2,
+        "layer_types": ["full_attention"],
+    }
+    data.update(overrides)
+    return data
+
+
+def _qwen_config_data(*, text=None, **overrides):
+    text_data = _text_config_data(**(text or {}))
+    data = {
+        "model_type": "qwen3_5",
+        "text_config": text_data,
+        "vision_config": {
+            "depth": 1,
+            "hidden_size": 8,
+            "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "in_channels": 3,
+            "patch_size": 2,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "out_hidden_size": int(text_data["hidden_size"]),
+            "num_position_embeddings": 16,
+        },
+        "image_token_id": 30,
+        "video_token_id": 31,
+        "tie_word_embeddings": False,
+    }
+    data.update(overrides)
+    return data
 from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
 from kestrel.models.qwen35.qwen_model import (
     Qwen3_5Attention,
@@ -44,6 +107,28 @@ requires_mkl = pytest.mark.skipif(
 
 
 _MODEL_ID = "Qwen/Qwen3.5-2B"
+
+
+def _make_qwen_cache(
+    *,
+    config,
+    page_table,
+    pool,
+    dtype,
+    shared_paged_layers: LayeredPagedKV | None = None,
+    replay_capacity: int = 16,
+) -> Qwen35InferenceCache:
+    paged_kv = shared_paged_layers or allocate_qwen35_paged_kv(
+        config=config,
+        page_table=page_table,
+        pool=pool,
+        dtype=dtype,
+    )
+    return Qwen35InferenceCache(
+        config=config,
+        paged_kv=paged_kv,
+        replay_capacity=int(replay_capacity),
+    )
 
 
 def _fake_capacity_compiled(capacity: int):
@@ -95,12 +180,9 @@ def test_fused_qkv_attention_handles_multitoken_prefill_views():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=4,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 10000,
-            "partial_rotary_factor": 1.0,
-            "mrope_section": [1, 1, 0],
-        },
+        rope_theta=10000,
+        partial_rotary_factor=1.0,
+        mrope_section=(1, 1, 0),
     )
     attn = Qwen3_5Attention(cfg, layer_idx=0)
     rotary = Qwen3_5TextRotaryEmbedding(cfg)
@@ -124,12 +206,9 @@ def test_attention_updates_paged_cache_with_fused_value_view(monkeypatch):
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=4,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 10000,
-            "partial_rotary_factor": 1.0,
-            "mrope_section": [1, 1, 0],
-        },
+        rope_theta=10000,
+        partial_rotary_factor=1.0,
+        mrope_section=(1, 1, 0),
     )
     attn = Qwen3_5Attention(cfg, layer_idx=0)
     rotary = Qwen3_5TextRotaryEmbedding(cfg)
@@ -229,23 +308,15 @@ def test_paged_attention_delegates_device_support_to_runtime(monkeypatch):
 
 def test_moe_config_builds_sparse_mlp_with_checkpoint_keys():
     cfg = Qwen3_5Config.from_dict(
-        {
-            "model_type": "qwen3_5_moe",
-            "text_config": {
-                "model_type": "qwen3_5_moe_text",
-                "vocab_size": 32,
-                "hidden_size": 8,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "head_dim": 4,
-                "layer_types": ["full_attention"],
-                "moe_intermediate_size": 8,
-                "shared_expert_intermediate_size": 8,
+        _qwen_config_data(
+            text={
                 "num_experts": 4,
                 "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 8,
             },
-        }
+            model_type="qwen3_5_moe",
+        )
     )
 
     assert cfg.text_config.is_moe
@@ -286,12 +357,9 @@ def test_text_model_fused_layer_boundaries_match_layer_loop():
         head_dim=4,
         intermediate_size=16,
         layer_types=["full_attention", "full_attention"],
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 10000,
-            "partial_rotary_factor": 1.0,
-            "mrope_section": [1, 1, 0],
-        },
+        rope_theta=10000,
+        partial_rotary_factor=1.0,
+        mrope_section=(1, 1, 0),
     )
     torch.manual_seed(0)
     model = Qwen3_5TextModel(cfg).eval()
@@ -1045,7 +1113,7 @@ def test_text_forward_uses_compact_gdn_state_indices_for_compact_cache():
         page_table=torch.arange(8, dtype=torch.int32).view(8, 1),
         build_slot_mapping=lambda *, batch_idx, positions: batch_idx.view(-1, 1),
     )
-    cache = Qwen35PagedHybridCache(
+    cache = _make_qwen_cache(
         config=cfg,
         page_table=PageTable(n_pages=4, page_size=1, max_batch_size=4, device="cpu"),
         pool=KVMemoryPool(device=torch.device("cpu")),
@@ -1081,7 +1149,7 @@ def test_text_forward_preserves_packed_gdn_row_mapping():
         page_table=torch.arange(8, dtype=torch.int32).view(8, 1),
         build_slot_mapping=lambda *, batch_idx, positions: batch_idx.view(-1, 1),
     )
-    cache = Qwen35PagedHybridCache(
+    cache = _make_qwen_cache(
         config=cfg,
         page_table=PageTable(n_pages=4, page_size=1, max_batch_size=4, device="cpu"),
         pool=KVMemoryPool(device=torch.device("cpu")),
@@ -1274,7 +1342,7 @@ def test_recurrent_checkpoint_reset_retires_replay_by_cursor_only():
         linear_num_key_heads=2,
         linear_num_value_heads=2,
     )
-    layer = LinearAttentionLayer(cfg)
+    layer = LinearAttentionLayer(cfg, replay_capacity=cfg.linear_replay_capacity)
     first = torch.randn((2, 2, 3, 3), dtype=torch.float32)
     second = torch.randn_like(first)
 
@@ -1302,7 +1370,7 @@ def test_zero_replay_cursor_ignores_stale_payload_when_materializing():
         linear_num_key_heads=2,
         linear_num_value_heads=2,
     )
-    layer = LinearAttentionLayer(cfg)
+    layer = LinearAttentionLayer(cfg, replay_capacity=cfg.linear_replay_capacity)
     initial = torch.randn((2, 2, 3, 3), dtype=torch.float32)
     layer.update_recurrent_state(initial)
     checkpoint = torch.randn_like(layer.replay_checkpoint_states)
@@ -1598,7 +1666,7 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
                 )
             ),
         ),
-        _shared_paged_layers=[],
+        _paged_kv=SimpleNamespace(layers=()),
         page_table=SimpleNamespace(
             n_pages=8,
             page_table=torch.zeros(1, 8, dtype=torch.int32),
@@ -1746,7 +1814,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
         max_batch_size=1,
-        _shared_paged_layers=[],
+        _paged_kv=SimpleNamespace(layers=()),
         _linear_state_pool=SimpleNamespace(
             initialize_from_config=lambda *args, **kwargs: calls.append(
                 ("initialize", args, kwargs)
@@ -1831,10 +1899,8 @@ def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
         vocab_size=248320,
         rms_norm_eps=1e-6,
         tie_word_embeddings=False,
-        rope_parameters={
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [24, 20, 20],
-        },
+        partial_rotary_factor=0.25,
+        mrope_section=(24, 20, 20),
         layer_types=["linear_attention", "full_attention"] * 32,
     )
 
@@ -1880,7 +1946,7 @@ def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch)
         max_batch_slots=2,
         dtype=torch.bfloat16,
         device=torch.device("cuda:0"),
-        _shared_paged_layers=[],
+        _paged_kv=SimpleNamespace(layers=()),
         _linear_state_pool=SimpleNamespace(
             initialize_from_config=lambda *_args, **_kwargs: None),
         model=SimpleNamespace(model=SimpleNamespace(
@@ -2001,10 +2067,14 @@ def test_decode_megakernel_factory_rejects_non_unit_kv_pages(monkeypatch):
 
     runtime = SimpleNamespace(
         max_batch_size=1,
-        _shared_paged_layers=[SimpleNamespace(
-            k_cache=torch.empty(1, 1, 2, 1),
-            v_cache=torch.empty(1, 1, 2, 1),
-        )],
+        _paged_kv=SimpleNamespace(
+            layers=(
+                SimpleNamespace(
+                    k_cache=torch.empty(1, 1, 2, 1),
+                    v_cache=torch.empty(1, 1, 2, 1),
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(
         megakernel_decode,
@@ -2336,6 +2406,7 @@ def test_zero_decode_graph_capture_buffers_initializes_and_clears_gdn_state():
         config=cfg,
         max_batch_slots=3,
         device=torch.device("cpu"),
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
     rt._decode_rope_deltas = torch.ones((3, 1), dtype=torch.long)
     slot = SimpleNamespace(
@@ -2398,8 +2469,8 @@ def test_linear_state_pool_captures_gqa_value_head_replay_ring_cpu():
     # Build a hybrid cache and seed its single GDN layer's recurrent + ring state
     # (mirrors what a prefill does: update_recurrent_state -> _ensure_replay_state
     # allocates the value-head ring; we then fill the ring with non-zero rows).
-    cache = Qwen35PagedHybridCache.__new__(Qwen35PagedHybridCache)
-    layer = LinearAttentionLayer(cfg)
+    cache = Qwen35InferenceCache.__new__(Qwen35InferenceCache)
+    layer = LinearAttentionLayer(cfg, replay_capacity=cfg.linear_replay_capacity)
     cache.layers = [layer]
     conv_dim = 2 * num_k_heads * key_dim + num_v_heads * value_dim
     layer.conv_states = torch.randn((1, conv_dim, 5), dtype=torch.bfloat16)
@@ -2414,7 +2485,12 @@ def test_linear_state_pool_captures_gqa_value_head_replay_ring_cpu():
     layer.replay_k.copy_(torch.randn_like(layer.replay_k.float()).to(layer.replay_k.dtype))
     layer.replay_u.copy_(torch.randn_like(layer.replay_u))
     layer.replay_g.copy_(torch.randn_like(layer.replay_g))
-    pool = Qwen35LinearStatePool(config=cfg, max_batch_slots=4, device=device)
+    pool = Qwen35LinearStatePool(
+        config=cfg,
+        max_batch_slots=4,
+        device=device,
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
+    )
     pool.initialize_from_config(cfg, dtype=torch.bfloat16)
     storage = pool.layers[0]
     # The pool ring must be value-head shaped (the bug allocated it key-head sized).
@@ -2447,8 +2523,8 @@ def test_linear_state_pool_fresh_prefill_capture_skips_unreachable_replay_payloa
         linear_conv_kernel_dim=5,
         linear_replay_capacity=8,
     )
-    cache = Qwen35PagedHybridCache.__new__(Qwen35PagedHybridCache)
-    layer = LinearAttentionLayer(cfg)
+    cache = Qwen35InferenceCache.__new__(Qwen35InferenceCache)
+    layer = LinearAttentionLayer(cfg, replay_capacity=cfg.linear_replay_capacity)
     cache.layers = [layer]
     conv_dim = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + (
         cfg.linear_num_value_heads * cfg.linear_value_head_dim
@@ -2475,6 +2551,7 @@ def test_linear_state_pool_fresh_prefill_capture_skips_unreachable_replay_payloa
         config=cfg,
         max_batch_slots=3,
         device=torch.device("cpu"),
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
     pool.initialize_from_config(cfg, dtype=torch.bfloat16)
     storage = pool.layers[0]
@@ -2709,7 +2786,7 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
         device="cpu",
     )
     pool = KVMemoryPool(device=torch.device("cpu"))
-    shared_layers = Qwen35PagedHybridCache.build_shared_paged_layers(
+    shared_layers = allocate_qwen35_paged_kv(
         config=cfg,
         page_table=page_table,
         pool=pool,
@@ -2717,21 +2794,21 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
     )
     allocated_bytes = pool.allocated_bytes
 
-    first = Qwen35PagedHybridCache(
+    first = _make_qwen_cache(
         config=cfg,
         page_table=page_table,
         pool=pool,
         dtype=torch.float32,
         shared_paged_layers=shared_layers,
     )
-    second = Qwen35PagedHybridCache(
+    second = _make_qwen_cache(
         config=cfg,
         page_table=page_table,
         pool=pool,
         dtype=torch.float32,
         shared_paged_layers=shared_layers,
     )
-    decode_cache = Qwen35PagedHybridCache(
+    decode_cache = _make_qwen_cache(
         config=cfg,
         page_table=page_table,
         pool=pool,
@@ -2740,9 +2817,9 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
     )
 
     assert pool.allocated_bytes == allocated_bytes
-    assert first.layers[1] is shared_layers[1]
-    assert second.layers[1] is shared_layers[1]
-    assert decode_cache.layers[1] is shared_layers[1]
+    assert first.layers[1] is shared_layers.producer(1)
+    assert second.layers[1] is shared_layers.producer(1)
+    assert decode_cache.layers[1] is shared_layers.producer(1)
 
     first.layers[0].update_conv_state(torch.full((1, 2, 3), 1.0))
     first.layers[0].update_recurrent_state(torch.full((1, 2, 2), 11.0))
@@ -2755,6 +2832,7 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
         config=cfg,
         max_batch_slots=3,
         device=torch.device("cpu"),
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
     state_pool.capture_from_cache(1, first)
     state_pool.capture_from_cache(2, second)
@@ -2808,7 +2886,7 @@ def test_qwen_linear_state_pool_captures_batched_gdn_rows():
         max_batch_size=3,
         device="cpu",
     )
-    cache = Qwen35PagedHybridCache(
+    cache = _make_qwen_cache(
         config=cfg,
         page_table=page_table,
         pool=KVMemoryPool(device=torch.device("cpu")),
@@ -2834,6 +2912,7 @@ def test_qwen_linear_state_pool_captures_batched_gdn_rows():
         config=cfg,
         max_batch_slots=3,
         device=torch.device("cpu"),
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
 
     state_pool.capture_batch_from_cache(
@@ -2876,13 +2955,13 @@ def test_qwen_linear_state_pool_initializes_from_config_for_graph_capture():
         device="cpu",
     )
     pool = KVMemoryPool(device=torch.device("cpu"))
-    shared_layers = Qwen35PagedHybridCache.build_shared_paged_layers(
+    shared_layers = allocate_qwen35_paged_kv(
         config=cfg,
         page_table=page_table,
         pool=pool,
         dtype=torch.bfloat16,
     )
-    decode_cache = Qwen35PagedHybridCache(
+    decode_cache = _make_qwen_cache(
         config=cfg,
         page_table=page_table,
         pool=pool,
@@ -2893,6 +2972,7 @@ def test_qwen_linear_state_pool_initializes_from_config_for_graph_capture():
         config=cfg,
         max_batch_slots=3,
         device=torch.device("cpu"),
+        replay_capacity=int(getattr(cfg, "linear_replay_capacity", 16)),
     )
 
     state_pool.initialize_from_config(cfg, dtype=torch.bfloat16)
@@ -2953,7 +3033,6 @@ def test_gated_delta_net_keeps_ssm_params_in_configured_dtype():
             linear_num_value_heads=2,
             linear_key_head_dim=2,
             linear_value_head_dim=2,
-            mamba_ssm_dtype="float32",
         )
         module = Qwen3_5GatedDeltaNet(config, layer_idx=0)
     finally:
@@ -3008,7 +3087,6 @@ def test_gated_delta_net_packed_prefill_derives_seq_idx_from_cu_seqlens():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     module.norm = Qwen3_5RMSNormGated(
@@ -3021,8 +3099,8 @@ def test_gated_delta_net_packed_prefill_derives_seq_idx_from_cu_seqlens():
     hidden_packed = torch.cat([hidden_a, hidden_b], dim=1)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
-    def make_cache() -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache() -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=1,
@@ -3084,7 +3162,6 @@ def test_gated_delta_net_packed_prefill_unequal_head_dims_matches_serial_sequenc
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     module.norm = Qwen3_5RMSNormGated(
@@ -3097,8 +3174,8 @@ def test_gated_delta_net_packed_prefill_unequal_head_dims_matches_serial_sequenc
     hidden_packed = torch.cat([hidden_a, hidden_b], dim=1)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
-    def make_cache() -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache() -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=1,
@@ -3161,7 +3238,6 @@ def test_gated_delta_net_batched_prefill_matches_serial_sequences():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     module.norm = Qwen3_5RMSNormGated(
@@ -3171,8 +3247,8 @@ def test_gated_delta_net_batched_prefill_matches_serial_sequences():
 
     hidden = torch.randn(2, 3, config.hidden_size)
 
-    def make_cache(max_batch_size: int) -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache(max_batch_size: int) -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=max_batch_size,
@@ -3226,14 +3302,13 @@ def test_gated_delta_net_grouped_head_decode_matches_full_sequence():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     reference = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     reference.load_state_dict(module.state_dict())
 
-    def make_cache() -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache() -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=1,
@@ -3279,14 +3354,13 @@ def test_gated_delta_net_replay_decode_uses_replay_state():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval().to(device)
     reference = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval().to(device)
     reference.load_state_dict(module.state_dict())
 
-    def make_cache() -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache() -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=1,
@@ -3296,6 +3370,7 @@ def test_gated_delta_net_replay_decode_uses_replay_state():
             ),
             pool=KVMemoryPool(device=device),
             dtype=torch.float32,
+            replay_capacity=8,
         )
 
     hidden_prefix = torch.randn(1, 2, config.hidden_size, device=device)
@@ -3355,18 +3430,18 @@ def test_gated_delta_net_chunk_decode_after_replay_matches_full_prefill():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval().to(device)
 
-    def make_cache() -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache() -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=1, page_size=1, max_batch_size=1, device=str(device)
             ),
             pool=KVMemoryPool(device=device),
             dtype=torch.float32,
+            replay_capacity=8,
         )
 
     hidden_prefix = torch.randn(1, 2, config.hidden_size, device=device)
@@ -3442,14 +3517,13 @@ def test_gated_delta_net_chunked_decode_selects_indexed_state_rows():
         linear_conv_kernel_dim=3,
         layer_types=["linear_attention"],
         num_hidden_layers=1,
-        mamba_ssm_dtype="float32",
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     reference = Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()
     reference.load_state_dict(module.state_dict())
 
-    def make_cache(max_batch_size: int) -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def make_cache(max_batch_size: int) -> Qwen35InferenceCache:
+        return _make_qwen_cache(
             config=config,
             page_table=PageTable(
                 n_pages=max_batch_size,

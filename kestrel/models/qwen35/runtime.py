@@ -23,7 +23,11 @@ from kestrel.runtime.preprocessing import (
 )
 
 from .decode_slot import Qwen35DecodeSlot, create_qwen35_decode_slot
-from .paged_cache import Qwen35LinearStatePool, Qwen35PagedHybridCache
+from .paged_cache import (
+    Qwen35InferenceCache,
+    Qwen35LinearStatePool,
+    allocate_qwen35_paged_kv,
+)
 from .prefill_slot import (
     Qwen35PrefillScratch,
     create_qwen35_prefill_slot,
@@ -358,11 +362,6 @@ class Qwen35Runtime:
         self.tokenizer = _TokenizerShim(Tokenizer.from_pretrained(self._model_name))
         self.prompt_template = Qwen35PromptTemplate()
         self._eos_ids = {IM_END_ID, END_OF_TEXT_ID}
-        eos_cfg = getattr(text_cfg, "eos_token_id", None)
-        if isinstance(eos_cfg, int):
-            self._eos_ids.add(eos_cfg)
-        elif eos_cfg is not None:
-            self._eos_ids.update(int(tid) for tid in eos_cfg)
 
         # Conservative fixed reservation for image requests. Actual prompt
         # insertion uses the per-image processor count.
@@ -412,7 +411,11 @@ class Qwen35Runtime:
                 f"kv_pool.device ({self._kv_pool.device}) must match runtime "
                 f"device ({self.device})"
             )
-        self._shared_paged_layers = Qwen35PagedHybridCache.build_shared_paged_layers(
+        spec_cfg = getattr(self._cfg, "spec_decode", None)
+        self._replay_capacity = (
+            self._spec_flush_cap(spec_cfg) if spec_cfg else 16
+        )
+        self._paged_kv = allocate_qwen35_paged_kv(
             config=text_cfg,
             page_table=self.page_table,
             pool=self._kv_pool,
@@ -422,6 +425,7 @@ class Qwen35Runtime:
             config=text_cfg,
             max_batch_slots=self.max_batch_slots,
             device=self.device,
+            replay_capacity=self._replay_capacity,
         )
         self._decode_rope_deltas = torch.zeros(
             (self.max_batch_slots, 1),
@@ -710,14 +714,15 @@ class Qwen35Runtime:
             # Already sized (e.g. by the pre-capture ``__init__`` call); the
             # tensors the captured graph bound must stay put.
             return
-        text_cfg = _text_config(self.hf_config)
-        text_cfg.linear_replay_capacity = flush_cap
         self._linear_state_pool.replay_capacity = flush_cap
         for st in self._linear_state_pool.layers:
             if st is not None:
                 st.replay_checkpoint_states = None
                 st.replay_k = st.replay_u = st.replay_g = st.replay_lengths = None
-        self._linear_state_pool.initialize_from_config(text_cfg, dtype=self.dtype)
+        self._linear_state_pool.initialize_from_config(
+            _text_config(self.hf_config),
+            dtype=self.dtype,
+        )
 
     @property
     def model_name(self) -> str:
@@ -2006,18 +2011,16 @@ class Qwen35Runtime:
             cache_state.linear_state_row_indices,
         )
 
-    def _new_cache(self) -> Qwen35PagedHybridCache:
-        return Qwen35PagedHybridCache(
+    def _new_cache(self) -> Qwen35InferenceCache:
+        return Qwen35InferenceCache(
             config=_text_config(self.hf_config),
-            page_table=self.page_table,
-            pool=self._kv_pool,
-            dtype=self.dtype,
-            shared_paged_layers=self._shared_paged_layers,
+            paged_kv=self._paged_kv,
+            replay_capacity=self._linear_state_pool.replay_capacity,
         )
 
     def _store_sequence_cache(self, batch_idx: int, cache: Any) -> None:
         cache_state = self._as_forward_cache(cache)
-        if not isinstance(cache_state.past_key_values, Qwen35PagedHybridCache):
+        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
             raise RuntimeError("Qwen engine decode requires paged hybrid caches")
         self._linear_state_pool.capture_from_cache(
             int(batch_idx),
@@ -2047,7 +2050,7 @@ class Qwen35Runtime:
         host_batch_indices: Sequence[int],
     ) -> None:
         cache_state = self._as_forward_cache(cache)
-        if not isinstance(cache_state.past_key_values, Qwen35PagedHybridCache):
+        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
             raise RuntimeError("Qwen engine decode requires paged hybrid caches")
         indices = batch_idx.to(device=self.device, dtype=torch.long).view(-1)
         batch_size = int(indices.shape[0])
@@ -2100,7 +2103,7 @@ class Qwen35Runtime:
         if coordinator is not None:
             coordinator.mark_coherent(rows)
 
-    def _decode_cache_for_slot(self, slot: Qwen35DecodeSlot) -> Qwen35PagedHybridCache:
+    def _decode_cache_for_slot(self, slot: Qwen35DecodeSlot) -> Qwen35InferenceCache:
         return self._decode_caches[int(slot.slot_id)]
 
     def _as_forward_cache(self, cache: Any) -> _QwenForwardCache:
@@ -2144,7 +2147,7 @@ class Qwen35Runtime:
         cache_batch_idx: torch.Tensor,
         batch_count: int,
     ) -> torch.Tensor:
-        if not isinstance(cache_state.past_key_values, Qwen35PagedHybridCache):
+        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
             return cache_batch_idx.to(dtype=torch.long)
 
         if cache_state.linear_state_row_indices is not None:

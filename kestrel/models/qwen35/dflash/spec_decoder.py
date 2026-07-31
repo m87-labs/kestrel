@@ -159,10 +159,13 @@ class SpecDecoder:
         # reference path also builds the verify ring at ``flush_cap``.
         _validate_flush_cap(int(flush_cap), self.block_size)
         self.flush_cap = int(flush_cap)
-        # Allocate the ReplaySSM ring buffers at flush_cap so the verify kernel and the
-        # flush/reset shape checks agree.
-        text_cfg = getattr(runtime.hf_config, "text_config", runtime.hf_config)
-        text_cfg.linear_replay_capacity = self.flush_cap
+        pool_capacity = int(runtime._linear_state_pool.replay_capacity)
+        if pool_capacity != self.flush_cap:
+            raise ValueError(
+                f"runtime linear-state pool replay_capacity ({pool_capacity}) "
+                f"must equal flush_cap ({self.flush_cap}); configure "
+                "spec_decode.flush_cap before building the runtime"
+            )
 
         self.gdn_layer_idxs = [
             i for i, layer in enumerate(self.lm.layers)
@@ -321,7 +324,7 @@ class SpecDecoder:
                     batch_idx=batch_idx,
                     cache_position_ids=torch.arange(len(prompt_ids), device=dev).view(1, -1),
             )
-            cache = fcache.past_key_values  # the inner Qwen35PagedHybridCache
+            cache = fcache.past_key_values  # the inner Qwen35InferenceCache
             with record("prefill_lm_head_argmax"):
                 # The first committed token (``cur_t``) is the request's token0.
                 # Greedy: the target argmax (byte-identical to the validated
@@ -866,7 +869,7 @@ class SpecRunner:
 
     * a **fixed** set of ``B`` page-table ``batch_idx`` reserved once at
       construction (pages never freed -> page-table rows are address-stable);
-    * a single **persistent** :class:`Qwen35PagedHybridCache` whose GDN linear
+    * a single **persistent** :class:`Qwen35InferenceCache` whose GDN linear
       layers are bound (``_linear_state_pool.bind_to_cache``) to the runtime's
       persistent ``_linear_state_pool`` tensors (fixed addresses);
     * the verify + draft graphs captured **lazily once** against those persistent
@@ -923,16 +926,14 @@ class SpecRunner:
         # the uncapturable torch verify fallback (see ``_validate_flush_cap``).
         _validate_flush_cap(int(flush_cap), self.block_size)
         self.flush_cap = int(flush_cap)
-        # The persistent pool must already be sized at flush_cap (the runtime
-        # builds the pool from text_config.linear_replay_capacity). Enforce it so
-        # the verify kernel and the flush/reset shapes agree.
+        # The persistent pool must already be sized at flush_cap so the verify
+        # kernel and the flush/reset shapes agree.
         pool_cap = int(getattr(runtime._linear_state_pool, "replay_capacity", 0))
         if pool_cap != self.flush_cap:
             raise ValueError(
                 f"runtime linear-state pool replay_capacity ({pool_cap}) must "
-                f"equal flush_cap ({self.flush_cap}); set "
-                f"text_config.linear_replay_capacity={self.flush_cap} before "
-                "building the runtime."
+                f"equal flush_cap ({self.flush_cap}); configure "
+                "spec_decode.flush_cap before building the runtime."
             )
 
         self.gdn_layer_idxs = [

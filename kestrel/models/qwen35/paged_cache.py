@@ -7,85 +7,84 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
-from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
+from kestrel.kv_cache import (
+    KVMemoryPool,
+    LayeredPagedKV,
+    PageTable,
+    PagedKVCache,
+    PagedKVLayerSpec,
+)
 
-from .qwen_compat import Cache, LinearAttentionLayer
+from .inference_ops import LinearAttentionLayer
 
 if TYPE_CHECKING:
     from mkl.megakernel.state_runtime import StatePhysicalForm
 
 
-class Qwen35PagedHybridCache(Cache):
-    """Hybrid Qwen cache: Kestrel paged KV plus GDN recurrent state."""
+def allocate_qwen35_paged_kv(
+    *,
+    config: Any,
+    page_table: PageTable,
+    pool: KVMemoryPool,
+    dtype: torch.dtype,
+) -> LayeredPagedKV:
+    """Allocate full-attention storage through Kestrel's shared cache owner."""
 
-    @staticmethod
-    def build_shared_paged_layers(
-        *,
-        config: Any,
-        page_table: PageTable,
-        pool: KVMemoryPool,
-        dtype: torch.dtype,
-    ) -> list[PagedKVCache | None]:
-        """Allocate the runtime-wide full-attention paged KV layers once."""
-
-        layer_types = _layer_types(config)
-        head_dim = _head_dim(config)
-        layers: list[PagedKVCache | None] = []
-        for layer_type in layer_types:
-            if layer_type == "linear_attention":
-                layers.append(None)
-                continue
-            layers.append(
-                PagedKVCache(
-                    page_table,
+    head_dim = _head_dim(config)
+    specs: list[PagedKVLayerSpec | None] = []
+    sources: list[int] = []
+    for layer_idx, layer_type in enumerate(_layer_types(config)):
+        if layer_type == "linear_attention":
+            specs.append(None)
+            sources.append(-1)
+        else:
+            specs.append(
+                PagedKVLayerSpec(
                     n_heads=int(config.num_key_value_heads),
                     head_dim=head_dim,
-                    dtype=dtype,
-                    pool=pool,
                 )
             )
-        return layers
+            sources.append(layer_idx)
+    return LayeredPagedKV.allocate(
+        layer_specs=specs,
+        source_layer_idx=sources,
+        page_table=page_table,
+        pool=pool,
+        dtype=dtype,
+    )
+
+
+class Qwen35InferenceCache:
+    """Per-forward GDN state over runtime-owned Kestrel paged K/V."""
 
     def __init__(
         self,
         *,
         config: Any,
-        page_table: PageTable,
-        pool: KVMemoryPool,
-        dtype: torch.dtype,
-        shared_paged_layers: Sequence[PagedKVCache | None] | None = None,
+        paged_kv: LayeredPagedKV,
+        replay_capacity: int,
     ) -> None:
         layer_types = _layer_types(config)
-        if shared_paged_layers is not None and len(shared_paged_layers) != len(
-            layer_types
-        ):
-            raise ValueError("shared_paged_layers length must match layer_types")
-
-        head_dim = _head_dim(config)
+        if len(paged_kv.layers) != len(layer_types):
+            raise ValueError("paged_kv layout must match layer_types")
         layers: list[Any] = []
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "linear_attention":
-                layers.append(LinearAttentionLayer(config))
-                continue
-            if shared_paged_layers is not None:
-                layer = shared_paged_layers[layer_idx]
-                if not isinstance(layer, PagedKVCache):
-                    raise ValueError(
-                        "shared_paged_layers must contain PagedKVCache "
-                        f"for full-attention layer {layer_idx}"
+                layers.append(
+                    LinearAttentionLayer(
+                        config,
+                        replay_capacity=replay_capacity,
                     )
-                layers.append(layer)
-                continue
-            layers.append(
-                PagedKVCache(
-                    page_table,
-                    n_heads=int(config.num_key_value_heads),
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    pool=pool,
                 )
-            )
-        super().__init__(layers=layers)
+                continue
+            layer = paged_kv.producer(layer_idx)
+            if layer is None:
+                raise ValueError(
+                    f"full-attention layer {layer_idx} has no paged K/V producer"
+                )
+            layers.append(layer)
+        self.layers = tuple(layers)
+        self.paged_kv = paged_kv
         self.seq_length = 0
 
     def update(
@@ -108,11 +107,39 @@ class Qwen35PagedHybridCache(Cache):
             **kwargs,
         )
 
-    def get_paged_layer(self, layer_idx: int) -> PagedKVCache | None:
-        if not (0 <= layer_idx < len(self.layers)):
-            return None
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        layer_idx: int,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self.layers[layer_idx].update_conv_state(conv_states, **kwargs)
+
+    def update_recurrent_state(
+        self,
+        recurrent_states: torch.Tensor,
+        layer_idx: int,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self.layers[layer_idx].update_recurrent_state(
+            recurrent_states,
+            **kwargs,
+        )
+
+    def has_previous_state(self, layer_idx: int | None = None) -> bool:
+        if layer_idx is None:
+            return any(
+                isinstance(layer, LinearAttentionLayer)
+                and bool(layer.has_previous_state)
+                for layer in self.layers
+            ) or self.seq_length > 0
         layer = self.layers[layer_idx]
-        return layer if isinstance(layer, PagedKVCache) else None
+        if isinstance(layer, LinearAttentionLayer):
+            return bool(layer.has_previous_state)
+        return self.seq_length > 0
+
+    def get_paged_layer(self, layer_idx: int) -> PagedKVCache | None:
+        return self.paged_kv.producer(layer_idx)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return int(self.seq_length)
@@ -150,10 +177,11 @@ class Qwen35LinearStatePool:
         config: Any,
         max_batch_slots: int,
         device: torch.device,
+        replay_capacity: int,
     ) -> None:
         self.max_batch_slots = int(max_batch_slots)
         self.device = device
-        self.replay_capacity = int(getattr(config, "linear_replay_capacity", 16))
+        self.replay_capacity = int(replay_capacity)
         self.num_k_heads = int(getattr(config, "linear_num_key_heads", 0))
         self.layers: list[_LinearStateStorage | None] = [
             _LinearStateStorage() if layer_type == "linear_attention" else None
@@ -211,7 +239,7 @@ class Qwen35LinearStatePool:
     def capture_from_cache(
         self,
         batch_idx: int,
-        cache: Qwen35PagedHybridCache,
+        cache: Qwen35InferenceCache,
     ) -> None:
         batch_idx_tensor = torch.empty((1,), dtype=torch.long, device=self.device)
         batch_idx_tensor.fill_(int(batch_idx))
@@ -224,7 +252,7 @@ class Qwen35LinearStatePool:
     def capture_batch_from_cache(
         self,
         batch_idx: torch.Tensor,
-        cache: Qwen35PagedHybridCache,
+        cache: Qwen35InferenceCache,
         *,
         batch_size: int,
         copy_replay_payload: bool = True,
@@ -247,7 +275,7 @@ class Qwen35LinearStatePool:
                 copy_replay_payload=copy_replay_payload,
             )
 
-    def bind_to_cache(self, cache: Qwen35PagedHybridCache) -> None:
+    def bind_to_cache(self, cache: Qwen35InferenceCache) -> None:
         """Bind cache linear layers directly to runtime-owned persistent state."""
 
         for layer_idx, storage in enumerate(self.layers):
@@ -652,6 +680,7 @@ def _head_dim(config: Any) -> int:
 
 
 __all__ = [
+    "allocate_qwen35_paged_kv",
+    "Qwen35InferenceCache",
     "Qwen35LinearStatePool",
-    "Qwen35PagedHybridCache",
 ]

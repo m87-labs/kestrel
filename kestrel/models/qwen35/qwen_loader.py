@@ -492,20 +492,27 @@ def load_qwen35_model(
     dtype: torch.dtype,
     attn_implementation: str = "sdpa",
 ) -> Qwen3_5ForConditionalGeneration:
+    if attn_implementation != "sdpa":
+        raise ValueError(
+            "Qwen inference text attention requires attn_implementation='sdpa'"
+        )
     config_path = hf_hub_download(repo_id, "config.json")
     with open(config_path, "r", encoding="utf-8") as handle:
         config_data: dict[str, Any] = json.load(handle)
     config = Qwen3_5Config.from_dict(config_data)
-    config.text_config._attn_implementation = attn_implementation
-    config.vision_config._attn_implementation = _vision_attn_implementation(
-        device, attn_implementation
+    use_vision_flash_attention = (
+        _vision_attn_implementation(device, attn_implementation)
+        == _CUDA_VISION_ATTN_IMPLEMENTATION
     )
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
         with torch.device(device):
-            model = Qwen3_5ForConditionalGeneration(config)
+            model = Qwen3_5ForConditionalGeneration(
+                config,
+                use_vision_flash_attention=use_vision_flash_attention,
+            )
     finally:
         torch.set_default_dtype(old_dtype)
 
@@ -525,7 +532,7 @@ def load_qwen35_model(
             "Failed to load Qwen 3.5 weights: "
             f"missing={missing[:8]} unexpected={unexpected[:8]}"
         )
-    if config.tie_word_embeddings:
+    if config.text_config.tie_word_embeddings:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
     return model.to(device=device).eval()
 

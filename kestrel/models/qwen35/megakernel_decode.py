@@ -23,9 +23,8 @@ def _layer_kinds(config: Any) -> list[int]:
 
 
 def _rope_config(config: Any) -> tuple[float, list[int]]:
-    rope = config.rope_parameters or {}
-    partial = float(rope.get("partial_rotary_factor", 0.25))
-    sections = [int(value) for value in rope.get("mrope_section", ())]
+    partial = float(config.partial_rotary_factor)
+    sections = [int(value) for value in config.mrope_section]
     if len(sections) != 3:
         raise _UnsupportedDecodeConfig(
             f"Qwen decode needs three M-RoPE sections, got {sections}")
@@ -130,7 +129,7 @@ class Qwen35DecodeMegakernel:
         if getattr(runtime, "dtype", torch.bfloat16) is not torch.bfloat16:
             return None
         if not _supports_paged_decode_abi(
-            getattr(runtime, "_shared_paged_layers", ())
+            getattr(getattr(runtime, "_paged_kv", None), "layers", ())
         ):
             return None
 
@@ -284,8 +283,8 @@ class Qwen35DecodeMegakernel:
             if layer is not None
         ):
             raise RuntimeError("Qwen GDN state pool must be initialized before binding")
-        m_k = _paged_tensors(runtime._shared_paged_layers, "k_cache")
-        m_v = _paged_tensors(runtime._shared_paged_layers, "v_cache")
+        m_k = _paged_tensors(runtime._paged_kv.layers, "k_cache")
+        m_v = _paged_tensors(runtime._paged_kv.layers, "v_cache")
         rope_inv_freq = self.text_model.rotary_emb.inv_freq
         n_pages = int(runtime.page_table.n_pages)
         authoritative_page_table = runtime.page_table.page_table

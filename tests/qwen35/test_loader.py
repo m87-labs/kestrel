@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -8,6 +10,65 @@ from kestrel.models.qwen35 import qwen_loader
 from kestrel.models.qwen35 import qwen_model
 from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
 from kestrel.models.qwen35.qwen_model import Qwen3_5RMSNorm, Qwen3_5RMSNormGated
+
+
+def _text_config_data(**overrides):
+    hidden = int(overrides.get("hidden_size", 8))
+    heads = int(overrides.get("num_attention_heads", 2))
+    data = {
+        "vocab_size": 32,
+        "hidden_size": hidden,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": heads,
+        "num_key_value_heads": 1,
+        "hidden_act": "silu",
+        "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 0],
+            "mrope_interleaved": True,
+        },
+        "attention_bias": False,
+        "head_dim": hidden // heads,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 2,
+        "linear_value_head_dim": 2,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 2,
+        "layer_types": ["full_attention"],
+    }
+    data.update(overrides)
+    return data
+
+
+def _qwen_config_data(*, text=None, **overrides):
+    text_data = _text_config_data(**(text or {}))
+    data = {
+        "model_type": "qwen3_5",
+        "text_config": text_data,
+        "vision_config": {
+            "depth": 1,
+            "hidden_size": 8,
+            "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "in_channels": 3,
+            "patch_size": 2,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "out_hidden_size": int(text_data["hidden_size"]),
+            "num_position_embeddings": 16,
+        },
+        "image_token_id": 30,
+        "video_token_id": 31,
+        "tie_word_embeddings": False,
+    }
+    data.update(overrides)
+    return data
 
 
 class _TinyModel(torch.nn.Module):
@@ -32,7 +93,7 @@ class _TinyGatedDeltaNet(torch.nn.Module):
 
 
 class _TinyQwen(torch.nn.Module):
-    def __init__(self, _config) -> None:
+    def __init__(self, _config, **_kwargs) -> None:
         super().__init__()
         self.config = _config
         self.gdn = _TinyGatedDeltaNet()
@@ -321,15 +382,13 @@ def test_load_sharded_safetensors_fuses_gdn_input_projection(tmp_path, monkeypat
 
 
 def test_qwen36_fp8_gdn_dequantizes_into_fused_projection(tmp_path, monkeypatch):
-    cfg = Qwen3_5TextConfig.from_dict(
-        {
-            "hidden_size": 128,
-            "linear_key_head_dim": 16,
-            "linear_value_head_dim": 16,
-            "linear_num_key_heads": 1,
-            "linear_num_value_heads": 16,
-            "expert_weight_format": "fp8_e4m3",
-        }
+    cfg = Qwen3_5TextConfig(
+        hidden_size=128,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_num_key_heads=1,
+        linear_num_value_heads=16,
+        expert_weight_format="fp8_e4m3",
     )
 
     class _Block(torch.nn.Module):
@@ -520,7 +579,6 @@ def test_load_sharded_safetensors_fuses_mlp_gate_up_projection(tmp_path, monkeyp
 def test_qwen35_experts_use_interleaved_gate_up_projection():
     config = Qwen3_5TextConfig(
         hidden_size=2,
-        hidden_act="silu",
         num_experts=1,
         num_experts_per_tok=1,
         moe_intermediate_size=8,
@@ -543,18 +601,18 @@ def test_qwen35_experts_use_interleaved_gate_up_projection():
 
 def test_qwen35_fp8_config_uses_quantized_expert_buffers():
     cfg = Qwen3_5Config.from_dict(
-        {
-            "model_type": "qwen3_5_moe",
-            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
-            "text_config": {
-                "model_type": "qwen3_5_moe_text",
+        _qwen_config_data(
+            model_type="qwen3_5_moe",
+            quantization_config={"quant_method": "fp8", "fmt": "e4m3"},
+            text={
                 "hidden_size": 128,
-                "hidden_act": "silu",
+                "head_dim": 64,
                 "num_experts": 2,
                 "num_experts_per_tok": 1,
                 "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
             },
-        }
+        )
     )
     experts = qwen_model.Qwen3_5Experts(cfg.text_config)
 
@@ -568,7 +626,6 @@ def test_qwen35_fp8_config_uses_quantized_expert_buffers():
 def test_qwen35_fp8_experts_fallback_when_kestrel_config_missing(monkeypatch):
     config = Qwen3_5TextConfig(
         hidden_size=128,
-        hidden_act="silu",
         num_experts=1,
         num_experts_per_tok=1,
         moe_intermediate_size=128,
@@ -597,13 +654,11 @@ def test_qwen35_fp8_experts_fallback_when_kestrel_config_missing(monkeypatch):
 
 def test_qwen35_fp8_config_keeps_dense_projection_modules_bf16_by_default():
     cfg = Qwen3_5Config.from_dict(
-        {
-            "model_type": "qwen3_5_moe",
-            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
-            "text_config": {
-                "model_type": "qwen3_5_moe_text",
+        _qwen_config_data(
+            model_type="qwen3_5_moe",
+            quantization_config={"quant_method": "fp8", "fmt": "e4m3"},
+            text={
                 "hidden_size": 128,
-                "hidden_act": "silu",
                 "intermediate_size": 128,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -615,8 +670,9 @@ def test_qwen35_fp8_config_keeps_dense_projection_modules_bf16_by_default():
                 "num_experts": 2,
                 "num_experts_per_tok": 1,
                 "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
             },
-        }
+        )
     )
 
     gdn = qwen_model.Qwen3_5GatedDeltaNet(cfg.text_config, layer_idx=0)
@@ -639,13 +695,11 @@ def test_qwen35_fp8_config_keeps_dense_projection_modules_bf16_by_default():
 
 def test_qwen35_fp8_dense_bf16_default_keeps_experts_fp8():
     cfg = Qwen3_5Config.from_dict(
-        {
-            "model_type": "qwen3_5_moe",
-            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
-            "text_config": {
-                "model_type": "qwen3_5_moe_text",
+        _qwen_config_data(
+            model_type="qwen3_5_moe",
+            quantization_config={"quant_method": "fp8", "fmt": "e4m3"},
+            text={
                 "hidden_size": 128,
-                "hidden_act": "silu",
                 "intermediate_size": 128,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -657,8 +711,9 @@ def test_qwen35_fp8_dense_bf16_default_keeps_experts_fp8():
                 "num_experts": 2,
                 "num_experts_per_tok": 1,
                 "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
             },
-        }
+        )
     )
 
     gdn = qwen_model.Qwen3_5GatedDeltaNet(cfg.text_config, layer_idx=0)
@@ -690,7 +745,6 @@ def test_load_sharded_safetensors_preserves_fp8_expert_weights_and_scales(
 ):
     config = Qwen3_5TextConfig(
         hidden_size=128,
-        hidden_act="silu",
         num_experts=2,
         num_experts_per_tok=1,
         moe_intermediate_size=128,
@@ -778,14 +832,11 @@ def test_qwen35_kestrel_moe_capacity_buckets_prefill_tokens():
 
 def test_load_qwen35_model_preserves_ssm_parameter_dtype(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(
-        """
-        {
-          "model_type": "qwen3_5",
-          "text_config": {"mamba_ssm_dtype": "float32"},
-          "vision_config": {},
-          "tie_word_embeddings": false
-        }
-        """,
+        json.dumps(
+            _qwen_config_data(
+                text={"mamba_ssm_dtype": "float32"},
+            )
+        ),
         encoding="utf-8",
     )
     (tmp_path / "model.safetensors.index.json").write_text(
@@ -822,8 +873,8 @@ def test_load_qwen35_model_preserves_ssm_parameter_dtype(tmp_path, monkeypatch):
         dtype=torch.bfloat16,
     )
 
-    assert model.config.text_config._attn_implementation == "sdpa"
-    assert model.config.vision_config._attn_implementation == "sdpa"
+    assert not hasattr(model.config.text_config, "_attn_implementation")
+    assert not hasattr(model.config.vision_config, "_attn_implementation")
     assert model.gdn.A_log.dtype == torch.float32
     assert model.gdn.dt_bias.dtype == torch.float32
     assert model.dense.weight.dtype == torch.bfloat16

@@ -15,8 +15,6 @@
 from __future__ import annotations
 
 import itertools
-import warnings
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -24,23 +22,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .qwen_compat import (
-    ACT2FN,
-    ALL_ATTENTION_FUNCTIONS,
-    BaseModelOutputWithPast,
-    BaseModelOutputWithPooling,
-    Cache,
-    FlashAttentionKwargs,
-    PreTrainedModel,
-    ROPE_INIT_FUNCTIONS,
-    TransformersKwargs,
-    Unpack,
+from .inference_ops import (
     create_causal_mask,
-    eager_attention_forward,
     get_vision_bilinear_indices_and_weights,
     get_vision_cu_seqlens,
     get_vision_position_ids,
-    is_flash_attention_requested,
+    kestrel_vision_flash_attention_forward,
+    sdpa_attention_forward,
     torch_compilable_check,
 )
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
@@ -82,14 +70,28 @@ _KESTREL_RMSNORM_HIDDEN_SIZES = {128, 256, 1024, 2048, 2560, 4096, 5120}
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
-def _as_torch_dtype(dtype: Any) -> torch.dtype:
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    if isinstance(dtype, str):
-        resolved = getattr(torch, dtype.removeprefix("torch."), None)
-        if isinstance(resolved, torch.dtype):
-            return resolved
-    return torch.get_default_dtype()
+
+
+@dataclass
+class _TextModelOutput:
+    last_hidden_state: torch.Tensor
+    past_key_values: Any = None
+    hidden_states: Any = None
+    attentions: Any = None
+    rope_deltas: torch.Tensor | None = None
+
+
+@dataclass
+class _VisionModelOutput:
+    last_hidden_state: torch.Tensor
+    pooler_output: Any = None
+
+
+def _module_dtype(module: nn.Module) -> torch.dtype:
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return torch.get_default_dtype()
 
 
 def _kestrel_moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
@@ -128,15 +130,14 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+        inv_freq, self.attention_scaling = self.compute_default_rope_parameters(
+            self.config,
+            device,
+        )
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
-        self.mrope_section = config.rope_parameters.get("mrope_section", [11, 11, 10])
+        self.mrope_section = config.mrope_section
 
     @staticmethod
     def compute_default_rope_parameters(
@@ -157,8 +158,8 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        base = config.rope_parameters["rope_theta"]
-        partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         dim = int(head_dim * partial_rotary_factor)
 
@@ -390,8 +391,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
-        self.activation = config.hidden_act
-        self.act = ACT2FN[config.hidden_act]
+        self.activation = "silu"
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # QKV
@@ -407,7 +407,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        ssm_dtype = _as_torch_dtype(config.mamba_ssm_dtype)
+        ssm_dtype = torch.float32
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads, dtype=ssm_dtype))
 
         A = torch.empty(self.num_v_heads, dtype=ssm_dtype).uniform_(0, 16)
@@ -441,9 +441,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Cache | None = None,
+        cache_params: Any = None,
         attention_mask: torch.Tensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs: Any,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -885,7 +885,7 @@ def paged_attention_forward(
     dropout: float = 0.0,
     paged_kv_seqlens_q: torch.Tensor | None = None,
     cu_seq_lens_q: torch.Tensor | None = None,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs: Any,
 ):
     if page_table is None or paged_kv_seqlens_k is None:
         raise RuntimeError("Qwen paged attention requires page_table and seqused_k")
@@ -945,12 +945,12 @@ class Qwen3_5Attention(nn.Module):
         self.qkv_proj = nn.Linear(
             config.hidden_size,
             self.q_gate_size + 2 * self.kv_size,
-            bias=config.attention_bias,
+            bias=False,
         )
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
-            bias=config.attention_bias,
+            bias=False,
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
@@ -960,8 +960,8 @@ class Qwen3_5Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        past_key_values: Any = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -1032,11 +1032,7 @@ class Qwen3_5Attention(nn.Module):
                 **attn_kwargs,
             )
         else:
-            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation, eager_attention_forward
-            )
-
-            attn_output, attn_weights = attention_interface(
+            attn_output, attn_weights = sdpa_attention_forward(
                 self,
                 query_states,
                 key_states,
@@ -1062,11 +1058,6 @@ class Qwen3_5MLP(nn.Module):
     ):
         super().__init__()
         self.config = config
-        if config.hidden_act != "silu":
-            raise ValueError(
-                "Qwen3_5MLP only supports hidden_act='silu', "
-                f"got {config.hidden_act!r}"
-            )
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
         self.gate_up_proj = nn.Linear(
@@ -1160,7 +1151,7 @@ class Qwen3_5Experts(nn.Module):
                     dtype=torch.float32,
                 ),
             )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = F.silu
 
     def _expert_gate_up(self, expert_idx: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj[expert_idx]
@@ -1470,8 +1461,8 @@ class Qwen3_5DecoderLayer(nn.Module):
         output_layernorm: Qwen3_5RMSNorm | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        past_key_values: Any = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_states = normalized_hidden_states
 
@@ -1521,8 +1512,8 @@ class Qwen3_5DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        past_key_values: Any = None,
+        **kwargs: Any,
     ) -> torch.FloatTensor:
         hidden_states, _ = self._forward_from_normalized(
             hidden_states,
@@ -1544,7 +1535,6 @@ class Qwen3_5VisionMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.linear_fc1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
         self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
-        self.act_fn = ACT2FN[config.hidden_act]
         # cuBLASLt fused-MLP GELU epilogue mode that matches ``config.hidden_act``.
         # The vision encoder uses ``gelu_pytorch_tanh`` (tanh approximation); plain
         # ``gelu`` maps to the exact (erf) GELU.
@@ -1554,6 +1544,11 @@ class Qwen3_5VisionMLP(nn.Module):
             self._gelu_approximate = "none"
         else:
             self._gelu_approximate = None
+
+        self.act_fn = lambda value: F.gelu(
+            value,
+            approximate=self._gelu_approximate or "none",
+        )
     def forward(self, hidden_state, residual=None, hidden_workspace=None):
         """``linear_fc2(act_fn(linear_fc1(hidden_state)))``, plus ``residual``.
 
@@ -1639,7 +1634,12 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3_5VisionAttention(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig) -> None:
+    def __init__(
+        self,
+        config: Qwen3_5VisionConfig,
+        *,
+        use_flash_attention: bool,
+    ) -> None:
         super().__init__()
         self.dim = config.hidden_size
         self.num_heads = config.num_heads
@@ -1650,6 +1650,7 @@ class Qwen3_5VisionAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.is_causal = False
+        self.use_flash_attention = bool(use_flash_attention)
 
     def forward(
         self,
@@ -1669,13 +1670,9 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        if is_flash_attention_requested(self.config):
+        if self.use_flash_attention:
             # Flash Attention: Use cu_seqlens for variable length attention
-            attn_output, _ = attention_interface(
+            attn_output, _ = kestrel_vision_flash_attention_forward(
                 self,
                 query_states,
                 key_states,
@@ -1696,7 +1693,7 @@ class Qwen3_5VisionAttention(nn.Module):
             ]
 
             attn_outputs = [
-                attention_interface(
+                sdpa_attention_forward(
                     self,
                     q,
                     k,
@@ -1717,11 +1714,19 @@ class Qwen3_5VisionAttention(nn.Module):
 
 
 class Qwen3_5VisionBlock(nn.Module):
-    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+    def __init__(
+        self,
+        config: Qwen3_5VisionConfig,
+        *,
+        use_flash_attention: bool,
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen3_5VisionAttention(config=config)
+        self.attn = Qwen3_5VisionAttention(
+            config=config,
+            use_flash_attention=use_flash_attention,
+        )
         self.mlp = Qwen3_5VisionMLP(config=config)
 
     def forward(
@@ -1748,15 +1753,18 @@ class Qwen3_5VisionBlock(nn.Module):
         return hidden_states
 
 
-class Qwen3_5VisionModel(PreTrainedModel):
+class Qwen3_5VisionModel(nn.Module):
     config: Qwen3_5VisionConfig
-    input_modalities = ("image", "video")
 
-    def __init__(self, config) -> None:
-        super().__init__(config)
+    def __init__(
+        self,
+        config: Qwen3_5VisionConfig,
+        *,
+        use_flash_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
         self.spatial_merge_size = config.spatial_merge_size
-        self.patch_size = config.patch_size
-        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
 
         self.patch_embed = Qwen3_5VisionPatchEmbed(
             config=config,
@@ -1768,7 +1776,15 @@ class Qwen3_5VisionModel(PreTrainedModel):
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = nn.ModuleList([Qwen3_5VisionBlock(config) for _ in range(config.depth)])
+        self.blocks = nn.ModuleList(
+            [
+                Qwen3_5VisionBlock(
+                    config,
+                    use_flash_attention=use_flash_attention,
+                )
+                for _ in range(config.depth)
+            ]
+        )
         self.merger = Qwen3_5VisionPatchMerger(
             config=config,
             use_postshuffle_norm=False,
@@ -1791,29 +1807,6 @@ class Qwen3_5VisionModel(PreTrainedModel):
             )
             self._mlp_hidden_workspace = ws
         return ws[:num_tokens]
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        warnings.warn(
-            f"`{self.__class__.__name__}.rot_pos_emb` is deprecated. Use the local `get_vision_position_ids` helper and apply the rotary embedding module.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size)
-        rotary_pos_emb = self.rotary_pos_emb(position_ids)
-        return rotary_pos_emb
-
-    def fast_pos_embed_interpolate(self, grid_thw):
-        warnings.warn(
-            f"`{self.__class__.__name__}.fast_pos_embed_interpolate` is deprecated. Use the local `get_vision_bilinear_indices_and_weights` helper and apply `self.pos_embed`.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
-            grid_thw,
-            num_grid_per_side=self.num_grid_per_side,
-            spatial_merge_size=self.config.spatial_merge_size,
-        )
-        return (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -1868,29 +1861,19 @@ class Qwen3_5VisionModel(PreTrainedModel):
 
         merged_hidden_states = self.merger(hidden_states)
 
-        return BaseModelOutputWithPooling(
+        return _VisionModelOutput(
             last_hidden_state=hidden_states,
             pooler_output=merged_hidden_states,
         )
 
 
-@dataclass
-class Qwen3_5ModelOutputWithPast(BaseModelOutputWithPast):
-    r"""
-    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-        The rope index difference between sequence length and multimodal rope.
-        The attribute is deprecated and will be removed in v5.20, use `model.base_model.rope_deltas` instead.
-    """
-
-    rope_deltas: torch.LongTensor | None = None
-
-
-class Qwen3_5TextModel(PreTrainedModel):
+class Qwen3_5TextModel(nn.Module):
     config: Qwen3_5TextConfig
 
     def __init__(self, config: Qwen3_5TextConfig):
-        super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1901,10 +1884,10 @@ class Qwen3_5TextModel(PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        past_key_values: Any = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
+        **kwargs: Any,
+    ) -> _TextModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1974,7 +1957,7 @@ class Qwen3_5TextModel(PreTrainedModel):
             else self.norm(hidden_states)
         )
 
-        return Qwen3_5ModelOutputWithPast(
+        return _TextModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
@@ -1994,14 +1977,26 @@ class Qwen3_5TextModel(PreTrainedModel):
         return linear_attn_mask
 
 
-class Qwen3_5Model(PreTrainedModel):
+class Qwen3_5Model(nn.Module):
     config: Qwen3_5Config
 
-    def __init__(self, config):
-        super().__init__(config)
-        self.visual = Qwen3_5VisionModel(config.vision_config)
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        *,
+        use_vision_flash_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.visual = Qwen3_5VisionModel(
+            config.vision_config,
+            use_flash_attention=use_vision_flash_attention,
+        )
         self.language_model = Qwen3_5TextModel(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.language_model.embed_tokens
 
     def get_vision_position_ids(
         self,
@@ -2160,8 +2155,8 @@ class Qwen3_5Model(PreTrainedModel):
         self,
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPooling:
+        **kwargs: Any,
+    ) -> _VisionModelOutput:
         r"""
         pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
             The tensors corresponding to the input videos.
@@ -2175,17 +2170,17 @@ class Qwen3_5Model(PreTrainedModel):
         self,
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPooling:
+        **kwargs: Any,
+    ) -> _VisionModelOutput:
         r"""
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
             The tensors corresponding to the input images.
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
         """
-        pixel_values = pixel_values.type(self.visual.dtype)
+        pixel_values = pixel_values.type(_module_dtype(self.visual))
         kwargs.pop("return_dict", None)
-        vision_output: BaseModelOutputWithPooling = self.visual(
+        vision_output = self.visual(
             pixel_values, grid_thw=image_grid_thw, **kwargs
         )
         image_embeds = vision_output.pooler_output
@@ -2293,15 +2288,15 @@ class Qwen3_5Model(PreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        past_key_values: Any = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Qwen3_5ModelOutputWithPast:
+        **kwargs: Any,
+    ) -> _TextModelOutput:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
@@ -2353,7 +2348,7 @@ class Qwen3_5Model(PreTrainedModel):
                 vision_kwargs[vision_key] = value
 
         if pixel_values is not None:
-            image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+            image_outputs = self.get_image_features(
                 pixel_values, image_grid_thw, return_dict=True, **vision_kwargs
             )
             image_embeds = image_outputs.pooler_output
@@ -2364,7 +2359,7 @@ class Qwen3_5Model(PreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+            video_outputs = self.get_video_features(
                 pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
             )
             video_embeds = video_outputs.pooler_output
@@ -2394,7 +2389,7 @@ class Qwen3_5Model(PreTrainedModel):
             **language_kwargs,
         )
 
-        return Qwen3_5ModelOutputWithPast(
+        return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -2403,93 +2398,25 @@ class Qwen3_5Model(PreTrainedModel):
         )
 
 
-@dataclass
-class Qwen3_5LMOutputWithPast:
-    logits: torch.Tensor | None = None
-    past_key_values: Cache | None = None
-    hidden_states: tuple[torch.Tensor, ...] | None = None
-    attentions: tuple[torch.Tensor, ...] | None = None
-    rope_deltas: torch.LongTensor | None = None
-
-
-class Qwen3_5ForConditionalGeneration(PreTrainedModel):
+class Qwen3_5ForConditionalGeneration(nn.Module):
     config: Qwen3_5Config
 
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = Qwen3_5Model(config)
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        *,
+        use_vision_flash_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.model = Qwen3_5Model(
+            config,
+            use_vision_flash_attention=use_vision_flash_attention,
+        )
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
-    def get_video_features(
-        self,
-        pixel_values_videos: torch.FloatTensor,
-        video_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPooling:
-        r"""
-        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-            The tensors corresponding to the input videos.
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The temporal, height and width of feature shape of each video in LLM.
-        """
-        return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
-
-    def get_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPooling:
-        r"""
-        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-            The tensors corresponding to the input images.
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
-        """
-        return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Qwen3_5LMOutputWithPast:
-        outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            mm_token_type_ids=mm_token_type_ids,
-            **kwargs,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        return Qwen3_5LMOutputWithPast(
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
-        )
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
 
 
 __all__ = [

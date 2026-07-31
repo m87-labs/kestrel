@@ -1,8 +1,7 @@
-"""Small local compatibility layer for the Qwen 3.5 model."""
+"""Inference-only attention and recurrent-state operations for Qwen 3.5."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -11,72 +10,18 @@ import torch.nn.functional as F
 from torch import nn
 
 
-TransformersKwargs = dict[str, Any]
-FlashAttentionKwargs = dict[str, Any]
-Unpack = Any
-
-
 def torch_compilable_check(condition: bool, message: str) -> None:
     if not bool(condition):
         raise ValueError(message)
 
 
-_FLASH_ATTENTION_IMPLEMENTATIONS = frozenset({"kestrel_vision_flash_attention"})
-
-
-def is_flash_attention_requested(config: Any) -> bool:
-    return getattr(config, "_attn_implementation", None) in _FLASH_ATTENTION_IMPLEMENTATIONS
-
-
-ACT2FN: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
-    "silu": F.silu,
-    "gelu": F.gelu,
-    "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
-}
-
-
-@dataclass
-class BaseModelOutputWithPast:
-    last_hidden_state: torch.Tensor
-    past_key_values: Any = None
-    hidden_states: Any = None
-    attentions: Any = None
-
-
-@dataclass
-class BaseModelOutputWithPooling:
-    last_hidden_state: torch.Tensor
-    pooler_output: Any = None
-    hidden_states: Any = None
-    attentions: Any = None
-
-
-class PreTrainedModel(nn.Module):
-    def __init__(self, config: Any) -> None:
-        super().__init__()
-        self.config = config
-
-    def get_input_embeddings(self) -> nn.Module:
-        if hasattr(self, "embed_tokens"):
-            return self.embed_tokens
-        if hasattr(self, "language_model"):
-            return self.language_model.embed_tokens
-        if hasattr(self, "model"):
-            return self.model.get_input_embeddings()
-        raise AttributeError(f"{type(self).__name__} has no input embeddings")
-
-    @property
-    def dtype(self) -> torch.dtype:
-        try:
-            return next(self.parameters()).dtype
-        except StopIteration:
-            return torch.get_default_dtype()
-
-ROPE_INIT_FUNCTIONS: dict[str, Callable[..., Any]] = {}
-
-
 class LinearAttentionLayer:
-    def __init__(self, config: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        replay_capacity: int,
+    ) -> None:
         self.conv_states: torch.Tensor | None = None
         self.recurrent_states: torch.Tensor | None = None
         self.replay_checkpoint_states: torch.Tensor | None = None
@@ -84,7 +29,7 @@ class LinearAttentionLayer:
         self.replay_u: torch.Tensor | None = None
         self.replay_g: torch.Tensor | None = None
         self.replay_lengths: torch.Tensor | None = None
-        self.replay_capacity = int(getattr(config, "linear_replay_capacity", 16))
+        self.replay_capacity = int(replay_capacity)
         self.num_k_heads = int(getattr(config, "linear_num_key_heads", 0))
         self.num_v_heads = int(getattr(config, "linear_num_value_heads", 0))
         self.is_conv_states_initialized = False
@@ -341,96 +286,6 @@ class LinearAttentionLayer:
                 )
         self.replay_lengths.index_fill_(0, row_indices, 0)
 
-    def batch_select_indices(self, indices: torch.Tensor) -> None:
-        if self.is_conv_states_initialized:
-            self.conv_states = self.conv_states[indices, ...]
-        if self.is_recurrent_states_initialized:
-            self.recurrent_states = self.recurrent_states[indices, ...]
-        if self.replay_checkpoint_states is not None:
-            self.replay_checkpoint_states = self.replay_checkpoint_states[indices, ...]
-        if self.replay_k is not None:
-            self.replay_k = self.replay_k[indices, ...]
-        if self.replay_u is not None:
-            self.replay_u = self.replay_u[indices, ...]
-        if self.replay_g is not None:
-            self.replay_g = self.replay_g[indices, ...]
-        if self.replay_lengths is not None:
-            self.replay_lengths = self.replay_lengths[indices]
-
-    def crop(self, max_length: int) -> None:
-        return None
-
-
-class Cache:
-    def __init__(self, layers: list[Any] | None = None) -> None:
-        self.layers = layers or []
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.layers[layer_idx].update(key_states, value_states, *args, **kwargs)
-
-    def update_conv_state(
-        self,
-        conv_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].update_conv_state(conv_states, **kwargs)
-
-    def update_recurrent_state(
-        self,
-        recurrent_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].update_recurrent_state(
-            recurrent_states,
-            **kwargs,
-        )
-
-    def has_previous_state(self, layer_idx: int | None = None) -> bool:
-        if layer_idx is not None:
-            layer = self.layers[layer_idx]
-            if isinstance(layer, LinearAttentionLayer):
-                return bool(layer.has_previous_state)
-            return layer.get_seq_length() > 0
-        return any(
-            bool(getattr(layer, "has_previous_state", False))
-            or (hasattr(layer, "get_seq_length") and layer.get_seq_length() > 0)
-            for layer in self.layers
-        )
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        if 0 <= layer_idx < len(self.layers):
-            layer = self.layers[layer_idx]
-            if hasattr(layer, "get_seq_length"):
-                length = int(layer.get_seq_length())
-                if length > 0:
-                    return length
-        for layer in self.layers:
-            if hasattr(layer, "get_seq_length"):
-                length = int(layer.get_seq_length())
-                if length > 0:
-                    return length
-        return 0
-
-    def batch_select_indices(self, indices: torch.Tensor) -> None:
-        for layer in self.layers:
-            if hasattr(layer, "batch_select_indices"):
-                layer.batch_select_indices(indices)
-
-    def crop(self, max_length: int) -> None:
-        for layer in self.layers:
-            if hasattr(layer, "crop"):
-                layer.crop(max_length)
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -439,28 +294,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Any,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-    if dropout != 0.0:
-        raise ValueError("Qwen inference attention only supports dropout=0")
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
-    return attn_output.transpose(1, 2).contiguous(), attn_weights
 
 
 def sdpa_attention_forward(
@@ -541,24 +374,12 @@ def kestrel_vision_flash_attention_forward(
     return out.unsqueeze(0), None
 
 
-class _AttentionRegistry:
-    def get_interface(self, name: str, default: Callable[..., Any]) -> Callable[..., Any]:
-        if name == "sdpa":
-            return sdpa_attention_forward
-        if name == "kestrel_vision_flash_attention":
-            return kestrel_vision_flash_attention_forward
-        return default
-
-
-ALL_ATTENTION_FUNCTIONS = _AttentionRegistry()
-
-
 def create_causal_mask(
     *,
     config: Any,
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor | None,
-    past_key_values: Cache | None,
+    past_key_values: Any | None,
     position_ids: torch.Tensor | None,
 ) -> torch.Tensor | None:
     batch_size, query_length = inputs_embeds.shape[:2]
@@ -683,21 +504,10 @@ def get_vision_cu_seqlens(
 
 
 __all__ = [
-    "ACT2FN",
-    "ALL_ATTENTION_FUNCTIONS",
-    "BaseModelOutputWithPast",
-    "BaseModelOutputWithPooling",
-    "Cache",
-    "FlashAttentionKwargs",
-    "PreTrainedModel",
-    "TransformersKwargs",
-    "Unpack",
     "create_causal_mask",
-    "eager_attention_forward",
     "get_vision_bilinear_indices_and_weights",
     "get_vision_cu_seqlens",
     "get_vision_position_ids",
-    "is_flash_attention_requested",
     "kestrel_vision_flash_attention_forward",
     "sdpa_attention_forward",
     "torch_compilable_check",
