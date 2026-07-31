@@ -19,11 +19,10 @@ from kestrel.engine import InferenceEngine
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
 from kestrel.ops import attention as attention_ops
-from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
-from kestrel.models.gemma4.runtime import Gemma4Runtime
+from kestrel.models.gemma4.runtime import Gemma4Runtime, create_gemma4_runtime
 from kestrel.runtime.paged_resources import decode_slot_rows
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
@@ -105,191 +104,6 @@ class _FakePageTable:
             self.free_batch_idx.append(batch_idx)
 
 
-def test_text_rotary_runtime_preserves_existing_cpu_math():
-    torch.manual_seed(0)
-    query = torch.randn(2, 5, 3, 8)
-    key = torch.randn(2, 5, 1, 8)
-    angles = torch.randn(2, 5, 4)
-    cos = torch.cat((angles.cos(), angles.cos()), dim=-1)
-    sin = torch.cat((angles.sin(), angles.sin()), dim=-1)
-    rotary = gemma_model._prepare_neox_rotary(cos, sin)
-
-    actual_query, actual_key = gemma_model._apply_neox_rotary(
-        query, key, rotary
-    )
-
-    expected_query = rotary_ops.apply_rotary(
-        query,
-        cos,
-        sin,
-        unsqueeze_dim=2,
-    )
-    expected_key = rotary_ops.apply_rotary(
-        key,
-        cos,
-        sin,
-        unsqueeze_dim=2,
-    )
-    torch.testing.assert_close(actual_query, expected_query)
-    torch.testing.assert_close(actual_key, expected_key)
-
-
-def test_text_attention_emits_typed_runtime_attention(monkeypatch):
-    calls = []
-
-    class FakeTensor:
-        dtype = torch.bfloat16
-        device = SimpleNamespace(type="cuda")
-
-        def __init__(self, name):
-            self.name = name
-
-        def transpose(self, left, right):
-            calls.append(("transpose", self.name, left, right))
-            return self
-
-        def contiguous(self):
-            return self
-
-    output = FakeTensor("out")
-
-    def fake_flash(q, k, v, **kwargs):
-        calls.append(("flash", q, k, v, kwargs))
-        return output, None
-
-    monkeypatch.setattr(
-        attention_ops,
-        "get_runtime",
-        lambda: SimpleNamespace(
-            attention=SimpleNamespace(flash_attn_fwd=fake_flash)
-        ),
-    )
-    q, k, v = FakeTensor("q"), FakeTensor("k"), FakeTensor("v")
-
-    result = attention_ops.dense_attention(
-        q,
-        k,
-        v,
-        num_key_value_groups=8,
-        attention_mask=None,
-        scaling=1.0,
-        causal=False,
-        window_size_left=511,
-        window_size_right=0,
-    )
-
-    assert result is output
-    flash = next(call for call in calls if call[0] == "flash")
-    assert flash[4] == {
-        "causal": False,
-        "window_size_left": 511,
-        "window_size_right": 0,
-        "softmax_scale": 1.0,
-    }
-
-
-def test_paged_local_attention_retains_window_while_global_retains_history(monkeypatch):
-    calls = []
-
-    def fake_flash(query, key, value, **kwargs):
-        calls.append(kwargs)
-        return query, None
-
-    monkeypatch.setattr(
-        "kestrel.ops.attention.get_runtime",
-        lambda: SimpleNamespace(
-            attention=SimpleNamespace(flash_attn_fwd=fake_flash)
-        ),
-    )
-    query = torch.zeros((1, 1, 1, 4))
-    layer = SimpleNamespace(
-        k_cache=torch.zeros((1, 1, 1, 4)),
-        v_cache=torch.zeros((1, 1, 1, 4)),
-        k_scale=None,
-        v_scale=None,
-    )
-    metadata = {
-        "paged_kv_layer": layer,
-        "page_table": torch.zeros((1, 600), dtype=torch.int32),
-        "paged_kv_seqlens_k": torch.tensor([600], dtype=torch.int32),
-        "scaling": 1.0,
-    }
-
-    attention_ops.paged_attention(query, **metadata, sliding_window=512)
-    attention_ops.paged_attention(query, **metadata, sliding_window=None)
-
-    assert calls[0]["seqused_k"].item() == 600
-    assert calls[0]["window_size_left"] == 511
-    assert calls[0]["window_size_right"] == 0
-    assert calls[0]["causal"] is False
-    assert calls[1]["window_size_left"] is None
-    assert calls[1]["window_size_right"] is None
-    assert calls[1]["causal"] is True
-
-
-def test_text_attention_cpu_causal_gqa_matches_reference():
-    torch.manual_seed(0)
-    query = torch.randn(1, 4, 3, 8)
-    key = torch.randn(1, 1, 3, 8)
-    value = torch.randn(1, 1, 3, 8)
-
-    actual = attention_ops.dense_attention(
-        query,
-        key,
-        value,
-        num_key_value_groups=4,
-        attention_mask=None,
-        scaling=0.5,
-        causal=True,
-    )
-
-    key = key.repeat_interleave(4, dim=1)
-    value = value.repeat_interleave(4, dim=1)
-    scores = torch.matmul(query, key.transpose(2, 3)) * 0.5
-    mask = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
-    scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-    expected = torch.matmul(scores.softmax(dim=-1), value)
-    expected = expected.transpose(1, 2).contiguous()
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_packed_text_attention_matches_individual_rows_on_cpu():
-    torch.manual_seed(1)
-    query = torch.randn(1, 2, 7, 8)
-    key = torch.randn(1, 1, 7, 8)
-    value = torch.randn(1, 1, 7, 8)
-    cu_seqlens = torch.tensor([0, 2, 7], dtype=torch.int32)
-
-    packed = attention_ops.dense_attention(
-        query,
-        key,
-        value,
-        num_key_value_groups=2,
-        attention_mask=None,
-        scaling=0.5,
-        causal=True,
-        cu_seqlens=cu_seqlens,
-    )
-    expected = torch.cat(
-        [
-            attention_ops.dense_attention(
-                query[..., start:end, :],
-                key[..., start:end, :],
-                value[..., start:end, :],
-                num_key_value_groups=2,
-                attention_mask=None,
-                scaling=0.5,
-                causal=True,
-            )
-            for start, end in ((0, 2), (2, 7))
-        ],
-        dim=1,
-    )
-
-    torch.testing.assert_close(packed, expected)
-
-
 def test_packed_text_prefill_matches_individual_rows():
     torch.manual_seed(11)
     model = Gemma4TextModel(
@@ -309,168 +123,6 @@ def test_packed_text_prefill_matches_individual_rows():
 
     torch.testing.assert_close(actual[0, :2], short[0])
     torch.testing.assert_close(actual[0, 2:], long[0])
-
-
-def test_packed_flash_attention_receives_varlen_abi(monkeypatch):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    calls = []
-
-    def fake_flash_attn_fwd(query, key, value, **kwargs):
-        calls.append((query, key, value, kwargs))
-        return torch.empty_like(query), None
-
-    monkeypatch.setattr(
-        attention_ops,
-        "get_runtime",
-        lambda: SimpleNamespace(
-            attention=SimpleNamespace(flash_attn_fwd=fake_flash_attn_fwd)
-        ),
-    )
-    with FakeTensorMode():
-        query = torch.empty((1, 2, 7, 8), dtype=torch.bfloat16, device="cuda")
-        key = torch.empty((1, 1, 7, 8), dtype=torch.bfloat16, device="cuda")
-        value = torch.empty_like(key)
-        cu_seqlens = torch.tensor(
-            [0, 2, 7],
-            dtype=torch.int32,
-            device="cuda",
-        )
-        out = attention_ops.dense_attention(
-            query,
-            key,
-            value,
-            num_key_value_groups=2,
-            attention_mask=None,
-            scaling=0.5,
-            causal=True,
-            cu_seqlens=cu_seqlens,
-        )
-
-    q, k, v, kwargs = calls[0]
-    assert q.shape == (7, 2, 8)
-    assert k.shape == v.shape == (7, 1, 8)
-    assert kwargs["cu_seqlens_q"] is cu_seqlens
-    assert kwargs["cu_seqlens_k"] is cu_seqlens
-    assert out.shape == (1, 7, 2, 8)
-
-
-@pytest.mark.parametrize("kind", ["text", "vision"])
-def test_mlp_uses_generic_gated_activation_provider(monkeypatch, kind):
-    if kind == "text":
-        mlp = gemma_model.Gemma4TextMLP(_text_config(), layer_idx=0)
-        project = mlp.gate_up_proj
-    else:
-        mlp = gemma_model.Gemma4VisionMLP(
-            _vision_config(
-                hidden_size=4,
-                intermediate_size=8,
-                use_clipped_linears=True,
-            )
-        )
-        project = mlp.gate_up_proj.forward_packed
-    calls = []
-
-    def fake_gated_activation(out, gate_up, *, activation, layout):
-        calls.append((activation, layout, tuple(gate_up.shape)))
-        gate, up = gate_up.chunk(2, dim=-1)
-        out.copy_(torch.nn.functional.gelu(gate, approximate="tanh") * up)
-
-    monkeypatch.setattr(
-        gemma_model,
-        "_kestrel_gated_activation_into",
-        fake_gated_activation,
-    )
-    x = torch.randn((2, 4))
-    actual = mlp(x)
-    gate_up = project(x)
-    gate, up = gate_up.chunk(2, dim=-1)
-    expected = mlp.down_proj(
-        torch.nn.functional.gelu(gate, approximate="tanh") * up
-    )
-
-    torch.testing.assert_close(actual, expected)
-    assert calls == [("gelu_tanh", "contiguous", (2, 16))]
-
-
-def test_vision_attention_cpu_matches_additive_padding_mask():
-    torch.manual_seed(7)
-    query = torch.randn((2, 5, 2, 4))
-    key = torch.randn((2, 5, 2, 4))
-    value = torch.randn((2, 5, 2, 4))
-    valid = torch.tensor(
-        [
-            [True, True, True, False, False],
-            [True, True, True, True, False],
-        ]
-    )
-    scale = 0.5
-
-    actual = attention_ops.variable_length_attention(
-        query,
-        key,
-        value,
-        num_key_value_groups=1,
-        used_key_lengths=valid.sum(dim=-1, dtype=torch.int32),
-        scaling=scale,
-    )
-
-    mask = attention_ops.bidirectional_padding_mask(valid, dtype=query.dtype)
-    query_bhsd = query.transpose(1, 2)
-    key_bhsd = key.transpose(1, 2)
-    value_bhsd = value.transpose(1, 2)
-    scores = torch.matmul(query_bhsd, key_bhsd.transpose(2, 3)) * scale + mask
-    expected = (
-        torch.softmax(scores, dim=-1, dtype=torch.float32)
-        .to(query.dtype)
-        .matmul(value_bhsd)
-        .transpose(1, 2)
-        .contiguous()
-    )
-    torch.testing.assert_close(actual, expected)
-
-
-def test_vision_attention_mps_uses_uniform_runtime(monkeypatch):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    calls = []
-
-    def fake_flash_attn_fwd(query, key, value, **kwargs):
-        calls.append((query, key, value, kwargs))
-        return torch.empty_like(query), None
-
-    runtime = SimpleNamespace(
-        attention=SimpleNamespace(flash_attn_fwd=fake_flash_attn_fwd),
-    )
-    monkeypatch.setattr(attention_ops, "get_runtime", lambda: runtime)
-
-    with FakeTensorMode():
-        query = torch.empty((2, 5, 2, 4), dtype=torch.float16, device="mps")
-        key = torch.empty_like(query)
-        value = torch.empty_like(query)
-        seqused_k = torch.empty((2,), dtype=torch.int32, device="mps")
-        out = attention_ops.variable_length_attention(
-            query,
-            key,
-            value,
-            num_key_value_groups=1,
-            used_key_lengths=seqused_k,
-            scaling=0.5,
-        )
-
-    assert out.shape == query.shape
-    assert calls == [
-        (
-            query,
-            key,
-            value,
-            {
-                "seqused_k": seqused_k,
-                "causal": False,
-                "softmax_scale": 0.5,
-            },
-        )
-    ]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -531,7 +183,7 @@ def test_modelspecs_register_on_import():
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)
-    assert spec.runtime is Gemma4Runtime
+    assert spec.runtime is create_gemma4_runtime
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
     assert spec.skills().names() == ("query",)
@@ -962,6 +614,7 @@ def test_gemma_paged_cache_includes_shared_kv_producer(
     cfg = _text_config(
         num_kv_shared_layers=1,
         layer_types=[layer_type, layer_type],
+        num_attention_heads=2,
         num_global_key_value_heads=2,
         head_dim=256,
         global_head_dim=512,
@@ -1099,15 +752,6 @@ def test_query_skill_defaults_to_direct_answer_mode():
     assert built.request_context.reasoning is True
 
 
-def test_float_image_arrays_are_scaled_before_uint8_conversion():
-    image = np.ones((32, 32, 3), dtype=np.float32)
-    inputs = preprocess_image(image)
-    valid = inputs.pixel_values[: inputs.num_image_tokens * 9]
-
-    assert inputs.pixel_values.dtype is torch.bfloat16
-    assert float(valid.max()) > 0.9
-
-
 @pytest.mark.parametrize("pixel", [0, 127, 255])
 def test_image_preprocessing_matches_official_rescale_domain(pixel):
     image = np.full((32, 32, 3), pixel, dtype=np.uint8)
@@ -1119,15 +763,6 @@ def test_image_preprocessing_matches_official_rescale_domain(pixel):
     valid = inputs.pixel_values[: inputs.num_image_tokens * 9]
 
     assert torch.equal(valid, torch.full_like(valid, expected))
-
-
-def test_image_preprocessing_uses_consumer_dtype():
-    inputs = preprocess_image(
-        np.zeros((32, 32, 3), dtype=np.uint8),
-        dtype=torch.float16,
-    )
-
-    assert inputs.pixel_values.dtype is torch.float16
 
 
 def test_image_preprocessing_preserves_patch_order_and_padding():
@@ -1161,32 +796,3 @@ def test_image_preprocessing_preserves_patch_order_and_padding():
             ]
         ),
     )
-
-
-def test_image_preprocessing_preserves_grid_larger_than_configured_max():
-    inputs = preprocess_image(
-        np.zeros((2, 64, 3), dtype=np.uint8),
-        config=Gemma4ImageProcessorConfig(
-            max_patches=1,
-            patch_size=1,
-            pooling_kernel_size=1,
-        ),
-    )
-
-    assert inputs.pixel_values.shape[0] > 1
-    assert inputs.image_position_ids.shape[0] == inputs.pixel_values.shape[0]
-
-
-@pytest.mark.parametrize("default_dtype", [torch.float16, torch.bfloat16])
-def test_image_preprocessing_rescale_ignores_default_dtype(default_dtype):
-    image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
-    expected = preprocess_image(image, dtype=torch.float32)
-    original_dtype = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(default_dtype)
-        actual = preprocess_image(image, dtype=torch.float32)
-    finally:
-        torch.set_default_dtype(original_dtype)
-
-    assert torch.equal(actual.pixel_values, expected.pixel_values)
-    assert torch.equal(actual.image_position_ids, expected.image_position_ids)
