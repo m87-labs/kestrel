@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from tokenizers import Tokenizer
@@ -18,7 +19,6 @@ from kestrel.engine import InferenceEngine
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
 from kestrel.ops import attention as attention_ops
-from kestrel.ops import norm as norm_ops
 from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
@@ -31,9 +31,12 @@ from kestrel.models.gemma4.config import (
     Gemma4VisionConfig,
     RopeSpec,
 )
+from kestrel.models.gemma4.image import (
+    Gemma4ImageProcessorConfig,
+    preprocess_image,
+)
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
-from kestrel.models.gemma4.runtime import create_gemma4_runtime
 from kestrel.models.gemma4.skills import build_skill_registry
 
 
@@ -91,32 +94,6 @@ def _vision_config(**overrides) -> Gemma4VisionConfig:
     return Gemma4VisionConfig(**values)
 
 
-def _fake_capacity_compiled(capacity: int, *, dynamic: bool):
-    capacity = int(capacity)
-    static = {} if dynamic and capacity > 1 else {"active_batch": capacity}
-
-    def refusal(name, value):
-        assert name == "active_batch"
-        value = int(value)
-        if value < 1 or value > capacity:
-            return "outside capacity"
-        if static and value != capacity:
-            return "does not match static extent"
-        return None
-
-    return SimpleNamespace(device_program=SimpleNamespace(
-        static_runtime_extents=static,
-        runtime_extent_refusal=refusal,
-    ))
-
-
-def _fake_kv_cache():
-    return SimpleNamespace(layers=[SimpleNamespace(
-        k_cache=torch.empty(1, 1, 1, 1),
-        v_cache=torch.empty(1, 1, 1, 1),
-    )])
-
-
 class _FakePageTable:
     def __init__(self, free_batch_idx: list[int], pages_available: int = 4096) -> None:
         self.free_batch_idx = free_batch_idx
@@ -126,31 +103,6 @@ class _FakePageTable:
         del cached_page_count
         if batch_idx not in self.free_batch_idx:
             self.free_batch_idx.append(batch_idx)
-
-
-def test_rmsnorm_uses_dense_runtime_with_uniform_fp32_weight(monkeypatch):
-    calls = []
-
-    def fake_rmsnorm(x, weight, eps):
-        calls.append((x, weight, eps))
-        return x
-
-    monkeypatch.setattr(norm_ops, "_rmsnorm", fake_rmsnorm)
-    scaled = gemma_model.norm_ops.RMSNorm(1536)
-    unscaled = gemma_model.norm_ops.RMSNorm(512, with_scale=False)
-    x_scaled = torch.zeros((2, 1536), dtype=torch.bfloat16)
-    x_unscaled = torch.zeros((2, 512), dtype=torch.bfloat16)
-
-    assert scaled(x_scaled) is x_scaled
-    assert unscaled(x_unscaled) is x_unscaled
-    assert scaled.weight.dtype == torch.float32
-    assert unscaled.weight.dtype == torch.float32
-    assert "weight" in scaled.state_dict()
-    assert "weight" not in unscaled.state_dict()
-    assert calls == [
-        (x_scaled, scaled.weight, 1.0e-6),
-        (x_unscaled, unscaled.weight, 1.0e-6),
-    ]
 
 
 def test_text_rotary_runtime_preserves_existing_cpu_math():
@@ -403,9 +355,20 @@ def test_packed_flash_attention_receives_varlen_abi(monkeypatch):
     assert out.shape == (1, 7, 2, 8)
 
 
-def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
-    cfg = _text_config()
-    mlp = gemma_model.Gemma4TextMLP(cfg, layer_idx=0)
+@pytest.mark.parametrize("kind", ["text", "vision"])
+def test_mlp_uses_generic_gated_activation_provider(monkeypatch, kind):
+    if kind == "text":
+        mlp = gemma_model.Gemma4TextMLP(_text_config(), layer_idx=0)
+        project = mlp.gate_up_proj
+    else:
+        mlp = gemma_model.Gemma4VisionMLP(
+            _vision_config(
+                hidden_size=4,
+                intermediate_size=8,
+                use_clipped_linears=True,
+            )
+        )
+        project = mlp.gate_up_proj.forward_packed
     calls = []
 
     def fake_gated_activation(out, gate_up, *, activation, layout):
@@ -420,38 +383,7 @@ def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
     )
     x = torch.randn((2, 4))
     actual = mlp(x)
-    gate_up = mlp.gate_up_proj(x)
-    gate, up = gate_up.chunk(2, dim=-1)
-    expected = mlp.down_proj(
-        torch.nn.functional.gelu(gate, approximate="tanh") * up
-    )
-
-    torch.testing.assert_close(actual, expected)
-    assert calls == [("gelu_tanh", "contiguous", (2, 16))]
-
-
-def test_vision_mlp_uses_generic_gated_activation_provider(monkeypatch):
-    cfg = _vision_config(
-        hidden_size=4,
-        intermediate_size=8,
-        use_clipped_linears=True,
-    )
-    mlp = gemma_model.Gemma4VisionMLP(cfg)
-    calls = []
-
-    def fake_gated_activation(out, gate_up, *, activation, layout):
-        calls.append((activation, layout, tuple(gate_up.shape)))
-        gate, up = gate_up.chunk(2, dim=-1)
-        out.copy_(torch.nn.functional.gelu(gate, approximate="tanh") * up)
-
-    monkeypatch.setattr(
-        gemma_model,
-        "_kestrel_gated_activation_into",
-        fake_gated_activation,
-    )
-    x = torch.randn((2, 4))
-    actual = mlp(x)
-    gate_up = mlp.gate_up_proj.forward_packed(x)
+    gate_up = project(x)
     gate, up = gate_up.chunk(2, dim=-1)
     expected = mlp.down_proj(
         torch.nn.functional.gelu(gate, approximate="tanh") * up
@@ -595,7 +527,7 @@ def test_modelspecs_register_on_import():
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)
-    assert spec.runtime is create_gemma4_runtime
+    assert spec.runtime is Gemma4Runtime
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
     assert spec.skills().names() == ("query",)
@@ -819,347 +751,6 @@ def test_decode_compile_translates_model_config(monkeypatch):
     )
 
 
-def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
-    from kestrel.models.gemma4 import generated_decode
-    from mkl.megakernel.device_runtime import DeviceRuntimeError
-
-    config = SimpleNamespace()
-    calls = []
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        max_batch_size=1,
-        max_seq_length=2048,
-        dtype=torch.bfloat16,
-        _kv_cache=_fake_kv_cache(),
-        model=SimpleNamespace(
-            model=SimpleNamespace(language_model=SimpleNamespace(config=config))),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: calls.append(("properties", device)) or SimpleNamespace(
-            multi_processor_count=132,
-            major=9,
-            minor=0,
-            name="test-gpu",
-        ),
-    )
-    def compile_config(model_config, **kwargs):
-        calls.append(("compile", model_config, kwargs))
-        return _fake_capacity_compiled(
-            kwargs["batch_capacity"], dynamic=True)
-
-    monkeypatch.setattr(
-        generated_decode, "_compile_from_config", compile_config)
-    monkeypatch.setattr(
-        "mkl.compiler.frontend.validate_program.validate_compiled_tape",
-        lambda artifact: SimpleNamespace(program=artifact),
-    )
-    monkeypatch.setattr(
-        "mkl.megakernel.device_runtime.resolve_shipped_aot_bundle",
-        lambda artifact, *, arch: calls.append(
-            ("resolve", artifact.program.device_program.static_runtime_extents,
-             arch)
-        ) or None,
-    )
-
-    with pytest.raises(
-        DeviceRuntimeError,
-        match=r"missing active extents \[1\].*unresolved artifacts",
-    ):
-        generated_decode.create_generated_decode(runtime)
-    assert calls[0] == ("properties", torch.device("cuda:0"))
-    assert calls[1:] == [
-        call
-        for batch_capacity in (1, 2, 4, 8)
-        for call in (
-            ("compile", config, {
-                "batch_capacity": batch_capacity,
-                "max_kv_len": 2048,
-                "num_ctas": 132,
-                "gpu": "test-gpu",
-            }),
-            (
-                "resolve",
-                (
-                    {"active_batch": 1}
-                    if batch_capacity == 1 else {}
-                ),
-                "sm90",
-            ),
-        )
-    ]
-
-
-def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch):
-    from kestrel.models.gemma4 import generated_decode
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    compiled_capacities = []
-    resolved_capacities = []
-    config = SimpleNamespace()
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        max_batch_size=11,
-        max_seq_length=2048,
-        dtype=torch.bfloat16,
-        _kv_cache=_fake_kv_cache(),
-        model=SimpleNamespace(
-            model=SimpleNamespace(language_model=SimpleNamespace(config=config))),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(
-            multi_processor_count=132,
-            major=9,
-            minor=0,
-            name="test-gpu",
-        ),
-    )
-
-    def compile_config(model_config, **kwargs):
-        capacity = int(kwargs["batch_capacity"])
-        compiled_capacities.append(capacity)
-        compiled = _fake_capacity_compiled(capacity, dynamic=True)
-        compiled.capacity = capacity
-        return compiled
-
-    monkeypatch.setattr(
-        generated_decode, "_compile_from_config", compile_config)
-    monkeypatch.setattr(
-        "mkl.compiler.frontend.validate_program.validate_compiled_tape",
-        lambda artifact: SimpleNamespace(
-            program=artifact, capacity=artifact.capacity),
-    )
-
-    def resolve_bundle(artifact, *, arch):
-        resolved_capacities.append((artifact.capacity, arch))
-        return "bundle" if artifact.capacity == 8 else None
-
-    monkeypatch.setattr(
-        "mkl.megakernel.device_runtime.resolve_shipped_aot_bundle",
-        resolve_bundle,
-    )
-    monkeypatch.setattr(
-        GeneratedDecode,
-        "__init__",
-        lambda self, bound_runtime, *, spec, programs: setattr(
-            self, "_programs", programs),
-    )
-
-    result = generated_decode.create_generated_decode(runtime)
-
-    assert result is not None
-    assert compiled_capacities == [1, 2, 4, 8]
-    assert resolved_capacities == [
-        (capacity, "sm90") for capacity in compiled_capacities]
-    assert tuple(result._programs) == (8,)
-    assert result.supports(8)
-    assert not result.supports(11)
-
-
-@pytest.mark.parametrize("missing_name", ["mkl", "mkl.megakernel"])
-def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_name):
-    import builtins
-
-    from kestrel.models.gemma4 import generated_decode
-
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        dtype=torch.bfloat16,
-        _kv_cache=_fake_kv_cache(),
-    )
-    real_import = builtins.__import__
-
-    def import_without_mkl(name, *args, **kwargs):
-        if name == "mkl.compiler.frontend.models.aot":
-            raise ModuleNotFoundError(
-                f"No module named {missing_name!r}", name=missing_name
-            )
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_without_mkl)
-
-    assert generated_decode.create_generated_decode(runtime) is None
-
-
-def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
-    from kestrel.models.gemma4 import generated_decode
-    from mkl.compiler.frontend.gpu_model import CalibrationUnavailable
-    from mkl.megakernel.device_runtime import DeviceRuntimeError
-
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        max_batch_size=1,
-        max_seq_length=2048,
-        dtype=torch.bfloat16,
-        _kv_cache=_fake_kv_cache(),
-        model=SimpleNamespace(
-            model=SimpleNamespace(
-                language_model=SimpleNamespace(config=SimpleNamespace())
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(
-            multi_processor_count=132,
-            major=9,
-            minor=0,
-            name="NVIDIA H200",
-        ),
-    )
-    monkeypatch.setattr(
-        generated_decode,
-        "_compile_from_config",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            CalibrationUnavailable("NVIDIA H200 has no calibration")
-        ),
-    )
-
-    with pytest.raises(
-        DeviceRuntimeError,
-        match="no calibration for 'NVIDIA H200'",
-    ):
-        generated_decode.create_generated_decode(runtime)
-
-
-@pytest.mark.parametrize("batch_size", [11, 16])
-def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_size):
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    calls = []
-    batch_capacity = 16
-    state = SimpleNamespace(
-        invocation=SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs)),
-        argument_names={"active_batch", "kv_len"},
-        required_launch_extents={"active_batch", "kv_len"},
-    )
-    megakernel = GeneratedDecode.__new__(GeneratedDecode)
-    megakernel._programs = {1: (object(),) * 3, 8: (object(),) * 3,
-                            batch_capacity: (object(),) * 3}
-    megakernel._slots = {(7, batch_capacity): state}
-    megakernel._input_preparation_plan = ()
-    megakernel._spec = SimpleNamespace(
-        label="Gemma",
-        launch_extents=lambda slot, extent: {
-            "active_batch": extent,
-            "kv_len": int(slot.meta.input_pos.cpu[:extent].max()) + 1,
-        }
-    )
-    slot = SimpleNamespace(
-        slot_id=7,
-        meta=SimpleNamespace(input_pos=SimpleNamespace(
-            cpu=torch.arange(batch_size, dtype=torch.int32))),
-    )
-
-    assert megakernel.supports(batch_size)
-    assert megakernel._capacity_for(batch_size) == batch_capacity
-    megakernel.run(slot, batch_size)
-
-    assert calls == [{"active_batch": batch_size, "kv_len": batch_size}]
-
-
-def test_generated_decode_rejects_input_namespace_collisions():
-    from kestrel.runtime.generated_decode import _merge_disjoint_inputs
-
-    with pytest.raises(RuntimeError, match="owned by both shared and slot"):
-        _merge_disjoint_inputs(
-            "test",
-            shared={"page_table": object()},
-            capacity={"active_rows": object()},
-            slot={"page_table": object()},
-        )
-
-
-def test_generated_decode_rejects_cross_capacity_weight_abi_drift():
-    from kestrel.runtime.generated_decode import _require_uniform_weight_contract
-
-    programs = {
-        1: (
-            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
-            None,
-            None,
-        ),
-        8: (
-            SimpleNamespace(weight_binding_contract=("weight", "fp8")),
-            None,
-            None,
-        ),
-    }
-
-    with pytest.raises(RuntimeError, match="weight storage ABI"):
-        _require_uniform_weight_contract(
-            "test",
-            programs,
-        )
-
-
-def test_generated_decode_accepts_uniform_cross_capacity_weight_abi():
-    from kestrel.runtime.generated_decode import _require_uniform_weight_contract
-
-    programs = {
-        1: (
-            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
-            None,
-            None,
-        ),
-        8: (
-            SimpleNamespace(weight_binding_contract=("weight", "bf16")),
-            None,
-            None,
-        ),
-    }
-
-    _require_uniform_weight_contract(
-        "test",
-        programs,
-    )
-
-
-def test_generated_decode_run_rejects_missing_dynamic_launch_extent():
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    generated = GeneratedDecode.__new__(GeneratedDecode)
-    generated._programs = {1: (object(),) * 3}
-    generated._slots = {
-        (0, 1): SimpleNamespace(
-            invocation=SimpleNamespace(launch=lambda **_kwargs: None),
-            argument_names={"active_batch"},
-            required_launch_extents={"active_batch"},
-        )
-    }
-    generated._input_preparation_plan = ()
-    generated._spec = SimpleNamespace(
-        label="test",
-        launch_extents=lambda _slot, _batch_size: {},
-    )
-
-    with pytest.raises(RuntimeError, match="active_batch"):
-        generated.run(SimpleNamespace(slot_id=0), 1)
-
-
-def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    megakernel = GeneratedDecode.__new__(GeneratedDecode)
-    megakernel._programs = {
-        1: (object(),) * 3,
-        8: (object(),) * 3,
-        16: (object(),) * 3,
-    }
-
-    assert megakernel._capacity_for(1) == 1
-    assert megakernel._capacity_for(3) == 8
-    assert megakernel._capacity_for(11) == 16
-    assert megakernel._capacity_for(16) == 16
-    assert megakernel._capacity_for(0) is None
-    assert megakernel._capacity_for(17) is None
-    assert not megakernel.supports(17)
-
-
 def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = torch.device("cpu")
@@ -1269,7 +860,7 @@ def test_engine_adopts_externally_supplied_runtime_kv_pool():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_runtime_constructs():
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
-    rt = create_gemma4_runtime(
+    rt = Gemma4Runtime(
         cfg,
         kv_pool=KVMemoryPool(device=cfg.resolved_device()),
         compute_stream=torch.cuda.Stream(),
@@ -1357,34 +948,28 @@ def test_active_sequence_lifecycle_registers_and_frees_batch_index():
     assert rt.page_table.free_batch_idx == [0]
 
 
-def test_gemma_paged_cache_includes_sliding_shared_kv_producer():
+@pytest.mark.parametrize(
+    ("layer_type", "heads", "head_dim"),
+    [("sliding_attention", 1, 256), ("full_attention", 1, 512)],
+)
+def test_gemma_paged_cache_includes_shared_kv_producer(
+    layer_type, heads, head_dim
+):
     cfg = _text_config(
         num_kv_shared_layers=1,
-        layer_types=["sliding_attention", "sliding_attention"],
-        head_dim=256,
-        global_head_dim=256,
-    )
-
-    specs, sources = paged_kv_layout(cfg)
-    assert specs == (PagedKVLayerSpec(1, 256), None)
-    assert sources == (0, 0)
-
-
-def test_gemma_paged_cache_includes_global_shared_kv_producer():
-    cfg = _text_config(
-        num_kv_shared_layers=1,
-        layer_types=["full_attention", "full_attention"],
+        layer_types=[layer_type, layer_type],
         num_global_key_value_heads=2,
         head_dim=256,
         global_head_dim=512,
     )
 
     specs, sources = paged_kv_layout(cfg)
-    assert specs == (PagedKVLayerSpec(1, 512), None)
+    assert specs == (PagedKVLayerSpec(heads, head_dim), None)
     assert sources == (0, 0)
 
-    specs, _ = paged_kv_layout(replace(cfg, attention_k_eq_v=True))
-    assert specs[0] == PagedKVLayerSpec(2, 512)
+    if layer_type == "full_attention":
+        specs, _ = paged_kv_layout(replace(cfg, attention_k_eq_v=True))
+        assert specs[0] == PagedKVLayerSpec(2, 512)
 
 
 def test_gemma_shared_kv_sources_preserve_local_global_topology():
@@ -1511,10 +1096,6 @@ def test_query_skill_defaults_to_direct_answer_mode():
 
 
 def test_float_image_arrays_are_scaled_before_uint8_conversion():
-    import numpy as np
-
-    from kestrel.models.gemma4.image import preprocess_image
-
     image = np.ones((32, 32, 3), dtype=np.float32)
     inputs = preprocess_image(image)
     valid = inputs.pixel_values[: inputs.num_image_tokens * 9]
@@ -1525,10 +1106,6 @@ def test_float_image_arrays_are_scaled_before_uint8_conversion():
 
 @pytest.mark.parametrize("pixel", [0, 127, 255])
 def test_image_preprocessing_matches_official_rescale_domain(pixel):
-    import numpy as np
-
-    from kestrel.models.gemma4.image import preprocess_image
-
     image = np.full((32, 32, 3), pixel, dtype=np.uint8)
     inputs = preprocess_image(image)
     expected = torch.tensor(
@@ -1541,10 +1118,6 @@ def test_image_preprocessing_matches_official_rescale_domain(pixel):
 
 
 def test_image_preprocessing_uses_consumer_dtype():
-    import numpy as np
-
-    from kestrel.models.gemma4.image import preprocess_image
-
     inputs = preprocess_image(
         np.zeros((32, 32, 3), dtype=np.uint8),
         dtype=torch.float16,
@@ -1554,13 +1127,6 @@ def test_image_preprocessing_uses_consumer_dtype():
 
 
 def test_image_preprocessing_preserves_patch_order_and_padding():
-    import numpy as np
-
-    from kestrel.models.gemma4.image import (
-        Gemma4ImageProcessorConfig,
-        preprocess_image,
-    )
-
     config = Gemma4ImageProcessorConfig(
         max_patches=6,
         patch_size=2,
@@ -1594,13 +1160,6 @@ def test_image_preprocessing_preserves_patch_order_and_padding():
 
 
 def test_image_preprocessing_preserves_grid_larger_than_configured_max():
-    import numpy as np
-
-    from kestrel.models.gemma4.image import (
-        Gemma4ImageProcessorConfig,
-        preprocess_image,
-    )
-
     inputs = preprocess_image(
         np.zeros((2, 64, 3), dtype=np.uint8),
         config=Gemma4ImageProcessorConfig(
@@ -1616,10 +1175,6 @@ def test_image_preprocessing_preserves_grid_larger_than_configured_max():
 
 @pytest.mark.parametrize("default_dtype", [torch.float16, torch.bfloat16])
 def test_image_preprocessing_rescale_ignores_default_dtype(default_dtype):
-    import numpy as np
-
-    from kestrel.models.gemma4.image import preprocess_image
-
     image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
     expected = preprocess_image(image, dtype=torch.float32)
     original_dtype = torch.get_default_dtype()
