@@ -313,8 +313,8 @@ def _paged_attention_forward(
         window_size_left=(sliding_window - 1) if sliding_window is not None else None,
         window_size_right=0 if sliding_window is not None else None,
         softmax_scale=scaling,
-        k_scale=getattr(paged_kv_layer, "k_scale", None),
-        v_scale=getattr(paged_kv_layer, "v_scale", None),
+        k_scale=paged_kv_layer.k_scale,
+        v_scale=paged_kv_layer.v_scale,
     )
     return out.contiguous()
 
@@ -371,8 +371,7 @@ class Gemma4TextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Any,
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
         kv_cache: LayeredPagedKV | None = None,
         cache_position_ids: Optional[torch.Tensor] = None,
@@ -456,7 +455,7 @@ class Gemma4TextAttention(nn.Module):
                 key_states,
                 value_states,
                 num_key_value_groups=self.num_key_value_groups,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 scaling=self.scaling,
                 causal=not self.is_sliding,
                 window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
@@ -510,9 +509,6 @@ class Gemma4TextDecoderLayer(nn.Module):
         publishes_kv: bool,
     ) -> None:
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
         self.self_attn = Gemma4TextAttention(
             config,
             layer_idx,
@@ -520,22 +516,28 @@ class Gemma4TextDecoderLayer(nn.Module):
             publishes_kv=publishes_kv,
         )
         self.mlp = Gemma4TextMLP(config, layer_idx)
-        self.input_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.register_buffer("layer_scalar", torch.ones(1))
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
             self.per_layer_input_gate = nn.Linear(
-                self.hidden_size, self.hidden_size_per_layer_input, bias=False
+                config.hidden_size, self.hidden_size_per_layer_input, bias=False
             )
             self.per_layer_projection = nn.Linear(
-                self.hidden_size_per_layer_input, self.hidden_size, bias=False
+                self.hidden_size_per_layer_input, config.hidden_size, bias=False
             )
             self.post_per_layer_input_norm = Gemma4RMSNorm(
-                self.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps
             )
 
     def forward(
@@ -544,19 +546,25 @@ class Gemma4TextDecoderLayer(nn.Module):
         per_layer_input: Optional[torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
         kv_cache: LayeredPagedKV | None = None,
-        **attention_kwargs: Any,
+        cache_position_ids: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
+        paged_kv_use_sliding_window: bool = True,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
             transient_kv=transient_kv,
             kv_cache=kv_cache,
-            **attention_kwargs,
+            cache_position_ids=cache_position_ids,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
+            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -590,7 +598,6 @@ class Gemma4TextScaledWordEmbedding(nn.Embedding):
         embed_scale: float = 1.0,
     ) -> None:
         super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.scalar_embed_scale = embed_scale
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -606,13 +613,11 @@ class Gemma4TextModel(nn.Module):
     def __init__(self, config: Gemma4TextConfig) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = 0
-        self.vocab_size = config.vocab_size
 
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
-            self.padding_idx,
+            0,
             embed_scale=config.hidden_size**0.5,
         )
         sources = kv_source_layers(config)
@@ -639,7 +644,7 @@ class Gemma4TextModel(nn.Module):
             self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                self.padding_idx,
+                0,
                 embed_scale=config.hidden_size_per_layer_input**0.5,
             )
             self.register_buffer(
@@ -688,7 +693,6 @@ class Gemma4TextModel(nn.Module):
         kv_cache: LayeredPagedKV | None = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
-        prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
         cache_position_ids: Optional[torch.Tensor] = None,
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
@@ -716,7 +720,6 @@ class Gemma4TextModel(nn.Module):
                 seq_len, device=inputs_embeds.device
             ).unsqueeze(0)
 
-        masks = prebuilt_masks or {}
         position_embeddings = {}
         for layer_type in self.unique_layer_types:
             cos, sin = self.rotary_emb(inputs_embeds, position_ids, layer_type)
@@ -736,7 +739,6 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 transient_kv=transient_kv,
                 position_embeddings=position_embeddings[layer_type],
-                attention_mask=masks.get(layer_type),
                 kv_cache=kv_cache,
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,
@@ -781,7 +783,6 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         self.patch_size = config.patch_size
         self.position_embedding_size = config.position_embedding_size
@@ -867,7 +868,6 @@ class Gemma4VisionMLP(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_up_proj = Gemma4ClippableLinear(
@@ -940,17 +940,16 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig, device: Optional[torch.device] = None) -> None:
         super().__init__()
-        self.config = config
-        self.rope_type = config.rope.kind
-        if self.rope_type != "default":
-            raise ValueError(f"Vision RoPE only supports rope_type='default', got {self.rope_type!r}")
+        if config.rope.kind != "default":
+            raise ValueError(
+                f"Vision RoPE only supports rope_type='default', got {config.rope.kind!r}"
+            )
         base = config.rope.theta
         head_dim = config.head_dim
         # Per HF: the reference impl computes RoPE freqs independently for each
         # spatial dimension using head_dim // ndim (ndim=2 for x/y), so each axis
         # gets the same frequency range — not a global inv_freq split.
         spatial_dim = head_dim // 2
-        self.spatial_dim = spatial_dim
         inv = 1.0 / (
             base
             ** (torch.arange(0, spatial_dim, 2, dtype=torch.int64, device=device).float() / spatial_dim)
@@ -1032,11 +1031,9 @@ def _vision_attention_forward(
 
 class Gemma4VisionAttention(nn.Module):
 
-    def __init__(self, config: Gemma4VisionConfig, layer_idx: int) -> None:
+    def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = 1.0
         self.qkv_proj = PackedBoundedProjections(
@@ -1091,17 +1088,20 @@ class Gemma4VisionAttention(nn.Module):
 
 
 class Gemma4VisionEncoderLayer(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig, layer_idx: int) -> None:
+    def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
-        self.self_attn = Gemma4VisionAttention(config, layer_idx)
+        self.self_attn = Gemma4VisionAttention(config)
         self.mlp = Gemma4VisionMLP(config)
-        self.input_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -1156,11 +1156,9 @@ def _build_bidirectional_mask(
 class Gemma4VisionEncoder(nn.Module):
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.config = config
-        self.num_layers = config.num_hidden_layers
         self.rotary_emb = Gemma4VisionRotaryEmbedding(config)
         self.layers = nn.ModuleList(
-            [Gemma4VisionEncoderLayer(config, i) for i in range(self.num_layers)]
+            [Gemma4VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
     def forward(
@@ -1236,13 +1234,11 @@ class Gemma4VisionEmbedder(nn.Module):
         text_config: Gemma4TextConfig,
     ) -> None:
         super().__init__()
-        self.vision_hidden_size = vision_config.hidden_size
-        self.text_hidden_size = text_config.hidden_size
         self.embedding_projection = nn.Linear(
-            self.vision_hidden_size, self.text_hidden_size, bias=False
+            vision_config.hidden_size, text_config.hidden_size, bias=False
         )
         self.embedding_pre_projection_norm = Gemma4RMSNorm(
-            self.vision_hidden_size,
+            vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             with_scale=False,
         )
@@ -1256,18 +1252,12 @@ class Gemma4Model(nn.Module):
 
     def __init__(self, config: Gemma4Config) -> None:
         super().__init__()
-        self.config = config
         text_cfg = config.text_config
-        self.vocab_size = text_cfg.vocab_size
 
         self.language_model = Gemma4TextModel(text_cfg)
-        self.vocab_size_per_layer_input = text_cfg.vocab_size_per_layer_input
 
         self.vision_tower = Gemma4VisionModel(config.vision_config)
         self.embed_vision = Gemma4VisionEmbedder(config.vision_config, text_cfg)
-
-    def get_input_embeddings(self) -> nn.Module:
-        return self.language_model.embed_tokens
 
     def get_image_features(
         self,
@@ -1281,9 +1271,6 @@ class Gemma4Model(nn.Module):
         )
         return self.embed_vision(vision_hidden)
 
-    def image_placeholder_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return input_ids == self.config.image_token_id
-
 class Gemma4ForConditionalGeneration(nn.Module):
 
     def __init__(self, config: Gemma4Config) -> None:
@@ -1291,37 +1278,18 @@ class Gemma4ForConditionalGeneration(nn.Module):
         self.config = config
         text_cfg = config.text_config
         self.model = Gemma4Model(config)
-        self.vocab_size = text_cfg.vocab_size
         self.lm_head = nn.Linear(text_cfg.hidden_size, text_cfg.vocab_size, bias=False)
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
-        kv_cache: LayeredPagedKV | None = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-        prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
         logits_to_keep: int = 0,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
     ) -> torch.Tensor:
         hidden_states = self.model.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
-            kv_cache=kv_cache,
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
-            prebuilt_masks=prebuilt_masks,
-            cache_position_ids=cache_position_ids,
-            slot_mapping=slot_mapping,
-            page_table=page_table,
-            paged_kv_seqlens_k=paged_kv_seqlens_k,
-            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
         )
         slice_indices = slice(-logits_to_keep, None) if logits_to_keep else slice(None)
         logits = self.lm_head(hidden_states[:, slice_indices, :])

@@ -128,10 +128,10 @@ class Gemma4DecodeMegakernel:
     def try_create(cls, runtime: Any) -> Gemma4DecodeMegakernel | None:
         if runtime.device.type != "cuda":
             return None
-        if getattr(runtime, "dtype", torch.bfloat16) is not torch.bfloat16:
+        if runtime.dtype is not torch.bfloat16:
             return None
         if not _supports_paged_decode_abi(
-            getattr(getattr(runtime, "_kv_cache", None), "layers", None)
+            runtime._kv_cache.layers
         ):
             return None
 
@@ -155,7 +155,7 @@ class Gemma4DecodeMegakernel:
         try:
             programs = resolve_capacity_programs(
                 DECODE_BATCH_CAPACITIES,
-                max_active_extent=int(getattr(runtime, "max_batch_size", 1)),
+                max_active_extent=runtime.max_batch_size,
                 compile_program=lambda batch_capacity: _compile_from_config(
                     runtime.model.model.language_model.config,
                     batch_capacity=batch_capacity,

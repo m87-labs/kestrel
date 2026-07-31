@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.processors import TemplateProcessing
 
 import kestrel.models.gemma4  # noqa: F401
 from kestrel.config import RuntimeConfig
@@ -322,6 +326,21 @@ def test_text_attention_cpu_causal_gqa_matches_reference():
     expected = expected.transpose(1, 2).contiguous()
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_padded_text_prefill_matches_individual_active_rows():
+    torch.manual_seed(11)
+    model = Gemma4TextModel(
+        _text_config(layer_types=["sliding_attention", "full_attention"])
+    )
+    batch = torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]])
+
+    batched = model(input_ids=batch)
+    short = model(input_ids=batch[:1, :2])
+    long = model(input_ids=batch[1:])
+
+    torch.testing.assert_close(batched[0, :2], short[0])
+    torch.testing.assert_close(batched[1], long[0])
 
 
 def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
@@ -1021,6 +1040,20 @@ def test_runtime_generate_base_ignores_instruct_terminators() -> None:
     assert runtime.generate("question", max_new_tokens=3) == repr(
         [TOOL_RESPONSE_ID, END_OF_TURN_ID]
     )
+
+
+def test_disabling_tokenizer_postprocessor_preserves_no_special_token_ids():
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "<bos>": 2}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.post_processor = TemplateProcessing(
+        single="<bos> $A",
+        special_tokens=[("<bos>", 2)],
+    )
+    expected = tokenizer.encode("hello", add_special_tokens=False).ids
+
+    tokenizer.post_processor = None
+
+    assert tokenizer.encode("hello").ids == expected == [1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

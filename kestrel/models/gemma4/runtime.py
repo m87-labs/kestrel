@@ -60,35 +60,6 @@ class _SimplePrefillSlot:
     scratch: Any = None
 
 
-@dataclass
-class _EncodeResult:
-    """Match the surface kestrel skills expect: ``encode(s).ids``."""
-
-    ids: list[int]
-
-
-class _TokenizerShim:
-    """Adapts ``tokenizers.Tokenizer`` to the encode/decode surface."""
-
-    def __init__(self, tokenizer: Any) -> None:
-        self._tok = tokenizer
-
-    def encode(self, text: str) -> _EncodeResult:
-        enc = self._tok.encode(text, add_special_tokens=False)
-        return _EncodeResult(ids=list(enc.ids))
-
-    def decode(
-        self,
-        ids: Sequence[int],
-        skip_special_tokens: bool = True,
-        **kwargs: Any,
-    ) -> str:
-        return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._tok, name)
-
-
 class Gemma4Runtime:
     """Runtime wrapping vendored Gemma 4 modeling for the kestrel engine."""
 
@@ -153,27 +124,28 @@ class Gemma4Runtime:
 
             materialize_dynamic_batch_domain(
                 vision_tower.encoder,
-                max_batch_size=int(getattr(cfg, "max_batch_size", 1)),
+                max_batch_size=cfg.max_batch_size,
                 inputs_for_batch=vision_inputs,
                 synchronize=lambda: torch.cuda.synchronize(self.device),
             )
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        self.tokenizer = _TokenizerShim(Tokenizer.from_pretrained(repo_id))
+        self.tokenizer = Tokenizer.from_pretrained(repo_id)
+        self.tokenizer.post_processor = None
         self.prompt_template = Gemma4PromptTemplate(repo_id)
 
         self._model_name = repo_id
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.spec = None
-        self.max_batch_size = getattr(cfg, "max_batch_size", 1)
+        self.max_batch_size = cfg.max_batch_size
         self.max_batch_slots = self.max_batch_size + 2
         self._vision_pixel_staging: CpuGpuBuffer | None = None
         self._vision_position_staging: CpuGpuBuffer | None = None
         self._decode_slot_rows = _decode_slot_rows(self.max_batch_size)
         self._padding_batch_idx = self.max_batch_slots - 1
-        self.page_size = int(getattr(cfg, "page_size", 1))
-        self._kv_cache_pages = int(getattr(cfg, "kv_cache_pages", 65536))
+        self.page_size = cfg.page_size
+        self._kv_cache_pages = cfg.kv_cache_pages
         self.max_seq_length = min(
             self._config.text_config.max_position_embeddings,
             _MAX_SHIPPED_KV_LEN,
@@ -250,7 +222,7 @@ class Gemma4Runtime:
         batch_size = len(crops_list)
         if batch_size < 1:
             raise ValueError("vision staging requires at least one input row")
-        capacity = max(batch_size, int(getattr(self, "max_batch_size", batch_size)))
+        capacity = max(batch_size, self.max_batch_size)
         first_crops = crops_list[0]
         pixel_shape = tuple(first_crops.pixel_values.shape)
         position_shape = tuple(first_crops.image_position_ids.shape)
@@ -629,17 +601,17 @@ class Gemma4Runtime:
                 image_features = image_features_by_row[row]
                 if image_features is None:
                     raise RuntimeError("missing encoded features for image row")
-                image_mask = self.model.model.image_placeholder_mask(input_ids)
+                image_mask = input_ids == self._config.image_token_id
                 llm_ids = input_ids.clone()
                 llm_ids[image_mask] = pad_id
-                embeds = self.model.model.get_input_embeddings()(llm_ids)
+                embeds = self.model.model.language_model.embed_tokens(llm_ids)
                 embeds = embeds.masked_scatter(
                     image_mask.unsqueeze(-1).expand_as(embeds),
                     image_features.to(device=embeds.device, dtype=embeds.dtype),
                 )
             else:
                 llm_ids = input_ids
-                embeds = self.model.model.get_input_embeddings()(input_ids)
+                embeds = self.model.model.language_model.embed_tokens(input_ids)
 
             embeds_rows.append(embeds)
             llm_id_rows.append(llm_ids)
