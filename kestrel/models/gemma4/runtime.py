@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.device import make_event, make_stream
 from kestrel.models.registry import get_spec
-from kestrel.runtime import ExecutionShape, TextToken
+from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
 from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -61,7 +61,7 @@ class _SimplePrefillSlot:
 
 
 class Gemma4Runtime:
-    """Runtime wrapping vendored Gemma 4 modeling for the kestrel engine."""
+    """Gemma 4 inference runtime for the Kestrel engine."""
 
     def __init__(
         self,
@@ -93,43 +93,41 @@ class Gemma4Runtime:
         )
         self._config = self.model.config
         vision_tower = self.model.model.vision_tower
-        if self.device.type == "cuda" and vision_tower is not None:
-            canonicalize_immutable_scalar_buffers(vision_tower.encoder)
-            vision_tower.encoder.forward = torch.compile(
-                vision_tower.encoder.forward,
-                dynamic=True,
-                fullgraph=False,
-                options={"triton.cudagraphs": False},
-            )
-            vision_cfg = self._config.vision_config
+        canonicalize_immutable_scalar_buffers(vision_tower.encoder)
+        vision_tower.encoder.forward = torch.compile(
+            vision_tower.encoder.forward,
+            dynamic=True,
+            fullgraph=False,
+            options={"triton.cudagraphs": False},
+        )
+        vision_cfg = self._config.vision_config
 
-            def vision_inputs(batch_size: int) -> tuple[torch.Tensor, ...]:
-                return (
-                    torch.zeros(
-                        (batch_size, MAX_PATCHES, int(vision_cfg.hidden_size)),
-                        dtype=self.dtype,
-                        device=self.device,
-                    ),
-                    torch.ones(
-                        (batch_size, MAX_PATCHES),
-                        dtype=torch.bool,
-                        device=self.device,
-                    ),
-                    torch.zeros(
-                        (batch_size, MAX_PATCHES, 2),
-                        dtype=torch.long,
-                        device=self.device,
-                    ),
-                )
-
-            materialize_dynamic_batch_domain(
-                vision_tower.encoder,
-                max_batch_size=cfg.max_batch_size,
-                inputs_for_batch=vision_inputs,
-                synchronize=lambda: torch.cuda.synchronize(self.device),
+        def vision_inputs(batch_size: int) -> tuple[torch.Tensor, ...]:
+            return (
+                torch.zeros(
+                    (batch_size, MAX_PATCHES, vision_cfg.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                torch.ones(
+                    (batch_size, MAX_PATCHES),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+                torch.zeros(
+                    (batch_size, MAX_PATCHES, 2),
+                    dtype=torch.long,
+                    device=self.device,
+                ),
             )
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
+
+        materialize_dynamic_batch_domain(
+            vision_tower.encoder,
+            max_batch_size=cfg.max_batch_size,
+            inputs_for_batch=vision_inputs,
+            synchronize=lambda: torch.cuda.synchronize(self.device),
+        )
+        torch.cuda.empty_cache()
 
         self.tokenizer = Tokenizer.from_pretrained(repo_id)
         self.tokenizer.post_processor = None
@@ -229,8 +227,8 @@ class Gemma4Runtime:
         if len(pixel_shape) != 2 or len(position_shape) != 2:
             raise ValueError("vision inputs must be rank-2 tensors")
 
-        pixel_staging = getattr(self, "_vision_pixel_staging", None)
-        position_staging = getattr(self, "_vision_position_staging", None)
+        pixel_staging = self._vision_pixel_staging
+        position_staging = self._vision_position_staging
         expected_pixel_shape = (capacity, *pixel_shape)
         expected_position_shape = (capacity, *position_shape)
         if pixel_staging is None:
@@ -238,7 +236,7 @@ class Gemma4Runtime:
                 *expected_pixel_shape,
                 dtype=first_crops.pixel_values.dtype,
                 device=self.device,
-                pin_memory=self.device.type == "cuda",
+                pin_memory=True,
                 with_numpy=False,
                 zero=False,
             )
@@ -253,7 +251,7 @@ class Gemma4Runtime:
                 *expected_position_shape,
                 dtype=first_crops.image_position_ids.dtype,
                 device=self.device,
-                pin_memory=self.device.type == "cuda",
+                pin_memory=True,
                 zero=False,
             )
             self._vision_position_staging = position_staging
@@ -319,6 +317,10 @@ class Gemma4Runtime:
     @property
     def compute_stream(self):
         return self._primary_stream
+
+    @property
+    def kv_pool(self) -> KVMemoryPool:
+        return self._kv_pool
 
     @property
     def primary_stream(self):
@@ -399,9 +401,6 @@ class Gemma4Runtime:
 
     def shutdown(self) -> None:
         self._image_preprocessor.shutdown(wait=True)
-
-    def shutdown_image_preprocessor(self) -> None:
-        self.shutdown()
 
     def can_reserve(self, total_length: int) -> bool:
         return (
@@ -666,14 +665,20 @@ class Gemma4Runtime:
 
     def finalize_prepared_sequence_after_prefill(self, prepared: Any) -> None:
         self.active_sequences[prepared.state.batch_idx] = prepared.state
-        return None
 
     def abort_prepared_sequence(self, prepared: Any) -> None:
         self.active_sequences.pop(prepared.state.batch_idx, None)
         self._release_batch_idx(prepared.state.batch_idx)
 
-    def retain_sequence_prefix(self, *args: Any, **kwargs: Any) -> None:
-        return None
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
+        pass
 
     def release_sequence(self, state: Any) -> None:
         self.active_sequences.pop(state.batch_idx, None)

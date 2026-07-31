@@ -137,10 +137,6 @@ def preprocess_image(
     )
 
 
-def preprocess(image: Any) -> GemmaImageInputs:
-    return preprocess_image(image)
-
-
 class Gemma4ImagePreprocessor:
     def __init__(
         self,
@@ -172,6 +168,5 @@ __all__ = [
     "IMAGE_SEQ_LENGTH",
     "MAX_IMAGE_TOKENS",
     "MAX_PATCHES",
-    "preprocess",
     "preprocess_image",
 ]

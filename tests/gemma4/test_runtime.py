@@ -14,6 +14,7 @@ from tokenizers.processors import TemplateProcessing
 
 import kestrel.models.gemma4  # noqa: F401
 from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
@@ -903,6 +904,8 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = torch.device("cpu")
     runtime.max_batch_size = 4
+    runtime._vision_pixel_staging = None
+    runtime._vision_position_staging = None
     calls = []
     input_ptrs = []
 
@@ -983,6 +986,19 @@ def test_decode_state_tables_keep_local_and_global_storage_disjoint():
         (3, 1, 4), None, None]
     assert [None if tensor is None else tuple(tensor.shape) for tensor in global_] == [
         None, (3, 1, 8), None]
+
+
+def test_engine_adopts_externally_supplied_runtime_kv_pool():
+    cfg = RuntimeConfig(device="cuda", model=_MODEL_ID)
+    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
+    runtime.device = cfg.resolved_device()
+    runtime._kv_pool = object()
+    runtime._primary_stream = object()
+
+    engine = InferenceEngine(cfg, runtime=runtime)
+
+    assert engine.runtime is runtime
+    assert engine._kv_pool is runtime.kv_pool
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
