@@ -21,9 +21,13 @@ from kestrel.skills import DecodeStep, MediaInput, SkillFinalizeResult, SkillSpe
 
 
 def _make_request(
-    *, request_id: int = 1, image: np.ndarray | bytes | None = None
+    *,
+    request_id: int = 1,
+    image: np.ndarray | bytes | None = None,
+    media: tuple[MediaInput, ...] | None = None,
 ) -> _AutoregressiveRequest:
-    media = () if image is None else (MediaInput(kind="image", data=image),)
+    if media is None:
+        media = () if image is None else (MediaInput(kind="image", data=image),)
     return _AutoregressiveRequest(
         request_id=request_id,
         prompt="prompt",
@@ -275,6 +279,88 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     assert str(failures[0][1]) == "crop failed"
 
 
+def _coordinator(runtime=None):
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
+    coordinator = _AdmissionCoordinator(
+        runtime=runtime
+        or _FakeRuntime(prefix_cache=None, prefix_hit=False),
+        wake_event=threading.Event(),
+        fail_request=_record_failure(failures),
+    )
+    return coordinator, failures
+
+
+def test_admission_derives_legacy_image_from_media_not_image_field() -> None:
+    """Admission reads the request's media; the transitional queued image
+    field is dead to it. A request whose image field disagrees with media
+    still preprocesses the media payload."""
+    preprocessor = _FakeImagePreprocessor()
+    runtime = _FakeRuntime(
+        prefix_cache=None, prefix_hit=False, image_preprocessor=preprocessor,
+    )
+    coordinator, failures = _coordinator(runtime)
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    req = _make_request(image=None, media=(MediaInput(kind="image", data=image),))
+
+    ready = coordinator.submit(req)
+
+    assert ready is None  # queued behind async preprocessing
+    assert not failures
+    assert preprocessor.submissions == [image]
+    assert preprocessor.submissions[0] is image
+
+
+def test_admission_multiple_images_preserve_order() -> None:
+    first = np.zeros((2, 2, 3), dtype=np.uint8)
+    second = np.full((2, 2, 3), 7, dtype=np.uint8)
+    coordinator, failures = _coordinator()
+    req = _make_request(
+        media=(
+            MediaInput(kind="image", data=first),
+            MediaInput(kind="image", data=second),
+        )
+    )
+
+    ready = coordinator.submit(req)
+
+    assert ready is not None
+    assert not failures
+    assert isinstance(ready.image, tuple)
+    assert len(ready.image) == 2
+    assert np.array_equal(ready.image[0], first)
+    assert np.array_equal(ready.image[1], second)
+
+
+def test_admission_rejects_non_image_media_request_locally() -> None:
+    coordinator, failures = _coordinator()
+    bad = _make_request(media=(MediaInput(kind="audio", data=b"pcm"),))
+
+    assert coordinator.submit(bad) is None
+    assert len(failures) == 1
+    assert failures[0][0] is bad
+    assert isinstance(failures[0][1], NotImplementedError)
+
+    # The failure is request-local: the coordinator still admits other work.
+    ready = coordinator.submit(_make_request(image=None))
+    assert ready is not None
+    assert len(failures) == 1
+
+
+def test_admission_rejects_mixed_media_request_locally() -> None:
+    coordinator, failures = _coordinator()
+    bad = _make_request(
+        media=(
+            MediaInput(kind="image", data=b"img"),
+            MediaInput(kind="video", data=b"frames"),
+        )
+    )
+
+    assert coordinator.submit(bad) is None
+    assert len(failures) == 1
+    assert failures[0][0] is bad
+    assert isinstance(failures[0][1], NotImplementedError)
+
+
 def test_extract_private_logprobs_setting() -> None:
     engine = object.__new__(InferenceEngine)
 
@@ -384,7 +470,7 @@ def test_build_generation_request_consumes_generated_prefix() -> None:
     )
     runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
 
-    generation_req, skill_state = engine._build_generation_request(runtime, req, None)
+    generation_req, skill_state = engine._build_generation_request(runtime, req, None, None)
 
     assert generation_req.prompt_tokens == [TextToken(1)]
     assert generation_req.prefill_tokens == [TextToken(1), TextToken(10), TextToken(11)]
@@ -403,7 +489,7 @@ def test_build_generation_request_rejects_skill_stop_in_generated_prefix() -> No
     runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
 
     with pytest.raises(ValueError, match="must not contain stop tokens"):
-        engine._build_generation_request(runtime, req, None)
+        engine._build_generation_request(runtime, req, None, None)
 
 
 def test_extract_private_suppress_next_token_ids_setting() -> None:

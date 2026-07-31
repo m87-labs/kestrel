@@ -15,11 +15,12 @@ from typing import Any
 import numpy as np
 import pytest
 
+from kestrel.engine._types import _media_to_legacy_image
 from kestrel.engine.core import InferenceEngine
 from kestrel.models.moondream.skills import QuerySkill
 from kestrel.skills import MediaInput, SkillRegistry
 
-_adapt = InferenceEngine._media_to_legacy_image
+_adapt = _media_to_legacy_image
 
 
 def test_empty_media_maps_to_none() -> None:

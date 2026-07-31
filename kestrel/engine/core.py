@@ -97,6 +97,7 @@ from kestrel.engine._types import (
     _StreamQueueItem,
     _StreamingChunk,
     _StreamingSessionRequest,
+    _media_to_legacy_image,
 )
 from kestrel.engine.executor import AutoregressiveExecutor
 from kestrel.engine.single_pass import SinglePassExecutor, _SinglePassRequest
@@ -527,26 +528,6 @@ class InferenceEngine:
                 self._photon_reporter = None
         for runtime in self._runtimes.values():
             runtime.shutdown()
-
-    @staticmethod
-    def _media_to_legacy_image(
-        media: "tuple[MediaInput, ...]",
-    ) -> object | None:
-        """Adapt ordered ``BuiltRequest.media`` to the legacy image value.
-
-        This helper validates modality only. Concrete image payload validation
-        remains in ``_submit_request``.
-        """
-        if not media:
-            return None
-        kinds = {item.kind for item in media}
-        if kinds != {"image"}:
-            raise NotImplementedError(
-                "non-image request media is unsupported"
-            )
-        if len(media) == 1:
-            return media[0].data
-        return tuple(item.data for item in media)
 
     async def _run_skill(
         self,
@@ -1056,10 +1037,7 @@ class InferenceEngine:
             else:
                 media = (MediaInput(kind="image", data=image),)
         else:
-            image = cast(
-                Optional[LegacyImageInput],
-                self._media_to_legacy_image(media),
-            )
+            image = _media_to_legacy_image(media)
 
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
@@ -1733,17 +1711,18 @@ class InferenceEngine:
         runtime: AutoregressiveRuntime,
         req: _AutoregressiveRequest,
         image_crops: Any,
+        image: Optional[LegacyImageInput],
     ) -> tuple[GenerationRequest, SkillState]:
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)
-        if req.image is None and image_crops is None:
+        if image is None and image_crops is None:
             image_length = 0
-        elif isinstance(req.image, (list, tuple)):
+        elif isinstance(image, (list, tuple)):
             # Multi-image chat: each image expands one ImageMarker token — which
             # is already counted in prompt_length — into an image_prefix_length
             # patch block, so it adds image_prefix_length - 1 KV positions per
             # image. (target_length = prompt_length + image_length + max_new.)
-            image_length = len(req.image) * (runtime.image_prefix_length - 1)
+            image_length = len(image) * (runtime.image_prefix_length - 1)
         else:
             image_length = runtime.image_prefix_length
         adapter = req.adapter
@@ -1755,7 +1734,7 @@ class InferenceEngine:
             temperature=req.temperature,
             top_p=req.top_p,
             stream_callback=stream_cb,
-            image=req.image,
+            image=image,
             image_hash=req.image_hash,
             image_crops=image_crops,
             image_length=image_length,

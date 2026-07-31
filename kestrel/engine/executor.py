@@ -35,7 +35,9 @@ from kestrel.engine._types import (
     _AutoregressiveRequest,
     _ReadyAdmission,
     _hash_image,
+    _media_to_legacy_image,
 )
+from kestrel.utils.image import LegacyImageInput
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,7 +57,8 @@ class _AdmissionCoordinator:
         # Gemma 4's pixel_values bundle, etc.) and threads them back
         # into ``launch_prepared_batch``.
         self._pending_crops: Dict[
-            int, tuple[_AutoregressiveRequest, "Future[Any]"]
+            int,
+            tuple[_AutoregressiveRequest, "Future[Any]", LegacyImageInput],
         ] = {}
         self._ready_crops: queue.Queue[int] = queue.Queue()
 
@@ -63,10 +66,22 @@ class _AdmissionCoordinator:
         return bool(self._pending_crops)
 
     def submit(self, req: _AutoregressiveRequest) -> Optional[_ReadyAdmission]:
-        if req.image is None:
-            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
+        # Admission owns the media-to-legacy-image boundary: the request's
+        # ordered media is validated here and adapted to the image
+        # representation everything below admission still speaks. Unsupported
+        # modalities fail only this request.
+        try:
+            image = _media_to_legacy_image(req.media)
+        except NotImplementedError as exc:
+            self._fail_request(req, exc)
+            return None
 
-        if isinstance(req.image, (list, tuple)):
+        if image is None:
+            return _ReadyAdmission(
+                req=req, crops=None, prefix_cache_hit=False, image=None
+            )
+
+        if isinstance(image, tuple):
             # Multi-image chat: the single-image prefix cache and overlap-crop
             # precompute don't apply (the marker interleaver crops each image
             # inline). Decode/validate each element up front so unsupported
@@ -77,28 +92,32 @@ class _AdmissionCoordinator:
             from kestrel.utils.image import decode_to_srgb
 
             try:
-                req.image = tuple(decode_to_srgb(im) for im in req.image)
+                image = tuple(decode_to_srgb(im) for im in image)
             except Exception as exc:
                 self._fail_request(req, exc)
                 return None
-            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
+            return _ReadyAdmission(
+                req=req, crops=None, prefix_cache_hit=False, image=image
+            )
 
         if self._runtime.prefix_cache is not None:
-            req.image_hash = _hash_image(req.image)
+            req.image_hash = _hash_image(image)
             prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
             if self._runtime.check_prefix_cache(
                 prefill_tokens, req.image_hash, req.adapter
             ):
-                return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=True)
+                return _ReadyAdmission(
+                    req=req, crops=None, prefix_cache_hit=True, image=image
+                )
 
         try:
-            future = self._runtime.preprocess_image_async(req.image)
+            future = self._runtime.preprocess_image_async(image)
         except Exception as exc:
             self._fail_request(req, exc)
             return None
 
         req_id = req.request_id
-        self._pending_crops[req_id] = (req, future)
+        self._pending_crops[req_id] = (req, future, image)
         future.add_done_callback(
             lambda _future, rid=req_id: self._on_crops_ready(rid)
         )
@@ -115,17 +134,19 @@ class _AdmissionCoordinator:
             if pending is None:
                 continue
 
-            req, future = pending
+            req, future, image = pending
             try:
                 crops = future.result()
             except Exception as exc:
                 self._fail_request(req, exc)
                 continue
-            return _ReadyAdmission(req=req, crops=crops, prefix_cache_hit=False)
+            return _ReadyAdmission(
+                req=req, crops=crops, prefix_cache_hit=False, image=image
+            )
 
     def fail_all(self, error: Optional[BaseException] = None) -> None:
         exc = error or RuntimeError("Engine shut down")
-        for req, future in list(self._pending_crops.values()):
+        for req, future, _image in list(self._pending_crops.values()):
             if future and not future.done():
                 future.cancel()
             self._fail_request(req, exc)
@@ -282,15 +303,15 @@ class AutoregressiveExecutor:
         req = ready.req
         try:
             generation_req, skill_state = self._build_generation_request(
-                self._runtime, req, ready.crops
+                self._runtime, req, ready.crops, ready.image
             )
         except Exception as exc:
             self._admission_failures.append(Completion(request=req, error=exc))
             return
         crops_ready = (
-            req.image is None
+            ready.image is None
             # Multi-image chat crops each image inline (no overlap precompute).
-            or isinstance(req.image, (list, tuple))
+            or isinstance(ready.image, (list, tuple))
             or ready.prefix_cache_hit
             or (ready.crops is not None)
         )
@@ -304,7 +325,7 @@ class AutoregressiveExecutor:
             request=generation_req,
             skill_state=skill_state,
             phase=phase,
-            has_image=req.image is not None,
+            has_image=ready.image is not None,
             crops_ready=crops_ready,
             lora_slot_ready=lora_slot_ready,
             prefix_cache_hit=ready.prefix_cache_hit,

@@ -23,6 +23,7 @@ from typing import (
     Protocol,
     Sequence,
     Union,
+    cast,
 )
 
 import numpy as np
@@ -305,6 +306,30 @@ class _ReadyAdmission:
     req: _AutoregressiveRequest
     crops: Any
     prefix_cache_hit: bool
+    # The legacy image value derived from the request's media at admission —
+    # None / one scalar image / an ordered tuple. Request construction below
+    # admission stays image-based and reads it from here.
+    image: Optional[LegacyImageInput] = None
+
+
+def _media_to_legacy_image(
+    media: tuple[MediaInput, ...],
+) -> Optional[LegacyImageInput]:
+    """Adapt ordered request media to the legacy image representation.
+
+    The temporary compatibility boundary between the generic media channel
+    and the image-specific path below admission. Validates modality only —
+    image payload validation stays where it is today. Raises
+    ``NotImplementedError`` for audio/video/mixed media.
+    """
+    if not media:
+        return None
+    kinds = {item.kind for item in media}
+    if kinds != {"image"}:
+        raise NotImplementedError("non-image request media is unsupported")
+    if len(media) == 1:
+        return cast(LegacyImageInput, media[0].data)
+    return cast(LegacyImageInput, tuple(item.data for item in media))
 
 
 def _hash_image(image: LegacyImageInput) -> bytes:
