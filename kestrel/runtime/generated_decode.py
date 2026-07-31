@@ -207,7 +207,9 @@ class GeneratedDecode:
             return None
         try:
             from kestrel_kernels.generated_decode import resolve_compatible_programs
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != "kestrel_kernels.generated_decode":
+                raise
             return None
 
         properties = torch.cuda.get_device_properties(runtime.device)
