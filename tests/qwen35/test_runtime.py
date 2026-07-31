@@ -724,18 +724,18 @@ def test_zero_replay_cursor_ignores_stale_payload_when_materializing():
 
 @requires_mkl
 def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
+    from kestrel.models.qwen35.inference_ops import LinearAttentionState
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
 
     recurrent = torch.arange(3 * 2 * 2 * 3, dtype=torch.float32).reshape(3, 2, 2, 3)
-    storage = SimpleNamespace(
-        recurrent_states=recurrent.clone(),
-        replay_checkpoint_states=torch.full((3, 2, 3, 2), -1.0),
-        replay_k=torch.ones(3, 4, 2, 2),
-        replay_u=torch.ones(3, 4, 2, 3),
-        replay_g=torch.ones(3, 4, 2),
-        replay_lengths=torch.full((3,), 4, dtype=torch.int32),
-    )
+    storage = LinearAttentionState(replay_capacity=4)
+    storage.recurrent_states = recurrent.clone()
+    storage.replay_checkpoint_states = torch.full((3, 2, 3, 2), -1.0)
+    storage.replay_k = torch.ones(3, 4, 2, 2)
+    storage.replay_u = torch.ones(3, 4, 2, 3)
+    storage.replay_g = torch.ones(3, 4, 2)
+    storage.replay_lengths = torch.full((3,), 4, dtype=torch.int32)
     pool = Qwen35LinearStatePool.__new__(Qwen35LinearStatePool)
     pool.device = torch.device("cpu")
     pool.layers = [storage]
@@ -770,19 +770,19 @@ def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
 
 @requires_mkl
 def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
+    from kestrel.models.qwen35.inference_ops import LinearAttentionState
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
 
     checkpoint = torch.arange(3 * 2 * 3 * 2, dtype=torch.float32).reshape(3, 2, 3, 2)
     stale_recurrent = torch.full((3, 2, 2, 3), -99.0)
-    storage = SimpleNamespace(
-        recurrent_states=stale_recurrent.clone(),
-        replay_checkpoint_states=checkpoint.clone(),
-        replay_k=torch.ones(3, 4, 2, 2),
-        replay_u=torch.ones(3, 4, 2, 3),
-        replay_g=torch.ones(3, 4, 2),
-        replay_lengths=torch.full((3,), 4, dtype=torch.int32),
-    )
+    storage = LinearAttentionState(replay_capacity=4)
+    storage.recurrent_states = stale_recurrent.clone()
+    storage.replay_checkpoint_states = checkpoint.clone()
+    storage.replay_k = torch.ones(3, 4, 2, 2)
+    storage.replay_u = torch.ones(3, 4, 2, 3)
+    storage.replay_g = torch.ones(3, 4, 2)
+    storage.replay_lengths = torch.full((3,), 4, dtype=torch.int32)
     pool = Qwen35LinearStatePool.__new__(Qwen35LinearStatePool)
     pool.device = torch.device("cpu")
     pool.layers = [storage]

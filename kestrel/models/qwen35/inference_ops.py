@@ -17,10 +17,9 @@ def torch_compilable_check(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-class LinearAttentionLayer:
+class LinearAttentionState:
     def __init__(
         self,
-        config: Any,
         *,
         replay_capacity: int,
     ) -> None:
@@ -32,8 +31,6 @@ class LinearAttentionLayer:
         self.replay_g: torch.Tensor | None = None
         self.replay_lengths: torch.Tensor | None = None
         self.replay_capacity = int(replay_capacity)
-        self.num_k_heads = int(config.linear_num_key_heads)
-        self.num_v_heads = int(config.linear_num_value_heads)
         self.is_conv_states_initialized = False
         self.is_recurrent_states_initialized = False
         self.has_previous_state = False
@@ -120,65 +117,57 @@ class LinearAttentionLayer:
         if recurrent_states.ndim != 4:
             return
         slots, value_heads, key_dim, value_dim = recurrent_states.shape
-        # The native ReplaySSM verify/decode/materialize CuTe kernels index the
-        # replay key ring by VALUE head (num_v_heads): each of the value-head
-        # ring rows holds the normalized key of its shared k-head, and the GQA
-        # k->v fan-out is applied to mixed_qkv inside the kernel rather than to
-        # the ring. The torch reference fold likewise broadcasts replay_k
-        # against the value-head checkpoint state. Size the ring by value_heads
-        # so the GQA (k16/v32) Qwen3.5-4B ring is consistent with both paths;
+        # ReplaySSM indexes the key ring by value head; GQA applies the k-to-v
+        # fan-out before the ring. Size by value_heads so k16/v32 Qwen3.5-4B is
+        # consistent with both the native kernels and torch reference fold;
         # sizing it by key_heads aliased verify writes and tripped the
         # materialize gate -> torch fallback -> "bad replay_k shape" at flush.
-        checkpoint_shape = (slots, value_heads, value_dim, key_dim)
-        replay_k_shape = (slots, self.replay_capacity, value_heads, key_dim)
-        replay_u_shape = (slots, self.replay_capacity, value_heads, value_dim)
-        replay_g_shape = (slots, self.replay_capacity, value_heads)
         replay_k_dtype = (
             getattr(self, "dtype", torch.float16)
             if recurrent_states.device.type == "mps"
             else torch.bfloat16
         )
-        if self.replay_checkpoint_states is None:
-            self.replay_checkpoint_states = torch.zeros(
-                checkpoint_shape,
-                dtype=torch.float32,
-                device=recurrent_states.device,
-            )
-            self.replay_k = torch.zeros(
-                replay_k_shape,
-                dtype=replay_k_dtype,
-                device=recurrent_states.device,
-            )
-            self.replay_u = torch.zeros(
-                replay_u_shape,
-                dtype=torch.float32,
-                device=recurrent_states.device,
-            )
-            self.replay_g = torch.zeros(
-                replay_g_shape,
-                dtype=torch.float32,
-                device=recurrent_states.device,
-            )
-            self.replay_lengths = torch.zeros(
-                (slots,),
-                dtype=torch.int32,
-                device=recurrent_states.device,
-            )
-            return
-        if tuple(self.replay_checkpoint_states.shape) != checkpoint_shape:
-            raise RuntimeError("Qwen replay checkpoint state shape changed")
-        if self.replay_k is None or self.replay_u is None or self.replay_g is None:
-            raise RuntimeError("Qwen replay cache tensors are incomplete")
-        if tuple(self.replay_k.shape) != replay_k_shape:
-            raise RuntimeError("Qwen replay key buffer shape changed")
-        if self.replay_k.dtype != replay_k_dtype:
-            raise RuntimeError("Qwen replay key buffer dtype changed")
-        if tuple(self.replay_u.shape) != replay_u_shape:
-            raise RuntimeError("Qwen replay update buffer shape changed")
-        if tuple(self.replay_g.shape) != replay_g_shape:
-            raise RuntimeError("Qwen replay gate buffer shape changed")
-        if self.replay_lengths is None:
-            raise RuntimeError("Qwen replay length tensor is missing")
+        specifications = {
+            "replay_checkpoint_states": (
+                (slots, value_heads, value_dim, key_dim),
+                torch.float32,
+            ),
+            "replay_k": (
+                (slots, self.replay_capacity, value_heads, key_dim),
+                replay_k_dtype,
+            ),
+            "replay_u": (
+                (slots, self.replay_capacity, value_heads, value_dim),
+                torch.float32,
+            ),
+            "replay_g": (
+                (slots, self.replay_capacity, value_heads),
+                torch.float32,
+            ),
+            "replay_lengths": ((slots,), torch.int32),
+        }
+        existing = [getattr(self, name) for name in specifications]
+        if any(tensor is not None for tensor in existing) and any(
+            tensor is None for tensor in existing
+        ):
+            raise RuntimeError("Qwen replay state tensors are incomplete")
+        for name, (shape, dtype) in specifications.items():
+            tensor = getattr(self, name)
+            if tensor is None:
+                setattr(
+                    self,
+                    name,
+                    torch.zeros(
+                        shape,
+                        dtype=dtype,
+                        device=recurrent_states.device,
+                    ),
+                )
+                continue
+            if tuple(tensor.shape) != shape:
+                raise RuntimeError(f"Qwen {name.replace('_', ' ')} shape changed")
+            if tensor.dtype != dtype:
+                raise RuntimeError(f"Qwen {name.replace('_', ' ')} dtype changed")
 
     def _reset_replay_rows(
         self,
@@ -200,6 +189,127 @@ class LinearAttentionLayer:
             return
         self.replay_checkpoint_states.index_copy_(0, indices, checkpoint_rows)
         self.replay_lengths.index_fill_(0, indices, 0)
+
+    def allocate_zeroed(
+        self,
+        *,
+        conv_shape: tuple[int, ...],
+        recurrent_shape: tuple[int, ...],
+        conv_dtype: torch.dtype,
+        recurrent_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        for name, shape, dtype in (
+            ("conv_states", conv_shape, conv_dtype),
+            ("recurrent_states", recurrent_shape, recurrent_dtype),
+        ):
+            tensor = getattr(self, name)
+            if tensor is None:
+                setattr(
+                    self,
+                    name,
+                    torch.zeros(shape, dtype=dtype, device=device),
+                )
+            elif tuple(tensor.shape) != shape:
+                raise RuntimeError(f"Qwen GDN {name} shape changed")
+
+        self.dtype = conv_dtype
+        self.device = device
+        self.max_batch_size = int(conv_shape[0])
+        self.conv_kernel_size = int(conv_shape[-1])
+        self.is_conv_states_initialized = True
+        self.is_recurrent_states_initialized = True
+        self._ensure_replay_state(self.recurrent_states)
+
+    def clear(self, row: int | None = None) -> None:
+        for tensor in (
+            self.conv_states,
+            self.recurrent_states,
+            self.replay_checkpoint_states,
+            self.replay_k,
+            self.replay_u,
+            self.replay_g,
+            self.replay_lengths,
+        ):
+            if tensor is None:
+                continue
+            if row is None:
+                tensor.zero_()
+            else:
+                tensor[int(row)].zero_()
+
+    def reset_replay_tail(self, row_indices: torch.Tensor) -> None:
+        if (
+            self.replay_k is None
+            or self.replay_u is None
+            or self.replay_g is None
+            or self.replay_lengths is None
+        ):
+            raise RuntimeError("Qwen replay state is not initialized")
+        # replay_lengths is the validity boundary. Payload slots are overwritten
+        # before the cursor advances, so clearing inaccessible K/U/G bytes would
+        # only add three launches per recurrent layer.
+        self.replay_lengths.index_fill_(0, row_indices, 0)
+
+    def seed_replay_rows(self, row_indices: torch.Tensor) -> None:
+        if self.recurrent_states is None or self.replay_checkpoint_states is None:
+            raise RuntimeError("Qwen recurrent state is not initialized")
+        checkpoint_rows = (
+            self.recurrent_states.index_select(0, row_indices)
+            .transpose(-1, -2)
+            .contiguous()
+        )
+        self.replay_checkpoint_states.index_copy_(
+            0,
+            row_indices,
+            checkpoint_rows,
+        )
+        self.reset_replay_tail(row_indices)
+
+    def copy_rows_from(
+        self,
+        source: "LinearAttentionState",
+        row_indices: torch.Tensor,
+        *,
+        copy_replay_payload: bool,
+    ) -> None:
+        batch_size = int(row_indices.shape[0])
+        for name in ("conv_states", "recurrent_states"):
+            destination = getattr(self, name)
+            source_tensor = getattr(source, name)
+            if destination is None or source_tensor is None:
+                raise RuntimeError(f"Qwen GDN {name} is not initialized")
+            destination.index_copy_(0, row_indices, source_tensor[:batch_size])
+        if self.replay_checkpoint_states is None:
+            return
+        checkpoint_rows = (
+            source.replay_checkpoint_states[:batch_size]
+            if source.replay_checkpoint_states is not None
+            else source.recurrent_states[:batch_size].transpose(-1, -2).contiguous()
+        )
+        self.replay_checkpoint_states.index_copy_(
+            0,
+            row_indices,
+            checkpoint_rows,
+        )
+        if copy_replay_payload and all(
+            getattr(source, name) is not None
+            for name in ("replay_k", "replay_u", "replay_g", "replay_lengths")
+        ):
+            for name in ("replay_k", "replay_u", "replay_g", "replay_lengths"):
+                destination = getattr(self, name)
+                source_tensor = getattr(source, name)
+                if destination is None or source_tensor is None:
+                    raise RuntimeError(f"Qwen GDN {name} is not initialized")
+                destination.index_copy_(
+                    0,
+                    row_indices,
+                    source_tensor[:batch_size],
+                )
+        else:
+            if self.replay_lengths is None:
+                raise RuntimeError("Qwen replay length tensor is missing")
+            self.replay_lengths.index_fill_(0, row_indices, 0)
 
     def materialize_recurrent_from_replay(
         self,
@@ -277,7 +387,12 @@ class LinearAttentionLayer:
         if not materialized:
             capacity = int(self.replay_k.shape[1])
             for row in row_indices.tolist():
-                state = self.replay_checkpoint_states[row].float().transpose(-1, -2).contiguous()
+                state = (
+                    self.replay_checkpoint_states[row]
+                    .float()
+                    .transpose(-1, -2)
+                    .contiguous()
+                )
                 for pos in range(capacity):
                     active = self.replay_lengths[row] > pos
                     alpha = torch.exp(self.replay_g[row, pos].float())[:, None, None]
@@ -286,11 +401,26 @@ class LinearAttentionLayer:
                     updated = alpha * state + k * u
                     state = torch.where(active, updated, state)
                 if write_recurrent:
-                    self.recurrent_states[row].copy_(state.to(self.recurrent_states.dtype))
+                    self.recurrent_states[row].copy_(
+                        state.to(self.recurrent_states.dtype)
+                    )
                 self.replay_checkpoint_states[row].copy_(
                     state.transpose(-1, -2).to(self.replay_checkpoint_states.dtype)
                 )
         self.replay_lengths.index_fill_(0, row_indices, 0)
+
+
+class LinearAttentionLayer(LinearAttentionState):
+    def __init__(
+        self,
+        config: Any,
+        *,
+        replay_capacity: int,
+    ) -> None:
+        super().__init__(replay_capacity=replay_capacity)
+        self.num_k_heads = int(config.linear_num_key_heads)
+        self.num_v_heads = int(config.linear_num_value_heads)
+
 
 def sdpa_attention_forward(
     module: nn.Module,
@@ -331,9 +461,13 @@ def kestrel_vision_flash_attention_forward(
     cu_seq_lens_k: torch.Tensor,
 ) -> tuple[torch.Tensor, None]:
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise ValueError("Kestrel Qwen vision attention expects query/key/value as [B, H, S, D]")
+        raise ValueError(
+            "Kestrel Qwen vision attention expects query/key/value as [B, H, S, D]"
+        )
     if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-        raise ValueError("Kestrel Qwen vision attention expects packed vision batch size 1")
+        raise ValueError(
+            "Kestrel Qwen vision attention expects packed vision batch size 1"
+        )
 
     device = query.device
     if cu_seq_lens_q.device != device:
