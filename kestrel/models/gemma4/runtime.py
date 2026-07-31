@@ -10,7 +10,6 @@ import torch
 
 from kestrel.device import make_event, make_stream
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
-from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -96,6 +95,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
         )
 
         text_config = self._config.text_config
+        self.vocab_size = int(text_config.vocab_size)
         self.max_batch_slots = self.max_batch_size + 2
         decode_rows = decode_slot_rows(self.max_batch_size)
         self._padding_batch_idx = self.max_batch_slots - 1
@@ -356,38 +356,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
             for row in rows:
                 features[row] = encoded
         return features
-
-    @property
-    def model_name(self) -> str:
-        return self._model_name
-
-    @property
-    def compute_stream(self):
-        return self._compute_stream
-
-    @property
-    def kv_pool(self) -> KVMemoryPool:
-        return self._kv_pool
-
-    @property
-    def copy_stream(self):
-        return self._copy_stream
-
-    @property
-    def vocab_size(self) -> int:
-        return int(self._config.text_config.vocab_size)
-
-    def skills(self):
-        return get_spec(self.model_name).skills()
-
-    def tasks(self) -> tuple[str, ...]:
-        return self.skills().names()
-
-    def preprocess_image_async(self, image):
-        return self._image_preprocessor.submit(image)
-
-    def shutdown(self) -> None:
-        self._image_preprocessor.shutdown()
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
         if self._prefill_slot_in_use:

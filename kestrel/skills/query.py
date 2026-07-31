@@ -43,7 +43,6 @@ class QueryPolicy:
     default_reasoning: bool = True
     reasoning_in_settings: bool = False
     supports_spatial_refs: bool = True
-    strip_client_sampling_defaults: bool = False
 
 
 class QuerySkill(SkillSpec):
@@ -71,18 +70,8 @@ class QuerySkill(SkillSpec):
                 raise ValueError("query does not support spatial_refs")
             if image is None:
                 raise ValueError("spatial_refs can only be used with an image")
-        sampling_settings = settings
-        if (
-            settings is not None
-            and self.policy.strip_client_sampling_defaults
-            and settings.get("temperature") == AR_DEFAULT_TEMPERATURE
-            and settings.get("top_p") == AR_DEFAULT_TOP_P
-        ):
-            sampling_settings = dict(settings)
-            sampling_settings.pop("temperature", None)
-            sampling_settings.pop("top_p", None)
         s = parse_settings(
-            sampling_settings,
+            settings,
             temperature=self.policy.temperature,
             top_p=self.policy.top_p,
             max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,

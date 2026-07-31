@@ -11,7 +11,6 @@ _QUERY_POLICY = QueryPolicy(
     default_reasoning=False,
     reasoning_in_settings=True,
     supports_spatial_refs=False,
-    strip_client_sampling_defaults=True,
 )
 
 

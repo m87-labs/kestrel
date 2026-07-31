@@ -11,7 +11,6 @@ _QUERY_POLICY = QueryPolicy(
     top_p=1.0,
     default_reasoning=False,
     supports_spatial_refs=False,
-    strip_client_sampling_defaults=True,
 )
 
 class Qwen35ChatSkill(ChatSkill):
