@@ -51,9 +51,6 @@ _kestrel_packed_recurrent_decode_replay_indexed = (
 _kestrel_packed_recurrent_decode_replay_indexed_gqa = (
     _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_decode_replay_indexed_gqa
 )
-_kestrel_packed_recurrent_verify_replay_indexed = (
-    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_verify_replay_indexed
-)
 _kestrel_packed_recurrent_prefill = (
     _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_prefill
 )
@@ -104,8 +101,6 @@ class Qwen3_5VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        self.dim = dim
-        self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -118,51 +113,21 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
     def __init__(self, config: Qwen3_5TextConfig, device=None):
         super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-
-        inv_freq, self.attention_scaling = self.compute_default_rope_parameters(
-            self.config,
-            device,
+        dim = int(config.head_dim * config.partial_rotary_factor)
+        inv_freq = 1.0 / (
+            config.rope_theta
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device,
+                    dtype=torch.float,
+                )
+                / dim
+            )
         )
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
         self.mrope_section = config.mrope_section
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: Qwen3_5TextConfig | None = None,
-        device: Optional["torch.device"] = None,
-        seq_len: int | None = None,
-    ) -> tuple["torch.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config:
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_theta
-        partial_rotary_factor = config.partial_rotary_factor
-        head_dim = config.head_dim
-        dim = int(head_dim * partial_rotary_factor)
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, attention_factor
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -178,8 +143,8 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
+        cos = emb.cos()
+        sin = emb.sin()
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -418,9 +383,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.packed_recurrent_decode_replay_indexed_gqa = (
             _kestrel_packed_recurrent_decode_replay_indexed_gqa
         )
-        self.packed_recurrent_verify_replay_indexed = (
-            _kestrel_packed_recurrent_verify_replay_indexed
-        )
         self.packed_recurrent_prefill = _kestrel_packed_recurrent_prefill
         self.supports_packed_gdn = _kestrel_supports_packed_gdn
 
@@ -439,7 +401,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
-        spec_verify: bool = False,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -490,12 +451,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dim=-1,
         )
         mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        if use_precomputed_states and seq_len > 1 and spec_verify:
-            # Cache the block's pre-conv input [B, conv_dim, T] so the spec-loop
-            # commit can roll the conv window over only the accepted prefix:
-            # conv_state = [committed_conv ++ block_preconv[:, :, :a+1]][-K_conv:].
-            layer_cache.spec_block_preconv = mixed_qkv.clone()
 
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
         core_attn_out = None
@@ -570,11 +525,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 # Prior single-token decode may have run the ReplaySSM path, which
                 # advances the replay ring buffer but not recurrent_states. Fold
                 # the buffer back in so this chunk continuation starts from the
-                # true current state instead of a stale recurrent_state. Spec
-                # verify blocks consume the replay ring directly, so only an
-                # explicit overflow flush should materialize them.
-                if not spec_verify:
-                    layer_cache.materialize_recurrent_from_replay(state_indices)
+                # true current state instead of a stale recurrent_state.
+                layer_cache.materialize_recurrent_from_replay(state_indices)
                 recurrent_state = layer_cache.recurrent_states
                 if state_indices is not None:
                     conv_state = conv_state.index_select(0, state_indices)
@@ -636,9 +588,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     layer.has_previous_state = True
                 elif not packed_prefill:
                     new_conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                    cache_params.update_conv_state(
+                    cache_params.layers[self.layer_idx].update_conv_state(
                         new_conv_state,
-                        self.layer_idx,
                         state_indices=state_indices if use_precomputed_states else None,
                     )
             if native_prefill:
@@ -701,9 +652,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     out=None,
                 )
                 if cache_params is not None and packed_conv_state is not None:
-                    cache_params.update_conv_state(
+                    cache_params.layers[self.layer_idx].update_conv_state(
                         packed_conv_state,
-                        self.layer_idx,
                         state_indices=state_indices if use_precomputed_states else None,
                     )
             else:
@@ -713,18 +663,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if core_attn_out is None:
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            if spec_verify and use_precomputed_states and seq_len > 1:
-                # Multi-token ReplaySSM spec-verify (Algorithm 4): read all T draft
-                # outputs from the committed checkpoint + ring buffer and append them;
-                # the spec loop's commit advances the cursor. The checkpoint is kept
-                # current by the prefill/decode commit (update_recurrent_state ->
-                # _reset_replay_rows seeds replay_checkpoint_states from recurrent_states).
-                _lc = cache_params.layers[self.layer_idx]
-                core_attn_out, last_recurrent_state = self.packed_recurrent_verify_replay_indexed(
-                    mixed_qkv, a, b, self.A_log, self.dt_bias,
-                    _lc.replay_checkpoint_states, _lc.replay_k, _lc.replay_u,
-                    _lc.replay_g, _lc.replay_lengths, state_indices,
-                )
             prepped_qk = (
                 native_prefill
                 and supports_native_packed_gdn
@@ -813,9 +751,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and last_recurrent_state is not None
             and last_recurrent_state is not packed_recurrent_state
         ):
-            cache_params.update_recurrent_state(
+            cache_params.layers[self.layer_idx].update_recurrent_state(
                 last_recurrent_state,
-                self.layer_idx,
                 state_indices=state_indices if use_precomputed_states else None,
             )
         elif cache_params is not None and native_prefill:
@@ -923,12 +860,10 @@ class Qwen3_5Attention(nn.Module):
 
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
-        self.config = config
         self.layer_idx = layer_idx
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.is_causal = True
         self.q_gate_size = config.num_attention_heads * self.head_dim * 2
         self.kv_size = config.num_key_value_heads * self.head_dim
         self.qkv_proj = nn.Linear(
@@ -989,11 +924,7 @@ class Qwen3_5Attention(nn.Module):
                 scaling=self.scaling,
             )
         else:
-            paged_kv_layer = past_key_values.get_paged_layer(self.layer_idx)
-            if paged_kv_layer is None:
-                raise RuntimeError(
-                    f"Qwen full-attention layer {self.layer_idx} has no paged K/V"
-                )
+            paged_kv_layer = past_key_values.layers[self.layer_idx]
             if cache_position_ids is None or slot_mapping is None:
                 raise RuntimeError(
                     "Qwen paged KV update requires cache_position_ids and slot_mapping"
@@ -1027,7 +958,6 @@ class Qwen3_5MLP(nn.Module):
         intermediate_size: int,
     ):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
         self.gate_up_proj = nn.Linear(
@@ -1402,7 +1332,6 @@ class Qwen3_5RMSNorm(nn.Module):
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
@@ -1437,7 +1366,6 @@ class Qwen3_5DecoderLayer(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
-        spec_verify: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_states = normalized_hidden_states
 
@@ -1450,7 +1378,6 @@ class Qwen3_5DecoderLayer(nn.Module):
                 cu_seq_lens_q=cu_seq_lens_q,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
-                spec_verify=spec_verify,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -1491,10 +1418,10 @@ class Qwen3_5DecoderLayer(nn.Module):
 class Qwen3_5VisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+        self.linear_fc1 = nn.Linear(hidden_size, self.intermediate_size, bias=True)
+        self.linear_fc2 = nn.Linear(self.intermediate_size, hidden_size, bias=True)
         # cuBLASLt fused-MLP GELU epilogue mode that matches ``config.hidden_act``.
         # The vision encoder uses ``gelu_pytorch_tanh`` (tanh approximation); plain
         # ``gelu`` maps to the exact (erf) GELU.
@@ -1556,14 +1483,12 @@ class Qwen3_5VisionMLP(nn.Module):
 class Qwen3_5VisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.embed_dim = config.hidden_size
-
         self.proj = nn.Linear(
-            self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size,
-            self.embed_dim,
+            config.in_channels
+            * config.temporal_patch_size
+            * config.patch_size
+            * config.patch_size,
+            config.hidden_size,
             bias=True,
         )
 
@@ -1607,8 +1532,6 @@ class Qwen3_5VisionAttention(nn.Module):
         self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
         self.proj = nn.Linear(self.dim, self.dim)
         self.scaling = self.head_dim**-0.5
-        self.config = config
-        self.is_causal = False
         self.use_flash_attention = bool(use_flash_attention)
 
     def forward(
@@ -1714,7 +1637,6 @@ class Qwen3_5VisionModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.spatial_merge_size = config.spatial_merge_size
 
         self.patch_embed = Qwen3_5VisionPatchEmbed(
             config=config,
@@ -1784,7 +1706,7 @@ class Qwen3_5VisionModel(nn.Module):
         )
         position_ids = get_vision_position_ids(
             grid_thw,
-            self.spatial_merge_size,
+            self.config.spatial_merge_size,
             position_ids,
         )
         cu_seqlens = get_vision_cu_seqlens(grid_thw, cu_seqlens)
@@ -1850,7 +1772,6 @@ class Qwen3_5TextModel(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
-        spec_verify: bool = False,
     ) -> _TextModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1916,7 +1837,6 @@ class Qwen3_5TextModel(nn.Module):
                 cu_seq_lens_q=cu_seq_lens_q,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
-                spec_verify=spec_verify,
             )
 
         hidden_states = (
@@ -1961,9 +1881,6 @@ class Qwen3_5Model(nn.Module):
             use_flash_attention=use_vision_flash_attention,
         )
         self.language_model = Qwen3_5TextModel(config.text_config)
-
-    def get_input_embeddings(self) -> nn.Module:
-        return self.language_model.embed_tokens
 
     def get_vision_position_ids(
         self,
@@ -2107,7 +2024,10 @@ class Qwen3_5Model(nn.Module):
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
         )
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        split_sizes = (
+            image_grid_thw.prod(-1)
+            // self.config.vision_config.spatial_merge_size**2
+        ).tolist()
         return torch.split(image_embeds, split_sizes)
 
     def get_placeholder_mask(
@@ -2117,8 +2037,9 @@ class Qwen3_5Model(nn.Module):
         image_features: torch.FloatTensor | None = None,
     ) -> torch.Tensor:
         if input_ids is None:
-            input_embeddings = self.get_input_embeddings()
-            image_embedding = input_embeddings.weight[self.config.image_token_id].to(
+            image_embedding = self.language_model.embed_tokens.weight[
+                self.config.image_token_id
+            ].to(
                 dtype=inputs_embeds.dtype
             )
             special_image_mask = inputs_embeds == image_embedding
@@ -2197,7 +2118,6 @@ class Qwen3_5Model(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
-        spec_verify: bool = False,
         vision_bilinear_indices: torch.Tensor | None = None,
         vision_bilinear_weights: torch.Tensor | None = None,
         vision_position_ids: torch.Tensor | None = None,
@@ -2207,7 +2127,7 @@ class Qwen3_5Model(nn.Module):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            inputs_embeds = self.language_model.embed_tokens(input_ids)
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(
@@ -2249,7 +2169,6 @@ class Qwen3_5Model(nn.Module):
             cu_seq_lens_q=cu_seq_lens_q,
             seq_idx=seq_idx,
             gdn_state_indices=gdn_state_indices,
-            spec_verify=spec_verify,
         )
 
         return _TextModelOutput(
@@ -2275,10 +2194,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             use_vision_flash_attention=use_vision_flash_attention,
         )
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-
-    def get_input_embeddings(self) -> nn.Module:
-        return self.model.get_input_embeddings()
-
 
 __all__ = [
     "Qwen3_5VisionModel",

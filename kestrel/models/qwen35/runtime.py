@@ -271,11 +271,8 @@ class Qwen35Runtime:
 
         self._cfg = cfg
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
-        # Speculative-decoding capability. ``None`` => one token per decode step
-        # (identical to non-spec behavior). Set by ``_maybe_init_spec_decode``
-        # at the end of __init__ when a drafter is configured.
+        # The runtime protocol requires an explicit speculative capability.
         self.spec = None
-        self._spec_runner = None
         self.device = (
             cfg.resolved_device()
             if hasattr(cfg, "resolved_device")
@@ -370,10 +367,7 @@ class Qwen35Runtime:
                 f"kv_pool.device ({self._kv_pool.device}) must match runtime "
                 f"device ({self.device})"
             )
-        spec_cfg = getattr(self._cfg, "spec_decode", None)
-        self._replay_capacity = (
-            self._spec_flush_cap(spec_cfg) if spec_cfg else 16
-        )
+        self._replay_capacity = 16
         self._paged_kv = allocate_qwen35_paged_kv(
             config=text_cfg,
             page_table=self.page_table,
@@ -445,19 +439,6 @@ class Qwen35Runtime:
 
         self.spatial_tables = None
 
-        # Size the persistent GDN (ReplaySSM) pool for spec decode BEFORE the
-        # decode graph is captured. The captured ``decode_with_slot`` graph binds
-        # the linear pool's replay tensors, and ``_maybe_init_spec_decode``
-        # reallocates them to ``flush_cap`` (changing their addresses/shapes); if
-        # that resize ran AFTER capture, a later fallback to ``decode_with_slot``
-        # would replay kernels bound to the freed/stale buffers. Resize first so
-        # the graph captures against the final tensors.
-        _spec_cfg_for_pool = getattr(self._cfg, "spec_decode", None)
-        if _spec_cfg_for_pool:
-            self._resize_linear_pool_for_spec(
-                self._spec_flush_cap(_spec_cfg_for_pool)
-            )
-
         if self.device.type == "cuda":
             from .megakernel_decode import Qwen35DecodeMegakernel
 
@@ -491,199 +472,6 @@ class Qwen35Runtime:
         if self._use_cuda_graphs:
             self._decode_graphs.ensure_ready(self._decode_slots)
 
-        self._maybe_init_spec_decode()
-
-    def _maybe_init_spec_decode(self) -> None:
-        """Build the spec-decode capability when a drafter is configured.
-
-        The drafter is a kestrel.models.qwen35 concern (the gated DFlash checkpoint),
-        so it is configured via a ``spec_decode`` dict on the runtime config (or
-        a pre-built drafter passed in) rather than the engine's shared
-        ``RuntimeConfig`` schema. When unset, ``self.spec`` stays ``None`` and
-        the runtime decodes one token per step exactly as before.
-
-        Config (``cfg.spec_decode``), all optional except a drafter source:
-          * ``drafter`` / ``drafter_repo``: a built ``DFlashDraftModel`` (+ its
-            ``DFlashConfig`` via ``drafter_config``), or a HF repo id to load.
-          * ``flush_cap`` (default 32), ``max_seq_len`` (default
-            ``max_seq_length``).
-        """
-        spec_cfg = getattr(self._cfg, "spec_decode", None)
-        if not spec_cfg:
-            return
-        from .dflash import (
-            DFlashConfig,
-            DFlashDraftModel,
-            SpecStepRunner,
-            load_dflash_drafter,
-        )
-        from kestrel.runtime.spec import SpecDecodeCaps
-
-        drafter = spec_cfg.get("drafter")
-        dcfg = spec_cfg.get("drafter_config")
-        if drafter is None:
-            repo = spec_cfg.get("drafter_repo")
-            if repo is None:
-                raise ValueError("spec_decode config needs 'drafter' or 'drafter_repo'")
-            drafter, dcfg = load_dflash_drafter(
-                repo, device=self.device, dtype=self.dtype
-            )
-        if not isinstance(drafter, DFlashDraftModel):
-            raise TypeError("spec_decode 'drafter' must be a DFlashDraftModel")
-        if dcfg is None:
-            raise ValueError("spec_decode config needs 'drafter_config' for a prebuilt drafter")
-
-        flush_cap = self._spec_flush_cap(spec_cfg)
-        # ``SpecRunner`` reserves ``max_seq_len`` KV pages for EACH of the
-        # ``max_batch_size`` fixed spec rows at construction and never frees them
-        # (the rows must be address-stable for graph capture). Defaulting this to
-        # the model context (``max_seq_length``) would reserve
-        # ``max_batch_size * max_position_embeddings`` pages up front, which on
-        # large-context models exceeds the serving KV page budget and makes
-        # ``page_table.reserve`` raise (or starve the pool) even for short
-        # prompts. The non-spec path only reserves each request's actual target
-        # length, so default the spec budget to the per-row share of the serving
-        # KV pages instead of the model maximum (still overridable explicitly).
-        explicit_max = spec_cfg.get("max_seq_len")
-        if explicit_max is not None:
-            max_seq_len = int(explicit_max)
-        else:
-            max_seq_len = self._default_spec_max_seq_len(flush_cap)
-
-        # The persistent GDN pool must be sized at flush_cap so the verify
-        # kernel + flush shapes agree. ``__init__`` already resized it to this
-        # capacity BEFORE the decode-graph capture (see ``_resize_linear_pool_for_spec``);
-        # re-run it here (idempotent) so the standalone / no-graph path is sized too.
-        self._resize_linear_pool_for_spec(flush_cap)
-
-        runner = SpecStepRunner(
-            self,
-            drafter,
-            dcfg,
-            batch_size=self.max_batch_size,
-            max_seq_len=max_seq_len,
-            flush_cap=flush_cap,
-            use_graphs=bool(spec_cfg.get("use_graphs", True)),
-            # Capture the draft graph as per-position LOGITS so the runtime spec
-            # path serves BOTH greedy and sampled (``temperature > 0``) requests.
-            # The default ``sampling=False`` captures greedy draft *tokens*, so a
-            # sampled request admitted through this runner would hit ``step()``'s
-            # ``NotImplementedError`` (no logits to run rejection sampling from).
-            # ``sampling=True`` is a superset: greedy rows still take the exact
-            # argmax/accept path, so this keeps greedy bit-exact while unlocking
-            # non-greedy spec decode end-to-end. Overridable via the spec config.
-            sampling=bool(spec_cfg.get("sampling", True)),
-        )
-        self._spec_runner = runner
-        self.spec = SpecDecodeCaps(
-            proposer=runner.proposer,
-            capture_hidden_layers=tuple(dcfg.target_layer_ids),
-            decoder=runner,
-        )
-
-    def _default_spec_max_seq_len(self, flush_cap: int) -> int:
-        """Per-row spec KV reservation derived from the serving KV budget.
-
-        ``SpecRunner`` reserves this many pages for every one of the
-        ``max_batch_size`` fixed rows up front and holds them for the life of the
-        runner. To keep that total within the serving KV page pool (rather than
-        the model's full context), size each row to its share of the available
-        pages, clamped to the model context above and to ``flush_cap`` below (a
-        row must at least span one GDN flush window).
-
-        Crucially, the share is taken over ``max_batch_size + 1`` slots, not
-        ``max_batch_size``: the serving ``admit`` contract starts each request as
-        a *transient* prefill ``batch_idx`` that ``prepare_sequence``
-        ``page_table.reserve``s its own pages for (up to ``target_length`` <=
-        ``max_seq_len`` pages) BEFORE ``admit`` re-points ``state.batch_idx`` at a
-        persistent spec row and erases that transient row. If the ``B`` persistent
-        rows already claimed the whole pool (minus a 2-page margin), that
-        transient reservation -- and hence ``prepare_sequence`` / ``can_reserve``
-        for an ordinary prompt -- would fail / starve the pool even though the
-        request will fit once admitted. Reserving an extra row-sized share
-        (``// (batch + 1)``) leaves headroom for exactly one in-flight transient
-        prefill (the scheduler admits one sequence at a time, erasing its
-        transient slot before preparing the next), so admission succeeds at pool
-        capacity. ``margin`` keeps the couple of pages for the padding row / page
-        0 that are already reserved.
-        """
-        batch = max(1, int(self.max_batch_size))
-        # Pages already spoken for before the spec runner reserves: page 0 (never
-        # handed out) + the padding batch row. Leave a small headroom so the spec
-        # reservation cannot consume the very last pages of the pool.
-        reserved_margin = 2
-        usable_pages = max(0, int(self._kv_cache_pages) - reserved_margin)
-        # Divide among B persistent rows PLUS one transient prefill slot. Taking
-        # the floor share over ``B + 1`` is exactly "reserve one row-sized slot
-        # (== max_seq_len == per_row_pages) for the in-flight transient, split the
-        # rest among the B held rows": after the B rows each claim
-        # ``per_row_pages``, the leftover ``usable - B*per_row_pages`` is provably
-        # ``>= per_row_pages`` (since ``per_row_pages <= usable/(B+1)``), so a
-        # transient whose reservation is itself an *admissible* request -- one that
-        # will fit a spec row, i.e. ``target_length <= max_seq_len ==
-        # per_row_tokens`` -- always fits alongside the B held rows at admit time.
-        # (A request larger than ``max_seq_len`` cannot occupy a spec row at all
-        # and is rejected at admit by ``_prefill_row``.)
-        per_row_pages = usable_pages // (batch + 1)
-        per_row_tokens = per_row_pages * int(self.page_size)
-        # A spec row must hold at least one flush window; if the pool is too small
-        # to give every row even that, fall back to the flush cap and let
-        # ``SpecRunner`` / ``page_table.reserve`` surface the real shortage.
-        budget = max(int(flush_cap), per_row_tokens)
-        return min(int(self.max_seq_length), budget)
-
-    @staticmethod
-    def _spec_flush_cap(spec_cfg: Any) -> int:
-        """The GDN replay-ring capacity for the spec runner (default 32).
-
-        Read in two places that must agree: the early ``__init__`` pre-pass that
-        resizes the linear-state pool *before* the decode graph is captured, and
-        the later ``_maybe_init_spec_decode`` that builds the runner.
-        """
-        return int(spec_cfg.get("flush_cap", 32))
-
-    def _resize_linear_pool_for_spec(self, flush_cap: int) -> None:
-        """Resize the persistent GDN (ReplaySSM) pool to ``flush_cap`` capacity.
-
-        The spec verify kernel + flush/reset shapes are keyed to the replay-ring
-        capacity, so the pool must be (re)allocated at ``flush_cap`` (the default
-        ``linear_replay_capacity`` is small, e.g. 16). This frees the old replay
-        tensors and re-initializes them at the new capacity, which CHANGES their
-        device addresses and shapes.
-
-        It is therefore called from ``__init__`` BEFORE
-        ``_decode_graphs.ensure_ready`` captures the normal ``decode_with_slot``
-        graph: that graph binds the linear pool's replay tensors
-        (``_prepare_decode_slot`` -> ``bind_to_cache``), so capturing it against
-        the small default buffers and then resizing here would leave any later
-        fallback to ``decode_with_slot`` replaying kernels bound to freed/stale
-        replay-buffer addresses. Sizing the pool first makes the captured graph
-        bind the final ``flush_cap`` tensors.
-
-        Idempotent: ``__init__`` runs this BEFORE the decode-graph capture and
-        ``_maybe_init_spec_decode`` runs it AGAIN afterwards (for the no-graph /
-        standalone path). The second call must NOT drop and reallocate the
-        replay tensors -- that would change their device addresses out from under
-        the already-captured ``decode_with_slot`` graph, exactly the breakage the
-        pre-capture resize exists to avoid. So when the pool is already at the
-        requested ``flush_cap``, skip the drop/realloc entirely and return.
-        """
-        flush_cap = int(flush_cap)
-        if int(self._linear_state_pool.replay_capacity) == flush_cap:
-            self._replay_capacity = flush_cap
-            # Already sized (e.g. by the pre-capture ``__init__`` call); the
-            # tensors the captured graph bound must stay put.
-            return
-        self._linear_state_pool.replay_capacity = flush_cap
-        for st in self._linear_state_pool.layers:
-            if st is not None:
-                st.replay_checkpoint_states = None
-                st.replay_k = st.replay_u = st.replay_g = st.replay_lengths = None
-        self._linear_state_pool.initialize_from_config(
-            self.architecture.text_config,
-            dtype=self.dtype,
-        )
-        self._replay_capacity = flush_cap
 
     @property
     def model_name(self) -> str:
@@ -726,38 +514,9 @@ class Qwen35Runtime:
     def shutdown(self) -> None:
         self.shutdown_image_preprocessor()
 
-    def _admission_max_seq_len(self) -> int:
-        """Largest total sequence length a request may be admitted with.
-
-        Normally the model context (``max_seq_length``). When a spec runner is
-        active it reserved each fixed spec row for only ``SpecRunner.max_seq_len``
-        tokens (which may be set BELOW the model context, e.g. an explicit
-        ``spec_decode.max_seq_len`` or the per-row KV-budget share). ``admit``
-        re-points the sequence onto one of those fixed rows, so a request whose
-        prompt+generation exceeds that row reservation cannot be served: ``step()``
-        would build slot mappings PAST the reserved pages. Cap admission to the
-        spec row length so such requests are rejected up front rather than
-        corrupting KV at decode time.
-
-        The cap further reserves ``block_size + 4`` tokens of verify headroom below
-        ``SpecRunner.max_seq_len``: ``step()`` verifies a full ``block_size`` from
-        the current KV cursor, so the final macro-step of a request whose
-        ``target_length == max_seq_len`` starts with the pending token at
-        ``ctx_len == max_seq_len - 1`` and builds slot mappings through
-        ``ctx_len + block_size - 1`` -- past the reserved pages. Admitting only up
-        to ``max_seq_len - (block_size + 4)`` leaves room for that final block,
-        matching the ``+ block_size + 4`` budget ``decode_batch`` / ``_prefill_row``
-        already enforce on the prefill path."""
-        limit = int(self.max_seq_length)
-        runner = self._spec_runner
-        if runner is not None:
-            headroom = int(runner.block_size) + 4
-            limit = min(limit, max(0, int(runner.max_seq_len) - headroom))
-        return limit
-
     def can_reserve(self, total_length: int) -> bool:
         return (
-            total_length <= self._admission_max_seq_len()
+            total_length <= self.max_seq_length
             and self.page_table.can_reserve_with_eviction(total_length)
             and self._available_batch_slots() > 0
         )
@@ -918,15 +677,10 @@ class Qwen35Runtime:
         )
         actual_kv_budget = prompt_len + (max_new_tokens or 128)
         target_length = max(budget_for_finalize, actual_kv_budget)
-        admit_limit = self._admission_max_seq_len()
-        if target_length > admit_limit:
-            # When a spec runner is active ``admit_limit`` is the fixed spec row
-            # reservation (``SpecRunner.max_seq_len``), which may be below the
-            # model context; rejecting here keeps ``step()`` from writing KV past
-            # the row's reserved pages after the sequence is moved onto it.
+        if target_length > self.max_seq_length:
             raise ValueError(
                 f"Requested length {target_length} exceeds "
-                f"max_seq_length={admit_limit}"
+                f"max_seq_length={self.max_seq_length}"
             )
         if self._available_batch_slots() <= 0:
             raise RuntimeError("Cannot reserve Qwen batch slot")
@@ -1052,24 +806,6 @@ class Qwen35Runtime:
         self._release_batch_idx(state.batch_idx)
 
     def _release_batch_idx(self, batch_idx: int) -> None:
-        # A spec-admitted sequence has had ``state.batch_idx`` re-pointed by
-        # ``SpecRunner.admit`` at one of the runner's FIXED persistent spec rows --
-        # rows reserved ONCE at runner construction whose page-table addresses + GDN
-        # pool slots are captured into the spec CUDA graphs (so they must stay
-        # allocated and address-stable for the runner's lifetime). The spec runner's
-        # own ``retire()`` is the authoritative cleanup for those rows (it returns the
-        # graph row to the runner's free list and resets the row's mask/cursor/GDN
-        # state); it deliberately does NOT free the batch_idx. So when the normal
-        # ``release_sequence`` cleanup later runs for that same ``state``, skip it
-        # entirely for a persistent spec row: ``page_table.erase`` would free the
-        # fixed row back to the pool (letting it be reallocated under the live spec
-        # graphs -> page-table corruption), and ``_clear_decode_state`` would clobber
-        # that row's GDN linear state + RoPE deltas in the shared ``_linear_state_pool``
-        # (addressed by the same batch_idx). Mirrors the ``-1`` sentinel guard in
-        # ``admit``: a batch_idx the runtime does not own must not be erased.
-        runner = self._spec_runner
-        if runner is not None and int(batch_idx) in runner._persistent_batch_idx:
-            return
         self.active_sequences.pop(batch_idx, None)
         self._caches.pop(batch_idx, None)
         self._clear_decode_state(batch_idx)
@@ -1222,8 +958,7 @@ class Qwen35Runtime:
             paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
             gdn_state_indices=batch_idx,
         )
-        last_hidden = outputs.last_hidden_state
-        hidden = last_hidden[:, 0, :]
+        hidden = outputs.last_hidden_state[:, 0, :]
         slot.hidden_last[:batch_size].copy_(hidden)
         slot.logits[:batch_size].copy_(self.model.lm_head(hidden))
 
@@ -1839,10 +1574,8 @@ class Qwen35Runtime:
             cu_seq_lens_q=packed.cu_seq_lens_q,
             seq_idx=packed.seq_idx,
         )
-        last_hidden = outputs.last_hidden_state
-        if hasattr(outputs.past_key_values, "advance_to"):
-            outputs.past_key_values.advance_to(packed.max_length)
-        return last_hidden, _QwenForwardCache(
+        outputs.past_key_values.advance_to(packed.max_length)
+        return outputs.last_hidden_state, _QwenForwardCache(
             outputs.past_key_values,
             packed.rope_deltas,
         )
@@ -1858,7 +1591,6 @@ class Qwen35Runtime:
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
-        spec_verify: bool = False,
     ) -> tuple[torch.Tensor, Any]:
         cache_state = (
             past_key_values
@@ -1909,7 +1641,6 @@ class Qwen35Runtime:
             )
             gdn_state_indices = self._gdn_state_indices_for_cache(
                 cache_state,
-                cache_batch_idx=cache_batch_idx,
                 batch_count=batch_count,
             )
             cache_kwargs = {
@@ -1918,7 +1649,6 @@ class Qwen35Runtime:
                 "page_table": paged_kv_page_table,
                 "paged_kv_seqlens_k": paged_kv_seqlens_k,
                 "gdn_state_indices": gdn_state_indices,
-                "spec_verify": spec_verify,
             }
             # Single-sequence multi-token prefill (e.g. generate()): pass
             # cu_seq_lens_q = [0, seq_len] so GDN takes the native packed_prefill
@@ -1961,17 +1691,18 @@ class Qwen35Runtime:
                 **cache_kwargs,
             )
             rope_deltas = outputs.rope_deltas
+        cache = outputs.past_key_values
         last_hidden = outputs.last_hidden_state
         if (
             batch_idx is not None
             and cache_position_ids is not None
-            and hasattr(outputs.past_key_values, "advance_to")
+            and cache is not None
         ):
-            outputs.past_key_values.advance_to(
+            cache.advance_to(
                 int(cache_position_ids.max().item()) + 1
             )
         return last_hidden, _QwenForwardCache(
-            outputs.past_key_values,
+            cache,
             rope_deltas,
             cache_state.linear_state_row_indices,
         )
@@ -2109,12 +1840,8 @@ class Qwen35Runtime:
         self,
         cache_state: _QwenForwardCache,
         *,
-        cache_batch_idx: torch.Tensor,
         batch_count: int,
     ) -> torch.Tensor:
-        if not isinstance(cache_state.past_key_values, Qwen35InferenceCache):
-            return cache_batch_idx.to(dtype=torch.long)
-
         if cache_state.linear_state_row_indices is not None:
             indices = cache_state.linear_state_row_indices.to(
                 device=self.device,

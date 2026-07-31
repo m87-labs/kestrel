@@ -84,30 +84,7 @@ class Qwen35InferenceCache:
                 )
             layers.append(layer)
         self.layers = tuple(layers)
-        self.paged_kv = paged_kv
         self.seq_length = 0
-
-    def update_conv_state(
-        self,
-        conv_states: torch.Tensor,
-        layer_idx: int,
-        state_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].update_conv_state(
-            conv_states,
-            state_indices,
-        )
-
-    def update_recurrent_state(
-        self,
-        recurrent_states: torch.Tensor,
-        layer_idx: int,
-        state_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].update_recurrent_state(
-            recurrent_states,
-            state_indices,
-        )
 
     def has_previous_state(self, layer_idx: int | None = None) -> bool:
         if layer_idx is None:
@@ -122,9 +99,10 @@ class Qwen35InferenceCache:
         return self.seq_length > 0
 
     def get_paged_layer(self, layer_idx: int) -> PagedKVCache | None:
-        return self.paged_kv.producer(layer_idx)
+        layer = self.layers[layer_idx]
+        return layer if isinstance(layer, PagedKVCache) else None
 
-    def get_seq_length(self, layer_idx: int = 0) -> int:
+    def get_seq_length(self) -> int:
         return int(self.seq_length)
 
     def advance_to(self, seq_length: int) -> None:
