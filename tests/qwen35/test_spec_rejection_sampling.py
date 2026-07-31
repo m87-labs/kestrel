@@ -878,7 +878,6 @@ def _try_build_spec_step_runner(batch_size=2, block_size=16, sampling=True):
         mask_token_id=0, target_layer_ids=target_layer_ids,
     )
     drafter = DFlashDraftModel(dcfg).to(dev, torch.bfloat16).eval()
-    tc.linear_replay_capacity = flush_cap
     rt._linear_state_pool.replay_capacity = flush_cap
     for st in rt._linear_state_pool.layers:
         if st is not None:

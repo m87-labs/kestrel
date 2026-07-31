@@ -76,15 +76,7 @@ _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Any = None
-    hidden_states: Any = None
-    attentions: Any = None
     rope_deltas: torch.Tensor | None = None
-
-
-@dataclass
-class _VisionModelOutput:
-    last_hidden_state: torch.Tensor
-    pooler_output: Any = None
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:
@@ -1657,7 +1649,6 @@ class Qwen3_5VisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
@@ -1683,7 +1674,6 @@ class Qwen3_5VisionAttention(nn.Module):
                 cu_seq_lens_q=cu_seqlens,
                 cu_seq_lens_k=cu_seqlens,
                 is_causal=False,
-                **kwargs,
             )
         else:
             # Other implementations: Process each chunk separately
@@ -1702,7 +1692,6 @@ class Qwen3_5VisionAttention(nn.Module):
                     scaling=self.scaling,
                     dropout=0.0,
                     is_causal=False,
-                    **kwargs,
                 )[0]
                 for q, k, v in zip(*splits)
             ]
@@ -1735,7 +1724,6 @@ class Qwen3_5VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         mlp_workspace: torch.Tensor | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         r"""
         cu_seqlens (`torch.Tensor`):
@@ -1745,7 +1733,6 @@ class Qwen3_5VisionBlock(nn.Module):
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         hidden_states = self.mlp(
             self.norm2(hidden_states), hidden_states, mlp_workspace
@@ -1808,7 +1795,16 @@ class Qwen3_5VisionModel(nn.Module):
             self._mlp_hidden_workspace = ws
         return ws[:num_tokens]
 
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        bilinear_indices: torch.Tensor | None = None,
+        bilinear_weights: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
@@ -1823,10 +1819,15 @@ class Qwen3_5VisionModel(nn.Module):
             grid_thw,
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.config.spatial_merge_size,
-            kwargs=kwargs,
+            bilinear_indices=bilinear_indices,
+            bilinear_weights=bilinear_weights,
         )
-        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
-        cu_seqlens = get_vision_cu_seqlens(grid_thw, kwargs=kwargs)
+        position_ids = get_vision_position_ids(
+            grid_thw,
+            self.spatial_merge_size,
+            position_ids,
+        )
+        cu_seqlens = get_vision_cu_seqlens(grid_thw, cu_seqlens)
 
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
@@ -1856,15 +1857,9 @@ class Qwen3_5VisionModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
                 mlp_workspace=mlp_workspace,
-                **kwargs,
             )
 
-        merged_hidden_states = self.merger(hidden_states)
-
-        return _VisionModelOutput(
-            last_hidden_state=hidden_states,
-            pooler_output=merged_hidden_states,
-        )
+        return self.merger(hidden_states)
 
 
 class Qwen3_5TextModel(nn.Module):
@@ -1993,7 +1988,6 @@ class Qwen3_5Model(nn.Module):
             use_flash_attention=use_vision_flash_attention,
         )
         self.language_model = Qwen3_5TextModel(config.text_config)
-        self.rope_deltas = None  # cache rope_deltas here
 
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.embed_tokens
@@ -2008,7 +2002,7 @@ class Qwen3_5Model(nn.Module):
         device: str | torch.device | None = None,
     ):
         """
-        Compute 3D positional indices for vision tokens derived from a single image or video input.
+        Compute 3D positional indices for vision tokens derived from one image.
 
         The positions are generated from the input grid defined by temporal (T), height (H), and
         width (W) dimensions. Temporal and spatial dimensions can be downscaled according to the
@@ -2018,7 +2012,7 @@ class Qwen3_5Model(nn.Module):
             start_position (`int`):
                 Offset added to all computed positional indices.
             grid_thw (`Sequence[int]` or `torch.Tensor` of shape `(3,)`):
-                The (T, H, W) grid representing the feature layout of the current image or video after patch embedding.
+                The (T, H, W) grid after patch embedding.
             temp_merge_size (`int`, *optional*):
                 Factor by which the temporal dimension is reduced in the backbone. The temporal grid size is divided
                 by this value. Defaults to 1.
@@ -2046,8 +2040,6 @@ class Qwen3_5Model(nn.Module):
         position_width = torch.arange(llm_grid_w, device=device) + start_position
         position_height = torch.arange(llm_grid_h, device=device) + start_position
 
-        # Repeat the positions per each grid and per video frame. Repeat patterns are important
-        # do not modify without checking values!
         position_width = position_width.repeat(llm_grid_h * llm_grid_t)
         position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
         # Important: add `start_positions` after applying `time_interval`, order matters
@@ -2061,39 +2053,9 @@ class Qwen3_5Model(nn.Module):
         input_ids: torch.LongTensor,
         mm_token_type_ids: torch.IntTensor,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Difference from Qwen2VL/Qwen2.5VL's get_rope_index:
-        - Since Qwen3.5 use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split too.
-
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
-                it.
-            mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`):
-                Token type ids matching each modality to a different value in the input sequence, i.e. text (0), image (1), video (2).
-            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-                The temporal, height and width of feature shape of each image in LLM.
-            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-                The temporal, height and width of feature shape of each video in LLM.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-        Returns:
-            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
-            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
-        """
-
-        # Separate video grid thw into multiple grids because timestamps are used to separate videos.
-        if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
-            video_grid_thw[:, 0] = 1
+        """Build text/image M-RoPE positions and the decode offset."""
         spatial_merge_size = self.config.vision_config.spatial_merge_size
 
         mrope_position_deltas = []
@@ -2104,10 +2066,7 @@ class Qwen3_5Model(nn.Module):
             dtype=input_ids.dtype,
             device=input_ids.device,
         )
-        grid_iters = {
-            1: iter(image_grid_thw) if image_grid_thw is not None else None,
-            2: iter(video_grid_thw) if video_grid_thw is not None else None,
-        }
+        image_grids = iter(image_grid_thw) if image_grid_thw is not None else None
 
         for batch_idx, current_input_ids in enumerate(input_ids):
             input_token_type = mm_token_type_ids[batch_idx]
@@ -2132,14 +2091,17 @@ class Qwen3_5Model(nn.Module):
                         torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos
                     )
                     current_pos += text_len
-                # image == 1, video == 2
-                else:
-                    grid_thw = next(grid_iters[modality_type])
+                elif modality_type == 1 and image_grids is not None:
+                    grid_thw = next(image_grids)
                     vision_position_ids = self.get_vision_position_ids(
                         current_pos, grid_thw, 1, spatial_merge_size, device=input_ids.device
                     )
                     llm_pos_ids_list.append(vision_position_ids)
                     current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
+                else:
+                    raise ValueError(
+                        f"unsupported Qwen modality type {modality_type}"
+                    )
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             if attention_mask is not None:
                 position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions.to(position_ids.device)
@@ -2151,56 +2113,36 @@ class Qwen3_5Model(nn.Module):
         ).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_video_features(
-        self,
-        pixel_values_videos: torch.FloatTensor,
-        video_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Any,
-    ) -> _VisionModelOutput:
-        r"""
-        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-            The tensors corresponding to the input videos.
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The temporal, height and width of feature shape of each video in LLM.
-        """
-        # Same implementation as for images
-        return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
-
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Any,
-    ) -> _VisionModelOutput:
-        r"""
-        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-            The tensors corresponding to the input images.
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
-        """
+        *,
+        bilinear_indices: torch.Tensor | None = None,
+        bilinear_weights: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        if image_grid_thw is None:
+            raise ValueError("image_grid_thw is required with pixel_values")
         pixel_values = pixel_values.type(_module_dtype(self.visual))
-        kwargs.pop("return_dict", None)
-        vision_output = self.visual(
-            pixel_values, grid_thw=image_grid_thw, **kwargs
+        image_embeds = self.visual(
+            pixel_values,
+            grid_thw=image_grid_thw,
+            bilinear_indices=bilinear_indices,
+            bilinear_weights=bilinear_weights,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
         )
-        image_embeds = vision_output.pooler_output
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
-        vision_output.pooler_output = image_embeds
-
-        return vision_output
+        return torch.split(image_embeds, split_sizes)
 
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
         image_features: torch.FloatTensor | None = None,
-        video_features: torch.FloatTensor | None = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
+    ) -> torch.Tensor:
         if input_ids is None:
             input_embeddings = self.get_input_embeddings()
             image_embedding = input_embeddings.weight[self.config.image_token_id].to(
@@ -2208,14 +2150,8 @@ class Qwen3_5Model(nn.Module):
             )
             special_image_mask = inputs_embeds == image_embedding
             special_image_mask = special_image_mask.all(-1)
-            video_embedding = input_embeddings.weight[self.config.video_token_id].to(
-                dtype=inputs_embeds.dtype
-            )
-            special_video_mask = inputs_embeds == video_embedding
-            special_video_mask = special_video_mask.all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
 
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -2225,49 +2161,37 @@ class Qwen3_5Model(nn.Module):
                 f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
             )
 
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if video_features is not None:
-            torch_compilable_check(
-                inputs_embeds[special_video_mask].numel() == video_features.numel(),
-                f"Video features and video tokens do not match, tokens: {n_video_tokens}, features: {video_features.shape[0]}",
-            )
-        return special_image_mask, special_video_mask
+        return special_image_mask
 
     def compute_3d_position_ids(
         self,
         input_ids: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: torch.Tensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-    ) -> torch.Tensor | None:
+        rope_deltas: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
-        has_multimodal = image_grid_thw is not None or video_grid_thw is not None
-        if has_multimodal and mm_token_type_ids is None and input_ids is not None:
+        if image_grid_thw is not None and mm_token_type_ids is None and input_ids is not None:
             raise ValueError(
-                "Multimodal data was passed (via `image_grid_thw` or `video_grid_thw`) but `mm_token_type_ids` is "
-                "missing. Please pass `mm_token_type_ids` to the model so that multimodal RoPE (M-RoPE) can be "
-                "computed correctly. `mm_token_type_ids` is returned by the processor alongside `input_ids`."
+                "image_grid_thw requires mm_token_type_ids for multimodal RoPE"
             )
-        can_compute_mrope = input_ids is not None and mm_token_type_ids is not None and has_multimodal
+        can_compute_mrope = (
+            input_ids is not None
+            and mm_token_type_ids is not None
+            and image_grid_thw is not None
+        )
 
-        if can_compute_mrope and (self.rope_deltas is None or past_key_values_length == 0):
-            position_ids, rope_deltas = self.get_rope_index(
+        if can_compute_mrope and past_key_values_length == 0:
+            return self.get_rope_index(
                 input_ids,
                 image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
                 attention_mask=attention_mask,
                 mm_token_type_ids=mm_token_type_ids,
             )
-            self.rope_deltas = rope_deltas
-        # Use pre-calculated rope-deltas to infer correct 3D position ids during incremental
-        # generation (past_key_values_length > 0) or when only inputs_embeds is provided (no input_ids
-        # to recompute from). Skip when input_ids is provided without past_key_values to avoid shape
-        # mismatches from stale rope_deltas (e.g., training forward pass after generation).
-        elif self.rope_deltas is not None and (past_key_values_length > 0 or input_ids is None):
+        if rope_deltas is not None and (past_key_values_length > 0 or input_ids is None):
             batch_size, seq_length, _ = inputs_embeds.shape
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
@@ -2276,12 +2200,10 @@ class Qwen3_5Model(nn.Module):
             else:
                 position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
                 position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
-            delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
+            delta = rope_deltas.repeat_interleave(batch_size // rope_deltas.shape[0], dim=0)
             position_ids = position_ids + delta.to(device=inputs_embeds.device)
-        else:
-            # Can't build correct 3D positions. Let the model infer it
-            position_ids = None
-        return position_ids
+            return position_ids, rope_deltas
+        return None, rope_deltas
 
     def forward(
         self,
@@ -2291,93 +2213,53 @@ class Qwen3_5Model(nn.Module):
         past_key_values: Any = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        **kwargs: Any,
+        rope_deltas: torch.Tensor | None = None,
+        cache_position_ids: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_q: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        gdn_state_indices: torch.Tensor | None = None,
+        spec_verify: bool = False,
+        vision_bilinear_indices: torch.Tensor | None = None,
+        vision_bilinear_weights: torch.Tensor | None = None,
+        vision_position_ids: torch.Tensor | None = None,
+        vision_cu_seqlens: torch.Tensor | None = None,
     ) -> _TextModelOutput:
-        r"""
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The temporal, height and width of feature shape of each video in LLM.
-        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        vision_metadata_keys = {
-            "vision_bilinear_indices",
-            "vision_bilinear_weights",
-            "vision_position_ids",
-            "vision_cu_seqlens",
-            "bilinear_indices",
-            "bilinear_weights",
-            "cu_seqlens",
-        }
-        language_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in vision_metadata_keys
-        }
-        vision_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key
-            not in {
-                "cache_position_ids",
-                "slot_mapping",
-                "page_table",
-                "paged_kv_seqlens_q",
-                "paged_kv_seqlens_k",
-                "cu_seq_lens_q",
-                "seq_idx",
-            }
-        }
-        for external_key, vision_key in (
-            ("vision_bilinear_indices", "bilinear_indices"),
-            ("vision_bilinear_weights", "bilinear_weights"),
-            ("vision_position_ids", "position_ids"),
-            ("vision_cu_seqlens", "cu_seqlens"),
-        ):
-            value = vision_kwargs.pop(external_key, None)
-            if value is not None:
-                vision_kwargs[vision_key] = value
-
         if pixel_values is not None:
-            image_outputs = self.get_image_features(
-                pixel_values, image_grid_thw, return_dict=True, **vision_kwargs
+            image_embeds = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                bilinear_indices=vision_bilinear_indices,
+                bilinear_weights=vision_bilinear_weights,
+                position_ids=vision_position_ids,
+                cu_seqlens=vision_cu_seqlens,
             )
-            image_embeds = image_outputs.pooler_output
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
+            image_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
-            video_outputs = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
-            )
-            video_embeds = video_outputs.pooler_output
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
         if position_ids is None:
-            position_ids = self.compute_3d_position_ids(
+            position_ids, rope_deltas = self.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 mm_token_type_ids=mm_token_type_ids,
+                rope_deltas=rope_deltas,
             )
 
         outputs = self.language_model(
@@ -2386,15 +2268,21 @@ class Qwen3_5Model(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            **language_kwargs,
+            cache_position_ids=cache_position_ids,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            paged_kv_seqlens_q=paged_kv_seqlens_q,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
+            cu_seq_lens_q=cu_seq_lens_q,
+            seq_idx=seq_idx,
+            gdn_state_indices=gdn_state_indices,
+            spec_verify=spec_verify,
         )
 
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
+            rope_deltas=rope_deltas,
         )
 
 

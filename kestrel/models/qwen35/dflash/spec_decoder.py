@@ -655,7 +655,6 @@ class SpecDecoder:
                                         device=dev, dtype=torch.int64)
                 slotmap = pt.build_slot_mapping(batch_idx=bidx_tok, positions=cpos)
                 seqk_pf = torch.tensor([n for n in prompt_lens], device=dev, dtype=torch.int32)
-                rt.model.model.rope_deltas = None
                 out_pf = rt.model.model.language_model(
                     input_ids=in_ids, position_ids=cpos, past_key_values=cache,
                     cache_position_ids=cpos, slot_mapping=slotmap,
@@ -1029,7 +1028,6 @@ class SpecRunner:
         # persistent pool. KV is written into the runtime-shared paged pool (in
         # place at the reserved pages) regardless.
         tmp_cache = rt._new_cache()
-        rt.model.model.rope_deltas = None
         out_pf = rt.model.model.language_model(
             input_ids=in_ids, position_ids=cpos, past_key_values=tmp_cache,
             cache_position_ids=cpos, slot_mapping=slotmap,
@@ -2225,7 +2223,6 @@ class SpecStepRunner(SpecRunner):
             cpos = torch.arange(n, device=dev).view(1, -1)
             page_tbl_row = torch.index_select(pt.page_table, 0, self.cb[row:row + 1])
             tmp_cache = rt._new_cache()
-            rt.model.model.rope_deltas = None
             if image_inputs is not None:
                 # Multimodal prefill: route through _forward_base, which runs the
                 # vision encoder + multimodal position ids and writes GDN/KV state

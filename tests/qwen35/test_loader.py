@@ -89,7 +89,6 @@ def _qwen_config_data(*, text=None, **overrides):
             "num_position_embeddings": 16,
         },
         "image_token_id": 30,
-        "video_token_id": 31,
         "tie_word_embeddings": False,
     }
     data.update(overrides)

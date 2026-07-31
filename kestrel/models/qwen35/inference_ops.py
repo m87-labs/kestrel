@@ -407,9 +407,9 @@ def create_causal_mask(
 def get_vision_position_ids(
     grid_thw: torch.Tensor,
     spatial_merge_size: int | torch.Tensor,
-    kwargs: dict[str, Any] | None = None,
+    position_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if kwargs is not None and (position_ids := kwargs.pop("position_ids", None)) is not None:
+    if position_ids is not None:
         return position_ids
     device = grid_thw.device
     if isinstance(spatial_merge_size, int):
@@ -439,13 +439,11 @@ def get_vision_bilinear_indices_and_weights(
     grid_thw: torch.Tensor,
     num_grid_per_side: int,
     spatial_merge_size: int,
-    kwargs: dict[str, Any] | None = None,
+    bilinear_indices: torch.Tensor | None = None,
+    bilinear_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if kwargs is not None:
-        bilinear_indices = kwargs.pop("bilinear_indices", None)
-        bilinear_weights = kwargs.pop("bilinear_weights", None)
-        if bilinear_indices is not None and bilinear_weights is not None:
-            return bilinear_indices, bilinear_weights
+    if bilinear_indices is not None and bilinear_weights is not None:
+        return bilinear_indices, bilinear_weights
     side = num_grid_per_side
     merge_size = spatial_merge_size
     device = grid_thw.device
@@ -493,9 +491,10 @@ def get_vision_bilinear_indices_and_weights(
 
 
 def get_vision_cu_seqlens(
-    grid_thw: torch.Tensor, kwargs: dict[str, Any] | None = None
+    grid_thw: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if kwargs is not None and (cu_seqlens := kwargs.pop("cu_seqlens", None)) is not None:
+    if cu_seqlens is not None:
         return cu_seqlens
     cu_seqlens = torch.repeat_interleave(
         grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]

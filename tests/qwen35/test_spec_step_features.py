@@ -667,7 +667,6 @@ def _try_build_runner(block_size=16, flush_cap=64, max_batch_size=2):
         mask_token_id=0, target_layer_ids=target_layer_ids,
     )
     drafter = DFlashDraftModel(dcfg).to(dev, torch.bfloat16).eval()
-    tc.linear_replay_capacity = flush_cap
     rt._linear_state_pool.replay_capacity = flush_cap
     for st in rt._linear_state_pool.layers:
         if st is not None:
@@ -1020,7 +1019,6 @@ def test_spec_admit_first_logprob_matches_normal_decode_greedy():
             slotmap = pt.build_slot_mapping(batch_idx=bidx_tok, positions=cpos)
             page_tbl_row = torch.index_select(
                 pt.page_table, 0, torch.tensor([ref_bidx], device=rt.device))
-            rt.model.model.rope_deltas = None
             out_pf = rt.model.model.language_model(
                 input_ids=torch.tensor([prompt], device=rt.device, dtype=torch.long),
                 position_ids=cpos, past_key_values=tmp_cache,
@@ -1499,7 +1497,6 @@ def _image_decode_reference(rt, ids, image_kwargs, n_new):
     rt.page_table.commit_block_table([bidx])
     try:
         cpos = torch.arange(len(ids), device=dev, dtype=torch.long).view(1, -1)
-        rt.model.model.rope_deltas = None
         last_hidden, cache = rt._forward_base(
             input_ids=torch.tensor([ids], dtype=torch.long, device=dev),
             past_key_values=rt._new_cache(), batch_idx=bidx,
@@ -2336,7 +2333,6 @@ def _try_build_spec_runner(block_size=16, flush_cap=128, batch_size=1,
         mask_token_id=0, target_layer_ids=target_layer_ids,
     )
     drafter = DFlashDraftModel(dcfg).to(dev, torch.bfloat16).eval()
-    tc.linear_replay_capacity = flush_cap
     rt._linear_state_pool.replay_capacity = flush_cap
     for st in rt._linear_state_pool.layers:
         if st is not None:

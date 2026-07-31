@@ -1246,7 +1246,6 @@ class Qwen35Runtime:
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
         cache_position_ids = slot.cache_position_ids[:batch_size]
         input_ids = slot.decode_token_ids[:batch_size].view(-1, 1)
-        self.model.model.rope_deltas = None
         outputs = self.model.model(
             input_ids=input_ids,
             past_key_values=cache,
@@ -1857,7 +1856,6 @@ class Qwen35Runtime:
         packed: _PackedPrefillBatch,
     ) -> tuple[torch.Tensor, _QwenForwardCache]:
         cache = self._new_cache()
-        self.model.model.rope_deltas = None
         outputs = self.model.model(
             input_ids=packed.input_ids,
             past_key_values=cache,
@@ -1987,7 +1985,6 @@ class Qwen35Runtime:
             )
             rope_deltas = None
         else:
-            self.model.model.rope_deltas = cache_state.rope_deltas
             outputs = self.model.model(
                 input_ids=input_ids,
                 past_key_values=cache_state.past_key_values,
@@ -1995,9 +1992,10 @@ class Qwen35Runtime:
                 image_grid_thw=image_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
                 position_ids=position_ids,
+                rope_deltas=cache_state.rope_deltas,
                 **cache_kwargs,
             )
-            rope_deltas = getattr(outputs, "rope_deltas", None)
+            rope_deltas = outputs.rope_deltas
         last_hidden = outputs.last_hidden_state
         if (
             batch_idx is not None

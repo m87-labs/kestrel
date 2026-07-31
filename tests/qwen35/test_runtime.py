@@ -102,7 +102,6 @@ def _qwen_config_data(*, text=None, **overrides):
             "num_position_embeddings": 16,
         },
         "image_token_id": 30,
-        "video_token_id": 31,
         "tie_word_embeddings": False,
     }
     data.update(overrides)
@@ -1002,22 +1001,15 @@ class _FakeQwenVLModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.language_model = _FakeLanguageModel()
-        self.rope_deltas = None
 
     def __call__(self, **kwargs):
-        self.calls.append(
-            {
-                **kwargs,
-                "rope_deltas_before_call": self.rope_deltas,
-            }
-        )
+        self.calls.append(dict(kwargs))
         input_ids = kwargs["input_ids"]
         rope_deltas = (
             torch.tensor([[7]], dtype=torch.long)
             if kwargs.get("pixel_values") is not None
-            else self.rope_deltas
+            else kwargs.get("rope_deltas")
         )
-        self.rope_deltas = rope_deltas
         return SimpleNamespace(
             last_hidden_state=torch.ones(
                 input_ids.shape[0], input_ids.shape[1], 2
@@ -1040,8 +1032,6 @@ def test_image_forward_cache_routes_decode_through_multimodal_wrapper():
         mm_token_type_ids=torch.tensor([[0, 1]], dtype=torch.int32),
     )
 
-    stale_rope = torch.tensor([[99]], dtype=torch.long)
-    qwen_model.rope_deltas = stale_rope
     _, next_cache = rt._forward_base(
         input_ids=torch.tensor([[3]]),
         past_key_values=cache,
@@ -1050,7 +1040,7 @@ def test_image_forward_cache_routes_decode_through_multimodal_wrapper():
     assert len(qwen_model.calls) == 2
     assert qwen_model.language_model.calls == []
     assert qwen_model.calls[1]["past_key_values"] == "vision-cache-1"
-    assert qwen_model.calls[1]["rope_deltas_before_call"] is cache.rope_deltas
+    assert qwen_model.calls[1]["rope_deltas"] is cache.rope_deltas
     assert next_cache.rope_deltas is cache.rope_deltas
 
 
@@ -1073,14 +1063,13 @@ def test_multimodal_forward_uses_explicit_position_ids():
 
     assert len(qwen_model.calls) == 1
     assert qwen_model.calls[0]["position_ids"] is position_ids
-    assert qwen_model.calls[0]["rope_deltas_before_call"] is cache.rope_deltas
+    assert qwen_model.calls[0]["rope_deltas"] is cache.rope_deltas
     assert next_cache.rope_deltas is cache.rope_deltas
 
 
-def test_text_forward_cache_keeps_language_model_shortcut_with_stale_rope():
+def test_text_forward_cache_keeps_language_model_shortcut():
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     qwen_model = _FakeQwenVLModel()
-    qwen_model.rope_deltas = torch.tensor([[99]], dtype=torch.long)
     rt.model = SimpleNamespace(model=qwen_model)
 
     _, cache = rt._forward_base(
