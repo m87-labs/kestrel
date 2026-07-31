@@ -22,6 +22,7 @@ from kestrel.runtime.prefill import project_packed_last_rows
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 from kestrel.runtime.preprocessing import derive_preprocessing_workers
 from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
+from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
 from .generated_decode import create_generated_decode
 from .image import MAX_IMAGE_TOKENS, MAX_PATCHES, preprocess_image
@@ -37,7 +38,7 @@ from .prompt_template import (
 )
 
 
-class Gemma4Runtime:
+class Gemma4Runtime(UncachedPagedRuntime):
     def __init__(
         self,
         cfg: Any,
@@ -156,7 +157,6 @@ class Gemma4Runtime:
             dtype=self.dtype,
         )
         self._decode_megakernel = create_generated_decode(self)
-        self.prefix_cache = None
 
     def _configure_model(self, cfg: Any) -> None:
         vision = self.model.model.vision_tower
@@ -389,19 +389,6 @@ class Gemma4Runtime:
     def shutdown(self) -> None:
         self._image_preprocessor.shutdown()
 
-    def can_reserve(self, total_length: int) -> bool:
-        return (
-            total_length <= self.max_seq_length
-            and self.page_table.can_reserve_with_eviction(total_length)
-        )
-
-    def prefill_budget(self) -> tuple[int, int]:
-        return (self.page_table.pages_available, self._available_batch_slots())
-
-    def _available_batch_slots(self) -> int:
-        active_headroom = max(0, self.max_batch_size - len(self.active_sequences))
-        return min(active_headroom, len(self.page_table.free_batch_idx))
-
     def acquire_prefill_slot(self, slot_id: int | None = None) -> Any:
         if self._prefill_slot_in_use:
             raise RuntimeError("Prefill slot pool exhausted")
@@ -417,29 +404,6 @@ class Gemma4Runtime:
             raise RuntimeError("prefill slot is not acquired")
         self._prefill_slot_in_use = False
 
-    def acquire_adapter_slot(self, adapter_id: str, adapter: Any) -> int:
-        raise NotImplementedError("LoRA adapters are not supported")
-
-    def release_adapter_slot(self, slot: int) -> None:
-        raise NotImplementedError("LoRA adapters are not supported")
-
-    def classify_prefill(
-        self,
-        prompt_tokens: Sequence[Token],
-        *,
-        has_image: bool = False,
-        image_hash: bytes | None = None,
-        adapter_id: str | None = None,
-    ) -> Any:
-        from kestrel.runtime.state import PrefillClassification
-
-        return PrefillClassification(
-            prompt_length=len(prompt_tokens),
-            skip_positions=0,
-            can_reuse=False,
-            use_prefix_attn=False,
-        )
-
     def prepare_sequence(
         self,
         prompt_tokens: Sequence[Token],
@@ -451,8 +415,6 @@ class Gemma4Runtime:
         image_hash: bytes | None = None,
         adapter_id: str | None = None,
     ) -> Any:
-        from kestrel.runtime.state import PreparedSequence, _CacheLookupResult
-
         tokens, image_tokens, text_length = self._prepare_prompt(
             prompt_tokens,
             image=image,
@@ -464,43 +426,11 @@ class Gemma4Runtime:
             text_length + self.image_prefix_length + new_tokens,
             prompt_length + new_tokens,
         )
-        if target_length > self.max_seq_length:
-            raise ValueError(
-                f"Requested length {target_length} exceeds "
-                f"max_seq_length={self.max_seq_length}"
-            )
-        if self._available_batch_slots() <= 0:
-            raise RuntimeError("Cannot reserve batch slot")
-        batch_idx = self.page_table.allocate()
-        try:
-            self.page_table.reserve(batch_idx, target_length)
-        except Exception:
-            self.page_table.erase(batch_idx, 0)
-            raise
-        state = SequenceState(
-            batch_idx=batch_idx,
-            length=prompt_length,
-            max_length=target_length,
-            prompt_length=prompt_length,
+        return self._prepare_uncached_sequence(
+            tokens=tokens,
+            target_length=target_length,
             image_length=image_tokens,
-            last_hidden=None,
             lora_slot=lora_slot,
-            cache_tokens=None,
-            cache_lock_node=None,
-            cache_owned_page_count=0,
-            reused_page_count=0,
-        )
-        return PreparedSequence(
-            state=state,
-            tokens_list=tokens,
-            cache_tokens=[],
-            cache_result=_CacheLookupResult(
-                match=None,
-                skip_positions=0,
-                temp_lock_node=None,
-                can_reuse=False,
-                namespace=None,
-            ),
             adapter_id=adapter_id,
             image_hash=image_hash,
         )
@@ -613,35 +543,6 @@ class Gemma4Runtime:
         for row, prepared in enumerate(prepared_sequences):
             prepared.state.last_hidden = hidden_rows[row].detach()
         return logits
-
-    def finalize_prepared_sequence_after_prefill(self, prepared: Any) -> None:
-        self.active_sequences[prepared.state.batch_idx] = prepared.state
-
-    def abort_prepared_sequence(self, prepared: Any) -> None:
-        self.active_sequences.pop(prepared.state.batch_idx, None)
-        self._release_batch_idx(prepared.state.batch_idx)
-
-    def retain_sequence_prefix(
-        self,
-        state: SequenceState,
-        generated_tokens: Sequence[Token],
-        *,
-        adapter_id: str | None,
-        image_hash: bytes | None,
-    ) -> None:
-        del state, generated_tokens, adapter_id, image_hash
-        if self.prefix_cache is not None:
-            raise RuntimeError(
-                "prefix retention requires a runtime with prefix-cache support"
-            )
-
-    def release_sequence(self, state: SequenceState) -> None:
-        self.active_sequences.pop(state.batch_idx, None)
-        self._release_batch_idx(state.batch_idx)
-
-    def _release_batch_idx(self, batch_idx: int) -> None:
-        if batch_idx not in self.page_table.free_batch_idx:
-            self.page_table.erase(batch_idx, 0)
 
     def decode_with_slot(self, slot: Any, batch_size: int) -> None:
         if batch_size == 0:
