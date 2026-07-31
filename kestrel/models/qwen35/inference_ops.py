@@ -36,8 +36,11 @@ class LinearAttentionLayer:
         self.is_recurrent_states_initialized = False
         self.has_previous_state = False
 
-    def update_conv_state(self, conv_states: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        state_indices = kwargs.get("state_indices")
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        state_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if state_indices is not None and not self.is_conv_states_initialized:
             raise RuntimeError("Indexed conv state update requires initialized state")
         if not self.is_conv_states_initialized:
@@ -80,9 +83,10 @@ class LinearAttentionLayer:
         return self.conv_states
 
     def update_recurrent_state(
-        self, recurrent_states: torch.Tensor, **kwargs: Any
+        self,
+        recurrent_states: torch.Tensor,
+        state_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        state_indices = kwargs.get("state_indices")
         if state_indices is not None and not self.is_recurrent_states_initialized:
             raise RuntimeError(
                 "Indexed recurrent state update requires initialized state"
@@ -304,7 +308,6 @@ def sdpa_attention_forward(
     attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
-    **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -331,32 +334,20 @@ def kestrel_vision_flash_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
     scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Any,
+    cu_seq_lens_q: torch.Tensor,
+    cu_seq_lens_k: torch.Tensor,
 ) -> tuple[torch.Tensor, None]:
-    if attention_mask is not None:
-        raise ValueError("Kestrel Qwen vision attention expects attention_mask=None")
-    if dropout != 0.0:
-        raise ValueError("Kestrel Qwen vision attention only supports dropout=0")
-    if bool(kwargs.get("is_causal", getattr(module, "is_causal", False))):
-        raise ValueError("Kestrel Qwen vision attention only supports non-causal attention")
-
-    cu_seqlens_q = kwargs.get("cu_seq_lens_q")
-    cu_seqlens_k = kwargs.get("cu_seq_lens_k")
-    if cu_seqlens_q is None or cu_seqlens_k is None:
-        raise ValueError("Kestrel Qwen vision attention requires cu_seq_lens_q and cu_seq_lens_k")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Kestrel Qwen vision attention expects query/key/value as [B, H, S, D]")
     if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
         raise ValueError("Kestrel Qwen vision attention expects packed vision batch size 1")
 
     device = query.device
-    if cu_seqlens_q.device != device:
-        cu_seqlens_q = cu_seqlens_q.to(device=device, non_blocking=True)
-    if cu_seqlens_k.device != device:
-        cu_seqlens_k = cu_seqlens_k.to(device=device, non_blocking=True)
+    if cu_seq_lens_q.device != device:
+        cu_seq_lens_q = cu_seq_lens_q.to(device=device, non_blocking=True)
+    if cu_seq_lens_k.device != device:
+        cu_seq_lens_k = cu_seq_lens_k.to(device=device, non_blocking=True)
 
     key = repeat_kv(key, module.num_key_value_groups)
     value = repeat_kv(value, module.num_key_value_groups)
@@ -364,8 +355,8 @@ def kestrel_vision_flash_attention_forward(
         query[0].transpose(0, 1),
         key[0].transpose(0, 1),
         value[0].transpose(0, 1),
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_q=cu_seq_lens_q,
+        cu_seqlens_k=cu_seq_lens_k,
         softmax_scale=scaling,
         causal=False,
         m_block_size=128,

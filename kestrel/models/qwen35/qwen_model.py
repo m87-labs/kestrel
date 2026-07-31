@@ -32,6 +32,7 @@ from .inference_ops import (
     torch_compilable_check,
 )
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from .paged_cache import Qwen35InferenceCache
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
@@ -75,7 +76,7 @@ _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 @dataclass
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
-    past_key_values: Any = None
+    past_key_values: Qwen35InferenceCache | None = None
     rope_deltas: torch.Tensor | None = None
 
 
@@ -201,7 +202,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
 
 class Qwen3_5RMSNormGated(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+    def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -244,9 +245,8 @@ def torch_chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
-    **kwargs,
+    cu_seqlens: torch.Tensor | None = None,
 ):
-    cu_seqlens = kwargs.get("cu_seqlens")
     # Single-sequence (numel==2: [0, T]) falls through to the core chunk math so the
     # host read below is skipped under CUDA-graph capture (graph-safety).
     if cu_seqlens is not None and int(cu_seqlens.numel()) > 2:
@@ -433,9 +433,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Any = None,
+        cache_params: Qwen35InferenceCache | None = None,
         attention_mask: torch.Tensor | None = None,
-        **kwargs: Any,
+        *,
+        cu_seq_lens_q: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        gdn_state_indices: torch.Tensor | None = None,
+        spec_verify: bool = False,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -447,7 +451,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # diverge in how the conv input is assembled and which kernel consumes the states below,
         # which we gate locally on `seq_len`.
         use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
-        cu_seqlens_q = kwargs.get("cu_seq_lens_q")
+        cu_seqlens_q = cu_seq_lens_q
         supports_native_packed_gdn = (
             self.supports_packed_gdn(
                 hidden_states.device,
@@ -472,7 +476,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             layer_cache = cache_params.layers[self.layer_idx]
             conv_state = layer_cache.conv_states
             recurrent_state = layer_cache.recurrent_states
-            state_indices = kwargs.get("gdn_state_indices")
+            state_indices = gdn_state_indices
             if state_indices is not None:
                 state_indices = state_indices.to(
                     device=conv_state.device,
@@ -487,7 +491,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        if use_precomputed_states and seq_len > 1 and kwargs.get("spec_verify"):
+        if use_precomputed_states and seq_len > 1 and spec_verify:
             # Cache the block's pre-conv input [B, conv_dim, T] so the spec-loop
             # commit can roll the conv window over only the accepted prefix:
             # conv_state = [committed_conv ++ block_preconv[:, :, :a+1]][-K_conv:].
@@ -569,7 +573,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 # true current state instead of a stale recurrent_state. Spec
                 # verify blocks consume the replay ring directly, so only an
                 # explicit overflow flush should materialize them.
-                if not kwargs.get("spec_verify"):
+                if not spec_verify:
                     layer_cache.materialize_recurrent_from_replay(state_indices)
                 recurrent_state = layer_cache.recurrent_states
                 if state_indices is not None:
@@ -638,7 +642,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         state_indices=state_indices if use_precomputed_states else None,
                     )
             if native_prefill:
-                seq_idx = kwargs.get("seq_idx")
                 if seq_idx is None:
                     seq_idx = _packed_seq_idx_from_cu_seqlens(
                         cu_seqlens_q,
@@ -659,7 +662,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     final_state=packed_conv_state,
                 )
             elif packed_prefill:
-                seq_idx = kwargs.get("seq_idx")
                 if seq_idx is None:
                     seq_idx = _packed_seq_idx_from_cu_seqlens(
                         cu_seqlens_q,
@@ -711,7 +713,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if core_attn_out is None:
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            if kwargs.get("spec_verify") and use_precomputed_states and seq_len > 1:
+            if spec_verify and use_precomputed_states and seq_len > 1:
                 # Multi-token ReplaySSM spec-verify (Algorithm 4): read all T draft
                 # outputs from the committed checkpoint + ring buffer and append them;
                 # the spec loop's commit advances the cursor. The checkpoint is kept
@@ -866,18 +868,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def paged_attention_forward(
-    module: nn.Module,
     query: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
     *,
     paged_kv_layer: Any,
     page_table: torch.Tensor | None,
     paged_kv_seqlens_k: torch.Tensor | None,
-    dropout: float = 0.0,
     paged_kv_seqlens_q: torch.Tensor | None = None,
     cu_seq_lens_q: torch.Tensor | None = None,
-    **kwargs: Any,
 ):
     if page_table is None or paged_kv_seqlens_k is None:
         raise RuntimeError("Qwen paged attention requires page_table and seqused_k")
@@ -952,8 +949,14 @@ class Qwen3_5Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        past_key_values: Any = None,
-        **kwargs: Any,
+        past_key_values: Qwen35InferenceCache | None = None,
+        *,
+        cache_position_ids: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_q: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -975,55 +978,7 @@ class Qwen3_5Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        paged_kv_layer = None
-        if past_key_values is not None and hasattr(past_key_values, "get_paged_layer"):
-            paged_kv_layer = past_key_values.get_paged_layer(self.layer_idx)
-
-        if past_key_values is not None:
-            if paged_kv_layer is not None:
-                cache_position_ids = kwargs.get("cache_position_ids")
-                slot_mapping = kwargs.get("slot_mapping")
-                if cache_position_ids is None or slot_mapping is None:
-                    raise RuntimeError(
-                        "Qwen paged KV update requires cache_position_ids and slot_mapping"
-                    )
-                paged_kv_layer.update(
-                    input_pos=cache_position_ids,
-                    k_val=key_states.transpose(1, 2),
-                    v_val=value_states.transpose(1, 2),
-                    slot_mapping=slot_mapping,
-                )
-            else:
-                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-
-        if paged_kv_layer is not None:
-            attn_kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key
-                not in {
-                    "cache_position_ids",
-                    "slot_mapping",
-                    "page_table",
-                    "paged_kv_seqlens_q",
-                    "paged_kv_seqlens_k",
-                    "cu_seq_lens_q",
-                }
-            }
-            attn_output, attn_weights = paged_attention_forward(
-                self,
-                query_states,
-                attention_mask,
-                dropout=0.0,
-                scaling=self.scaling,
-                paged_kv_layer=paged_kv_layer,
-                page_table=kwargs.get("page_table"),
-                paged_kv_seqlens_q=kwargs.get("paged_kv_seqlens_q"),
-                paged_kv_seqlens_k=kwargs.get("paged_kv_seqlens_k"),
-                cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
-                **attn_kwargs,
-            )
-        else:
+        if past_key_values is None:
             attn_output, attn_weights = sdpa_attention_forward(
                 self,
                 query_states,
@@ -1032,7 +987,30 @@ class Qwen3_5Attention(nn.Module):
                 attention_mask,
                 dropout=0.0,
                 scaling=self.scaling,
-                **kwargs,
+            )
+        else:
+            paged_kv_layer = past_key_values.get_paged_layer(self.layer_idx)
+            if paged_kv_layer is None:
+                raise RuntimeError(
+                    f"Qwen full-attention layer {self.layer_idx} has no paged K/V"
+                )
+            if cache_position_ids is None or slot_mapping is None:
+                raise RuntimeError(
+                    "Qwen paged KV update requires cache_position_ids and slot_mapping"
+                )
+            paged_kv_layer.update(
+                input_pos=cache_position_ids,
+                k_val=key_states.transpose(1, 2),
+                v_val=value_states.transpose(1, 2),
+                slot_mapping=slot_mapping,
+            )
+            attn_output, attn_weights = paged_attention_forward(
+                query_states,
+                paged_kv_layer=paged_kv_layer,
+                page_table=page_table,
+                paged_kv_seqlens_q=paged_kv_seqlens_q,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
+                cu_seq_lens_q=cu_seq_lens_q,
             )
 
         attn_output = attn_output * torch.sigmoid(gate)
@@ -1449,8 +1427,17 @@ class Qwen3_5DecoderLayer(nn.Module):
         output_layernorm: Qwen3_5RMSNorm | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Any = None,
-        **kwargs: Any,
+        past_key_values: Qwen35InferenceCache | None = None,
+        *,
+        cache_position_ids: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_q: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        gdn_state_indices: torch.Tensor | None = None,
+        spec_verify: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_states = normalized_hidden_states
 
@@ -1460,17 +1447,24 @@ class Qwen3_5DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 attention_mask=attention_mask,
-                **kwargs,
+                cu_seq_lens_q=cu_seq_lens_q,
+                seq_idx=seq_idx,
+                gdn_state_indices=gdn_state_indices,
+                spec_verify=spec_verify,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
                 past_key_values=past_key_values,
                 position_embeddings=position_embeddings,
-                **kwargs,
+                cache_position_ids=cache_position_ids,
+                slot_mapping=slot_mapping,
+                page_table=page_table,
+                paged_kv_seqlens_q=paged_kv_seqlens_q,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
+                cu_seq_lens_q=cu_seq_lens_q,
             )
 
         # Fully Connected
@@ -1493,28 +1487,6 @@ class Qwen3_5DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states, None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Any = None,
-        **kwargs: Any,
-    ) -> torch.FloatTensor:
-        hidden_states, _ = self._forward_from_normalized(
-            hidden_states,
-            self.input_layernorm(hidden_states),
-            position_embeddings=position_embeddings,
-            output_layernorm=None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            **kwargs,
-        )
-        return hidden_states
-
 
 class Qwen3_5VisionMLP(nn.Module):
     def __init__(self, config):
@@ -1663,12 +1635,9 @@ class Qwen3_5VisionAttention(nn.Module):
                 query_states,
                 key_states,
                 value_states,
-                attention_mask=None,
                 scaling=self.scaling,
-                dropout=0.0,
                 cu_seq_lens_q=cu_seqlens,
                 cu_seq_lens_k=cu_seqlens,
-                is_causal=False,
             )
         else:
             # Other implementations: Process each chunk separately
@@ -1686,7 +1655,6 @@ class Qwen3_5VisionAttention(nn.Module):
                     attention_mask=None,
                     scaling=self.scaling,
                     dropout=0.0,
-                    is_causal=False,
                 )[0]
                 for q, k, v in zip(*splits)
             ]
@@ -1871,9 +1839,18 @@ class Qwen3_5TextModel(nn.Module):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Any = None,
+        past_key_values: Qwen35InferenceCache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        **kwargs: Any,
+        *,
+        cache_position_ids: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_q: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        gdn_state_indices: torch.Tensor | None = None,
+        spec_verify: bool = False,
     ) -> _TextModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1895,13 +1872,9 @@ class Qwen3_5TextModel(nn.Module):
         else:
             text_position_ids = None
 
-        uses_paged_kv = (
-            past_key_values is not None
-            and getattr(past_key_values, "uses_paged_kv", lambda: False)()
-        )
         causal_mask = (
             None
-            if uses_paged_kv and attention_mask is None
+            if past_key_values is not None and attention_mask is None
             else create_causal_mask(
                 config=self.config,
                 inputs_embeds=inputs_embeds,
@@ -1935,7 +1908,15 @@ class Qwen3_5TextModel(nn.Module):
                 attention_mask=layer_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
-                **kwargs,
+                cache_position_ids=cache_position_ids,
+                slot_mapping=slot_mapping,
+                page_table=page_table,
+                paged_kv_seqlens_q=paged_kv_seqlens_q,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
+                cu_seq_lens_q=cu_seq_lens_q,
+                seq_idx=seq_idx,
+                gdn_state_indices=gdn_state_indices,
+                spec_verify=spec_verify,
             )
 
         hidden_states = (
@@ -2161,7 +2142,7 @@ class Qwen3_5Model(nn.Module):
         inputs_embeds: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_values: torch.Tensor | None = None,
+        past_key_values: Qwen35InferenceCache | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         rope_deltas: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -2202,7 +2183,7 @@ class Qwen3_5Model(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Any = None,
+        past_key_values: Qwen35InferenceCache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,

@@ -87,43 +87,26 @@ class Qwen35InferenceCache:
         self.paged_kv = paged_kv
         self.seq_length = 0
 
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(self.layers[layer_idx], PagedKVCache):
-            raise RuntimeError(
-                "Qwen full-attention layers update PagedKVCache directly with "
-                "Kestrel's BSHD layout"
-            )
-        return self.layers[layer_idx].update(
-            key_states,
-            value_states,
-            *args,
-            **kwargs,
-        )
-
     def update_conv_state(
         self,
         conv_states: torch.Tensor,
         layer_idx: int,
-        **kwargs: Any,
+        state_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.layers[layer_idx].update_conv_state(conv_states, **kwargs)
+        return self.layers[layer_idx].update_conv_state(
+            conv_states,
+            state_indices,
+        )
 
     def update_recurrent_state(
         self,
         recurrent_states: torch.Tensor,
         layer_idx: int,
-        **kwargs: Any,
+        state_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.layers[layer_idx].update_recurrent_state(
             recurrent_states,
-            **kwargs,
+            state_indices,
         )
 
     def has_previous_state(self, layer_idx: int | None = None) -> bool:
@@ -143,9 +126,6 @@ class Qwen35InferenceCache:
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return int(self.seq_length)
-
-    def uses_paged_kv(self) -> bool:
-        return any(isinstance(layer, PagedKVCache) for layer in self.layers)
 
     def advance_to(self, seq_length: int) -> None:
         self.seq_length = max(self.seq_length, int(seq_length))

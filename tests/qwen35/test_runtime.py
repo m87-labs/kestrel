@@ -254,7 +254,7 @@ def test_attention_updates_paged_cache_with_fused_value_view(monkeypatch):
             assert layer_idx == 0
             return self.layer
 
-    def fake_paged_attention_forward(module, query, attention_mask, **kwargs):
+    def fake_paged_attention_forward(query, **kwargs):
         return query.transpose(1, 2), None
 
     monkeypatch.setattr(
@@ -305,10 +305,7 @@ def test_paged_attention_delegates_device_support_to_runtime(monkeypatch):
     monkeypatch.setattr(qwen_model, "_flash_attn_fwd", fake_flash_attn_fwd)
 
     out, _ = qwen_model.paged_attention_forward(
-        SimpleNamespace(),
         query,
-        None,
-        1.0,
         paged_kv_layer=paged_kv_layer,
         page_table=page_table,
         paged_kv_seqlens_k=seqused_k,
@@ -407,9 +404,11 @@ def test_text_model_fused_layer_boundaries_match_layer_loop():
 
         expected = inputs_embeds
         for decoder_layer in model.layers:
-            expected = decoder_layer(
+            expected, _ = decoder_layer._forward_from_normalized(
                 expected,
+                decoder_layer.input_layernorm(expected),
                 position_embeddings=position_embeddings,
+                output_layernorm=None,
                 attention_mask=causal_mask,
                 position_ids=text_position_ids,
                 past_key_values=None,
