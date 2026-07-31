@@ -2973,8 +2973,8 @@ def test_query_skill_defaults_to_non_reasoning():
         prompt={"question": "Warmup prompt.", "reasoning": False},
         settings={"max_tokens": 1, "temperature": 0.2, "top_p": 0.9},
     )
-    assert built.temperature == 0.0
-    assert built.top_p == 1.0
+    assert built.temperature == 0.2
+    assert built.top_p == 0.9
 
     built = skill.build_request(
         image=None,

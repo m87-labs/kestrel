@@ -10,8 +10,6 @@ from kestrel.runtime.tokens import ImageMarker, TextToken, Token
 from kestrel.skills import ChatSkill, QueryRequest, QuerySkill, SkillRegistry
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
-    AR_DEFAULT_TEMPERATURE,
-    AR_DEFAULT_TOP_P,
     BuiltRequest,
     parse_settings,
 )
@@ -35,9 +33,8 @@ class Qwen35QuerySkill(QuerySkill):
         refs = normalize_spatial_refs(prompt.get("spatial_refs"))
         if refs is not None:
             raise ValueError("Qwen 3.5 query does not support spatial_refs")
-        sampling_settings = _without_generic_sampling_defaults(settings)
         s = parse_settings(
-            sampling_settings,
+            settings,
             temperature=0.0,
             top_p=1.0,
             max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
@@ -58,22 +55,6 @@ class Qwen35QuerySkill(QuerySkill):
             temperature=s.temperature,
             top_p=s.top_p,
         )
-
-def _without_generic_sampling_defaults(
-    settings: Optional[Mapping[str, object]],
-) -> Optional[Mapping[str, object]]:
-    if settings is None:
-        return None
-    if (
-        settings.get("temperature") == AR_DEFAULT_TEMPERATURE
-        and settings.get("top_p") == AR_DEFAULT_TOP_P
-    ):
-        stripped = dict(settings)
-        stripped.pop("temperature", None)
-        stripped.pop("top_p", None)
-        return stripped
-    return settings
-
 
 class Qwen35ChatSkill(ChatSkill):
     """Qwen chat: emit a vision placeholder per image at its content position.

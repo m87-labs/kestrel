@@ -17,7 +17,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    List,
     Mapping,
     Optional,
     Sequence,
@@ -52,12 +51,8 @@ from kestrel.scheduler import (
     StreamUpdate,
 )
 from kestrel.skills import (
-    AR_DEFAULT_MAX_NEW_TOKENS,
-    AR_DEFAULT_TEMPERATURE,
-    AR_DEFAULT_TOP_P,
     DecodeStep,
     SkillRegistry,
-    SkillSpec,
     SkillState,
 )
 from kestrel.models.moondream.lora import AdapterProvider
@@ -76,7 +71,6 @@ from kestrel.engine._types import (
     _ModelStreamQueue,
     _StreamCompletion,
     _StreamQueue,
-    _StreamQueueItem,
     _StreamingChunk,
     _StreamingSessionRequest,
 )
@@ -221,13 +215,6 @@ class InferenceEngine:
         # runtime.skills()). ``skills=`` is an optional override, mainly
         # for tests; when None the default model's registry is used.
         self._skills_override = skills
-        # AR serving defaults live with the AR skills (sampling config, not
-        # kernel config); the engine only needs them to seed the warmup
-        # query. Sourced from the skill-layer constants, not redefined here.
-        self._default_max_new_tokens = AR_DEFAULT_MAX_NEW_TOKENS
-        self._default_temperature = AR_DEFAULT_TEMPERATURE
-        self._default_top_p = AR_DEFAULT_TOP_P
-
     @property
     def runtime(self) -> AutoregressiveRuntime:
         runtime = self._runtimes.get(self._default_model)
@@ -471,8 +458,6 @@ class InferenceEngine:
 
         try:
             warmup_settings: Dict[str, object] = {
-                "temperature": self._default_temperature,
-                "top_p": self._default_top_p,
                 "max_tokens": 1,
             }
             # Warmup uses slot 0 (no LoRA) - adapter-specific warmup is not required
