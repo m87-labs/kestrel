@@ -557,11 +557,7 @@ class Qwen3_5MLP(nn.Module):
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
-        hidden = torch.empty(
-            (*gate_up.shape[:-1], self.intermediate_size),
-            device=gate_up.device,
-            dtype=gate_up.dtype,
-        )
+        hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
             gate_up,

@@ -247,11 +247,7 @@ class Gemma4TextMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        hidden = torch.empty(
-            (*gate_up.shape[:-1], self.intermediate_size),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
+        hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
             gate_up,
@@ -598,11 +594,7 @@ class Gemma4VisionMLP(nn.Module):
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj.forward_packed(x)
-        hidden = torch.empty(
-            (*gate_up.shape[:-1], self.intermediate_size),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
+        hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
             gate_up,
