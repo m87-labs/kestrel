@@ -155,10 +155,9 @@ class Gemma4Runtime:
             dtype=self.dtype,
         )
 
-        self._primary_stream = (
+        self._compute_stream = (
             compute_stream if compute_stream is not None else make_stream(self.device)
         )
-        self._compute_stream = self._primary_stream
         self._copy_stream = make_stream(self.device)
         self.graph_capture_lock = threading.RLock()
         self.page_table = PageTable(
@@ -167,7 +166,7 @@ class Gemma4Runtime:
             max_batch_size=self.max_batch_slots,
             device=str(self.device),
             prefix_cache=None,
-            h2d_stream=self._primary_stream,
+            h2d_stream=self._compute_stream,
         )
         self.page_table.free_batch_idx.remove(self._padding_batch_idx)
         self.page_table.reserve(self._padding_batch_idx, 1)
@@ -316,15 +315,11 @@ class Gemma4Runtime:
 
     @property
     def compute_stream(self):
-        return self._primary_stream
+        return self._compute_stream
 
     @property
     def kv_pool(self) -> KVMemoryPool:
         return self._kv_pool
-
-    @property
-    def primary_stream(self):
-        return self._primary_stream
 
     @property
     def copy_stream(self):
@@ -334,67 +329,11 @@ class Gemma4Runtime:
     def vocab_size(self) -> int:
         return int(self._config.text_config.vocab_size)
 
-    @property
-    def cuda_graphs_enabled(self) -> bool:
-        return False
-
     def skills(self):
         return get_spec(self.model_name).skills()
 
     def tasks(self) -> tuple[str, ...]:
         return self.skills().names()
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        prompt: str,
-        *,
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-    ) -> str:
-        """Greedy / nucleus single-stream generation through our model."""
-        query = self.prompt_template.query()
-        if query is None:  # pragma: no cover - all Gemma 4 variants expose query()
-            raise RuntimeError("Gemma 4 prompt template missing query()")
-        stop_token_ids = {self.prompt_template.eos_id, *query.stop_token_ids}
-        user_ids = self.tokenizer.encode(prompt).ids
-        ids = (
-            [self.prompt_template.bos_id]
-            + list(query.prefix)
-            + list(user_ids)
-            + list(query.answer_prefix)
-        )
-        input_ids = torch.tensor([ids], device=self.device)
-        prompt_len = input_ids.shape[1]
-
-        for _ in range(max_new_tokens):
-            logits = self.model(input_ids=input_ids)[0, -1]
-            if temperature > 0.0:
-                logits = logits / max(temperature, 1e-6)
-                probs = torch.softmax(logits, dim=-1)
-                if 0.0 < top_p < 1.0:
-                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-                    cum = torch.cumsum(sorted_probs, dim=-1)
-                    cutoff = (cum > top_p).nonzero()
-                    keep = cutoff[0, 0].item() + 1 if cutoff.numel() else sorted_probs.numel()
-                    sorted_probs[keep:] = 0
-                    sorted_probs = sorted_probs / sorted_probs.sum()
-                    pick = torch.multinomial(sorted_probs, 1)
-                    next_id = sorted_idx[pick].item()
-                else:
-                    next_id = int(torch.multinomial(probs, 1).item())
-            else:
-                next_id = int(logits.argmax().item())
-
-            if next_id in stop_token_ids:
-                break
-            input_ids = torch.cat(
-                [input_ids, torch.tensor([[next_id]], device=self.device)], dim=1
-            )
-
-        new_tokens = input_ids[0, prompt_len:].tolist()
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def preprocess_image_async(self, image):
         return self._image_preprocessor.submit(image)
@@ -462,7 +401,6 @@ class Gemma4Runtime:
     ) -> Any:
         from kestrel.runtime.state import (
             PreparedSequence,
-            SequenceState,
             _CacheLookupResult,
         )
         from .prompt_template import (
@@ -574,7 +512,6 @@ class Gemma4Runtime:
         self.page_table.commit_block_table(batch_indices)
 
         text_cfg = self._config.text_config
-        softcap = text_cfg.final_logit_softcapping
         pad_id = 0
 
         seq_lengths: list[int] = []
@@ -656,8 +593,8 @@ class Gemma4Runtime:
             seq_lengths,
             self.model.lm_head,
         )
-        if softcap is not None:
-            logits = torch.tanh(logits / softcap) * softcap
+        softcap = text_cfg.final_logit_softcapping
+        logits = torch.tanh(logits / softcap) * softcap
         for row, (prepared, seq_len) in enumerate(zip(prepared_sequences, seq_lengths)):
             prepared.state.last_hidden = last_hidden_rows[row].detach()
 
@@ -720,7 +657,6 @@ class Gemma4Runtime:
 
     def _run_decode_eager(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
         text_cfg = self._config.text_config
-        softcap = text_cfg.final_logit_softcapping
         token_ids_gpu = slot.decode_token_ids[:batch_size]
         self._build_decode_metadata(slot, batch_size)
         input_ids = token_ids_gpu.view(batch_size, 1)
@@ -737,8 +673,9 @@ class Gemma4Runtime:
         )
         last_hidden = hidden_states[:, 0]
         torch.mm(last_hidden, self.model.lm_head.weight.t(), out=slot.logits[:batch_size])
-        if softcap is not None:
-            slot.logits[:batch_size].div_(softcap).tanh_().mul_(softcap)
+        slot.logits[:batch_size].div_(
+            text_cfg.final_logit_softcapping
+        ).tanh_().mul_(text_cfg.final_logit_softcapping)
         slot.hidden_last[:batch_size].copy_(last_hidden)
 
 __all__ = ["Gemma4Runtime"]

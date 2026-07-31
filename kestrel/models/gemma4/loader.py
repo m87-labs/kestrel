@@ -14,7 +14,7 @@ from kestrel.runtime.bounded_projection import (
 )
 
 from .config import Gemma4Config, parse_gemma4_config
-from .model import Gemma4ForConditionalGeneration
+from .model import Gemma4InferenceModel
 
 
 _UNSUPPORTED_WEIGHT_PREFIXES = (
@@ -112,14 +112,14 @@ def load_model(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> Gemma4ForConditionalGeneration:
+) -> Gemma4InferenceModel:
     config = load_config(repo_id)
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
         with torch.device(device):
-            model = Gemma4ForConditionalGeneration(config)
+            model = Gemma4InferenceModel(config)
     finally:
         torch.set_default_dtype(old_dtype)
 

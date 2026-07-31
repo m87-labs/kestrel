@@ -201,9 +201,9 @@ class Gemma4DecodeMegakernel:
         ambient_stream = torch.cuda.current_stream(runtime.device)
         self._model_weights_ready = torch.cuda.Event()
         self._model_weights_ready.record(ambient_stream)
-        runtime.primary_stream.wait_event(self._model_weights_ready)
+        runtime.compute_stream.wait_event(self._model_weights_ready)
         self._weight_storage_ready = torch.cuda.Event()
-        with torch.cuda.stream(runtime.primary_stream):
+        with torch.cuda.stream(runtime.compute_stream):
             self.weight_storage = bind_owned_weight_storage(
                 first_compiled,
                 runtime.model,
@@ -216,7 +216,7 @@ class Gemma4DecodeMegakernel:
                 dtype=runtime.dtype,
                 device=runtime.device,
             )
-            self._weight_storage_ready.record(runtime.primary_stream)
+            self._weight_storage_ready.record(runtime.compute_stream)
         ambient_stream.wait_event(self._weight_storage_ready)
 
         layer_types = list(config.layer_types)

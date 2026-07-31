@@ -271,7 +271,7 @@ def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
 
     monkeypatch.setattr(loader, "hf_hub_download", fake_hf_hub_download)
     monkeypatch.setattr(loader, "snapshot_download", fake_snapshot_download)
-    monkeypatch.setattr(loader, "Gemma4ForConditionalGeneration", _TinyGemma4)
+    monkeypatch.setattr(loader, "Gemma4InferenceModel", _TinyGemma4)
 
     model = loader.load_model(
         "repo",

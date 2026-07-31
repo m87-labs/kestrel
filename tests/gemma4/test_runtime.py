@@ -27,12 +27,6 @@ from kestrel.models.gemma4.config import (
 )
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
-from kestrel.models.gemma4.prompt_template import (
-    END_OF_TURN_ID,
-    EOS_ID,
-    Gemma4PromptTemplate,
-    TOOL_RESPONSE_ID,
-)
 from kestrel.models.gemma4.runtime import (
     Gemma4Runtime,
     _decode_slot_rows,
@@ -41,7 +35,6 @@ from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
 
 
 _MODEL_ID = "google/gemma-4-E2B-it"
-_BASE_MODEL_ID = "google/gemma-4-E2B"
 
 
 def _text_config(**overrides) -> Gemma4TextConfig:
@@ -130,35 +123,6 @@ class _FakePageTable:
         del cached_page_count
         if batch_idx not in self.free_batch_idx:
             self.free_batch_idx.append(batch_idx)
-
-
-class _GenerateTokenizer:
-    def encode(self, _text: str) -> SimpleNamespace:
-        return SimpleNamespace(ids=[7])
-
-    def decode(self, token_ids, *, skip_special_tokens: bool) -> str:
-        assert skip_special_tokens is True
-        return "answer" if list(token_ids) == [42] else repr(list(token_ids))
-
-
-class _ScriptedGenerateModel:
-    def __init__(self, token_ids: list[int]) -> None:
-        self._token_ids = iter(token_ids)
-
-    def __call__(self, *, input_ids) -> torch.Tensor:
-        token_id = next(self._token_ids)
-        logits = torch.full((1, input_ids.shape[1], 128), -1.0)
-        logits[0, -1, token_id] = 1.0
-        return logits
-
-
-def _generate_runtime(model_name: str, token_ids: list[int]) -> Gemma4Runtime:
-    runtime = Gemma4Runtime.__new__(Gemma4Runtime)
-    runtime.device = torch.device("cpu")
-    runtime.prompt_template = Gemma4PromptTemplate(model_name)
-    runtime.tokenizer = _GenerateTokenizer()
-    runtime.model = _ScriptedGenerateModel(token_ids)
-    return runtime
 
 
 def test_rmsnorm_uses_dense_runtime_with_uniform_fp32_weight(monkeypatch):
@@ -993,7 +957,7 @@ def test_engine_adopts_externally_supplied_runtime_kv_pool():
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = cfg.resolved_device()
     runtime._kv_pool = object()
-    runtime._primary_stream = object()
+    runtime._compute_stream = object()
 
     engine = InferenceEngine(cfg, runtime=runtime)
 
@@ -1037,27 +1001,6 @@ def test_runtime_constructs():
     rt.shutdown()
 
 
-@pytest.mark.parametrize(
-    "stop_id",
-    [EOS_ID, END_OF_TURN_ID, TOOL_RESPONSE_ID],
-)
-def test_runtime_generate_stops_on_instruct_terminators(stop_id: int) -> None:
-    runtime = _generate_runtime(_MODEL_ID, [42, stop_id, 43])
-
-    assert runtime.generate("question", max_new_tokens=3) == "answer"
-
-
-def test_runtime_generate_base_ignores_instruct_terminators() -> None:
-    runtime = _generate_runtime(
-        _BASE_MODEL_ID,
-        [TOOL_RESPONSE_ID, END_OF_TURN_ID, EOS_ID],
-    )
-
-    assert runtime.generate("question", max_new_tokens=3) == repr(
-        [TOOL_RESPONSE_ID, END_OF_TURN_ID]
-    )
-
-
 def test_disabling_tokenizer_postprocessor_preserves_no_special_token_ids():
     tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "<bos>": 2}, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = Whitespace()
@@ -1070,18 +1013,6 @@ def test_disabling_tokenizer_postprocessor_preserves_no_special_token_ids():
     tokenizer.post_processor = None
 
     assert tokenizer.encode("hello").ids == expected == [1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_runtime_generate_produces_text():
-    cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
-    rt = Gemma4Runtime(cfg, kv_pool=KVMemoryPool(device=cfg.resolved_device()))
-    try:
-        answer = rt.generate("Why is the sky blue?", max_new_tokens=32)
-    finally:
-        rt.shutdown()
-    assert isinstance(answer, str)
-    assert len(answer.strip()) > 0, f"expected non-empty answer; got {answer!r}"
 
 
 def test_batch_index_allocation_gates_capacity():

@@ -33,18 +33,9 @@ class GemmaDecodeMetaBuffers:
             device=device,
             pin_memory=pin_memory,
         )
-
-    @property
-    def batch_idx(self) -> Any:
-        return self._inputs.batch_idx
-
-    @property
-    def input_pos(self) -> Any:
-        return self._inputs.input_pos
-
-    @property
-    def lora_slot_ids(self) -> Any:
-        return self._inputs.lora_slot_ids
+        self.batch_idx = self._inputs.batch_idx
+        self.input_pos = self._inputs.input_pos
+        self.lora_slot_ids = self._inputs.lora_slot_ids
 
     def copy_inputs_to_gpu(self) -> None:
         """Stage batch_idx/input_pos/lora_slot_ids to the GPU in one H2D copy."""

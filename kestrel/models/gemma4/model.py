@@ -1271,7 +1271,7 @@ class Gemma4Model(nn.Module):
         )
         return self.embed_vision(vision_hidden)
 
-class Gemma4ForConditionalGeneration(nn.Module):
+class Gemma4InferenceModel(nn.Module):
 
     def __init__(self, config: Gemma4Config) -> None:
         super().__init__()
@@ -1281,26 +1281,7 @@ class Gemma4ForConditionalGeneration(nn.Module):
         self.lm_head = nn.Linear(text_cfg.hidden_size, text_cfg.vocab_size, bias=False)
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        logits_to_keep: int = 0,
-    ) -> torch.Tensor:
-        hidden_states = self.model.language_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-        )
-        slice_indices = slice(-logits_to_keep, None) if logits_to_keep else slice(None)
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        if self.config.text_config.final_logit_softcapping is not None:
-            cap = self.config.text_config.final_logit_softcapping
-            logits = logits / cap
-            logits = torch.tanh(logits)
-            logits = logits * cap
-        return logits
-
 __all__ = [
-    "Gemma4ForConditionalGeneration",
+    "Gemma4InferenceModel",
     "Gemma4Model",
 ]
