@@ -99,7 +99,6 @@ class _PackedPrefillBatch:
     rope_deltas: torch.Tensor
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
-    mm_token_type_ids: Optional[torch.Tensor] = None
     vision_bilinear_indices: Optional[torch.Tensor] = None
     vision_bilinear_weights: Optional[torch.Tensor] = None
     vision_position_ids: Optional[torch.Tensor] = None
@@ -1423,9 +1422,6 @@ class Qwen35Runtime:
                 if has_images and scratch.image_grid_thw is not None
                 else None
             ),
-            mm_token_type_ids=(
-                scratch.text_meta.mm_token_type_ids.gpu[:, :total_tokens] if has_images else None
-            ),
             vision_bilinear_indices=(
                 scratch.vision_bilinear_indices.gpu[:, :pixel_rows]
                 if has_images and scratch.vision_bilinear_indices is not None
@@ -1458,7 +1454,6 @@ class Qwen35Runtime:
             past_key_values=cache,
             pixel_values=packed.pixel_values,
             image_grid_thw=packed.image_grid_thw,
-            mm_token_type_ids=packed.mm_token_type_ids,
             position_ids=packed.position_ids,
             vision_bilinear_indices=packed.vision_bilinear_indices,
             vision_bilinear_weights=packed.vision_bilinear_weights,

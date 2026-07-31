@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,7 +74,6 @@ _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
-    rope_deltas: torch.Tensor | None = None
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:
@@ -1850,127 +1848,6 @@ class Qwen3_5Model(nn.Module):
         )
         self.language_model = Qwen3_5TextModel(config.text_config)
 
-    def get_vision_position_ids(
-        self,
-        start_position: int,
-        grid_thw: list[int, int, int] | torch.Tensor,
-        temp_merge_size: int = 1,
-        spatial_merge_size: int = 1,
-        time_interval: int = 1,
-        device: str | torch.device | None = None,
-    ):
-        """
-        Compute 3D positional indices for vision tokens derived from one image.
-
-        The positions are generated from the input grid defined by temporal (T), height (H), and
-        width (W) dimensions. Temporal and spatial dimensions can be downscaled according to the
-        merge sizes used in the vision backbone. The resulting positions are offset by `start_position`.
-
-        Args:
-            start_position (`int`):
-                Offset added to all computed positional indices.
-            grid_thw (`Sequence[int]` or `torch.Tensor` of shape `(3,)`):
-                The (T, H, W) grid after patch embedding.
-            temp_merge_size (`int`, *optional*):
-                Factor by which the temporal dimension is reduced in the backbone. The temporal grid size is divided
-                by this value. Defaults to 1.
-            spatial_merge_size (`int`, *optional*):
-                Factor by which the spatial dimensions (H and W) are reduced in the backbone. Both H and W are divided
-                by this value. Defaults to 1.
-            time_interval (`int`, *optional*):
-                Spacing factor applied between consecutive temporal position indices.Defaults to 1.
-            device (`str` or `torch.device`, *optional*):
-                Device on which the resulting tensor is allocated. If `None`, uses the current default device.
-
-        Returns:
-            torch.LongTensor of shape (3, sequence_length):
-                Positional indices for temporal, height, and width dimensions,
-                flattened into sequence form and offset by `start_position`.
-        """
-        llm_grid_t, llm_grid_h, llm_grid_w = (
-            grid_thw[0].item() // temp_merge_size,
-            grid_thw[1].item() // spatial_merge_size,
-            grid_thw[2].item() // spatial_merge_size,
-        )
-
-        # Add `start_position` after arange for compile
-        position_temporal = torch.arange(llm_grid_t, device=device) * time_interval
-        position_width = torch.arange(llm_grid_w, device=device) + start_position
-        position_height = torch.arange(llm_grid_h, device=device) + start_position
-
-        position_width = position_width.repeat(llm_grid_h * llm_grid_t)
-        position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
-        # Important: add `start_positions` after applying `time_interval`, order matters
-        position_temporal = position_temporal.repeat_interleave(llm_grid_h * llm_grid_w) + start_position
-        vision_position_ids = torch.stack([position_temporal, position_height, position_width], dim=0)
-
-        return vision_position_ids
-
-    def get_rope_index(
-        self,
-        input_ids: torch.LongTensor,
-        mm_token_type_ids: torch.IntTensor,
-        image_grid_thw: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build text/image M-RoPE positions and the decode offset."""
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-
-        mrope_position_deltas = []
-        position_ids = torch.zeros(
-            3,
-            input_ids.shape[0],
-            input_ids.shape[1],
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        image_grids = iter(image_grid_thw) if image_grid_thw is not None else None
-
-        for batch_idx, current_input_ids in enumerate(input_ids):
-            input_token_type = mm_token_type_ids[batch_idx]
-            if attention_mask is not None:
-                current_input_ids = current_input_ids[attention_mask[batch_idx].bool()]
-                input_token_type = input_token_type[attention_mask[batch_idx].bool()]
-
-            input_type_group = []
-            for key, group in itertools.groupby(enumerate(input_token_type.tolist()), lambda x: x[1]):
-                group = list(group)
-                start_index = group[0][0]
-                end_index = group[-1][0] + 1
-                input_type_group.append((key, start_index, end_index))
-
-            current_pos = 0
-            llm_pos_ids_list = []
-            for modality_type, start_idx, end_idx in input_type_group:
-                # text == 0
-                if modality_type == 0:
-                    text_len = end_idx - start_idx
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos
-                    )
-                    current_pos += text_len
-                elif modality_type == 1 and image_grids is not None:
-                    grid_thw = next(image_grids)
-                    vision_position_ids = self.get_vision_position_ids(
-                        current_pos, grid_thw, 1, spatial_merge_size, device=input_ids.device
-                    )
-                    llm_pos_ids_list.append(vision_position_ids)
-                    current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
-                else:
-                    raise ValueError(
-                        f"unsupported Qwen modality type {modality_type}"
-                    )
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-            if attention_mask is not None:
-                position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions.to(position_ids.device)
-            else:
-                position_ids[:, batch_idx] = llm_positions.to(position_ids.device)
-            mrope_position_deltas.append(llm_positions.max() + 1 - len(current_input_ids))
-        mrope_position_deltas = torch.stack(mrope_position_deltas).to(
-            device=input_ids.device, dtype=input_ids.dtype
-        ).unsqueeze(1)
-        return position_ids, mrope_position_deltas
-
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -1998,58 +1875,14 @@ class Qwen3_5Model(nn.Module):
         ).tolist()
         return torch.split(image_embeds, split_sizes)
 
-    def compute_3d_position_ids(
-        self,
-        input_ids: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        past_key_values: Qwen35InferenceCache | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
-        rope_deltas: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
-        if image_grid_thw is not None and mm_token_type_ids is None and input_ids is not None:
-            raise ValueError(
-                "image_grid_thw requires mm_token_type_ids for multimodal RoPE"
-            )
-        can_compute_mrope = (
-            input_ids is not None
-            and mm_token_type_ids is not None
-            and image_grid_thw is not None
-        )
-
-        if can_compute_mrope and past_key_values_length == 0:
-            return self.get_rope_index(
-                input_ids,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                mm_token_type_ids=mm_token_type_ids,
-            )
-        if rope_deltas is not None and (past_key_values_length > 0 or input_ids is None):
-            batch_size, seq_length, _ = inputs_embeds.shape
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-                position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
-            else:
-                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
-            delta = rope_deltas.repeat_interleave(batch_size // rope_deltas.shape[0], dim=0)
-            position_ids = position_ids + delta.to(device=inputs_embeds.device)
-            return position_ids, rope_deltas
-        return None, rope_deltas
-
     def forward(
         self,
         input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
         past_key_values: Qwen35InferenceCache | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
-        rope_deltas: torch.Tensor | None = None,
         cache_position_ids: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         page_table: torch.Tensor | None = None,
@@ -2087,17 +1920,6 @@ class Qwen3_5Model(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if position_ids is None:
-            position_ids, rope_deltas = self.compute_3d_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
-                rope_deltas=rope_deltas,
-            )
-
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -2117,7 +1939,6 @@ class Qwen3_5Model(nn.Module):
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
-            rope_deltas=rope_deltas,
         )
 
 

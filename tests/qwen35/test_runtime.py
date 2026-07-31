@@ -2019,7 +2019,6 @@ def test_packed_prefill_batch_builds_token_level_metadata():
     assert torch.equal(packed.position_ids[0, 0], torch.tensor([0, 1, 0]))
     assert packed.paged_kv_page_table.shape[0] == 2
     assert packed.paged_kv_seqlens_k.tolist() == [2, 1]
-    assert packed.mm_token_type_ids is None
     assert torch.equal(prefill_slot.batch_idx[:2], torch.tensor([first, second]))
 
 
@@ -2110,10 +2109,6 @@ def test_packed_prefill_batch_stages_image_metadata_in_slot_buffers():
         batch_indices=[batch_idx],
     )
 
-    assert torch.equal(
-        packed.mm_token_type_ids,
-        torch.tensor([[0, 1, 1, 1, 1, 0]], dtype=torch.int32),
-    )
     assert torch.equal(packed.image_grid_thw, crops.image_grid_thw)
     assert torch.equal(packed.pixel_values, crops.pixel_values)
     assert prefill_slot.scratch.pixel_values is not None
