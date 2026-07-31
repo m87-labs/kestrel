@@ -46,7 +46,6 @@ Kestrel supports these model families:
 | Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Requires access approval |
 | Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Private repository |
 | Qwen 3.5 | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Dense and MoE variants registered by Hugging Face repository ID |
-| Qwen 3.6 | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | 35B-A3B BF16 and FP8 variants |
 
 For Moondream 3, request access (automatically granted) then authenticate with `huggingface-cli login` or set `HF_TOKEN`.
 

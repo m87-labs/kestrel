@@ -171,8 +171,6 @@ def test_modelspecs_register_on_import():
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.5-35B-A3B",
-        "Qwen/Qwen3.5-122B-A10B",
-        "Qwen/Qwen3.5-397B-A17B",
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)

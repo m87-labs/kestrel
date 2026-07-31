@@ -19,10 +19,6 @@ _VARIANTS = [
     "Qwen/Qwen3.5-27B",
     "Qwen/Qwen3.5-35B-A3B",
     "Qwen/Qwen3.5-35B-A3B-Base",
-    "Qwen/Qwen3.5-122B-A10B",
-    "Qwen/Qwen3.5-397B-A17B",
-    "Qwen/Qwen3.6-35B-A3B",
-    "Qwen/Qwen3.6-35B-A3B-FP8",
 ]
 
 for _repo_id in _VARIANTS:
