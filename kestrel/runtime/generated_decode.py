@@ -1,7 +1,7 @@
 """Runtime binding for compiler-generated decode bundles."""
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import torch
 
@@ -15,14 +15,93 @@ class DeviceInputPreparation:
     requires: tuple[str, ...] = ()
 
 
+class GeneratedDecodeBindings(Protocol):
+    def is_eligible(self, runtime: Any) -> bool: ...
+    def runtime_inputs(self, runtime: Any) -> Mapping[str, Any]: ...
+    def slot_inputs(self, slot: Any, capacity: int) -> Mapping[str, Any]: ...
+    def launch_extents(self, slot: Any, batch_size: int) -> Mapping[str, int]: ...
+
+
+@dataclass(frozen=True)
+class PagedDecodeBindings:
+    """Common runtime ABI for generated decode over paged KV."""
+
+    layers: Sequence[Any]
+    kv_sets: Sequence[tuple[str, str | None]] = (("", None),)
+    layer_kinds: Sequence[str] | None = None
+    extra_runtime_inputs: Callable[[Any], Mapping[str, Any]] | None = None
+    extra_slot_inputs: Callable[[Any, int], Mapping[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.layer_kinds is not None and len(self.layer_kinds) != len(self.layers):
+            raise ValueError("paged KV layers and layer kinds must have equal length")
+        if self.layer_kinds is None and any(
+            kind is not None for _name, kind in self.kv_sets
+        ):
+            raise ValueError("filtered paged KV inputs require layer kinds")
+
+    def is_eligible(self, _runtime: Any) -> bool:
+        return all(
+            layer is None
+            or int(layer.k_cache.shape[2]) == int(layer.v_cache.shape[2]) == 1
+            for layer in self.layers
+        )
+
+    def _paged_tensors(self, field: str, layer_kind: str | None):
+        kinds = (
+            self.layer_kinds
+            if self.layer_kinds is not None
+            else (None,) * len(self.layers)
+        )
+        return [
+            None
+            if layer is None or (layer_kind is not None and kind != layer_kind)
+            else getattr(layer, field)[:, :, 0, :]
+            for kind, layer in zip(kinds, self.layers, strict=True)
+        ]
+
+    def runtime_inputs(self, runtime: Any) -> Mapping[str, Any]:
+        inputs = {"page_table": runtime.page_table.page_table, "kv_len": 1}
+        for name, layer_kind in self.kv_sets:
+            suffix = f"_{name}" if name else ""
+            inputs[f"mK{suffix}"] = self._paged_tensors("k_cache", layer_kind)
+            inputs[f"mV{suffix}"] = self._paged_tensors("v_cache", layer_kind)
+        return _merge_disjoint(
+            "decode",
+            paged=inputs,
+            extra=(self.extra_runtime_inputs(runtime)
+                   if self.extra_runtime_inputs else {}),
+        )
+
+    def slot_inputs(self, slot: Any, capacity: int) -> Mapping[str, Any]:
+        inputs = {
+            "input_ids": slot.decode_token_ids[:capacity],
+            "final_norm": slot.hidden_last[:capacity],
+            "logits": slot.logits[:capacity],
+            "batch_idx": slot.meta.batch_idx.gpu[:capacity],
+            "input_pos": slot.meta.input_pos.gpu[:capacity],
+        }
+        return _merge_disjoint(
+            "decode slot",
+            standard=inputs,
+            extra=(self.extra_slot_inputs(slot, capacity)
+                   if self.extra_slot_inputs else {}),
+        )
+
+    @staticmethod
+    def launch_extents(slot: Any, batch_size: int) -> Mapping[str, int]:
+        return {
+            "active_batch": int(batch_size),
+            "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
+        }
+
+
 @dataclass(frozen=True)
 class GeneratedDecodeSpec:
     label: str
     weight_root: torch.nn.Module
     weight_layer_prefix: str
-    runtime_inputs: Callable[[], Mapping[str, Any]]
-    slot_inputs: Callable[[Any, int], Mapping[str, Any]]
-    launch_extents: Callable[[Any, int], Mapping[str, int]]
+    bindings: GeneratedDecodeBindings
     capacity_inputs: Callable[
         [int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]
     ] | None = None
@@ -120,7 +199,11 @@ class GeneratedDecode:
     def try_create(
         cls, runtime: Any, spec: GeneratedDecodeSpec,
     ) -> "GeneratedDecode | None":
-        if runtime.device.type != "cuda" or runtime.dtype is not torch.bfloat16:
+        if (
+            not spec.bindings.is_eligible(runtime)
+            or runtime.device.type != "cuda"
+            or runtime.dtype is not torch.bfloat16
+        ):
             return None
         from kestrel_kernels.generated_decode import resolve_compatible_programs
 
@@ -171,7 +254,7 @@ class GeneratedDecode:
                 programs[0].descriptor,
                 layer_prefix=spec.weight_layer_prefix,
             )
-            shared_inputs = dict(spec.runtime_inputs())
+            shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
         ambient_stream.wait_event(weights_ready)
 
@@ -188,7 +271,7 @@ class GeneratedDecode:
                     spec.label,
                     shared=shared_inputs,
                     capacity=capacity_inputs,
-                    slot=dict(spec.slot_inputs(slot, capacity)),
+                    slot=dict(spec.bindings.slot_inputs(slot, capacity)),
                 )
                 plan = _preparation_plan(
                     program.descriptor,
@@ -200,7 +283,7 @@ class GeneratedDecode:
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch)
                 launch_extents = dict(
-                    spec.launch_extents(slot, construction_batch))
+                    spec.bindings.launch_extents(slot, construction_batch))
                 extents.update(launch_extents)
                 bindings = assemble_bindings(
                     program.descriptor,
@@ -263,7 +346,7 @@ class GeneratedDecode:
         for step in self._input_preparation_plan:
             self._spec.preparation_callbacks[step.name](slot, int(batch_size))
         bound = self._slots[(int(slot.slot_id), capacity)]
-        extents = dict(self._spec.launch_extents(slot, int(batch_size)))
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         missing = bound.required_launch_extents - extents.keys()
         if missing:
             raise RuntimeError(
@@ -274,4 +357,10 @@ class GeneratedDecode:
         })
 
 
-__all__ = ["DeviceInputPreparation", "GeneratedDecode", "GeneratedDecodeSpec"]
+__all__ = [
+    "DeviceInputPreparation",
+    "GeneratedDecode",
+    "GeneratedDecodeBindings",
+    "GeneratedDecodeSpec",
+    "PagedDecodeBindings",
+]

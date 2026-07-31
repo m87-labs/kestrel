@@ -25,7 +25,8 @@ def test_generated_decode_uses_smallest_capacity():
     generated._input_preparation_plan = ()
     generated._spec = SimpleNamespace(
         label="test",
-        launch_extents=lambda _slot, batch: {"active_batch": batch},
+        bindings=SimpleNamespace(
+            launch_extents=lambda _slot, batch: {"active_batch": batch}),
         preparation_callbacks={},
     )
     slot = SimpleNamespace(slot_id=7)

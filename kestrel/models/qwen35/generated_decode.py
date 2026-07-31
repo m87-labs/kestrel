@@ -8,6 +8,7 @@ from kestrel.runtime.generated_decode import (
     DeviceInputPreparation,
     GeneratedDecode,
     GeneratedDecodeSpec,
+    PagedDecodeBindings,
 )
 
 
@@ -18,28 +19,17 @@ def _state_tensors(state_pool: Any, field: str) -> list[torch.Tensor | None]:
     ]
 
 
-def _paged_tensors(paged_layers: Any, field: str) -> list[torch.Tensor | None]:
-    result = []
-    for layer in paged_layers:
-        if layer is None:
-            result.append(None)
-            continue
-        tensor = getattr(layer, field)
-        if int(tensor.shape[2]) != 1:
-            raise ValueError(
-                f"generated decode requires unit KV pages, got {tuple(tensor.shape)}")
-        result.append(tensor[:, :, 0, :])
-    return result
-
-
 def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
-    layers = runtime._paged_kv.layers
-    if any(
-        layer is not None
-        and (int(layer.k_cache.shape[2]) != 1 or int(layer.v_cache.shape[2]) != 1)
-        for layer in layers
-    ):
-        return None
+    bindings = PagedDecodeBindings(
+        runtime._paged_kv.layers,
+        extra_runtime_inputs=lambda bound_runtime: {
+            "rope_inv_freq": (
+                bound_runtime.model.model.language_model.rotary_emb.inv_freq),
+        },
+        extra_slot_inputs=lambda slot, capacity: {
+            "position_ids": slot.position_ids[1:4, :capacity, 0],
+        },
+    )
 
     state_cache = {}
     recurrent_by_form = {}
@@ -67,34 +57,14 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             "gdn_recurrent_state": recurrent,
         }
 
-    page_table = runtime.page_table.page_table
     return GeneratedDecode.try_create(
         runtime,
         GeneratedDecodeSpec(
             label="Qwen",
             weight_root=runtime.model,
             weight_layer_prefix="model.language_model.layers",
-            runtime_inputs=lambda: {
-                "page_table": page_table,
-                "rope_inv_freq": (
-                    runtime.model.model.language_model.rotary_emb.inv_freq),
-                "mK": _paged_tensors(layers, "k_cache"),
-                "mV": _paged_tensors(layers, "v_cache"),
-                "kv_len": 1,
-            },
+            bindings=bindings,
             capacity_inputs=state_inputs,
-            slot_inputs=lambda slot, capacity: {
-                "input_ids": slot.decode_token_ids[:capacity],
-                "final_norm": slot.hidden_last[:capacity],
-                "logits": slot.logits[:capacity],
-                "batch_idx": slot.meta.batch_idx.gpu[:capacity],
-                "input_pos": slot.meta.input_pos.gpu[:capacity],
-                "position_ids": slot.position_ids[1:4, :capacity, 0],
-            },
-            launch_extents=lambda slot, batch_size: {
-                "active_batch": batch_size,
-                "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
-            },
             preparations=(
                 DeviceInputPreparation(
                     "gather_rope_deltas", ("rope_deltas",), ("batch_idx",)),
