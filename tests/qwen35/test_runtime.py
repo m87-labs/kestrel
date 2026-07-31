@@ -86,7 +86,9 @@ def test_supported_variants_register():
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-27B-FP8",
         "Qwen/Qwen3.6-35B-A3B",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
     }
     assert expected <= set(known_models())
     assert get_spec(_MODEL_ID).runtime is Qwen35Runtime
