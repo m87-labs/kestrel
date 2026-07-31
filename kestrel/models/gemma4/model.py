@@ -98,14 +98,13 @@ class Gemma4TextAttention(nn.Module):
         self.kv_source_layer_idx = kv_source_layer_idx
         self.owns_kv = kv_source_layer_idx == layer_idx
         self.publishes_kv = publishes_kv
-        self.layer_type = config.layer_types[layer_idx]
-        self.is_sliding = self.layer_type == "sliding_attention"
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
         self.head_dim = (
             config.global_head_dim if (not self.is_sliding and config.global_head_dim) else config.head_dim
         )
-        self.use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
+        use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
         num_kv_heads = attention_kv_heads(config, is_sliding=self.is_sliding)
         self.num_key_value_groups = config.num_attention_heads // num_kv_heads
 
@@ -122,7 +121,7 @@ class Gemma4TextAttention(nn.Module):
             )
             self.v_proj = (
                 nn.Linear(config.hidden_size, num_kv_heads * self.head_dim, bias=False)
-                if not self.use_alternative_attention
+                if not use_alternative_attention
                 else None
             )
 
@@ -236,14 +235,15 @@ class Gemma4TextMLP(nn.Module):
         is_kv_shared = layer_idx >= first_shared > 0
         use_double_wide = config.use_double_wide_mlp and is_kv_shared
 
-        self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
         self.gate_up_proj = PackedLinear(
-            self.hidden_size,
+            config.hidden_size,
             (self.intermediate_size, self.intermediate_size),
             source_names=("gate_proj", "up_proj"),
         )
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.down_proj = nn.Linear(
+            self.intermediate_size, config.hidden_size, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
@@ -508,25 +508,10 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.patch_size = config.patch_size
-        self.position_embedding_size = config.position_embedding_size
-
-        self.input_proj = nn.Linear(3 * self.patch_size**2, self.hidden_size, bias=False)
+        self.input_proj = nn.Linear(3 * config.patch_size**2, config.hidden_size, bias=False)
         self.position_embedding_table = nn.Parameter(
-            torch.ones(2, self.position_embedding_size, self.hidden_size)
+            torch.ones(2, config.position_embedding_size, config.hidden_size)
         )
-
-    def _position_embeddings(
-        self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
-    ) -> torch.Tensor:
-        clamped_positions = pixel_position_ids.clamp(min=0)
-        position_embeddings = (
-            self.position_embedding_table[0, clamped_positions[..., 0]]
-            + self.position_embedding_table[1, clamped_positions[..., 1]]
-        )
-        position_embeddings = torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
-        return position_embeddings
 
     def forward(
         self,
@@ -535,7 +520,14 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         padding_positions: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
-        position_embeddings = self._position_embeddings(pixel_position_ids, padding_positions)
+        positions = pixel_position_ids.clamp(min=0)
+        position_embeddings = (
+            self.position_embedding_table[0, positions[..., 0]]
+            + self.position_embedding_table[1, positions[..., 1]]
+        )
+        position_embeddings = torch.where(
+            padding_positions.unsqueeze(-1), 0.0, position_embeddings
+        )
         return hidden_states + position_embeddings
 
 
@@ -543,8 +535,7 @@ class Gemma4VisionPooler(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.root_hidden_size = self.hidden_size**0.5
+        self.root_hidden_size = config.hidden_size**0.5
 
     def _avg_pool_by_positions(
         self,
@@ -593,17 +584,16 @@ class Gemma4VisionMLP(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_up_proj = PackedBoundedProjections(
-            self.hidden_size,
+            config.hidden_size,
             (self.intermediate_size, self.intermediate_size),
             source_names=("gate_proj", "up_proj"),
             use_bounds=config.use_clipped_linears,
         )
         self.down_proj = BoundedLinear(
             self.intermediate_size,
-            self.hidden_size,
+            config.hidden_size,
             use_bounds=config.use_clipped_linears,
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -491,7 +491,11 @@ def test_vision_position_embeddings_match_one_hot_reference(dtype):
         [[False, False, True], [False, True, False]]
     )
 
-    actual = embedder._position_embeddings(
+    actual = embedder(
+        torch.zeros(
+            (*pixel_position_ids.shape[:-1], embedder.input_proj.in_features),
+            dtype=dtype,
+        ),
         pixel_position_ids,
         padding_positions,
     )
