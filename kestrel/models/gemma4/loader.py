@@ -13,7 +13,7 @@ from kestrel.runtime.bounded_projection import (
     bind_declared_packed_bounded_projections,
 )
 
-from .config import Gemma4Config
+from .config import Gemma4Config, parse_gemma4_config
 from .model import Gemma4ForConditionalGeneration
 
 
@@ -26,7 +26,7 @@ _UNSUPPORTED_WEIGHT_PREFIXES = (
 def load_config(repo_id: str) -> Gemma4Config:
     config_path = hf_hub_download(repo_id, filename="config.json")
     with open(config_path, "r", encoding="utf-8") as handle:
-        return Gemma4Config.from_dict(json.load(handle))
+        return parse_gemma4_config(json.load(handle))
 
 
 def load_weights(repo_id: str, model: torch.nn.Module) -> None:
@@ -124,8 +124,7 @@ def load_model(
         torch.set_default_dtype(old_dtype)
 
     load_weights(repo_id, model)
-    if config.tie_word_embeddings:
-        model.lm_head.weight = model.model.language_model.embed_tokens.weight
+    model.lm_head.weight = model.model.language_model.embed_tokens.weight
     return model.to(device=device).eval()
 
 

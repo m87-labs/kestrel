@@ -22,15 +22,8 @@ def _compile_from_config(
 ):
     from mkl.compiler.frontend.models.gemma import compile_gemma4_decode
 
-    if bool(config.enable_moe_block):
-        raise _UnsupportedDecodeConfig("generated Gemma decode currently covers dense MLPs")
-    if bool(config.attention_bias):
-        raise _UnsupportedDecodeConfig("generated Gemma decode requires bias-free attention")
     if bool(config.attention_k_eq_v):
         raise _UnsupportedDecodeConfig("generated Gemma decode requires an explicit V projection")
-    if str(config.hidden_activation) != "gelu_pytorch_tanh":
-        raise _UnsupportedDecodeConfig(
-            f"unsupported Gemma activation {config.hidden_activation!r}")
     ple_hidden = int(config.hidden_size_per_layer_input or 0)
     if ple_hidden <= 0:
         raise _UnsupportedDecodeConfig("generated Gemma decode requires traced PLE inputs")
@@ -59,7 +52,7 @@ def _compile_from_config(
         inter=int(config.intermediate_size),
         nh=int(config.num_attention_heads),
         nkv=int(config.num_key_value_heads),
-        global_nkv=int(config.num_key_value_heads),
+        global_nkv=int(config.num_global_key_value_heads),
         local_head_dim=int(config.head_dim),
         global_head_dim=int(config.global_head_dim),
         window=int(config.sliding_window),
@@ -69,7 +62,7 @@ def _compile_from_config(
         vocab_size=int(config.vocab_size),
         rms_norm_eps=float(config.rms_norm_eps),
         final_logit_softcapping=config.final_logit_softcapping,
-        tie_word_embeddings=bool(config.tie_word_embeddings),
+        tie_word_embeddings=True,
         double_wide_mlp=bool(config.use_double_wide_mlp),
         num_ctas=int(num_ctas),
         num_splits=None,
@@ -138,7 +131,7 @@ class Gemma4DecodeMegakernel:
         if getattr(runtime, "dtype", torch.bfloat16) is not torch.bfloat16:
             return None
         if not _supports_paged_decode_abi(
-            getattr(runtime, "_shared_paged_layers", None)
+            getattr(getattr(runtime, "_kv_cache", None), "layers", None)
         ):
             return None
 
@@ -227,7 +220,7 @@ class Gemma4DecodeMegakernel:
         ambient_stream.wait_event(self._weight_storage_ready)
 
         layer_types = list(config.layer_types)
-        paged_layers = runtime._shared_paged_layers
+        paged_layers = runtime._kv_cache.layers
         local_k = _paged_tensors(
             paged_layers, layer_types, kind="sliding_attention", field="k_cache")
         local_v = _paged_tensors(

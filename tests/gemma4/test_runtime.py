@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,14 +10,18 @@ import torch
 
 import kestrel.models.gemma4  # noqa: F401
 from kestrel.config import RuntimeConfig
-from kestrel.kv_cache import KVMemoryPool
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.models.gemma4.decode_slot import GemmaDecodeSlot
-from kestrel.models.gemma4.config import Gemma4TextConfig, Gemma4VisionConfig
+from kestrel.models.gemma4.config import (
+    Gemma4TextConfig,
+    Gemma4VisionConfig,
+    RopeSpec,
+)
 from kestrel.models.gemma4.model import Gemma4TextModel
-from kestrel.models.gemma4.paged_cache import _paged_layer_config, _stores_shared_kv
+from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
 from kestrel.models.gemma4.prompt_template import (
     END_OF_TURN_ID,
     EOS_ID,
@@ -26,7 +30,6 @@ from kestrel.models.gemma4.prompt_template import (
 )
 from kestrel.models.gemma4.runtime import (
     Gemma4Runtime,
-    _DirectPagedPrefillCache,
     _decode_slot_rows,
 )
 from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
@@ -34,6 +37,57 @@ from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
 
 _MODEL_ID = "google/gemma-4-E2B-it"
 _BASE_MODEL_ID = "google/gemma-4-E2B"
+
+
+def _text_config(**overrides) -> Gemma4TextConfig:
+    layer_types = tuple(overrides.pop("layer_types", ("sliding_attention",)))
+    values = {
+        "vocab_size": 16,
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "num_hidden_layers": len(layer_types),
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "max_position_embeddings": 2048,
+        "rms_norm_eps": 1e-6,
+        "rope": {
+            "sliding_attention": RopeSpec("default", 10_000.0),
+            "full_attention": RopeSpec("proportional", 1_000_000.0, 0.25),
+        },
+        "sliding_window": 512,
+        "layer_types": layer_types,
+        "final_logit_softcapping": 30.0,
+        "vocab_size_per_layer_input": 0,
+        "hidden_size_per_layer_input": 0,
+        "num_global_key_value_heads": 1,
+        "global_head_dim": 4,
+        "attention_k_eq_v": False,
+        "num_kv_shared_layers": 0,
+        "use_double_wide_mlp": False,
+    }
+    values.update(overrides)
+    return Gemma4TextConfig(**values)
+
+
+def _vision_config(**overrides) -> Gemma4VisionConfig:
+    values = {
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "rms_norm_eps": 1e-6,
+        "rope": RopeSpec("default", 100.0),
+        "pooling_kernel_size": 3,
+        "patch_size": 14,
+        "position_embedding_size": 16,
+        "use_clipped_linears": False,
+        "standardize": False,
+    }
+    values.update(overrides)
+    return Gemma4VisionConfig(**values)
 
 
 def _fake_capacity_compiled(capacity: int, *, dynamic: bool):
@@ -53,6 +107,13 @@ def _fake_capacity_compiled(capacity: int, *, dynamic: bool):
         static_runtime_extents=static,
         runtime_extent_refusal=refusal,
     ))
+
+
+def _fake_kv_cache():
+    return SimpleNamespace(layers=[SimpleNamespace(
+        k_cache=torch.empty(1, 1, 1, 1),
+        v_cache=torch.empty(1, 1, 1, 1),
+    )])
 
 
 class _FakePageTable:
@@ -79,12 +140,11 @@ class _ScriptedGenerateModel:
     def __init__(self, token_ids: list[int]) -> None:
         self._token_ids = iter(token_ids)
 
-    def __call__(self, *, input_ids, use_cache: bool) -> SimpleNamespace:
-        assert use_cache is False
+    def __call__(self, *, input_ids) -> torch.Tensor:
         token_id = next(self._token_ids)
         logits = torch.full((1, input_ids.shape[1], 128), -1.0)
         logits[0, -1, token_id] = 1.0
-        return SimpleNamespace(logits=logits)
+        return logits
 
 
 def _generate_runtime(model_name: str, token_ids: list[int]) -> Gemma4Runtime:
@@ -144,37 +204,6 @@ def test_text_rotary_runtime_preserves_existing_cpu_math():
     torch.testing.assert_close(actual_key, expected_key)
 
 
-def test_direct_paged_prefill_cache_writes_batched_kv_once():
-    calls = []
-
-    class FakePagedLayer:
-        def update(self, input_pos, k_val, v_val, *, slot_mapping):
-            calls.append((input_pos, k_val, v_val, slot_mapping))
-
-    positions = torch.arange(6).reshape(2, 3)
-    slot_mapping = positions + 10
-    cache = _DirectPagedPrefillCache(
-        layers=(FakePagedLayer(),),
-        positions=positions,
-        slot_mapping=slot_mapping,
-    )
-    key = torch.randn(2, 1, 3, 4)
-    value = torch.randn(2, 1, 3, 4)
-
-    actual_key, actual_value = cache.update(key, value, 0)
-
-    assert actual_key is key
-    assert actual_value is value
-    assert len(calls) == 1
-    input_pos, stored_key, stored_value, stored_slots = calls[0]
-    assert input_pos is positions
-    assert stored_slots is slot_mapping
-    torch.testing.assert_close(stored_key, key.transpose(1, 2))
-    torch.testing.assert_close(stored_value, value.transpose(1, 2))
-    assert cache._k == []
-    assert cache._v == []
-
-
 def test_text_attention_emits_typed_runtime_attention(monkeypatch):
     calls = []
 
@@ -229,6 +258,45 @@ def test_text_attention_emits_typed_runtime_attention(monkeypatch):
     }
 
 
+def test_paged_local_attention_retains_window_while_global_retains_history(monkeypatch):
+    calls = []
+
+    def fake_flash(query, key, value, **kwargs):
+        calls.append(kwargs)
+        return query, None
+
+    monkeypatch.setattr(
+        "kestrel_kernels.get_runtime",
+        lambda: SimpleNamespace(
+            attention=SimpleNamespace(flash_attn_fwd=fake_flash)
+        ),
+    )
+    query = torch.zeros((1, 1, 1, 4))
+    layer = SimpleNamespace(
+        k_cache=torch.zeros((1, 1, 1, 4)),
+        v_cache=torch.zeros((1, 1, 1, 4)),
+        k_scale=None,
+        v_scale=None,
+    )
+    metadata = {
+        "paged_kv_layer": layer,
+        "page_table": torch.zeros((1, 600), dtype=torch.int32),
+        "paged_kv_seqlens_k": torch.tensor([600], dtype=torch.int32),
+        "scaling": 1.0,
+    }
+
+    gemma_model._paged_attention_forward(query, **metadata, sliding_window=512)
+    gemma_model._paged_attention_forward(query, **metadata, sliding_window=None)
+
+    assert calls[0]["seqused_k"].item() == 600
+    assert calls[0]["window_size_left"] == 511
+    assert calls[0]["window_size_right"] == 0
+    assert calls[0]["causal"] is False
+    assert calls[1]["window_size_left"] is None
+    assert calls[1]["window_size_right"] is None
+    assert calls[1]["causal"] is True
+
+
 def test_text_attention_cpu_causal_gqa_matches_reference():
     torch.manual_seed(0)
     query = torch.randn(1, 4, 3, 8)
@@ -257,15 +325,7 @@ def test_text_attention_cpu_causal_gqa_matches_reference():
 
 
 def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
-    cfg = Gemma4TextConfig(
-        hidden_size=4,
-        intermediate_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        hidden_activation="gelu_pytorch_tanh",
-    )
+    cfg = _text_config()
     mlp = gemma_model.Gemma4TextMLP(cfg, layer_idx=0)
     calls = []
 
@@ -292,10 +352,9 @@ def test_text_mlp_uses_generic_gated_activation_provider(monkeypatch):
 
 
 def test_vision_mlp_uses_generic_gated_activation_provider(monkeypatch):
-    cfg = Gemma4VisionConfig(
+    cfg = _vision_config(
         hidden_size=4,
         intermediate_size=8,
-        hidden_activation="gelu_pytorch_tanh",
         use_clipped_linears=True,
     )
     mlp = gemma_model.Gemma4VisionMLP(cfg)
@@ -405,7 +464,7 @@ def test_vision_attention_mps_uses_uniform_runtime(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_vision_position_embeddings_match_one_hot_reference(dtype):
-    cfg = Gemma4VisionConfig(
+    cfg = _vision_config(
         hidden_size=8,
         position_embedding_size=16,
     )
@@ -529,6 +588,7 @@ def test_decode_compile_translates_model_config(monkeypatch):
         intermediate_size=128,
         num_attention_heads=4,
         num_key_value_heads=1,
+        num_global_key_value_heads=1,
         head_dim=16,
         global_head_dim=32,
         sliding_window=8,
@@ -576,10 +636,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
         max_batch_size=1,
         max_seq_length=2048,
         dtype=torch.bfloat16,
-        _shared_paged_layers=[SimpleNamespace(
-            k_cache=torch.empty(1, 1, 1, 1),
-            v_cache=torch.empty(1, 1, 1, 1),
-        )],
+        _kv_cache=_fake_kv_cache(),
         model=SimpleNamespace(
             model=SimpleNamespace(language_model=SimpleNamespace(config=config))),
     )
@@ -651,10 +708,7 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
         max_batch_size=11,
         max_seq_length=2048,
         dtype=torch.bfloat16,
-        _shared_paged_layers=[SimpleNamespace(
-            k_cache=torch.empty(1, 1, 1, 1),
-            v_cache=torch.empty(1, 1, 1, 1),
-        )],
+        _kv_cache=_fake_kv_cache(),
         model=SimpleNamespace(
             model=SimpleNamespace(language_model=SimpleNamespace(config=config))),
     )
@@ -719,10 +773,7 @@ def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_n
     runtime = SimpleNamespace(
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
-        _shared_paged_layers=[SimpleNamespace(
-            k_cache=torch.empty(1, 1, 1, 1),
-            v_cache=torch.empty(1, 1, 1, 1),
-        )],
+        _kv_cache=_fake_kv_cache(),
     )
     real_import = builtins.__import__
 
@@ -748,10 +799,7 @@ def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
         max_batch_size=1,
         max_seq_length=2048,
         dtype=torch.bfloat16,
-        _shared_paged_layers=[SimpleNamespace(
-            k_cache=torch.empty(1, 1, 1, 1),
-            v_cache=torch.empty(1, 1, 1, 1),
-        )],
+        _kv_cache=_fake_kv_cache(),
         model=SimpleNamespace(
             model=SimpleNamespace(
                 language_model=SimpleNamespace(config=SimpleNamespace())
@@ -832,11 +880,10 @@ def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
     assert not megakernel.supports(17)
 
 
-def test_prefill_batches_uncached_images_and_splits_active_tokens():
+def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = torch.device("cpu")
     runtime.max_batch_size = 4
-    runtime._vision_feature_cache = {}
     calls = []
     input_ptrs = []
 
@@ -883,16 +930,12 @@ def test_prefill_batches_uncached_images_and_splits_active_tokens():
         torch.arange(8, 12, dtype=torch.float32).reshape(1, 4),
     )
 
-    cached = runtime._image_features_for_batch([second, first])
-    assert len(calls) == 1
-    assert cached[0] is features[1]
-    assert cached[1] is features[0]
-
     pixel_gpu_ptr = runtime._vision_pixel_staging.gpu.data_ptr()
     position_gpu_ptr = runtime._vision_position_staging.gpu.data_ptr()
-    runtime._vision_feature_cache.clear()
-    runtime._image_features_for_batch([first, second])
+    repeated = runtime._image_features_for_batch([second, first])
     assert len(calls) == 2
+    assert repeated[0] is not features[1]
+    assert repeated[1] is not features[0]
     assert runtime._vision_pixel_staging.gpu.data_ptr() == pixel_gpu_ptr
     assert runtime._vision_position_staging.gpu.data_ptr() == position_gpu_ptr
     assert input_ptrs[1] == (pixel_gpu_ptr, position_gpu_ptr)
@@ -1034,49 +1077,54 @@ def test_active_sequence_lifecycle_registers_and_frees_batch_index():
 
 
 def test_gemma_paged_cache_includes_sliding_shared_kv_producer():
-    cfg = Gemma4TextConfig(
-        num_hidden_layers=2,
+    cfg = _text_config(
         num_kv_shared_layers=1,
         layer_types=["sliding_attention", "sliding_attention"],
-        num_key_value_heads=1,
         head_dim=256,
+        global_head_dim=256,
     )
 
-    assert _stores_shared_kv(cfg, 0)
-    assert _paged_layer_config(cfg, 0) == (1, 256)
-    assert _paged_layer_config(cfg, 1) is None
+    specs, sources = paged_kv_layout(cfg)
+    assert specs == (PagedKVLayerSpec(1, 256), None)
+    assert sources == (0, 0)
 
 
 def test_gemma_paged_cache_includes_global_shared_kv_producer():
-    cfg = Gemma4TextConfig(
-        num_hidden_layers=2,
+    cfg = _text_config(
         num_kv_shared_layers=1,
         layer_types=["full_attention", "full_attention"],
-        num_key_value_heads=1,
         num_global_key_value_heads=2,
         head_dim=256,
         global_head_dim=512,
     )
 
-    assert _stores_shared_kv(cfg, 0)
-    assert _paged_layer_config(cfg, 0) == (1, 512)
-    assert _paged_layer_config(cfg, 1) is None
+    specs, sources = paged_kv_layout(cfg)
+    assert specs == (PagedKVLayerSpec(1, 512), None)
+    assert sources == (0, 0)
 
-    cfg.attention_k_eq_v = True
-    assert _paged_layer_config(cfg, 0) == (2, 512)
+    specs, _ = paged_kv_layout(replace(cfg, attention_k_eq_v=True))
+    assert specs[0] == PagedKVLayerSpec(2, 512)
+
+
+def test_gemma_shared_kv_sources_preserve_local_global_topology():
+    cfg = _text_config(
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        num_kv_shared_layers=2,
+    )
+
+    assert kv_source_layers(cfg) == (0, 1, 2, 3, 2, 3)
 
 
 def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
-    cfg = Gemma4TextConfig(
+    cfg = _text_config(
         vocab_size=8,
-        hidden_size=4,
-        intermediate_size=8,
-        num_hidden_layers=2,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        global_head_dim=4,
-        hidden_size_per_layer_input=0,
         num_kv_shared_layers=1,
         layer_types=["sliding_attention", "sliding_attention"],
     )
@@ -1091,13 +1139,10 @@ def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
 
     fake_paged_layer = FakePagedLayer()
 
-    class FakeCache:
-        def get_seq_length(self, layer_idx: int = 0) -> int:
-            del layer_idx
-            return 0
-
-        def get_paged_layer(self, layer_idx: int):
-            return fake_paged_layer if layer_idx == 0 else None
+    cache = LayeredPagedKV(
+        layers=(fake_paged_layer, None),
+        source_layer_idx=(0, 0),
+    )
 
     paged_calls = []
 
@@ -1114,8 +1159,7 @@ def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
 
     model(
         input_ids=torch.tensor([[1]], dtype=torch.long),
-        past_key_values=FakeCache(),
-        use_cache=True,
+        kv_cache=cache,
         cache_position_ids=torch.zeros((1, 1), dtype=torch.long),
         slot_mapping=torch.zeros((1, 1), dtype=torch.long),
         page_table=torch.zeros((1, 1), dtype=torch.int32),
@@ -1124,6 +1168,37 @@ def test_gemma_shared_sliding_layers_reuse_paged_kv(monkeypatch):
 
     assert fake_paged_layer.updates == 1
     assert paged_calls == [fake_paged_layer, fake_paged_layer]
+
+
+def test_nonpaged_local_attention_truncates_history_beyond_window():
+    query = torch.zeros((1, 1, 1, 2))
+    key = torch.zeros((1, 1, 600, 2))
+    value = torch.zeros((1, 1, 600, 2))
+    value[:, :, 0] = 1.0
+
+    local = gemma_model._attention_forward(
+        query,
+        key,
+        value,
+        num_key_value_groups=1,
+        attention_mask=None,
+        scaling=1.0,
+        causal=False,
+        window_size_left=511,
+        window_size_right=0,
+    )
+    global_ = gemma_model._attention_forward(
+        query,
+        key,
+        value,
+        num_key_value_groups=1,
+        attention_mask=None,
+        scaling=1.0,
+        causal=True,
+    )
+
+    assert torch.count_nonzero(local) == 0
+    torch.testing.assert_close(global_[0, 0, 0], torch.full((2,), 1 / 600))
 
 
 def test_query_skill_defaults_to_direct_answer_mode():

@@ -9,7 +9,7 @@ from typing import Any, Optional, Sequence
 import torch
 from torch.nn import functional as F
 
-from kestrel.kv_cache import KVMemoryPool, PageTable
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.device import make_event, make_stream
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, TextToken
@@ -28,16 +28,14 @@ from .decode_slot import GemmaDecodeSlot, create_gemma_decode_slot
 from .loader import load_model
 from .image import (
     Gemma4ImagePreprocessor,
-    GemmaImageInputs,
     IMAGE_SEQ_LENGTH,
     MAX_PATCHES,
 )
 from .prompt_template import Gemma4PromptTemplate
-from .model import SimpleDynamicCache
-from .paged_cache import Gemma4PagedHybridCache
+from .paged_cache import paged_kv_layout
 
 
-_DENSE_KV_MAX_SEQ_LEN = 2048
+_MAX_SHIPPED_KV_LEN = 2048
 
 
 def _decode_slot_rows(max_batch_size: int) -> int:
@@ -91,238 +89,6 @@ class _TokenizerShim:
         return getattr(self._tok, name)
 
 
-def _build_batched_decode_masks(
-    layer_types: Sequence[str],
-    *,
-    seq_lengths: Sequence[int],
-    max_past: int,
-    sliding_window: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    neg = torch.finfo(dtype).min
-    total_len = max_past + 1
-    masks: dict[str, torch.Tensor] = {}
-    for layer_type in set(layer_types):
-        mask = torch.full(
-            (len(seq_lengths), 1, 1, total_len),
-            neg,
-            dtype=dtype,
-            device=device,
-        )
-        for row, seq_len in enumerate(seq_lengths):
-            if layer_type == "full_attention":
-                mask[row, 0, 0, :seq_len] = 0
-            elif layer_type == "sliding_attention":
-                start = max(0, int(seq_len) - sliding_window + 1)
-                mask[row, 0, 0, start:seq_len] = 0
-            else:
-                raise ValueError(f"Unsupported layer_type {layer_type!r}")
-            mask[row, 0, 0, max_past] = 0
-        masks[layer_type] = mask
-    return masks
-
-
-class _BatchedPrefillCache(SimpleDynamicCache):
-    def __init__(self, seq_lengths: Sequence[int]) -> None:
-        super().__init__()
-        self._seq_lengths = list(seq_lengths)
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self._ensure_layer(layer_idx)
-        self._k[layer_idx] = key_states
-        self._v[layer_idx] = value_states
-        return key_states, value_states
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return 0
-
-    def split_into_caches(self) -> list[SimpleDynamicCache]:
-        caches = [SimpleDynamicCache() for _ in self._seq_lengths]
-        for layer_idx, key_states in enumerate(self._k):
-            if key_states is None:
-                continue
-            value_states = self._v[layer_idx]
-            for row, seq_len in enumerate(self._seq_lengths):
-                caches[row].update(
-                    key_states[row : row + 1, :, :seq_len, :],
-                    value_states[row : row + 1, :, :seq_len, :],
-                    layer_idx,
-                )
-        return caches
-
-
-class _DirectPagedPrefillCache(SimpleDynamicCache):
-    """Write prefill K/V once into the runtime's authoritative paged cache."""
-
-    def __init__(
-        self,
-        *,
-        layers: Sequence[Any],
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        super().__init__()
-        self._layers = layers
-        self._positions = positions
-        self._slot_mapping = slot_mapping
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        layer = self._layers[layer_idx]
-        if layer is None:
-            raise RuntimeError(
-                f"Gemma prefill produced K/V for storage-free layer {layer_idx}"
-            )
-        layer.update(
-            input_pos=self._positions,
-            k_val=key_states.transpose(1, 2),
-            v_val=value_states.transpose(1, 2),
-            slot_mapping=self._slot_mapping,
-        )
-        return key_states, value_states
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        del layer_idx
-        return 0
-
-
-class _SlotKVState:
-    def __init__(
-        self,
-        layer_configs: Sequence[Optional[tuple[int, int]]],
-        *,
-        max_batch_slots: int,
-        max_seq_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        self.k: list[Optional[torch.Tensor]] = []
-        self.v: list[Optional[torch.Tensor]] = []
-        self.max_seq_len = int(max_seq_len)
-        for cfg in layer_configs:
-            if cfg is None:
-                self.k.append(None)
-                self.v.append(None)
-                continue
-            heads, head_dim = cfg
-            shape = (max_batch_slots, int(heads), self.max_seq_len, int(head_dim))
-            self.k.append(torch.empty(shape, device=device, dtype=dtype))
-            self.v.append(torch.empty(shape, device=device, dtype=dtype))
-        self.seq_lens = torch.zeros(max_batch_slots, dtype=torch.long, device=device)
-
-    def write_prefill(
-        self,
-        batch_idx: int,
-        layer_idx: int,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-    ) -> None:
-        if self.k[layer_idx] is None:
-            return
-        seq_len = int(key_states.shape[-2])
-        if seq_len > self.max_seq_len:
-            raise RuntimeError(
-                f"Gemma4 decode KV max_seq_len={self.max_seq_len} is too small for {seq_len}"
-            )
-        self.k[layer_idx][batch_idx, :, :seq_len, :].copy_(key_states[0])
-        self.v[layer_idx][batch_idx, :, :seq_len, :].copy_(value_states[0])
-
-    def set_seq_len(self, batch_idx: int, seq_len: int) -> None:
-        if seq_len > self.max_seq_len:
-            raise RuntimeError(
-                f"Gemma4 decode KV max_seq_len={self.max_seq_len} is too small for {seq_len}"
-            )
-        self.seq_lens[batch_idx] = int(seq_len)
-
-    def clear_slot(self, batch_idx: int) -> None:
-        self.seq_lens[batch_idx] = 0
-
-    def make_decode_cache(
-        self,
-        batch_indices: torch.Tensor,
-        seq_lengths: Sequence[int],
-        max_past: int,
-        paged_layers: Sequence[Any] | None = None,
-    ) -> "_ActiveSlotKVCache":
-        return _ActiveSlotKVCache(self, batch_indices, seq_lengths, max_past, paged_layers)
-
-class _ActiveSlotKVCache(SimpleDynamicCache):
-    def __init__(
-        self,
-        state: _SlotKVState,
-        batch_indices: torch.Tensor,
-        seq_lengths: Sequence[int],
-        max_past: int,
-        paged_layers: Sequence[Any] | None = None,
-    ) -> None:
-        super().__init__()
-        self._state = state
-        self._batch_indices = batch_indices.to(device=state.seq_lens.device, dtype=torch.long)
-        self._seq_lengths = list(int(x) for x in seq_lengths)
-        self._seq_lengths_tensor = torch.tensor(
-            self._seq_lengths, device=state.seq_lens.device, dtype=torch.long
-        )
-        self._max_past = int(max_past)
-        self._paged_layers = paged_layers
-        self._new_k: list[tuple[int, torch.Tensor]] = []
-        self._new_v: list[tuple[int, torch.Tensor]] = []
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        past_k = self._state.k[layer_idx][:, :, : self._max_past, :].index_select(
-            0,
-            self._batch_indices,
-        )
-        past_v = self._state.v[layer_idx][:, :, : self._max_past, :].index_select(
-            0,
-            self._batch_indices,
-        )
-        self._new_k.append((layer_idx, key_states.detach()))
-        self._new_v.append((layer_idx, value_states.detach()))
-        return torch.cat([past_k, key_states], dim=-2), torch.cat([past_v, value_states], dim=-2)
-
-    def get_paged_layer(self, layer_idx: int) -> Any:
-        if self._paged_layers is None or not (0 <= layer_idx < len(self._paged_layers)):
-            return None
-        return self._paged_layers[layer_idx]
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return self._max_past
-
-    def write_back(self) -> None:
-        rows = torch.arange(
-            self._batch_indices.shape[0],
-            device=self._batch_indices.device,
-            dtype=torch.long,
-        )
-        for (layer_idx, key_states), (_, value_states) in zip(self._new_k, self._new_v):
-            self._state.k[layer_idx][self._batch_indices, :, self._seq_lengths_tensor, :] = (
-                key_states[rows, :, 0, :]
-            )
-            self._state.v[layer_idx][self._batch_indices, :, self._seq_lengths_tensor, :] = (
-                value_states[rows, :, 0, :]
-            )
-        self._state.seq_lens.index_add_(
-            0,
-            self._batch_indices,
-            torch.ones_like(self._batch_indices, dtype=self._state.seq_lens.dtype),
-        )
-
-
 class Gemma4Runtime:
     """Runtime wrapping vendored Gemma 4 modeling for the kestrel engine."""
 
@@ -335,8 +101,10 @@ class Gemma4Runtime:
         compute_stream: Any = None,
     ) -> None:
         self._cfg = cfg
-        self.device = cfg.resolved_device() if hasattr(cfg, "resolved_device") else torch.device(cfg.device)
-        self.dtype = cfg.resolved_dtype() if hasattr(cfg, "resolved_dtype") else (cfg.dtype if hasattr(cfg, "dtype") else torch.bfloat16)
+        self.device = cfg.resolved_device()
+        self.dtype = cfg.resolved_dtype()
+        if self.device.type != "cuda" or self.dtype is not torch.bfloat16:
+            raise ValueError("Gemma 4 inference requires CUDA with bfloat16")
         self._kv_pool = kv_pool if kv_pool is not None else KVMemoryPool(device=self.device)
         if self._kv_pool.device != self.device:
             raise ValueError(
@@ -408,7 +176,7 @@ class Gemma4Runtime:
         self._kv_cache_pages = int(getattr(cfg, "kv_cache_pages", 65536))
         self.max_seq_length = min(
             self._config.text_config.max_position_embeddings,
-            _DENSE_KV_MAX_SEQ_LEN,
+            _MAX_SHIPPED_KV_LEN,
         )
         self.image_prefix_length = IMAGE_SEQ_LENGTH + 2
 
@@ -434,9 +202,6 @@ class Gemma4Runtime:
         self.page_table.free_batch_idx.remove(self._padding_batch_idx)
         self.page_table.reserve(self._padding_batch_idx, 1)
         self.page_table.commit_block_table([self._padding_batch_idx])
-        # CUDA native fallback and generated decode share this authoritative cache.
-        self._use_paged_kv = self.device.type == "cuda"
-
         self._prefill_slot = _SimplePrefillSlot(
             slot_id=0,
             batch_idx=torch.zeros((self.max_batch_size,), dtype=torch.int64, device=self.device),
@@ -464,67 +229,29 @@ class Gemma4Runtime:
         self.decode_slots: Sequence[Any] = self._decode_slots
         self.active_sequences: dict[int, Any] = {}
 
-        self._vision_feature_cache: dict[int, torch.Tensor] = {}
-        self._preprocess_cache: dict[int, Any] = {}
-        self._sequence_cache_keys: dict[int, tuple[int | None, int | None]] = {}
-        first_shared = text_cfg.num_hidden_layers - (getattr(text_cfg, "num_kv_shared_layers", 0) or 0)
-        layer_configs: list[Optional[tuple[int, int]]] = []
-        for layer_idx, layer_type in enumerate(text_cfg.layer_types):
-            if layer_idx >= first_shared and (getattr(text_cfg, "num_kv_shared_layers", 0) or 0) > 0:
-                layer_configs.append(None)
-            elif layer_type == "full_attention" and getattr(text_cfg, "global_head_dim", None):
-                layer_configs.append((text_cfg.num_key_value_heads, text_cfg.global_head_dim))
-            else:
-                layer_configs.append((text_cfg.num_key_value_heads, text_cfg.head_dim))
-        self._shared_paged_layers = (
-            Gemma4PagedHybridCache.build_shared_paged_layers(
-                config=text_cfg,
-                page_table=self.page_table,
-                pool=self._kv_pool,
-                dtype=self.dtype,
-            )
-            if self._use_paged_kv
-            else None
-        )
-        self._paged_decode_cache = (
-            Gemma4PagedHybridCache(
-                config=text_cfg,
-                page_table=self.page_table,
-                pool=self._kv_pool,
-                dtype=self.dtype,
-                shared_paged_layers=self._shared_paged_layers,
-            )
-            if self._shared_paged_layers is not None
-            else None
-        )
-        self._kv_state = (
-            None
-            if self._use_paged_kv
-            else _SlotKVState(
-                layer_configs,
-                max_batch_slots=self.max_batch_slots,
-                max_seq_len=self.max_seq_length,
-                device=self.device,
-                dtype=self.dtype,
-            )
+        layer_specs, source_layer_idx = paged_kv_layout(text_cfg)
+        self._kv_cache = LayeredPagedKV.allocate(
+            layer_specs=layer_specs,
+            source_layer_idx=source_layer_idx,
+            page_table=self.page_table,
+            pool=self._kv_pool,
+            dtype=self.dtype,
         )
 
-        self._decode_megakernel = None
-        if self.device.type == "cuda":
-            from .generated_decode import Gemma4DecodeMegakernel
+        from .generated_decode import Gemma4DecodeMegakernel
 
-            self._decode_megakernel = Gemma4DecodeMegakernel.try_create(self)
+        self._decode_megakernel = Gemma4DecodeMegakernel.try_create(self)
         self.prefix_cache = None
 
     def _stage_vision_inputs(
         self,
-        misses: Sequence[tuple[int, tuple[Any, list[int]]]],
+        crops_list: Sequence[Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = len(misses)
+        batch_size = len(crops_list)
         if batch_size < 1:
             raise ValueError("vision staging requires at least one input row")
         capacity = max(batch_size, int(getattr(self, "max_batch_size", batch_size)))
-        first_crops = misses[0][1][0]
+        first_crops = crops_list[0]
         pixel_shape = tuple(first_crops.pixel_values.shape)
         position_shape = tuple(first_crops.image_position_ids.shape)
         if len(pixel_shape) != 2 or len(position_shape) != 2:
@@ -564,7 +291,7 @@ class Gemma4Runtime:
                 f"{tuple(position_staging.cpu.shape)} -> {expected_position_shape}"
             )
 
-        for row, (_, (crops, _)) in enumerate(misses):
+        for row, crops in enumerate(crops_list):
             if (
                 tuple(crops.pixel_values.shape) != pixel_shape
                 or crops.pixel_values.dtype != pixel_staging.cpu.dtype
@@ -590,40 +317,25 @@ class Gemma4Runtime:
         image_crops_list: Sequence[Any],
     ) -> list[torch.Tensor | None]:
         features: list[torch.Tensor | None] = [None] * len(image_crops_list)
-        missing: dict[int, tuple[Any, list[int]]] = {}
+        unique: dict[int, tuple[Any, list[int]]] = {}
         for row, crops in enumerate(image_crops_list):
-            if crops is None:
-                continue
-            cache_key = id(crops)
-            cached = self._vision_feature_cache.get(cache_key)
-            if cached is not None:
-                features[row] = cached
-                continue
-            if cache_key not in missing:
-                missing[cache_key] = (crops, [])
-            missing[cache_key][1].append(row)
-
-        if missing:
-            misses = list(missing.items())
-            pixel_values, position_ids = self._stage_vision_inputs(misses)
+            if crops is not None:
+                unique.setdefault(id(crops), (crops, []))[1].append(row)
+        if unique:
+            groups = list(unique.values())
+            crops = [item for item, _ in groups]
+            pixel_values, position_ids = self._stage_vision_inputs(crops)
             packed = self.model.model.get_image_features(
                 pixel_values,
                 position_ids,
             ).detach()
-            lengths = [
-                int(crops.num_image_tokens)
-                for _, (crops, _) in misses
-            ]
+            lengths = [int(item.num_image_tokens) for item in crops]
             if int(packed.shape[0]) != sum(lengths):
                 raise RuntimeError(
                     "vision encoder returned "
                     f"{int(packed.shape[0])} tokens for declared split {lengths}"
                 )
-            for (cache_key, (_, rows)), encoded in zip(
-                misses,
-                packed.split(lengths, dim=0),
-            ):
-                self._vision_feature_cache[cache_key] = encoded
+            for (_, rows), encoded in zip(groups, packed.split(lengths, dim=0)):
                 for row in rows:
                     features[row] = encoded
         return features
@@ -683,7 +395,7 @@ class Gemma4Runtime:
         prompt_len = input_ids.shape[1]
 
         for _ in range(max_new_tokens):
-            logits = self.model(input_ids=input_ids, use_cache=False).logits[0, -1]
+            logits = self.model(input_ids=input_ids)[0, -1]
             if temperature > 0.0:
                 logits = logits / max(temperature, 1e-6)
                 probs = torch.softmax(logits, dim=-1)
@@ -711,18 +423,9 @@ class Gemma4Runtime:
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def preprocess_image_async(self, image):
-        image_id = id(image)
-        cached = self._preprocess_cache.get(image_id)
-        if cached is not None:
-            return cached
-        future = self._image_preprocessor.submit(image)
-        self._preprocess_cache[image_id] = future
-        return future
+        return self._image_preprocessor.submit(image)
 
     def shutdown(self) -> None:
-        self._vision_feature_cache.clear()
-        self._preprocess_cache.clear()
-        self._sequence_cache_keys.clear()
         self._image_preprocessor.shutdown(wait=True)
 
     def shutdown_image_preprocessor(self) -> None:
@@ -897,12 +600,11 @@ class Gemma4Runtime:
             image_crops_list = [None] * batch_size
 
         batch_indices = [int(prepared.state.batch_idx) for prepared in prepared_sequences]
-        if self._use_paged_kv:
-            self.page_table.commit_block_table(batch_indices)
+        self.page_table.commit_block_table(batch_indices)
 
         text_cfg = self._config.text_config
         softcap = text_cfg.final_logit_softcapping
-        pad_id = text_cfg.pad_token_id or 0
+        pad_id = 0
 
         seq_lengths: list[int] = []
         embeds_rows: list[torch.Tensor] = []
@@ -924,7 +626,6 @@ class Gemma4Runtime:
             seq_lengths.append(len(token_ids))
             input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
             if image is not None and crops is not None:
-                self._sequence_cache_keys[int(prepared.state.batch_idx)] = (id(image), id(crops))
                 image_features = image_features_by_row[row]
                 if image_features is None:
                     raise RuntimeError("missing encoded features for image row")
@@ -966,53 +667,27 @@ class Gemma4Runtime:
                 llm_ids_batch
             )
 
-        direct_paged_prefill = self._shared_paged_layers is not None
-        if direct_paged_prefill:
-            active_batch_idx = prefill_slot.batch_idx[:batch_size]
-            slot_mapping = self.page_table.build_slot_mapping(
-                batch_idx=active_batch_idx,
-                positions=position_ids,
-            )
-            cache = _DirectPagedPrefillCache(
-                layers=self._shared_paged_layers,
-                positions=position_ids,
-                slot_mapping=slot_mapping,
-            )
-        else:
-            cache = _BatchedPrefillCache(seq_lengths)
-        outputs = self.model.model(
+        slot_mapping = self.page_table.build_slot_mapping(
+            batch_idx=prefill_slot.batch_idx[:batch_size],
+            positions=position_ids,
+        )
+        hidden_states = self.model.model.language_model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
             position_ids=position_ids,
-            past_key_values=cache,
-            use_cache=True,
+            kv_cache=self._kv_cache,
+            cache_position_ids=position_ids,
+            slot_mapping=slot_mapping,
         )
         last_hidden_rows, logits = project_padded_last_rows(
-            outputs.last_hidden_state,
+            hidden_states,
             seq_lengths,
             self.model.lm_head,
         )
         if softcap is not None:
             logits = torch.tanh(logits / softcap) * softcap
         for row, (prepared, seq_len) in enumerate(zip(prepared_sequences, seq_lengths)):
-            batch_idx = int(prepared.state.batch_idx)
-            if not direct_paged_prefill:
-                if self._kv_state is None:
-                    raise RuntimeError(
-                        "contiguous prefill cache requires slot K/V storage"
-                    )
-                for layer_idx, key_states in enumerate(cache._k):
-                    if key_states is None:
-                        continue
-                    value_states = cache._v[layer_idx]
-                    self._kv_state.write_prefill(
-                        batch_idx,
-                        layer_idx,
-                        key_states[row : row + 1, :, :seq_len, :],
-                        value_states[row : row + 1, :, :seq_len, :],
-                    )
-                self._kv_state.set_seq_len(batch_idx, seq_len)
             prepared.state.last_hidden = last_hidden_rows[row].detach()
 
         return logits
@@ -1033,17 +708,6 @@ class Gemma4Runtime:
         self._release_batch_idx(state.batch_idx)
 
     def _release_batch_idx(self, batch_idx: int) -> None:
-        image_key, vision_key = getattr(self, "_sequence_cache_keys", {}).pop(
-            batch_idx,
-            (None, None),
-        )
-        if image_key is not None and hasattr(self, "_preprocess_cache"):
-            self._preprocess_cache.pop(image_key, None)
-        if vision_key is not None and hasattr(self, "_vision_feature_cache"):
-            self._vision_feature_cache.pop(vision_key, None)
-        kv_state = getattr(self, "_kv_state", None)
-        if kv_state is not None:
-            kv_state.clear_slot(batch_idx)
         if batch_idx not in self.page_table.free_batch_idx:
             self.page_table.erase(batch_idx, 0)
 
@@ -1080,56 +744,21 @@ class Gemma4Runtime:
     def _run_decode_eager(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
         text_cfg = self._config.text_config
         softcap = text_cfg.final_logit_softcapping
-        input_pos_cpu = slot.meta.input_pos.np[:batch_size]
         token_ids_gpu = slot.decode_token_ids[:batch_size]
-        if self._use_paged_kv:
-            self._build_decode_metadata(slot, batch_size)
-
-        batch_indices = slot.meta.batch_idx.gpu[:batch_size]
-        seq_lengths = [int(input_pos_cpu[row]) for row in range(batch_size)]
-        max_past = max(seq_lengths, default=0)
-        if self._use_paged_kv:
-            if self._paged_decode_cache is None:
-                raise RuntimeError("paged Gemma decode cache is unavailable")
-            cache = self._paged_decode_cache
-        else:
-            if self._kv_state is None:
-                raise RuntimeError("contiguous Gemma decode cache is unavailable")
-            cache = self._kv_state.make_decode_cache(
-                batch_indices,
-                seq_lengths,
-                max_past,
-            )
-        masks = _build_batched_decode_masks(
-            text_cfg.layer_types,
-            seq_lengths=seq_lengths,
-            max_past=max_past,
-            sliding_window=text_cfg.sliding_window,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        self._build_decode_metadata(slot, batch_size)
         input_ids = token_ids_gpu.view(batch_size, 1)
         position_ids = slot.meta.input_pos.gpu[:batch_size].view(batch_size, 1)
-        model_kwargs = {}
-        if self._use_paged_kv:
-            model_kwargs = {
-                "cache_position_ids": slot.cache_position_ids[:batch_size],
-                "slot_mapping": slot.slot_mapping[:batch_size],
-                "page_table": slot.paged_kv_page_table[:batch_size],
-                "paged_kv_seqlens_k": slot.paged_kv_seqlens_k[:batch_size],
-                "paged_kv_use_sliding_window": (max_past + 1) > int(text_cfg.sliding_window),
-            }
-        outputs = self.model.model(
+        hidden_states = self.model.model.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
-            past_key_values=cache,
-            prebuilt_masks=masks,
-            use_cache=True,
-            **model_kwargs,
+            kv_cache=self._kv_cache,
+            cache_position_ids=slot.cache_position_ids[:batch_size],
+            slot_mapping=slot.slot_mapping[:batch_size],
+            page_table=slot.paged_kv_page_table[:batch_size],
+            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
+            paged_kv_use_sliding_window=True,
         )
-        if not self._use_paged_kv:
-            cache.write_back()
-        last_hidden = outputs.last_hidden_state[:, 0]
+        last_hidden = hidden_states[:, 0]
         torch.mm(last_hidden, self.model.lm_head.weight.t(), out=slot.logits[:batch_size])
         if softcap is not None:
             slot.logits[:batch_size].div_(softcap).tanh_().mul_(softcap)

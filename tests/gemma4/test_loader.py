@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
-
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -55,8 +53,7 @@ class _TinyGemma4(torch.nn.Module):
         self.config = config
         self.model = _TinyInnerModel()
         self.lm_head = torch.nn.Linear(2, 2, bias=False)
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+        self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
 
 def test_load_weights_accepts_compatible_keys(tmp_path, monkeypatch):
@@ -201,8 +198,53 @@ def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
                     "num_attention_heads": 1,
                     "num_key_value_heads": 1,
                     "head_dim": 2,
+                    "max_position_embeddings": 2048,
+                    "rms_norm_eps": 1e-6,
+                    "rope_parameters": {
+                        "sliding_attention": {
+                            "rope_type": "default",
+                            "rope_theta": 10_000.0,
+                        },
+                        "full_attention": {
+                            "rope_type": "proportional",
+                            "rope_theta": 1_000_000.0,
+                            "partial_rotary_factor": 0.25,
+                        },
+                    },
+                    "sliding_window": 512,
+                    "layer_types": ["sliding_attention"],
+                    "final_logit_softcapping": 30.0,
+                    "vocab_size_per_layer_input": 0,
+                    "hidden_size_per_layer_input": 0,
+                    "global_head_dim": 2,
+                    "attention_k_eq_v": False,
+                    "num_kv_shared_layers": 0,
+                    "use_double_wide_mlp": False,
+                    "hidden_activation": "gelu_pytorch_tanh",
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
                 },
-                "vision_config": {},
+                "vision_config": {
+                    "hidden_size": 2,
+                    "intermediate_size": 4,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 2,
+                    "rms_norm_eps": 1e-6,
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 100.0,
+                    },
+                    "pooling_kernel_size": 3,
+                    "patch_size": 14,
+                    "position_embedding_size": 16,
+                    "use_clipped_linears": False,
+                    "standardize": False,
+                    "hidden_activation": "gelu_pytorch_tanh",
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                },
                 "audio_config": {},
                 "tie_word_embeddings": True,
                 "image_token_id": 11,
@@ -237,7 +279,7 @@ def test_load_model_loads_config_and_ties_embeddings(tmp_path, monkeypatch):
         dtype=torch.bfloat16,
     )
 
-    assert model.config.tie_word_embeddings is True
+    assert not hasattr(model.config, "tie_word_embeddings")
     assert not hasattr(model.config, "audio_config")
     assert not hasattr(model.config, "audio_token_id")
     assert not hasattr(model.config, "video_token_id")

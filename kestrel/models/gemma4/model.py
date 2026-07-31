@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections import UserDict
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 from kestrel_kernels import get_runtime
+from kestrel.kv_cache import LayeredPagedKV
 from kestrel.runtime.bounded_projection import (
     PackedBoundedProjections,
 )
@@ -20,7 +19,7 @@ from .config import (
     Gemma4VisionConfig,
     attention_kv_heads,
 )
-from ._model_utils import SimpleDynamicCache, get_activation
+from .paged_cache import kv_source_layers
 
 _dense_runtime = get_runtime().dense
 _rotary_runtime = get_runtime().rotary
@@ -124,7 +123,7 @@ class Gemma4TextRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma4TextConfig, device: Optional[torch.device] = None) -> None:
         super().__init__()
         self.config = config
-        self.layer_types: set[str] = set(config.layer_types or [])
+        self.layer_types = set(config.layer_types)
         # Plain attribute (not a buffer) — see class docstring.
         self.inv_freq: dict[str, torch.Tensor] = {}
         self.attention_scaling: dict[str, float] = {}
@@ -132,13 +131,11 @@ class Gemma4TextRotaryEmbedding(nn.Module):
 
     def _init_tables(self, device: Optional[torch.device] = None) -> None:
         for layer_type in sorted(self.layer_types):
-            params = self.config.rope_parameters.get(layer_type)
-            if params is None:
-                continue
-            rope_type = params.get("rope_type", "default")
-            base = float(params["rope_theta"])
-            partial = float(params.get("partial_rotary_factor", 1.0))
-            factor = float(params.get("factor", 1.0))
+            params = self.config.rope[layer_type]
+            rope_type = params.kind
+            base = params.theta
+            partial = params.partial_rotary_factor
+            factor = params.factor
 
             # HF: only "proportional" RoPE uses global_head_dim; "default"
             # always uses head_dim (even on full_attention layers).
@@ -149,11 +146,19 @@ class Gemma4TextRotaryEmbedding(nn.Module):
 
             if rope_type == "default":
                 inv = _rope_default_inv_freq(
-                    head_dim, base, partial_rotary_factor=partial, factor=factor, device=device
+                    head_dim,
+                    base,
+                    partial_rotary_factor=partial,
+                    factor=factor,
+                    device=device,
                 )
             elif rope_type == "proportional":
                 inv = _rope_proportional_inv_freq(
-                    head_dim, base, partial_rotary_factor=partial, factor=factor, device=device
+                    head_dim,
+                    base,
+                    partial_rotary_factor=partial,
+                    factor=factor,
+                    device=device,
                 )
             else:
                 raise ValueError(f"Unsupported rope_type {rope_type!r} for layer_type {layer_type!r}")
@@ -316,12 +321,20 @@ def _paged_attention_forward(
 
 class Gemma4TextAttention(nn.Module):
 
-    def __init__(self, config: Gemma4TextConfig, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        layer_idx: int,
+        *,
+        kv_source_layer_idx: int,
+        publishes_kv: bool,
+    ) -> None:
         super().__init__()
-        self.config = config
         self.layer_idx = layer_idx
-        layer_types = config.layer_types or []
-        self.layer_type = layer_types[layer_idx] if layer_types else None
+        self.kv_source_layer_idx = kv_source_layer_idx
+        self.owns_kv = kv_source_layer_idx == layer_idx
+        self.publishes_kv = publishes_kv
+        self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
@@ -333,41 +346,26 @@ class Gemma4TextAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.num_key_value_groups = config.num_attention_heads // num_kv_heads
         self.scaling = 1.0
-        # Shared-KV layer detection: the last ``num_kv_shared_layers``
-        # layers reuse upstream K/V and skip their own K/V machinery.
-        first_shared = config.num_hidden_layers - config.num_kv_shared_layers
-        self.is_kv_shared_layer = layer_idx >= first_shared >= 0 and config.num_kv_shared_layers > 0
-
-        # Are we the last non-shared layer of our type? If so we publish
-        # K/V into ``shared_kv_states`` for downstream shared layers.
-        prev_layers = layer_types[:first_shared]
-        if prev_layers and self.layer_type in prev_layers and not self.is_kv_shared_layer:
-            self.store_full_length_kv = (
-                layer_idx
-                == len(prev_layers) - 1 - prev_layers[::-1].index(self.layer_type)
-            )
-        else:
-            self.store_full_length_kv = False
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
         )
         self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        if not self.is_kv_shared_layer:
+        if self.owns_kv:
             self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
             self.k_proj = nn.Linear(
-                config.hidden_size, num_kv_heads * self.head_dim, bias=config.attention_bias
+                config.hidden_size, num_kv_heads * self.head_dim, bias=False
             )
             self.v_proj = (
-                nn.Linear(config.hidden_size, num_kv_heads * self.head_dim, bias=config.attention_bias)
+                nn.Linear(config.hidden_size, num_kv_heads * self.head_dim, bias=False)
                 if not self.use_alternative_attention
                 else None
             )
 
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
         )
 
     def forward(
@@ -375,9 +373,8 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Any,
         attention_mask: Optional[torch.Tensor],
-        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
-        shared_paged_kv_states: dict[str, Any],
-        past_key_values: Optional[SimpleDynamicCache] = None,
+        transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
+        kv_cache: LayeredPagedKV | None = None,
         cache_position_ids: Optional[torch.Tensor] = None,
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
@@ -390,29 +387,21 @@ class Gemma4TextAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape)
         query_states = self.q_norm(query_states)
 
-        paged_kv_layer = None
-        if past_key_values is not None and hasattr(past_key_values, "get_paged_layer"):
-            paged_kv_layer = past_key_values.get_paged_layer(self.layer_idx)
-
-        shared_paged_kv_layer = (
-            shared_paged_kv_states.get(self.layer_type)
-            if self.is_kv_shared_layer
-            else None
-        )
         key_states: Optional[torch.Tensor] = None
         value_states: Optional[torch.Tensor] = None
-        if self.is_kv_shared_layer:
+        if not self.owns_kv:
             query_states, _ = _apply_neox_rotary(
                 query_states, None, position_embeddings
             )
             query_states = query_states.transpose(1, 2)
-            # Pull pre-computed K/V from the same-type non-shared layer.
-            if shared_paged_kv_layer is not None:
-                paged_kv_layer = shared_paged_kv_layer
-            else:
-                key_states, value_states = shared_kv_states[self.layer_type]
-                key_states = key_states.to(query_states.device)
-                value_states = value_states.to(query_states.device)
+            if page_table is None:
+                source = transient_kv[self.kv_source_layer_idx]
+                if source is None:
+                    raise RuntimeError(
+                        f"Gemma layer {self.layer_idx} has no transient K/V from "
+                        f"producer {self.kv_source_layer_idx}"
+                    )
+                key_states, value_states = source
         else:
             key_states = self.k_proj(hidden_states).view(hidden_shape)
             value_states = (
@@ -429,38 +418,32 @@ class Gemma4TextAttention(nn.Module):
             value_states = self.v_norm(value_states)
             value_states = value_states.transpose(1, 2)
 
-        if past_key_values is not None and not self.is_kv_shared_layer:
-            if paged_kv_layer is not None:
-                if (
-                    cache_position_ids is None
-                    or slot_mapping is None
-                    or page_table is None
-                    or paged_kv_seqlens_k is None
-                ):
-                    raise RuntimeError("Gemma paged KV update requires decode metadata")
-                assert key_states is not None and value_states is not None
-                paged_kv_layer.update(
-                    input_pos=cache_position_ids,
-                    k_val=key_states.transpose(1, 2),
-                    v_val=value_states.transpose(1, 2),
-                    slot_mapping=slot_mapping,
-                )
-            else:
-                assert key_states is not None and value_states is not None
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx
-                )
-        if self.store_full_length_kv:
-            if paged_kv_layer is not None:
-                shared_paged_kv_states[self.layer_type] = paged_kv_layer
-            else:
-                assert key_states is not None and value_states is not None
-                shared_kv_states[self.layer_type] = (key_states, value_states)
+        if self.owns_kv and kv_cache is not None:
+            if cache_position_ids is None or slot_mapping is None:
+                raise RuntimeError("Gemma paged K/V write requires positions and slots")
+            assert key_states is not None and value_states is not None
+            producer = kv_cache.producer(self.layer_idx)
+            if producer is None:
+                raise RuntimeError(f"Gemma layer {self.layer_idx} has no paged K/V producer")
+            producer.update(
+                input_pos=cache_position_ids,
+                k_val=key_states.transpose(1, 2),
+                v_val=value_states.transpose(1, 2),
+                slot_mapping=slot_mapping,
+            )
+        if self.publishes_kv:
+            assert key_states is not None and value_states is not None
+            transient_kv[self.layer_idx] = (key_states, value_states)
 
-        if paged_kv_layer is not None:
+        if page_table is not None:
+            if kv_cache is None or paged_kv_seqlens_k is None:
+                raise RuntimeError("Gemma paged attention requires K/V storage metadata")
+            producer = kv_cache.producer(self.layer_idx)
+            if producer is None:
+                raise RuntimeError(f"Gemma layer {self.layer_idx} has no paged K/V producer")
             attn_out = _paged_attention_forward(
                 query_states,
-                paged_kv_layer=paged_kv_layer,
+                paged_kv_layer=producer,
                 page_table=page_table,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 scaling=self.scaling,
@@ -499,41 +482,43 @@ class Gemma4TextMLP(nn.Module):
             bias=False,
         )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = get_activation(config.hidden_activation)
-        self.gated_activation = (
-            "gelu_tanh"
-            if config.hidden_activation == "gelu_pytorch_tanh"
-            else None
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        if self.gated_activation is None:
-            gate, up = gate_up.split(self.intermediate_size, dim=-1)
-            hidden = self.act_fn(gate) * up
-        else:
-            hidden = torch.empty(
-                (*gate_up.shape[:-1], self.intermediate_size),
-                dtype=gate_up.dtype,
-                device=gate_up.device,
-            )
-            _kestrel_gated_activation_into(
-                hidden,
-                gate_up,
-                activation=self.gated_activation,
-                layout="contiguous",
-            )
+        hidden = torch.empty(
+            (*gate_up.shape[:-1], self.intermediate_size),
+            dtype=gate_up.dtype,
+            device=gate_up.device,
+        )
+        _kestrel_gated_activation_into(
+            hidden,
+            gate_up,
+            activation="gelu_tanh",
+            layout="contiguous",
+        )
         return self.down_proj(hidden)
 
 
 class Gemma4TextDecoderLayer(nn.Module):
 
-    def __init__(self, config: Gemma4TextConfig, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        layer_idx: int,
+        *,
+        kv_source_layer_idx: int,
+        publishes_kv: bool,
+    ) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.self_attn = Gemma4TextAttention(config, layer_idx)
+        self.self_attn = Gemma4TextAttention(
+            config,
+            layer_idx,
+            kv_source_layer_idx=kv_source_layer_idx,
+            publishes_kv=publishes_kv,
+        )
         self.mlp = Gemma4TextMLP(config, layer_idx)
         self.input_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -543,7 +528,6 @@ class Gemma4TextDecoderLayer(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.act_fn = get_activation(config.hidden_activation)
             self.per_layer_input_gate = nn.Linear(
                 self.hidden_size, self.hidden_size_per_layer_input, bias=False
             )
@@ -554,25 +538,14 @@ class Gemma4TextDecoderLayer(nn.Module):
                 self.hidden_size, eps=config.rms_norm_eps
             )
 
-        # MoE branch (used by 26B-A4B only). Built lazily / skipped for
-        # dense variants where ``enable_moe_block`` is False.
-        self.enable_moe_block = config.enable_moe_block
-        if self.enable_moe_block:
-            raise NotImplementedError(
-                "MoE Gemma 4 (26B-A4B) is not yet vendored; this scaffold "
-                "covers the dense variants (E2B / E4B / 31B)."
-            )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         per_layer_input: Optional[torch.Tensor],
-        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        shared_paged_kv_states: dict[str, Any],
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[SimpleDynamicCache] = None,
+        kv_cache: LayeredPagedKV | None = None,
         **attention_kwargs: Any,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -581,9 +554,8 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            shared_kv_states=shared_kv_states,
-            shared_paged_kv_states=shared_paged_kv_states,
-            past_key_values=past_key_values,
+            transient_kv=transient_kv,
+            kv_cache=kv_cache,
             **attention_kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -598,7 +570,7 @@ class Gemma4TextDecoderLayer(nn.Module):
         if self.hidden_size_per_layer_input and per_layer_input is not None:
             residual = hidden_states
             hidden_states = self.per_layer_input_gate(hidden_states)
-            hidden_states = self.act_fn(hidden_states)
+            hidden_states = F.gelu(hidden_states, approximate="tanh")
             hidden_states = hidden_states * per_layer_input
             hidden_states = self.per_layer_projection(hidden_states)
             hidden_states = self.post_per_layer_input_norm(hidden_states)
@@ -629,24 +601,12 @@ def _mask_neg_value(dtype: torch.dtype) -> float:
     return torch.finfo(dtype).min
 
 
-@dataclass
-class Gemma4TextModelOutput:
-    last_hidden_state: torch.Tensor
-    past_key_values: Optional[SimpleDynamicCache]
-
-
-@dataclass
-class Gemma4CausalLMOutput:
-    logits: torch.Tensor
-    past_key_values: Optional[SimpleDynamicCache]
-
-
 class Gemma4TextModel(nn.Module):
 
     def __init__(self, config: Gemma4TextConfig) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id or 0
+        self.padding_idx = 0
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
@@ -655,8 +615,20 @@ class Gemma4TextModel(nn.Module):
             self.padding_idx,
             embed_scale=config.hidden_size**0.5,
         )
+        sources = kv_source_layers(config)
+        published = {
+            source for layer, source in enumerate(sources) if layer != source
+        }
         self.layers = nn.ModuleList(
-            [Gemma4TextDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            [
+                Gemma4TextDecoderLayer(
+                    config,
+                    layer,
+                    kv_source_layer_idx=sources[layer],
+                    publishes_kv=layer in published,
+                )
+                for layer in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Gemma4TextRotaryEmbedding(config)
@@ -713,17 +685,16 @@ class Gemma4TextModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[SimpleDynamicCache] = None,
+        kv_cache: LayeredPagedKV | None = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
         prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
-        use_cache: bool = False,
         cache_position_ids: Optional[torch.Tensor] = None,
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         paged_kv_seqlens_k: Optional[torch.Tensor] = None,
         paged_kv_use_sliding_window: bool = True,
-    ) -> Gemma4TextModelOutput:
+    ) -> torch.Tensor:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is not None and per_layer_inputs is not None:
@@ -738,15 +709,12 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs = self.get_per_layer_inputs(input_ids)
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
 
-        if use_cache and past_key_values is None:
-            past_key_values = SimpleDynamicCache()
-
         seq_len = inputs_embeds.shape[1]
-        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device) + past_len
-            position_ids = position_ids.unsqueeze(0)
+            position_ids = torch.arange(
+                seq_len, device=inputs_embeds.device
+            ).unsqueeze(0)
 
         masks = prebuilt_masks or {}
         position_embeddings = {}
@@ -755,8 +723,9 @@ class Gemma4TextModel(nn.Module):
             position_embeddings[layer_type] = _prepare_neox_rotary(cos, sin)
 
         hidden_states = inputs_embeds
-        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = UserDict()
-        shared_paged_kv_states: dict[str, Any] = {}
+        transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None] = [
+            None
+        ] * len(self.layers)
         for i, layer in enumerate(self.layers):
             per_layer_input = (
                 per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
@@ -765,12 +734,10 @@ class Gemma4TextModel(nn.Module):
             hidden_states = layer(
                 hidden_states,
                 per_layer_input=per_layer_input,
-                shared_kv_states=shared_kv_states,
+                transient_kv=transient_kv,
                 position_embeddings=position_embeddings[layer_type],
                 attention_mask=masks.get(layer_type),
-                shared_paged_kv_states=shared_paged_kv_states,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
+                kv_cache=kv_cache,
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,
                 page_table=page_table,
@@ -779,66 +746,7 @@ class Gemma4TextModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-        return Gemma4TextModelOutput(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
-
-
-class Gemma4ForCausalLM(nn.Module):
-
-    def __init__(self, config: Gemma4TextConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.model = Gemma4TextModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        if config.tie_word_embeddings:
-            # HF ties the LM head to the (unscaled) token embedding weight.
-            self.lm_head.weight = self.model.embed_tokens.weight
-
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[SimpleDynamicCache] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-        prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
-        use_cache: bool = False,
-        logits_to_keep: int = 0,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
-    ) -> Gemma4CausalLMOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
-            prebuilt_masks=prebuilt_masks,
-            use_cache=use_cache,
-            cache_position_ids=cache_position_ids,
-            slot_mapping=slot_mapping,
-            page_table=page_table,
-            paged_kv_seqlens_k=paged_kv_seqlens_k,
-            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
-        )
-        hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if logits_to_keep else slice(None)
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-        if self.config.final_logit_softcapping is not None:
-            cap = self.config.final_logit_softcapping
-            logits = logits / cap
-            logits = torch.tanh(logits)
-            logits = logits * cap
-        return Gemma4CausalLMOutput(
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-        )
+        return hidden_states
 
 class Gemma4ClippableLinear(nn.Module):
 
@@ -968,12 +876,6 @@ class Gemma4VisionMLP(nn.Module):
             2 * self.intermediate_size,
         )
         self.down_proj = Gemma4ClippableLinear(config, self.intermediate_size, self.hidden_size)
-        if config.hidden_activation != "gelu_pytorch_tanh":
-            raise ValueError(
-                "fused vision MLP requires hidden_activation='gelu_pytorch_tanh', "
-                f"got {config.hidden_activation!r}"
-            )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
         hidden = torch.empty(
@@ -1039,11 +941,11 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma4VisionConfig, device: Optional[torch.device] = None) -> None:
         super().__init__()
         self.config = config
-        self.rope_type = config.rope_parameters.get("rope_type", "default")
+        self.rope_type = config.rope.kind
         if self.rope_type != "default":
             raise ValueError(f"Vision RoPE only supports rope_type='default', got {self.rope_type!r}")
-        base = float(config.rope_parameters["rope_theta"])
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        base = config.rope.theta
+        head_dim = config.head_dim
         # Per HF: the reference impl computes RoPE freqs independently for each
         # spatial dimension using head_dim // ndim (ndim=2 for x/y), so each axis
         # gets the same frequency range — not a global inv_freq split.
@@ -1086,17 +988,6 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
         return cos, sin
 
 
-def _vision_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return hidden_states
-    batch, num_kv, slen, head_dim = hidden_states.shape
-    return (
-        hidden_states[:, :, None, :, :]
-        .expand(batch, num_kv, n_rep, slen, head_dim)
-        .reshape(batch, num_kv * n_rep, slen, head_dim)
-    )
-
-
 def _vision_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1127,8 +1018,8 @@ def _vision_attention_forward(
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
-    key_states = _vision_repeat_kv(key, num_key_value_groups)
-    value_states = _vision_repeat_kv(value, num_key_value_groups)
+    key_states = _repeat_kv(key, num_key_value_groups)
+    value_states = _repeat_kv(value, num_key_value_groups)
     positions = torch.arange(query.shape[-2], device=query.device)
     valid = positions.unsqueeze(0) < seqused_k.unsqueeze(1)
     attention_mask = _build_bidirectional_mask(valid, dtype=query.dtype)
@@ -1292,11 +1183,6 @@ class Gemma4VisionEncoder(nn.Module):
         return hidden_states
 
 
-@dataclass
-class Gemma4VisionOutput:
-    last_hidden_state: torch.Tensor
-
-
 class Gemma4VisionModel(nn.Module):
 
     def __init__(self, config: Gemma4VisionConfig) -> None:
@@ -1313,7 +1199,7 @@ class Gemma4VisionModel(nn.Module):
         self,
         pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
-    ) -> Gemma4VisionOutput:
+    ) -> torch.Tensor:
         pooling_kernel_size = self.config.pooling_kernel_size
         # HF derives ``output_length`` from the input grid divided by
         # pooling_kernel_size**2 along the patch axis (axis -2 of
@@ -1339,7 +1225,7 @@ class Gemma4VisionModel(nn.Module):
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
 
-        return Gemma4VisionOutput(last_hidden_state=hidden_states)
+        return hidden_states
 
 
 class Gemma4VisionEmbedder(nn.Module):
@@ -1366,20 +1252,6 @@ class Gemma4VisionEmbedder(nn.Module):
         return self.embedding_projection(normed)
 
 
-@dataclass
-class Gemma4ModelOutput:
-    last_hidden_state: torch.Tensor
-    past_key_values: Optional[SimpleDynamicCache]
-    image_hidden_states: Optional[torch.Tensor] = None
-
-
-@dataclass
-class Gemma4CausalLMOutput:
-    logits: torch.Tensor
-    past_key_values: Optional[SimpleDynamicCache]
-    image_hidden_states: Optional[torch.Tensor] = None
-
-
 class Gemma4Model(nn.Module):
 
     def __init__(self, config: Gemma4Config) -> None:
@@ -1391,12 +1263,8 @@ class Gemma4Model(nn.Module):
         self.language_model = Gemma4TextModel(text_cfg)
         self.vocab_size_per_layer_input = text_cfg.vocab_size_per_layer_input
 
-        if config.vision_config is not None:
-            self.vision_tower = Gemma4VisionModel(config.vision_config)
-            self.embed_vision = Gemma4VisionEmbedder(config.vision_config, text_cfg)
-        else:
-            self.vision_tower = None
-            self.embed_vision = None
+        self.vision_tower = Gemma4VisionModel(config.vision_config)
+        self.embed_vision = Gemma4VisionEmbedder(config.vision_config, text_cfg)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.embed_tokens
@@ -1407,86 +1275,14 @@ class Gemma4Model(nn.Module):
         image_position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Encode image patches and project into text-embedding space."""
-        if self.vision_tower is None:
-            raise RuntimeError("vision_config is None; image inputs not supported")
-        vision_out = self.vision_tower(
+        vision_hidden = self.vision_tower(
             pixel_values=pixel_values,
             pixel_position_ids=image_position_ids,
         )
-        return self.embed_vision(vision_out.last_hidden_state)
+        return self.embed_vision(vision_hidden)
 
     def image_placeholder_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         return input_ids == self.config.image_token_id
-
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_position_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[SimpleDynamicCache] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-        prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
-        use_cache: bool = False,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        paged_kv_use_sliding_window: bool = True,
-    ) -> Gemma4ModelOutput:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
-
-        # Build placeholder masks before we trample input_ids.
-        if input_ids is not None:
-            image_mask = self.image_placeholder_mask(input_ids)
-
-            # The image token id may be OOV for embed_tokens. Replace it with
-            # pad before lookup, then scatter the real vision features.
-            llm_input_ids = input_ids.clone()
-            llm_input_ids[image_mask] = self.config.text_config.pad_token_id or 0
-            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
-        else:
-            image_mask = torch.zeros_like(inputs_embeds[..., 0], dtype=torch.bool)
-            llm_input_ids = None
-
-        # PLE inputs: derived from input_ids (with multimodal slots → pad).
-        if per_layer_inputs is None and self.config.text_config.hidden_size_per_layer_input:
-            if llm_input_ids is not None:
-                per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids)
-            # If only inputs_embeds was provided, language_model.forward
-            # will reverse-lookup to recover ids — but that's expensive.
-            # Production callers should pass per_layer_inputs directly
-            # when feeding raw embeds.
-
-        # Merge image features.
-        if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values, image_position_ids)
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            scatter_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(scatter_mask, image_features)
-
-        out = self.language_model(
-            input_ids=None,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
-            prebuilt_masks=prebuilt_masks,
-            use_cache=use_cache,
-            cache_position_ids=cache_position_ids,
-            slot_mapping=slot_mapping,
-            page_table=page_table,
-            paged_kv_seqlens_k=paged_kv_seqlens_k,
-            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
-        )
-        return Gemma4ModelOutput(
-            last_hidden_state=out.last_hidden_state,
-            past_key_values=out.past_key_values,
-            image_hidden_states=image_features if pixel_values is not None else None,
-        )
-
 
 class Gemma4ForConditionalGeneration(nn.Module):
 
@@ -1497,35 +1293,36 @@ class Gemma4ForConditionalGeneration(nn.Module):
         self.model = Gemma4Model(config)
         self.vocab_size = text_cfg.vocab_size
         self.lm_head = nn.Linear(text_cfg.hidden_size, text_cfg.vocab_size, bias=False)
-        if config.tie_word_embeddings:
-            # HF ties the LM head to the (unscaled) embed_tokens weight.
-            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+        self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_position_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[SimpleDynamicCache] = None,
+        kv_cache: LayeredPagedKV | None = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
         prebuilt_masks: Optional[dict[str, torch.Tensor]] = None,
-        use_cache: bool = False,
         logits_to_keep: int = 0,
-    ) -> Gemma4CausalLMOutput:
-        outputs = self.model(
+        cache_position_ids: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
+        paged_kv_use_sliding_window: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = self.model.language_model(
             input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_position_ids=image_position_ids,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            kv_cache=kv_cache,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
             prebuilt_masks=prebuilt_masks,
-            use_cache=use_cache,
+            cache_position_ids=cache_position_ids,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
+            paged_kv_use_sliding_window=paged_kv_use_sliding_window,
         )
-        hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if logits_to_keep else slice(None)
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         if self.config.text_config.final_logit_softcapping is not None:
@@ -1533,14 +1330,9 @@ class Gemma4ForConditionalGeneration(nn.Module):
             logits = logits / cap
             logits = torch.tanh(logits)
             logits = logits * cap
-        return Gemma4CausalLMOutput(
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            image_hidden_states=outputs.image_hidden_states,
-        )
+        return logits
 
 __all__ = [
     "Gemma4ForConditionalGeneration",
     "Gemma4Model",
-    "SimpleDynamicCache",
 ]
