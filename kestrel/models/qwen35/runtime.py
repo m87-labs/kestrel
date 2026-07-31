@@ -19,7 +19,6 @@ from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.state import SequenceState
 from kestrel.runtime.tokens import Token
-from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
     derive_preprocessing_workers,
@@ -35,9 +34,7 @@ from .prefill_slot import (
     create_qwen35_prefill_slot,
 )
 from .prompt_template import (
-    END_OF_TEXT_ID,
     IMAGE_PAD_ID,
-    IM_END_ID,
     IM_START_ID,
     Qwen35PromptTemplate,
     VISION_END_ID,
@@ -317,7 +314,6 @@ class Qwen35Runtime:
         self.tokenizer = Tokenizer.from_pretrained(self._model_name)
         self.tokenizer.post_processor = None
         self.prompt_template = Qwen35PromptTemplate()
-        self._eos_ids = {IM_END_ID, END_OF_TEXT_ID}
 
         # Conservative fixed reservation for image requests. Actual prompt
         # insertion uses the per-image processor count.
@@ -387,12 +383,6 @@ class Qwen35Runtime:
             (self.max_batch_slots, 1),
             dtype=torch.long,
             device=self.device,
-        )
-        self._cache_batch_idx_staging = CpuGpuBuffer(
-            self.max_batch_slots,
-            dtype=torch.int64,
-            device=self.device,
-            pin_memory=self.device.type == "cuda",
         )
 
         self._prefill_slots = tuple(
@@ -971,122 +961,6 @@ class Qwen35Runtime:
         slot.hidden_last[:batch_size].copy_(hidden)
         slot.logits[:batch_size].copy_(self.model.lm_head(hidden))
 
-    def _host_long_tensor(
-        self,
-        values: Sequence[int] | Sequence[Sequence[int]],
-    ) -> torch.Tensor:
-        first = values[0] if values else ()
-        rows = (
-            [list(row) for row in values]
-            if isinstance(first, (list, tuple))
-            else [list(values)]  # type: ignore[list-item]
-        )
-        row_count = len(rows)
-        col_count = len(rows[0]) if rows else 0
-        cpu = torch.empty(
-            (row_count, col_count),
-            dtype=torch.long,
-            device="cpu",
-            pin_memory=self.device.type == "cuda",
-        )
-        for row_idx, row in enumerate(rows):
-            if len(row) != col_count:
-                raise ValueError("Qwen host tensor rows must have equal length")
-            for col_idx, value in enumerate(row):
-                cpu[row_idx, col_idx] = int(value)
-        return cpu.to(device=self.device, non_blocking=True)
-
-    def _device_long_scalar(self, shape: tuple[int, ...], value: int) -> torch.Tensor:
-        out = torch.empty(shape, dtype=torch.long, device=self.device)
-        out.fill_(int(value))
-        return out
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        prompt: str,
-        *,
-        image: Optional[Any] = None,
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-        reasoning: bool = False,
-    ) -> str:
-        query = self.prompt_template.query()
-        if query is None:
-            raise RuntimeError("Qwen 3.5 prompt template missing query()")
-        user_ids = self.tokenizer.encode(prompt).ids
-        opener = query.reasoning_prefix if reasoning else query.answer_prefix
-        ids = [self.prompt_template.bos_id] + list(query.prefix) + user_ids + list(opener)
-        image_inputs = self._image_preprocessor.process(image) if image is not None else None
-        if image_inputs is not None:
-            offset = 1 + len(query.prefix)
-            image_block = (
-                [VISION_START_ID]
-                + [IMAGE_PAD_ID] * int(image_inputs.num_image_tokens)
-                + [VISION_END_ID]
-            )
-            ids = ids[:offset] + image_block + ids[offset:]
-
-        batch_idx = self.page_table.allocate()
-        cache = self._new_cache()
-        try:
-            self.page_table.reserve(batch_idx, len(ids) + max_new_tokens)
-            self.page_table.commit_block_table([batch_idx])
-            input_ids = self._host_long_tensor([ids])
-            image_kwargs = self._image_forward_kwargs(input_ids, image_inputs)
-            cache_position_ids = torch.arange(
-                len(ids), dtype=torch.long, device=self.device
-            ).view(1, -1)
-            last_hidden, cache = self._forward_base(
-                input_ids=input_ids,
-                past_key_values=cache,
-                batch_idx=batch_idx,
-                cache_position_ids=cache_position_ids,
-                **image_kwargs,
-            )
-            logits = self._logits_for_last(last_hidden[0, -1])
-            generated: list[int] = []
-            for _ in range(max_new_tokens):
-                next_id = self._sample_next(logits, temperature=temperature, top_p=top_p)
-                if next_id in self._eos_ids:
-                    break
-                generated.append(next_id)
-                step_ids = self._device_long_scalar((1, 1), next_id)
-                pos = self._device_long_scalar(
-                    (1, 1),
-                    int(cache.past_key_values.get_seq_length()),
-                )
-                last_hidden, cache = self._forward_base(
-                    input_ids=step_ids,
-                    past_key_values=cache,
-                    batch_idx=batch_idx,
-                    cache_position_ids=pos,
-                )
-                logits = self._logits_for_last(last_hidden[0, 0])
-            return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
-        finally:
-            self.page_table.erase(batch_idx, 0)
-
-    def _image_forward_kwargs(
-        self,
-        input_ids: torch.Tensor,
-        image_inputs: Optional[QwenImageInputs],
-    ) -> dict[str, torch.Tensor]:
-        if image_inputs is None:
-            return {}
-        pixel_values = image_inputs.pixel_values.to(
-            device=self.device, dtype=self.dtype
-        )
-        image_grid_thw = image_inputs.image_grid_thw.to(device=self.device)
-        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
-        mm_token_type_ids[input_ids == IMAGE_PAD_ID] = 1
-        return {
-            "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "mm_token_type_ids": mm_token_type_ids,
-        }
-
     def _prefill_scratch_for(
         self,
         slot: Any,
@@ -1589,133 +1463,6 @@ class Qwen35Runtime:
             packed.rope_deltas,
         )
 
-    def _forward_base(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        past_key_values: Optional[Any],
-        batch_idx: Optional[int | Sequence[int] | torch.Tensor] = None,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        mm_token_type_ids: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Any]:
-        cache_state = (
-            past_key_values
-            if isinstance(past_key_values, _QwenForwardCache)
-            else _QwenForwardCache(past_key_values)
-        )
-        if batch_idx is not None:
-            if cache_state.past_key_values is None:
-                cache_state.past_key_values = self._new_cache()
-            cache_batch_idx = self._cache_batch_idx_tensor(batch_idx)
-            batch_count = int(cache_batch_idx.shape[0])
-            if input_ids.shape[0] != batch_count:
-                raise ValueError(
-                    "input_ids batch dimension must match cache batch indices"
-                )
-            if cache_position_ids is None:
-                if batch_count != 1:
-                    raise RuntimeError(
-                        "Batched Qwen decode requires explicit cache positions"
-                    )
-                start = int(cache_state.past_key_values.get_seq_length())
-                cache_position_ids = torch.arange(
-                    start,
-                    start + input_ids.shape[1],
-                    dtype=torch.long,
-                    device=self.device,
-                ).view(1, -1)
-            cache_position_ids = cache_position_ids.to(
-                device=self.device, dtype=torch.long
-            )
-            if cache_position_ids.ndim == 1:
-                cache_position_ids = cache_position_ids.view(batch_count, -1)
-            if cache_position_ids.shape[0] != batch_count:
-                raise ValueError(
-                    "cache_position_ids batch dimension must match batch_idx"
-                )
-            slot_mapping = self.page_table.build_slot_mapping(
-                batch_idx=cache_batch_idx,
-                positions=cache_position_ids,
-            )
-            paged_kv_page_table = torch.index_select(
-                self.page_table.page_table,
-                0,
-                cache_batch_idx.to(dtype=torch.long),
-            )
-            paged_kv_seqlens_k = (
-                cache_position_ids.max(dim=1).values.to(dtype=torch.int32) + 1
-            )
-            gdn_state_indices = self._gdn_state_indices_for_cache(
-                cache_state,
-                batch_count=batch_count,
-            )
-            cache_kwargs = {
-                "cache_position_ids": cache_position_ids,
-                "slot_mapping": slot_mapping,
-                "page_table": paged_kv_page_table,
-                "paged_kv_seqlens_k": paged_kv_seqlens_k,
-                "gdn_state_indices": gdn_state_indices,
-            }
-            # Single-sequence multi-token prefill (e.g. generate()): pass
-            # cu_seq_lens_q = [0, seq_len] so GDN takes the native packed_prefill
-            # path (the model derives seq_idx from it), matching
-            # _forward_packed_prefill. Single-token decode steps skip this and
-            # stay on the decode path.
-            if input_ids.shape[0] == 1 and input_ids.shape[1] > 1:
-                cache_kwargs["cu_seq_lens_q"] = torch.tensor(
-                    [0, input_ids.shape[1]],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-        else:
-            cache_kwargs = {}
-        has_multimodal_inputs = (
-            pixel_values is not None
-            or image_grid_thw is not None
-            or mm_token_type_ids is not None
-        )
-        use_multimodal_positions = (
-            has_multimodal_inputs or cache_state.rope_deltas is not None
-        )
-        if not use_multimodal_positions:
-            outputs = self.model.model.language_model(
-                input_ids=input_ids,
-                position_ids=cache_position_ids if batch_idx is not None else None,
-                past_key_values=cache_state.past_key_values,
-                **cache_kwargs,
-            )
-            rope_deltas = None
-        else:
-            outputs = self.model.model(
-                input_ids=input_ids,
-                past_key_values=cache_state.past_key_values,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                position_ids=position_ids,
-                rope_deltas=cache_state.rope_deltas,
-                **cache_kwargs,
-            )
-            rope_deltas = outputs.rope_deltas
-        cache = outputs.past_key_values
-        last_hidden = outputs.last_hidden_state
-        if (
-            batch_idx is not None
-            and cache_position_ids is not None
-            and cache is not None
-        ):
-            cache.advance_to(
-                int(cache_position_ids.max().item()) + 1
-            )
-        return last_hidden, _QwenForwardCache(
-            cache,
-            rope_deltas,
-            cache_state.linear_state_row_indices,
-        )
-
     def _new_cache(self) -> Qwen35InferenceCache:
         return Qwen35InferenceCache(
             config=self.architecture.text_config,
@@ -1818,73 +1565,4 @@ class Qwen35Runtime:
             else _QwenForwardCache(cache)
         )
 
-    def _cache_batch_idx_tensor(
-        self, batch_idx: int | Sequence[int] | torch.Tensor
-    ) -> torch.Tensor:
-        if isinstance(batch_idx, torch.Tensor):
-            return batch_idx.to(device=self.device, dtype=torch.int64).view(-1)
-        if isinstance(batch_idx, int):
-            values = [batch_idx]
-        else:
-            values = [int(idx) for idx in batch_idx]
-        staging = getattr(self, "_cache_batch_idx_staging", None)
-        if staging is None or len(values) > staging.cpu.shape[0]:
-            staging = CpuGpuBuffer(
-                max(len(values), int(getattr(self, "max_batch_slots", len(values)))),
-                dtype=torch.int64,
-                device=self.device,
-                pin_memory=self.device.type == "cuda",
-            )
-            self._cache_batch_idx_staging = staging
-        if len(values) > staging.cpu.shape[0]:
-            raise ValueError(
-                f"Qwen batch index staging buffer holds "
-                f"{staging.cpu.shape[0]} values, got {len(values)}"
-            )
-        for idx, value in enumerate(values):
-            staging.cpu[idx] = int(value)
-        return staging.copy_to_gpu(len(values)).view(-1)
-
-    def _gdn_state_indices_for_cache(
-        self,
-        cache_state: _QwenForwardCache,
-        *,
-        batch_count: int,
-    ) -> torch.Tensor:
-        if cache_state.linear_state_row_indices is not None:
-            indices = cache_state.linear_state_row_indices.to(
-                device=self.device,
-                dtype=torch.long,
-            ).view(-1)
-            if int(indices.shape[0]) != batch_count:
-                raise ValueError(
-                    "linear_state_row_indices batch dimension must match batch_idx"
-                )
-            return indices
-
-        return torch.arange(batch_count, dtype=torch.long, device=self.device)
-
-    def _logits_for_last(self, last_hidden: torch.Tensor) -> torch.Tensor:
-        return self.model.lm_head(last_hidden.unsqueeze(0))[0]
-
-    def _sample_next(
-        self,
-        logits: torch.Tensor,
-        *,
-        temperature: float,
-        top_p: float,
-    ) -> int:
-        if temperature <= 0.0:
-            return int(torch.argmax(logits).item())
-        logits = logits / max(float(temperature), 1e-6)
-        probs = torch.softmax(logits, dim=-1)
-        if 0.0 < top_p < 1.0:
-            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-            cum = torch.cumsum(sorted_probs, dim=-1)
-            keep = int((cum <= top_p).sum().item()) + 1
-            sorted_probs[keep:] = 0
-            sorted_probs = sorted_probs / sorted_probs.sum()
-            pick = torch.multinomial(sorted_probs, 1)
-            return int(sorted_idx[pick].item())
-        return int(torch.multinomial(probs, 1).item())
 __all__ = ["Qwen35Runtime", "QwenImageInputs"]
