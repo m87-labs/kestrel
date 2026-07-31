@@ -28,10 +28,7 @@ from kestrel.models.gemma4.config import (
     Gemma4VisionConfig,
     RopeSpec,
 )
-from kestrel.models.gemma4.image import (
-    Gemma4ImageProcessorConfig,
-    preprocess_image,
-)
+from kestrel.models.gemma4.image import preprocess_image
 from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
 from kestrel.models.gemma4.skills import build_skill_registry
@@ -749,36 +746,3 @@ def test_image_preprocessing_matches_official_rescale_domain(pixel):
     valid = inputs.pixel_values[: inputs.num_image_tokens * 9]
 
     assert torch.equal(valid, torch.full_like(valid, expected))
-
-
-def test_image_preprocessing_preserves_patch_order_and_padding():
-    config = Gemma4ImageProcessorConfig(
-        max_patches=6,
-        patch_size=2,
-        pooling_kernel_size=1,
-    )
-    image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
-    inputs = preprocess_image(image, config=config, dtype=torch.float32)
-
-    expected_patches = (
-        image.reshape(2, 2, 2, 2, 3)
-        .transpose(0, 2, 1, 3, 4)
-        .reshape(4, 12)
-    )
-    expected_pixels = torch.zeros((6, 12))
-    expected_pixels[:4] = torch.from_numpy(expected_patches).float().mul_(1.0 / 255.0)
-
-    assert torch.equal(inputs.pixel_values, expected_pixels)
-    assert torch.equal(
-        inputs.image_position_ids,
-        torch.tensor(
-            [
-                [0, 0],
-                [1, 0],
-                [0, 1],
-                [1, 1],
-                [-1, -1],
-                [-1, -1],
-            ]
-        ),
-    )

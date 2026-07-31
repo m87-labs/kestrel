@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from functools import partial
 from typing import Any, Sequence
 
 import torch
@@ -90,7 +89,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             with_numpy={"pixel_values": False},
         )
         self._image_preprocessor = AsyncPreprocessor(
-            partial(preprocess_image, dtype=self.dtype),
+            preprocess_image,
             workers=derive_preprocessing_workers(self.max_batch_size),
         )
 

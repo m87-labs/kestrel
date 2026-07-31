@@ -14,48 +14,38 @@ from PIL import Image
 
 
 @dataclass(frozen=True)
-class Gemma4ImageProcessorConfig:
-    max_patches: int = 2520
-    patch_size: int = 16
-    pooling_kernel_size: int = 3
-
-
-@dataclass(frozen=True)
 class GemmaImageInputs:
     pixel_values: torch.Tensor
     image_position_ids: torch.Tensor
     num_image_tokens: int
 
 
-DEFAULT_IMAGE_CONFIG = Gemma4ImageProcessorConfig()
-MAX_PATCHES = DEFAULT_IMAGE_CONFIG.max_patches
-MAX_IMAGE_TOKENS = MAX_PATCHES // (DEFAULT_IMAGE_CONFIG.pooling_kernel_size**2)
+MAX_PATCHES = 2520
+PATCH_SIZE = 16
+POOLING_KERNEL_SIZE = 3
+MAX_IMAGE_TOKENS = MAX_PATCHES // POOLING_KERNEL_SIZE**2
 
 
 def _pick_grid(
     height: int,
     width: int,
-    config: Gemma4ImageProcessorConfig,
 ) -> tuple[int, int]:
     aspect = width / height
-    ideal_w = math.sqrt(config.max_patches * aspect)
-    ideal_h = math.sqrt(config.max_patches / aspect)
+    ideal_w = math.sqrt(MAX_PATCHES * aspect)
+    ideal_h = math.sqrt(MAX_PATCHES / aspect)
     grid_w = max(
-        config.pooling_kernel_size,
-        int(ideal_w // config.pooling_kernel_size) * config.pooling_kernel_size,
+        POOLING_KERNEL_SIZE,
+        int(ideal_w // POOLING_KERNEL_SIZE) * POOLING_KERNEL_SIZE,
     )
     grid_h = max(
-        config.pooling_kernel_size,
-        int(ideal_h // config.pooling_kernel_size) * config.pooling_kernel_size,
+        POOLING_KERNEL_SIZE,
+        int(ideal_h // POOLING_KERNEL_SIZE) * POOLING_KERNEL_SIZE,
     )
     return grid_h, grid_w
 
 
 def preprocess_image(
     image: Any,
-    config: Gemma4ImageProcessorConfig = DEFAULT_IMAGE_CONFIG,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
 ) -> GemmaImageInputs:
     if isinstance(image, (bytes, bytearray)):
         image = Image.open(io.BytesIO(image)).convert("RGB")
@@ -66,9 +56,9 @@ def preprocess_image(
         if finite.size and finite.min() >= 0.0 and finite.max() <= 1.0:
             image = image * 255.0
     array = decode_to_srgb(image)
-    grid_h, grid_w = _pick_grid(*array.shape[:2], config)
-    resized_h = grid_h * config.patch_size
-    resized_w = grid_w * config.patch_size
+    grid_h, grid_w = _pick_grid(*array.shape[:2])
+    resized_h = grid_h * PATCH_SIZE
+    resized_w = grid_w * PATCH_SIZE
 
     num_valid = grid_h * grid_w
     if not array.flags.writeable:
@@ -86,26 +76,26 @@ def preprocess_image(
     patches = (
         pixels.reshape(
             grid_h,
-            config.patch_size,
+            PATCH_SIZE,
             grid_w,
-            config.patch_size,
+            PATCH_SIZE,
             3,
         )
         .permute(0, 2, 1, 3, 4)
         .reshape(
             num_valid,
-            3 * config.patch_size * config.patch_size,
+            3 * PATCH_SIZE * PATCH_SIZE,
         )
     )
 
-    output_patches = max(config.max_patches, num_valid)
+    output_patches = max(MAX_PATCHES, num_valid)
     pixel_values = torch.full(
         (
             output_patches,
-            3 * config.patch_size * config.patch_size,
+            3 * PATCH_SIZE * PATCH_SIZE,
         ),
         0,
-        dtype=dtype,
+        dtype=torch.bfloat16,
     )
     valid_pixels = patches.to(torch.float32).mul_(1.0 / 255.0)
     # Gemma 4's processor config rescales to [0, 1] with do_normalize=false.
@@ -122,12 +112,11 @@ def preprocess_image(
     return GemmaImageInputs(
         pixel_values=pixel_values,
         image_position_ids=image_position_ids,
-        num_image_tokens=num_valid // (config.pooling_kernel_size**2),
+        num_image_tokens=num_valid // POOLING_KERNEL_SIZE**2,
     )
 
 
 __all__ = [
-    "Gemma4ImageProcessorConfig",
     "GemmaImageInputs",
     "MAX_IMAGE_TOKENS",
     "MAX_PATCHES",
