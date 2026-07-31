@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import math
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -137,33 +136,8 @@ def preprocess_image(
     )
 
 
-class Gemma4ImagePreprocessor:
-    def __init__(
-        self,
-        *,
-        num_workers: int,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> None:
-        self._dtype = dtype
-        self._executor = ThreadPoolExecutor(
-            max_workers=num_workers,
-            thread_name_prefix="kestrel-gemma4-img",
-        )
-
-    def submit(self, image: Any) -> Future[GemmaImageInputs]:
-        return self._executor.submit(
-            preprocess_image,
-            image,
-            dtype=self._dtype,
-        )
-
-    def shutdown(self, wait: bool = True) -> None:
-        self._executor.shutdown(wait=wait)
-
-
 __all__ = [
     "Gemma4ImageProcessorConfig",
-    "Gemma4ImagePreprocessor",
     "GemmaImageInputs",
     "IMAGE_SEQ_LENGTH",
     "MAX_IMAGE_TOKENS",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional, Sequence
 
 import torch
@@ -14,7 +15,6 @@ from kestrel.device import make_event, make_stream
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
-from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
     materialize_dynamic_batch_domain,
@@ -24,13 +24,10 @@ from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
     derive_preprocessing_workers,
 )
+from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
 
 from .loader import load_model
-from .image import (
-    Gemma4ImagePreprocessor,
-    IMAGE_SEQ_LENGTH,
-    MAX_PATCHES,
-)
+from .image import IMAGE_SEQ_LENGTH, MAX_PATCHES, preprocess_image
 from .prompt_template import Gemma4PromptTemplate
 from .paged_cache import paged_kv_layout
 
@@ -138,8 +135,11 @@ class Gemma4Runtime:
         self.spec = None
         self.max_batch_size = cfg.max_batch_size
         self.max_batch_slots = self.max_batch_size + 2
-        self._vision_pixel_staging: CpuGpuBuffer | None = None
-        self._vision_position_staging: CpuGpuBuffer | None = None
+        self._vision_stager = BatchedTensorStager(
+            capacity=self.max_batch_size,
+            device=self.device,
+            with_numpy={"pixel_values": False},
+        )
         self._decode_slot_rows = _decode_slot_rows(self.max_batch_size)
         self._padding_batch_idx = self.max_batch_slots - 1
         self.page_size = cfg.page_size
@@ -150,9 +150,9 @@ class Gemma4Runtime:
         )
         self.image_prefix_length = IMAGE_SEQ_LENGTH + 2
 
-        self._image_preprocessor = Gemma4ImagePreprocessor(
-            num_workers=derive_preprocessing_workers(self.max_batch_size),
-            dtype=self.dtype,
+        self._image_preprocessor = AsyncPreprocessor(
+            partial(preprocess_image, dtype=self.dtype),
+            workers=derive_preprocessing_workers(self.max_batch_size),
         )
 
         self._compute_stream = (
@@ -213,75 +213,6 @@ class Gemma4Runtime:
         self._decode_megakernel = create_generated_decode(self)
         self.prefix_cache = None
 
-    def _stage_vision_inputs(
-        self,
-        crops_list: Sequence[Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = len(crops_list)
-        if batch_size < 1:
-            raise ValueError("vision staging requires at least one input row")
-        capacity = max(batch_size, self.max_batch_size)
-        first_crops = crops_list[0]
-        pixel_shape = tuple(first_crops.pixel_values.shape)
-        position_shape = tuple(first_crops.image_position_ids.shape)
-        if len(pixel_shape) != 2 or len(position_shape) != 2:
-            raise ValueError("vision inputs must be rank-2 tensors")
-
-        pixel_staging = self._vision_pixel_staging
-        position_staging = self._vision_position_staging
-        expected_pixel_shape = (capacity, *pixel_shape)
-        expected_position_shape = (capacity, *position_shape)
-        if pixel_staging is None:
-            pixel_staging = CpuGpuBuffer(
-                *expected_pixel_shape,
-                dtype=first_crops.pixel_values.dtype,
-                device=self.device,
-                pin_memory=True,
-                with_numpy=False,
-                zero=False,
-            )
-            self._vision_pixel_staging = pixel_staging
-        elif tuple(pixel_staging.cpu.shape) != expected_pixel_shape:
-            raise RuntimeError(
-                "vision pixel staging shape changed after allocation: "
-                f"{tuple(pixel_staging.cpu.shape)} -> {expected_pixel_shape}"
-            )
-        if position_staging is None:
-            position_staging = CpuGpuBuffer(
-                *expected_position_shape,
-                dtype=first_crops.image_position_ids.dtype,
-                device=self.device,
-                pin_memory=True,
-                zero=False,
-            )
-            self._vision_position_staging = position_staging
-        elif tuple(position_staging.cpu.shape) != expected_position_shape:
-            raise RuntimeError(
-                "vision position staging shape changed after allocation: "
-                f"{tuple(position_staging.cpu.shape)} -> {expected_position_shape}"
-            )
-
-        for row, crops in enumerate(crops_list):
-            if (
-                tuple(crops.pixel_values.shape) != pixel_shape
-                or crops.pixel_values.dtype != pixel_staging.cpu.dtype
-            ):
-                raise ValueError("batched vision pixel tensors must share shape and dtype")
-            if (
-                tuple(crops.image_position_ids.shape) != position_shape
-                or crops.image_position_ids.dtype != position_staging.cpu.dtype
-            ):
-                raise ValueError(
-                    "batched vision position tensors must share shape and dtype"
-                )
-            pixel_staging.cpu[row].copy_(crops.pixel_values)
-            position_staging.cpu[row].copy_(crops.image_position_ids)
-
-        return (
-            pixel_staging.copy_to_gpu(batch_size),
-            position_staging.copy_to_gpu(batch_size),
-        )
-
     def _image_features_for_batch(
         self,
         image_crops_list: Sequence[Any],
@@ -294,10 +225,18 @@ class Gemma4Runtime:
         if unique:
             groups = list(unique.values())
             crops = [item for item, _ in groups]
-            pixel_values, position_ids = self._stage_vision_inputs(crops)
+            staged = self._vision_stager.stage(
+                [
+                    {
+                        "pixel_values": item.pixel_values,
+                        "position_ids": item.image_position_ids,
+                    }
+                    for item in crops
+                ]
+            )
             packed = self.model.model.get_image_features(
-                pixel_values,
-                position_ids,
+                staged["pixel_values"],
+                staged["position_ids"],
             ).detach()
             lengths = [int(item.num_image_tokens) for item in crops]
             if int(packed.shape[0]) != sum(lengths):
@@ -340,7 +279,7 @@ class Gemma4Runtime:
         return self._image_preprocessor.submit(image)
 
     def shutdown(self) -> None:
-        self._image_preprocessor.shutdown(wait=True)
+        self._image_preprocessor.shutdown()
 
     def can_reserve(self, total_length: int) -> bool:
         return (

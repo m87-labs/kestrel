@@ -20,6 +20,7 @@ from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
+from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
     Gemma4TextConfig,
     Gemma4VisionConfig,
@@ -822,11 +823,15 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
 
     calls = []
     batch_capacity = 16
-    state = SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs))
+    state = SimpleNamespace(
+        invocation=SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs)),
+        scalar_arguments={"active_batch", "kv_len"},
+    )
     megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {1: (object(),) * 3, 8: (object(),) * 3,
                             batch_capacity: (object(),) * 3}
     megakernel._slots = {(7, batch_capacity): state}
+    megakernel._input_preparation_plan = ()
     megakernel._spec = SimpleNamespace(
         launch_extents=lambda slot, extent: {
             "active_batch": extent,
@@ -869,8 +874,11 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     runtime = Gemma4Runtime.__new__(Gemma4Runtime)
     runtime.device = torch.device("cpu")
     runtime.max_batch_size = 4
-    runtime._vision_pixel_staging = None
-    runtime._vision_position_staging = None
+    runtime._vision_stager = BatchedTensorStager(
+        capacity=4,
+        device=runtime.device,
+        with_numpy={"pixel_values": False},
+    )
     calls = []
     input_ptrs = []
 
@@ -900,11 +908,13 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     assert len(calls) == 1
     assert calls[0][0].shape == (2, 6, 3)
     assert calls[0][1].shape == (2, 6, 2)
-    assert runtime._vision_pixel_staging.cpu.shape == (4, 6, 3)
-    assert runtime._vision_position_staging.cpu.shape == (4, 6, 2)
+    pixel_buffer = runtime._vision_stager.buffers["pixel_values"]
+    position_buffer = runtime._vision_stager.buffers["position_ids"]
+    assert pixel_buffer.cpu.shape == (4, 6, 3)
+    assert position_buffer.cpu.shape == (4, 6, 2)
     assert input_ptrs[0] == (
-        runtime._vision_pixel_staging.gpu.data_ptr(),
-        runtime._vision_position_staging.gpu.data_ptr(),
+        pixel_buffer.gpu.data_ptr(),
+        position_buffer.gpu.data_ptr(),
     )
     assert features[0] is features[2]
     assert features[3] is None
@@ -917,14 +927,14 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
         torch.arange(8, 12, dtype=torch.float32).reshape(1, 4),
     )
 
-    pixel_gpu_ptr = runtime._vision_pixel_staging.gpu.data_ptr()
-    position_gpu_ptr = runtime._vision_position_staging.gpu.data_ptr()
+    pixel_gpu_ptr = pixel_buffer.gpu.data_ptr()
+    position_gpu_ptr = position_buffer.gpu.data_ptr()
     repeated = runtime._image_features_for_batch([second, first])
     assert len(calls) == 2
     assert repeated[0] is not features[1]
     assert repeated[1] is not features[0]
-    assert runtime._vision_pixel_staging.gpu.data_ptr() == pixel_gpu_ptr
-    assert runtime._vision_position_staging.gpu.data_ptr() == position_gpu_ptr
+    assert pixel_buffer.gpu.data_ptr() == pixel_gpu_ptr
+    assert position_buffer.gpu.data_ptr() == position_gpu_ptr
     assert input_ptrs[1] == (pixel_gpu_ptr, position_gpu_ptr)
 
 
