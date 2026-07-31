@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from kestrel.ops.attention import repeat_kv
+
 
 def torch_compilable_check(condition: bool, message: str) -> None:
     if not bool(condition):
@@ -289,16 +291,6 @@ class LinearAttentionLayer:
                     state.transpose(-1, -2).to(self.replay_checkpoint_states.dtype)
                 )
         self.replay_lengths.index_fill_(0, row_indices, 0)
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
 
 def sdpa_attention_forward(
     module: nn.Module,

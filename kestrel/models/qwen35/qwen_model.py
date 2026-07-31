@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from kestrel.ops.rotary import default_inv_freq
+
 from .inference_ops import (
     create_causal_mask,
     get_vision_bilinear_indices_and_weights,
@@ -101,7 +103,7 @@ class Qwen3_5VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        inv_freq = default_inv_freq(dim, theta)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
@@ -113,20 +115,14 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
     def __init__(self, config: Qwen3_5TextConfig, device=None):
         super().__init__()
-        dim = int(config.head_dim * config.partial_rotary_factor)
-        inv_freq = 1.0 / (
-            config.rope_theta
-            ** (
-                torch.arange(0, dim, 2, dtype=torch.int64).to(
-                    device=device,
-                    dtype=torch.float,
-                )
-                / dim
-            )
+        inv_freq = default_inv_freq(
+            config.head_dim,
+            config.rope_theta,
+            partial_rotary_factor=config.partial_rotary_factor,
+            device=device,
         )
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
         self.mrope_section = config.mrope_section
 
     @torch.no_grad()
