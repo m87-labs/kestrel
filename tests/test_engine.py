@@ -32,7 +32,6 @@ def _make_request(
         request_id=request_id,
         prompt="prompt",
         prompt_tokens=[object(), object()],
-        image=image,
         image_hash=None,
         media=media,
         max_new_tokens=8,

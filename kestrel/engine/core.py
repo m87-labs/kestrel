@@ -97,7 +97,6 @@ from kestrel.engine._types import (
     _StreamQueueItem,
     _StreamingChunk,
     _StreamingSessionRequest,
-    _media_to_legacy_image,
 )
 from kestrel.engine.executor import AutoregressiveExecutor
 from kestrel.engine.single_pass import SinglePassExecutor, _SinglePassRequest
@@ -1026,18 +1025,21 @@ class InferenceEngine:
 
         # The queued request carries ordered media; a legacy ``image``
         # argument (the stable submit(image=...) surface) is projected into
-        # it, and skill-originated media passes through untouched. When media
-        # is the source, the transitional legacy ``image`` value is derived
-        # from it so the admission path below keeps working unchanged.
+        # it, and skill-originated media passes through untouched. The legacy
+        # image representation begins only at admission.
         if media is None:
             if image is None:
                 media = ()
             elif isinstance(image, (list, tuple)):
+                if not image:
+                    # Matches the historical rejection of an empty image list —
+                    # an explicitly image-typed argument with nothing in it.
+                    raise TypeError(
+                        "image must be an np.ndarray/bytes, or a list of them"
+                    )
                 media = tuple(MediaInput(kind="image", data=one) for one in image)
             else:
                 media = (MediaInput(kind="image", data=image),)
-        else:
-            image = _media_to_legacy_image(media)
 
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
@@ -1056,16 +1058,15 @@ class InferenceEngine:
                 "adapter provider is available."
             )
 
-        image_obj = None
-        if image is not None:
+        # Validate image payload types up front (matching the historical
+        # submit(image=...) behavior). Modality validation is admission's job:
+        # non-image media flows through and fails only its own request there.
+        image_items = [item.data for item in media if item.kind == "image"]
+        if image_items:
             if self.runtime.image_prefix_length == 0:
                 raise ValueError("Runtime does not support image inputs")
-            # A skill may pass several images (an ordered list, e.g. chat with
-            # multiple images); the runtime that accepts them unpacks the list.
-            items = image if isinstance(image, (list, tuple)) else [image]
-            if not items or not all(isinstance(one, (np.ndarray, bytes)) for one in items):
+            if not all(isinstance(one, (np.ndarray, bytes)) for one in image_items):
                 raise TypeError("image must be an np.ndarray/bytes, or a list of them")
-            image_obj = image
 
         prompt_str = skill_spec.prompt_text(request_context)
         tokens = list(skill_spec.build_prompt_tokens(self.runtime, request_context))
@@ -1082,7 +1083,6 @@ class InferenceEngine:
             request_id=req_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
-            image=image_obj,
             image_hash=None,  # Computed in scheduler thread if prefix cache enabled
             media=media,
             max_new_tokens=max_new_tokens,

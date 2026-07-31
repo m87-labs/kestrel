@@ -4,8 +4,7 @@
 ordered ``MediaInput`` values, and passes skill-originated
 ``BuiltRequest.media`` through untouched. These tests pin that the queued
 ``_AutoregressiveRequest.media`` preserves object identity and order from
-both entry paths (and, transitionally, that the legacy ``image`` field still
-mirrors the same payload for the admission path).
+both entry paths; the legacy image representation begins only at admission.
 """
 
 from __future__ import annotations
@@ -83,7 +82,6 @@ def _stub_engine() -> InferenceEngine:
 def test_no_image_queues_empty_media() -> None:
     payload = _submit(_stub_engine(), image=None)
     assert payload.media == ()
-    assert payload.image is None
 
 
 def test_one_image_queues_one_media_input() -> None:
@@ -92,7 +90,6 @@ def test_one_image_queues_one_media_input() -> None:
     (item,) = payload.media
     assert item.kind == "image"
     assert item.data is image
-    assert payload.image is image  # transitional legacy mirror
 
 
 def test_multiple_images_queue_ordered_media() -> None:
@@ -108,7 +105,6 @@ def test_skill_media_reaches_queued_request_unchanged() -> None:
     media = (MediaInput(kind="image", data=image),)
     payload = _submit(_stub_engine(), image=None, media=media)
     assert payload.media is media  # the exact tuple, not a copy
-    assert payload.image is image  # transitional legacy mirror
 
 
 def test_public_query_media_reaches_queue() -> None:

@@ -279,12 +279,11 @@ class _AutoregressiveRequest:
     request_id: int
     prompt: str
     prompt_tokens: Sequence[Token]
-    image: Optional[LegacyImageInput]
     image_hash: Optional[bytes]  # SHA256 hash for prefix caching
-    # The ordered engine-facing media of this request. Transitional: ``image``
-    # above carries the same payload in legacy form so the admission path can
-    # keep reading it; the two fields are populated together until admission
-    # consumes ``media`` directly and ``image`` is removed.
+    # The ordered engine-facing media of this request — the projection of the
+    # skill-owned request (``request_context``) that the engine consumes. The
+    # legacy image representation begins only at admission, which adapts this
+    # media and carries the result on _ReadyAdmission.
     media: tuple[MediaInput, ...]
     max_new_tokens: int
     temperature: float
