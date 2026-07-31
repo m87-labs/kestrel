@@ -17,18 +17,20 @@ from kestrel.engine import (
 )
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
-from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills import DecodeStep, MediaInput, SkillFinalizeResult, SkillSpec, SkillState
 
 
 def _make_request(
     *, request_id: int = 1, image: np.ndarray | bytes | None = None
 ) -> _AutoregressiveRequest:
+    media = () if image is None else (MediaInput(kind="image", data=image),)
     return _AutoregressiveRequest(
         request_id=request_id,
         prompt="prompt",
         prompt_tokens=[object(), object()],
         image=image,
         image_hash=None,
+        media=media,
         max_new_tokens=8,
         temperature=0.0,
         top_p=1.0,

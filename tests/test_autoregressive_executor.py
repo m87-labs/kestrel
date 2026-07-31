@@ -38,6 +38,7 @@ def _pending(request_id: int) -> _AutoregressiveRequest:
         prompt_tokens=[],
         image=None,
         image_hash=None,
+        media=(),
         max_new_tokens=4,
         temperature=0.0,
         top_p=1.0,

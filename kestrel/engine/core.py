@@ -572,16 +572,12 @@ class InferenceEngine:
         return_logprobs = self._extract_logprobs(settings)
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
-        effective_image = cast(
-            Optional[LegacyImageInput],
-            self._media_to_legacy_image(built.media),
-        )
         submit_fn = self.submit_streaming if stream else self.submit
         return await submit_fn(
             built.request_context,
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
-            image=effective_image,
+            _media=built.media,
             temperature=built.temperature,
             top_p=built.top_p,
             _logprobs=return_logprobs,
@@ -603,6 +599,7 @@ class InferenceEngine:
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
+        _media: Optional[tuple[MediaInput, ...]] = None,
     ) -> EngineResult:
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
@@ -617,6 +614,7 @@ class InferenceEngine:
             request_context=request_context,
             adapter=adapter,
             image=image,
+            media=_media,
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
@@ -803,6 +801,7 @@ class InferenceEngine:
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
+        _media: Optional[tuple[MediaInput, ...]] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         generated_prefix = self._normalize_generated_prefix(
@@ -818,6 +817,7 @@ class InferenceEngine:
             request_context=request_context,
             adapter=adapter,
             image=image,
+            media=_media,
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
@@ -1037,10 +1037,29 @@ class InferenceEngine:
         suppress_next_token_ids: Optional[tuple[int, ...]],
         stream_queue: Optional[_StreamQueue],
         skill: str,
+        media: Optional[tuple[MediaInput, ...]] = None,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
         await self._ensure_started()
+
+        # The queued request carries ordered media; a legacy ``image``
+        # argument (the stable submit(image=...) surface) is projected into
+        # it, and skill-originated media passes through untouched. When media
+        # is the source, the transitional legacy ``image`` value is derived
+        # from it so the admission path below keeps working unchanged.
+        if media is None:
+            if image is None:
+                media = ()
+            elif isinstance(image, (list, tuple)):
+                media = tuple(MediaInput(kind="image", data=one) for one in image)
+            else:
+                media = (MediaInput(kind="image", data=image),)
+        else:
+            image = cast(
+                Optional[LegacyImageInput],
+                self._media_to_legacy_image(media),
+            )
 
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
@@ -1087,6 +1106,7 @@ class InferenceEngine:
             prompt_tokens=tokens,
             image=image_obj,
             image_hash=None,  # Computed in scheduler thread if prefix cache enabled
+            media=media,
             max_new_tokens=max_new_tokens,
             temperature=norm_temperature,
             top_p=norm_top_p,

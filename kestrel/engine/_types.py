@@ -29,7 +29,7 @@ import numpy as np
 
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
 from kestrel.models.moondream.runtime import Token
-from kestrel.skills import SkillSpec, SkillState
+from kestrel.skills import MediaInput, SkillSpec, SkillState
 from kestrel.utils.image import LegacyImageInput
 
 @dataclass(slots=True)
@@ -280,6 +280,11 @@ class _AutoregressiveRequest:
     prompt_tokens: Sequence[Token]
     image: Optional[LegacyImageInput]
     image_hash: Optional[bytes]  # SHA256 hash for prefix caching
+    # The ordered engine-facing media of this request. Transitional: ``image``
+    # above carries the same payload in legacy form so the admission path can
+    # keep reading it; the two fields are populated together until admission
+    # consumes ``media`` directly and ``image`` is removed.
+    media: tuple[MediaInput, ...]
     max_new_tokens: int
     temperature: float
     top_p: float

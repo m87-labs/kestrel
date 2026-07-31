@@ -167,6 +167,7 @@ def test_worker_fails_ar_if_scheduler_dies_after_forwarding() -> None:
             prompt_tokens=[],
             image=None,
             image_hash=None,
+            media=(),
             max_new_tokens=1,
             temperature=0.0,
             top_p=1.0,

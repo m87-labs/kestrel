@@ -61,10 +61,11 @@ def test_rejects_mixed_image_and_non_image_media() -> None:
         )
 
 
-def test_public_image_request_submits_through_legacy_image_path() -> None:
-    """End to end across the compatibility boundary: a public ``query`` with
-    an image flows prompt -> skill media -> adapter -> the unchanged
-    ``submit(image=...)`` path, delivering the caller's exact image object."""
+def test_public_image_request_submits_ordered_media() -> None:
+    """End to end above the queue: a public ``query`` with an image flows
+    prompt -> skill media -> ``submit(_media=...)``, delivering the caller's
+    exact image object. The legacy image value is derived from this media
+    at request submission (transitionally) and, ultimately, at admission."""
     eng = object.__new__(InferenceEngine)
     eng._skills_override = SkillRegistry([QuerySkill()])
     captured: dict[str, Any] = {}
@@ -78,4 +79,6 @@ def test_public_image_request_submits_through_legacy_image_path() -> None:
     image = np.zeros((2, 2, 3), dtype=np.uint8)
     out = asyncio.run(eng.query(image=image, question="what is this?"))
     assert out == "RESULT"
-    assert captured["image"] is image
+    (item,) = captured["_media"]
+    assert item.kind == "image"
+    assert item.data is image
