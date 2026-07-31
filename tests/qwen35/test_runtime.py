@@ -19,7 +19,7 @@ from kestrel.models.qwen35.qwen_model import (
     Qwen3_5TopKRouter,
 )
 from kestrel.models.qwen35.runtime import Qwen35Runtime
-from kestrel.models.qwen35.skills import Qwen35QuerySkill
+from kestrel.models.qwen35.skills import build_skill_registry
 from kestrel.runtime.carried_state import StateRepresentationRequirement
 
 
@@ -271,7 +271,7 @@ def test_gdn_ssm_parameters_stay_float32():
 
 
 def test_query_defaults_to_direct_answer():
-    skill = Qwen35QuerySkill()
+    skill = build_skill_registry().resolve("query")
     request = skill.build_request(
         image=None,
         prompt={"question": "What is 2+2?"},

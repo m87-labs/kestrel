@@ -20,7 +20,7 @@ from kestrel.models.qwen35.prompt_template import (
     IM_END_ID,
     Qwen35PromptTemplate,
 )
-from kestrel.models.qwen35.skills import Qwen35QuerySkill
+from kestrel.models.qwen35.skills import build_skill_registry
 
 
 _ANSWER_ID = 42
@@ -43,7 +43,7 @@ def _runtime():
 
 
 def _request(*, stream_callback=None, return_logprobs: bool = False):
-    skill = Qwen35QuerySkill()
+    skill = build_skill_registry().resolve("query")
     context = QueryRequest(
         question="question",
         image=None,

@@ -36,8 +36,21 @@ class QueryRequest:
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
+@dataclass(frozen=True, slots=True)
+class QueryPolicy:
+    temperature: float = AR_DEFAULT_TEMPERATURE
+    top_p: float = AR_DEFAULT_TOP_P
+    default_reasoning: bool = True
+    reasoning_in_settings: bool = False
+    supports_spatial_refs: bool = True
+
+
 class QuerySkill(SkillSpec):
     """Default skill emitting plain text answers."""
+
+    def __init__(self, policy: QueryPolicy = QueryPolicy()) -> None:
+        super().__init__(name="query")
+        self.policy = policy
 
     def build_request(
         self,
@@ -52,18 +65,27 @@ class QuerySkill(SkillSpec):
         if not question:
             raise ValueError("question must be a non-empty string")
         refs = normalize_spatial_refs(prompt.get("spatial_refs"))
-        if refs is not None and image is None:
-            raise ValueError("spatial_refs can only be used with an image")
+        if refs is not None:
+            if not self.policy.supports_spatial_refs:
+                raise ValueError("query does not support spatial_refs")
+            if image is None:
+                raise ValueError("spatial_refs can only be used with an image")
         s = parse_settings(
             settings,
-            temperature=AR_DEFAULT_TEMPERATURE,
-            top_p=AR_DEFAULT_TOP_P,
+            temperature=self.policy.temperature,
+            top_p=self.policy.top_p,
             max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
         )
+        reasoning_source = settings if self.policy.reasoning_in_settings else prompt
         request = QueryRequest(
             question=question,
             image=image,
-            reasoning=bool(prompt.get("reasoning", True)),
+            reasoning=bool(
+                (reasoning_source or {}).get(
+                    "reasoning",
+                    self.policy.default_reasoning,
+                )
+            ),
             stream=bool(prompt.get("stream", False)),
             spatial_refs=refs,
         )
@@ -76,9 +98,6 @@ class QuerySkill(SkillSpec):
 
     def prompt_text(self, request_context: object) -> str:
         return getattr(request_context, "question", "")
-
-    def __init__(self) -> None:
-        super().__init__(name="query")
 
     def build_prompt_tokens(
         self,
