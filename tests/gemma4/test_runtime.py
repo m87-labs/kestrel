@@ -99,6 +99,20 @@ class _FakePageTable:
             self.free_batch_idx.append(batch_idx)
 
 
+def test_embedding_scales_live_with_their_generated_weight_sources():
+    model = Gemma4TextModel(
+        _text_config(
+            vocab_size_per_layer_input=8,
+            hidden_size_per_layer_input=2,
+        )
+    )
+
+    assert model.embed_tokens.embed_scale.item() == pytest.approx(2.0)
+    assert model.embed_tokens_per_layer.embed_scale.item() == pytest.approx(2**0.5)
+    assert "embed_tokens.embed_scale" not in model.state_dict()
+    assert "embed_tokens_per_layer.embed_scale" not in model.state_dict()
+
+
 def test_packed_text_prefill_matches_individual_rows():
     torch.manual_seed(11)
     model = Gemma4TextModel(

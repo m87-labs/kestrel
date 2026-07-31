@@ -358,7 +358,7 @@ class Gemma4TextModel(nn.Module):
             config.hidden_size,
             padding_idx=0,
         )
-        self.register_buffer(
+        self.embed_tokens.register_buffer(
             "embed_scale",
             torch.tensor(config.hidden_size**0.5),
             persistent=False,
@@ -389,8 +389,8 @@ class Gemma4TextModel(nn.Module):
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
                 padding_idx=0,
             )
-            self.register_buffer(
-                "per_layer_embed_scale",
+            self.embed_tokens_per_layer.register_buffer(
+                "embed_scale",
                 torch.tensor(config.hidden_size_per_layer_input**0.5),
                 persistent=False,
             )
@@ -410,10 +410,13 @@ class Gemma4TextModel(nn.Module):
             )
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids) * self.embed_scale
+        return self.embed_tokens(input_ids) * self.embed_tokens.embed_scale
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
-        per = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
+        per = (
+            self.embed_tokens_per_layer(input_ids)
+            * self.embed_tokens_per_layer.embed_scale
+        )
         return per.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
