@@ -21,7 +21,7 @@ from kestrel.models import get_spec, known_models
 from kestrel.ops import attention as attention_ops
 from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
-from kestrel.models.gemma4.runtime import Gemma4Runtime, create_gemma4_runtime
+from kestrel.models.gemma4.runtime import Gemma4Runtime
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
     Gemma4TextConfig,
@@ -178,7 +178,7 @@ def test_modelspecs_register_on_import():
     }
     assert expected <= names, f"missing variants: {expected - names}"
     spec = get_spec(_MODEL_ID)
-    assert spec.runtime is create_gemma4_runtime
+    assert spec.runtime is Gemma4Runtime
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
     assert spec.skills().names() == ("query",)
@@ -236,10 +236,6 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots(
 
     captured = {}
 
-    def embed_row(_runtime, input_ids, **kwargs):
-        del kwargs
-        return input_ids.unsqueeze(-1).float(), input_ids
-
     def prefill(
         _runtime,
         inputs_embeds,
@@ -262,10 +258,20 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots(
     rt = Gemma4Runtime.__new__(Gemma4Runtime)
     rt.max_batch_size = 2
     rt.device = torch.device("cpu")
-    rt.model = object()
-    rt._config = object()
-    monkeypatch.setattr(Gemma4Runtime, "_embed_row", embed_row)
+    rt.model = SimpleNamespace(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(
+                embed=lambda input_ids: input_ids.unsqueeze(-1).float()
+            )
+        )
+    )
+    rt._config = SimpleNamespace(image_token_id=999)
     monkeypatch.setattr(Gemma4Runtime, "_prefill", prefill)
+    monkeypatch.setattr(
+        Gemma4Runtime,
+        "_image_features_for_batch",
+        lambda _runtime, _crops: [None, torch.tensor([[-1.0]])],
+    )
     rt.page_table = _PackedPageTable()
     rows = [
         SimpleNamespace(
@@ -274,16 +280,26 @@ def test_launch_prepared_batch_packs_heterogeneous_rows_without_invalid_slots(
         ),
         SimpleNamespace(
             state=SimpleNamespace(batch_idx=2, last_hidden=None),
-            tokens_list=[TextToken(token_id=index) for index in range(512)],
+            tokens_list=[
+                TextToken(token_id=999),
+                *[TextToken(token_id=index) for index in range(1, 512)],
+            ],
         ),
     ]
     slot = SimpleNamespace(batch_idx=torch.zeros(2, dtype=torch.long))
 
-    logits = rt.launch_prepared_batch(rows, slot)
+    logits = rt.launch_prepared_batch(
+        rows,
+        slot,
+        images=[None, object()],
+        image_crops_list=[None, object()],
+    )
 
     assert logits.shape == (2, 4)
     assert captured["inputs_embeds"].shape == (1, 520, 1)
     assert captured["input_ids"].shape == (1, 520)
+    assert captured["inputs_embeds"][0, 8, 0] == -1
+    assert captured["input_ids"][0, 8] == 0
     assert captured["position_ids"][0, :8].tolist() == list(range(8))
     assert captured["position_ids"][0, 8:].tolist() == list(range(512))
     assert captured["cu_seqlens"].tolist() == [0, 8, 520]
@@ -459,7 +475,7 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
 
 
 def test_decode_state_tables_keep_local_and_global_storage_disjoint():
-    from kestrel.models.gemma4.generated_decode import _paged_tensors
+    from kestrel.models.gemma4.generated_decode import _paged_kv
 
     layers = [
         SimpleNamespace(
@@ -474,8 +490,8 @@ def test_decode_state_tables_keep_local_and_global_storage_disjoint():
     ]
     kinds = ["sliding_attention", "full_attention", "sliding_attention"]
 
-    local = _paged_tensors(layers, kinds, kind="sliding_attention", field="k_cache")
-    global_ = _paged_tensors(layers, kinds, kind="full_attention", field="k_cache")
+    local, _ = _paged_kv(layers, kinds, kind="sliding_attention")
+    global_, _ = _paged_kv(layers, kinds, kind="full_attention")
 
     assert [None if tensor is None else tuple(tensor.shape) for tensor in local] == [
         (3, 1, 4), None, None]

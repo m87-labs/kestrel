@@ -226,31 +226,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
             text_length,
         )
 
-    def _embed_row(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        image: Any,
-        crops: Any,
-        image_features: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        language_model = self.model.model.language_model
-        if image is None or crops is None:
-            return language_model.embed(input_ids), input_ids
-        if image_features is None:
-            raise RuntimeError("missing encoded features for image row")
-        image_mask = input_ids == self._config.image_token_id
-        model_ids = input_ids.clone()
-        model_ids[image_mask] = 0
-        embeds = language_model.embed(model_ids)
-        return (
-            embeds.masked_scatter(
-                image_mask.unsqueeze(-1).expand_as(embeds),
-                image_features.to(device=embeds.device, dtype=embeds.dtype),
-            ),
-            model_ids,
-        )
-
     def _prefill(
         self,
         inputs_embeds: torch.Tensor,
@@ -428,58 +403,64 @@ class Gemma4Runtime(UncachedPagedRuntime):
         ]
         self.page_table.commit_block_table(batch_indices)
 
+        token_rows = []
         lengths = []
-        embed_rows = []
-        id_rows = []
         image_features = self._image_features_for_batch(image_crops_list)
-        for row, (prepared, image, crops) in enumerate(
-            zip(prepared_sequences, images, image_crops_list, strict=True)
+        for prepared, image, crops in zip(
+            prepared_sequences, images, image_crops_list, strict=True
         ):
-            prefill_slot.batch_idx[row] = prepared.state.batch_idx
+            if (image is None) != (crops is None):
+                raise ValueError("each image row requires matching preprocessed crops")
             tokens = prepared.tokens_list
             if not tokens or not all(isinstance(token, TextToken) for token in tokens):
                 raise ValueError("prefill requires non-empty text-token rows")
-            token_ids = torch.tensor(
-                [[int(token.token_id) for token in tokens]],
-                dtype=torch.long,
-                device=self.device,
-            )
-            embeds, model_ids = self._embed_row(
-                token_ids,
-                image=image,
-                crops=crops,
-                image_features=image_features[row],
-            )
-            lengths.append(token_ids.shape[1])
-            embed_rows.append(embeds)
-            id_rows.append(model_ids)
+            token_rows.append([int(token.token_id) for token in tokens])
+            lengths.append(len(tokens))
 
-        inputs_embeds = torch.cat(embed_rows, dim=1)
-        input_ids = torch.cat(id_rows, dim=1)
-        positions = [
-            torch.arange(
-                length,
-                dtype=torch.long,
-                device=self.device,
-            )
-            for length in lengths
+        flat_ids = [token_id for row in token_rows for token_id in row]
+        input_ids = torch.tensor([flat_ids], dtype=torch.long, device=self.device)
+        image_mask = input_ids == self._config.image_token_id
+        model_ids = input_ids.masked_fill(image_mask, 0)
+        inputs_embeds = self.model.model.language_model.embed(model_ids)
+        packed_image_features = [
+            features for features in image_features if features is not None
         ]
-        position_ids = torch.cat(positions).unsqueeze(0)
-        token_batch_indices = torch.cat(
+        feature_count = sum(int(features.shape[0]) for features in packed_image_features)
+        image_token_count = sum(
+            row.count(self._config.image_token_id) for row in token_rows
+        )
+        if feature_count != image_token_count:
+            raise RuntimeError(
+                f"encoded {feature_count} image features for "
+                f"{image_token_count} image tokens"
+            )
+        if packed_image_features:
+            inputs_embeds.masked_scatter_(
+                image_mask.unsqueeze(-1).expand_as(inputs_embeds),
+                torch.cat(packed_image_features),
+            )
+
+        prefill_slot.batch_idx[:batch_size].copy_(
+            torch.tensor(batch_indices, dtype=torch.long, device=self.device)
+        )
+        position_ids = torch.tensor(
+            [[position for length in lengths for position in range(length)]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        token_batch_indices = torch.tensor(
             [
-                torch.full(
-                    (length,),
-                    batch_idx,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                for batch_idx, length in zip(
-                    batch_indices,
-                    lengths,
-                    strict=True,
-                )
-            ]
-        ).unsqueeze(0)
+                [
+                    batch_idx
+                    for batch_idx, length in zip(
+                        batch_indices, lengths, strict=True
+                    )
+                    for _ in range(length)
+                ]
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
         slot_mapping = self.page_table.build_slot_mapping(
             batch_idx=token_batch_indices,
             positions=position_ids,
@@ -501,7 +482,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
         )
         hidden_rows, logits = self._prefill(
             inputs_embeds,
-            input_ids,
+            model_ids,
             position_ids,
             slot_mapping,
             last_token_offsets,
@@ -524,19 +505,4 @@ class Gemma4Runtime(UncachedPagedRuntime):
         self._eager_decode(slot, batch_size)
 
 
-def create_gemma4_runtime(
-    cfg: Any,
-    *,
-    max_lora_rank: int | None = None,
-    kv_pool: KVMemoryPool | None = None,
-    compute_stream: Any = None,
-) -> Gemma4Runtime:
-    return Gemma4Runtime(
-        cfg,
-        max_lora_rank=max_lora_rank,
-        kv_pool=kv_pool,
-        compute_stream=compute_stream,
-    )
-
-
-__all__ = ["Gemma4Runtime", "create_gemma4_runtime"]
+__all__ = ["Gemma4Runtime"]

@@ -37,25 +37,30 @@ def _compile_from_config(
     )
 
 
-def _paged_tensors(
+def _paged_kv(
     layers: Any,
     layer_types: tuple[str, ...],
     *,
     kind: str,
-    field: str,
-) -> list[torch.Tensor | None]:
+) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
+    keys = []
     values = []
     for layer_type, layer in zip(layer_types, layers, strict=True):
         if layer is None or layer_type != kind:
+            keys.append(None)
             values.append(None)
             continue
-        tensor = getattr(layer, field)
-        if tensor.shape[2] != 1:
-            raise ValueError(
-                f"generated decode requires unit KV pages, got {tuple(tensor.shape)}"
-            )
-        values.append(tensor[:, :, 0, :])
-    return values
+        for tensor, output in (
+            (layer.k_cache, keys),
+            (layer.v_cache, values),
+        ):
+            if tensor.shape[2] != 1:
+                raise ValueError(
+                    "generated decode requires unit KV pages, "
+                    f"got {tuple(tensor.shape)}"
+                )
+            output.append(tensor[:, :, 0, :])
+    return keys, values
 
 
 def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
@@ -72,17 +77,6 @@ def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
             for table in rotary(probe, positions, kind)
         )
         for kind in ("sliding_attention", "full_attention")
-    }
-
-
-def _runtime_extents(runtime: Any, capacity: int) -> dict[str, int]:
-    del capacity
-    page_table = runtime.page_table.page_table
-    return {
-        "n_pages": runtime.page_table.n_pages,
-        "page_table_capacity": page_table.shape[1],
-        "position_capacity": runtime.max_seq_length,
-        "state_rows": page_table.shape[0],
     }
 
 
@@ -115,6 +109,12 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
         ropes = _rope_tables(runtime)
         local_cos, local_sin = ropes["sliding_attention"]
         global_cos, global_sin = ropes["full_attention"]
+        local_k, local_v = _paged_kv(
+            layers, layer_types, kind="sliding_attention"
+        )
+        global_k, global_v = _paged_kv(
+            layers, layer_types, kind="full_attention"
+        )
         return {
             "page_table": page_table,
             "kv_len": 1,
@@ -122,18 +122,10 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             "rope_sin_local": local_sin,
             "rope_cos_global": global_cos,
             "rope_sin_global": global_sin,
-            "mK_local": _paged_tensors(
-                layers, layer_types, kind="sliding_attention", field="k_cache"
-            ),
-            "mV_local": _paged_tensors(
-                layers, layer_types, kind="sliding_attention", field="v_cache"
-            ),
-            "mK_global": _paged_tensors(
-                layers, layer_types, kind="full_attention", field="k_cache"
-            ),
-            "mV_global": _paged_tensors(
-                layers, layer_types, kind="full_attention", field="v_cache"
-            ),
+            "mK_local": local_k,
+            "mV_local": local_v,
+            "mK_global": global_k,
+            "mV_global": global_v,
         }
 
     return GeneratedDecode.try_create(
@@ -158,7 +150,12 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
                 "batch_idx": slot.meta.batch_idx.gpu[:capacity],
                 "input_pos": slot.meta.input_pos.gpu[:capacity],
             },
-            runtime_extents=lambda capacity: _runtime_extents(runtime, capacity),
+            runtime_extents=lambda _capacity: {
+                "n_pages": runtime.page_table.n_pages,
+                "page_table_capacity": runtime.page_table.page_table.shape[1],
+                "position_capacity": runtime.max_seq_length,
+                "state_rows": runtime.page_table.page_table.shape[0],
+            },
             launch_extents=lambda slot, batch_size: {
                 "active_batch": batch_size,
                 "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
