@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import threading
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Sequence
 
 import torch
 from torch.nn import functional as F
 
-from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
-from kestrel.device import make_event, make_stream
+from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
-from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
+from kestrel.runtime.decode_slot import DecodeSlot
+from kestrel.runtime.paged_resources import create_paged_runtime_resources
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
     materialize_dynamic_batch_domain,
@@ -33,28 +31,6 @@ from .paged_cache import paged_kv_layout
 
 
 _MAX_SHIPPED_KV_LEN = 2048
-
-
-def _decode_slot_rows(max_batch_size: int) -> int:
-    """Cover both logical scheduler slots and the next decode capacity."""
-
-    max_batch_size = int(max_batch_size)
-    if max_batch_size < 1:
-        raise ValueError("max_batch_size must be positive")
-    scheduler_rows = max_batch_size + 2
-    decode_capacity = 1 << (max_batch_size - 1).bit_length()
-    return max(scheduler_rows, decode_capacity)
-
-
-@dataclass
-class _SimplePrefillSlot:
-    """Scheduler-facing state for Gemma prefill."""
-
-    slot_id: int
-    batch_idx: torch.Tensor
-    step_done_event: Any
-    commit_done_event: Any
-    scratch: Any = None
 
 
 class Gemma4Runtime:
@@ -134,14 +110,11 @@ class Gemma4Runtime:
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.spec = None
         self.max_batch_size = cfg.max_batch_size
-        self.max_batch_slots = self.max_batch_size + 2
         self._vision_stager = BatchedTensorStager(
             capacity=self.max_batch_size,
             device=self.device,
             with_numpy={"pixel_values": False},
         )
-        self._decode_slot_rows = _decode_slot_rows(self.max_batch_size)
-        self._padding_batch_idx = self.max_batch_slots - 1
         self.page_size = cfg.page_size
         self._kv_cache_pages = cfg.kv_cache_pages
         self.max_seq_length = min(
@@ -155,47 +128,28 @@ class Gemma4Runtime:
             workers=derive_preprocessing_workers(self.max_batch_size),
         )
 
-        self._compute_stream = (
-            compute_stream if compute_stream is not None else make_stream(self.device)
-        )
-        self._copy_stream = make_stream(self.device)
-        self.graph_capture_lock = threading.RLock()
-        self.page_table = PageTable(
-            n_pages=self._kv_cache_pages,
+        text_cfg = self._config.text_config
+        resources = create_paged_runtime_resources(
+            device=self.device,
+            dtype=self.dtype,
+            max_batch_size=self.max_batch_size,
             page_size=self.page_size,
-            max_batch_size=self.max_batch_slots,
-            device=str(self.device),
-            prefix_cache=None,
-            h2d_stream=self._compute_stream,
+            kv_cache_pages=self._kv_cache_pages,
+            vocab_size=text_cfg.vocab_size,
+            hidden_dim=text_cfg.hidden_size,
+            compute_stream=compute_stream,
         )
-        self.page_table.free_batch_idx.remove(self._padding_batch_idx)
-        self.page_table.reserve(self._padding_batch_idx, 1)
-        self.page_table.commit_block_table([self._padding_batch_idx])
-        self._prefill_slot = _SimplePrefillSlot(
-            slot_id=0,
-            batch_idx=torch.zeros((self.max_batch_size,), dtype=torch.int64, device=self.device),
-            step_done_event=make_event(self.device, enable_timing=False, blocking=False),
-            commit_done_event=make_event(self.device, enable_timing=False, blocking=False),
-        )
+        self._compute_stream = resources.compute_stream
+        self._copy_stream = resources.copy_stream
+        self.graph_capture_lock = resources.graph_capture_lock
+        self.page_table = resources.page_table
+        self.max_batch_slots = resources.max_batch_slots
+        self._decode_slot_rows = resources.decode_rows
+        self._padding_batch_idx = resources.padding_batch_idx
+        self._prefill_slot = resources.prefill_slot
         self._prefill_slot_in_use = False
         self.prefill_slots: Sequence[Any] = (self._prefill_slot,)
-
-        text_cfg = self._config.text_config
-        self._decode_slots = tuple(
-            create_decode_slot(
-                slot_id=i,
-                device=self.device,
-                dtype=self.dtype,
-                max_batch_slots=self._decode_slot_rows,
-                kv_cache_pages=self._kv_cache_pages,
-                vocab_size=text_cfg.vocab_size,
-                hidden_dim=text_cfg.hidden_size,
-                position_shape=(self._decode_slot_rows, 1),
-                compute_stream=self._compute_stream,
-                copy_stream=self._copy_stream,
-            )
-            for i in range(2)
-        )
+        self._decode_slots = resources.decode_slots
         self.decode_slots: Sequence[Any] = self._decode_slots
         self.active_sequences: dict[int, Any] = {}
 

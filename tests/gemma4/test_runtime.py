@@ -20,6 +20,7 @@ from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
 from kestrel.models.gemma4 import model as gemma_model
 from kestrel.runtime.decode_slot import DecodeSlot
+from kestrel.runtime.paged_resources import decode_slot_rows
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
     Gemma4TextConfig,
@@ -30,7 +31,6 @@ from kestrel.models.gemma4.model import Gemma4TextModel
 from kestrel.models.gemma4.paged_cache import kv_source_layers, paged_kv_layout
 from kestrel.models.gemma4.runtime import (
     Gemma4Runtime,
-    _decode_slot_rows,
 )
 from kestrel.models.gemma4.skills import Gemma4QuerySkill, build_skill_registry
 
@@ -513,10 +513,10 @@ def test_decode_slot_implements_constraint_buffer_abi():
 
 
 def test_decode_slot_rows_cover_non_bucket_compiled_capacity():
-    assert _decode_slot_rows(1) == 3
-    assert _decode_slot_rows(8) == 10
-    assert _decode_slot_rows(11) == 16
-    assert _decode_slot_rows(16) == 18
+    assert decode_slot_rows(1) == 3
+    assert decode_slot_rows(8) == 10
+    assert decode_slot_rows(11) == 16
+    assert decode_slot_rows(16) == 18
 
 
 def test_decode_with_slot_runs_generated_program_for_b1(monkeypatch):
@@ -825,7 +825,7 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
     batch_capacity = 16
     state = SimpleNamespace(
         invocation=SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs)),
-        scalar_arguments={"active_batch", "kv_len"},
+        argument_names={"active_batch", "kv_len"},
     )
     megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {1: (object(),) * 3, 8: (object(),) * 3,
