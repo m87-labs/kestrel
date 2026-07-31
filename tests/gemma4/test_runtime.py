@@ -474,8 +474,8 @@ def test_prefill_deduplicates_images_within_batch_without_persistent_cache():
     assert input_ptrs[1] == (pixel_gpu_ptr, position_gpu_ptr)
 
 
-def test_decode_state_tables_keep_local_and_global_storage_disjoint():
-    from kestrel.models.gemma4.generated_decode import _paged_kv
+def test_generated_decode_binds_named_paged_kv_sets():
+    from kestrel.runtime.generated_decode import PagedDecodeBindings
 
     layers = [
         SimpleNamespace(
@@ -489,14 +489,28 @@ def test_decode_state_tables_keep_local_and_global_storage_disjoint():
         None,
     ]
     kinds = ["sliding_attention", "full_attention", "sliding_attention"]
+    runtime = SimpleNamespace(
+        page_table=SimpleNamespace(
+            n_pages=7,
+            page_table=torch.empty(5, 9, dtype=torch.int32),
+        )
+    )
+    inputs = PagedDecodeBindings(
+        layers,
+        kv_sets=(
+            ("local", "sliding_attention"),
+            ("global", "full_attention"),
+        ),
+        layer_kinds=kinds,
+    ).runtime_inputs(runtime)
 
-    local, _ = _paged_kv(layers, kinds, kind="sliding_attention")
-    global_, _ = _paged_kv(layers, kinds, kind="full_attention")
-
-    assert [None if tensor is None else tuple(tensor.shape) for tensor in local] == [
-        (3, 1, 4), None, None]
-    assert [None if tensor is None else tuple(tensor.shape) for tensor in global_] == [
-        None, (3, 1, 8), None]
+    assert [
+        None if tensor is None else tuple(tensor.shape) for tensor in inputs["mK_local"]
+    ] == [(3, 1, 4), None, None]
+    assert [
+        None if tensor is None else tuple(tensor.shape)
+        for tensor in inputs["mK_global"]
+    ] == [None, (3, 1, 8), None]
 
 
 def test_engine_adopts_externally_supplied_runtime_kv_pool():
