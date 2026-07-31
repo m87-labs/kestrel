@@ -30,8 +30,8 @@ class LinearAttentionLayer:
         self.replay_g: torch.Tensor | None = None
         self.replay_lengths: torch.Tensor | None = None
         self.replay_capacity = int(replay_capacity)
-        self.num_k_heads = int(getattr(config, "linear_num_key_heads", 0))
-        self.num_v_heads = int(getattr(config, "linear_num_value_heads", 0))
+        self.num_k_heads = int(config.linear_num_key_heads)
+        self.num_v_heads = int(config.linear_num_value_heads)
         self.is_conv_states_initialized = False
         self.is_recurrent_states_initialized = False
         self.has_previous_state = False

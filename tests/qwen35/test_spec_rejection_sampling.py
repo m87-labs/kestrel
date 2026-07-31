@@ -655,7 +655,7 @@ def _build_runtime_and_drafter(block_size: int = 16):
         RuntimeConfig(device="cuda", model="Qwen/Qwen3.5-4B", max_batch_size=1),
         kv_pool=KVMemoryPool(device=dev),
     )
-    tc = getattr(rt.hf_config, "text_config", rt.hf_config)
+    tc = rt.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]
@@ -863,7 +863,7 @@ def _try_build_spec_step_runner(batch_size=2, block_size=16, sampling=True):
                       max_batch_size=batch_size + 1, enable_cuda_graphs=False),
         kv_pool=KVMemoryPool(device=dev),
     )
-    tc = getattr(rt.hf_config, "text_config", rt.hf_config)
+    tc = rt.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]

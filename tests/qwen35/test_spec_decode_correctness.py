@@ -73,7 +73,7 @@ def _random_drafter(rt: Qwen35Runtime, block_size: int):
     Quality is irrelevant -- verify is exact-greedy -- but the shapes (hidden
     size, vocab, head dims, target taps) must match the target model.
     """
-    tc = getattr(rt.hf_config, "text_config", rt.hf_config)
+    tc = rt.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]  # 8 valid residual taps

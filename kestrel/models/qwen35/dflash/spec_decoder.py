@@ -959,7 +959,7 @@ class SpecRunner:
 
         # Persistent cache bound to the runtime's persistent GDN pool. The pool
         # rows are addressed by the actual batch_idx (gdn_state_indices=self.cb).
-        text_cfg = getattr(runtime.hf_config, "text_config", runtime.hf_config)
+        text_cfg = runtime.architecture.text_config
         runtime._linear_state_pool.initialize_from_config(text_cfg, dtype=runtime.dtype)
         self.cache = runtime._new_cache()
         runtime._linear_state_pool.bind_to_cache(self.cache)

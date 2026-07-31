@@ -152,7 +152,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         """
         base = config.rope_theta
         partial_rotary_factor = config.partial_rotary_factor
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = config.head_dim
         dim = int(head_dim * partial_rotary_factor)
 
         attention_factor = 1.0  # Unused in this type of RoPE
@@ -928,7 +928,7 @@ class Qwen3_5Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.is_causal = True
@@ -1421,10 +1421,6 @@ class Qwen3_5RMSNorm(nn.Module):
     def forward(self, x):
         return qwen_rms_norm(x, self.weight, self.eps)
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
@@ -1604,17 +1600,16 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig, use_postshuffle_norm=False) -> None:
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
+        self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.act_fn = nn.GELU()
         self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+        x = self.norm(x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
 
@@ -1772,10 +1767,7 @@ class Qwen3_5VisionModel(nn.Module):
                 for _ in range(config.depth)
             ]
         )
-        self.merger = Qwen3_5VisionPatchMerger(
-            config=config,
-            use_postshuffle_norm=False,
-        )
+        self.merger = Qwen3_5VisionPatchMerger(config)
         # One shared fused-MLP fc1/gelu workspace for all blocks (the intermediate
         # is consumed within each block's fused call and the blocks run
         # sequentially, so a single buffer suffices instead of one per block).

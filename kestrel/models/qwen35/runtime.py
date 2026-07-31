@@ -16,6 +16,8 @@ from torch import nn
 
 from kestrel.kv_cache import KVMemoryPool, PageTable
 from kestrel.runtime.decode_graph import DecodeGraphManager
+from kestrel.runtime.state import SequenceState
+from kestrel.runtime.tokens import Token
 from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
@@ -69,51 +71,10 @@ def _native_decode_state_requirements(generated, linear_state_pool):
 
 
 @dataclass
-class _EncodeResult:
-    ids: list[int]
-
-
-@dataclass
-class _TextConfigView:
-    vocab_size: int
-
-
-@dataclass
-class _RuntimeConfigView:
-    hf_config: Any
-    text: _TextConfigView
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.hf_config, name)
-
-
-@dataclass
 class _QwenForwardCache:
     past_key_values: Any
     rope_deltas: Optional[torch.Tensor] = None
     linear_state_row_indices: Optional[torch.Tensor] = None
-
-
-class _TokenizerShim:
-    def __init__(self, tokenizer: Any) -> None:
-        self._tok = tokenizer
-
-    def encode(self, text: str) -> _EncodeResult:
-        enc = self._tok.encode(text, add_special_tokens=False)
-        return _EncodeResult(ids=list(enc.ids))
-
-    def decode(
-        self,
-        ids: Sequence[int],
-        skip_special_tokens: bool = True,
-        **kwargs: Any,
-    ) -> str:
-        return self._tok.decode(
-            list(ids), skip_special_tokens=skip_special_tokens, **kwargs
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._tok, name)
 
 
 @dataclass
@@ -349,17 +310,15 @@ class Qwen35Runtime:
             )
 
         self.model = self._load_model(self._model_name).eval()
-        self.hf_config = self.model.config
-        text_cfg = _text_config(self.hf_config)
-        self.max_seq_length = int(getattr(text_cfg, "max_position_embeddings"))
-        self.config = _RuntimeConfigView(
-            hf_config=self.hf_config,
-            text=_TextConfigView(vocab_size=int(getattr(text_cfg, "vocab_size"))),
-        )
+        self.architecture = self.model.config
+        text_cfg = self.architecture.text_config
+        self.max_seq_length = int(text_cfg.max_position_embeddings)
+        self.vocab_size = int(text_cfg.vocab_size)
 
         from tokenizers import Tokenizer
 
-        self.tokenizer = _TokenizerShim(Tokenizer.from_pretrained(self._model_name))
+        self.tokenizer = Tokenizer.from_pretrained(self._model_name)
+        self.tokenizer.post_processor = None
         self.prompt_template = Qwen35PromptTemplate()
         self._eos_ids = {IM_END_ID, END_OF_TEXT_ID}
 
@@ -460,8 +419,8 @@ class Qwen35Runtime:
                 dtype=self.dtype,
                 max_batch_slots=self.max_batch_slots,
                 kv_cache_pages=self._kv_cache_pages,
-                vocab_size=int(getattr(text_cfg, "vocab_size")),
-                hidden_dim=int(getattr(text_cfg, "hidden_size")),
+                vocab_size=int(text_cfg.vocab_size),
+                hidden_dim=int(text_cfg.hidden_size),
                 compute_stream=self.primary_stream,
                 copy_stream=self.copy_stream,
             )
@@ -721,7 +680,7 @@ class Qwen35Runtime:
                 st.replay_checkpoint_states = None
                 st.replay_k = st.replay_u = st.replay_g = st.replay_lengths = None
         self._linear_state_pool.initialize_from_config(
-            _text_config(self.hf_config),
+            self.architecture.text_config,
             dtype=self.dtype,
         )
         self._replay_capacity = flush_cap
@@ -898,7 +857,7 @@ class Qwen35Runtime:
             grids = image_crops.image_grid_thw
             num_images = int(grids.shape[0])
             spatial = int(
-                getattr(self.hf_config.vision_config, "spatial_merge_size", 2)
+                self.architecture.vision_config.spatial_merge_size
             )
             # Per-image token count, computed the same way the position-id /
             # vision-metadata paths expect (so the expanded pad count matches).
@@ -1079,7 +1038,14 @@ class Qwen35Runtime:
     def abort_prepared_sequence(self, prepared: Any) -> None:
         self._release_batch_idx(prepared.state.batch_idx)
 
-    def retain_sequence_prefix(self, *args: Any, **kwargs: Any) -> None:
+    def retain_sequence_prefix(
+        self,
+        state: SequenceState,
+        generated_tokens: Sequence[Token],
+        *,
+        adapter_id: str | None,
+        image_hash: bytes | None,
+    ) -> None:
         return None
 
     def release_sequence(self, state: Any) -> None:
@@ -1159,7 +1125,7 @@ class Qwen35Runtime:
         slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
 
     def _zero_decode_graph_capture_buffers(self, slot: Qwen35DecodeSlot) -> None:
-        text_cfg = _text_config(self.hf_config)
+        text_cfg = self.architecture.text_config
         self._linear_state_pool.initialize_from_config(text_cfg, dtype=self.dtype)
         self._linear_state_pool.zero_all()
         self._decode_rope_deltas.zero_()
@@ -1432,7 +1398,7 @@ class Qwen35Runtime:
         image_grid_thw: np.ndarray,
     ) -> int:
         spatial_merge_size = int(
-            getattr(self.hf_config.vision_config, "spatial_merge_size", 2)
+            self.architecture.vision_config.spatial_merge_size
         )
         cursor = start
         current_pos = 0
@@ -1512,11 +1478,10 @@ class Qwen35Runtime:
             num_grid_per_side = int(visual.num_grid_per_side)
             spatial_merge_size = int(visual.config.spatial_merge_size)
         else:
-            vision_config = self.hf_config.vision_config
-            num_positions = int(getattr(vision_config, "num_position_embeddings", 2304))
+            vision_config = self.architecture.vision_config
+            num_positions = int(vision_config.num_position_embeddings)
             num_grid_per_side = int(num_positions**0.5)
-            spatial_merge_size = int(getattr(vision_config, "spatial_merge_size", 2))
-
+            spatial_merge_size = int(vision_config.spatial_merge_size)
 
         bilinear_indices = scratch.vision_bilinear_indices.np[:, :pixel_rows]
         bilinear_weights = scratch.vision_bilinear_weights.np[:, :pixel_rows]
@@ -2013,7 +1978,7 @@ class Qwen35Runtime:
 
     def _new_cache(self) -> Qwen35InferenceCache:
         return Qwen35InferenceCache(
-            config=_text_config(self.hf_config),
+            config=self.architecture.text_config,
             paged_kv=self._paged_kv,
             replay_capacity=self._linear_state_pool.replay_capacity,
         )
@@ -2186,10 +2151,4 @@ class Qwen35Runtime:
             pick = torch.multinomial(sorted_probs, 1)
             return int(sorted_idx[pick].item())
         return int(torch.multinomial(probs, 1).item())
-
-
-def _text_config(config: Any) -> Any:
-    return getattr(config, "text_config", config)
-
-
 __all__ = ["Qwen35Runtime", "QwenImageInputs"]

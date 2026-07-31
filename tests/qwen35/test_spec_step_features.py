@@ -653,7 +653,7 @@ def _try_build_runner(block_size=16, flush_cap=64, max_batch_size=2):
                       enable_cuda_graphs=False),
         kv_pool=KVMemoryPool(device=dev),
     )
-    tc = getattr(rt.hf_config, "text_config", rt.hf_config)
+    tc = rt.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]
@@ -2319,7 +2319,7 @@ def _try_build_spec_runner(block_size=16, flush_cap=128, batch_size=1,
                       max_batch_size=max(batch_size + 1, 2)),
         kv_pool=KVMemoryPool(device=dev),
     )
-    tc = getattr(rt.hf_config, "text_config", rt.hf_config)
+    tc = rt.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]

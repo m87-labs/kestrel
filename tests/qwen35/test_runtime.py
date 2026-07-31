@@ -466,6 +466,8 @@ def test_topk_router_matches_full_softmax_renormalization():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_runtime_constructs():
+    from tokenizers import Tokenizer
+
     cfg = RuntimeConfig(device="cuda", model=_MODEL_ID, max_batch_size=1)
     rt = Qwen35Runtime(cfg, kv_pool=KVMemoryPool(device=cfg.resolved_device()))
 
@@ -475,6 +477,14 @@ def test_runtime_constructs():
     assert rt.image_prefix_length > 0
     assert callable(rt.tokenizer.encode)
     assert callable(rt.tokenizer.decode)
+    assert rt.tokenizer.post_processor is None
+    assert rt.vocab_size == rt.architecture.text_config.vocab_size
+    text = "No hidden special tokens."
+    reference = Tokenizer.from_pretrained(_MODEL_ID)
+    assert rt.tokenizer.encode(text).ids == reference.encode(
+        text,
+        add_special_tokens=False,
+    ).ids
     assert rt.prompt_template.bos_id == 248045
     assert not hasattr(rt, "region")
     assert len(rt.prefill_slots) == 2
@@ -524,7 +534,7 @@ def test_spec_pool_resized_before_decode_graph_capture(monkeypatch):
             device=RuntimeConfig(device="cuda", model=_MODEL_ID).resolved_device()
         ),
     )
-    tc = getattr(probe.hf_config, "text_config", probe.hf_config)
+    tc = probe.architecture.text_config
     n_layers = int(tc.num_hidden_layers)
     step = max(1, n_layers // 8)
     target_layer_ids = tuple(range(1, n_layers, step))[:8]
@@ -642,16 +652,13 @@ def test_resize_linear_pool_for_spec_is_idempotent(monkeypatch):
         def initialize_from_config(self, config, *, dtype):
             self.init_calls += 1
 
-    monkeypatch.setattr(
-        "kestrel.models.qwen35.runtime._text_config",
-        lambda cfg: SimpleNamespace(linear_replay_capacity=0),
-    )
-
     flush_cap = 48
     # First resize: pool at the small default -> must reallocate to flush_cap.
     pool = _FakePool(capacity=16)
     stub = SimpleNamespace(
-        _linear_state_pool=pool, hf_config=object(), dtype=torch.bfloat16
+        _linear_state_pool=pool,
+        architecture=SimpleNamespace(text_config=object()),
+        dtype=torch.bfloat16,
     )
     _RT._resize_linear_pool_for_spec(stub, flush_cap)
     assert pool.replay_capacity == flush_cap
@@ -1122,6 +1129,8 @@ def test_text_forward_uses_compact_gdn_state_indices_for_compact_cache():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
     )
     rt.page_table = SimpleNamespace(
         page_table=torch.arange(8, dtype=torch.int32).view(8, 1),
@@ -1158,6 +1167,8 @@ def test_text_forward_preserves_packed_gdn_row_mapping():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
     )
     rt.page_table = SimpleNamespace(
         page_table=torch.arange(8, dtype=torch.int32).view(8, 1),
@@ -2414,7 +2425,7 @@ def test_zero_decode_graph_capture_buffers_initializes_and_clears_gdn_state():
         linear_conv_kernel_dim=5,
     )
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
-    rt.hf_config = cfg
+    rt.architecture = SimpleNamespace(text_config=cfg)
     rt.dtype = torch.bfloat16
     rt._linear_state_pool = Qwen35LinearStatePool(
         config=cfg,
@@ -2669,8 +2680,11 @@ def test_packed_prefill_batch_builds_token_level_metadata():
 
 def test_packed_prefill_multimodal_position_ids_match_qwen_mrope_layout():
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
-    rt.hf_config = SimpleNamespace(
-        vision_config=SimpleNamespace(spatial_merge_size=2)
+    rt.architecture = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2,
+            num_position_embeddings=2304,
+        )
     )
     out = torch.empty((3, 1, 9), dtype=torch.long).numpy()
     mm_types = torch.tensor(
@@ -2705,8 +2719,11 @@ def test_packed_prefill_batch_stages_image_metadata_in_slot_buffers():
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     rt.device = torch.device("cpu")
     rt.dtype = torch.float32
-    rt.hf_config = SimpleNamespace(
-        vision_config=SimpleNamespace(spatial_merge_size=2)
+    rt.architecture = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2,
+            num_position_embeddings=2304,
+        )
     )
     rt.page_table = PageTable(
         n_pages=16,
@@ -2792,6 +2809,8 @@ def test_qwen_linear_state_pool_binds_decode_cache_to_persistent_rows():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
     )
     page_table = PageTable(
         n_pages=4,
@@ -2893,6 +2912,8 @@ def test_qwen_linear_state_pool_captures_batched_gdn_rows():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
     )
     page_table = PageTable(
         n_pages=4,

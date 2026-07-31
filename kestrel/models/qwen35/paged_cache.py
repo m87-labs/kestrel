@@ -182,7 +182,7 @@ class Qwen35LinearStatePool:
         self.max_batch_slots = int(max_batch_slots)
         self.device = device
         self.replay_capacity = int(replay_capacity)
-        self.num_k_heads = int(getattr(config, "linear_num_key_heads", 0))
+        self.num_k_heads = int(config.linear_num_key_heads)
         self.layers: list[_LinearStateStorage | None] = [
             _LinearStateStorage() if layer_type == "linear_attention" else None
             for layer_type in _layer_types(config)
@@ -662,21 +662,11 @@ class Qwen35LinearStatePool:
             storage.replay_lengths.index_fill_(0, src_indices, 0)
 
 def _layer_types(config: Any) -> list[str]:
-    layer_types = getattr(config, "layer_types", None)
-    if layer_types is None:
-        n_layers = int(getattr(config, "num_hidden_layers", 0))
-        return ["full_attention"] * n_layers
-    return list(layer_types)
+    return list(config.layer_types)
 
 
 def _head_dim(config: Any) -> int:
-    return int(
-        getattr(
-            config,
-            "head_dim",
-            int(config.hidden_size) // int(config.num_attention_heads),
-        )
-    )
+    return int(config.head_dim)
 
 
 __all__ = [
