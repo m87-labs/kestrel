@@ -8,7 +8,7 @@ import kestrel.models.qwen35  # noqa: F401
 import kestrel.models.qwen35.qwen_model as qwen_model
 from kestrel.models import get_spec, known_models
 from kestrel.models.qwen35.inference_ops import LinearAttentionLayer
-from kestrel.models.qwen35.paged_cache import qwen_paged_kv_layout
+from kestrel.models.qwen35.cache import qwen_kv_layout
 from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
 from kestrel.models.qwen35.qwen_model import (
     Qwen3_5Attention,
@@ -95,7 +95,7 @@ def test_supported_variants_register():
 
 
 def test_hybrid_cache_uses_shared_paged_kv_layout():
-    specs, sources = qwen_paged_kv_layout(
+    specs, sources = qwen_kv_layout(
         _text_config(
             num_hidden_layers=3,
             layer_types=["linear_attention", "full_attention", "linear_attention"],

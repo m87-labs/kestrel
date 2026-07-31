@@ -34,7 +34,7 @@ from .inference_ops import (
     torch_compilable_check,
 )
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
-from .paged_cache import Qwen35InferenceCache
+from .cache import Qwen35InferenceCache
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API

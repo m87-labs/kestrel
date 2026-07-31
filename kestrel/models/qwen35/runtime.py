@@ -25,10 +25,10 @@ from kestrel.runtime.preprocessing import (
 )
 from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
-from .paged_cache import (
+from .cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
-    qwen_paged_kv_layout,
+    qwen_kv_layout,
 )
 from .prefill_slot import (
     Qwen35PrefillScratch,
@@ -367,7 +367,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 f"device ({self.device})"
             )
         self._replay_capacity = 16
-        kv_specs, kv_sources = qwen_paged_kv_layout(text_cfg)
+        kv_specs, kv_sources = qwen_kv_layout(text_cfg)
         self._paged_kv = LayeredPagedKV.allocate(
             layer_specs=kv_specs,
             source_layer_idx=kv_sources,

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm
 
 
-def qwen_paged_kv_layout(
+def qwen_kv_layout(
     config: Any,
 ) -> tuple[tuple[PagedKVLayerSpec | None, ...], tuple[int, ...]]:
     """Describe which hybrid layers own ordinary paged K/V storage."""
@@ -339,7 +339,7 @@ class Qwen35LinearStatePool:
 
 
 __all__ = [
-    "qwen_paged_kv_layout",
+    "qwen_kv_layout",
     "Qwen35InferenceCache",
     "Qwen35LinearStatePool",
 ]
