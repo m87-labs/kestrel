@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields, replace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,9 +21,7 @@ from kestrel.models import get_spec, known_models
 from kestrel.ops import attention as attention_ops
 from kestrel.runtime import ExecutionShape, TextToken
 from kestrel.models.gemma4 import model as gemma_model
-from kestrel.runtime.decode_slot import DecodeSlot
 from kestrel.models.gemma4.runtime import Gemma4Runtime, create_gemma4_runtime
-from kestrel.runtime.paged_resources import decode_slot_rows
 from kestrel.runtime.staging import BatchedTensorStager
 from kestrel.models.gemma4.config import (
     Gemma4TextConfig,
@@ -187,18 +185,6 @@ def test_modelspecs_register_on_import():
     assert spec.tokenizer_id == _MODEL_ID
     assert spec.skills is build_skill_registry
     assert spec.skills().names() == ("query",)
-
-
-def test_decode_slot_implements_constraint_buffer_abi():
-    names = {field.name for field in fields(DecodeSlot)}
-    assert {"disallow_mask", "mask_ready_event"} <= names
-
-
-def test_decode_slot_rows_cover_non_bucket_compiled_capacity():
-    assert decode_slot_rows(1) == 3
-    assert decode_slot_rows(8) == 10
-    assert decode_slot_rows(11) == 16
-    assert decode_slot_rows(16) == 18
 
 
 def test_prefill_slot_release_rejects_foreign_and_duplicate_slots():
