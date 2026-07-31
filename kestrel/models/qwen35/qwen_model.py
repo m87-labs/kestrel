@@ -2004,17 +2004,7 @@ class Qwen3_5Model(nn.Module):
         inputs_embeds: torch.FloatTensor,
         image_features: torch.FloatTensor | None = None,
     ) -> torch.Tensor:
-        if input_ids is None:
-            image_embedding = self.language_model.embed_tokens.weight[
-                self.config.image_token_id
-            ].to(
-                dtype=inputs_embeds.dtype
-            )
-            special_image_mask = inputs_embeds == image_embedding
-            special_image_mask = special_image_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-
+        special_image_mask = input_ids == self.config.image_token_id
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if image_features is not None:
@@ -2069,11 +2059,10 @@ class Qwen3_5Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Qwen35InferenceCache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
@@ -2091,11 +2080,7 @@ class Qwen3_5Model(nn.Module):
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
     ) -> _TextModelOutput:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds = self.language_model.embed_tokens(input_ids)
+        inputs_embeds = self.language_model.embed_tokens(input_ids)
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(
