@@ -32,6 +32,62 @@ class GeneratedDecodeSpec:
 class _BoundInvocation:
     invocation: Any
     argument_names: frozenset[str]
+    required_launch_extents: frozenset[str]
+
+
+def _merge_disjoint_inputs(
+    label: str,
+    **namespaces: Mapping[str, Any],
+) -> dict[str, Any]:
+    owners: dict[str, str] = {}
+    merged: dict[str, Any] = {}
+    for namespace, values in namespaces.items():
+        for name, value in values.items():
+            previous = owners.get(name)
+            if previous is not None:
+                raise RuntimeError(
+                    f"generated {label} input {name!r} is owned by both "
+                    f"{previous} and {namespace}"
+                )
+            owners[name] = namespace
+            merged[name] = value
+    return merged
+
+
+def _require_uniform_weight_contract(
+    label: str,
+    programs: Mapping[int, tuple[Any, Any, Any]],
+) -> None:
+    contracts = {
+        int(capacity): tuple(compiled.weight_binding_contract)
+        for capacity, (compiled, _validated, _bundle) in programs.items()
+    }
+    first = next(iter(contracts.values()))
+    incompatible = [
+        capacity for capacity, contract in contracts.items() if contract != first
+    ]
+    if incompatible:
+        raise RuntimeError(
+            f"generated {label} capacities disagree on weight storage ABI: "
+            f"{incompatible}"
+        )
+
+
+def _required_launch_extents(
+    compiled: Any,
+    construction_extents: Mapping[str, int],
+) -> frozenset[str]:
+    program = compiled.device_program
+    static_values = program.static_runtime_extents.values
+    if callable(static_values):
+        static_values = program.static_runtime_extents.items()
+    static_names = {str(name) for name, _value in static_values}
+    construction_names = set(construction_extents)
+    return frozenset(
+        argument.name
+        for argument in program.argument_plan.by_source("runtime_extent")
+        if argument.name not in static_names and argument.name not in construction_names
+    )
 
 
 class GeneratedDecode:
@@ -104,6 +160,7 @@ class GeneratedDecode:
         self._programs = dict(sorted(programs.items()))
         self._spec = spec
         first_compiled = next(iter(self._programs.values()))[0]
+        _require_uniform_weight_contract(spec.label, self._programs)
         self.state_requirements_by_capacity = {
             int(capacity): tuple(
                 StateRepresentationRequirement(
@@ -149,40 +206,83 @@ class GeneratedDecode:
         for slot in runtime.decode_slots:
             for batch_capacity, program in self._programs.items():
                 compiled, validated, aot_bundle = program
-                requirements = self.state_requirements_by_capacity[
-                    int(batch_capacity)
-                ]
-                runtime_inputs = {
-                    **shared_inputs,
-                    **(
-                        spec.capacity_inputs(int(batch_capacity), requirements)
-                        if spec.capacity_inputs is not None
-                        else {}
-                    ),
-                    **spec.slot_inputs(slot, int(batch_capacity)),
-                }
+                requirements = self.state_requirements_by_capacity[int(batch_capacity)]
+                capacity_inputs = (
+                    dict(spec.capacity_inputs(int(batch_capacity), requirements))
+                    if spec.capacity_inputs is not None
+                    else {}
+                )
+                slot_inputs = dict(spec.slot_inputs(slot, int(batch_capacity)))
+                runtime_inputs = _merge_disjoint_inputs(
+                    spec.label,
+                    shared=shared_inputs,
+                    capacity=capacity_inputs,
+                    slot=slot_inputs,
+                )
                 plan = derive_device_input_preparation_plan(
                     compiled.device_program,
                     ready_inputs=set(runtime_inputs) - spec.not_ready_inputs,
                     preparations=spec.preparations,
                 )
                 plans.append(tuple(step.name for step in plan))
+                argument_names = frozenset(
+                    argument.name
+                    for argument in compiled.device_program.argument_plan.arguments
+                )
+                construction_batch = min(
+                    int(batch_capacity),
+                    int(runtime.max_batch_size),
+                )
+                construction_extents = dict(spec.runtime_extents(int(batch_capacity)))
+                initial_launch_extents = dict(
+                    spec.launch_extents(slot, construction_batch)
+                )
+                overlap = construction_extents.keys() & initial_launch_extents.keys()
+                if overlap:
+                    raise RuntimeError(
+                        f"generated {spec.label} capacity {batch_capacity} "
+                        "declares extents as both construction and launch values "
+                        f"{sorted(overlap)}"
+                    )
+                unknown_launch_extents = initial_launch_extents.keys() - argument_names
+                if unknown_launch_extents:
+                    raise RuntimeError(
+                        f"generated {spec.label} capacity {batch_capacity} "
+                        "declares unknown launch arguments "
+                        f"{sorted(unknown_launch_extents)}"
+                    )
+                required_launch_extents = frozenset(
+                    _required_launch_extents(compiled, construction_extents)
+                    | initial_launch_extents.keys()
+                )
+                missing_launch_extents = (
+                    required_launch_extents - initial_launch_extents.keys()
+                )
+                if missing_launch_extents:
+                    raise RuntimeError(
+                        f"generated {spec.label} capacity {batch_capacity} "
+                        "does not supply dynamic launch extents "
+                        f"{sorted(missing_launch_extents)}"
+                    )
                 bindings = assemble_torch_device_bindings(
                     compiled,
                     bound_weights=self.weight_storage.buffers,
                     runtime_inputs=runtime_inputs,
-                    runtime_extents=spec.runtime_extents(int(batch_capacity)),
+                    runtime_extents={
+                        **construction_extents,
+                        **initial_launch_extents,
+                    },
                     stream=slot.compute_stream,
                     device=runtime.device,
                 )
-                self._slots[(int(slot.slot_id), int(batch_capacity))] = _BoundInvocation(
-                    invocation=bind_aot_device_program(
-                        validated, aot_bundle, bindings.values
-                    ),
-                    argument_names=frozenset(
-                        argument.name
-                        for argument in compiled.device_program.argument_plan.arguments
-                    ),
+                self._slots[(int(slot.slot_id), int(batch_capacity))] = (
+                    _BoundInvocation(
+                        invocation=bind_aot_device_program(
+                            validated, aot_bundle, bindings.values
+                        ),
+                        argument_names=argument_names,
+                        required_launch_extents=required_launch_extents,
+                    )
                 )
         if len(set(plans)) != 1:
             raise RuntimeError(
@@ -226,6 +326,12 @@ class GeneratedDecode:
             self._spec.preparation_callbacks[step_name](slot, batch_size)
         bound = self._slots[(int(slot.slot_id), capacity)]
         candidates = self._spec.launch_extents(slot, batch_size)
+        missing = bound.required_launch_extents - candidates.keys()
+        if missing:
+            raise RuntimeError(
+                f"generated {self._spec.label} launch does not supply dynamic "
+                f"extents {sorted(missing)}"
+            )
         bound.invocation.launch(
             **{
                 name: value

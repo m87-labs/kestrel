@@ -121,9 +121,7 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
     state_cache: dict[str, list[torch.Tensor | None]] = {}
     recurrent_states_by_form: dict[Any, list[torch.Tensor | None]] = {}
 
-    def state_inputs(
-        _capacity: int, requirements: tuple[Any, ...]
-    ) -> dict[str, Any]:
+    def state_inputs(_capacity: int, requirements: tuple[Any, ...]) -> dict[str, Any]:
         if not state_cache:
             state_cache["conv"] = _state_tensors(
                 runtime._linear_state_pool, "conv_states"
@@ -186,8 +184,7 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
                 "input_pos": slot.meta.input_pos.gpu[:capacity],
                 "position_ids": slot.position_ids[1:4, :capacity, 0],
             },
-            runtime_extents=lambda capacity: {
-                "active_batch": capacity,
+            runtime_extents=lambda _capacity: {
                 "n_pages": int(runtime.page_table.n_pages),
                 "page_table_capacity": int(page_table.shape[1]),
                 "state_rows": int(page_table.shape[0]),
@@ -211,12 +208,14 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             not_ready_inputs=frozenset({"position_ids"}),
             preparation_callbacks={
                 "gather_rope_deltas": (
-                    lambda slot, batch_size:
-                    runtime._gather_decode_rope_deltas(slot, batch_size)
+                    lambda slot, batch_size: runtime._gather_decode_rope_deltas(
+                        slot, batch_size
+                    )
                 ),
                 "prepare_position_ids": (
-                    lambda slot, batch_size:
-                    runtime._prepare_decode_position_ids(slot, batch_size)
+                    lambda slot, batch_size: runtime._prepare_decode_position_ids(
+                        slot, batch_size
+                    )
                 ),
             },
             unsupported=(_UnsupportedDecodeConfig,),

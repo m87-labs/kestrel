@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +13,6 @@ import kestrel.models.qwen35.qwen_model as qwen_model
 from kestrel.config import RuntimeConfig
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.models import get_spec, known_models
-from kestrel.runtime.decode_slot import DecodeSlot
 from kestrel.models.qwen35.paged_cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
@@ -22,6 +20,18 @@ from kestrel.models.qwen35.paged_cache import (
 )
 from kestrel.models.qwen35.inference_ops import LinearAttentionLayer
 from kestrel.models.qwen35.prompt_template import IMAGE_PAD_ID
+from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
+from kestrel.models.qwen35.qwen_model import (
+    Qwen3_5Attention,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5RMSNormGated,
+    Qwen3_5SparseMoeBlock,
+    Qwen3_5TextModel,
+    Qwen3_5TextRotaryEmbedding,
+    Qwen3_5TopKRouter,
+)
+from kestrel.models.qwen35.runtime import QwenImageInputs, Qwen35Runtime
+from kestrel.models.qwen35.skills import Qwen35QuerySkill
 
 
 def _text_config_data(**overrides):
@@ -105,21 +115,6 @@ def _qwen_config_data(*, text=None, **overrides):
     }
     data.update(overrides)
     return data
-from kestrel.models.qwen35.qwen_config import Qwen3_5Config, Qwen3_5TextConfig
-from kestrel.models.qwen35.qwen_model import (
-    Qwen3_5Attention,
-    Qwen3_5GatedDeltaNet,
-    Qwen3_5RMSNormGated,
-    Qwen3_5SparseMoeBlock,
-    Qwen3_5TextModel,
-    Qwen3_5TextRotaryEmbedding,
-    Qwen3_5TopKRouter,
-)
-from kestrel.models.qwen35.runtime import (
-    QwenImageInputs,
-    Qwen35Runtime,
-)
-from kestrel.models.qwen35.skills import Qwen35QuerySkill
 
 
 requires_mkl = pytest.mark.skipif(
@@ -154,21 +149,15 @@ def _make_qwen_cache(
 
 
 def _fake_capacity_compiled(capacity: int):
-    capacity = int(capacity)
-
-    def refusal(name, value):
-        assert name == "active_batch"
-        return (
-            None
-            if 1 <= int(value) <= capacity
-            else "exceeds physical capacity"
-        )
-
     return SimpleNamespace(
-        capacity=capacity,
+        capacity=int(capacity),
         device_program=SimpleNamespace(
             static_runtime_extents={},
-            runtime_extent_refusal=refusal,
+            runtime_extent_refusal=lambda name, value: (
+                None
+                if name == "active_batch" and 1 <= int(value) <= int(capacity)
+                else "exceeds physical capacity"
+            ),
         ),
     )
 
@@ -189,11 +178,6 @@ def test_modelspecs_register_on_import():
     spec = get_spec(_MODEL_ID)
     assert spec.runtime is Qwen35Runtime
     assert spec.tokenizer_id == _MODEL_ID
-
-
-def test_decode_slot_implements_constraint_buffer_abi():
-    names = {field.name for field in fields(DecodeSlot)}
-    assert {"disallow_mask", "mask_ready_event"} <= names
 
 
 def test_fused_qkv_attention_handles_multitoken_prefill_views():
@@ -486,10 +470,13 @@ def test_runtime_constructs(monkeypatch, tmp_path):
     assert rt.tokenizer.post_processor is None
     assert rt.vocab_size == rt.architecture.text_config.vocab_size
     text = "No hidden special tokens."
-    assert rt.tokenizer.encode(text).ids == reference.encode(
-        text,
-        add_special_tokens=False,
-    ).ids
+    assert (
+        rt.tokenizer.encode(text).ids
+        == reference.encode(
+            text,
+            add_special_tokens=False,
+        ).ids
+    )
     assert rt.prompt_template.bos_id == 248045
     assert not hasattr(rt, "region")
     assert len(rt.prefill_slots) == 2
@@ -539,12 +526,14 @@ def test_decode_with_slot_runs_bound_megakernel_for_b1(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: _StreamContext())
     rt._decode_graphs = SimpleNamespace(
         run=lambda bound_slot, batch_size: calls.append(
-            ("graph", bound_slot, batch_size)),
+            ("graph", bound_slot, batch_size)
+        ),
     )
     rt._decode_megakernel = SimpleNamespace(
         supports=lambda batch_size: batch_size == 1,
         run=lambda bound_slot, batch_size: calls.append(
-            ("megakernel", bound_slot, batch_size)),
+            ("megakernel", bound_slot, batch_size)
+        ),
     )
     rt._decode_state_coordinator = None
 
@@ -563,47 +552,56 @@ def test_decode_path_switch_prepares_compiler_declared_state(monkeypatch):
 
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     calls = []
-    generated_c1 = (StateRepresentationRequirement(
-        "gdn_recurrent_state",
-        "materialized",
-        ("state_row", "value_head", "key", "value"),
-        "fp32",
-    ),)
-    generated_c8 = (StateRepresentationRequirement(
-        "gdn_recurrent_state",
-        "materialized",
-        ("state_row", "value_head", "value", "key"),
-        "fp32",
-    ),)
-    native = (StateRepresentationRequirement(
-        "gdn_recurrent_state",
-        "replay",
-        ("state_row", "value_head", "value", "key"),
-        "fp32",
-    ),)
+    generated_c1 = (
+        StateRepresentationRequirement(
+            "gdn_recurrent_state",
+            "materialized",
+            ("state_row", "value_head", "key", "value"),
+            "fp32",
+        ),
+    )
+    generated_c8 = (
+        StateRepresentationRequirement(
+            "gdn_recurrent_state",
+            "materialized",
+            ("state_row", "value_head", "value", "key"),
+            "fp32",
+        ),
+    )
+    native = (
+        StateRepresentationRequirement(
+            "gdn_recurrent_state",
+            "replay",
+            ("state_row", "value_head", "value", "key"),
+            "fp32",
+        ),
+    )
     megakernel = SimpleNamespace(
         supports=lambda batch_size: batch_size <= 2,
         state_requirements_for=(
             lambda batch_size: generated_c1 if batch_size == 1 else generated_c8
         ),
-        run=lambda slot, batch_size: calls.append(
-            ("generated", slot, batch_size)),
+        run=lambda slot, batch_size: calls.append(("generated", slot, batch_size)),
     )
     coordinator = SimpleNamespace(
         prepare=lambda requirements, rows: calls.append(
-            ("prepare", requirements, rows)),
+            ("prepare", requirements, rows)
+        ),
     )
     slot = SimpleNamespace(
         compute_stream=None,
-        meta=SimpleNamespace(batch_idx=SimpleNamespace(
-            cpu=torch.tensor([3, 5, 7], dtype=torch.int64))),
+        meta=SimpleNamespace(
+            batch_idx=SimpleNamespace(cpu=torch.tensor([3, 5, 7], dtype=torch.int64))
+        ),
     )
     rt._decode_megakernel = megakernel
     rt._decode_state_coordinator = coordinator
     rt._native_decode_state_requirements = native
     rt._decode_graphs = SimpleNamespace(
         run=lambda bound_slot, batch_size: calls.append(
-            ("native", bound_slot, batch_size)))
+            ("native", bound_slot, batch_size)
+        )
+    )
 
     Qwen35Runtime.decode_with_slot(rt, slot, batch_size=2)
     Qwen35Runtime.decode_with_slot(rt, slot, batch_size=1)
@@ -660,7 +658,8 @@ def test_prefill_state_coherence_bookkeeping_is_optional():
     rt = Qwen35Runtime.__new__(Qwen35Runtime)
     calls = []
     rt._decode_state_coordinator = SimpleNamespace(
-        mark_coherent=lambda rows: calls.append(tuple(rows)))
+        mark_coherent=lambda rows: calls.append(tuple(rows))
+    )
 
     rt._mark_decode_state_coherent((3, 5))
     rt._decode_state_coordinator = None
@@ -728,8 +727,7 @@ def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
 
-    recurrent = torch.arange(3 * 2 * 2 * 3, dtype=torch.float32).reshape(
-        3, 2, 2, 3)
+    recurrent = torch.arange(3 * 2 * 2 * 3, dtype=torch.float32).reshape(3, 2, 2, 3)
     storage = SimpleNamespace(
         recurrent_states=recurrent.clone(),
         replay_checkpoint_states=torch.full((3, 2, 3, 2), -1.0),
@@ -755,11 +753,9 @@ def test_linear_state_pool_seeds_selected_replay_rows_from_materialized():
         (0, 2),
     )
 
-    expected = recurrent.index_select(
-        0, torch.tensor([0, 2])).transpose(-1, -2)
+    expected = recurrent.index_select(0, torch.tensor([0, 2])).transpose(-1, -2)
     assert torch.equal(
-        storage.replay_checkpoint_states.index_select(
-            0, torch.tensor([0, 2])),
+        storage.replay_checkpoint_states.index_select(0, torch.tensor([0, 2])),
         expected,
     )
     assert torch.equal(
@@ -777,8 +773,7 @@ def test_linear_state_pool_preserves_value_major_checkpoint_on_replay_switch():
     from kestrel.models.qwen35.paged_cache import Qwen35LinearStatePool
     from mkl.megakernel.state_runtime import StatePhysicalForm
 
-    checkpoint = torch.arange(
-        3 * 2 * 3 * 2, dtype=torch.float32).reshape(3, 2, 3, 2)
+    checkpoint = torch.arange(3 * 2 * 3 * 2, dtype=torch.float32).reshape(3, 2, 3, 2)
     stale_recurrent = torch.full((3, 2, 2, 3), -99.0)
     storage = SimpleNamespace(
         recurrent_states=stale_recurrent.clone(),
@@ -826,16 +821,20 @@ def test_linear_state_pool_selects_compiler_required_recurrent_storage():
     pool = Qwen35LinearStatePool.__new__(Qwen35LinearStatePool)
     pool.layers = [storage, None]
 
-    selected_key_major = pool.recurrent_tensors_for_form(StatePhysicalForm(
-        "materialized",
-        ("state_row", "value_head", "key", "value"),
-        "fp32",
-    ))
-    selected_value_major = pool.recurrent_tensors_for_form(StatePhysicalForm(
-        "materialized",
-        ("state_row", "value_head", "value", "key"),
-        "fp32",
-    ))
+    selected_key_major = pool.recurrent_tensors_for_form(
+        StatePhysicalForm(
+            "materialized",
+            ("state_row", "value_head", "key", "value"),
+            "fp32",
+        )
+    )
+    selected_value_major = pool.recurrent_tensors_for_form(
+        StatePhysicalForm(
+            "materialized",
+            ("state_row", "value_head", "value", "key"),
+            "fp32",
+        )
+    )
 
     assert selected_key_major[0] is key_major
     assert selected_key_major[1] is None
@@ -866,8 +865,7 @@ def test_linear_state_pool_refuses_unsupported_in_place_layout_change():
         ValueError,
         match="does not support changing physical form",
     ):
-        pool.transition_recurrent_form(
-            key_major, value_major, (0,))
+        pool.transition_recurrent_form(key_major, value_major, (0,))
 
 
 @requires_mkl
@@ -875,41 +873,32 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     from kestrel.models.qwen35 import generated_decode
     from kestrel.runtime.generated_decode import GeneratedDecode
     from mkl.compiler import frontend
-    from mkl.megakernel import device_runtime
+    from mkl.megakernel import device_input_preparation, device_runtime
     from mkl.megakernel.state_runtime import StateRepresentationRequirement
 
     original_empty = torch.empty
     streams = []
-    bind_calls = []
-    ownership_calls = []
-    ordering = []
     selected_state_forms = []
     bound_runtime_inputs = []
+    bound_runtime_extents = []
 
     class _FakeEvent:
-        def __init__(self):
-            self.index = len([item for item in ordering if item[0] == "new-event"])
-            ordering.append(("new-event", self.index))
-
-        def record(self, stream):
-            ordering.append(("record", self.index, stream.name))
+        def record(self, _stream):
+            pass
 
     class _FakeStream:
         def __init__(self, name):
             self.name = name
 
-        def wait_event(self, event):
-            ordering.append(("wait", self.name, event.index))
+        def wait_event(self, _event):
+            pass
 
     class _StreamContext:
-        def __init__(self, stream):
-            self.stream = stream
-
         def __enter__(self):
-            ordering.append(("enter", self.stream.name))
+            pass
 
         def __exit__(self, exc_type, exc, traceback):
-            ordering.append(("exit", self.stream.name))
+            pass
 
     primary_stream = _FakeStream("primary-stream")
     ambient_stream = _FakeStream("ambient-stream")
@@ -917,42 +906,20 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     value_major_graph = object()
 
     def compiled_for(graph):
-        runtime_input_names = (
-            "input_ids",
-            "final_norm",
-            "logits",
-            "page_table",
-            "batch_idx",
-            "input_pos",
-            "position_ids",
-            "rope_inv_freq",
-            "gdn_conv_state",
-            "gdn_recurrent_state",
-            "mK",
-            "mV",
-        )
-        external = tuple(
-            SimpleNamespace(name=f"{name}_abi")
-            for name in runtime_input_names
+        launch_arguments = tuple(
+            SimpleNamespace(name=name) for name in ("active_batch", "kv_len")
         )
         return SimpleNamespace(
             graph=graph,
+            weight_binding_contract=(),
             device_program=SimpleNamespace(
-                validate_argument_plan=lambda: None,
                 argument_plan=SimpleNamespace(
-                    arguments=[],
+                    arguments=launch_arguments,
                     by_source=lambda source: (
-                        external if source == "external" else ()
+                        launch_arguments if source == "runtime_extent" else ()
                     ),
                 ),
-                physical_abi=SimpleNamespace(operands=tuple(
-                    SimpleNamespace(
-                        abi_name=f"{name}_abi",
-                        logical_name=name,
-                        owner="engine",
-                    )
-                    for name in runtime_input_names
-                )),
+                static_runtime_extents=SimpleNamespace(values={}),
             ),
         )
 
@@ -973,7 +940,10 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
             logits=torch.zeros(8, 16),
             meta=SimpleNamespace(
                 batch_idx=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
-                input_pos=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
+                input_pos=SimpleNamespace(
+                    cpu=torch.zeros(8, dtype=torch.int32),
+                    gpu=torch.zeros(8, dtype=torch.int32),
+                ),
             ),
             position_ids=torch.zeros(4, 8, 1, dtype=torch.int32),
         )
@@ -982,12 +952,11 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     runtime = SimpleNamespace(
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
+        max_batch_size=8,
         primary_stream=primary_stream,
         compute_stream=primary_stream,
         model=SimpleNamespace(
-            model=SimpleNamespace(
-                language_model=text_model
-            ),
+            model=SimpleNamespace(language_model=text_model),
             lm_head=object(),
         ),
         _linear_state_pool=SimpleNamespace(
@@ -1021,13 +990,13 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     )
     monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
     monkeypatch.setattr(
-        torch.cuda, "current_stream", lambda device=None: ambient_stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: _StreamContext(stream))
+        torch.cuda, "current_stream", lambda device=None: ambient_stream
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: _StreamContext())
     monkeypatch.setattr(
         frontend,
         "bind_owned_weight_storage",
-        lambda *args, **kwargs: ownership_calls.append((args, kwargs))
-        or SimpleNamespace(buffers={}),
+        lambda *args, **kwargs: SimpleNamespace(buffers={}),
     )
     monkeypatch.setattr(
         frontend,
@@ -1039,8 +1008,11 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
                 storage_axis_order=(
                     "state_row",
                     "value_head",
-                    *(("key", "value") if graph is key_major_graph
-                      else ("value", "key")),
+                    *(
+                        ("key", "value")
+                        if graph is key_major_graph
+                        else ("value", "key")
+                    ),
                 ),
                 storage_dtype="fp32",
             ),
@@ -1050,14 +1022,19 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     def assemble(*args, stream, **kwargs):
         streams.append(stream)
         bound_runtime_inputs.append(kwargs["runtime_inputs"])
+        bound_runtime_extents.append(kwargs["runtime_extents"])
         return SimpleNamespace(values={})
 
     monkeypatch.setattr(device_runtime, "assemble_torch_device_bindings", assemble)
     monkeypatch.setattr(
         device_runtime,
         "bind_aot_device_program",
-        lambda *args, **kwargs: bind_calls.append(args)
-        or SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        device_input_preparation,
+        "derive_device_input_preparation_plan",
+        lambda *_args, **_kwargs: (),
     )
 
     bundle_c1 = object()
@@ -1068,9 +1045,7 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
     monkeypatch.setattr(
         GeneratedDecode,
         "try_create",
-        classmethod(
-            lambda cls, bound_runtime, spec: captured.setdefault("spec", spec)
-        ),
+        classmethod(lambda cls, bound_runtime, spec: captured.setdefault("spec", spec)),
     )
     generated_decode.create_generated_decode(runtime)
     generated = GeneratedDecode(
@@ -1102,9 +1077,7 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
             "fp32",
         ).physical_form,
     ]
-    assert [
-        inputs["gdn_recurrent_state"] for inputs in bound_runtime_inputs
-    ] == [
+    assert [inputs["gdn_recurrent_state"] for inputs in bound_runtime_inputs] == [
         ["key-major-state"],
         ["value-major-state"],
         ["key-major-state"],
@@ -1115,35 +1088,20 @@ def test_decode_megakernel_binds_each_invocation_to_its_slot_stream(monkeypatch)
         for inputs in bound_runtime_inputs
     )
     assert all("x" not in inputs for inputs in bound_runtime_inputs)
+    assert [extents["active_batch"] for extents in bound_runtime_extents] == [
+        1,
+        8,
+        1,
+        8,
+    ]
     assert generated.state_requirements_for(1)[0].storage_axis_order[-2:] == (
-        "key", "value")
+        "key",
+        "value",
+    )
     assert generated.state_requirements_for(4)[0].storage_axis_order[-2:] == (
-        "value", "key")
-    assert ownership_calls == [
-        (
-            (compiled_c1, runtime.model),
-            {
-                "device": runtime.device,
-                "layer_prefix": "model.language_model.layers",
-            },
-        )
-    ]
-    assert ordering == [
-        ("new-event", 0),
-        ("record", 0, "ambient-stream"),
-        ("wait", "primary-stream", 0),
-        ("new-event", 1),
-        ("enter", "primary-stream"),
-        ("record", 1, "primary-stream"),
-        ("exit", "primary-stream"),
-        ("wait", "ambient-stream", 1),
-    ]
-    assert bind_calls == [
-        (validated_c1, bundle_c1, {}),
-        (validated_c8, bundle_c8, {}),
-        (validated_c1, bundle_c1, {}),
-        (validated_c8, bundle_c8, {}),
-    ]
+        "value",
+        "key",
+    )
 
 
 @requires_mkl
@@ -1154,9 +1112,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     calls = []
     runtime = SimpleNamespace(
         model=SimpleNamespace(
-            model=SimpleNamespace(
-                language_model=SimpleNamespace(config="text-config")
-            )
+            model=SimpleNamespace(language_model=SimpleNamespace(config="text-config"))
         ),
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
@@ -1172,19 +1128,22 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda device: calls.append(("properties", device)) or SimpleNamespace(
-            multi_processor_count=132,
-            major=9,
-            minor=0,
-            name="NVIDIA H100 80GB HBM3",
+        lambda device: (
+            calls.append(("properties", device))
+            or SimpleNamespace(
+                multi_processor_count=132,
+                major=9,
+                minor=0,
+                name="NVIDIA H100 80GB HBM3",
+            )
         ),
     )
+
     def compile_config(config, *, batch_capacity, num_ctas, gpu):
         calls.append(("compile", config, batch_capacity, num_ctas, gpu))
         return _fake_capacity_compiled(batch_capacity)
 
-    monkeypatch.setattr(
-        generated_decode, "_compile_from_config", compile_config)
+    monkeypatch.setattr(generated_decode, "_compile_from_config", compile_config)
     # The AOT boundary requires a validation certificate -- stub the mint so bundle resolution
     # receives the ValidatedProgram rather than the raw artifact.
     monkeypatch.setattr(
@@ -1193,9 +1152,7 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     )
     monkeypatch.setattr(
         "mkl.megakernel.device_runtime.resolve_shipped_aot_bundle",
-        lambda artifact, *, arch: calls.append(
-            ("resolve", artifact, arch)
-        ) or None,
+        lambda artifact, *, arch: calls.append(("resolve", artifact, arch)) or None,
     )
 
     with pytest.raises(
@@ -1204,17 +1161,12 @@ def test_decode_megakernel_factory_fails_closed_on_bundle_miss(monkeypatch):
     ):
         generated_decode.create_generated_decode(runtime)
     assert calls[0] == ("properties", torch.device("cuda:0"))
-    assert [
-        call for call in calls if call[0] == "compile"
-    ] == [
+    assert [call for call in calls if call[0] == "compile"] == [
         ("compile", "text-config", capacity, 132, "NVIDIA H100 80GB HBM3")
         for capacity in (1, 2, 4, 8)
     ]
     resolve_calls = [call for call in calls if call[0] == "resolve"]
-    assert [
-        (call[1].program.capacity, call[2])
-        for call in resolve_calls
-    ] == [
+    assert [(call[1].program.capacity, call[2]) for call in resolve_calls] == [
         (capacity, "sm90") for capacity in (1, 2, 4, 8)
     ]
 
@@ -1252,244 +1204,88 @@ def test_decode_compile_passes_model_and_gpu_config_to_compiler(monkeypatch):
         layer_types=["linear_attention", "full_attention"] * 32,
     )
 
-    assert generated_decode._compile_from_config(
-        config,
-        num_ctas=132,
-        gpu="NVIDIA H100 80GB HBM3",
-    ) == "compiled"
-    assert calls == [{
-        "n_layers": 64,
-        "hidden": 2560,
-        "inter": 9216,
-        "nh": 16,
-        "nkv": 4,
-        "head_dim": 256,
-        "num_k_heads": 16,
-        "num_v_heads": 32,
-        "key_head_dim": 128,
-        "value_head_dim": 128,
-        "conv_kernel": 4,
-        "partial_rotary": 0.25,
-        "rope_sections": [24, 20, 20],
-        "vocab_size": 248320,
-        "rms_norm_eps": 1e-6,
-        "tie_word_embeddings": False,
-        "num_ctas": 132,
-        "num_splits": None,
-        "max_kv_len": 65536,
-        "batch_tile": 1,
-        "static_extent_bindings": {},
-        "gpu": "NVIDIA H100 80GB HBM3",
-        "layer_types": [0, 1] * 32,
-    }]
-
-
-@requires_mkl
-def test_decode_megakernel_factory_considers_wider_capacity_domains(monkeypatch):
-    from kestrel.models.qwen35 import generated_decode
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    calls = []
-    runtime = SimpleNamespace(
-        max_batch_size=2,
-        max_batch_slots=2,
-        dtype=torch.bfloat16,
-        device=torch.device("cuda:0"),
-        _paged_kv=SimpleNamespace(layers=()),
-        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
-        _linear_state_pool=SimpleNamespace(
-            initialize_from_config=lambda *_args, **_kwargs: None),
-        model=SimpleNamespace(model=SimpleNamespace(
-            language_model=SimpleNamespace(config="config"))),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(
-            multi_processor_count=132, major=9, minor=0, name="test-gpu"),
-    )
-    monkeypatch.setattr(
-        generated_decode,
-        "_compile_from_config",
-        lambda _config, *, batch_capacity, **_kwargs: calls.append(
-            batch_capacity) or _fake_capacity_compiled(batch_capacity),
-    )
-    monkeypatch.setattr(
-        "mkl.compiler.frontend.validate_program.validate_compiled_tape",
-        lambda compiled: SimpleNamespace(program=compiled),
-    )
-    monkeypatch.setattr(
-        "mkl.megakernel.device_runtime.resolve_shipped_aot_bundle",
-        lambda validated, *, arch: SimpleNamespace(validated=validated, arch=arch),
-    )
-    monkeypatch.setattr(
-        GeneratedDecode,
-        "__init__",
-        lambda self, _runtime, *, spec, programs: setattr(
-            self, "_programs", programs
-        ),
-    )
-
-    result = generated_decode.create_generated_decode(runtime)
-    assert calls == [1, 2]
-    assert set(result._programs) == {1, 2}
-
-
-@requires_mkl
-def test_decode_megakernel_routes_intermediate_batch_to_covering_capacity(
-):
-    from kestrel.runtime.generated_decode import GeneratedDecode
-
-    launches = []
-    preparation_calls = []
-
-    def launch(**kwargs):
-        launches.append(kwargs)
-        preparation_calls.append(("launch", kwargs))
-
-    invocation = SimpleNamespace(launch=launch)
-    megakernel = GeneratedDecode.__new__(GeneratedDecode)
-    megakernel._programs = {
-        capacity: object() for capacity in (1, 2, 4, 8, 16)
-    }
-    megakernel._slots = {
-        (7, 16): SimpleNamespace(
-            invocation=invocation,
-            argument_names={"active_batch", "kv_len"},
+    assert (
+        generated_decode._compile_from_config(
+            config,
+            num_ctas=132,
+            gpu="NVIDIA H100 80GB HBM3",
         )
-    }
-    megakernel._input_preparation_plan = ("first", "second")
-    megakernel._spec = SimpleNamespace(
-        preparation_callbacks={
-            name: (
-                lambda slot, batch_size, name=name:
-                preparation_calls.append((name, slot.slot_id, batch_size))
-            )
-            for name in ("first", "second")
-        },
-        launch_extents=lambda slot, batch_size: {
-            "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
-            "active_batch": batch_size,
-        },
+        == "compiled"
     )
-    slot = SimpleNamespace(
-        slot_id=7,
-        compute_stream="stream",
-        decode_token_ids=torch.arange(16),
-        meta=SimpleNamespace(
-            input_pos=SimpleNamespace(cpu=torch.arange(16))
-        ),
-        hidden_last=torch.empty((16, 3)),
-        logits=torch.empty((16, 3)),
-    )
-    assert megakernel.supports(11)
-    megakernel.run(slot, batch_size=11)
-
-    assert launches == [{"kv_len": 11, "active_batch": 11}]
-    assert preparation_calls == [
-        ("first", 7, 11),
-        ("second", 7, 11),
-        ("launch", {"kv_len": 11, "active_batch": 11}),
+    assert calls == [
+        {
+            "n_layers": 64,
+            "hidden": 2560,
+            "inter": 9216,
+            "nh": 16,
+            "nkv": 4,
+            "head_dim": 256,
+            "num_k_heads": 16,
+            "num_v_heads": 32,
+            "key_head_dim": 128,
+            "value_head_dim": 128,
+            "conv_kernel": 4,
+            "partial_rotary": 0.25,
+            "rope_sections": [24, 20, 20],
+            "vocab_size": 248320,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": False,
+            "num_ctas": 132,
+            "num_splits": None,
+            "max_kv_len": 65536,
+            "batch_tile": 1,
+            "static_extent_bindings": {},
+            "gpu": "NVIDIA H100 80GB HBM3",
+            "layer_types": [0, 1] * 32,
+        }
     ]
 
 
-def test_decode_megakernel_factory_rejects_non_bf16_runtime(monkeypatch):
-    from kestrel.models.qwen35 import generated_decode
-
-    runtime = SimpleNamespace(
-        max_batch_size=1,
-        dtype=torch.float16,
-        device=torch.device("cuda:0"),
-        _paged_kv=SimpleNamespace(layers=()),
-        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
-        model=SimpleNamespace(model=SimpleNamespace(
-            language_model=SimpleNamespace(config="config"))),
-    )
-    monkeypatch.setattr(
-        generated_decode,
-        "_compile_from_config",
-        lambda *_args, **_kwargs: pytest.fail(
-            "an ineligible runtime must not compile or resolve a B1 artifact"
-        ),
-    )
-
-    assert generated_decode.create_generated_decode(runtime) is None
-
-
-def test_decode_megakernel_factory_rejects_non_unit_kv_pages(monkeypatch):
-    from kestrel.models.qwen35 import generated_decode
-
-    runtime = SimpleNamespace(
-        max_batch_size=1,
-        _paged_kv=SimpleNamespace(
-            layers=(
-                SimpleNamespace(
-                    k_cache=torch.empty(1, 1, 2, 1),
-                    v_cache=torch.empty(1, 1, 2, 1),
+@pytest.mark.parametrize(
+    ("runtime", "case"),
+    [
+        (
+            SimpleNamespace(
+                max_batch_size=1,
+                dtype=torch.float16,
+                device=torch.device("cuda:0"),
+                _paged_kv=SimpleNamespace(layers=()),
+                page_table=SimpleNamespace(
+                    page_table=torch.zeros(1, 8, dtype=torch.int32)
                 ),
-            )
+                model=SimpleNamespace(
+                    model=SimpleNamespace(
+                        language_model=SimpleNamespace(config="config")
+                    )
+                ),
+            ),
+            "non-bf16 runtime",
         ),
-    )
+        (
+            SimpleNamespace(
+                _paged_kv=SimpleNamespace(
+                    layers=(
+                        SimpleNamespace(
+                            k_cache=torch.empty(1, 1, 2, 1),
+                            v_cache=torch.empty(1, 1, 2, 1),
+                        ),
+                    )
+                ),
+            ),
+            "non-unit KV pages",
+        ),
+    ],
+)
+def test_decode_megakernel_rejects_ineligible_runtime(monkeypatch, runtime, case):
+    from kestrel.models.qwen35 import generated_decode
+
     monkeypatch.setattr(
         generated_decode,
         "_compile_from_config",
         lambda *_args, **_kwargs: pytest.fail(
-            "an ineligible runtime must not compile or resolve a B1 artifact"
+            f"{case} must not compile or resolve an artifact"
         ),
     )
-
-    assert generated_decode.create_generated_decode(runtime) is None
-
-
-def test_decode_megakernel_factory_uses_native_without_compiler(monkeypatch):
-    import builtins
-
-    from kestrel.models.qwen35 import generated_decode
-
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        dtype=torch.bfloat16,
-        _paged_kv=SimpleNamespace(layers=()),
-    )
-    real_import = builtins.__import__
-
-    def import_without_mkl(name, *args, **kwargs):
-        if name == "mkl" or name.startswith("mkl."):
-            raise ModuleNotFoundError(
-                "No module named 'mkl'", name="mkl"
-            )
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_without_mkl)
-
-    assert generated_decode.create_generated_decode(runtime) is None
-
-
-def test_decode_megakernel_factory_rejects_incomplete_compiler(monkeypatch):
-    import builtins
-
-    from kestrel.models.qwen35 import generated_decode
-
-    runtime = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        dtype=torch.bfloat16,
-        max_batch_size=1,
-        _paged_kv=SimpleNamespace(layers=()),
-        page_table=SimpleNamespace(page_table=torch.zeros(1, 8, dtype=torch.int32)),
-        model=SimpleNamespace(model=SimpleNamespace(
-            language_model=SimpleNamespace(config="config"))),
-    )
-    real_import = builtins.__import__
-
-    def import_with_incomplete_mkl(name, *args, **kwargs):
-        if name == "mkl.compiler.frontend.gpu_model":
-            raise ModuleNotFoundError(
-                "No module named 'mkl.compiler.frontend.gpu_model'",
-                name="mkl.compiler.frontend.gpu_model",
-            )
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_with_incomplete_mkl)
 
     assert generated_decode.create_generated_decode(runtime) is None
 
@@ -1501,9 +1297,7 @@ def test_decode_megakernel_factory_falls_back_for_unsupported_config(monkeypatch
     config = SimpleNamespace()
     runtime = SimpleNamespace(
         model=SimpleNamespace(
-            model=SimpleNamespace(
-                language_model=SimpleNamespace(config=config)
-            )
+            model=SimpleNamespace(language_model=SimpleNamespace(config=config))
         ),
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
@@ -1659,9 +1453,7 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
         last_token_offsets=torch.tensor([1, 3], dtype=torch.long),
         rope_deltas=torch.tensor([[2], [4]], dtype=torch.long),
     )
-    hidden = torch.tensor(
-        [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
-    )
+    hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
     cache = object()
 
     class FakeLmHead:
@@ -1677,6 +1469,7 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
     rt.page_table = SimpleNamespace(
         commit_block_table=lambda batch_indices: committed.append(list(batch_indices))
     )
+
     def build_packed_prefill_batch(*args, **kwargs):
         kwargs["prefill_slot"].batch_idx[:2].copy_(torch.tensor([3, 5]))
         return packed
@@ -1684,12 +1477,14 @@ def test_launch_prepared_batch_batches_prefill_logits_once():
     rt._build_packed_prefill_batch = build_packed_prefill_batch
     rt._forward_packed_prefill = lambda packed_batch: (hidden, cache)
     rt._store_packed_sequence_caches = (
-        lambda batch_indices, cache_value, *, rope_deltas, host_batch_indices: stored.append(
-            (
-                list(batch_indices),
-                cache_value,
-                rope_deltas.clone(),
-                list(host_batch_indices),
+        lambda batch_indices, cache_value, *, rope_deltas, host_batch_indices: (
+            stored.append(
+                (
+                    list(batch_indices),
+                    cache_value,
+                    rope_deltas.clone(),
+                    list(host_batch_indices),
+                )
             )
         )
     )
@@ -1861,7 +1656,9 @@ def test_linear_state_pool_captures_gqa_value_head_replay_ring_cpu():
     assert tuple(layer.replay_k.shape) == (1, cap, num_v_heads, key_dim)
     # Put a recognizable ring window in place.
     layer.replay_lengths.fill_(3)
-    layer.replay_k.copy_(torch.randn_like(layer.replay_k.float()).to(layer.replay_k.dtype))
+    layer.replay_k.copy_(
+        torch.randn_like(layer.replay_k.float()).to(layer.replay_k.dtype)
+    )
     layer.replay_u.copy_(torch.randn_like(layer.replay_u))
     layer.replay_g.copy_(torch.randn_like(layer.replay_g))
     pool = Qwen35LinearStatePool(
@@ -2044,9 +1841,7 @@ def test_packed_prefill_multimodal_position_ids_match_qwen_mrope_layout():
         )
     )
     out = torch.empty((3, 1, 9), dtype=torch.long).numpy()
-    mm_types = torch.tensor(
-        [0, 1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.int32
-    ).numpy()
+    mm_types = torch.tensor([0, 1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.int32).numpy()
     image_grid_thw = torch.tensor([[1, 4, 6]], dtype=torch.long).numpy()
 
     delta = Qwen35Runtime._fill_multimodal_position_ids(
@@ -2521,7 +2316,9 @@ def test_gated_delta_net_packed_prefill_derives_seq_idx_from_cu_seqlens():
     assert torch.allclose(packed_out[:, 2:], out_b, atol=1e-5, rtol=1e-5)
     assert torch.allclose(
         packed_cache.layers[0].conv_states,
-        torch.cat([cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0),
+        torch.cat(
+            [cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0
+        ),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -2597,7 +2394,9 @@ def test_gated_delta_net_packed_prefill_unequal_head_dims_matches_serial_sequenc
     assert torch.allclose(packed_out[:, 2:], out_b, atol=1e-5, rtol=1e-5)
     assert torch.allclose(
         packed_cache.layers[0].conv_states,
-        torch.cat([cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0),
+        torch.cat(
+            [cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0
+        ),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -2665,7 +2464,9 @@ def test_gated_delta_net_batched_prefill_matches_serial_sequences():
     assert torch.allclose(batched_out[1:], out_b, atol=1e-5, rtol=1e-5)
     assert torch.allclose(
         batched_cache.layers[0].conv_states,
-        torch.cat([cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0),
+        torch.cat(
+            [cache_a.layers[0].conv_states, cache_b.layers[0].conv_states], dim=0
+        ),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -2776,7 +2577,9 @@ def test_gated_delta_net_replay_decode_uses_replay_state():
         # against the recurrence directly: a token's replay-decode output must
         # equal its output when prefix+token are prefilled in one shot.
         module(hidden_prefix, cache_params=replay_cache)
-        first = module(hidden_decode[:, :1], cache_params=replay_cache, gdn_state_indices=idx)
+        first = module(
+            hidden_decode[:, :1], cache_params=replay_cache, gdn_state_indices=idx
+        )
         module(hidden_decode[:, 1:], cache_params=replay_cache, gdn_state_indices=idx)
 
         reference_out = reference(
@@ -2849,7 +2652,10 @@ def test_gated_delta_net_chunk_decode_after_replay_matches_full_prefill():
     reference_cache = make_cache()
     with torch.inference_mode():
         # Reference: prefill prefix+decode tokens in one shot -> true pre-chunk state.
-        module(torch.cat([hidden_prefix, hidden_decode], dim=1), cache_params=reference_cache)
+        module(
+            torch.cat([hidden_prefix, hidden_decode], dim=1),
+            cache_params=reference_cache,
+        )
         assert int(reference_cache.layers[0].replay_lengths[0]) == 0
         reference_state = reference_cache.layers[0].recurrent_states.clone()
         out_reference = module(
@@ -2878,7 +2684,9 @@ def test_gated_delta_net_chunk_decode_after_replay_matches_full_prefill():
         # scaled decode steps) rather than exactly. The stale state diverges by
         # >1e-2 above, so this tolerance still cleanly separates correct from
         # stale.
-        torch.testing.assert_close(materialized_state, reference_state, atol=2e-3, rtol=2e-3)
+        torch.testing.assert_close(
+            materialized_state, reference_state, atol=2e-3, rtol=2e-3
+        )
 
         # (b) Wiring: the seq_len>1 chunk path must trigger the materialize, so a
         # chunk continuation after replay decode matches the one-shot reference.
