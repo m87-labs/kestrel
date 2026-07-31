@@ -10,7 +10,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kestrel.kv_cache import KVMemoryPool, PageTable, PagedKVCache
+from kestrel.kv_cache import (
+    KVMemoryPool,
+    LayeredPagedKV,
+    PageTable,
+    PagedKVCache,
+    PagedKVLayerSpec,
+)
 
 
 def _make_page_table(*, page_size: int = 1, n_pages: int = 4) -> PageTable:
@@ -35,6 +41,36 @@ def test_pool_tracks_allocated_bytes_without_budget() -> None:
     expected = 2 * 4 * 2 * 1 * 8 * 4  # 2x for K+V, fp32 = 4 bytes
     assert pool.allocated_bytes == expected
     assert tuple(cache.k_cache.shape) == (4, 2, 1, 8)
+
+
+def test_layered_paged_kv_maps_shared_and_stateless_layers() -> None:
+    pool = KVMemoryPool(device="cpu")
+    page_table = _make_page_table()
+    cache = LayeredPagedKV.allocate(
+        layer_specs=(
+            PagedKVLayerSpec(n_heads=2, head_dim=8),
+            None,
+            None,
+            PagedKVLayerSpec(n_heads=4, head_dim=4),
+        ),
+        source_layer_idx=(0, -1, 0, 3),
+        page_table=page_table,
+        pool=pool,
+        dtype=torch.float32,
+    )
+
+    assert cache.owns(0)
+    assert not cache.owns(1)
+    assert not cache.owns(2)
+    assert cache.owns(3)
+    assert cache.producer(1) is None
+    assert cache.producer(2) is cache.producer(0)
+    assert cache.producer(3).k_cache.shape[1:] == (4, 1, 4)
+
+
+def test_layered_paged_kv_rejects_missing_producer() -> None:
+    with pytest.raises(ValueError, match="has no storage"):
+        LayeredPagedKV(layers=(None, None), source_layer_idx=(0, 0))
 
 
 def test_pool_serves_multiple_caches_against_one_budget() -> None:
