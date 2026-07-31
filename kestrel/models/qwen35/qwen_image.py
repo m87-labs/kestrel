@@ -7,7 +7,7 @@ from typing import Any
 import kestrel_native
 import numpy as np
 import torch
-from kestrel.utils.image import ensure_srgb
+from kestrel.utils.image import decode_to_srgb
 
 
 @dataclass(frozen=True)
@@ -47,22 +47,11 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def _to_rgb_array(image: Any) -> np.ndarray:
-    if isinstance(image, bytes):
-        decoded = kestrel_native.decode_image(image)
-        if decoded is None:
-            raise ValueError("Unsupported image format")
-        return np.ascontiguousarray(decoded)
-    if isinstance(image, np.ndarray):
-        return np.ascontiguousarray(ensure_srgb(image))
-    raise TypeError(f"Unsupported Qwen image input type: {type(image)!r}")
-
-
 def preprocess_image(
     image: Any,
     config: QwenImageProcessorConfig = QwenImageProcessorConfig(),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rgb = _to_rgb_array(image)
+    rgb = np.ascontiguousarray(decode_to_srgb(image))
     height, width = rgb.shape[:2]
     resized_h, resized_w = smart_resize(
         height,
