@@ -2,7 +2,8 @@
 import threading
 import weakref
 from contextlib import nullcontext
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -237,6 +238,91 @@ class PagedKVCache(torch.nn.Module):
             )
 
         return k_val, v_val
+
+
+@dataclass(frozen=True, slots=True)
+class PagedKVLayerSpec:
+    """Physical storage shape for one paged-attention producer layer."""
+
+    n_heads: int
+    head_dim: int
+    k_scale: float | None = None
+    v_scale: float | None = None
+
+
+class LayeredPagedKV:
+    """Paged K/V storage shared by logical layers.
+
+    ``source_layer_idx`` maps each logical layer to the physical layer whose
+    cache it reads. ``-1`` denotes a layer with no paged K/V state. Attention
+    policy such as local versus global windows remains model metadata rather
+    than storage metadata.
+    """
+
+    def __init__(
+        self,
+        *,
+        layers: Sequence[PagedKVCache | None],
+        source_layer_idx: Sequence[int],
+    ) -> None:
+        self.layers = tuple(layers)
+        self.source_layer_idx = tuple(int(idx) for idx in source_layer_idx)
+        if len(self.layers) != len(self.source_layer_idx):
+            raise ValueError("layers and source_layer_idx must have equal length")
+        for layer_idx, source_idx in enumerate(self.source_layer_idx):
+            if source_idx == -1:
+                if self.layers[layer_idx] is not None:
+                    raise ValueError("layers without a source cannot own paged K/V")
+                continue
+            if not 0 <= source_idx < len(self.layers):
+                raise ValueError(f"invalid paged K/V source layer {source_idx}")
+            if self.layers[source_idx] is None:
+                raise ValueError(f"paged K/V source layer {source_idx} has no storage")
+            if self.layers[layer_idx] is not None and layer_idx != source_idx:
+                raise ValueError("only producer layers may own paged K/V storage")
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        layer_specs: Sequence[PagedKVLayerSpec | None],
+        source_layer_idx: Sequence[int],
+        page_table: "PageTable",
+        pool: KVMemoryPool,
+        dtype: torch.dtype,
+    ) -> "LayeredPagedKV":
+        if len(layer_specs) != len(source_layer_idx):
+            raise ValueError("layer_specs and source_layer_idx must have equal length")
+        layers: list[PagedKVCache | None] = []
+        for layer_idx, spec in enumerate(layer_specs):
+            if spec is None:
+                layers.append(None)
+                continue
+            if int(source_layer_idx[layer_idx]) != layer_idx:
+                raise ValueError("a physical layer spec must identify its own source")
+            layers.append(
+                PagedKVCache(
+                    page_table,
+                    n_heads=int(spec.n_heads),
+                    head_dim=int(spec.head_dim),
+                    dtype=dtype,
+                    pool=pool,
+                    k_scale=spec.k_scale,
+                    v_scale=spec.v_scale,
+                )
+            )
+        return cls(layers=layers, source_layer_idx=source_layer_idx)
+
+    def producer(self, layer_idx: int) -> PagedKVCache | None:
+        source_idx = self.source_layer_idx[int(layer_idx)]
+        return None if source_idx == -1 else self.layers[source_idx]
+
+    def owns(self, layer_idx: int) -> bool:
+        layer_idx = int(layer_idx)
+        return (
+            self.source_layer_idx[layer_idx] == layer_idx
+            and self.layers[layer_idx] is not None
+        )
 
 
 class PageTable:
