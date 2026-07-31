@@ -2366,6 +2366,7 @@ def test_batch_index_allocation_gates_capacity():
     rt.max_seq_length = 4096
     rt.active_sequences = {}
     rt._caches = {}
+    rt._chat_image_crops = {}
     rt.page_table = PageTable(
         n_pages=16,
         page_size=1,
@@ -2383,9 +2384,11 @@ def test_batch_index_allocation_gates_capacity():
         rt.page_table.allocate()
 
     rt._caches[first] = object()
+    rt._chat_image_crops[first] = object()
     rt._release_batch_idx(first)
     assert first in rt.page_table.free_batch_idx
     assert first not in rt._caches
+    assert first not in rt._chat_image_crops
     assert rt.prefill_budget()[1] == 1
 
     rt._release_batch_idx(first)

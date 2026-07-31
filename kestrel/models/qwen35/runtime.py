@@ -807,6 +807,7 @@ class Qwen35Runtime:
     def _release_batch_idx(self, batch_idx: int) -> None:
         self.active_sequences.pop(batch_idx, None)
         self._caches.pop(batch_idx, None)
+        self._chat_image_crops.pop(batch_idx, None)
         self._clear_decode_state(batch_idx)
         if batch_idx not in self.page_table.free_batch_idx:
             self.page_table.erase(batch_idx, 0)
