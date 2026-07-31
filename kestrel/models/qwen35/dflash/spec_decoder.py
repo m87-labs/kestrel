@@ -160,12 +160,14 @@ class SpecDecoder:
         _validate_flush_cap(int(flush_cap), self.block_size)
         self.flush_cap = int(flush_cap)
         pool_capacity = int(runtime._linear_state_pool.replay_capacity)
-        if pool_capacity != self.flush_cap:
-            raise ValueError(
-                f"runtime linear-state pool replay_capacity ({pool_capacity}) "
-                f"must equal flush_cap ({self.flush_cap}); configure "
-                "spec_decode.flush_cap before building the runtime"
-            )
+        if runtime._use_cuda_graphs:
+            # SpecDecoder owns transient caches and does not bind the runtime's
+            # persistent state pool. Keep already-captured decode graph
+            # addresses intact while giving new transient caches the requested
+            # ring capacity.
+            runtime._replay_capacity = self.flush_cap
+        else:
+            runtime._resize_linear_pool_for_spec(self.flush_cap)
 
         self.gdn_layer_idxs = [
             i for i, layer in enumerate(self.lm.layers)

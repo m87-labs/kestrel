@@ -38,7 +38,6 @@ def _required(data: dict[str, Any], name: str, scope: str) -> Any:
 class Qwen3_5TextConfig:
     vocab_size: int
     hidden_size: int
-    intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -55,6 +54,7 @@ class Qwen3_5TextConfig:
     linear_num_key_heads: int
     linear_num_value_heads: int
     layer_types: tuple[str, ...] | list[str]
+    intermediate_size: int | None = None
     moe_intermediate_size: int | None = None
     shared_expert_intermediate_size: int | None = None
     num_experts_per_tok: int | None = None
@@ -68,10 +68,6 @@ class Qwen3_5TextConfig:
         unsupported = set(layer_types) - {"linear_attention", "full_attention"}
         if unsupported:
             raise ValueError(f"unsupported Qwen layer types: {sorted(unsupported)}")
-        if self.hidden_size != self.num_attention_heads * self.head_dim:
-            raise ValueError(
-                "Qwen hidden_size must equal num_attention_heads * head_dim"
-            )
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError(
                 "Qwen num_attention_heads must be divisible by num_key_value_heads"
@@ -140,6 +136,7 @@ class Qwen3_5TextConfig:
 
         transformed = frozenset(
             {
+                "intermediate_size",
                 "tie_word_embeddings",
                 "rope_theta",
                 "partial_rotary_factor",
@@ -154,6 +151,11 @@ class Qwen3_5TextConfig:
             transformed=transformed,
         )
         kwargs.update(
+            intermediate_size=(
+                data.get("intermediate_size")
+                if is_moe
+                else _required(data, "intermediate_size", "Qwen dense text")
+            ),
             tie_word_embeddings=bool(tie_word_embeddings),
             rope_theta=float(_required(rope, "rope_theta", "Qwen RoPE")),
             partial_rotary_factor=float(

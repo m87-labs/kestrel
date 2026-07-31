@@ -711,6 +711,7 @@ class Qwen35Runtime:
         """
         flush_cap = int(flush_cap)
         if int(self._linear_state_pool.replay_capacity) == flush_cap:
+            self._replay_capacity = flush_cap
             # Already sized (e.g. by the pre-capture ``__init__`` call); the
             # tensors the captured graph bound must stay put.
             return
@@ -723,6 +724,7 @@ class Qwen35Runtime:
             _text_config(self.hf_config),
             dtype=self.dtype,
         )
+        self._replay_capacity = flush_cap
 
     @property
     def model_name(self) -> str:
