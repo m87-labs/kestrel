@@ -13,6 +13,7 @@ from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.device import make_event, make_stream
 from kestrel.models.registry import get_spec
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
+from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -24,7 +25,6 @@ from kestrel.runtime.preprocessing import (
     derive_preprocessing_workers,
 )
 
-from .decode_slot import GemmaDecodeSlot, create_gemma_decode_slot
 from .loader import load_model
 from .image import (
     Gemma4ImagePreprocessor,
@@ -182,7 +182,7 @@ class Gemma4Runtime:
 
         text_cfg = self._config.text_config
         self._decode_slots = tuple(
-            create_gemma_decode_slot(
+            create_decode_slot(
                 slot_id=i,
                 device=self.device,
                 dtype=self.dtype,
@@ -190,6 +190,7 @@ class Gemma4Runtime:
                 kv_cache_pages=self._kv_cache_pages,
                 vocab_size=text_cfg.vocab_size,
                 hidden_dim=text_cfg.hidden_size,
+                position_shape=(self._decode_slot_rows, 1),
                 compute_stream=self._compute_stream,
                 copy_stream=self._copy_stream,
             )
@@ -207,9 +208,9 @@ class Gemma4Runtime:
             dtype=self.dtype,
         )
 
-        from .generated_decode import Gemma4DecodeMegakernel
+        from .generated_decode import create_generated_decode
 
-        self._decode_megakernel = Gemma4DecodeMegakernel.try_create(self)
+        self._decode_megakernel = create_generated_decode(self)
         self.prefix_cache = None
 
     def _stage_vision_inputs(
@@ -625,7 +626,7 @@ class Gemma4Runtime:
         if batch_idx not in self.page_table.free_batch_idx:
             self.page_table.erase(batch_idx, 0)
 
-    def _build_decode_metadata(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
+    def _build_decode_metadata(self, slot: DecodeSlot, batch_size: int) -> None:
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
         input_pos = slot.meta.input_pos.gpu[:batch_size]
         slot.cache_position_ids[:batch_size, 0].copy_(input_pos)
@@ -643,7 +644,7 @@ class Gemma4Runtime:
             )
         )
 
-    def decode_with_slot(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
+    def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         if batch_size == 0:
             return
         if (
@@ -655,7 +656,7 @@ class Gemma4Runtime:
             return
         self._run_decode_eager(slot, batch_size)
 
-    def _run_decode_eager(self, slot: GemmaDecodeSlot, batch_size: int) -> None:
+    def _run_decode_eager(self, slot: DecodeSlot, batch_size: int) -> None:
         text_cfg = self._config.text_config
         token_ids_gpu = slot.decode_token_ids[:batch_size]
         self._build_decode_metadata(slot, batch_size)

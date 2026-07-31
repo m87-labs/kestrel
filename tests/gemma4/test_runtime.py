@@ -19,7 +19,7 @@ from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PagedKVLayerSpec
 from kestrel.models import get_spec, known_models
 from kestrel.runtime import ExecutionShape
 from kestrel.models.gemma4 import model as gemma_model
-from kestrel.models.gemma4.decode_slot import GemmaDecodeSlot
+from kestrel.runtime.decode_slot import DecodeSlot
 from kestrel.models.gemma4.config import (
     Gemma4TextConfig,
     Gemma4VisionConfig,
@@ -507,7 +507,7 @@ def test_modelspecs_register_on_import():
 
 
 def test_decode_slot_implements_constraint_buffer_abi():
-    names = {field.name for field in fields(GemmaDecodeSlot)}
+    names = {field.name for field in fields(DecodeSlot)}
     assert {"disallow_mask", "mask_ready_event"} <= names
 
 
@@ -657,7 +657,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
         DeviceRuntimeError,
         match=r"missing active extents \[1\].*unresolved artifacts",
     ):
-        generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
+        generated_decode.create_generated_decode(runtime)
     assert calls[0] == ("properties", torch.device("cuda:0"))
     assert calls[1:] == [
         call
@@ -683,6 +683,7 @@ def test_decode_factory_fails_closed_on_aot_bundle_miss(monkeypatch):
 
 def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch):
     from kestrel.models.gemma4 import generated_decode
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
     compiled_capacities = []
     resolved_capacities = []
@@ -731,13 +732,13 @@ def test_decode_factory_falls_back_above_largest_production_capacity(monkeypatch
         resolve_bundle,
     )
     monkeypatch.setattr(
-        generated_decode.Gemma4DecodeMegakernel,
+        GeneratedDecode,
         "__init__",
-        lambda self, bound_runtime, *, programs: setattr(
+        lambda self, bound_runtime, *, spec, programs: setattr(
             self, "_programs", programs),
     )
 
-    result = generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
+    result = generated_decode.create_generated_decode(runtime)
 
     assert result is not None
     assert compiled_capacities == [1, 2, 4, 8]
@@ -762,7 +763,7 @@ def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_n
     real_import = builtins.__import__
 
     def import_without_mkl(name, *args, **kwargs):
-        if name == "mkl.megakernel.device_runtime":
+        if name == "mkl.compiler.frontend.models.aot":
             raise ModuleNotFoundError(
                 f"No module named {missing_name!r}", name=missing_name
             )
@@ -770,7 +771,7 @@ def test_decode_factory_uses_native_path_without_compiler(monkeypatch, missing_n
 
     monkeypatch.setattr(builtins, "__import__", import_without_mkl)
 
-    assert generated_decode.Gemma4DecodeMegakernel.try_create(runtime) is None
+    assert generated_decode.create_generated_decode(runtime) is None
 
 
 def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
@@ -812,26 +813,26 @@ def test_decode_factory_fails_closed_without_device_calibration(monkeypatch):
         DeviceRuntimeError,
         match="no calibration for 'NVIDIA H200'",
     ):
-        generated_decode.Gemma4DecodeMegakernel.try_create(runtime)
+        generated_decode.create_generated_decode(runtime)
 
 
 @pytest.mark.parametrize("batch_size", [11, 16])
 def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_size):
-    from kestrel.models.gemma4.generated_decode import (
-        Gemma4DecodeMegakernel,
-        _SlotInvocation,
-    )
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
     calls = []
     batch_capacity = 16
-    state = _SlotInvocation(
-        invocation=SimpleNamespace(
-            launch=lambda **kwargs: calls.append(kwargs)),
-    )
-    megakernel = Gemma4DecodeMegakernel.__new__(Gemma4DecodeMegakernel)
+    state = SimpleNamespace(launch=lambda **kwargs: calls.append(kwargs))
+    megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {1: (object(),) * 3, 8: (object(),) * 3,
                             batch_capacity: (object(),) * 3}
     megakernel._slots = {(7, batch_capacity): state}
+    megakernel._spec = SimpleNamespace(
+        launch_extents=lambda slot, extent: {
+            "active_batch": extent,
+            "kv_len": int(slot.meta.input_pos.cpu[:extent].max()) + 1,
+        }
+    )
     slot = SimpleNamespace(
         slot_id=7,
         meta=SimpleNamespace(input_pos=SimpleNamespace(
@@ -846,9 +847,9 @@ def test_decode_megakernel_run_uses_smallest_capacity_and_logical_extent(batch_s
 
 
 def test_decode_megakernel_capacity_selection_rejects_uncovered_extents():
-    from kestrel.models.gemma4.generated_decode import Gemma4DecodeMegakernel
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
-    megakernel = Gemma4DecodeMegakernel.__new__(Gemma4DecodeMegakernel)
+    megakernel = GeneratedDecode.__new__(GeneratedDecode)
     megakernel._programs = {
         1: (object(),) * 3,
         8: (object(),) * 3,
