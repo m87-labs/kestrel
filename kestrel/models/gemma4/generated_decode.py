@@ -1,6 +1,4 @@
-"""Gemma descriptors for compiler-generated decode."""
-
-from __future__ import annotations
+"""Gemma runtime tensors for bundled generated decode."""
 
 from typing import Any
 
@@ -11,34 +9,6 @@ from kestrel.runtime.generated_decode import (
     GeneratedDecodeSpec,
     PagedDecodeBindings,
 )
-
-
-def _compile_from_config(
-    config: Any,
-    *,
-    batch_capacity: int = 1,
-    max_kv_len: int,
-    num_ctas: int,
-    gpu: str,
-):
-    from mkl.compiler.frontend import DecodeCompileTarget
-    from mkl.compiler.frontend.models.gemma import (
-        Gemma4DecodeTraceConfig,
-        compile_gemma4_decode,
-    )
-
-    trace = Gemma4DecodeTraceConfig.from_model_config(
-        config,
-        max_kv_len=max_kv_len,
-    )
-    return compile_gemma4_decode(
-        trace,
-        target=DecodeCompileTarget(
-            batch_capacity=batch_capacity,
-            num_ctas=num_ctas,
-            gpu=gpu,
-        ),
-    )
 
 
 def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
@@ -83,36 +53,15 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             ("global", "full_attention"),
         ),
         layer_kinds=tuple(config.layer_types),
-        position_capacity=runtime.max_seq_length,
         extra_runtime_inputs=rope_inputs,
     )
-    try:
-        from mkl.compiler.frontend.models.aot import DECODE_BATCH_CAPACITIES
-        from mkl.compiler.frontend.models.gemma import (
-            UnsupportedGemma4DecodeConfig,
-        )
-    except ModuleNotFoundError as exc:
-        missing = str(exc.name or "")
-        if missing != "mkl" and not missing.startswith("mkl."):
-            raise
-        return None
-
     return GeneratedDecode.try_create(
         runtime,
         GeneratedDecodeSpec(
             label="Gemma",
-            capacities=DECODE_BATCH_CAPACITIES,
-            compile_program=lambda capacity, properties: _compile_from_config(
-                config,
-                batch_capacity=capacity,
-                max_kv_len=runtime.max_seq_length,
-                num_ctas=properties.multi_processor_count,
-                gpu=properties.name,
-            ),
             weight_root=runtime.model,
             weight_layer_prefix="model.language_model.layers",
             bindings=bindings,
-            unsupported=(UnsupportedGemma4DecodeConfig,),
         ),
     )
 
