@@ -18,13 +18,12 @@ from torch import nn
 from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
-from kestrel.runtime.state import SequenceState
 from kestrel.runtime.tokenizer import load_tokenizer
-from kestrel.runtime.tokens import Token
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
     derive_preprocessing_workers,
 )
+from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
 from .paged_cache import (
     Qwen35InferenceCache,
@@ -247,7 +246,7 @@ def _write_vision_grid_metadata(
     return token_offset, sequence_offset
 
 
-class Qwen35Runtime:
+class Qwen35Runtime(UncachedPagedRuntime):
     """Runtime wrapping upstream Qwen 3.5 modeling for Kestrel."""
 
     def __init__(
@@ -333,15 +332,14 @@ class Qwen35Runtime:
         # launch_prepared_batch so each image is preprocessed exactly once.
         self._chat_image_crops: dict[int, QwenImageInputs] = {}
 
-        self.primary_stream = compute_stream or (
+        self._compute_stream = compute_stream or (
             torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         )
-        self.copy_stream = (
+        self._copy_stream = (
             torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         )
         self.graph_capture_lock = threading.RLock()
 
-        self.prefix_cache = None
         if getattr(cfg, "enable_prefix_cache", False):
             warnings.warn(
                 "Qwen 3.5 prefix cache is disabled until GDN recurrent state "
@@ -357,7 +355,7 @@ class Qwen35Runtime:
             max_batch_size=self.max_batch_slots,
             device=str(self.device),
             prefix_cache=None,
-            h2d_stream=self.primary_stream,
+            h2d_stream=self._compute_stream,
         )
         self.page_table.free_batch_idx.remove(self._padding_batch_idx)
         self.page_table.reserve(self._padding_batch_idx, 1)
@@ -422,8 +420,8 @@ class Qwen35Runtime:
                         torch.long,
                     ),
                 },
-                compute_stream=self.primary_stream,
-                copy_stream=self.copy_stream,
+                compute_stream=self._compute_stream,
+                copy_stream=self._copy_stream,
             )
             for i in range(2)
         )
@@ -435,7 +433,7 @@ class Qwen35Runtime:
             device=self.device,
             max_batch=self.max_batch_size,
             graph_capture_lock=self.graph_capture_lock,
-            compute_stream=self.primary_stream,
+            compute_stream=self._compute_stream,
             run_forward=self._run_decode_forward,
             prepare_step=self._prepare_decode_slot,
             zero_padding=self._zero_decode_graph_padding,
@@ -477,27 +475,9 @@ class Qwen35Runtime:
         if self._use_cuda_graphs:
             self._decode_graphs.ensure_ready(self._decode_slots)
 
-
-    @property
-    def model_name(self) -> str:
-        return self._model_name
-
     @property
     def cuda_graphs_enabled(self) -> bool:
         return self._use_cuda_graphs
-
-    @property
-    def kv_pool(self) -> KVMemoryPool:
-        return self._kv_pool
-
-    @property
-    def compute_stream(self) -> torch.cuda.Stream | None:
-        return self.primary_stream
-
-    def skills(self) -> Any:
-        from .skills import build_skill_registry
-
-        return build_skill_registry()
 
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
@@ -509,29 +489,6 @@ class Qwen35Runtime:
             dtype=self.dtype,
             attn_implementation=attn_impl,
         )
-
-    def preprocess_image_async(self, image: Any) -> Future[QwenImageInputs]:
-        return self._image_preprocessor.submit(image)
-
-    def shutdown_image_preprocessor(self) -> None:
-        self._image_preprocessor.shutdown(wait=True)
-
-    def shutdown(self) -> None:
-        self.shutdown_image_preprocessor()
-
-    def can_reserve(self, total_length: int) -> bool:
-        return (
-            total_length <= self.max_seq_length
-            and self.page_table.can_reserve_with_eviction(total_length)
-            and self._available_batch_slots() > 0
-        )
-
-    def prefill_budget(self) -> tuple[int, int]:
-        return (self.page_table.pages_available, self._available_batch_slots())
-
-    def _available_batch_slots(self) -> int:
-        active_headroom = max(0, self.max_batch_size - len(self.active_sequences))
-        return min(active_headroom, len(self.page_table.free_batch_idx))
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:
         if slot_id < 0 or slot_id >= len(self._prefill_slots):
@@ -563,29 +520,6 @@ class Qwen35Runtime:
         event.record()
         slot.step_done_event_pending = True
 
-    def acquire_adapter_slot(self, adapter_id: str, adapter: Any) -> int:
-        raise NotImplementedError("LoRA adapters not supported on Qwen35Runtime yet")
-
-    def release_adapter_slot(self, slot: int) -> None:
-        raise NotImplementedError("LoRA adapters not supported on Qwen35Runtime yet")
-
-    def classify_prefill(
-        self,
-        prompt_tokens: Sequence[Any],
-        *,
-        has_image: bool = False,
-        image_hash: Optional[bytes] = None,
-        adapter_id: Optional[str] = None,
-    ) -> Any:
-        from kestrel.runtime.state import PrefillClassification
-
-        return PrefillClassification(
-            prompt_length=len(prompt_tokens),
-            skip_positions=0,
-            can_reuse=False,
-            use_prefix_attn=False,
-        )
-
     def prepare_sequence(
         self,
         prompt_tokens: Sequence[Any],
@@ -599,11 +533,6 @@ class Qwen35Runtime:
     ) -> Any:
         from kestrel.runtime.tokens import TextToken
         from kestrel.runtime.tokens import ImageMarker
-        from kestrel.runtime.state import (
-            PreparedSequence,
-            SequenceState,
-            _CacheLookupResult,
-        )
 
         tokens_list = list(prompt_tokens)
         text_only_len = len(tokens_list)
@@ -674,57 +603,27 @@ class Qwen35Runtime:
                 )
                 tokens_list = tokens_list[:offset] + image_block + tokens_list[offset:]
 
-        prompt_len = len(tokens_list)
+        new_tokens = 128 if max_new_tokens is None else max_new_tokens
         budget_for_finalize = (
             text_only_len
             + (self.image_prefix_length if image is not None else 0)
-            + (max_new_tokens or 128)
+            + new_tokens
         )
-        actual_kv_budget = prompt_len + (max_new_tokens or 128)
+        actual_kv_budget = len(tokens_list) + new_tokens
         target_length = max(budget_for_finalize, actual_kv_budget)
-        if target_length > self.max_seq_length:
-            raise ValueError(
-                f"Requested length {target_length} exceeds "
-                f"max_seq_length={self.max_seq_length}"
-            )
-        if self._available_batch_slots() <= 0:
-            raise RuntimeError("Cannot reserve Qwen batch slot")
-        batch_idx = self.page_table.allocate()
-        try:
-            self.page_table.reserve(batch_idx, target_length)
-        except Exception:
-            self.page_table.erase(batch_idx, 0)
-            raise
-        state = SequenceState(
-            batch_idx=batch_idx,
-            length=prompt_len,
-            max_length=target_length,
-            prompt_length=prompt_len,
-            image_length=(num_image_tokens + 2 * num_images) if image is not None else 0,
-            last_hidden=None,
+        prepared = self._prepare_uncached_sequence(
+            tokens=tokens_list,
+            target_length=target_length,
+            image_length=(
+                num_image_tokens + 2 * num_images if image is not None else 0
+            ),
             lora_slot=lora_slot,
-            cache_tokens=None,
-            cache_lock_node=None,
-            cache_owned_page_count=0,
-            reused_page_count=0,
-        )
-        cache_result = _CacheLookupResult(
-            match=None,
-            skip_positions=0,
-            temp_lock_node=None,
-            can_reuse=False,
-            namespace=None,
-        )
-        if chat_crops is not None:
-            self._chat_image_crops[int(batch_idx)] = chat_crops
-        return PreparedSequence(
-            state=state,
-            tokens_list=tokens_list,
-            cache_tokens=[],
-            cache_result=cache_result,
             adapter_id=adapter_id,
             image_hash=image_hash,
         )
+        if chat_crops is not None:
+            self._chat_image_crops[int(prepared.state.batch_idx)] = chat_crops
+        return prepared
 
     @torch.inference_mode()
     def launch_prepared_batch(
@@ -791,32 +690,9 @@ class Qwen35Runtime:
         finally:
             self._record_prefill_slot_done(prefill_slot)
 
-    def finalize_prepared_sequence_after_prefill(self, prepared: Any) -> None:
-        self.active_sequences[prepared.state.batch_idx] = prepared.state
-        return None
-
-    def abort_prepared_sequence(self, prepared: Any) -> None:
-        self._release_batch_idx(prepared.state.batch_idx)
-
-    def retain_sequence_prefix(
-        self,
-        state: SequenceState,
-        generated_tokens: Sequence[Token],
-        *,
-        adapter_id: str | None,
-        image_hash: bytes | None,
-    ) -> None:
-        return None
-
-    def release_sequence(self, state: Any) -> None:
-        self._release_batch_idx(state.batch_idx)
-
-    def _release_batch_idx(self, batch_idx: int) -> None:
-        self.active_sequences.pop(batch_idx, None)
+    def _release_runtime_state(self, batch_idx: int) -> None:
         self._chat_image_crops.pop(batch_idx, None)
         self._clear_decode_state(batch_idx)
-        if batch_idx not in self.page_table.free_batch_idx:
-            self.page_table.erase(batch_idx, 0)
 
     @torch.inference_mode()
     def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
