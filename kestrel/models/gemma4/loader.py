@@ -13,7 +13,7 @@ from kestrel.runtime.bounded_projection import (
     bind_declared_packed_projections,
 )
 
-from .config import Gemma4Config, parse_gemma4_config
+from .config import Gemma4Config
 from .model import Gemma4InferenceModel
 
 
@@ -21,12 +21,6 @@ _UNSUPPORTED_WEIGHT_PREFIXES = (
     "model.audio_tower.",
     "model.embed_audio.",
 )
-
-
-def load_config(repo_id: str) -> Gemma4Config:
-    config_path = hf_hub_download(repo_id, filename="config.json")
-    with open(config_path, "r", encoding="utf-8") as handle:
-        return parse_gemma4_config(json.load(handle))
 
 
 def load_weights(repo_id: str, model: torch.nn.Module) -> None:
@@ -98,7 +92,9 @@ def load_model(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Gemma4InferenceModel:
-    config = load_config(repo_id)
+    config_path = hf_hub_download(repo_id, filename="config.json")
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = Gemma4Config.from_dict(json.load(handle))
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
@@ -114,7 +110,6 @@ def load_model(
 
 
 __all__ = [
-    "load_config",
     "load_model",
     "load_weights",
 ]
