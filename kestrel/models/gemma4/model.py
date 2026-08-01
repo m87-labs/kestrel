@@ -150,12 +150,10 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
-        paged_kv_layer: PagedKVCache | None = None,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        cu_seqlens: torch.Tensor | None = None,
+        paged_kv_layer: PagedKVCache,
+        cache_position_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -171,14 +169,13 @@ class Gemma4TextAttention(nn.Module):
                 query_states, None, position_embeddings
             )
             query_states = query_states.transpose(1, 2)
-            if page_table is None:
-                source = transient_kv[self.kv_source_layer_idx]
-                if source is None:
-                    raise RuntimeError(
-                        f"Gemma layer {self.layer_idx} has no transient K/V from "
-                        f"producer {self.kv_source_layer_idx}"
-                    )
-                key_states, value_states = source
+            source = transient_kv[self.kv_source_layer_idx]
+            if source is None:
+                raise RuntimeError(
+                    f"Gemma layer {self.layer_idx} has no transient K/V from "
+                    f"producer {self.kv_source_layer_idx}"
+                )
+            key_states, value_states = source
         else:
             key_states = self.k_proj(hidden_states).view(hidden_shape)
             value_states = (
@@ -197,9 +194,7 @@ class Gemma4TextAttention(nn.Module):
                 value_states, self.v_norm.weight, self.v_norm.eps)
             value_states = value_states.transpose(1, 2)
 
-        if self.owns_kv and paged_kv_layer is not None:
-            if cache_position_ids is None or slot_mapping is None:
-                raise RuntimeError("Gemma paged K/V write requires positions and slots")
+        if self.owns_kv:
             assert key_states is not None and value_states is not None
             paged_kv_layer.update(
                 input_pos=cache_position_ids,
@@ -211,29 +206,17 @@ class Gemma4TextAttention(nn.Module):
             assert key_states is not None and value_states is not None
             transient_kv[self.layer_idx] = (key_states, value_states)
 
-        if page_table is not None:
-            if paged_kv_layer is None or paged_kv_seqlens_k is None:
-                raise RuntimeError("Gemma paged attention requires K/V storage metadata")
-            attn_out = attention_ops.paged_attention(
-                query_states,
-                paged_kv_layer=paged_kv_layer,
-                page_table=page_table,
-                paged_kv_seqlens_k=paged_kv_seqlens_k,
-                scaling=1.0,
-                sliding_window=self.sliding_window,
-            )
-        else:
-            assert key_states is not None and value_states is not None
-            attn_out = attention_ops.dense_attention(
-                query_states,
-                key_states,
-                value_states,
-                scaling=1.0,
-                causal=not self.is_sliding,
-                window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
-                window_size_right=0 if self.is_sliding else None,
-                cu_seqlens=cu_seqlens,
-            )
+        assert key_states is not None and value_states is not None
+        attn_out = attention_ops.dense_attention(
+            query_states,
+            key_states,
+            value_states,
+            scaling=1.0,
+            causal=not self.is_sliding,
+            window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
+            window_size_right=0 if self.is_sliding else None,
+            cu_seqlens=cu_seqlens,
+        )
         attn_out = attn_out.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_out)
 
@@ -313,12 +296,10 @@ class Gemma4TextDecoderLayer(nn.Module):
         per_layer_input: Optional[torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        paged_kv_layer: PagedKVCache | None = None,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        cu_seqlens: torch.Tensor | None = None,
+        paged_kv_layer: PagedKVCache,
+        cache_position_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = _dense_runtime.rmsnorm(
@@ -333,8 +314,6 @@ class Gemma4TextDecoderLayer(nn.Module):
             paged_kv_layer=paged_kv_layer,
             cache_position_ids=cache_position_ids,
             slot_mapping=slot_mapping,
-            page_table=page_table,
-            paged_kv_seqlens_k=paged_kv_seqlens_k,
             cu_seqlens=cu_seqlens,
         )
         hidden_states = _dense_runtime.rmsnorm(
@@ -473,37 +452,16 @@ class Gemma4TextModel(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        kv_cache: Sequence[PagedKVCache | None] | None = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-        cache_position_ids: Optional[torch.Tensor] = None,
-        slot_mapping: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-        paged_kv_seqlens_k: Optional[torch.Tensor] = None,
-        cu_seqlens: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: Sequence[PagedKVCache | None],
+        per_layer_inputs: Optional[torch.Tensor],
+        cache_position_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("specify exactly one of input_ids or inputs_embeds")
-        if input_ids is not None and per_layer_inputs is not None:
-            raise ValueError("per_layer_inputs requires inputs_embeds (not input_ids)")
-
-        if input_ids is not None:
-            inputs_embeds = self.embed(input_ids)
-
         if self.hidden_size_per_layer_input:
-            if per_layer_inputs is None:
-                assert input_ids is not None
-                per_layer_inputs = self.get_per_layer_inputs(input_ids)
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
-
-        seq_len = inputs_embeds.shape[1]
-
-        if position_ids is None:
-            position_ids = torch.arange(
-                seq_len, device=inputs_embeds.device
-            ).unsqueeze(0)
 
         position_embeddings = {}
         for layer_type in self.unique_layer_types:
@@ -519,20 +477,17 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
             )
             layer_type = self.config.layer_types[i]
+            paged_kv_layer = kv_cache[self.kv_source_layers[i]]
+            if paged_kv_layer is None:
+                raise RuntimeError(f"Gemma layer {i} has no paged K/V storage")
             hidden_states = layer(
                 hidden_states,
                 per_layer_input=per_layer_input,
                 transient_kv=transient_kv,
                 position_embeddings=position_embeddings[layer_type],
-                paged_kv_layer=(
-                    kv_cache[self.kv_source_layers[i]]
-                    if kv_cache is not None
-                    else None
-                ),
+                paged_kv_layer=paged_kv_layer,
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,
-                page_table=page_table,
-                paged_kv_seqlens_k=paged_kv_seqlens_k,
                 cu_seqlens=cu_seqlens,
             )
 

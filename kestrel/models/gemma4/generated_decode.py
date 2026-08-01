@@ -27,12 +27,12 @@ def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     }
 
 
-def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
+def create_generated_decode(runtime: Any) -> GeneratedDecode:
     """Describe Gemma inputs; shared runtime code owns binding and launch."""
 
     layers = runtime._kv_cache
-    if not layers or not PagedDecodeBindings(layers).is_eligible(runtime):
-        return None
+    if not layers:
+        raise RuntimeError("Gemma generated decode requires paged K/V storage")
     config = runtime.model.model.language_model.config
 
     def rope_inputs(bound_runtime: Any) -> dict[str, torch.Tensor]:
@@ -55,7 +55,7 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
         layer_kinds=tuple(config.layer_types),
         extra_runtime_inputs=rope_inputs,
     )
-    return GeneratedDecode.try_create(
+    generated = GeneratedDecode.try_create(
         runtime,
         GeneratedDecodeSpec(
             label="Gemma",
@@ -64,6 +64,16 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             bindings=bindings,
         ),
     )
+    if generated is None:
+        raise RuntimeError(
+            "Gemma requires a compatible bundled generated-decode program"
+        )
+    if not generated.supports(runtime.max_batch_size):
+        raise RuntimeError(
+            "Gemma generated decode does not cover configured max_batch_size="
+            f"{runtime.max_batch_size}"
+        )
+    return generated
 
 
 __all__ = ["create_generated_decode"]

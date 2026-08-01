@@ -157,7 +157,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             pool=self._kv_pool,
             dtype=self.dtype,
         )
-        self._decode_megakernel = create_generated_decode(self)
+        self._generated_decode = create_generated_decode(self)
 
     def _configure_model(self, cfg: Any) -> None:
         vision = self.model.model.vision_tower
@@ -245,11 +245,10 @@ class Gemma4Runtime(UncachedPagedRuntime):
             else None
         )
         hidden = language_model(
-            input_ids=None,
             inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
             position_ids=position_ids,
             kv_cache=self._kv_cache,
+            per_layer_inputs=per_layer_inputs,
             cache_position_ids=position_ids,
             slot_mapping=slot_mapping,
             cu_seqlens=cu_seqlens,
@@ -262,37 +261,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
         logits = self.model.lm_head(rows)
         cap = text_config.final_logit_softcapping
         return rows, torch.tanh(logits / cap) * cap
-
-    def _eager_decode(self, slot: Any, batch_size: int) -> None:
-        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
-        input_pos = slot.meta.input_pos.gpu[:batch_size]
-        slot.cache_position_ids[:batch_size, 0].copy_(input_pos)
-        slot.position_ids[:batch_size, 0].copy_(input_pos)
-        self.page_table.populate_paged_kv_metadata(
-            batch_idx=batch_idx,
-            input_pos=input_pos,
-            out_page_table=slot.paged_kv_page_table[:batch_size],
-            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
-        )
-        slot.slot_mapping[:batch_size].copy_(
-            self.page_table.build_slot_mapping(
-                batch_idx=batch_idx,
-                positions=slot.cache_position_ids[:batch_size],
-            )
-        )
-        hidden = self.model.model.language_model(
-            input_ids=slot.decode_token_ids[:batch_size].view(batch_size, 1),
-            position_ids=input_pos.view(batch_size, 1),
-            kv_cache=self._kv_cache,
-            cache_position_ids=slot.cache_position_ids[:batch_size],
-            slot_mapping=slot.slot_mapping[:batch_size],
-            page_table=slot.paged_kv_page_table[:batch_size],
-            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
-        )[:, 0]
-        torch.mm(hidden, self.model.lm_head.weight.t(), out=slot.logits[:batch_size])
-        cap = self._config.text_config.final_logit_softcapping
-        slot.logits[:batch_size].div_(cap).tanh_().mul_(cap)
-        slot.hidden_last[:batch_size].copy_(hidden)
 
     def _image_features_for_batch(
         self,
@@ -502,14 +470,8 @@ class Gemma4Runtime(UncachedPagedRuntime):
     def decode_with_slot(self, slot: Any, batch_size: int) -> None:
         if batch_size == 0:
             return
-        if (
-            self._decode_megakernel is not None
-            and self._decode_megakernel.supports(batch_size)
-        ):
-            with torch.cuda.stream(slot.compute_stream):
-                self._decode_megakernel.run(slot, batch_size)
-            return
-        self._eager_decode(slot, batch_size)
+        with torch.cuda.stream(slot.compute_stream):
+            self._generated_decode.run(slot, batch_size)
 
 
 __all__ = ["Gemma4Runtime"]
