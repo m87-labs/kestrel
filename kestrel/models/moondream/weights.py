@@ -250,13 +250,42 @@ def _assign_md3_text_weights(
         param.data = param.data.contiguous()
 
 
+def _copy_patch_emb_weight(param: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy a checkpoint `patch_emb.weight` into the alignment-padded parameter.
+
+    The parameter is `[enc_dim, aligned_patch_dim]` (592 columns for SigLIP) while
+    every existing checkpoint carries the RAW width (588).  Checkpoints are NOT
+    re-exported for this: they load unchanged and the pad columns are zeroed here,
+    which is exact -- a zero column contributes exactly zero to every dot product.
+
+    A width that is neither the parameter's nor a prefix of it RAISES.  This is the
+    one place a real checkpoint could silently mis-load, and a wrong-shaped
+    `patch_emb` would produce a plausible-looking encoder that is quietly wrong, so
+    the mismatch is refused rather than broadcast, truncated or padded on faith.
+    """
+    if src.shape == param.shape:
+        param.data.copy_(src)
+        return
+    if src.ndim != 2 or src.shape[0] != param.shape[0] or src.shape[1] > param.shape[1]:
+        raise ValueError(
+            f"patch_emb.weight checkpoint shape {tuple(src.shape)} is not compatible "
+            f"with the model parameter {tuple(param.shape)}. The parameter is padded "
+            "to the tensor-core alignment, so a checkpoint may be narrower in the "
+            "input dimension (it is zero-extended) but nothing else may differ.")
+    k = src.shape[1]
+    param.data[:, :k].copy_(src)
+    param.data[:, k:].zero_()
+
+
 def _assign_md2_vision_weights(
     get_tensor: Callable[[str], torch.Tensor], model: nn.Module
 ) -> None:
     """Assign vision weights from Moondream 2 checkpoint format (model.vision.*)."""
     vision = model.vision
 
-    vision["patch_emb"].weight.data.copy_(get_tensor("model.vision.patch_emb.weight"))
+    _copy_patch_emb_weight(
+        vision["patch_emb"].weight, get_tensor("model.vision.patch_emb.weight")
+    )
     vision["patch_emb"].bias.data.copy_(get_tensor("model.vision.patch_emb.bias"))
     vision.pos_emb.data.copy_(get_tensor("model.vision.pos_emb"))
     vision["post_ln"].weight.data.copy_(get_tensor("model.vision.post_ln.weight"))
@@ -288,10 +317,16 @@ def _assign_md2_vision_weights(
 def _assign_md3_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
     """Assign vision weights from Moondream 3 checkpoint format (vision_encoder.*)."""
     vision = model.vision
+    # patch_emb.weight is NOT in this map: its parameter is padded to the tensor-core
+    # alignment, so it needs the zero-extending copy rather than the exact-shape
+    # `copy_` the loop below performs. Keeping it out means the generic loop stays
+    # strict for every other tensor instead of growing a shape-tolerant path that
+    # would mask a real mismatch elsewhere.
+    _copy_patch_emb_weight(
+        vision["patch_emb"].weight,
+        get_tensor("vision_encoder.encoder.model.visual.patch_embed.linear.weight"),
+    )
     weight_map: Dict[str, torch.Tensor] = {
-        "vision_encoder.encoder.model.visual.patch_embed.linear.weight": vision[
-            "patch_emb"
-        ].weight,
         "vision_encoder.encoder.model.visual.patch_embed.linear.bias": vision[
             "patch_emb"
         ].bias,
