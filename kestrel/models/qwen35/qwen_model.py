@@ -173,135 +173,6 @@ class Qwen3_5RMSNormGated(nn.Module):
         )
 
 
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    """
-    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
-    """
-    # NOTE: attention mask is a 2D boolean tensor
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
-        dtype = hidden_states.dtype
-        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-
-    return hidden_states
-
-
-def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
-    """This function is intended to align with the l2norm implementation in the FLA library."""
-    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x * inv_norm
-
-
-def torch_chunk_gated_delta_rule(
-    query,
-    key,
-    value,
-    g,
-    beta,
-    chunk_size=64,
-    initial_state=None,
-    output_final_state=False,
-    use_qk_l2norm_in_kernel=False,
-    cu_seqlens: torch.Tensor | None = None,
-):
-    # Single-sequence (numel==2: [0, T]) falls through to the core chunk math so the
-    # host read below is skipped under CUDA-graph capture (graph-safety).
-    if cu_seqlens is not None and int(cu_seqlens.numel()) > 2:
-        offsets = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
-        outputs = []
-        final_states = []
-        for row, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
-            row_initial_state = None
-            if initial_state is not None:
-                row_initial_state = initial_state[row : row + 1]
-            out, state = torch_chunk_gated_delta_rule(
-                query[:, start:end],
-                key[:, start:end],
-                value[:, start:end],
-                g[:, start:end],
-                beta[:, start:end],
-                chunk_size=chunk_size,
-                initial_state=row_initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            )
-            outputs.append(out)
-            if state is not None:
-                final_states.append(state)
-        core_attn_out = torch.cat(outputs, dim=1)
-        last_recurrent_state = (
-            torch.cat(final_states, dim=0) if final_states else None
-        )
-        return core_attn_out, last_recurrent_state
-
-    initial_dtype = query.dtype
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
-    scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
-
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    # reshape to chunks
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
-
-    # chunk decay
-    g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
-
-    # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
-
-    if not output_final_state:
-        last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
-
-
 def _packed_seq_idx_from_cu_seqlens(
     cu_seqlens: torch.Tensor,
     total_tokens: int,
@@ -393,16 +264,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
     ):
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-
-        # Set up dimensions for reshapes later
+        if attention_mask is not None:
+            raise RuntimeError("Qwen GDN requires packed sequence metadata")
+        if cache_params is None:
+            raise RuntimeError("Qwen GDN requires inference cache state")
         batch_size, seq_len, _ = hidden_states.shape
-
-        # We have cached `conv_state` / `recurrent_state` to continue from. The two cached modes
-        # (single-token decode and chunk-tokens continuation) share the state read here; they only
-        # diverge in how the conv input is assembled and which kernel consumes the states below,
-        # which we gate locally on `seq_len`.
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
+        is_decode = cache_params.has_previous_state(self.layer_idx)
         cu_seqlens_q = cu_seq_lens_q
         supports_native_packed_gdn = (
             self.supports_packed_gdn(
@@ -415,19 +282,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and self.num_v_heads % self.num_k_heads == 0
             and self.head_v_dim == self.head_k_dim
         )
-        packed_prefill = (
-            cu_seqlens_q is not None
-            and batch_size == 1
-            and cache_params is not None
-            and not use_precomputed_states
-        )
-        native_prefill = packed_prefill and supports_native_packed_gdn
-
-        # getting projected states from cache if it exists
-        if use_precomputed_states:
+        if not supports_native_packed_gdn:
+            raise RuntimeError("Qwen GDN requires a native packed runtime")
+        if is_decode:
+            if seq_len != 1:
+                raise RuntimeError(
+                    "Qwen GDN cached continuation supports one token per decode"
+                )
+        elif cu_seqlens_q is None or batch_size != 1:
+            raise RuntimeError("Qwen GDN prefill requires packed sequence metadata")
+        if is_decode:
             layer_cache = cache_params.layers[self.layer_idx]
             conv_state = layer_cache.conv_states
-            recurrent_state = layer_cache.recurrent_states
+            if conv_state is None:
+                raise RuntimeError("Qwen GDN decode state was not initialized")
             state_indices = gdn_state_indices
             if state_indices is not None:
                 state_indices = state_indices.to(
@@ -444,11 +312,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-        core_attn_out = None
-        last_recurrent_state = None
-        packed_recurrent_state = None
 
-        if use_precomputed_states and seq_len == 1:
+        if is_decode:
             # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
             if state_indices is None:
                 raise RuntimeError("Qwen cached GDN decode requires gdn_state_indices")
@@ -460,304 +325,116 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.conv1d.bias,
                 self.activation,
             )
-            if supports_native_packed_gdn:
-                # ReplaySSM is the only single-token GDN decode path. The ring
-                # buffers are seeded at prefill (native packed prefill here, or
-                # the state-pool capture for the captured path) and bound to the
-                # cache before decode, so they are always present.
-                #
-                # The replay ring is indexed by VALUE head (num_v_heads) -- both
-                # the symmetric and GQA kernels read it that way (the GQA kernel
-                # applies the k->v fan-out to q/k internally). On a GQA layer
-                # (num_v_heads != num_k_heads) the symmetric
-                # ``packed_recurrent_decode_replay_indexed`` validates replay_k
-                # as num_k_heads-shaped, so after the value-head ring allocation
-                # it rejects the (correct) v-head ring and its torch fallback
-                # raises ``bad replay_k shape``. Route GQA shapes to the GQA
-                # decode kernel, which expects the v-head ring; keep the
-                # symmetric kernel for symmetric (num_v_heads == num_k_heads)
-                # layers.
-                replay_checkpoint = layer_cache.replay_checkpoint_states
-                replay_k = layer_cache.replay_k
-                replay_u = layer_cache.replay_u
-                replay_g = layer_cache.replay_g
-                replay_lengths = layer_cache.replay_lengths
-                assert (
-                    replay_checkpoint is not None
-                    and replay_k is not None
-                    and replay_u is not None
-                    and replay_g is not None
-                    and replay_lengths is not None
-                ), "ReplaySSM decode state was not seeded before GDN decode"
-                decode_fn = (
-                    self.packed_recurrent_decode_replay_indexed_gqa
-                    if self.num_v_heads != self.num_k_heads
-                    else self.packed_recurrent_decode_replay_indexed
-                )
-                core_attn_out, last_recurrent_state = decode_fn(
-                    mixed_qkv_decode,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    replay_checkpoint,
-                    replay_k,
-                    replay_u,
-                    replay_g,
-                    replay_lengths,
-                    state_indices,
-                )
-            else:
-                mixed_qkv = mixed_qkv_decode[:, :, None]
+            replay_checkpoint = layer_cache.replay_checkpoint_states
+            replay_k = layer_cache.replay_k
+            replay_u = layer_cache.replay_u
+            replay_g = layer_cache.replay_g
+            replay_lengths = layer_cache.replay_lengths
+            assert (
+                replay_checkpoint is not None
+                and replay_k is not None
+                and replay_u is not None
+                and replay_g is not None
+                and replay_lengths is not None
+            ), "ReplaySSM decode state was not seeded before GDN decode"
+            decode_fn = (
+                self.packed_recurrent_decode_replay_indexed_gqa
+                if self.num_v_heads != self.num_k_heads
+                else self.packed_recurrent_decode_replay_indexed
+            )
+            core_attn_out, _ = decode_fn(
+                mixed_qkv_decode,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                replay_checkpoint,
+                replay_k,
+                replay_u,
+                replay_g,
+                replay_lengths,
+                state_indices,
+            )
         else:
-            # Multi-token forward (prefill, or chunked-tokens decode when the cache has prior state).
-            packed_conv_state = None
-            if use_precomputed_states:
-                # Prior single-token decode may have run the ReplaySSM path, which
-                # advances the replay ring buffer but not recurrent_states. Fold
-                # the buffer back in so this chunk continuation starts from the
-                # true current state instead of a stale recurrent_state.
-                layer_cache.materialize_recurrent_from_replay(state_indices)
-                recurrent_state = layer_cache.recurrent_states
-                if state_indices is not None:
-                    conv_state = conv_state.index_select(0, state_indices)
-                    recurrent_state = recurrent_state.index_select(0, state_indices)
-                elif conv_state.shape[0] != batch_size:
-                    raise RuntimeError(
-                        "Qwen cached chunk decode requires gdn_state_indices "
-                        "when state batch differs from token batch"
-                    )
-                # Cached chunked-tokens decode: prepend the cached conv context so the causal conv
-                # sees the correct left-context rather than zero-padding. Dropped from the output
-                # at the end of this branch.
-                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
-            if cache_params is not None:
-                if native_prefill:
-                    num_sequences = (
-                        int(cu_seqlens_q.numel() - 1)
-                        if packed_prefill
-                        else batch_size
-                    )
-                    layer = cache_params.layers[self.layer_idx]
-                    conv_shape = (
-                        num_sequences,
-                        self.conv_dim,
-                        self.conv_kernel_size,
-                    )
-                    if (
-                        not layer.is_conv_states_initialized
-                        or layer.conv_states is None
-                        or tuple(layer.conv_states.shape) != conv_shape
-                    ):
-                        _install_linear_conv_state(
-                            layer,
-                            torch.empty(
-                                conv_shape,
-                                device=mixed_qkv.device,
-                                dtype=mixed_qkv.dtype,
-                            ),
-                        )
-                    packed_conv_state = layer.conv_states
-                    recurrent_shape = (
-                        num_sequences,
-                        self.num_v_heads,
-                        self.head_k_dim,
-                        self.head_v_dim,
-                    )
-                    if (
-                        not layer.is_recurrent_states_initialized
-                        or layer.recurrent_states is None
-                        or tuple(layer.recurrent_states.shape) != recurrent_shape
-                    ):
-                        layer.recurrent_states = torch.empty(
-                            recurrent_shape,
-                            device=mixed_qkv.device,
-                            dtype=torch.float32,
-                        )
-                        layer.is_recurrent_states_initialized = True
-                    packed_recurrent_state = layer.recurrent_states
-                    layer.has_previous_state = True
-                elif not packed_prefill:
-                    new_conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                    cache_params.layers[self.layer_idx].update_conv_state(
-                        new_conv_state,
-                        state_indices=state_indices if use_precomputed_states else None,
-                    )
-            if native_prefill:
-                if seq_idx is None:
-                    seq_idx = _packed_seq_idx_from_cu_seqlens(
-                        cu_seqlens_q,
-                        mixed_qkv.shape[-1],
-                        mixed_qkv.device,
-                    )
-                recurrence_cu_seqlens = cu_seqlens_q
-                # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
-                # Triton Bench on H100 was 0.0358 ms vs 0.0250 ms at seq=384,
-                # and 0.0515 ms vs 0.0333 ms at seq=768,chunks=2; keeping the
-                # separate kernels.
-                mixed_qkv = self.causal_conv1d_packed(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    seq_idx=seq_idx,
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    final_state=packed_conv_state,
+            num_sequences = int(cu_seqlens_q.numel() - 1)
+            layer = cache_params.layers[self.layer_idx]
+            conv_shape = (num_sequences, self.conv_dim, self.conv_kernel_size)
+            if (
+                not layer.is_conv_states_initialized
+                or layer.conv_states is None
+                or tuple(layer.conv_states.shape) != conv_shape
+            ):
+                _install_linear_conv_state(
+                    layer,
+                    torch.empty(
+                        conv_shape,
+                        device=mixed_qkv.device,
+                        dtype=mixed_qkv.dtype,
+                    ),
                 )
-            elif packed_prefill:
-                if seq_idx is None:
-                    seq_idx = _packed_seq_idx_from_cu_seqlens(
-                        cu_seqlens_q,
-                        mixed_qkv.shape[-1],
-                        mixed_qkv.device,
-                    )
-                recurrence_cu_seqlens = cu_seqlens_q
-                if cache_params is not None:
-                    num_sequences = int(cu_seqlens_q.numel() - 1)
-                    layer = cache_params.layers[self.layer_idx]
-                    conv_shape = (
-                        num_sequences,
-                        self.conv_dim,
-                        self.conv_kernel_size,
-                    )
-                    if (
-                        not layer.is_conv_states_initialized
-                        or layer.conv_states is None
-                        or tuple(layer.conv_states.shape) != conv_shape
-                    ):
-                        _install_linear_conv_state(
-                            layer,
-                            torch.empty(
-                                conv_shape,
-                                device=mixed_qkv.device,
-                                dtype=mixed_qkv.dtype,
-                            ),
-                        )
-                    packed_conv_state = layer.conv_states
-                mixed_qkv = self.causal_conv1d_packed(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    seq_idx=seq_idx,
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    final_state=packed_conv_state,
-                    out=None,
+            packed_conv_state = layer.conv_states
+            recurrent_shape = (
+                num_sequences,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+            if (
+                not layer.is_recurrent_states_initialized
+                or layer.recurrent_states is None
+                or tuple(layer.recurrent_states.shape) != recurrent_shape
+            ):
+                layer.recurrent_states = torch.empty(
+                    recurrent_shape,
+                    device=mixed_qkv.device,
+                    dtype=torch.float32,
                 )
-                if cache_params is not None and packed_conv_state is not None:
-                    cache_params.layers[self.layer_idx].update_conv_state(
-                        packed_conv_state,
-                        state_indices=state_indices if use_precomputed_states else None,
-                    )
-            else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
-            if use_precomputed_states:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-
-        if core_attn_out is None:
+                layer.is_recurrent_states_initialized = True
+            packed_recurrent_state = layer.recurrent_states
+            layer.has_previous_state = True
+            if seq_idx is None:
+                seq_idx = _packed_seq_idx_from_cu_seqlens(
+                    cu_seqlens_q,
+                    mixed_qkv.shape[-1],
+                    mixed_qkv.device,
+                )
+            recurrence_cu_seqlens = cu_seqlens_q
+            # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
+            # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
+            # on H100; keeping the separate kernels.
+            mixed_qkv = self.causal_conv1d_packed(
+                x=mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                seq_idx=seq_idx,
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                final_state=packed_conv_state,
+            )
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            prepped_qk = (
-                native_prefill
-                and supports_native_packed_gdn
-                and not use_precomputed_states
+            query, key, value, g, beta = self.packed_prefill_prepare(
+                mixed_qkv,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
             )
-            if prepped_qk:
-                query, key, value, g, beta = self.packed_prefill_prepare(
-                    mixed_qkv,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                )
-            else:
-                query, key, value = torch.split(
-                    mixed_qkv,
-                    [
-                        self.key_dim,
-                        self.key_dim,
-                        self.value_dim,
-                    ],
-                    dim=-1,
-                )
-
-                query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-                key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-                value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-                beta = b.sigmoid()
-                # If the model is loaded in fp16, without the .float() here, A might be -inf
-                g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-                if self.num_v_heads // self.num_k_heads > 1:
-                    query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-                    key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-            if core_attn_out is None and prepped_qk:
-                # Native serial prefill recurrence beats Kestrel-prep+FLA on
-                # most Qwen packed shapes (for example seq=384,chunks=1:
-                # 0.252 ms vs 0.433 ms on H100). It still loses at
-                # seq=768,chunks=1 (0.489 ms vs 0.441 ms); closing that
-                # remaining case needs a native chunk/WY-parallel recurrence.
-                core_attn_out, last_recurrent_state = self.packed_recurrent_prefill(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    recurrence_cu_seqlens,
-                    output_final_state=cache_params is not None,
-                    final_state=packed_recurrent_state,
-                )
-            elif core_attn_out is None:
-                initial_recurrent_state = (
-                    recurrent_state if use_precomputed_states else None
-                )
-                if initial_recurrent_state is not None:
-                    if (
-                        state_indices is not None
-                        and initial_recurrent_state.shape[0] != batch_size
-                    ):
-                        initial_recurrent_state = initial_recurrent_state.index_select(
-                            0,
-                            state_indices,
-                        )
-                    elif initial_recurrent_state.shape[0] != batch_size:
-                        raise RuntimeError(
-                            "Qwen cached recurrent decode requires gdn_state_indices "
-                            "when state batch differs from token batch"
-                        )
-                core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g=g,
-                    beta=beta,
-                    initial_state=initial_recurrent_state,
-                    output_final_state=cache_params is not None,
-                    use_qk_l2norm_in_kernel=True,
-                    # The chunked FLA kernel takes a single `cu_seqlens` arg; for packed self-attention this matches q-side lengths.
-                    cu_seqlens=cu_seqlens_q,
-                )
-
-        # Update cache
-        if (
-            cache_params is not None
-            and last_recurrent_state is not None
-            and last_recurrent_state is not packed_recurrent_state
-        ):
-            cache_params.layers[self.layer_idx].update_recurrent_state(
-                last_recurrent_state,
-                state_indices=state_indices if use_precomputed_states else None,
+            core_attn_out, _ = self.packed_recurrent_prefill(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                recurrence_cu_seqlens,
+                output_final_state=True,
+                final_state=packed_recurrent_state,
             )
-        elif cache_params is not None and native_prefill:
             # Native packed prefill writes recurrent_states in place, bypassing
             # update_recurrent_state -> _reset_replay_rows. Seed the ReplaySSM
             # ring buffer from the committed state here so single-token decode
             # takes the replay path in eager mode too (the captured path seeds
             # the same checkpoint via the state-pool capture).
             seed_layer = cache_params.layers[self.layer_idx]
-            if (
-                hasattr(seed_layer, "_reset_replay_rows")
-                and getattr(seed_layer, "recurrent_states", None) is not None
-            ):
-                seed_layer._reset_replay_rows(seed_layer.recurrent_states, None)
+            seed_layer._reset_replay_rows(seed_layer.recurrent_states, None)
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
