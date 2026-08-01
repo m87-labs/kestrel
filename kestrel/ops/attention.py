@@ -39,10 +39,7 @@ def dense_attention(
 ) -> torch.Tensor:
     """Run dense or packed attention through the device runtime."""
 
-    q, k, v = (
-        tensor.transpose(1, 2).contiguous()
-        for tensor in (query, key, value)
-    )
+    q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     arguments = {"causal": causal, "softmax_scale": scaling}
     if cu_seqlens is not None:
         if (
@@ -61,7 +58,7 @@ def dense_attention(
     out, _ = get_runtime().attention.flash_attn_fwd(q, k, v, **arguments)
     if cu_seqlens is not None:
         out = out.reshape(query.shape[0], query.shape[2], *out.shape[-2:])
-    return out.contiguous()
+    return out
 
 
 def paged_attention(
@@ -76,10 +73,10 @@ def paged_attention(
     sliding_window: int | None = None,
 ) -> torch.Tensor:
     """Attend batched or packed queries against a paged K/V layer."""
-    q = query.transpose(1, 2).contiguous()
+    q = query.transpose(1, 2)
     seqused_q = paged_kv_seqlens_q
     if cu_seqlens_q is not None:
-        q = q.flatten(0, 1).contiguous()
+        q = q.flatten(0, 1)
         seqused_q = None
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(f"paged attention requires fp16/bf16 query, got {q.dtype}")
@@ -104,7 +101,7 @@ def paged_attention(
     )
     if cu_seqlens_q is not None:
         out = out.reshape(query.shape[0], query.shape[2], *out.shape[-2:])
-    return out.contiguous()
+    return out
 
 
 __all__ = ["dense_attention", "paged_attention", "repeat_kv"]
