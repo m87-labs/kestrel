@@ -27,6 +27,7 @@ from .base import (
     parse_settings,
 )
 from .chat import ChatContentPart, ChatMessage, ChatRequest, ChatSkill, ChatSkillState
+from .query import QueryPolicy, QueryRequest, QuerySkill, QuerySkillState
 
 __all__ = [
     "AR_DEFAULT_MAX_NEW_TOKENS",
@@ -45,4 +46,8 @@ __all__ = [
     "SkillSpec",
     "SkillState",
     "parse_settings",
+    "QueryRequest",
+    "QueryPolicy",
+    "QuerySkill",
+    "QuerySkillState",
 ]

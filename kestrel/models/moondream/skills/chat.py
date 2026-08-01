@@ -23,8 +23,7 @@ from typing import Dict, List
 from kestrel.runtime.tokens import ImageMarker, TextToken
 from kestrel.skills.base import SkillFinalizeResult, SkillSpec
 from kestrel.skills.chat import ChatRequest, ChatSkill
-
-from .query import QueryRequest, QuerySkillState
+from kestrel.skills.query import QueryRequest, QuerySkillState
 
 if False:  # pragma: no cover - type-checking imports
     from ..runtime import MoondreamRuntime, Token

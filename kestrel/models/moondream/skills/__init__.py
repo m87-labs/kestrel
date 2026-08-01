@@ -12,13 +12,12 @@ model-agnostic kernel.
 
 from functools import cache
 
-from kestrel.skills import SkillRegistry
+from kestrel.skills import QuerySkill, SkillRegistry
 
 from .caption import CaptionRequest, CaptionSkill
 from .chat import MoondreamChatSkill
 from .detect import DetectRequest, DetectSkill
 from .point import PointRequest, PointSkill
-from .query import QueryRequest, QuerySkill
 from .segment import SegmentRequest, SegmentSkill
 
 
@@ -54,8 +53,6 @@ __all__ = [
     "DetectSkill",
     "PointRequest",
     "PointSkill",
-    "QueryRequest",
-    "QuerySkill",
     "SegmentRequest",
     "SegmentSkill",
 ]

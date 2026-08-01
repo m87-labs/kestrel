@@ -194,7 +194,7 @@ class FakeRuntime:
 
     def skills(self) -> Any:
         from kestrel.skills import SkillRegistry
-        from kestrel.models.moondream.skills import QuerySkill
+        from kestrel.skills import QuerySkill
 
         return SkillRegistry([QuerySkill()])
 

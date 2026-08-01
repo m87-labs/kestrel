@@ -27,8 +27,8 @@ from typing import (
 
 import numpy as np
 
+from kestrel.runtime import Token
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
-from kestrel.models.moondream.runtime import Token
 from kestrel.skills import SkillSpec, SkillState
 
 @dataclass(slots=True)

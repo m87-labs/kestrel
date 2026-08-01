@@ -11,7 +11,7 @@ import pytest
 
 from kestrel.models.moondream.config import TokenizerConfig
 from kestrel.models.protocols import QueryTemplate
-from kestrel.models.moondream.skills.query import QueryRequest, QuerySkill
+from kestrel.skills.query import QueryRequest, QuerySkill
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills.base import DecodeStep
 

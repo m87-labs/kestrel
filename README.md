@@ -2,9 +2,9 @@
 
 ![Kestrel Overview](https://raw.githubusercontent.com/m87-labs/kestrel/main/assets/kestrel-overview.png)
 
-High-performance inference engine for the [Moondream](https://moondream.ai) vision-language model.
+High-performance inference engine for vision-language models.
 
-Kestrel is the inference engine behind [Photon](https://moondream.ai/p/photon), Moondream's on-device deployment option. Most users should install via `pip install moondream` — this repo is the internal engine for those who need direct access.
+Kestrel is the inference engine behind [Photon](https://moondream.ai/p/photon), Moondream's on-device deployment option. Most Moondream users should install via `pip install moondream`; this repository provides the engine directly and supports additional model families.
 
 Kestrel provides async, micro-batched inference with streaming support, paged KV caching, and optimized CUDA and Metal kernels. It's designed for production deployments where throughput and latency matter.
 
@@ -26,7 +26,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
     SM90 (H100, H200, GH200), SM100 (B200), SM110 (Jetson Thor), SM120 (RTX PRO 6000).
     Other CUDA GPUs may work but have not been tested.
   - **Apple Silicon Mac** (M-series) on macOS 13 (Ventura) or later, with native Metal kernels.
-- `MOONDREAM_API_KEY` (optional) — only needed for finetuned-model inference (get a key from [moondream.ai](https://moondream.ai))
+- `MOONDREAM_API_KEY` (optional) — only needed for Moondream finetuned-model inference (get a key from [moondream.ai](https://moondream.ai))
 
 ## Installation
 
@@ -38,15 +38,15 @@ For Jetson Orin (JetPack 6) or Jetson Thor (JetPack 7), see the [Jetson setup gu
 
 ## Model Access
 
-Kestrel supports both Moondream 3 and Moondream 2:
+Kestrel supports these model families:
 
 | Model | Repository | Notes |
 |-------|------------|-------|
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
-| Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Requires access approval |
-| Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Private repository |
-
-For Moondream 3, request access (automatically granted) then authenticate with `huggingface-cli login` or set `HF_TOKEN`.
+| Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Public, no approval needed |
+| Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
+| Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
+| Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 
 ## Quick Start
 
@@ -59,8 +59,8 @@ from kestrel.engine import InferenceEngine
 
 async def main():
     # Weights are automatically downloaded from HuggingFace on first run.
-    # Use model="moondream2", "moondream3-preview", or "moondream3.1-9B-A2B".
-    cfg = RuntimeConfig(model="moondream2")
+    # Use a registered model name or Hugging Face repository ID.
+    cfg = RuntimeConfig(model="Qwen/Qwen3.5-4B")
 
     # Create the engine (loads model and warms up). No API key needed for
     # local inference; pass api_key="..." only for finetuned models.
@@ -268,7 +268,7 @@ architecture and checkpoint format.
 |----------|-------------|
 | `MOONDREAM_API_KEY` | Optional. Only needed for finetuned-model inference. Get this from [moondream.ai](https://moondream.ai). |
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
-| `HF_TOKEN` | HuggingFace token for gated models like Moondream 3. Alternatively, run `huggingface-cli login`. |
+| `HF_TOKEN` | Hugging Face token for private or gated model repositories. Alternatively, run `huggingface-cli login`. |
 
 ## Triton Inference Server
 

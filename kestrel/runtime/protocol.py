@@ -116,11 +116,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     graph_capture_lock: Any  # context manager serializing CUDA-graph capture
     kv_pool: Any  # Engine-owned KV memory pool shared with co-hosted AR runtimes
 
-    # Model-specific state callers reach into today.
-    # Narrowing these is a follow-up.
-    config: Any
-    region: Any
-    spatial_tables: Any
+    # Shared cache state used by the scheduler.
     page_table: Any
 
     # Capacity queries

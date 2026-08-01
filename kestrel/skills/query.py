@@ -1,15 +1,12 @@
-"""Query skill leveraging the existing text generation flow."""
-
+"""Model-agnostic question-answering skill."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..runtime import CoordToken, TextToken, Token
 from kestrel.models.protocols import QueryTemplate
-from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
-
+from kestrel.runtime.tokens import CoordToken, TextToken, Token
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
     AR_DEFAULT_TEMPERATURE,
@@ -21,10 +18,10 @@ from kestrel.skills.base import (
     SkillState,
     parse_settings,
 )
-from typing import Mapping
+from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
 if False:  # pragma: no cover - type-checking imports
-    from ..runtime import MoondreamRuntime
+    from kestrel.runtime.protocol import AutoregressiveRuntime
     from kestrel.scheduler.types import GenerationRequest
 
 
@@ -39,8 +36,21 @@ class QueryRequest:
     spatial_refs: Optional[Sequence[Sequence[float]]] = None
 
 
+@dataclass(frozen=True, slots=True)
+class QueryPolicy:
+    temperature: float = AR_DEFAULT_TEMPERATURE
+    top_p: float = AR_DEFAULT_TOP_P
+    default_reasoning: bool = True
+    reasoning_in_settings: bool = False
+    supports_spatial_refs: bool = True
+
+
 class QuerySkill(SkillSpec):
     """Default skill emitting plain text answers."""
+
+    def __init__(self, policy: QueryPolicy = QueryPolicy()) -> None:
+        super().__init__(name="query")
+        self.policy = policy
 
     def build_request(
         self,
@@ -55,18 +65,27 @@ class QuerySkill(SkillSpec):
         if not question:
             raise ValueError("question must be a non-empty string")
         refs = normalize_spatial_refs(prompt.get("spatial_refs"))
-        if refs is not None and image is None:
-            raise ValueError("spatial_refs can only be used with an image")
+        if refs is not None:
+            if not self.policy.supports_spatial_refs:
+                raise ValueError("query does not support spatial_refs")
+            if image is None:
+                raise ValueError("spatial_refs can only be used with an image")
         s = parse_settings(
             settings,
-            temperature=AR_DEFAULT_TEMPERATURE,
-            top_p=AR_DEFAULT_TOP_P,
+            temperature=self.policy.temperature,
+            top_p=self.policy.top_p,
             max_tokens=AR_DEFAULT_MAX_NEW_TOKENS,
         )
+        reasoning_source = settings if self.policy.reasoning_in_settings else prompt
         request = QueryRequest(
             question=question,
             image=image,
-            reasoning=bool(prompt.get("reasoning", True)),
+            reasoning=bool(
+                (reasoning_source or {}).get(
+                    "reasoning",
+                    self.policy.default_reasoning,
+                )
+            ),
             stream=bool(prompt.get("stream", False)),
             spatial_refs=refs,
         )
@@ -80,12 +99,9 @@ class QuerySkill(SkillSpec):
     def prompt_text(self, request_context: object) -> str:
         return getattr(request_context, "question", "")
 
-    def __init__(self) -> None:
-        super().__init__(name="query")
-
     def build_prompt_tokens(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         request_context: object,
     ) -> Sequence["Token"]:
         if not isinstance(request_context, QueryRequest):
@@ -123,7 +139,7 @@ class QuerySkill(SkillSpec):
 
     def create_state(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         request: "GenerationRequest",
         request_context: "QueryRequest",
     ) -> "QuerySkillState":
@@ -137,8 +153,8 @@ class QuerySkillState(SkillState):
 
     # The query mask is genuinely stateful: it transitions INACTIVE -> ACTIVE
     # mid-run. While collecting reasoning, ``allowed_token_ids`` is ``None`` and
-    # (for non-moondream2 models) ``suppressed_token_ids`` is ``None`` too -- no
-    # active constraint. Once the model emits ``answer_id``, the state flips to
+    # ``suppressed_token_ids`` may also be inactive, depending on the model's
+    # declarative query template. Once the model emits ``answer_id``, the state flips to
     # forcing ``post_reasoning_prefix`` one id at a time via
     # ``allowed_token_ids``. A single spec macro-step commits a variable run
     # under ONE mask, so a run that begins in reasoning (mask = None) and crosses
@@ -185,13 +201,13 @@ class QuerySkillState(SkillState):
         self._post_reasoning_idx: int = 0
 
     def stop_token_ids(
-        self, runtime: "MoondreamRuntime"
+        self, runtime: "AutoregressiveRuntime"
     ) -> Optional[Sequence[int]]:
         stop_token_ids = self._get_query_template(runtime).stop_token_ids
         return stop_token_ids or None
 
     def allowed_token_ids(
-        self, runtime: "MoondreamRuntime"
+        self, runtime: "AutoregressiveRuntime"
     ) -> Optional[Sequence[int]]:
         if (
             self._post_reasoning_tokens is not None
@@ -201,26 +217,22 @@ class QuerySkillState(SkillState):
         return None
 
     def suppressed_token_ids(
-        self, runtime: "MoondreamRuntime"
+        self, runtime: "AutoregressiveRuntime"
     ) -> Optional[Sequence[int]]:
-        if runtime.model_name != "moondream2":
-            return None
-        pt = runtime.prompt_template
+        template = self._get_query_template(runtime)
         if self._reasoning_enabled and self._collecting_reasoning:
-            # During reasoning: suppress eos and size tokens (matching HF).
-            return [pt.eos_id, pt.size_id]
+            return template.reasoning_suppressed_token_ids or None
         # Don't suppress during post-reasoning injection (allowed_token_ids does it).
         if (
             self._post_reasoning_tokens is not None
             and self._post_reasoning_idx < len(self._post_reasoning_tokens)
         ):
             return None
-        # During answer generation: suppress answer_id (matching HF).
-        return [pt.answer_id]
+        return template.answer_suppressed_token_ids or None
 
     def consume_step(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         step: DecodeStep,
     ) -> None:
         if self._reasoning_enabled:
@@ -288,7 +300,7 @@ class QuerySkillState(SkillState):
             self._answer_tokens.append(step.token.token_id)
         return None
 
-    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+    def pop_stream_delta(self, runtime: "AutoregressiveRuntime") -> Optional[str]:
         if not self._streaming:
             return None
         if self._collecting_reasoning:
@@ -306,7 +318,7 @@ class QuerySkillState(SkillState):
 
     def finalize(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         *,
         reason: str,
     ) -> SkillFinalizeResult:
@@ -348,7 +360,7 @@ class QuerySkillState(SkillState):
             output=output,
         )
 
-    def on_prefill(self, runtime: "MoondreamRuntime") -> None:
+    def on_prefill(self, runtime: "AutoregressiveRuntime") -> None:
         if not self._reasoning_enabled:
             return None
         self._ensure_token_ids(runtime)
@@ -368,7 +380,7 @@ class QuerySkillState(SkillState):
         self._current_chunk_points.clear()
         self._pending_coord = None
 
-    def _ensure_token_ids(self, runtime: "MoondreamRuntime") -> None:
+    def _ensure_token_ids(self, runtime: "AutoregressiveRuntime") -> None:
         if self._answer_id is not None:
             return
         pt = runtime.prompt_template
@@ -377,7 +389,7 @@ class QuerySkillState(SkillState):
         self._end_ground_id = pt.end_ground_id
 
     def _get_query_template(
-        self, runtime: "MoondreamRuntime"
+        self, runtime: "AutoregressiveRuntime"
     ) -> QueryTemplate:
         if self._query_template is None:
             template = runtime.prompt_template.query()

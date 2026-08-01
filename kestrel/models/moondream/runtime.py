@@ -46,6 +46,7 @@ from kestrel.runtime import (
 )
 from kestrel.runtime.sampling import SamplingHooks
 from kestrel.runtime.state import _CacheLookupResult
+from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.scheduler.spatial import compute_spatial_values
 
 # ``kestrel.scheduler.tokens`` imports CoordToken/SizeToken/TextToken
@@ -79,7 +80,6 @@ from .region import (
     encode_coordinate,
     encode_size,
 )
-from .tokenizer import load_tokenizer
 from ...seg_refiner import SegmentRefiner, _HAS_SEG_DEPS
 from ...dense_lora import DenseLoRATorchMLPScratch, create_mlp_scratch
 from .decode_slot import DecodeSlot, create_decode_slot

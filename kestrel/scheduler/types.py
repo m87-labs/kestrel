@@ -6,9 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
-from kestrel.models.moondream.runtime import SequenceState, Token
-from kestrel.runtime import AutoregressiveRuntime
-from kestrel.models.moondream.image_crops import OverlapCropOutput
+from kestrel.runtime import AutoregressiveRuntime, SequenceState, Token
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
 
 
@@ -192,7 +190,7 @@ class GenerationRequest:
     stream_callback: Optional["StreamCallback"] = None
     image: Optional[np.ndarray | bytes] = None
     image_hash: Optional[bytes] = None  # SHA256 hash for prefix caching
-    image_crops: Optional[OverlapCropOutput] = None
+    image_crops: object | None = None
     image_length: int = 0
     submitted_at: float = 0.0
     skill_state: Optional[SkillState] = field(default=None, repr=False)

@@ -10,10 +10,11 @@ from kestrel.engine import InferenceEngine
 from kestrel.models.moondream.runtime import CoordToken, SizeToken, TextToken
 from kestrel.skills import SkillRegistry
 from kestrel.models.moondream.skills import (
-    CaptionSkill, DetectSkill, PointSkill, QuerySkill, SegmentSkill,
+    CaptionSkill, DetectSkill, PointSkill, SegmentSkill,
 )
+from kestrel.skills import QuerySkill
 from kestrel.models.moondream.skills.point import PointRequest
-from kestrel.models.moondream.skills.query import QueryRequest
+from kestrel.skills.query import QueryRequest
 
 
 def _ALL_SKILLS() -> SkillRegistry:
@@ -61,7 +62,6 @@ def test_point_prompt_tokens_include_spatial_refs_before_object_text() -> None:
 def test_engine_point_normalizes_spatial_refs_for_request() -> None:
     engine = object.__new__(InferenceEngine)
     engine._skills_override = _ALL_SKILLS()
-    engine._default_max_new_tokens = 128
     engine._skills_override = _ALL_SKILLS()
     captured: dict[str, object] = {}
 
@@ -95,7 +95,6 @@ def test_engine_point_normalizes_spatial_refs_for_request() -> None:
 def test_engine_point_keeps_positional_settings_compatibility() -> None:
     engine = object.__new__(InferenceEngine)
     engine._skills_override = _ALL_SKILLS()
-    engine._default_max_new_tokens = 128
     engine._skills_override = _ALL_SKILLS()
     captured: dict[str, object] = {}
 
@@ -143,7 +142,6 @@ def test_engine_query_treats_empty_spatial_refs_as_unset_without_image() -> None
     engine._skills_override = _ALL_SKILLS()
     engine._default_temperature = 0.0
     engine._default_top_p = 1.0
-    engine._default_max_new_tokens = 128
     captured: dict[str, object] = {}
 
     async def fake_submit(request_context: object, **kwargs: object) -> SimpleNamespace:

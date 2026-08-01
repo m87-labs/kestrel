@@ -11,15 +11,13 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 if False:  # pragma: no cover - type-checking imports
     import numpy as np
-    from kestrel.models.moondream.runtime import MoondreamRuntime
+    from kestrel.runtime import AutoregressiveRuntime
+    from kestrel.runtime.tokens import Token
     from kestrel.scheduler.types import GenerationRequest
-    from kestrel.models.moondream.runtime import Token
 
 
-# Moondream's autoregressive serving defaults. These are AR sampling
-# config (token sampling), not kernel config — they live with the AR
-# skills, which are the model's per-capability units. query/caption use
-# AR_DEFAULT_TEMPERATURE; detect/point/segment override to greedy (0.0).
+# Default autoregressive sampling settings. Individual model skills may
+# override them when their prompt or training contract requires it.
 AR_DEFAULT_TEMPERATURE = 0.2
 AR_DEFAULT_TOP_P = 0.9
 AR_DEFAULT_MAX_NEW_TOKENS = 768
@@ -139,14 +137,14 @@ class SkillSpec:
 
     def build_prompt_tokens(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         request_context: object,
     ) -> Sequence["Token"]:
         raise NotImplementedError
 
     def create_state(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         request: "GenerationRequest",
         request_context: object,
     ) -> "SkillState":
@@ -181,20 +179,20 @@ class SkillState:
 
     # ------------------------------------------------------------------
 
-    def on_prefill(self, runtime: "MoondreamRuntime") -> None:
+    def on_prefill(self, runtime: "AutoregressiveRuntime") -> None:
         """Hook invoked once prefill completes."""
         return None
 
     def consume_step(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         step: DecodeStep,
     ) -> None:
         raise NotImplementedError
 
     def finalize(
         self,
-        runtime: "MoondreamRuntime",
+        runtime: "AutoregressiveRuntime",
         *,
         reason: str,
     ) -> SkillFinalizeResult:
@@ -213,11 +211,11 @@ class SkillState:
     def token_count(self) -> int:
         return len(self._tokens)
 
-    def allowed_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+    def allowed_token_ids(self, runtime: "AutoregressiveRuntime") -> Optional[Sequence[int]]:
         """Optional per-skill restriction on the next sampled token ids."""
         return None
 
-    def suppressed_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+    def suppressed_token_ids(self, runtime: "AutoregressiveRuntime") -> Optional[Sequence[int]]:
         """Optional per-skill token ids to suppress (set logits to -inf).
 
         Complement of allowed_token_ids: these tokens are forced to -inf
@@ -225,7 +223,7 @@ class SkillState:
         """
         return None
 
-    def stop_token_ids(self, runtime: "MoondreamRuntime") -> Optional[Sequence[int]]:
+    def stop_token_ids(self, runtime: "AutoregressiveRuntime") -> Optional[Sequence[int]]:
         """Optional per-skill token ids that end generation.
 
         The scheduler stops a sequence when its last token matches the
@@ -238,7 +236,7 @@ class SkillState:
 
     # Streaming -------------------------------------------------------
 
-    def pop_stream_delta(self, runtime: "MoondreamRuntime") -> Optional[str]:
+    def pop_stream_delta(self, runtime: "AutoregressiveRuntime") -> Optional[str]:
         """Return newly available human-readable text for streaming clients."""
 
         return None
