@@ -187,15 +187,6 @@ def _packed_seq_idx_from_cu_seqlens(
     )[None, :]
 
 
-def _install_linear_conv_state(layer: Any, conv_states: torch.Tensor) -> None:
-    layer.dtype = conv_states.dtype
-    layer.device = conv_states.device
-    layer.max_batch_size = conv_states.shape[0]
-    layer.conv_kernel_size = conv_states.shape[-1]
-    layer.conv_states = conv_states
-    layer.is_conv_states_initialized = True
-
-
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
@@ -358,18 +349,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_sequences = int(cu_seqlens_q.numel() - 1)
             layer = cache_params.layers[self.layer_idx]
             conv_shape = (num_sequences, self.conv_dim, self.conv_kernel_size)
-            if (
-                not layer.is_conv_states_initialized
-                or layer.conv_states is None
-                or tuple(layer.conv_states.shape) != conv_shape
-            ):
-                _install_linear_conv_state(
-                    layer,
-                    torch.empty(
-                        conv_shape,
-                        device=mixed_qkv.device,
-                        dtype=mixed_qkv.dtype,
-                    ),
+            if layer.conv_states is None or tuple(layer.conv_states.shape) != conv_shape:
+                layer.conv_states = torch.empty(
+                    conv_shape,
+                    device=mixed_qkv.device,
+                    dtype=mixed_qkv.dtype,
                 )
             packed_conv_state = layer.conv_states
             recurrent_shape = (
@@ -379,8 +363,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
             if (
-                not layer.is_recurrent_states_initialized
-                or layer.recurrent_states is None
+                layer.recurrent_states is None
                 or tuple(layer.recurrent_states.shape) != recurrent_shape
             ):
                 layer.recurrent_states = torch.empty(
@@ -388,7 +371,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     device=mixed_qkv.device,
                     dtype=torch.float32,
                 )
-                layer.is_recurrent_states_initialized = True
             packed_recurrent_state = layer.recurrent_states
             layer.has_previous_state = True
             if seq_idx is None:
@@ -427,11 +409,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 output_final_state=True,
                 final_state=packed_recurrent_state,
             )
-            # Native packed prefill writes recurrent_states in place, bypassing
-            # update_recurrent_state -> _reset_replay_rows. Seed the ReplaySSM
-            # ring buffer from the committed state here so single-token decode
-            # takes the replay path in eager mode too (the captured path seeds
-            # the same checkpoint via the state-pool capture).
+            # Seed ReplaySSM from the packed prefill's committed recurrent state.
             seed_layer = cache_params.layers[self.layer_idx]
             seed_layer._reset_replay_rows(seed_layer.recurrent_states, None)
 

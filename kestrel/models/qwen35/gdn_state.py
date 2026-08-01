@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 
@@ -21,87 +19,7 @@ class LinearAttentionState:
         self.replay_g: torch.Tensor | None = None
         self.replay_lengths: torch.Tensor | None = None
         self.replay_capacity = int(replay_capacity)
-        self.is_conv_states_initialized = False
-        self.is_recurrent_states_initialized = False
         self.has_previous_state = False
-
-    def update_conv_state(
-        self,
-        conv_states: torch.Tensor,
-        state_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if state_indices is not None and not self.is_conv_states_initialized:
-            raise RuntimeError("Indexed conv state update requires initialized state")
-        if not self.is_conv_states_initialized:
-            self.dtype, self.device = conv_states.dtype, conv_states.device
-            self.max_batch_size = conv_states.shape[0]
-            self.conv_kernel_size = conv_states.shape[-1]
-            self.conv_states = torch.empty_like(conv_states)
-            self.is_conv_states_initialized = True
-        if state_indices is not None:
-            indices = state_indices.to(
-                device=self.conv_states.device,
-                dtype=torch.long,
-            ).view(-1)
-            if int(indices.shape[0]) != int(conv_states.shape[0]):
-                raise ValueError("state_indices must match conv_states batch dimension")
-            state_view = self.conv_states.index_select(0, indices).clone()
-            if not self.has_previous_state:
-                state_view.copy_(conv_states)
-                self.has_previous_state = True
-            else:
-                num_new_tokens = conv_states.shape[-1]
-                if num_new_tokens >= self.conv_kernel_size:
-                    state_view.copy_(conv_states[..., -self.conv_kernel_size :])
-                else:
-                    state_view = state_view.roll(shifts=-num_new_tokens, dims=-1)
-                    state_view[:, :, -num_new_tokens:] = conv_states
-            self.conv_states.index_copy_(0, indices, state_view)
-            return self.conv_states
-        if not self.has_previous_state:
-            self.conv_states.copy_(conv_states)
-            self.has_previous_state = True
-        else:
-            num_new_tokens = conv_states.shape[-1]
-            if num_new_tokens >= self.conv_kernel_size:
-                self.conv_states.copy_(conv_states[..., -self.conv_kernel_size :])
-            else:
-                new_conv_states = self.conv_states.roll(shifts=-num_new_tokens, dims=-1)
-                new_conv_states[:, :, -num_new_tokens:] = conv_states
-                self.conv_states.copy_(new_conv_states)
-        return self.conv_states
-
-    def update_recurrent_state(
-        self,
-        recurrent_states: torch.Tensor,
-        state_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if state_indices is not None and not self.is_recurrent_states_initialized:
-            raise RuntimeError(
-                "Indexed recurrent state update requires initialized state"
-            )
-        if not self.is_recurrent_states_initialized:
-            self.recurrent_states = torch.empty_like(recurrent_states)
-            self.is_recurrent_states_initialized = True
-            # Allocate the ReplaySSM ring-buffer state alongside the recurrent
-            # state pool (formerly done in lazy_initialization, which main
-            # inlined away here).
-            self._ensure_replay_state(recurrent_states)
-        if state_indices is not None:
-            indices = state_indices.to(
-                device=self.recurrent_states.device,
-                dtype=torch.long,
-            ).view(-1)
-            if int(indices.shape[0]) != int(recurrent_states.shape[0]):
-                raise ValueError(
-                    "state_indices must match recurrent_states batch dimension"
-                )
-            self.recurrent_states.index_copy_(0, indices, recurrent_states)
-            self._reset_replay_rows(recurrent_states, indices)
-            return self.recurrent_states
-        self.recurrent_states.copy_(recurrent_states)
-        self._reset_replay_rows(recurrent_states, None)
-        return self.recurrent_states
 
     def _ensure_replay_state(self, recurrent_states: torch.Tensor) -> None:
         if recurrent_states.ndim != 4:
@@ -109,11 +27,12 @@ class LinearAttentionState:
         slots, value_heads, key_dim, value_dim = recurrent_states.shape
         # ReplaySSM indexes the key ring by value head; GQA applies the k-to-v
         # fan-out before the ring. Size by value_heads so k16/v32 Qwen3.5-4B is
-        # consistent with both the native kernels and torch reference fold;
-        # sizing it by key_heads aliased verify writes and tripped the
-        # materialize gate -> torch fallback -> "bad replay_k shape" at flush.
+        # consistent with both the native kernels and numeric oracle; sizing it
+        # by key_heads aliases verify writes and breaks materialization.
+        if recurrent_states.device.type == "mps" and self.conv_states is None:
+            raise RuntimeError("Qwen replay state requires convolution state")
         replay_k_dtype = (
-            getattr(self, "dtype", torch.float16)
+            self.conv_states.dtype
             if recurrent_states.device.type == "mps"
             else torch.bfloat16
         )
@@ -203,12 +122,6 @@ class LinearAttentionState:
             elif tuple(tensor.shape) != shape:
                 raise RuntimeError(f"Qwen GDN {name} shape changed")
 
-        self.dtype = conv_dtype
-        self.device = device
-        self.max_batch_size = int(conv_shape[0])
-        self.conv_kernel_size = int(conv_shape[-1])
-        self.is_conv_states_initialized = True
-        self.is_recurrent_states_initialized = True
         self._ensure_replay_state(self.recurrent_states)
 
     def clear(self, row: int | None = None) -> None:
@@ -368,18 +281,4 @@ class LinearAttentionState:
             write_recurrent=write_recurrent,
         )
         self.replay_lengths.index_fill_(0, row_indices, 0)
-
-
-class LinearAttentionLayer(LinearAttentionState):
-    def __init__(
-        self,
-        config: Any,
-        *,
-        replay_capacity: int,
-    ) -> None:
-        super().__init__(replay_capacity=replay_capacity)
-        self.num_k_heads = int(config.linear_num_key_heads)
-        self.num_v_heads = int(config.linear_num_value_heads)
-
-
-__all__ = ["LinearAttentionLayer", "LinearAttentionState"]
+__all__ = ["LinearAttentionState"]

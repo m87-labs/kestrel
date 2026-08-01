@@ -8,7 +8,7 @@ import torch
 
 from kestrel.kv_cache import PagedKVCache, PagedKVLayerSpec
 
-from .gdn_state import LinearAttentionLayer, LinearAttentionState
+from .gdn_state import LinearAttentionState
 
 if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm
@@ -51,10 +51,7 @@ class Qwen35InferenceCache:
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "linear_attention":
                 layers.append(
-                    LinearAttentionLayer(
-                        config,
-                        replay_capacity=replay_capacity,
-                    )
+                    LinearAttentionState(replay_capacity=replay_capacity)
                 )
                 continue
             layer = paged_kv[layer_idx]
@@ -70,14 +67,14 @@ class Qwen35InferenceCache:
         if layer_idx is None:
             return (
                 any(
-                    isinstance(layer, LinearAttentionLayer)
+                    isinstance(layer, LinearAttentionState)
                     and bool(layer.has_previous_state)
                     for layer in self.layers
                 )
                 or self.seq_length > 0
             )
         layer = self.layers[layer_idx]
-        if isinstance(layer, LinearAttentionLayer):
+        if isinstance(layer, LinearAttentionState):
             return bool(layer.has_previous_state)
         return self.seq_length > 0
 
@@ -162,7 +159,7 @@ class Qwen35LinearStatePool:
             if storage is None:
                 continue
             src_layer = cache.layers[layer_idx]
-            if not isinstance(src_layer, LinearAttentionLayer):
+            if not isinstance(src_layer, LinearAttentionState):
                 raise ValueError("Cannot capture mismatched Qwen linear state")
             if not src_layer.has_previous_state:
                 raise RuntimeError("Cannot capture uninitialized Qwen GDN state")
@@ -180,7 +177,7 @@ class Qwen35LinearStatePool:
             if storage is None:
                 continue
             layer = cache.layers[layer_idx]
-            if not isinstance(layer, LinearAttentionLayer):
+            if not isinstance(layer, LinearAttentionState):
                 raise ValueError("Cannot bind mismatched Qwen linear state")
             if storage.conv_states is None or storage.recurrent_states is None:
                 raise RuntimeError("Qwen GDN state pool is not initialized")
@@ -192,17 +189,6 @@ class Qwen35LinearStatePool:
             layer.replay_g = storage.replay_g
             layer.replay_lengths = storage.replay_lengths
             layer.replay_capacity = self.replay_capacity
-            # Mirror ``_install_linear_conv_state``'s metadata so the multi-token
-            # (chunked / spec-verify) GDN conv path -- which reads
-            # ``conv_kernel_size`` -- works against the bound persistent state,
-            # not just the single-token decode path that goes through the
-            # indexed conv-update kernel.
-            layer.dtype = storage.conv_states.dtype
-            layer.device = storage.conv_states.device
-            layer.max_batch_size = storage.conv_states.shape[0]
-            layer.conv_kernel_size = storage.conv_states.shape[-1]
-            layer.is_conv_states_initialized = True
-            layer.is_recurrent_states_initialized = True
             layer.has_previous_state = True
 
     def clear(self, batch_idx: int) -> None:
@@ -308,7 +294,7 @@ class Qwen35LinearStatePool:
     def _ensure_storage(
         self,
         storage: LinearAttentionState,
-        src_layer: LinearAttentionLayer,
+        src_layer: LinearAttentionState,
         *,
         batch_size: int = 1,
     ) -> None:
