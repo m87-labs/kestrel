@@ -1,7 +1,6 @@
 
 import threading
 import weakref
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -10,18 +9,12 @@ import torch
 
 from kestrel_kernels import get_runtime
 
-from kestrel.device import resolve_device
+from kestrel.device import resolve_device, stream_context
 from kestrel.utils import CpuGpuBuffer
 
 _KERNELS = get_runtime()
 reshape_and_cache_flash_cuda = _KERNELS.cache.reshape_and_cache_flash
 build_paged_kv_metadata_runtime = _KERNELS.cache.build_paged_kv_metadata
-
-
-def _maybe_stream_context(stream: torch.cuda.Stream | None):
-    """Return a stream context manager, or nullcontext if stream is None."""
-    from kestrel.device import stream_context
-    return stream_context(stream)
 
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
@@ -567,12 +560,12 @@ class PageTable:
         gpu_slice = self.page_table[batch_idx, start:end]
         cpu_slice = self._page_table_cpu_tensor[batch_idx, start:end]
         # Use the designated H2D stream to avoid races with graph replay.
-        with _maybe_stream_context(self._h2d_stream):
+        with stream_context(self._h2d_stream):
             gpu_slice.copy_(cpu_slice, non_blocking=True)
 
     def _sync_full_page_table(self) -> None:
         # Use the designated H2D stream to avoid races with graph replay.
-        with _maybe_stream_context(self._h2d_stream):
+        with stream_context(self._h2d_stream):
             self._page_table_buffer.copy_to_gpu()
 
     def commit_block_table(self, batch_indices: list[int] | None = None) -> None:
@@ -595,7 +588,7 @@ class PageTable:
             return
         # Find max row index and copy all rows up to that point in one call
         max_row = max(dirty_rows) + 1
-        with _maybe_stream_context(self._h2d_stream):
+        with stream_context(self._h2d_stream):
             self._page_table_buffer.copy_to_gpu(max_row)
         self._dirty_rows -= dirty_rows
 
