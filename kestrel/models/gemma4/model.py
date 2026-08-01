@@ -630,7 +630,6 @@ class Gemma4VisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seqused_k: torch.Tensor,
-        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -644,7 +643,7 @@ class Gemma4VisionAttention(nn.Module):
             query_states,
             cos,
             sin,
-            position_ids,
+            dimensions=2,
         )
 
         key_states = key_states.view(hidden_shape)
@@ -654,7 +653,7 @@ class Gemma4VisionAttention(nn.Module):
             key_states,
             cos,
             sin,
-            position_ids,
+            dimensions=2,
         )
 
         value_states = value_states.view(hidden_shape)
@@ -692,7 +691,6 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seqused_k: torch.Tensor,
-        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = _dense_runtime.rmsnorm(
@@ -704,7 +702,6 @@ class Gemma4VisionEncoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             seqused_k=seqused_k,
-            position_ids=position_ids,
         )
         hidden_states = _dense_runtime.rmsnorm(
             hidden_states,
@@ -761,7 +758,6 @@ class Gemma4VisionEncoder(nn.Module):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 seqused_k=seqused_k,
-                position_ids=pixel_position_ids,
             )
         return hidden_states
 

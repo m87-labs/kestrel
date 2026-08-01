@@ -76,11 +76,10 @@ def apply_multidimensional_rotary(
     tensor: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: torch.Tensor,
     *,
+    dimensions: int,
     unsqueeze_dim: int = 2,
 ) -> torch.Tensor:
-    dimensions = position_ids.shape[-1]
     if dimensions <= 0 or tensor.shape[-1] % (2 * dimensions):
         raise ValueError("rotary channels must divide into even position blocks")
     shape = (*tensor.shape[:-1], dimensions, tensor.shape[-1] // dimensions)
@@ -108,10 +107,14 @@ class MultidimensionalRotaryEmbedding(nn.Module):
         if dimensions <= 0 or head_dim % (2 * dimensions):
             raise ValueError("head channels must divide into even rotary blocks")
         self.dimensions = dimensions
-        self.inv_freq = default_inv_freq(
-            head_dim // dimensions,
-            base,
-            device=device,
+        self.register_buffer(
+            "inv_freq",
+            default_inv_freq(
+                head_dim // dimensions,
+                base,
+                device=device,
+            ),
+            persistent=False,
         )
 
     @torch.no_grad()
@@ -122,8 +125,6 @@ class MultidimensionalRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.shape[-1] != self.dimensions:
             raise ValueError(f"expected {self.dimensions} position dimensions")
-        if self.inv_freq.device != tensor.device:
-            self.inv_freq = self.inv_freq.to(tensor.device)
         device_type = tensor.device.type if tensor.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             frequencies = position_ids.float()[..., None] * self.inv_freq.float()

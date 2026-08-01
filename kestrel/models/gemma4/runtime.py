@@ -201,15 +201,12 @@ class Gemma4Runtime(UncachedPagedRuntime):
         self,
         prompt_tokens: Sequence[Token],
         *,
-        image: Any,
         image_crops: Any,
     ) -> tuple[list[Token], int, int]:
         tokens = list(prompt_tokens)
         text_length = len(tokens)
-        if image is None:
-            return tokens, 0, text_length
         if image_crops is None:
-            raise RuntimeError("image preprocessing did not produce crops")
+            return tokens, 0, text_length
         count = int(image_crops.num_image_tokens)
         image_block = (
             [TextToken(token_id=START_OF_IMAGE_ID)]
@@ -328,9 +325,9 @@ class Gemma4Runtime(UncachedPagedRuntime):
         image_hash: bytes | None = None,
         adapter_id: str | None = None,
     ) -> Any:
+        del image
         tokens, image_tokens, text_length = self._prepare_prompt(
             prompt_tokens,
-            image=image,
             image_crops=image_crops,
         )
         prompt_length = len(tokens)
@@ -356,19 +353,16 @@ class Gemma4Runtime(UncachedPagedRuntime):
         images: Sequence[Any] | None = None,
         image_crops_list: Sequence[Any] | None = None,
     ) -> torch.Tensor:
+        del images
         batch_size = len(prepared_sequences)
         if not 0 < batch_size <= self.max_batch_size:
             raise ValueError(
                 f"prefill batch must lie in [1, {self.max_batch_size}]"
             )
-        if images is None:
-            images = [None] * batch_size
         if image_crops_list is None:
             image_crops_list = [None] * batch_size
-        if len(images) != batch_size or len(image_crops_list) != batch_size:
-            raise ValueError(
-                "images and image_crops_list must match prepared_sequences"
-            )
+        if len(image_crops_list) != batch_size:
+            raise ValueError("image_crops_list must match prepared_sequences")
         batch_indices = [
             int(prepared.state.batch_idx) for prepared in prepared_sequences
         ]
@@ -377,11 +371,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
         token_rows = []
         lengths = []
         image_features = self._image_features_for_batch(image_crops_list)
-        for prepared, image, crops in zip(
-            prepared_sequences, images, image_crops_list, strict=True
-        ):
-            if (image is None) != (crops is None):
-                raise ValueError("each image row requires matching preprocessed crops")
+        for prepared in prepared_sequences:
             tokens = prepared.tokens_list
             if not tokens or not all(isinstance(token, TextToken) for token in tokens):
                 raise ValueError("prefill requires non-empty text-token rows")
@@ -436,8 +426,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
             batch_idx=token_batch_indices,
             positions=position_ids,
         )
-        if bool((slot_mapping < 0).any()):
-            raise RuntimeError("packed prefill resolved an unreserved KV slot")
         cumulative = [0]
         for length in lengths:
             cumulative.append(cumulative[-1] + length)
