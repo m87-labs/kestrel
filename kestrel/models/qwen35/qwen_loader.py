@@ -96,14 +96,14 @@ def _loadable_tensor(
     expected_shape: torch.Size,
     scale_inv: torch.Tensor | None = None,
     *,
-    allow_fp8_dequant: bool = False,
+    convert_fp8_to_bf16: bool = False,
 ) -> torch.Tensor:
     if _is_float8_tensor(value):
-        if not allow_fp8_dequant:
+        if not convert_fp8_to_bf16:
             raise ValueError(
                 f"Qwen FP8 weight {key!r} reached a non-FP8 target; add a native FP8 "
-                "module with a matching weight_scale_inv buffer or an explicit "
-                "BF16 fallback entry"
+                "module with a matching weight_scale_inv buffer or declare BF16 "
+                "storage conversion"
             )
         value = _dequantize_fp8_weight(value, scale_inv, expected_shape, key=key)
     if key.endswith("visual.patch_embed.proj.weight") and value.ndim == 5:
@@ -118,7 +118,7 @@ def _loadable_tensor(
     return value
 
 
-def _allow_fp8_dequant_fallback(key: str) -> bool:
+def _stores_checkpoint_fp8_as_bf16(key: str) -> bool:
     return _FP8_TEXT_DENSE_WEIGHT_RE.match(key) is not None
 
 
@@ -386,7 +386,7 @@ def _load_sharded_safetensors(
                     qwen_rms_norm_weight_keys,
                     expected_state[key].shape,
                     scale_inv_by_key.get(scale_key),
-                    allow_fp8_dequant=_allow_fp8_dequant_fallback(key),
+                    convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
                 )
                 loaded_keys.add(key)
                 continue
@@ -401,7 +401,7 @@ def _load_sharded_safetensors(
                             set(),
                             value.shape,
                             scale_inv_by_key.get(_scale_inv_key(key)),
-                            allow_fp8_dequant=_allow_fp8_dequant_fallback(key),
+                            convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
                         )
                     )
                     pending_fused_parts[fused_key] = parts
@@ -443,7 +443,7 @@ def _load_sharded_safetensors(
                         set(),
                         value.shape,
                         scale_inv_by_key.get(_scale_inv_key(key)),
-                        allow_fp8_dequant=_allow_fp8_dequant_fallback(key),
+                        convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
                     )
                     continue
             unexpected.append(key)
