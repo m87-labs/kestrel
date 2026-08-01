@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from kestrel.ops.attention import dense_attention
+from kestrel.ops.attention import dense_attention, paged_attention
 from kestrel.ops.rotary import default_inv_freq
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
@@ -32,7 +32,6 @@ from kestrel_kernels import moe as _MOE_API
 from kestrel_kernels.moe.errors import FP8_MOE_REQUIRES_COMPACT_CONFIG
 
 _kestrel_runtime = get_runtime()
-_flash_attn_fwd = _kestrel_runtime.attention.flash_attn_fwd
 _kestrel_causal_conv1d_packed = _kestrel_runtime.gated_delta.causal_conv1d_packed
 _kestrel_causal_conv1d_update_indexed = (
     _kestrel_runtime.gated_delta.causal_conv1d_update_indexed
@@ -770,83 +769,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-# Adapted from GLM's rotary embedding helper.
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Removes the interleaving of cos and sin from GLM
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    if unsqueeze_dim != 1:
-        raise ValueError("Qwen text rotary expects [B, H, S, D] query/key tensors")
-    return _kestrel_text_mrope_apply(q, k, cos, sin)
-
-
-def paged_attention_forward(
-    query: torch.Tensor,
-    *,
-    paged_kv_layer: Any,
-    page_table: torch.Tensor | None,
-    paged_kv_seqlens_k: torch.Tensor | None,
-    paged_kv_seqlens_q: torch.Tensor | None = None,
-    cu_seq_lens_q: torch.Tensor | None = None,
-):
-    if page_table is None or paged_kv_seqlens_k is None:
-        raise RuntimeError("Qwen paged attention requires page_table and seqused_k")
-
-    q_bshd = query.transpose(1, 2).contiguous()
-    q_for_attention = q_bshd
-    seqused_q = paged_kv_seqlens_q
-    if cu_seq_lens_q is not None:
-        # Packed query layout: cu_seq_lens_q describes the per-sequence block
-        # boundaries over a flat [total_q, H, D] tensor. The single-sequence /
-        # production-prefill callers already pass batch dim 1 ([1, total, H, D]);
-        # the batched spec-verify caller passes [B, T, H, D] (equal-length blocks)
-        # so the FlashAttention varlen path takes the shipped packed cubin (the
-        # batched seqused_q path is JIT-only and unsafe under graph capture).
-        # Flatten the batch into the packed token axis either way.
-        q_for_attention = q_bshd.reshape(-1, q_bshd.shape[-2], q_bshd.shape[-1]).contiguous()
-        seqused_q = None
-    if q_for_attention.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError(
-            f"Qwen paged attention requires fp16/bf16 tensors, got {q_for_attention.dtype}"
-        )
-
-    k_cache = paged_kv_layer.k_cache.permute(0, 2, 1, 3)
-    v_cache = paged_kv_layer.v_cache.permute(0, 2, 1, 3)
-    out, _ = _flash_attn_fwd(
-        q_for_attention,
-        k_cache,
-        v_cache,
-        page_table=page_table,
-        cu_seqlens_q=cu_seq_lens_q,
-        seqused_q=seqused_q,
-        seqused_k=paged_kv_seqlens_k,
-        paged_kv_non_tma=True,
-        causal=True,
-        k_scale=getattr(paged_kv_layer, "k_scale", None),
-        v_scale=getattr(paged_kv_layer, "v_scale", None),
-    )
-    if cu_seq_lens_q is not None:
-        # Restore the [B, T, H, D] (or [1, total, H, D]) shape the caller expects.
-        out = out.reshape(q_bshd.shape[0], q_bshd.shape[1], *out.shape[-2:])
-    return out, None
-
-
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -908,7 +830,9 @@ class Qwen3_5Attention(nn.Module):
         value_states = value_states.reshape(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = _kestrel_text_mrope_apply(
+            query_states, key_states, cos, sin
+        )
 
         if past_key_values is None:
             if attention_mask is not None:
@@ -935,14 +859,20 @@ class Qwen3_5Attention(nn.Module):
                 v_val=value_states.transpose(1, 2),
                 slot_mapping=slot_mapping,
             )
-            attn_output, attn_weights = paged_attention_forward(
+            if page_table is None or paged_kv_seqlens_k is None:
+                raise RuntimeError(
+                    "Qwen paged attention requires page_table and seqused_k"
+                )
+            attn_output = paged_attention(
                 query_states,
                 paged_kv_layer=paged_kv_layer,
                 page_table=page_table,
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seqlens_q=cu_seq_lens_q,
+                scaling=self.scaling,
             )
+            attn_weights = None
 
         attn_output = attn_output * torch.sigmoid(gate)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -1479,12 +1409,6 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         return x
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _kestrel_spatial_rope_apply(q, k, cos, sin, axis_blocks=1)
-
-
 class Qwen3_5VisionAttention(nn.Module):
     def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
@@ -1506,7 +1430,9 @@ class Qwen3_5VisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = _kestrel_spatial_rope_apply(
+            query_states, key_states, cos, sin, axis_blocks=1
+        )
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
