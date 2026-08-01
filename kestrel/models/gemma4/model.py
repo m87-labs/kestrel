@@ -8,7 +8,6 @@ import torch
 from kestrel_kernels import get_runtime
 from kestrel.kv_cache import LayeredPagedKV
 from kestrel.ops import attention as attention_ops
-from kestrel.ops import norm as norm_ops
 from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime.bounded_projection import (
     BoundedLinear,
@@ -31,6 +30,22 @@ _rotary_runtime = get_runtime().rotary
 _kestrel_gated_activation_into = _dense_runtime.gated_activation_into
 _prepare_neox_rotary = _rotary_runtime.prepare_neox
 _apply_neox_rotary = _rotary_runtime.apply_neox
+
+
+def _rmsnorm_state(
+    dim: int,
+    eps: float,
+    *,
+    with_scale: bool = True,
+) -> nn.ModuleDict:
+    state = nn.ModuleDict()
+    weight = torch.ones(dim, dtype=torch.float32)
+    if with_scale:
+        state.weight = nn.Parameter(weight)
+    else:
+        state.register_buffer("weight", weight, persistent=False)
+    state.eps = eps
+    return state
 
 
 class Gemma4TextRotaryEmbedding(nn.Module):
@@ -111,11 +126,12 @@ class Gemma4TextAttention(nn.Module):
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
         )
-        self.q_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
 
         if self.owns_kv:
-            self.k_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.v_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+            self.k_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
+            self.v_norm = _rmsnorm_state(
+                self.head_dim, config.rms_norm_eps, with_scale=False)
             self.k_proj = nn.Linear(
                 config.hidden_size, num_kv_heads * self.head_dim, bias=False
             )
@@ -145,7 +161,8 @@ class Gemma4TextAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = self.q_proj(hidden_states).view(hidden_shape)
-        query_states = self.q_norm(query_states)
+        query_states = _dense_runtime.rmsnorm(
+            query_states, self.q_norm.weight, self.q_norm.eps)
 
         key_states: Optional[torch.Tensor] = None
         value_states: Optional[torch.Tensor] = None
@@ -167,7 +184,8 @@ class Gemma4TextAttention(nn.Module):
             value_states = (
                 self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
             )
-            key_states = self.k_norm(key_states)
+            key_states = _dense_runtime.rmsnorm(
+                key_states, self.k_norm.weight, self.k_norm.eps)
             query_states, key_states = _apply_neox_rotary(
                 query_states, key_states, position_embeddings
             )
@@ -175,7 +193,8 @@ class Gemma4TextAttention(nn.Module):
             assert key_states is not None
             key_states = key_states.transpose(1, 2)
 
-            value_states = self.v_norm(value_states)
+            value_states = _dense_runtime.rmsnorm(
+                value_states, self.v_norm.weight, self.v_norm.eps)
             value_states = value_states.transpose(1, 2)
 
         if self.owns_kv and kv_cache is not None:
@@ -275,16 +294,14 @@ class Gemma4TextDecoderLayer(nn.Module):
             publishes_kv=publishes_kv,
         )
         self.mlp = Gemma4TextMLP(config, layer_idx)
-        self.input_layernorm = norm_ops.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.pre_feedforward_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.post_feedforward_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
         self.register_buffer("layer_scalar", torch.ones(1))
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -295,9 +312,8 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.per_layer_projection = nn.Linear(
                 self.hidden_size_per_layer_input, config.hidden_size, bias=False
             )
-            self.post_per_layer_input_norm = norm_ops.RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
+            self.post_per_layer_input_norm = _rmsnorm_state(
+                config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -313,7 +329,11 @@ class Gemma4TextDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.input_layernorm.weight,
+            self.input_layernorm.eps,
+        )
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -325,13 +345,25 @@ class Gemma4TextDecoderLayer(nn.Module):
             paged_kv_seqlens_k=paged_kv_seqlens_k,
             cu_seqlens=cu_seqlens,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps,
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
         hidden_states = residual + hidden_states
 
         if self.hidden_size_per_layer_input and per_layer_input is not None:
@@ -340,7 +372,11 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states = F.gelu(hidden_states, approximate="tanh")
             hidden_states = hidden_states * per_layer_input
             hidden_states = self.per_layer_projection(hidden_states)
-            hidden_states = self.post_per_layer_input_norm(hidden_states)
+            hidden_states = _dense_runtime.rmsnorm(
+                hidden_states,
+                self.post_per_layer_input_norm.weight,
+                self.post_per_layer_input_norm.eps,
+            )
             hidden_states = residual + hidden_states
 
         hidden_states = hidden_states * self.layer_scalar
@@ -378,7 +414,7 @@ class Gemma4TextModel(nn.Module):
                 for layer in range(config.num_hidden_layers)
             ]
         )
-        self.norm = norm_ops.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _rmsnorm_state(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Gemma4TextRotaryEmbedding(config)
         self.unique_layer_types = set(config.layer_types or [])
 
@@ -405,9 +441,8 @@ class Gemma4TextModel(nn.Module):
                 bias=False,
             )
             self.per_layer_model_projection_scale = config.hidden_size**-0.5
-            self.per_layer_projection_norm = norm_ops.RMSNorm(
-                config.hidden_size_per_layer_input, eps=config.rms_norm_eps
-            )
+            self.per_layer_projection_norm = _rmsnorm_state(
+                config.hidden_size_per_layer_input, config.rms_norm_eps)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_tokens.embed_scale
@@ -434,7 +469,11 @@ class Gemma4TextModel(nn.Module):
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
         )
-        proj = self.per_layer_projection_norm(proj)
+        proj = _dense_runtime.rmsnorm(
+            proj,
+            self.per_layer_projection_norm.weight,
+            self.per_layer_projection_norm.eps,
+        )
         if per_layer_inputs is None:
             return proj
         return (proj + per_layer_inputs) * self.per_layer_input_scale
@@ -500,7 +539,8 @@ class Gemma4TextModel(nn.Module):
                 cu_seqlens=cu_seqlens,
             )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states, self.norm.weight, self.norm.eps)
         return hidden_states
 
 class Gemma4VisionPatchEmbedder(nn.Module):
@@ -629,9 +669,10 @@ class Gemma4VisionAttention(nn.Module):
             use_bounds=config.use_clipped_linears,
         )
 
-        self.q_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = norm_ops.RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+        self.q_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
+        self.k_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
+        self.v_norm = _rmsnorm_state(
+            self.head_dim, config.rms_norm_eps, with_scale=False)
 
     def forward(
         self,
@@ -646,7 +687,8 @@ class Gemma4VisionAttention(nn.Module):
 
         query_states, key_states, value_states = self.qkv_proj(hidden_states)
         query_states = query_states.view(hidden_shape)
-        query_states = self.q_norm(query_states)
+        query_states = _dense_runtime.rmsnorm(
+            query_states, self.q_norm.weight, self.q_norm.eps)
         query_states = rotary_ops.apply_multidimensional_rotary(
             query_states,
             cos,
@@ -655,7 +697,8 @@ class Gemma4VisionAttention(nn.Module):
         )
 
         key_states = key_states.view(hidden_shape)
-        key_states = self.k_norm(key_states)
+        key_states = _dense_runtime.rmsnorm(
+            key_states, self.k_norm.weight, self.k_norm.eps)
         key_states = rotary_ops.apply_multidimensional_rotary(
             key_states,
             cos,
@@ -664,7 +707,8 @@ class Gemma4VisionAttention(nn.Module):
         )
 
         value_states = value_states.view(hidden_shape)
-        value_states = self.v_norm(value_states)
+        value_states = _dense_runtime.rmsnorm(
+            value_states, self.v_norm.weight, self.v_norm.eps)
 
         attn_out = attention_ops.variable_length_attention(
             query_states,
@@ -683,16 +727,14 @@ class Gemma4VisionEncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Gemma4VisionAttention(config)
         self.mlp = Gemma4VisionMLP(config)
-        self.input_layernorm = norm_ops.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = norm_ops.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.pre_feedforward_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.post_feedforward_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -702,20 +744,36 @@ class Gemma4VisionEncoderLayer(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.input_layernorm.weight,
+            self.input_layernorm.eps,
+        )
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             seqused_k=seqused_k,
             position_ids=position_ids,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps,
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -813,14 +871,18 @@ class Gemma4VisionEmbedder(nn.Module):
         self.embedding_projection = nn.Linear(
             vision_config.hidden_size, text_config.hidden_size, bias=False
         )
-        self.embedding_pre_projection_norm = norm_ops.RMSNorm(
+        self.embedding_pre_projection_norm = _rmsnorm_state(
             vision_config.hidden_size,
-            eps=vision_config.rms_norm_eps,
+            vision_config.rms_norm_eps,
             with_scale=False,
         )
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        normed = self.embedding_pre_projection_norm(inputs_embeds)
+        normed = _dense_runtime.rmsnorm(
+            inputs_embeds,
+            self.embedding_pre_projection_norm.weight,
+            self.embedding_pre_projection_norm.eps,
+        )
         return self.embedding_projection(normed)
 
 
