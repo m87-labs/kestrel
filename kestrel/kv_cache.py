@@ -317,13 +317,6 @@ class LayeredPagedKV:
         source_idx = self.source_layer_idx[int(layer_idx)]
         return None if source_idx == -1 else self.layers[source_idx]
 
-    def owns(self, layer_idx: int) -> bool:
-        layer_idx = int(layer_idx)
-        return (
-            self.source_layer_idx[layer_idx] == layer_idx
-            and self.layers[layer_idx] is not None
-        )
-
 
 class PageTable:
     """
