@@ -264,7 +264,7 @@ class GeneratedDecode:
         ambient_stream.wait_event(weights_ready)
 
         self._slots = {}
-        plans = set()
+        plans = {}
         for slot in runtime.decode_slots:
             for capacity, program in self._programs.items():
                 requirements = self.state_requirements_by_capacity[capacity]
@@ -283,7 +283,7 @@ class GeneratedDecode:
                     ready=set(inputs) - spec.not_ready_inputs,
                     preparations=spec.preparations,
                 )
-                plans.add(tuple(step.name for step in plan))
+                plans.setdefault(tuple(step.name for step in plan), plan)
                 construction_batch = min(capacity, int(runtime.max_batch_size))
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch)
@@ -316,7 +316,7 @@ class GeneratedDecode:
         if len(plans) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on input preparation")
-        self._input_preparation_plan = next(iter(plans))
+        self._input_preparation_plan = next(iter(plans.values()))
         missing = {
             step.name for step in self._input_preparation_plan
         } - spec.preparation_callbacks.keys()
