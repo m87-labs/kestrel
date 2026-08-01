@@ -43,11 +43,9 @@ Kestrel supports these model families:
 | Model | Repository | Notes |
 |-------|------------|-------|
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
-| Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Requires access approval |
-| Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Private repository |
+| Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Public, no approval needed |
+| Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
 | Qwen 3.5 | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Dense and MoE variants registered by Hugging Face repository ID |
-
-For Moondream 3, request access (automatically granted) then authenticate with `huggingface-cli login` or set `HF_TOKEN`.
 
 ## Quick Start
 
@@ -269,7 +267,7 @@ architecture and checkpoint format.
 |----------|-------------|
 | `MOONDREAM_API_KEY` | Optional. Only needed for finetuned-model inference. Get this from [moondream.ai](https://moondream.ai). |
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
-| `HF_TOKEN` | HuggingFace token for gated models like Moondream 3. Alternatively, run `huggingface-cli login`. |
+| `HF_TOKEN` | Hugging Face token for private or gated model repositories. Alternatively, run `huggingface-cli login`. |
 
 ## Triton Inference Server
 
