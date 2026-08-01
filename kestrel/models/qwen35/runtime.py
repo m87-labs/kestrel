@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
+from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.tokenizer import load_tokenizer
@@ -28,7 +28,7 @@ from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 from .cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
-    qwen_kv_layout,
+    qwen_paged_kv_specs,
 )
 from .prefill_slot import (
     Qwen35PrefillScratch,
@@ -367,10 +367,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 f"device ({self.device})"
             )
         self._replay_capacity = 16
-        kv_specs, kv_sources = qwen_kv_layout(text_cfg)
-        self._paged_kv = LayeredPagedKV.allocate(
-            layer_specs=kv_specs,
-            source_layer_idx=kv_sources,
+        self._paged_kv = allocate_paged_kv_layers(
+            layer_specs=qwen_paged_kv_specs(text_cfg),
             page_table=self.page_table,
             pool=self._kv_pool,
             dtype=self.dtype,

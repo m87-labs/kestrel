@@ -21,7 +21,7 @@ def _state_tensors(state_pool: Any, field: str) -> list[torch.Tensor | None]:
 
 def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
     bindings = PagedDecodeBindings(
-        runtime._paged_kv.layers,
+        runtime._paged_kv,
         extra_runtime_inputs=lambda bound_runtime: {
             "rope_inv_freq": (
                 bound_runtime.model.model.language_model.rotary_emb.inv_freq),

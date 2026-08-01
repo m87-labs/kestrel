@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
-from kestrel.kv_cache import LayeredPagedKV, PagedKVLayerSpec
+from kestrel.kv_cache import PagedKVCache, PagedKVLayerSpec
 
 from .gdn_state import LinearAttentionLayer, LinearAttentionState
 
@@ -14,18 +14,16 @@ if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm
 
 
-def qwen_kv_layout(
+def qwen_paged_kv_specs(
     config: Any,
-) -> tuple[tuple[PagedKVLayerSpec | None, ...], tuple[int, ...]]:
+) -> tuple[PagedKVLayerSpec | None, ...]:
     """Describe which hybrid layers own ordinary paged K/V storage."""
 
     head_dim = int(config.head_dim)
     specs: list[PagedKVLayerSpec | None] = []
-    sources: list[int] = []
-    for layer_idx, layer_type in enumerate(config.layer_types):
+    for layer_type in config.layer_types:
         if layer_type == "linear_attention":
             specs.append(None)
-            sources.append(-1)
         else:
             specs.append(
                 PagedKVLayerSpec(
@@ -33,8 +31,7 @@ def qwen_kv_layout(
                     head_dim=head_dim,
                 )
             )
-            sources.append(layer_idx)
-    return tuple(specs), tuple(sources)
+    return tuple(specs)
 
 
 class Qwen35InferenceCache:
@@ -44,11 +41,11 @@ class Qwen35InferenceCache:
         self,
         *,
         config: Any,
-        paged_kv: LayeredPagedKV,
+        paged_kv: Sequence[PagedKVCache | None],
         replay_capacity: int,
     ) -> None:
         layer_types = tuple(config.layer_types)
-        if len(paged_kv.layers) != len(layer_types):
+        if len(paged_kv) != len(layer_types):
             raise ValueError("paged_kv layout must match layer_types")
         layers: list[Any] = []
         for layer_idx, layer_type in enumerate(layer_types):
@@ -60,7 +57,7 @@ class Qwen35InferenceCache:
                     )
                 )
                 continue
-            layer = paged_kv.producer(layer_idx)
+            layer = paged_kv[layer_idx]
             if layer is None:
                 raise ValueError(
                     f"full-attention layer {layer_idx} has no paged K/V producer"
@@ -339,7 +336,7 @@ class Qwen35LinearStatePool:
 
 
 __all__ = [
-    "qwen_kv_layout",
+    "qwen_paged_kv_specs",
     "Qwen35InferenceCache",
     "Qwen35LinearStatePool",
 ]
