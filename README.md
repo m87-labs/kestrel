@@ -45,7 +45,8 @@ Kestrel supports these model families:
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
 | Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Public, no approval needed |
 | Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
-| Qwen 3.5 | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Dense and MoE variants registered by Hugging Face repository ID |
+| Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
+| Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 
 ## Quick Start
 
