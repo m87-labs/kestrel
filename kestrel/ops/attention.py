@@ -89,33 +89,7 @@ def paged_attention(
     return out
 
 
-def variable_length_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    used_key_lengths: torch.Tensor,
-    scaling: float,
-) -> torch.Tensor:
-    """Attend over rows whose valid prefixes are given by ``used_key_lengths``."""
-    if (
-        used_key_lengths.dtype != torch.int32
-        or used_key_lengths.device != query.device
-        or used_key_lengths.shape != query.shape[:1]
-    ):
-        raise ValueError("used-K lengths must be on-device int32 [batch]")
-    out, _ = get_runtime().attention.flash_attn_fwd(
-        query,
-        key,
-        value,
-        seqused_k=used_key_lengths,
-        causal=False,
-        softmax_scale=scaling,
-    )
-    return out
-
-
 __all__ = [
     "dense_attention",
     "paged_attention",
-    "variable_length_attention",
 ]

@@ -5,8 +5,6 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from kestrel.runtime.compilation import _scalar_buffer_key
-
 
 class BoundedLinear(nn.Module):
     """Bias-free linear with optional checkpoint-provided input/output bounds."""
@@ -34,12 +32,6 @@ class BoundedLinear(nn.Module):
                 self.input_min,
                 self.input_max,
             )
-        return self.forward_bounded_input(hidden_states)
-
-    def forward_bounded_input(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
         projected = self.linear(hidden_states)
         if self.use_bounds:
             projected = torch.clamp(
@@ -230,11 +222,7 @@ def bind_declared_packed_projections(
 
             for bound_name in ("input_min", "input_max"):
                 values = bound_values[bound_name]
-                first_key = _scalar_buffer_key(values[0])
-                if any(
-                    _scalar_buffer_key(value) != first_key
-                    for value in values[1:]
-                ):
+                if any(not torch.equal(value, values[0]) for value in values[1:]):
                     raise ValueError(
                         f"cannot pack projection {module_name!r} with different "
                         f"{bound_name} values"

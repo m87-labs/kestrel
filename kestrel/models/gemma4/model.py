@@ -26,6 +26,7 @@ from .config import (
 from .paged_cache import kv_source_layers
 
 _dense_runtime = get_runtime().dense
+_attention_runtime = get_runtime().attention
 _rotary_runtime = get_runtime().rotary
 _kestrel_gated_activation_into = _dense_runtime.gated_activation_into
 _prepare_neox_rotary = _rotary_runtime.prepare_neox
@@ -705,12 +706,13 @@ class Gemma4VisionAttention(nn.Module):
         value_states = _dense_runtime.rmsnorm(
             value_states, self.v_norm.weight, self.v_norm.eps)
 
-        attn_out = attention_ops.variable_length_attention(
+        attn_out, _ = _attention_runtime.flash_attn_fwd(
             query_states,
             key_states,
             value_states,
-            used_key_lengths=seqused_k,
-            scaling=1.0,
+            seqused_k=seqused_k,
+            causal=False,
+            softmax_scale=1.0,
         )
         attn_out = attn_out.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_out)
