@@ -29,7 +29,6 @@ from .cache import Qwen35InferenceCache
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
-from kestrel_kernels.moe.errors import FP8_MOE_REQUIRES_COMPACT_CONFIG
 
 _kestrel_runtime = get_runtime()
 _kestrel_causal_conv1d_packed = _kestrel_runtime.gated_delta.causal_conv1d_packed
@@ -658,111 +657,17 @@ class Qwen3_5Experts(nn.Module):
                     dtype=torch.float32,
                 ),
             )
-        self.act_fn = F.silu
-
-    def _expert_gate_up(self, expert_idx: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj[expert_idx]
-        if gate_up.dtype != torch.uint8:
-            return gate_up
-        scale = self.gate_up_proj_scale[expert_idx]
-        gate_scale = scale[0].repeat_interleave(128, dim=0).repeat_interleave(
-            128, dim=1
-        )[: self.intermediate_dim, : self.hidden_dim]
-        up_scale = scale[1].repeat_interleave(128, dim=0).repeat_interleave(
-            128, dim=1
-        )[: self.intermediate_dim, : self.hidden_dim]
-        expanded_scale = torch.stack(
-            (
-                gate_scale.reshape(self.intermediate_dim // 8, 8, self.hidden_dim),
-                up_scale.reshape(self.intermediate_dim // 8, 8, self.hidden_dim),
-            ),
-            dim=1,
-        ).reshape(
-            2 * self.intermediate_dim,
-            self.hidden_dim,
-        )
-        return (
-            gate_up.view(torch.float8_e4m3fn).to(torch.float32)
-            * expanded_scale
-        ).to(torch.bfloat16)
-
-    def _expert_down(self, expert_idx: torch.Tensor) -> torch.Tensor:
-        down = self.down_proj[expert_idx]
-        if down.dtype != torch.uint8:
-            return down
-        scale = self.down_proj_scale[expert_idx]
-        expanded_scale = scale.repeat_interleave(128, dim=0).repeat_interleave(
-            128, dim=1
-        )
-        return (
-            down.view(torch.float8_e4m3fn).to(torch.float32)
-            * expanded_scale[: self.hidden_dim, : self.intermediate_dim]
-        ).to(torch.bfloat16)
-
-    def _split_interleaved_gate_up(
-        self, gate_up: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        gate_up = gate_up.reshape(
-            gate_up.shape[0],
-            self.intermediate_dim // 8,
-            2,
-            8,
-        )
-        gate = gate_up[:, :, 0, :].reshape(gate_up.shape[0], self.intermediate_dim)
-        up = gate_up[:, :, 1, :].reshape(gate_up.shape[0], self.intermediate_dim)
-        return gate, up
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if (
-            hidden_states.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and top_k_weights.dtype == torch.bfloat16
-            and self.top_k is not None
-        ):
-            try:
-                return self._forward_kestrel(
-                    hidden_states,
-                    top_k_index,
-                    top_k_weights,
-                )
-            except ValueError as exc:
-                if (
-                    self.expert_weight_format != "fp8_e4m3"
-                    or str(exc) != FP8_MOE_REQUIRES_COMPACT_CONFIG
-                ):
-                    raise
-
-        final_hidden_states = torch.zeros_like(hidden_states)
-        expert_ids_for_mask = (
-            top_k_index if top_k_index.dtype == torch.long else top_k_index.to(torch.long)
+        return self._forward_kestrel(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
         )
-        expert_mask = F.one_hot(expert_ids_for_mask, num_classes=self.num_experts).permute(2, 1, 0)
-        expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx_tensor in expert_hits:
-            expert_idx = expert_idx_tensor[0]
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate_up = F.linear(current_state, self._expert_gate_up(expert_idx))
-            gate, up = self._split_interleaved_gate_up(gate_up)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = F.linear(
-                current_hidden_states,
-                self._expert_down(expert_idx),
-            )
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(
-                0,
-                token_idx,
-                current_hidden_states.to(final_hidden_states.dtype),
-            )
-
-        return final_hidden_states
 
     def _forward_kestrel(
         self,
@@ -827,23 +732,11 @@ class Qwen3_5TopKRouter(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)
-        if (
-            router_logits.is_cuda
-            and router_logits.dtype == torch.bfloat16
-            and router_logits.is_contiguous()
-            and self.top_k == 8
-            and self.num_experts in (64, 256)
-        ):
-            return _kestrel_moe_topk_fwd(
-                router_logits,
-                self.top_k,
-                softmax=True,
-            )
-        router_top_logits, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        router_scores = F.softmax(router_top_logits, dtype=torch.float, dim=-1).to(
-            router_logits.dtype
+        return _kestrel_moe_topk_fwd(
+            router_logits,
+            self.top_k,
+            softmax=True,
         )
-        return router_scores, router_indices
 
 
 class Qwen3_5SparseMoeBlock(nn.Module):
