@@ -27,9 +27,9 @@ def kv_source_layers(config: Gemma4TextConfig) -> tuple[int, ...]:
     return tuple(sources)
 
 
-def paged_kv_layout(
+def paged_kv_specs(
     config: Gemma4TextConfig,
-) -> tuple[tuple[PagedKVLayerSpec | None, ...], tuple[int, ...]]:
+) -> tuple[PagedKVLayerSpec | None, ...]:
     sources = kv_source_layers(config)
     specs: list[PagedKVLayerSpec | None] = []
     for layer_idx, source_idx in enumerate(sources):
@@ -43,7 +43,7 @@ def paged_kv_layout(
                 head_dim=config.head_dim if is_sliding else config.global_head_dim,
             )
         )
-    return tuple(specs), sources
+    return tuple(specs)
 
 
-__all__ = ["kv_source_layers", "paged_kv_layout"]
+__all__ = ["kv_source_layers", "paged_kv_specs"]

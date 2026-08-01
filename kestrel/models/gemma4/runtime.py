@@ -8,7 +8,7 @@ from typing import Any, Sequence
 import torch
 
 from kestrel.device import make_event, make_stream
-from kestrel.kv_cache import KVMemoryPool, LayeredPagedKV, PageTable
+from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -26,7 +26,7 @@ from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 from .generated_decode import create_generated_decode
 from .image import MAX_IMAGE_TOKENS, MAX_PATCHES, preprocess_image
 from .loader import load_model
-from .paged_cache import paged_kv_layout
+from .paged_cache import paged_kv_specs
 from .prompt_template import (
     END_OF_IMAGE_ID,
     Gemma4PromptTemplate,
@@ -152,10 +152,8 @@ class Gemma4Runtime(UncachedPagedRuntime):
         )
         self.active_sequences: dict[int, SequenceState] = {}
 
-        layer_specs, source_layers = paged_kv_layout(text_config)
-        self._kv_cache = LayeredPagedKV.allocate(
-            layer_specs=layer_specs,
-            source_layer_idx=source_layers,
+        self._kv_cache = allocate_paged_kv_layers(
+            layer_specs=paged_kv_specs(text_config),
             page_table=self.page_table,
             pool=self._kv_pool,
             dtype=self.dtype,

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from kestrel_kernels import get_runtime
-from kestrel.kv_cache import LayeredPagedKV, PagedKVCache
+from kestrel.kv_cache import PagedKVCache
 from kestrel.ops import attention as attention_ops
 from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime.bounded_projection import (
@@ -391,6 +391,7 @@ class Gemma4TextModel(nn.Module):
             persistent=False,
         )
         sources = kv_source_layers(config)
+        self.kv_source_layers = sources
         published = {
             source for layer, source in enumerate(sources) if layer != source
         }
@@ -473,7 +474,7 @@ class Gemma4TextModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        kv_cache: LayeredPagedKV | None = None,
+        kv_cache: Sequence[PagedKVCache | None] | None = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
         cache_position_ids: Optional[torch.Tensor] = None,
@@ -523,7 +524,9 @@ class Gemma4TextModel(nn.Module):
                 transient_kv=transient_kv,
                 position_embeddings=position_embeddings[layer_type],
                 paged_kv_layer=(
-                    kv_cache.producer(i) if kv_cache is not None else None
+                    kv_cache[self.kv_source_layers[i]]
+                    if kv_cache is not None
+                    else None
                 ),
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,

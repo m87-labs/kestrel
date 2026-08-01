@@ -30,7 +30,7 @@ def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
 def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
     """Describe Gemma inputs; shared runtime code owns binding and launch."""
 
-    layers = runtime._kv_cache.layers
+    layers = runtime._kv_cache
     if not layers or not PagedDecodeBindings(layers).is_eligible(runtime):
         return None
     config = runtime.model.model.language_model.config
