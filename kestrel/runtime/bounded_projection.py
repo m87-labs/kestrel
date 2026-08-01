@@ -1,34 +1,11 @@
 """Dataflow helpers for bounded sibling projections."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Protocol
 
 import torch
 from torch import nn
 
 from kestrel.runtime.compilation import _scalar_buffer_key
-
-
-class BoundedProjection(Protocol):
-    input_min: torch.Tensor
-    input_max: torch.Tensor
-
-    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
-
-    def forward_bounded_input(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor: ...
-
-
-@dataclass(frozen=True)
-class PackedProjectionBindingStats:
-    groups: int
-    source_parameter_bytes: int
-    packed_parameter_bytes: int
-    source_bound_bytes: int
-    packed_bound_bytes: int
 
 
 class PackedBoundedProjections(nn.Module):
@@ -89,21 +66,12 @@ class PackedBoundedProjections(nn.Module):
         return packed.split(self.out_features, dim=-1)
 
 
-def _tensor_bytes(value: torch.Tensor) -> int:
-    return int(value.numel() * value.element_size())
-
-
 def bind_declared_packed_bounded_projections(
     module: nn.Module,
     state_dict: dict[str, torch.Tensor],
-) -> PackedProjectionBindingStats:
+) -> None:
     """Pack declared sibling weights after proving compatible transforms."""
 
-    groups = 0
-    source_parameter_bytes = 0
-    packed_parameter_bytes = 0
-    source_bound_bytes = 0
-    packed_bound_bytes = 0
     for module_name, child in module.named_modules():
         if not isinstance(child, PackedBoundedProjections):
             continue
@@ -211,60 +179,3 @@ def bind_declared_packed_bounded_projections(
             state_dict.pop(key)
         for key in source_bound_keys:
             state_dict.pop(key)
-
-        groups += 1
-        source_parameter_bytes += sum(_tensor_bytes(weight) for weight in weights)
-        packed_parameter_bytes += _tensor_bytes(packed_weight)
-        source_bound_bytes += sum(
-            _tensor_bytes(value)
-            for values in bound_values.values()
-            for value in values
-        )
-        packed_bound_bytes += sum(
-            _tensor_bytes(value)
-            for value in packed_bounds.values()
-        )
-
-    return PackedProjectionBindingStats(
-        groups=groups,
-        source_parameter_bytes=source_parameter_bytes,
-        packed_parameter_bytes=packed_parameter_bytes,
-        source_bound_bytes=source_bound_bytes,
-        packed_bound_bytes=packed_bound_bytes,
-    )
-
-
-def apply_sibling_bounded_projections(
-    hidden_states: torch.Tensor,
-    projections: Sequence[BoundedProjection],
-) -> tuple[torch.Tensor, ...]:
-    """Apply sibling projections with one clamp when their input bounds alias.
-
-    Immutable scalar canonicalization makes bit-identical bounds share their
-    Tensor object. Identity therefore proves that the input transform is the
-    same without a device comparison or model-specific policy. Unprepared or
-    heterogeneous projection groups retain their independent exact paths.
-    """
-
-    if not projections:
-        return ()
-    first = projections[0]
-    lower = getattr(first, "input_min", None)
-    upper = getattr(first, "input_max", None)
-    shares_bounds = (
-        lower is not None
-        and upper is not None
-        and all(
-            getattr(projection, "input_min", None) is lower
-            and getattr(projection, "input_max", None) is upper
-            for projection in projections[1:]
-        )
-    )
-    if not shares_bounds:
-        return tuple(projection(hidden_states) for projection in projections)
-
-    bounded = torch.clamp(hidden_states, lower, upper)
-    return tuple(
-        projection.forward_bounded_input(bounded)
-        for projection in projections
-    )
