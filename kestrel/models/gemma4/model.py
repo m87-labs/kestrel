@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 from kestrel_kernels import get_runtime
-from kestrel.kv_cache import LayeredPagedKV
+from kestrel.kv_cache import LayeredPagedKV, PagedKVCache
 from kestrel.ops import attention as attention_ops
 from kestrel.ops import rotary as rotary_ops
 from kestrel.runtime.bounded_projection import (
@@ -149,7 +149,7 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
-        kv_cache: LayeredPagedKV | None = None,
+        paged_kv_layer: PagedKVCache | None = None,
         cache_position_ids: Optional[torch.Tensor] = None,
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
@@ -196,14 +196,11 @@ class Gemma4TextAttention(nn.Module):
                 value_states, self.v_norm.weight, self.v_norm.eps)
             value_states = value_states.transpose(1, 2)
 
-        if self.owns_kv and kv_cache is not None:
+        if self.owns_kv and paged_kv_layer is not None:
             if cache_position_ids is None or slot_mapping is None:
                 raise RuntimeError("Gemma paged K/V write requires positions and slots")
             assert key_states is not None and value_states is not None
-            producer = kv_cache.producer(self.layer_idx)
-            if producer is None:
-                raise RuntimeError(f"Gemma layer {self.layer_idx} has no paged K/V producer")
-            producer.update(
+            paged_kv_layer.update(
                 input_pos=cache_position_ids,
                 k_val=key_states.transpose(1, 2),
                 v_val=value_states.transpose(1, 2),
@@ -214,14 +211,11 @@ class Gemma4TextAttention(nn.Module):
             transient_kv[self.layer_idx] = (key_states, value_states)
 
         if page_table is not None:
-            if kv_cache is None or paged_kv_seqlens_k is None:
+            if paged_kv_layer is None or paged_kv_seqlens_k is None:
                 raise RuntimeError("Gemma paged attention requires K/V storage metadata")
-            producer = kv_cache.producer(self.layer_idx)
-            if producer is None:
-                raise RuntimeError(f"Gemma layer {self.layer_idx} has no paged K/V producer")
             attn_out = attention_ops.paged_attention(
                 query_states,
-                paged_kv_layer=producer,
+                paged_kv_layer=paged_kv_layer,
                 page_table=page_table,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 scaling=1.0,
@@ -318,7 +312,7 @@ class Gemma4TextDecoderLayer(nn.Module):
         per_layer_input: Optional[torch.Tensor],
         transient_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        kv_cache: LayeredPagedKV | None = None,
+        paged_kv_layer: PagedKVCache | None = None,
         cache_position_ids: Optional[torch.Tensor] = None,
         slot_mapping: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
@@ -335,7 +329,7 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             transient_kv=transient_kv,
-            kv_cache=kv_cache,
+            paged_kv_layer=paged_kv_layer,
             cache_position_ids=cache_position_ids,
             slot_mapping=slot_mapping,
             page_table=page_table,
@@ -528,7 +522,9 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 transient_kv=transient_kv,
                 position_embeddings=position_embeddings[layer_type],
-                kv_cache=kv_cache,
+                paged_kv_layer=(
+                    kv_cache.producer(i) if kv_cache is not None else None
+                ),
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,
                 page_table=page_table,
