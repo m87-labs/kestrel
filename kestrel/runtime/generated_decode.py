@@ -196,6 +196,25 @@ class GeneratedDecode:
     """Select bundled capacities and bind them to one serving runtime."""
 
     @classmethod
+    def require(
+        cls,
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
+        *,
+        capacity: int,
+    ) -> "GeneratedDecode":
+        generated = cls.try_create(runtime, spec)
+        if generated is None:
+            raise RuntimeError(
+                f"{spec.label} requires a compatible bundled generated-decode program"
+            )
+        if not generated.supports(capacity):
+            raise RuntimeError(
+                f"generated {spec.label} decode does not cover capacity={capacity}"
+            )
+        return generated
+
+    @classmethod
     def try_create(
         cls, runtime: Any, spec: GeneratedDecodeSpec,
     ) -> "GeneratedDecode | None":
