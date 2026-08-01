@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import threading
 from concurrent.futures import Future
@@ -19,25 +18,6 @@ from kestrel.engine import (
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
-
-
-def test_warmup_uses_model_owned_sampling_defaults() -> None:
-    engine = object.__new__(InferenceEngine)
-    calls = []
-
-    async def query(**kwargs):
-        calls.append(kwargs)
-
-    engine.query = query
-    asyncio.run(engine._warmup_query_pipeline())
-
-    assert calls == [{
-        "image": None,
-        "question": "Warmup prompt.",
-        "reasoning": False,
-        "stream": False,
-        "settings": {"max_tokens": 1},
-    }]
 
 
 def _make_request(

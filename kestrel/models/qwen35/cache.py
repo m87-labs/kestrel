@@ -8,7 +8,7 @@ import torch
 
 from kestrel.kv_cache import LayeredPagedKV, PagedKVLayerSpec
 
-from .inference_ops import LinearAttentionLayer, LinearAttentionState
+from .gdn_state import LinearAttentionLayer, LinearAttentionState
 
 if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm

@@ -16,8 +16,6 @@ from .qwen_config import Qwen3_5Config
 from .qwen_model import Qwen3_5ForConditionalGeneration
 
 
-_CUDA_VISION_ATTN_IMPLEMENTATION = "kestrel_vision_flash_attention"
-
 _GDN_IN_PROJ_PARTS = (
     "in_proj_qkv.weight",
     "in_proj_z.weight",
@@ -49,20 +47,6 @@ def _torch_device_arg(device: torch.device) -> str:
     if device.type == "cuda":
         return f"cuda:{device.index or 0}"
     return device.type
-
-
-def _vision_attn_implementation(
-    device: torch.device,
-    fallback: str,
-    compute_capability: tuple[int, int] | None = None,
-) -> str:
-    if fallback != "sdpa" or device.type != "cuda":
-        return fallback
-    if compute_capability is None:
-        if not torch.cuda.is_available():
-            return fallback
-        compute_capability = torch.cuda.get_device_capability(device)
-    return _CUDA_VISION_ATTN_IMPLEMENTATION if int(compute_capability[0]) == 9 else fallback
 
 
 def _ignored_missing_key(key: str) -> bool:
@@ -505,29 +489,16 @@ def load_qwen35_model(
     *,
     device: torch.device,
     dtype: torch.dtype,
-    attn_implementation: str = "sdpa",
 ) -> Qwen3_5ForConditionalGeneration:
-    if attn_implementation != "sdpa":
-        raise ValueError(
-            "Qwen inference text attention requires attn_implementation='sdpa'"
-        )
     config_path = _resolve_checkpoint_file(source, "config.json")
     with open(config_path, "r", encoding="utf-8") as handle:
         config_data: dict[str, Any] = json.load(handle)
     config = Qwen3_5Config.from_dict(config_data)
-    use_vision_flash_attention = (
-        _vision_attn_implementation(device, attn_implementation)
-        == _CUDA_VISION_ATTN_IMPLEMENTATION
-    )
-
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
         with torch.device(device):
-            model = Qwen3_5ForConditionalGeneration(
-                config,
-                use_vision_flash_attention=use_vision_flash_attention,
-            )
+            model = Qwen3_5ForConditionalGeneration(config)
     finally:
         torch.set_default_dtype(old_dtype)
 

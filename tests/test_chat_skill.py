@@ -505,7 +505,7 @@ def test_moondream_chat_uses_query_stop_ids() -> None:
 
 
 def test_moondream_chat_inherits_query_suppression() -> None:
-    """: flattened chat must mirror the query skill's md2 masking."""
+    """Flattened chat must mirror the query skill's MD2 masking."""
     from kestrel.models.moondream.skills.chat import MoondreamChatSkill
 
     skill = MoondreamChatSkill()

@@ -21,16 +21,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from kestrel.ops.attention import dense_attention
 from kestrel.ops.rotary import default_inv_freq
 
-from .inference_ops import (
-    create_causal_mask,
-    get_vision_bilinear_indices_and_weights,
-    get_vision_cu_seqlens,
-    get_vision_position_ids,
-    kestrel_vision_flash_attention_forward,
-    sdpa_attention_forward,
-    torch_compilable_check,
+from .qwen_image import (
+    vision_bilinear_coordinates,
+    vision_cu_seqlens,
+    vision_position_ids,
 )
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
@@ -919,15 +916,18 @@ class Qwen3_5Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is None:
-            attn_output, attn_weights = sdpa_attention_forward(
-                self,
+            if attention_mask is not None:
+                raise RuntimeError(
+                    "Qwen dense attention requires packed sequence metadata")
+            attn_output = dense_attention(
                 query_states,
                 key_states,
                 value_states,
-                attention_mask,
-                dropout=0.0,
                 scaling=self.scaling,
+                causal=True,
+                cu_seqlens=cu_seq_lens_q,
             )
+            attn_weights = None
         else:
             paged_kv_layer = past_key_values.layers[self.layer_idx]
             if cache_position_ids is None or slot_mapping is None:
@@ -1491,21 +1491,14 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3_5VisionAttention(nn.Module):
-    def __init__(
-        self,
-        config: Qwen3_5VisionConfig,
-        *,
-        use_flash_attention: bool,
-    ) -> None:
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = self.dim // self.num_heads
-        self.num_key_value_groups = 1  # needed for eager attention
         self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
         self.proj = nn.Linear(self.dim, self.dim)
         self.scaling = self.head_dim**-0.5
-        self.use_flash_attention = bool(use_flash_attention)
 
     def forward(
         self,
@@ -1524,37 +1517,14 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        if self.use_flash_attention:
-            # Flash Attention: Use cu_seqlens for variable length attention
-            attn_output, _ = kestrel_vision_flash_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                scaling=self.scaling,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-            )
-        else:
-            # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-
-            attn_outputs = [
-                sdpa_attention_forward(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        attn_output = dense_attention(
+            query_states,
+            key_states,
+            value_states,
+            scaling=self.scaling,
+            causal=False,
+            cu_seqlens=cu_seqlens,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -1562,19 +1532,11 @@ class Qwen3_5VisionAttention(nn.Module):
 
 
 class Qwen3_5VisionBlock(nn.Module):
-    def __init__(
-        self,
-        config: Qwen3_5VisionConfig,
-        *,
-        use_flash_attention: bool,
-    ) -> None:
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen3_5VisionAttention(
-            config=config,
-            use_flash_attention=use_flash_attention,
-        )
+        self.attn = Qwen3_5VisionAttention(config)
         self.mlp = Qwen3_5VisionMLP(config=config)
 
     def forward(
@@ -1602,12 +1564,7 @@ class Qwen3_5VisionBlock(nn.Module):
 class Qwen3_5VisionModel(nn.Module):
     config: Qwen3_5VisionConfig
 
-    def __init__(
-        self,
-        config: Qwen3_5VisionConfig,
-        *,
-        use_flash_attention: bool = False,
-    ) -> None:
+    def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.config = config
 
@@ -1623,10 +1580,7 @@ class Qwen3_5VisionModel(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                Qwen3_5VisionBlock(
-                    config,
-                    use_flash_attention=use_flash_attention,
-                )
+                Qwen3_5VisionBlock(config)
                 for _ in range(config.depth)
             ]
         )
@@ -1670,19 +1624,19 @@ class Qwen3_5VisionModel(nn.Module):
         Returns:
             `torch.Tensor`: hidden_states.
         """
-        bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
+        bilinear_indices, bilinear_weights = vision_bilinear_coordinates(
             grid_thw,
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.config.spatial_merge_size,
-            bilinear_indices=bilinear_indices,
-            bilinear_weights=bilinear_weights,
+            indices=bilinear_indices,
+            weights=bilinear_weights,
         )
-        position_ids = get_vision_position_ids(
+        position_ids = vision_position_ids(
             grid_thw,
             self.config.spatial_merge_size,
             position_ids,
         )
-        cu_seqlens = get_vision_cu_seqlens(grid_thw, cu_seqlens)
+        cu_seqlens = vision_cu_seqlens(grid_thw, cu_seqlens)
 
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
@@ -1766,17 +1720,7 @@ class Qwen3_5TextModel(nn.Module):
         else:
             text_position_ids = None
 
-        causal_mask = (
-            None
-            if past_key_values is not None and attention_mask is None
-            else create_causal_mask(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=text_position_ids,
-            )
-        )
+        causal_mask = None if attention_mask is None else attention_mask
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
 
         hidden_states = inputs_embeds
@@ -1844,18 +1788,10 @@ class Qwen3_5TextModel(nn.Module):
 class Qwen3_5Model(nn.Module):
     config: Qwen3_5Config
 
-    def __init__(
-        self,
-        config: Qwen3_5Config,
-        *,
-        use_vision_flash_attention: bool = False,
-    ) -> None:
+    def __init__(self, config: Qwen3_5Config) -> None:
         super().__init__()
         self.config = config
-        self.visual = Qwen3_5VisionModel(
-            config.vision_config,
-            use_flash_attention=use_vision_flash_attention,
-        )
+        self.visual = Qwen3_5VisionModel(config.vision_config)
         self.language_model = Qwen3_5TextModel(config.text_config)
 
     def get_image_features(
@@ -1922,12 +1858,12 @@ class Qwen3_5Model(nn.Module):
             image_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
                 inputs_embeds.device
             )
-            torch_compilable_check(
-                inputs_embeds[image_mask].numel() == image_embeds.numel(),
-                "Image features and image tokens do not match, "
-                f"tokens: {image_token_mask.sum()}, "
-                f"features: {image_embeds.shape[0]}",
-            )
+            if inputs_embeds[image_mask].numel() != image_embeds.numel():
+                raise ValueError(
+                    "Image features and image tokens do not match, "
+                    f"tokens: {image_token_mask.sum()}, "
+                    f"features: {image_embeds.shape[0]}"
+                )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         outputs = self.language_model(
@@ -1955,18 +1891,10 @@ class Qwen3_5Model(nn.Module):
 class Qwen3_5ForConditionalGeneration(nn.Module):
     config: Qwen3_5Config
 
-    def __init__(
-        self,
-        config: Qwen3_5Config,
-        *,
-        use_vision_flash_attention: bool = False,
-    ) -> None:
+    def __init__(self, config: Qwen3_5Config) -> None:
         super().__init__()
         self.config = config
-        self.model = Qwen3_5Model(
-            config,
-            use_vision_flash_attention=use_vision_flash_attention,
-        )
+        self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
 __all__ = [

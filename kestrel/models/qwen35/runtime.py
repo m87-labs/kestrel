@@ -482,12 +482,10 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
-        attn_impl = os.environ.get("KESTREL_QWEN35_ATTN_IMPL", "sdpa")
         return load_qwen35_model(
             source,
             device=self.device,
             dtype=self.dtype,
-            attn_implementation=attn_impl,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:
