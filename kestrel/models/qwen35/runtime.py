@@ -971,16 +971,10 @@ class Qwen35Runtime(UncachedPagedRuntime):
         ):
             raise RuntimeError("Qwen vision metadata scratch was not allocated")
 
-        model = getattr(self, "model", None)
-        visual = getattr(getattr(model, "model", None), "visual", None)
-        if visual is not None:
-            num_grid_per_side = int(visual.num_grid_per_side)
-            spatial_merge_size = int(visual.config.spatial_merge_size)
-        else:
-            vision_config = self.architecture.vision_config
-            num_positions = int(vision_config.num_position_embeddings)
-            num_grid_per_side = int(num_positions**0.5)
-            spatial_merge_size = int(vision_config.spatial_merge_size)
+        vision_config = self.architecture.vision_config
+        num_positions = int(vision_config.num_position_embeddings)
+        num_grid_per_side = int(num_positions**0.5)
+        spatial_merge_size = int(vision_config.spatial_merge_size)
 
         bilinear_indices = scratch.vision_bilinear_indices.np[:, :pixel_rows]
         bilinear_weights = scratch.vision_bilinear_weights.np[:, :pixel_rows]

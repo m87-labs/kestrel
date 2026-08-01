@@ -24,11 +24,6 @@ from torch import nn
 from kestrel.ops.attention import dense_attention
 from kestrel.ops.rotary import default_inv_freq
 
-from .qwen_image import (
-    vision_bilinear_coordinates,
-    vision_cu_seqlens,
-    vision_position_ids,
-)
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
 
@@ -1573,7 +1568,6 @@ class Qwen3_5VisionModel(nn.Module):
         )
 
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
-        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
@@ -1607,37 +1601,12 @@ class Qwen3_5VisionModel(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        grid_thw: torch.Tensor,
         *,
-        bilinear_indices: torch.Tensor | None = None,
-        bilinear_weights: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        cu_seqlens: torch.Tensor | None = None,
+        bilinear_indices: torch.Tensor,
+        bilinear_weights: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
-                The final hidden states of the model.
-            grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
-                The temporal, height and width of feature shape of each image in LLM.
-
-        Returns:
-            `torch.Tensor`: hidden_states.
-        """
-        bilinear_indices, bilinear_weights = vision_bilinear_coordinates(
-            grid_thw,
-            num_grid_per_side=self.num_grid_per_side,
-            spatial_merge_size=self.config.spatial_merge_size,
-            indices=bilinear_indices,
-            weights=bilinear_weights,
-        )
-        position_ids = vision_position_ids(
-            grid_thw,
-            self.config.spatial_merge_size,
-            position_ids,
-        )
-        cu_seqlens = vision_cu_seqlens(grid_thw, cu_seqlens)
-
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = (self.pos_embed(bilinear_indices) * bilinear_weights[:, :, None]).sum(0)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
@@ -1806,10 +1775,19 @@ class Qwen3_5Model(nn.Module):
     ) -> tuple[torch.Tensor, ...]:
         if image_grid_thw is None:
             raise ValueError("image_grid_thw is required with pixel_values")
+        if any(
+            value is None
+            for value in (
+                bilinear_indices,
+                bilinear_weights,
+                position_ids,
+                cu_seqlens,
+            )
+        ):
+            raise ValueError("Qwen vision metadata must be precomputed by the runtime")
         pixel_values = pixel_values.type(_module_dtype(self.visual))
         image_embeds = self.visual(
             pixel_values,
-            grid_thw=image_grid_thw,
             bilinear_indices=bilinear_indices,
             bilinear_weights=bilinear_weights,
             position_ids=position_ids,
