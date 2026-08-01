@@ -56,13 +56,63 @@ def prepare_crops_from_overlap(
     return crops, overlap["tiling"]
 
 
+# Hopper `wgmma` operand descriptors require 16-byte alignment on the K-contiguous
+# operand; in bf16 that is 8 elements.  The natural SigLIP patch dimension is
+# 14*14*3 = 588, which is only 4-element aligned, so NO sm90 tile in cuBLAS's kernel
+# set is eligible and the heuristic falls back to an Ampere `s16816` kernel running on
+# a Hopper part.  Measured on H100 at nc=13 (M=9477, N=1152): 130.56 us for the
+# Ampere kernel against 36.96 us for the sm90 one it binds at K=592 -- 3.53x, or
+# +93.60 us per forward, on the single largest lever found on this path.
+#
+# Padding K to the next multiple of 8 is EXACT, not an approximation: the added
+# columns are zero on both operands, and a zero contributes exactly zero to every dot
+# product.  592 rather than 608 because a measured sweep put their walls inside each
+# other's spread while 592 costs +0.68% extra FLOPs against 608's +3.40%.
+PATCH_DIM_ALIGN = 8
+
+
+def aligned_patch_dim(raw_patch_dim: int) -> int:
+    """Round a patch dimension up to the tensor-core alignment (588 -> 592).
+
+    One owner for the rule: :func:`create_patches` and :func:`build_vision_model`
+    both derive their width from this, so the activation and the weight cannot
+    disagree about how wide the operand is.
+    """
+    return -(-raw_patch_dim // PATCH_DIM_ALIGN) * PATCH_DIM_ALIGN
+
+
 def create_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Fold an image batch into patch rows, zero-padded to the aligned width.
+
+    The padding is intrinsic rather than opt-in: this function exists to produce the
+    operand `patch_emb` consumes, and an unpadded caller would silently build the
+    misaligned GEMM this alignment exists to avoid.  Callers that want the raw width
+    should slice ``[..., :channels * patch_size**2]``.
+    """
     bsz, channels, height, width = x.shape
     p1 = p2 = patch_size
-    x = x.reshape(bsz, channels, height // p1, p1, width // p2, p2)
+    gh, gw = height // p1, width // p2
+    n = gh * gw
+    raw = channels * p1 * p2
+    dim = aligned_patch_dim(raw)
+
+    x = x.reshape(bsz, channels, gh, p1, gw, p2)
     x = x.permute(0, 2, 4, 1, 3, 5)
-    x = x.reshape(bsz, (height // p1) * (width // p2), channels * p1 * p2)
-    return x
+    if dim == raw:
+        return x.reshape(bsz, n, raw)
+
+    # The permute makes `x` non-contiguous, so materializing it costs one copy no
+    # matter what.  Writing THROUGH a strided view of the padded buffer spends
+    # exactly that one copy -- a `reshape(...)` followed by a slice-assign would pay
+    # it twice, and this op moves ~11 MiB per forward at nc=13.  Only the 4 pad
+    # columns are zeroed, not the whole buffer.
+    out = x.new_empty(bsz, n, dim)
+    out.as_strided(
+        size=(bsz, gh, gw, channels, p1, p2),
+        stride=(n * dim, gw * dim, dim, p1 * p2, p2, 1),
+    ).copy_(x)
+    out[:, :, raw:].zero_()
+    return out
 
 
 def vision_encoder(
@@ -196,7 +246,13 @@ def build_vision_model(
     *,
     device: torch.device | str | None = None,
 ) -> nn.Module:
-    patch_dim = config.enc_patch_size * config.enc_patch_size * config.in_channels
+    # Padded to the tensor-core alignment; `create_patches` pads the activation to
+    # the same width from the same rule.  Checkpoints stay canonical at the RAW width
+    # and are padded on load (see `weights._copy_patch_emb_weight`), so no re-export
+    # is needed and a 588-column checkpoint keeps working unchanged.
+    patch_dim = aligned_patch_dim(
+        config.enc_patch_size * config.enc_patch_size * config.in_channels
+    )
     grid_size = config.crop_size // config.enc_patch_size
     num_patches = grid_size * grid_size
 
@@ -236,6 +292,19 @@ def build_vision_model(
         }
     )
     model.pos_emb = nn.Parameter(torch.zeros(1, num_patches, config.enc_dim, dtype=dtype, device=device))
+
+    # Zero the alignment pad on BOTH operands, not just the activation.
+    # `nn.Linear(592, ...)` random-inits all 592 columns, so a freshly-built model
+    # carries garbage where the pad is. It is numerically harmless *today* only
+    # because `create_patches` zeroes the matching activation columns -- a one-sided
+    # invariant that holds until someone feeds this Linear a differently-built
+    # operand. Zeroing here makes the pad inert from either side, and matches what a
+    # checkpoint load produces (`weights._copy_patch_emb_weight` zeroes it too), so a
+    # built-then-loaded model and a built-only model agree.
+    raw_patch_dim = config.enc_patch_size * config.enc_patch_size * config.in_channels
+    if patch_dim != raw_patch_dim:
+        with torch.no_grad():
+            model["patch_emb"].weight[:, raw_patch_dim:].zero_()
     return model
 
 
@@ -296,6 +365,7 @@ __all__ = [
     "prepare_crops",
     "prepare_crops_from_overlap",
     "create_patches",
+    "aligned_patch_dim",
     "vision_encoder",
     "vision_projection",
     "build_vision_model",
