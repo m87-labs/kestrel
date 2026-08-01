@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from kestrel.ops.norm import RMSNorm
 from kestrel.ops.rotary import default_inv_freq
 
 from .inference_ops import (
@@ -57,6 +56,7 @@ _kestrel_packed_recurrent_prefill = (
     _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_prefill
 )
 _kestrel_gated_rmsnorm = _kestrel_runtime.gated_delta.gated_rmsnorm
+_kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
 _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
@@ -68,6 +68,13 @@ _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
+
+
+def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
+    state = nn.ModuleDict()
+    state.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+    state.eps = eps
+    return state
 
 
 @dataclass
@@ -870,8 +877,8 @@ class Qwen3_5Attention(nn.Module):
             bias=False,
         )
         # Unlike OLMo, these normalize only the head dimension.
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
+        self.k_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
 
     def forward(
         self,
@@ -900,8 +907,12 @@ class Qwen3_5Attention(nn.Module):
             dim=-1,
         )
 
-        query_states = self.q_norm(query_states.reshape(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(key_states.reshape(hidden_shape)).transpose(1, 2)
+        query_states = _kestrel_rmsnorm(
+            query_states.reshape(hidden_shape), self.q_norm.weight, self.q_norm.eps
+        ).transpose(1, 2)
+        key_states = _kestrel_rmsnorm(
+            key_states.reshape(hidden_shape), self.k_norm.weight, self.k_norm.eps
+        ).transpose(1, 2)
         value_states = value_states.reshape(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -1305,21 +1316,17 @@ class Qwen3_5DecoderLayer(nn.Module):
                 config.intermediate_size,
             )
         )
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
+        self.input_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = _rmsnorm_state(
+            config.hidden_size, config.rms_norm_eps)
 
     def _forward_from_normalized(
         self,
         residual: torch.Tensor,
         normalized_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        output_layernorm: RMSNorm | None = None,
+        output_layernorm: nn.ModuleDict | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Qwen35InferenceCache | None = None,
@@ -1720,7 +1727,7 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _rmsnorm_state(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
     def forward(
         self,
@@ -1777,7 +1784,9 @@ class Qwen3_5TextModel(nn.Module):
         decoder_layers = self.layers[: self.config.num_hidden_layers]
 
         if decoder_layers:
-            normalized_hidden_states = decoder_layers[0].input_layernorm(hidden_states)
+            state = decoder_layers[0].input_layernorm
+            normalized_hidden_states = _kestrel_rmsnorm(
+                hidden_states, state.weight, state.eps)
 
         for i, decoder_layer in enumerate(decoder_layers):
             layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
@@ -1808,7 +1817,8 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = (
             normalized_hidden_states
             if decoder_layers
-            else self.norm(hidden_states)
+            else _kestrel_rmsnorm(
+                hidden_states, self.norm.weight, self.norm.eps)
         )
 
         return _TextModelOutput(
