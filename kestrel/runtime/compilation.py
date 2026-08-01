@@ -1,19 +1,10 @@
 """Generic preparation passes for inference compilation."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
-
-
-@dataclass(frozen=True)
-class ScalarBufferCanonicalization:
-    """Result of exact immutable scalar-buffer canonicalization."""
-
-    candidates: int
-    aliases: int
 
 
 def materialize_dynamic_batch_domain(
@@ -44,7 +35,7 @@ def materialize_dynamic_batch_domain(
         synchronize()
 
 
-def _scalar_buffer_key(value: torch.Tensor) -> tuple[object, ...]:
+def immutable_scalar_key(value: torch.Tensor) -> tuple[object, ...]:
     host_bytes = bytes(
         value.detach()
         .cpu()
@@ -58,7 +49,7 @@ def _scalar_buffer_key(value: torch.Tensor) -> tuple[object, ...]:
 
 def canonicalize_immutable_scalar_buffers(
     module: nn.Module,
-) -> ScalarBufferCanonicalization:
+) -> None:
     """Alias bit-identical immutable scalar buffers before inference compilation.
 
     Sharing the Tensor object lets graph compilers represent repeated scalar
@@ -76,8 +67,6 @@ def canonicalize_immutable_scalar_buffers(
         )
 
     canonical: dict[tuple[object, ...], torch.Tensor] = {}
-    candidates = 0
-    aliases = 0
     for child in module.modules():
         for name, value in child._buffers.items():
             if (
@@ -95,11 +84,7 @@ def canonicalize_immutable_scalar_buffers(
                 raise ValueError(
                     f"immutable scalar buffer {name!r} must be materialized"
                 )
-            candidates += 1
-            key = _scalar_buffer_key(value)
+            key = immutable_scalar_key(value)
             existing = canonical.setdefault(key, value)
             if existing is not value:
                 child._buffers[name] = existing
-                aliases += 1
-
-    return ScalarBufferCanonicalization(candidates=candidates, aliases=aliases)

@@ -47,6 +47,7 @@ Kestrel supports these model families:
 | Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
 | Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
+| Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, and 31B base/instruction variants |
 
 ## Quick Start
 
@@ -60,7 +61,7 @@ from kestrel.engine import InferenceEngine
 async def main():
     # Weights are automatically downloaded from HuggingFace on first run.
     # Use a registered model name or Hugging Face repository ID.
-    cfg = RuntimeConfig(model="Qwen/Qwen3.5-4B")
+    cfg = RuntimeConfig(model="google/gemma-4-E2B-it")
 
     # Create the engine (loads model and warms up). No API key needed for
     # local inference; pass api_key="..." only for finetuned models.

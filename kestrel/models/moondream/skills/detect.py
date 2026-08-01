@@ -2,10 +2,11 @@
 
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, cast
 
 import numpy as np
 
+from kestrel.models.protocols import SpatialPromptTemplate
 from ..runtime import CoordToken, SizeToken, TextToken, Token
 
 from kestrel.skills.base import (
@@ -85,7 +86,7 @@ class DetectSkill(SkillSpec):
         if not isinstance(request_context, DetectRequest):
             raise ValueError("DetectSkill.build_prompt_tokens requires a DetectRequest")
         pt = runtime.prompt_template
-        template = pt.detect()
+        template = cast(SpatialPromptTemplate, pt).detect()
         if template is None:
             raise ValueError("Model does not include a detect template")
         prompt = request_context.object

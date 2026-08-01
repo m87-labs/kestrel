@@ -16,9 +16,9 @@ before the final answer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
-from kestrel.models.protocols import ChatTemplate, PrefixSuffix, QueryTemplate
+from kestrel.models.protocols import ChatTemplate, QueryTemplate
 
 
 IM_START_ID = 248_045
@@ -70,13 +70,6 @@ class Qwen35PromptTemplate:
     eos_id: int = END_OF_TEXT_ID
     answer_id: int = THINK_END_ID
     thinking_id: int = THINK_START_ID
-    coord_id: int = 0
-    size_id: int = 0
-    start_ground_points_id: int = 0
-    end_ground_id: int = 0
-
-    def caption(self, length: str) -> Optional[List[int]]:
-        return None
 
     def query(self) -> Optional[QueryTemplate]:
         return QueryTemplate(
@@ -117,14 +110,6 @@ class Qwen35PromptTemplate:
             supports_system=True,
         )
 
-    def detect(self) -> Optional[PrefixSuffix]:
-        return None
-
-    def point(self) -> Optional[PrefixSuffix]:
-        return None
-
-    def segment(self) -> Optional[PrefixSuffix]:
-        return None
 
 
 __all__ = [

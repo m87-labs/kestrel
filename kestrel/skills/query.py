@@ -1,11 +1,11 @@
 """Model-agnostic question-answering skill."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
-from kestrel.models.protocols import QueryTemplate
+from kestrel.models.protocols import QueryPromptTemplate, QueryTemplate
 from kestrel.runtime.tokens import CoordToken, TextToken, Token
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
@@ -107,7 +107,7 @@ class QuerySkill(SkillSpec):
         if not isinstance(request_context, QueryRequest):
             raise ValueError("QuerySkill.build_prompt_tokens requires a QueryRequest")
         prompt = request_context.question
-        pt = runtime.prompt_template
+        pt = cast(QueryPromptTemplate, runtime.prompt_template)
         template = pt.query()
         if template is None:
             raise ValueError("Model does not include a query template")
@@ -385,14 +385,16 @@ class QuerySkillState(SkillState):
             return
         pt = runtime.prompt_template
         self._answer_id = pt.answer_id
-        self._start_ground_id = pt.start_ground_points_id
-        self._end_ground_id = pt.end_ground_id
+        template = self._get_query_template(runtime)
+        self._start_ground_id = template.start_ground_points_id
+        self._end_ground_id = template.end_ground_id
 
     def _get_query_template(
         self, runtime: "AutoregressiveRuntime"
     ) -> QueryTemplate:
         if self._query_template is None:
-            template = runtime.prompt_template.query()
+            prompt_template = cast(QueryPromptTemplate, runtime.prompt_template)
+            template = prompt_template.query()
             if template is None:
                 raise ValueError("Model does not include a query template")
             self._query_template = template

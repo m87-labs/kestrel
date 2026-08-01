@@ -2,10 +2,11 @@
 
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, cast
 
 import numpy as np
 
+from kestrel.models.protocols import SpatialPromptTemplate
 from ..runtime import CoordToken, SizeToken, TextToken, Token
 from kestrel.utils.spatial_refs import build_spatial_tokens, normalize_spatial_refs
 
@@ -85,7 +86,7 @@ class PointSkill(SkillSpec):
         if not isinstance(request_context, PointRequest):
             raise ValueError("PointSkill.build_prompt_tokens requires a PointRequest")
         pt = runtime.prompt_template
-        template = pt.point()
+        template = cast(SpatialPromptTemplate, pt).point()
         if template is None:
             raise ValueError("Model does not include a point template")
         prompt = request_context.object

@@ -24,10 +24,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping as _Mapping, Sequence as _Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import numpy as np
 
+from kestrel.models.protocols import ChatPromptTemplate
 from kestrel.runtime.tokens import TextToken, Token
 from kestrel.skills.base import (
     AR_DEFAULT_MAX_NEW_TOKENS,
@@ -185,7 +186,7 @@ class ChatSkill(SkillSpec):
     ) -> Sequence[Token]:
         if not isinstance(request_context, ChatRequest):
             raise ValueError("ChatSkill.build_prompt_tokens requires a ChatRequest")
-        chat_tpl = runtime.prompt_template.chat()
+        chat_tpl = cast(ChatPromptTemplate, runtime.prompt_template).chat()
         if chat_tpl is None:
             raise ValueError(
                 "model has no chat() template; a model without a native chat "
@@ -253,7 +254,7 @@ class ChatSkill(SkillSpec):
     ) -> "ChatSkillState":
         if not isinstance(request_context, ChatRequest):
             raise ValueError("ChatSkill.create_state requires a ChatRequest context")
-        chat_tpl = runtime.prompt_template.chat()
+        chat_tpl = cast(ChatPromptTemplate, runtime.prompt_template).chat()
         if chat_tpl is None:
             raise ValueError("model has no chat() template for ChatSkill")
         return ChatSkillState(

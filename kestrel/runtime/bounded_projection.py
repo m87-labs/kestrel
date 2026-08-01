@@ -5,7 +5,43 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from kestrel.runtime.compilation import _scalar_buffer_key
+from kestrel.runtime.compilation import immutable_scalar_key
+
+
+class BoundedLinear(nn.Module):
+    """Bias-free linear with optional checkpoint-provided input/output bounds."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bounds: bool,
+    ) -> None:
+        super().__init__()
+        self.use_bounds = bool(use_bounds)
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        if self.use_bounds:
+            self.register_buffer("input_min", torch.tensor(-float("inf")))
+            self.register_buffer("input_max", torch.tensor(float("inf")))
+            self.register_buffer("output_min", torch.tensor(-float("inf")))
+            self.register_buffer("output_max", torch.tensor(float("inf")))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_bounds:
+            hidden_states = torch.clamp(
+                hidden_states,
+                self.input_min,
+                self.input_max,
+            )
+        projected = self.linear(hidden_states)
+        if self.use_bounds:
+            projected = torch.clamp(
+                projected,
+                self.output_min,
+                self.output_max,
+            )
+        return projected
 
 
 class PackedBoundedProjections(nn.Module):
@@ -53,7 +89,7 @@ class PackedBoundedProjections(nn.Module):
                 torch.full((total_out_features,), float("inf")),
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward_packed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_bounds:
             hidden_states = torch.clamp(
                 hidden_states,
@@ -63,22 +99,60 @@ class PackedBoundedProjections(nn.Module):
         packed = self.linear(hidden_states)
         if self.use_bounds:
             packed = torch.clamp(packed, self.output_min, self.output_max)
-        return packed.split(self.out_features, dim=-1)
+        return packed
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.forward_packed(hidden_states).split(self.out_features, dim=-1)
 
 
-def bind_declared_packed_bounded_projections(
+class PackedLinear(nn.Linear):
+    """Linear whose checkpoint weights are declared as packed siblings."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: Sequence[int],
+        *,
+        source_names: Sequence[str],
+        source_weight_leaf: str = "weight",
+    ) -> None:
+        packed_out_features = tuple(int(size) for size in out_features)
+        source_names = tuple(source_names)
+        if (
+            not packed_out_features
+            or any(size <= 0 for size in packed_out_features)
+            or len(source_names) != len(packed_out_features)
+        ):
+            raise ValueError("packed linear sources and output sizes must align")
+        super().__init__(
+            int(in_features),
+            sum(packed_out_features),
+            bias=False,
+        )
+        self.packed_out_features = packed_out_features
+        self.source_names = source_names
+        self.source_weight_leaf = source_weight_leaf
+
+
+def bind_declared_packed_projections(
     module: nn.Module,
     state_dict: dict[str, torch.Tensor],
 ) -> None:
     """Pack declared sibling weights after proving compatible transforms."""
 
     for module_name, child in module.named_modules():
-        if not isinstance(child, PackedBoundedProjections):
+        if not isinstance(child, (PackedBoundedProjections, PackedLinear)):
             continue
+        is_bounded = isinstance(child, PackedBoundedProjections)
+        output_sizes = (
+            child.out_features if is_bounded else child.packed_out_features
+        )
         parent_name, separator, _ = module_name.rpartition(".")
         source_prefix = f"{parent_name}." if separator else ""
         target_prefix = f"{module_name}." if module_name else ""
-        target_weight_key = target_prefix + "linear.weight"
+        target_weight_key = target_prefix + (
+            "linear.weight" if is_bounded else "weight"
+        )
         if target_weight_key in state_dict:
             continue
 
@@ -97,7 +171,7 @@ def bind_declared_packed_bounded_projections(
         for key, weight, output_size in zip(
             source_weight_keys,
             weights,
-            child.out_features,
+            output_sizes,
         ):
             expected_shape = (output_size, child.in_features)
             if (
@@ -117,7 +191,7 @@ def bind_declared_packed_bounded_projections(
         packed_bounds: dict[str, torch.Tensor] = {}
         source_bound_keys: list[str] = []
         bound_values: dict[str, list[torch.Tensor]] = {}
-        if child.use_bounds:
+        if is_bounded and child.use_bounds:
             for bound_name in (
                 "input_min",
                 "input_max",
@@ -150,9 +224,9 @@ def bind_declared_packed_bounded_projections(
 
             for bound_name in ("input_min", "input_max"):
                 values = bound_values[bound_name]
-                first_key = _scalar_buffer_key(values[0])
+                expected = immutable_scalar_key(values[0])
                 if any(
-                    _scalar_buffer_key(value) != first_key
+                    immutable_scalar_key(value) != expected
                     for value in values[1:]
                 ):
                     raise ValueError(
@@ -166,7 +240,7 @@ def bind_declared_packed_bounded_projections(
                         value.expand(output_size)
                         for value, output_size in zip(
                             bound_values[bound_name],
-                            child.out_features,
+                            output_sizes,
                         )
                     ]
                 )

@@ -430,7 +430,6 @@ class Qwen3_5Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.head_dim = config.head_dim
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.q_gate_size = config.num_attention_heads * self.head_dim * 2
         self.kv_size = config.num_key_value_heads * self.head_dim
@@ -557,11 +556,7 @@ class Qwen3_5MLP(nn.Module):
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
-        hidden = torch.empty(
-            (*gate_up.shape[:-1], self.intermediate_size),
-            device=gate_up.device,
-            dtype=gate_up.dtype,
-        )
+        hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
             gate_up,
