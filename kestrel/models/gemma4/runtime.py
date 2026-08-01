@@ -16,7 +16,6 @@ from kestrel.runtime.compilation import (
 )
 from kestrel.runtime.decode_slot import create_decode_slot
 from kestrel.runtime.paged_resources import PrefillSlot, decode_slot_rows
-from kestrel.runtime.prefill import project_packed_last_rows
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 from kestrel.runtime.preprocessing import derive_preprocessing_workers
 from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
@@ -235,7 +234,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
-        last_token_offsets: torch.Tensor,
+        last_token_offsets: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_config = self._config.text_config
@@ -255,11 +254,12 @@ class Gemma4Runtime(UncachedPagedRuntime):
             slot_mapping=slot_mapping,
             cu_seqlens=cu_seqlens,
         )
-        rows, logits = project_packed_last_rows(
-            hidden,
-            last_token_offsets,
-            self.model.lm_head,
+        rows = (
+            hidden[0, -1:]
+            if last_token_offsets is None
+            else hidden[0].index_select(0, last_token_offsets)
         )
+        logits = self.model.lm_head(rows)
         cap = text_config.final_logit_softcapping
         return rows, torch.tanh(logits / cap) * cap
 
@@ -478,10 +478,14 @@ class Gemma4Runtime(UncachedPagedRuntime):
             dtype=torch.int32,
             device=self.device,
         )
-        last_token_offsets = torch.tensor(
-            [end - 1 for end in cumulative[1:]],
-            dtype=torch.long,
-            device=self.device,
+        last_token_offsets = (
+            None
+            if batch_size == 1
+            else torch.tensor(
+                [end - 1 for end in cumulative[1:]],
+                dtype=torch.long,
+                device=self.device,
+            )
         )
         hidden_rows, logits = self._prefill(
             inputs_embeds,
