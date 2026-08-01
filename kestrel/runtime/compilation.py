@@ -35,7 +35,7 @@ def materialize_dynamic_batch_domain(
         synchronize()
 
 
-def _scalar_buffer_key(value: torch.Tensor) -> tuple[object, ...]:
+def immutable_scalar_key(value: torch.Tensor) -> tuple[object, ...]:
     host_bytes = bytes(
         value.detach()
         .cpu()
@@ -84,7 +84,7 @@ def canonicalize_immutable_scalar_buffers(
                 raise ValueError(
                     f"immutable scalar buffer {name!r} must be materialized"
                 )
-            key = _scalar_buffer_key(value)
+            key = immutable_scalar_key(value)
             existing = canonical.setdefault(key, value)
             if existing is not value:
                 child._buffers[name] = existing
