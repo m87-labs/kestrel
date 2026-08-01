@@ -6,69 +6,13 @@ from typing import Any
 
 import torch
 from kestrel_kernels import get_runtime
-from torch.nn import functional as F
-
-
-def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
-    if repeats == 1:
-        return hidden_states
-    batch, heads, sequence, width = hidden_states.shape
-    return (
-        hidden_states[:, :, None]
-        .expand(batch, heads, repeats, sequence, width)
-        .reshape(batch, heads * repeats, sequence, width)
-    )
-
-
-def bidirectional_padding_mask(
-    valid: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    blocked = torch.full(
-        (), torch.finfo(dtype).min, dtype=dtype, device=valid.device
-    )
-    return torch.where(valid[:, None, None, :], 0.0, blocked).expand(
-        valid.shape[0], 1, valid.shape[1], valid.shape[1]
-    )
-
-
-def _window_mask(
-    query: torch.Tensor,
-    key_length: int,
-    *,
-    causal: bool,
-    left: int,
-    right: int | None,
-) -> torch.Tensor:
-    query_length = query.shape[-2]
-    query_positions = (
-        torch.arange(query_length, device=query.device)
-        + key_length
-        - query_length
-    )
-    key_positions = torch.arange(key_length, device=query.device)
-    keep = key_positions[None] >= query_positions[:, None] - left
-    if causal:
-        keep &= key_positions[None] <= query_positions[:, None]
-    if right is not None:
-        keep &= key_positions[None] <= query_positions[:, None] + right
-    return torch.where(
-        keep,
-        0.0,
-        torch.full(
-            (), torch.finfo(query.dtype).min,
-            dtype=query.dtype, device=query.device,
-        ),
-    )[None, None]
 
 
 def dense_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    num_key_value_groups: int,
-    attention_mask: torch.Tensor | None,
+    *,
     scaling: float,
     causal: bool,
     window_size_left: int | None = None,
@@ -83,90 +27,26 @@ def dense_attention(
         or not cu_seqlens.is_contiguous()
     ):
         raise ValueError("packed row boundaries must be contiguous int32 on-device")
-    if cu_seqlens is not None and query.device.type != "cuda":
-        boundaries = cu_seqlens.tolist()
-        if (
-            boundaries[:1] != [0]
-            or boundaries[-1:] != [query.shape[-2]]
-            or any(a >= b for a, b in zip(boundaries[:-1], boundaries[1:]))
-        ):
-            raise ValueError(
-                "packed row boundaries must strictly partition every token"
-            )
-        return torch.cat(
-            [
-                dense_attention(
-                    query[..., start:end, :],
-                    key[..., start:end, :],
-                    value[..., start:end, :],
-                    num_key_value_groups,
-                    None,
-                    scaling,
-                    causal,
-                    window_size_left,
-                    window_size_right,
-                )
-                for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
-            ],
-            dim=1,
-        )
-
-    if (
-        attention_mask is None
-        and query.device.type == "cuda"
-        and query.dtype in (torch.float16, torch.bfloat16)
-    ):
-        q, k, v = (
-            tensor.transpose(1, 2).contiguous()
-            for tensor in (query, key, value)
-        )
-        arguments: dict[str, Any] = {
-            "causal": causal,
-            "window_size_left": window_size_left,
-            "window_size_right": window_size_right,
-            "softmax_scale": scaling,
-        }
-        if cu_seqlens is not None:
-            q, k, v = (
-                tensor.flatten(0, 1) for tensor in (q, k, v)
-            )
-            arguments.update(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-            )
-        out, _ = get_runtime().attention.flash_attn_fwd(q, k, v, **arguments)
-        if cu_seqlens is not None:
-            out = out.reshape(query.shape[0], query.shape[2], *out.shape[-2:])
-        return out.contiguous()
-
-    key = repeat_kv(key, num_key_value_groups)
-    value = repeat_kv(value, num_key_value_groups)
-    if attention_mask is None and window_size_left is not None:
-        attention_mask = _window_mask(
-            query,
-            key.shape[-2],
-            causal=causal,
-            left=window_size_left,
-            right=window_size_right,
-        )
-    elif attention_mask is None and causal:
-        attention_mask = _window_mask(
-            query,
-            key.shape[-2],
-            causal=True,
-            left=key.shape[-2],
-            right=None,
-        )
-    out = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=scaling,
+    q, k, v = (
+        tensor.transpose(1, 2).contiguous()
+        for tensor in (query, key, value)
     )
-    return out.transpose(1, 2).contiguous()
+    arguments: dict[str, Any] = {
+        "causal": causal,
+        "window_size_left": window_size_left,
+        "window_size_right": window_size_right,
+        "softmax_scale": scaling,
+    }
+    if cu_seqlens is not None:
+        q, k, v = (tensor.flatten(0, 1) for tensor in (q, k, v))
+        arguments.update(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+    out, _ = get_runtime().attention.flash_attn_fwd(q, k, v, **arguments)
+    if cu_seqlens is not None:
+        out = out.reshape(query.shape[0], query.shape[2], *out.shape[-2:])
+    return out.contiguous()
 
 
 def paged_attention(
@@ -202,7 +82,6 @@ def variable_length_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    num_key_value_groups: int,
     used_key_lengths: torch.Tensor,
     scaling: float,
 ) -> torch.Tensor:
@@ -213,42 +92,19 @@ def variable_length_attention(
         or used_key_lengths.shape != query.shape[:1]
     ):
         raise ValueError("used-K lengths must be on-device int32 [batch]")
-    if query.device.type in ("cuda", "mps") and query.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ):
-        out, _ = get_runtime().attention.flash_attn_fwd(
-            query,
-            key,
-            value,
-            seqused_k=used_key_lengths,
-            causal=False,
-            softmax_scale=scaling,
-        )
-        return out
-
-    query = query.transpose(1, 2)
-    key = repeat_kv(key.transpose(1, 2), num_key_value_groups)
-    value = repeat_kv(value.transpose(1, 2), num_key_value_groups)
-    positions = torch.arange(query.shape[-2], device=query.device)
-    mask = bidirectional_padding_mask(
-        positions[None] < used_key_lengths[:, None],
-        dtype=query.dtype,
-    )
-    return F.scaled_dot_product_attention(
+    out, _ = get_runtime().attention.flash_attn_fwd(
         query,
         key,
         value,
-        attn_mask=mask,
-        dropout_p=0.0,
-        scale=scaling,
-    ).transpose(1, 2).contiguous()
+        seqused_k=used_key_lengths,
+        causal=False,
+        softmax_scale=scaling,
+    )
+    return out
 
 
 __all__ = [
-    "bidirectional_padding_mask",
     "dense_attention",
     "paged_attention",
-    "repeat_kv",
     "variable_length_attention",
 ]

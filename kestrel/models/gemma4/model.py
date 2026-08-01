@@ -121,7 +121,6 @@ class Gemma4TextAttention(nn.Module):
         )
         use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
         num_kv_heads = attention_kv_heads(config, is_sliding=self.is_sliding)
-        self.num_key_value_groups = config.num_attention_heads // num_kv_heads
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
@@ -234,8 +233,6 @@ class Gemma4TextAttention(nn.Module):
                 query_states,
                 key_states,
                 value_states,
-                num_key_value_groups=self.num_key_value_groups,
-                attention_mask=None,
                 scaling=1.0,
                 causal=not self.is_sliding,
                 window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
@@ -652,7 +649,6 @@ class Gemma4VisionAttention(nn.Module):
     def __init__(self, config: Gemma4VisionConfig) -> None:
         super().__init__()
         self.head_dim = config.head_dim
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.qkv_proj = PackedBoundedProjections(
             config.hidden_size,
             (
@@ -714,7 +710,6 @@ class Gemma4VisionAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            num_key_value_groups=self.num_key_value_groups,
             used_key_lengths=seqused_k,
             scaling=1.0,
         )
