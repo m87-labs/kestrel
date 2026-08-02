@@ -27,7 +27,7 @@ def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     }
 
 
-def create_generated_decode(runtime: Any) -> GeneratedDecode:
+def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
     """Describe Gemma inputs; shared runtime code owns binding and launch."""
 
     layers = runtime._kv_cache
@@ -55,7 +55,7 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode:
         layer_kinds=tuple(config.layer_types),
         extra_runtime_inputs=rope_inputs,
     )
-    return GeneratedDecode.require(
+    return GeneratedDecode.try_create(
         runtime,
         GeneratedDecodeSpec(
             label="Gemma",
@@ -63,7 +63,6 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode:
             weight_layer_prefix="model.language_model.layers",
             bindings=bindings,
         ),
-        capacity=runtime.max_batch_size,
     )
 
 
