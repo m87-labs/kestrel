@@ -153,7 +153,9 @@ class Gemma4TextAttention(nn.Module):
         paged_kv_layer: PagedKVCache,
         cache_position_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -206,17 +208,33 @@ class Gemma4TextAttention(nn.Module):
             assert key_states is not None and value_states is not None
             transient_kv[self.layer_idx] = (key_states, value_states)
 
-        assert key_states is not None and value_states is not None
-        attn_out = attention_ops.dense_attention(
-            query_states,
-            key_states,
-            value_states,
-            scaling=1.0,
-            causal=not self.is_sliding,
-            window_size_left=(self.sliding_window - 1) if self.is_sliding else None,
-            window_size_right=0 if self.is_sliding else None,
-            cu_seqlens=cu_seqlens,
-        )
+        if page_table is not None:
+            if paged_kv_seqlens_k is None:
+                raise ValueError("paged Gemma attention requires K/V lengths")
+            attn_out = attention_ops.paged_attention(
+                query_states,
+                paged_kv_layer=paged_kv_layer,
+                page_table=page_table,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
+                scaling=1.0,
+                sliding_window=self.sliding_window,
+            )
+        else:
+            if paged_kv_seqlens_k is not None:
+                raise ValueError("paged K/V lengths require a page table")
+            assert key_states is not None and value_states is not None
+            attn_out = attention_ops.dense_attention(
+                query_states,
+                key_states,
+                value_states,
+                scaling=1.0,
+                causal=not self.is_sliding,
+                window_size_left=(
+                    self.sliding_window - 1 if self.is_sliding else None
+                ),
+                window_size_right=0 if self.is_sliding else None,
+                cu_seqlens=cu_seqlens,
+            )
         attn_out = attn_out.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_out)
 
@@ -299,7 +317,9 @@ class Gemma4TextDecoderLayer(nn.Module):
         paged_kv_layer: PagedKVCache,
         cache_position_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = _dense_runtime.rmsnorm(
@@ -315,6 +335,8 @@ class Gemma4TextDecoderLayer(nn.Module):
             cache_position_ids=cache_position_ids,
             slot_mapping=slot_mapping,
             cu_seqlens=cu_seqlens,
+            page_table=page_table,
+            paged_kv_seqlens_k=paged_kv_seqlens_k,
         )
         hidden_states = _dense_runtime.rmsnorm(
             hidden_states,
@@ -458,7 +480,9 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[torch.Tensor],
         cache_position_ids: torch.Tensor,
         slot_mapping: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        page_table: torch.Tensor | None = None,
+        paged_kv_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.hidden_size_per_layer_input:
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
@@ -489,6 +513,8 @@ class Gemma4TextModel(nn.Module):
                 cache_position_ids=cache_position_ids,
                 slot_mapping=slot_mapping,
                 cu_seqlens=cu_seqlens,
+                page_table=page_table,
+                paged_kv_seqlens_k=paged_kv_seqlens_k,
             )
 
         hidden_states = _dense_runtime.rmsnorm(

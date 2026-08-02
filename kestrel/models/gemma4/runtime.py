@@ -459,7 +459,61 @@ class Gemma4Runtime(UncachedPagedRuntime):
         if batch_size == 0:
             return
         with torch.cuda.stream(slot.compute_stream):
-            self._generated_decode.run(slot, batch_size)
+            if (
+                self._generated_decode is not None
+                and self._generated_decode.supports(batch_size)
+            ):
+                self._generated_decode.run(slot, batch_size)
+            else:
+                self._run_native_decode(slot, batch_size)
+
+    def _run_native_decode(self, slot: Any, batch_size: int) -> None:
+        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
+        input_pos = slot.meta.input_pos.gpu[:batch_size]
+        positions = slot.cache_position_ids[:batch_size]
+        positions[:, 0].copy_(input_pos)
+        slot.position_ids[:batch_size].copy_(positions)
+        self.page_table.populate_paged_kv_metadata(
+            batch_idx=batch_idx,
+            input_pos=input_pos,
+            out_page_table=slot.paged_kv_page_table[:batch_size],
+            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
+        )
+        slot.slot_mapping[:batch_size].copy_(
+            self.page_table.build_slot_mapping(
+                batch_idx=batch_idx,
+                positions=positions,
+            )
+        )
+
+        input_ids = slot.decode_token_ids[:batch_size].view(batch_size, 1)
+        language_model = self.model.model.language_model
+        inputs_embeds = language_model.embed(input_ids)
+        per_layer_inputs = (
+            language_model.get_per_layer_inputs(input_ids)
+            if self._config.text_config.hidden_size_per_layer_input
+            else None
+        )
+        hidden = language_model(
+            inputs_embeds=inputs_embeds,
+            position_ids=slot.position_ids[:batch_size],
+            kv_cache=self._kv_cache,
+            per_layer_inputs=per_layer_inputs,
+            cache_position_ids=positions,
+            slot_mapping=slot.slot_mapping[:batch_size],
+            cu_seqlens=None,
+            page_table=slot.paged_kv_page_table[:batch_size],
+            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
+        )[:, 0]
+        slot.hidden_last[:batch_size].copy_(hidden)
+        torch.mm(
+            hidden,
+            self.model.lm_head.weight.t(),
+            out=slot.logits[:batch_size],
+        )
+        cap = self._config.text_config.final_logit_softcapping
+        if cap is not None:
+            slot.logits[:batch_size].div_(cap).tanh_().mul_(cap)
 
 
 __all__ = ["Gemma4Runtime"]
