@@ -62,6 +62,10 @@ class _AdmissionCoordinator:
     def has_pending(self) -> bool:
         return bool(self._pending_crops)
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending_crops)
+
     def submit(self, req: _AutoregressiveRequest) -> Optional[_ReadyAdmission]:
         if req.image is None:
             return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
@@ -203,6 +207,10 @@ class AutoregressiveExecutor:
             fail_request=self._fail_via_admission,
         )
         self._active: Dict[int, _AutoregressiveRequest] = {}
+        self._admission_capacity = max(
+            runtime.max_batch_slots,
+            runtime.max_batch_size * 4,
+        )
         # Admission-time failures surface as completions the kernel delivers.
         self._admission_failures: List[Completion] = []
 
@@ -223,6 +231,13 @@ class AutoregressiveExecutor:
             or self._admission.has_pending()
             or bool(self._active)
             or bool(self._admission_failures)
+        )
+
+    @property
+    def has_ingress_capacity(self) -> bool:
+        return (
+            len(self._active) + self._admission.pending_count
+            < self._admission_capacity
         )
 
     def advance(self) -> TickResult:
@@ -316,8 +331,7 @@ class AutoregressiveExecutor:
 
     def _promote_ready(self) -> bool:
         promoted = False
-        cap = self._runtime.max_batch_size * 4
-        while len(self._scheduler.waiting) < cap:
+        while len(self._scheduler.waiting) < self._admission_capacity:
             ready = self._admission.take_ready()
             if ready is None:
                 break

@@ -1523,8 +1523,12 @@ class InferenceEngine:
                         continue
 
                     progressed = False
-                    # AR ingress (untagged — always the default model).
-                    while True:
+                    # AR ingress (untagged — always the default model). The
+                    # executor keeps a bounded preprocessing + execution
+                    # window so a large client backlog cannot starve device
+                    # progress while several batches remain available for
+                    # overlap.
+                    while ar_executor.has_ingress_capacity:
                         try:
                             item = self._scheduler_queue.get_nowait()
                         except queue.Empty:

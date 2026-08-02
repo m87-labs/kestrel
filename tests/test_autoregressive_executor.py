@@ -54,9 +54,11 @@ def _executor() -> AutoregressiveExecutor:
     ex = object.__new__(AutoregressiveExecutor)
     ex._runtime = SimpleNamespace(
         max_batch_size=1,
+        max_batch_slots=2,
         active_sequences={},
         release_sequence=lambda state: None,
     )
+    ex._admission_capacity = 4
     ex._to_engine_result = _fake_to_engine_result
     ex._active = {}
     ex._admission_failures = []
@@ -72,6 +74,7 @@ def _executor() -> AutoregressiveExecutor:
     )
     ex._admission = SimpleNamespace(
         has_pending=lambda: False,
+        pending_count=0,
         take_ready=lambda: None,
         fail_all=lambda exc: None,
     )
@@ -158,6 +161,16 @@ def test_idle_executor_reports_no_work() -> None:
     assert tick.completed == ()
     assert tick.has_work is False
     assert ex.has_work is False
+
+
+def test_ingress_capacity_counts_active_and_preprocessing_requests() -> None:
+    ex = _executor()
+    ex._active = {request_id: _pending(request_id) for request_id in range(3)}
+
+    assert ex.has_ingress_capacity is True
+
+    ex._admission.pending_count = 1
+    assert ex.has_ingress_capacity is False
 
 
 def test_shutdown_fails_in_flight_requests() -> None:
