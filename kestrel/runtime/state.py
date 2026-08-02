@@ -103,3 +103,4 @@ class PreparedSequence:
     cache_result: _CacheLookupResult
     adapter_id: str | None
     image_hash: bytes | None
+    use_prefix_attn: bool = False

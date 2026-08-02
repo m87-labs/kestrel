@@ -1913,6 +1913,7 @@ class MoondreamRuntime:
             cache_result=cache_result,
             adapter_id=adapter_id,
             image_hash=image_hash,
+            use_prefix_attn=bool(image_kv_length) and not cache_result.can_reuse,
         )
 
     def _build_prefill_inputs_for_prepared(
