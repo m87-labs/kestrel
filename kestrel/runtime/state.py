@@ -103,3 +103,8 @@ class PreparedSequence:
     cache_result: _CacheLookupResult
     adapter_id: str | None
     image_hash: bytes | None
+
+    @property
+    def use_prefix_attn(self) -> bool:
+        """Return the attention mode after cache lookup and reservation."""
+        return bool(self.state.image_length) and not self.cache_result.can_reuse

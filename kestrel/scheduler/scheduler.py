@@ -1827,6 +1827,32 @@ class GenerationScheduler:
                 progress = True
                 continue
 
+            # Prefix-cache state may change between candidate planning and
+            # binding: reservations for earlier rows can evict a prefix that a
+            # later candidate expected to reuse. The prepared sequence is the
+            # authoritative post-reservation mode. Defer a row that no longer
+            # matches the launch batch instead of handing mixed attention
+            # modes to the runtime.
+            if (
+                bound_batch
+                and prepared.use_prefix_attn
+                != bound_batch[0].prepared.use_prefix_attn
+            ):
+                self.runtime.abort_prepared_sequence(prepared)
+                lifecycle.prefill_started_at = None
+                lifecycle.prefill_completed_at = None
+                if acquired_lora:
+                    self.runtime.release_adapter_slot(request.lora_slot)
+                    request.lora_slot = 0
+                    lifecycle.lora_slot_ready = False
+                lifecycle.transition(
+                    RequestPhase.READY_FOR_PREFILL
+                    if (lifecycle.crops_ready and lifecycle.lora_slot_ready)
+                    else RequestPhase.WAITING_RESOURCES
+                )
+                progress = True
+                continue
+
             lifecycle.sequence_state = prepared.state
 
             self.waiting.remove(request)
