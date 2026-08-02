@@ -116,14 +116,18 @@ class _QwenImagePreprocessor:
             pv, grid = preprocess_image(one)
             pixel_values_parts.append(pv)
             grid_parts.append(grid)
-        pixel_values = torch.cat(pixel_values_parts, dim=0)
-        image_grid_thw = torch.cat(grid_parts, dim=0)
+        if len(images) == 1:
+            pixel_values = pixel_values_parts[0]
+            image_grid_thw = grid_parts[0]
+        else:
+            pixel_values = torch.cat(pixel_values_parts, dim=0)
+            image_grid_thw = torch.cat(grid_parts, dim=0)
         num_image_tokens = int(image_grid_thw.prod(-1).sum().item()) // 4
         if num_image_tokens <= 0:
             raise RuntimeError("Qwen image preprocessing produced no image tokens")
         return QwenImageInputs(
-            pixel_values=pixel_values.detach().cpu(),
-            image_grid_thw=image_grid_thw.detach().cpu(),
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             num_image_tokens=num_image_tokens,
         )
 
