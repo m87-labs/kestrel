@@ -128,6 +128,7 @@ class UncachedPagedRuntime:
             ),
             adapter_id=adapter_id,
             image_hash=image_hash,
+            use_prefix_attn=False,
         )
 
     def finalize_prepared_sequence_after_prefill(
