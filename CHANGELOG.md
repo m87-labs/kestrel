@@ -2,6 +2,55 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## 0.5.0 — 2026-08-02
+
+Kestrel now serves Qwen 3.5, Qwen 3.6, and Gemma 4 alongside the Moondream
+family. This release also adds Moondream 3.1, automatically accelerates
+supported decode workloads with bundled whole-model kernels, introduces a
+multi-turn chat interface, and improves responsiveness and fault isolation
+under production load.
+
+### More model families
+
+- Added image inference for the Qwen 3.5 family: 0.8B, 2B, 4B, 9B, 27B, and
+  35B-A3B checkpoints, including base variants where published.
+- Added Qwen 3.6 27B and 35B-A3B support for BF16 and FP8 checkpoints.
+- Added Gemma 4 E2B, E4B, and 31B base and instruction-tuned checkpoints,
+  including Gemma's mixed local/global attention and sliding-window behavior.
+- Added Moondream 3.1 9B A2B, plus explicit local model and tokenizer paths for
+  deployments that manage weights without Hugging Face downloads.
+
+### Faster inference by default
+
+- Moondream 2 and Moondream 3 can now decode through bundled whole-model
+  kernels on supported NVIDIA GPUs. Kestrel selects these kernels
+  automatically and falls back to the regular optimized path when a model,
+  device, or batch size is not covered; no compiler or JIT setup is required
+  in the deployed application.
+- Qwen and Gemma use the same generated-decode runtime where compatible
+  bundles are available, with transparent paged-attention fallback elsewhere.
+- Reduced host and transfer overhead across decode by keeping active request
+  groups stable, staging decode inputs together, sharing KV-cache resources,
+  and avoiding duplicate Moondream 3 expert weights.
+- Large request bursts begin producing results sooner because Kestrel now
+  bounds preprocessing and admission work instead of front-loading the entire
+  backlog before advancing the GPU.
+- Updated to `kestrel-kernels` 0.4.9, adding CUDA 13 runtime support, broader
+  native attention and recurrent-model coverage, faster multi-adapter MoE
+  execution, and expanded AOT kernel bundles across NVIDIA architectures.
+
+### Serving APIs and reliability
+
+- Added an OpenAI-style multi-turn chat interface with image content, optional
+  reasoning, streaming text deltas, and model-specific turn termination.
+- Added stateful model streaming sessions for workloads that send incremental
+  input while retaining model-owned state between chunks.
+- Requests that cannot fit the configured KV cache now fail individually
+  instead of stopping the scheduler and disrupting unrelated work.
+- Startup failures are surfaced cleanly, decode cohorts have more predictable
+  inter-token latency, and generated-decode initialization falls back safely
+  when a compatible bundled kernel is unavailable.
+
 ## 0.4.2 — 2026-06-06
 
 Local inference is now free and no longer needs an API key. This release also
