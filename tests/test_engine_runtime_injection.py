@@ -72,6 +72,26 @@ def test_engine_registers_injected_runtime_under_config_model_id() -> None:
     assert engine.runtime is runtime
 
 
+def test_create_owns_one_initialization_task(monkeypatch) -> None:
+    runtime = FakeRuntime(model_name="injected", device="cpu")
+    initialization_count = 0
+
+    async def initialize(engine: InferenceEngine) -> None:
+        nonlocal initialization_count
+        initialization_count += 1
+        await engine._ensure_started()
+        engine._initialized = True
+        engine._init_task = None
+
+    monkeypatch.setattr(InferenceEngine, "_initialize", initialize)
+
+    async def run() -> None:
+        await InferenceEngine.create(_cpu_cfg(), runtime=runtime)
+
+    asyncio.run(run())
+    assert initialization_count == 1
+
+
 def test_engine_cohosted_runtime_reuses_injected_runtime_pool() -> None:
     """An injected default runtime supplies the shared KV pool for later builds."""
 
