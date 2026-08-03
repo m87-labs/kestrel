@@ -1,6 +1,6 @@
 [project]
 name = "kestrel"
-version = "0.4.2"
+version = "0.5.0"
 description = "A fast, efficient inference engine for vision-language models"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
