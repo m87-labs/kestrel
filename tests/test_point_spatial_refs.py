@@ -14,6 +14,7 @@ from kestrel.models.moondream.skills import (
 )
 from kestrel.skills import QuerySkill
 from kestrel.models.moondream.skills.point import PointRequest
+from kestrel.models.moondream.skills.segment import SegmentRequest
 from kestrel.skills.query import QueryRequest
 
 
@@ -166,3 +167,28 @@ def test_engine_segment_requires_image_before_spatial_ref_validation() -> None:
     refs = np.array([[0.2, 0.3]], dtype=np.float32)
     with pytest.raises(ValueError, match="image must be provided for segmentation"):
         asyncio.run(engine.segment(None, "person", spatial_refs=refs))
+
+
+def test_engine_segment_propagates_streaming_to_skill_and_submitter() -> None:
+    engine = object.__new__(InferenceEngine)
+    engine._skills_override = _ALL_SKILLS()
+    captured: dict[str, object] = {}
+
+    async def fake_submit_streaming(
+        request_context: object, **kwargs: object
+    ) -> SimpleNamespace:
+        captured["request_context"] = request_context
+        captured["kwargs"] = kwargs
+        return SimpleNamespace()
+
+    engine.submit_streaming = fake_submit_streaming  # type: ignore[method-assign]
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    asyncio.run(engine.segment(image, "person", stream=True))
+
+    request = captured["request_context"]
+    assert isinstance(request, SegmentRequest)
+    assert request.stream is True
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["skill"] == "segment"
