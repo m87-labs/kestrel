@@ -314,7 +314,7 @@ class InferenceEngine:
             models=models,
             adapter_provider_uses_api_key=adapter_provider_uses_api_key,
         )
-        await engine._initialize()
+        await engine._ensure_started()
         return engine
 
     async def _initialize(self) -> None:
