@@ -246,18 +246,41 @@ class GeneratedDecode:
             assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
+            select_compatible_program,
         )
 
-        self._programs = {program.capacity: program for program in programs}
+        available_programs = tuple(programs)
+        if not available_programs:
+            raise ValueError("generated decode needs at least one program")
+        self._select_program = select_compatible_program
+        selected_identities = set()
+        for batch_size in range(1, int(runtime.max_batch_size) + 1):
+            selected = self._select_program(
+                available_programs, {"active_batch": batch_size})
+            if selected is not None:
+                selected_identities.add(selected.identity)
+        self._programs = tuple(
+            program for program in available_programs
+            if program.identity in selected_identities
+        )
+        if not self._programs:
+            raise ValueError("generated decode has no selectable batch artifact")
         self._spec = spec
-        contracts = {repr(program.descriptor["weights"]) for program in programs}
+        contracts = {
+            repr(program.descriptor["weights"]) for program in self._programs
+        }
         if len(contracts) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on weight storage")
-        self.state_requirements_by_capacity = {
-            program.capacity: _state_requirements(program.descriptor)
-            for program in programs
-        }
+        self.state_requirements_by_capacity = {}
+        for program in self._programs:
+            requirements = _state_requirements(program.descriptor)
+            existing = self.state_requirements_by_capacity.setdefault(
+                program.capacity, requirements)
+            if existing != requirements:
+                raise RuntimeError(
+                    f"generated {spec.label} capacity-{program.capacity} "
+                    "artifacts disagree on carried state")
         state_sets = {
             tuple(item.buffer for item in requirements)
             for requirements in self.state_requirements_by_capacity.values()
@@ -275,7 +298,7 @@ class GeneratedDecode:
         with torch.cuda.stream(runtime.compute_stream):
             self.weight_storage = materialize_weights(
                 spec.weight_root,
-                programs[0].descriptor,
+                self._programs[0].descriptor,
                 layer_prefix=spec.weight_layer_prefix,
             )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
@@ -285,7 +308,8 @@ class GeneratedDecode:
         self._slots = {}
         plans = {}
         for slot in runtime.decode_slots:
-            for capacity, program in self._programs.items():
+            for program in self._programs:
+                capacity = program.capacity
                 requirements = self.state_requirements_by_capacity[capacity]
                 capacity_inputs = (
                     dict(spec.capacity_inputs(capacity, requirements))
@@ -303,7 +327,8 @@ class GeneratedDecode:
                     preparations=spec.preparations,
                 )
                 plans.setdefault(tuple(step.name for step in plan), plan)
-                construction_batch = min(capacity, int(runtime.max_batch_size))
+                construction_batch = program.static_extent_bindings.get(
+                    "active_batch", min(capacity, int(runtime.max_batch_size)))
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch)
                 launch_extents = dict(
@@ -323,12 +348,26 @@ class GeneratedDecode:
                     ["argument_plan"]["arguments"]
                     if item["transport"] == "scalar"
                 )
-                unknown = launch_extents.keys() - scalar_names
+                static_extents = program.static_extent_bindings
+                mismatched = {
+                    name: (static_extents[name], launch_extents[name])
+                    for name in static_extents.keys() & launch_extents.keys()
+                    if int(static_extents[name]) != int(launch_extents[name])
+                }
+                if mismatched:
+                    raise RuntimeError(
+                        f"generated {spec.label} construction extents disagree "
+                        f"with static artifact bindings {mismatched}")
+                unknown = (
+                    launch_extents.keys() - scalar_names - static_extents.keys()
+                )
                 if unknown:
                     raise RuntimeError(
                         f"generated {spec.label} has unknown launch extents "
                         f"{sorted(unknown)}")
-                self._slots[(int(slot.slot_id), capacity)] = _BoundInvocation(
+                self._slots[
+                    (int(slot.slot_id), program.identity)
+                ] = _BoundInvocation(
                     program.bind(bindings), scalar_names,
                     frozenset(launch_extents),
                 )
@@ -344,32 +383,29 @@ class GeneratedDecode:
                 f"generated {spec.label} has no preparation callbacks for "
                 f"{sorted(missing)}")
 
-    def _capacity_for(self, batch_size: int) -> int | None:
-        return next(
-            (capacity for capacity in sorted(self._programs)
-             if capacity >= int(batch_size)),
-            None,
-        )
+    def _program_for(self, batch_size: int):
+        return self._select_program(
+            self._programs, {"active_batch": int(batch_size)})
 
     def supports(self, batch_size: int) -> bool:
-        return self._capacity_for(batch_size) is not None
+        return self._program_for(batch_size) is not None
 
     def state_requirements_for(
         self, batch_size: int,
     ) -> tuple[StateRepresentationRequirement, ...]:
-        capacity = self._capacity_for(batch_size)
-        if capacity is None:
+        program = self._program_for(batch_size)
+        if program is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
-        return self.state_requirements_by_capacity[capacity]
+        return self.state_requirements_by_capacity[program.capacity]
 
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
-        capacity = self._capacity_for(batch_size)
-        if capacity is None:
+        program = self._program_for(batch_size)
+        if program is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
         for step in self._input_preparation_plan:
             self._spec.preparation_callbacks[step.name](slot, int(batch_size))
-        bound = self._slots[(int(slot.slot_id), capacity)]
+        bound = self._slots[(int(slot.slot_id), program.identity)]
         extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         missing = bound.required_launch_extents - extents.keys()
         if missing:
