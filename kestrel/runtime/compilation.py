@@ -14,21 +14,27 @@ def materialize_dynamic_batch_domain(
     inputs_for_batch: Callable[[int], tuple[Any, ...]],
     synchronize: Callable[[], None] | None = None,
 ) -> None:
-    """Materialize the scalar-one and symbolic-positive batch regimes.
+    """Materialize every admitted batch before accepting serving work.
 
     ``torch.compile(dynamic=True)`` still specializes dimensions whose first
-    observed value is zero or one. A runtime that only initializes at batch one
-    can therefore compile the first grouped request in the serving path. Run
-    batch one and the largest admitted batch up front so both compiler regimes
-    are ready before public work is accepted.
+    observed value is zero or one. A symbolic graph can also retain
+    shape-specific first-execution work below the graph/compiler-cache layer.
+    The admitted batch domain is finite and small, so exercise it completely
+    before public work is accepted instead of relying on compiler internals to
+    make intermediate extents serving-ready. Keep capacity as the first
+    positive extent so it remains the representative symbolic compile input.
     """
 
     max_batch_size = int(max_batch_size)
     if max_batch_size < 1:
         raise ValueError("max_batch_size must be positive")
-    batches = (1,) if max_batch_size == 1 else (1, max_batch_size)
+    batch_sizes = (
+        (1,)
+        if max_batch_size == 1
+        else (1, max_batch_size, *range(2, max_batch_size))
+    )
     with torch.inference_mode():
-        for batch_size in batches:
+        for batch_size in batch_sizes:
             output = compiled(*inputs_for_batch(batch_size))
             del output
     if synchronize is not None:
