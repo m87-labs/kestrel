@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
 
 from kestrel.runtime import SequenceState, TextToken, Token
+from kestrel.scheduler.pipeline import (
+    LaunchHandle,
+    PendingCommit,
+    PrefillLaunch,
+    PrefillPendingCommit,
+)
+from kestrel.scheduler.queues import RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
 
@@ -118,3 +126,140 @@ def test_release_sequence_releases_and_propagates_when_retention_fails() -> None
 
     assert runtime.released_sequences == [lifecycle.state]
     assert lifecycle.state.batch_idx not in runtime.active_sequences
+
+
+def test_failed_prepared_cleanup_releases_installed_and_aborts_uninstalled() -> None:
+    runtime = FakeRuntime()
+    installed = SequenceState(batch_idx=0, length=1, max_length=2)
+    uninstalled = SequenceState(batch_idx=1, length=1, max_length=2)
+    runtime.active_sequences[installed.batch_idx] = installed
+    installed_prepared = SimpleNamespace(state=installed)
+    uninstalled_prepared = SimpleNamespace(state=uninstalled)
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    scheduler._retire_failed_prepared_sequences(
+        [installed_prepared, uninstalled_prepared]
+    )
+
+    assert runtime.released_sequences == [installed]
+    assert runtime.aborted_prepared == [uninstalled_prepared]
+    assert runtime.active_sequences == {}
+
+
+def test_failed_prepared_cleanup_returns_adapter_owned_before_install() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    runtime.active_sequences.clear()
+    lifecycle.request.lora_slot = 7
+    lifecycle.lora_slot_ready = True
+    prepared = SimpleNamespace(state=lifecycle.state)
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler.running = RunningQueue()
+    scheduler.running.push(lifecycle)
+
+    scheduler._retire_failed_prepared_sequences(
+        [prepared],
+        sequences=[lifecycle],
+        abort_adapter_slots=[7],
+    )
+
+    assert runtime.aborted_prepared == [prepared]
+    assert runtime.released_adapter_slots == [7]
+    assert len(scheduler.running) == 0
+    assert lifecycle.request.lora_slot == 0
+    assert lifecycle.lora_slot_ready is False
+
+
+def test_prefill_finalize_failure_retires_adapter_and_slot() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    runtime.active_sequences.clear()
+    lifecycle.request.lora_slot = 9
+    lifecycle.lora_slot_ready = True
+    prepared = SimpleNamespace(state=lifecycle.state)
+    staging = object()
+    released_staging: list[object] = []
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler._compute_stream = None
+    scheduler.running = RunningQueue()
+    scheduler._release_prefill_staging = released_staging.append
+    scheduler._finalize_prefill = lambda _handle: (_ for _ in ()).throw(
+        RuntimeError("sampling failed")
+    )
+    slot = runtime.prefill_slots[0]
+    handle = LaunchHandle(
+        kind="prefill",
+        sequences=[lifecycle],
+        payload=PrefillLaunch(
+            staging=staging,
+            slot_id=0,
+            logits=object(),
+            prepared_sequences=[prepared],
+            prefill_slot=slot,
+            abort_adapter_slots=(9,),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sampling failed"):
+        scheduler.finalize_sampling(handle)
+
+    assert runtime.aborted_prepared == [prepared]
+    assert runtime.released_adapter_slots == [9]
+    assert released_staging == [staging]
+    assert runtime.released_prefill_slots == [slot]
+    assert lifecycle.request.lora_slot == 0
+    assert lifecycle.lora_slot_ready is False
+
+
+def test_prefill_commit_failure_fences_before_returning_adapter() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    runtime.active_sequences.clear()
+    lifecycle.request.lora_slot = 12
+    lifecycle.lora_slot_ready = True
+    prepared = SimpleNamespace(state=lifecycle.state)
+    staging = object()
+    cleanup_order: list[str] = []
+
+    class _ComputeStream:
+        def synchronize(self) -> None:
+            cleanup_order.append("fence")
+
+    def abort_prepared(value: object) -> None:
+        cleanup_order.append("abort")
+        runtime.aborted_prepared.append(value)
+
+    runtime.abort_prepared_sequence = abort_prepared  # type: ignore[method-assign]
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler._compute_stream = _ComputeStream()
+    scheduler.running = RunningQueue()
+    scheduler.running.push(lifecycle)
+    scheduler._release_prefill_staging = lambda _staging: None
+    slot = runtime.prefill_slots[0]
+    transfer = SimpleNamespace(
+        wait=lambda: (_ for _ in ()).throw(RuntimeError("transfer failed"))
+    )
+    step = PendingCommit(
+        kind="prefill",
+        sequences=[lifecycle],
+        transfer=transfer,
+        payload=PrefillPendingCommit(
+            staging=staging,
+            slot_id=0,
+            prepared_sequences=[prepared],
+            prefill_slot=slot,
+            abort_adapter_slots=(12,),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        scheduler._commit_prefill(step)
+
+    assert cleanup_order == ["fence", "abort"]
+    assert runtime.released_adapter_slots == [12]
+    assert len(scheduler.running) == 0
+    assert runtime.released_prefill_slots == [slot]

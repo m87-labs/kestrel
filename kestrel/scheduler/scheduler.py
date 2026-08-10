@@ -12,7 +12,7 @@ import logging
 import torch
 from torch import Tensor
 
-from kestrel.device import NoopEvent, stream_context
+from kestrel.device import NoopEvent, stream_context, synchronize
 from kestrel.utils import CpuGpuBuffer
 from kestrel.runtime import (
     PrefillClassification,
@@ -163,7 +163,10 @@ class _BoundPrefill:
 
     candidate: _PrefillCandidate
     prepared: PreparedSequence
-    acquired_lora: bool
+    # If this row fails before runtime installation, the scheduler still owns
+    # this adapter reference. It may have been acquired in this bind or carried
+    # from an earlier deferred bind attempt.
+    abort_adapter_slot: int | None
 
 
 def _plan_prefill_launch_batch(
@@ -1525,7 +1528,7 @@ class GenerationScheduler:
         return self.runtime.acquire_adapter_slot(adapter_id, adapter)
 
     def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
-        """Fail a request that couldn't be admitted (e.g., adapter load failure)."""
+        """Fail an uninstalled request and release scheduler-owned resources."""
         _LOGGER.error(
             "Failed to admit request %s: %s",
             request.request_id,
@@ -1533,6 +1536,18 @@ class GenerationScheduler:
             exc_info=exc,
         )
         lifecycle = request.lifecycle
+        if lifecycle.lora_slot_ready and request.lora_slot:
+            # A request can carry a scheduler-owned adapter reference from an
+            # earlier bind that deferred on KV/prefix state. Terminal failures
+            # before installation have no runtime row whose release path could
+            # return it, so this helper is the final ownership backstop. Paths
+            # that already retired a prepared/installed row reset these fields
+            # first and are therefore no-ops here.
+            try:
+                self.runtime.release_adapter_slot(request.lora_slot)
+            finally:
+                request.lora_slot = 0
+                lifecycle.lora_slot_ready = False
         lifecycle.finish_reason = "error"
         lifecycle.error = exc
         lifecycle.finished = True
@@ -1618,6 +1633,75 @@ class GenerationScheduler:
     def _release_prefill_staging(self, staging: PrefillStaging) -> None:
         """Return a prefill staging bundle to the pool."""
         self._prefill_staging_pool.append(staging)
+
+    def _retire_failed_prepared_sequences(
+        self,
+        prepared_sequences: Sequence[PreparedSequence],
+        *,
+        sequences: Sequence[RequestLifecycle] = (),
+        abort_adapter_slots: Sequence[int | None] = (),
+        fence_compute_stream: bool = False,
+    ) -> None:
+        """Best-effort cleanup for rows that never reached a valid commit.
+
+        Runtime finalization may install rows one at a time. If a later row or
+        token materialization fails, release installed rows and abort the rest
+        so fatal cleanup never depends on ``active_sequences`` containing every
+        prepared row. Adapter slots remain scheduler-owned until installation;
+        aborting an uninstalled row therefore returns its parallel slot
+        explicitly, while ``release_sequence`` owns cleanup for an installed
+        row.
+
+        A prefill token makes its row runnable before the CPU commits it, so a
+        decode forward may already be queued when commit fails. Fence the
+        shared compute stream before reclaiming row resources on that path,
+        then remove the failed lifecycles from the running queue.
+        """
+
+        if fence_compute_stream:
+            try:
+                compute_stream = self._compute_stream
+                if compute_stream is None:
+                    synchronize(self.runtime.device)
+                else:
+                    compute_stream.synchronize()
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to fence compute stream before prepared-row cleanup"
+                )
+
+        for index, prepared in enumerate(prepared_sequences):
+            sequence = sequences[index] if index < len(sequences) else None
+            adapter_slot = (
+                abort_adapter_slots[index]
+                if index < len(abort_adapter_slots)
+                else None
+            )
+            installed = prepared.state.batch_idx in self.runtime.active_sequences
+            retired = False
+            try:
+                if installed:
+                    self.runtime.release_sequence(prepared.state)
+                    retired = True
+                else:
+                    try:
+                        self.runtime.abort_prepared_sequence(prepared)
+                    finally:
+                        if adapter_slot is not None:
+                            self.runtime.release_adapter_slot(adapter_slot)
+                    retired = True
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to retire prepared sequence row %s",
+                    prepared.state.batch_idx,
+                )
+            finally:
+                if sequence is not None:
+                    if sequence in self.running:
+                        self.running.remove(sequence)
+                    if adapter_slot is not None and retired:
+                        sequence.request.lora_slot = 0
+                        sequence.lora_slot_ready = False
 
     def _stage_prefill_sampling_params(
         self,
@@ -1706,6 +1790,7 @@ class GenerationScheduler:
                 slot_id=prefill_payload.slot_id,
                 prepared_sequences=prepared_sequences,
                 prefill_slot=prefill_slot,
+                abort_adapter_slots=prefill_payload.abort_adapter_slots,
                 runtime_step=runtime_step,
             ),
         )
@@ -1722,6 +1807,7 @@ class GenerationScheduler:
         staging = payload.staging
         prepared_sequences = payload.prepared_sequences
         prefill_slot = payload.prefill_slot
+        committed = False
         try:
             token_ids_cpu, logprobs_cpu = step.transfer.wait()
             prefill_slot.commit_done_event.synchronize()
@@ -1733,7 +1819,15 @@ class GenerationScheduler:
                 payload.prefill_slot.batch_idx[: len(step.sequences)].view(-1),
                 payload.runtime_step,
             )
+            committed = True
         finally:
+            if not committed:
+                self._retire_failed_prepared_sequences(
+                    prepared_sequences,
+                    sequences=step.sequences,
+                    abort_adapter_slots=payload.abort_adapter_slots,
+                    fence_compute_stream=True,
+                )
             self._release_prefill_staging(staging)
             self.runtime.release_prefill_slot(prefill_slot)
         return tokens, logprobs_cpu
@@ -1860,7 +1954,11 @@ class GenerationScheduler:
                 _BoundPrefill(
                     candidate=candidate,
                     prepared=prepared,
-                    acquired_lora=acquired_lora,
+                    abort_adapter_slot=(
+                        request.lora_slot
+                        if lifecycle.lora_slot_ready and request.lora_slot
+                        else None
+                    ),
                 )
             )
 
@@ -1872,18 +1970,24 @@ class GenerationScheduler:
         lifecycles = [request.lifecycle for request in requests]
         sequences = lifecycles
         prepared_sequences = [item.prepared for item in bound_batch]
+        abort_adapter_slots = tuple(item.abort_adapter_slot for item in bound_batch)
 
         def fail_bound_batch(
             exc: Exception,
             *,
             staging: PrefillStaging | None = None,
+            fence_compute_stream: bool = False,
         ) -> bool:
-            if staging is not None:
-                self._release_prefill_staging(staging)
             try:
-                for item in bound_batch:
-                    self.runtime.abort_prepared_sequence(item.prepared)
+                self._retire_failed_prepared_sequences(
+                    prepared_sequences,
+                    sequences=sequences,
+                    abort_adapter_slots=abort_adapter_slots,
+                    fence_compute_stream=fence_compute_stream,
+                )
             finally:
+                if staging is not None:
+                    self._release_prefill_staging(staging)
                 try:
                     self.runtime.release_prefill_slot(prefill_slot)
                 except Exception:
@@ -1893,13 +1997,6 @@ class GenerationScheduler:
                     lifecycle = request.lifecycle
                     lifecycle.prefill_started_at = None
                     lifecycle.prefill_completed_at = None
-                    if item.acquired_lora:
-                        try:
-                            self.runtime.release_adapter_slot(request.lora_slot)
-                        except Exception:
-                            pass
-                        request.lora_slot = 0
-                        lifecycle.lora_slot_ready = False
             for request in requests:
                 self._fail_request_early(request, exc)
             return True
@@ -1926,7 +2023,7 @@ class GenerationScheduler:
                 prefill_slot.commit_done_event.synchronize()
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
             except Exception as exc:
-                return fail_bound_batch(exc)
+                return fail_bound_batch(exc, fence_compute_stream=True)
 
             seq.first_token_time = lifecycle.prefill_started_at or time.perf_counter()
             self._finalize_sequence(seq, "length")
@@ -1936,13 +2033,11 @@ class GenerationScheduler:
         try:
             staging = self._acquire_prefill_staging()
         except Exception:
-            for item in bound_batch:
-                self.runtime.abort_prepared_sequence(item.prepared)
-                if item.acquired_lora:
-                    request = item.candidate.request
-                    self.runtime.release_adapter_slot(request.lora_slot)
-                    request.lora_slot = 0
-                    request.lifecycle.lora_slot_ready = False
+            self._retire_failed_prepared_sequences(
+                prepared_sequences,
+                sequences=sequences,
+                abort_adapter_slots=abort_adapter_slots,
+            )
             self.runtime.release_prefill_slot(prefill_slot)
             raise
 
@@ -1964,24 +2059,36 @@ class GenerationScheduler:
             for lifecycle in lifecycles:
                 lifecycle.prefill_completed_at = prefill_completed
         except Exception as exc:
-            return fail_bound_batch(exc, staging=staging)
+            return fail_bound_batch(
+                exc,
+                staging=staging,
+                fence_compute_stream=True,
+            )
 
         # Prefill has completed (KV/logits enqueued); notify skill.
-        for seq in sequences:
-            seq.skill_state.on_prefill(self.runtime)
+        try:
+            for seq in sequences:
+                seq.skill_state.on_prefill(self.runtime)
 
-        handle = LaunchHandle(
-            kind="prefill",
-            sequences=sequences,
-            payload=PrefillLaunch(
+            handle = LaunchHandle(
+                kind="prefill",
+                sequences=sequences,
+                payload=PrefillLaunch(
+                    staging=staging,
+                    slot_id=slot_id,
+                    logits=logits,
+                    prepared_sequences=prepared_sequences,
+                    prefill_slot=prefill_slot,
+                    abort_adapter_slots=abort_adapter_slots,
+                ),
+            )
+            pipeline.on_launch(handle)
+        except Exception as exc:
+            return fail_bound_batch(
+                exc,
                 staging=staging,
-                slot_id=slot_id,
-                logits=logits,
-                prepared_sequences=prepared_sequences,
-                prefill_slot=prefill_slot,
-            ),
-        )
-        pipeline.on_launch(handle)
+                fence_compute_stream=True,
+            )
         return True
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -2157,7 +2264,25 @@ class GenerationScheduler:
             if plan is not None:
                 raise AssertionError("Prefill finalize does not support masks")
             with stream_context(self._compute_stream):
-                return self._finalize_prefill(handle)
+                try:
+                    return self._finalize_prefill(handle)
+                except BaseException:
+                    payload = handle.payload
+                    if isinstance(payload, PrefillLaunch):
+                        self._retire_failed_prepared_sequences(
+                            payload.prepared_sequences,
+                            sequences=handle.sequences,
+                            abort_adapter_slots=payload.abort_adapter_slots,
+                            fence_compute_stream=True,
+                        )
+                        self._release_prefill_staging(payload.staging)
+                        try:
+                            self.runtime.release_prefill_slot(payload.prefill_slot)
+                        except Exception:
+                            _LOGGER.exception(
+                                "Failed to release prefill slot after finalize failure"
+                            )
+                    raise
         raise AssertionError(f"Unsupported handle kind {handle.kind!r}")
 
     def _finalize_sampling_on_stream(

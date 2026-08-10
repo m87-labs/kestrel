@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from kestrel.models.moondream.runtime import PrefillClassification, TextToken
+from kestrel.runtime import SequenceState
 from kestrel.scheduler.pipeline import PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
@@ -148,6 +150,81 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
     assert scheduler._completed[0].request_id == request.request_id
     assert request.lifecycle.phase == RequestPhase.COMPLETED
     assert len(runtime.released_prefill_slots) == 1
+
+
+def test_terminal_bound_failure_releases_adapter_from_deferred_bind() -> None:
+    request = _make_request()
+    # A previous attempt acquired the adapter, then deferred before launch.
+    # This attempt inherits the scheduler-owned reference without acquiring it.
+    request.adapter = "ft-1"
+    request.lora_slot = 7
+    request.lifecycle.lora_slot_ready = True
+    request.lifecycle.skill_state.on_prefill = lambda _runtime: (
+        (_ for _ in ()).throw(RuntimeError("on_prefill failed"))
+    )
+    prepared = SimpleNamespace(
+        state=SequenceState(batch_idx=1, length=1, max_length=9, lora_slot=7),
+        use_prefix_attn=False,
+    )
+    runtime = FakeRuntime(prepare_result=prepared)
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._compute_stream = None
+    staging = object()
+    scheduler._acquire_prefill_staging = lambda: staging
+    scheduler._release_prefill_staging = lambda _staging: None
+    scheduler._stage_prefill_sampling_params = lambda *_args: None
+
+    progressed = GenerationScheduler._launch_prefill_step(
+        scheduler,
+        PipelineState(),
+    )
+
+    assert progressed is True
+    assert runtime.aborted_prepared == [prepared]
+    assert runtime.released_adapter_slots == [7]
+    assert request.lora_slot == 0
+    assert request.lifecycle.lora_slot_ready is False
+    assert request.lifecycle.phase == RequestPhase.COMPLETED
+
+
+def test_terminal_prepare_failure_releases_adapter_from_deferred_bind() -> None:
+    request = _make_request()
+    request.adapter = "ft-1"
+    request.lora_slot = 11
+    request.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(prepare_exc=ValueError("invalid checkpoint state"))
+    scheduler = _make_scheduler(request, runtime)
+
+    progressed = GenerationScheduler._launch_prefill_step(
+        scheduler,
+        PipelineState(),
+    )
+
+    assert progressed is True
+    assert runtime.released_adapter_slots == [11]
+    assert request.lora_slot == 0
+    assert request.lifecycle.lora_slot_ready is False
+    assert request.lifecycle.phase == RequestPhase.COMPLETED
+
+
+def test_retryable_prepare_failure_preserves_deferred_adapter() -> None:
+    request = _make_request()
+    request.adapter = "ft-1"
+    request.lora_slot = 13
+    request.lifecycle.lora_slot_ready = True
+    runtime = FakeRuntime(prepare_exc=RuntimeError("Cannot reserve requested pages"))
+    scheduler = _make_scheduler(request, runtime)
+
+    progressed = GenerationScheduler._launch_prefill_step(
+        scheduler,
+        PipelineState(),
+    )
+
+    assert progressed is False
+    assert runtime.released_adapter_slots == []
+    assert request.lora_slot == 13
+    assert request.lifecycle.lora_slot_ready is True
+    assert list(scheduler.waiting) == [request]
 
 
 def test_advance_rejects_only_request_that_cannot_fit_kv_cache() -> None:
