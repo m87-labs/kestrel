@@ -523,7 +523,7 @@ class InferenceEngine:
         # image inside chat messages); prefer it over the top-level argument.
         effective_image = built.image if built.image is not None else image
         submit_fn = self.submit_streaming if stream else self.submit
-        return await submit_fn(
+        submission = submit_fn(
             built.request_context,
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
@@ -535,6 +535,10 @@ class InferenceEngine:
             _suppress_next_token_ids=suppress_next_token_ids,
             skill=skill_name,
         )
+        # The submission coroutine owns the built request now. Release the
+        # request-building frame's duplicate references before awaiting it.
+        del built, prompt, settings, image, effective_image
+        return await submission
 
     async def submit(
         self,
@@ -571,6 +575,10 @@ class InferenceEngine:
             stream_queue=None,
             skill=skill,
         )
+        # Ingress owns the request payload; the remainder of this frame only
+        # needs the result future, which may stay pending for a full decode.
+        del request_context, image
+        del generated_prefix, suppress_next_token_ids
         return await future
 
     @overload
@@ -845,6 +853,7 @@ class InferenceEngine:
         self._scheduler_event.set()
         if self._scheduler_error is not None:
             self._fail_all_pending(self._scheduler_failed_error())
+        del inputs, req
         return await future
 
     async def stream(
