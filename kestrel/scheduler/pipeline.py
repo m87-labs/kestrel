@@ -149,6 +149,10 @@ class PrefillLaunch:
     logits: object
     prepared_sequences: object
     prefill_slot: object
+    # Adapter slots acquired while binding each prepared row. The runtime takes
+    # ownership only after that row is installed; an abort must return the
+    # parallel slot explicitly.
+    abort_adapter_slots: object = ()
 
 
 @dataclass(slots=True)
@@ -170,6 +174,8 @@ class PrefillPendingCommit:
     slot_id: int
     prepared_sequences: object
     prefill_slot: object
+    # See ``PrefillLaunch.abort_adapter_slots``.
+    abort_adapter_slots: object = ()
     # See ``DecodePendingCommit.runtime_step``.
     runtime_step: object = None
 
