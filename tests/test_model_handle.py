@@ -9,10 +9,13 @@ that contract with stub runtimes — no GPU.
 from __future__ import annotations
 
 import asyncio
+import gc
 import queue
 from types import SimpleNamespace
 from typing import Any
+import weakref
 
+import numpy as np
 import pytest
 
 from kestrel.engine import InferenceEngine, ModelHandle
@@ -174,6 +177,38 @@ def test_text_only_query_through_handle() -> None:
     assert out == "RESULT"
     assert captured["image"] is None
     assert captured["prompt"] == {"question": "just text?"}
+
+
+def test_query_releases_image_from_result_await_frames() -> None:
+    async def run() -> None:
+        eng = _engine()
+        submitted = asyncio.Event()
+        result_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        image_id = id(image)
+        image_ref = weakref.ref(image)
+
+        async def submit_request(**kwargs: Any):
+            assert id(kwargs["image"]) == image_id
+            assert id(kwargs["request_context"].image) == image_id
+            submitted.set()
+            return result_future, 1
+
+        eng._submit_request = submit_request  # type: ignore[method-assign]
+        task = asyncio.create_task(
+            eng.model("ar-model").query(image=image, question="what is this?")
+        )
+        await submitted.wait()
+        await asyncio.sleep(0)
+
+        del image
+        gc.collect()
+        assert image_ref() is None
+
+        result_future.set_result("RESULT")
+        assert await task == "RESULT"
+
+    asyncio.run(run())
 
 
 def test_capability_lifts_settings_and_mirrors_stream() -> None:

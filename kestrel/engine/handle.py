@@ -100,7 +100,9 @@ class ModelHandle:
                 f"run() is for single-pass models; {self._model!r} is "
                 f"{runtime.execution_shape.value} — use its typed verbs."
             )
-        return await self._engine.run(self._model, task, inputs)
+        submission = self._engine.run(self._model, task, inputs)
+        del inputs
+        return await submission
 
     async def stream(self, task: str, /, **initial_prompt: Any) -> "ModelStream":
         """Start a stateful streaming session on this model.
@@ -155,20 +157,34 @@ class ModelHandle:
         without it this would misroute to the autoregressive path.
         """
         await self._engine._ensure_started()
+        # Move the public verb's kwargs into this routing frame, then empty the
+        # original dict so its suspended coroutine does not pin media payloads.
+        owned_prompt = dict(prompt)
+        prompt.clear()
         runtime = self._engine._runtimes.get(self._model)
         if runtime is not None and (
             runtime.execution_shape is ExecutionShape.SINGLE_PASS
         ):
-            return await self.run(task, prompt)
+            submission = self.run(task, owned_prompt)
+            del owned_prompt
+            return await submission
         if runtime is not None and runtime.execution_shape is ExecutionShape.STREAMING:
-            return await self.stream(task, **prompt)
+            submission = self.stream(task, **owned_prompt)
+            del owned_prompt
+            return await submission
         self._require_default_ar(task)
-        settings = prompt.pop("settings", None)
-        stream = bool(prompt.get("stream", False))
-        image = prompt.pop("image", None)
-        return await self._engine._run_skill(
-            task, image=image, prompt=prompt, settings=settings, stream=stream
+        settings = owned_prompt.pop("settings", None)
+        stream = bool(owned_prompt.get("stream", False))
+        image = owned_prompt.pop("image", None)
+        submission = self._engine._run_skill(
+            task,
+            image=image,
+            prompt=owned_prompt,
+            settings=settings,
+            stream=stream,
         )
+        del owned_prompt, settings, image
+        return await submission
 
     async def chat(
         self, **prompt: Any
