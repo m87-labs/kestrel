@@ -88,9 +88,15 @@ class PreparedSequence:
 
     Lifecycle:
     - created by the runtime's ``prepare_sequence(...)``
-    - consumed by the runtime's ``launch_prepared_batch(...)`` (GPU enqueue)
-    - finalized by the runtime's ``finalize_prepared_sequence_after_prefill(...)``
-    - aborted by the runtime's ``abort_prepared_sequence(...)`` on error/pause
+    - consumed by the runtime's ``launch_prepared_batch(...)`` (GPU enqueue),
+      which must enqueue all state visible to the first optimistic decode
+      before returning
+    - finalized after GPU completion by
+      ``finalize_prepared_sequence_after_prefill(...)``, which publishes only
+      host ownership/cache metadata because decode may already be in flight
+    - aborted by the runtime's ``abort_prepared_sequence(...)`` if launch or
+      commit fails before installation; pausing an installed sequence retains
+      its state for exact resume
 
     Note: PreparedSequence is decoupled from the prefill slot. The slot is
     acquired at launch time, allowing preparation to proceed even when all

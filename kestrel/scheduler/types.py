@@ -192,6 +192,13 @@ class GenerationRequest:
     image_hash: Optional[bytes] = None  # SHA256 hash for prefix caching
     image_crops: object | None = None
     image_length: int = 0
+    # Model-owned encoder-side conditioning prepared asynchronously at
+    # admission. It is separate from decoder positions and never contributes
+    # to decoder KV length.
+    encoder_input: object | None = None
+    # Stable semantic marker retained after the prepared host payload is
+    # dropped at the prefill completion boundary.
+    has_encoder_input: bool = field(init=False)
     submitted_at: float = 0.0
     skill_state: Optional[SkillState] = field(default=None, repr=False)
     lifecycle: RequestLifecycle = field(init=False, repr=False)
@@ -204,6 +211,7 @@ class GenerationRequest:
     prompt_length: int = field(init=False)
 
     def __post_init__(self) -> None:
+        self.has_encoder_input = self.encoder_input is not None
         tokens = list(self.prompt_tokens)
         self.prompt_tokens = tokens
         prefix_tokens = self.generated_prefix.tokens

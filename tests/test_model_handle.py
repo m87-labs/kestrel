@@ -20,7 +20,7 @@ import pytest
 
 from kestrel.engine import InferenceEngine, ModelHandle
 from kestrel.runtime import ExecutionShape
-from kestrel.skills import SkillRegistry
+from kestrel.skills import BuiltRequest, SkillRegistry, SkillSpec
 from kestrel.models.moondream.skills import CaptionSkill, SegmentSkill
 from kestrel.skills import QuerySkill
 
@@ -45,9 +45,30 @@ class _StubStreaming:
         return self._tasks
 
 
+class _TranscribeSkill(SkillSpec):
+    def __init__(self) -> None:
+        super().__init__("transcribe")
+
+    def build_request(
+        self,
+        image: Any,
+        prompt: Any,
+        settings: Any,
+    ) -> BuiltRequest:
+        return BuiltRequest(
+            request_context=SimpleNamespace(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            encoder_input=prompt["audio"],
+        )
+
+
 def _engine() -> InferenceEngine:
     """Minimal engine with an AR default + a single-pass model registered."""
-    ar_skills = SkillRegistry([QuerySkill(), CaptionSkill(), SegmentSkill()])
+    ar_skills = SkillRegistry(
+        [QuerySkill(), CaptionSkill(), SegmentSkill(), _TranscribeSkill()]
+    )
     eng = object.__new__(InferenceEngine)
     eng._default_model = "ar-model"
     eng._model_ids = ["ar-model", "sp-model"]
@@ -96,7 +117,7 @@ def test_model_rejects_unknown_id() -> None:
 def test_ar_handle_advertises_skill_vocabulary() -> None:
     eng = _engine()
     h = eng.model("ar-model")
-    assert h.tasks == ("query", "caption", "segment")
+    assert h.tasks == ("query", "caption", "segment", "transcribe")
     assert h.supports("query") is True
     assert h.supports("segment_masks") is False
 
@@ -211,6 +232,48 @@ def test_query_releases_image_from_result_await_frames() -> None:
     asyncio.run(run())
 
 
+def test_transcribe_releases_encoder_input_from_result_await_frames() -> None:
+    async def run() -> None:
+        eng = _engine()
+        submitted = asyncio.Event()
+        result_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        audio = np.zeros(16, dtype=np.float32)
+        audio_id = id(audio)
+        audio_ref = weakref.ref(audio)
+
+        async def submit_request(**kwargs: Any):
+            assert id(kwargs["encoder_input"]) == audio_id
+            submitted.set()
+            return result_future, 1
+
+        eng._submit_request = submit_request  # type: ignore[method-assign]
+        task = asyncio.create_task(eng.model("ar-model").transcribe(audio=audio))
+        await submitted.wait()
+        await asyncio.sleep(0)
+
+        del audio
+        gc.collect()
+        assert audio_ref() is None
+
+        result_future.set_result("RESULT")
+        assert await task == "RESULT"
+
+    asyncio.run(run())
+
+
+def test_transcribe_verb_routes_audio_through_model_skill() -> None:
+    eng = _engine()
+    captured: dict[str, Any] = {}
+    eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
+
+    out = asyncio.run(eng.model("ar-model").transcribe(audio=b"RIFF..."))
+
+    assert out == "RESULT"
+    assert captured["task"] == "transcribe"
+    assert captured["image"] is None
+    assert captured["prompt"] == {"audio": b"RIFF..."}
+
+
 def test_capability_lifts_settings_and_mirrors_stream() -> None:
     """settings (sampling) is lifted out of the model prompt as its own arg.
     stream is passed to the engine to select streaming delivery AND left in
@@ -262,7 +325,7 @@ def test_capability_verbs_are_uniform_kwargs() -> None:
     """
     import inspect
 
-    for verb in ("query", "caption", "detect", "point", "segment"):
+    for verb in ("query", "caption", "detect", "point", "segment", "transcribe"):
         params = list(inspect.signature(getattr(ModelHandle, verb)).parameters.values())
         assert [p.name for p in params] == ["self", "prompt"], verb
         assert params[1].kind is inspect.Parameter.VAR_KEYWORD, (

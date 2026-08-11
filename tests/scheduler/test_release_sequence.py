@@ -46,6 +46,7 @@ def _make_lifecycle(
     runtime: FakeRuntime,
     *,
     request_id: int = 7,
+    encoder_input: object | None = None,
 ) -> RequestLifecycle:
     state = SequenceState(
         batch_idx=0,
@@ -64,6 +65,7 @@ def _make_lifecycle(
         request_context=object(),
         image_hash=b"0123456789abcdef",
         adapter="adapter-a",
+        encoder_input=encoder_input,
     )
     lifecycle = RequestLifecycle(
         request=request,
@@ -111,6 +113,21 @@ def test_release_sequence_retains_only_decoded_suffix_after_generated_prefix() -
     assert len(runtime.retained_prefixes) == 1
     retain_call = runtime.retained_prefixes[0]
     assert retain_call["generated_tokens"] == [TextToken(11), TextToken(12)]
+    assert runtime.released_sequences == [lifecycle.state]
+
+
+def test_release_sequence_does_not_cache_encoder_conditioned_prompt() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime, encoder_input=object())
+    # The large prepared payload is released after prefill, while the semantic
+    # marker must continue to disable decoder-prefix retention.
+    lifecycle.request.encoder_input = None
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    GenerationScheduler._release_sequence(scheduler, lifecycle)
+
+    assert runtime.retained_prefixes == []
     assert runtime.released_sequences == [lifecycle.state]
 
 
@@ -262,4 +279,40 @@ def test_prefill_commit_failure_fences_before_returning_adapter() -> None:
     assert cleanup_order == ["fence", "abort"]
     assert runtime.released_adapter_slots == [12]
     assert len(scheduler.running) == 0
+    assert runtime.released_prefill_slots == [slot]
+
+
+def test_prefill_commit_drops_prepared_encoder_input() -> None:
+    runtime = FakeRuntime()
+    encoder_input = object()
+    lifecycle = _make_lifecycle(runtime, encoder_input=encoder_input)
+    prepared = SimpleNamespace(state=lifecycle.state)
+    staging = object()
+    released_staging: list[object] = []
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler._release_prefill_staging = released_staging.append
+    scheduler._materialize_tokens = lambda *_args, **_kwargs: [TextToken(9)]
+    slot = runtime.prefill_slots[0]
+    transfer = SimpleNamespace(wait=lambda: (object(), None))
+    step = PendingCommit(
+        kind="prefill",
+        sequences=[lifecycle],
+        transfer=transfer,
+        payload=PrefillPendingCommit(
+            staging=staging,
+            slot_id=0,
+            prepared_sequences=[prepared],
+            prefill_slot=slot,
+        ),
+    )
+
+    tokens, logprobs = scheduler._commit_prefill(step)
+
+    assert tokens == [TextToken(9)]
+    assert logprobs is None
+    assert lifecycle.request.encoder_input is None
+    assert lifecycle.request.has_encoder_input is True
+    assert runtime.finalized_prepared == [prepared]
+    assert released_staging == [staging]
     assert runtime.released_prefill_slots == [slot]

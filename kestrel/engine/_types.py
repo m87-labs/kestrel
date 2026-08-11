@@ -287,6 +287,7 @@ class _AutoregressiveRequest:
     stream_queue: Optional["_StreamQueue"]
     skill: SkillSpec
     request_context: object
+    encoder_input: object | None = None
     adapter: Optional[str] = None
     lora_slot: int = 0  # Always 0 here; scheduler assigns actual slot at admission
     return_logprobs: Optional[bool] = None
@@ -299,6 +300,7 @@ class _ReadyAdmission:
     req: _AutoregressiveRequest
     crops: Any
     prefix_cache_hit: bool
+    encoder_input: Any = None
 
 
 def _hash_image(image: "np.ndarray | bytes | Sequence[np.ndarray | bytes]") -> bytes:

@@ -1,6 +1,5 @@
 """Flexible batching scheduler for Moondream text inference."""
 
-
 from collections import Counter, deque
 from dataclasses import dataclass
 from itertools import islice
@@ -48,6 +47,7 @@ from .pipeline import (
 from kestrel_kernels.sampling import sample_step_from_logits
 from .transfer import RenderBuffer
 from kestrel.runtime.sampling import SamplingHooks
+from kestrel.runtime._compat import resolve_runtime_contract
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -186,11 +186,20 @@ def _plan_prefill_launch_batch(
     - keep all requests in a batch on the same prefill mode
     """
 
-    if not candidates or capacity_remaining <= 0 or slot_budget <= 0 or page_budget <= 0:
+    if (
+        not candidates
+        or capacity_remaining <= 0
+        or slot_budget <= 0
+        or page_budget <= 0
+    ):
         return []
 
-    non_prefix_candidates = [candidate for candidate in candidates if not candidate.use_prefix_attn]
-    prefix_candidates = [candidate for candidate in candidates if candidate.use_prefix_attn]
+    non_prefix_candidates = [
+        candidate for candidate in candidates if not candidate.use_prefix_attn
+    ]
+    prefix_candidates = [
+        candidate for candidate in candidates if candidate.use_prefix_attn
+    ]
 
     miss_cohort_sizes = Counter(
         candidate.cohort_key
@@ -209,7 +218,7 @@ def _plan_prefill_launch_batch(
                 -miss_cohort_sizes.get(candidate.cohort_key, 1),
                 candidate.request.submitted_at,
                 candidate.request.request_id,
-            )
+            ),
         )
     else:
         compatible = sorted(
@@ -281,8 +290,10 @@ class GenerationScheduler:
         # The model's skills, supplied by the engine. Required: the kernel
         # holds no model-specific default.
         self._skills = skill_registry
-        # Per-step sampling contract. Three optional hooks the runtime
+        # Per-step sampling contract. Optional hooks the runtime
         # can implement:
+        #   * sample_greedy — replace ordinary argmax for runtimes with a
+        #     batched constrained-greedy device path.
         #   * post_sample — run any model-specific GPU work alongside
         #     sampling (Moondream: coord/size decode from hidden states),
         #     return an opaque handle.
@@ -294,7 +305,11 @@ class GenerationScheduler:
         # The runtime owns all storage and D2H for its side-channel
         # values; the scheduler only manages sampled token ids +
         # logprobs.
-        self._hooks: SamplingHooks = getattr(runtime, "sampling_hooks", None) or SamplingHooks()
+        runtime_contract = resolve_runtime_contract(runtime)
+        self._hooks: SamplingHooks = runtime_contract.sampling_hooks
+        if self._hooks.sample_greedy is not None and runtime.spec is not None:
+            raise ValueError("custom greedy sampling requires non-speculative decoding")
+        self._eos_token_ids = runtime_contract.eos_token_ids
         self._pending_token_ids = torch.zeros(
             (runtime.max_batch_slots,),
             dtype=torch.long,
@@ -507,8 +522,17 @@ class GenerationScheduler:
                             progressed = True
 
         if not progressed:
-            stalled = next((request for request in self.waiting if self._is_launchable_request(request)), None)
-            if stalled is not None and not self.runtime.can_reserve(stalled.target_length):
+            stalled = next(
+                (
+                    request
+                    for request in self.waiting
+                    if self._is_launchable_request(request)
+                ),
+                None,
+            )
+            if stalled is not None and not self.runtime.can_reserve(
+                stalled.target_length
+            ):
                 error = RuntimeError(
                     "Insufficient KV cache capacity for request "
                     f"{stalled.request_id} (needs {stalled.target_length} tokens)."
@@ -876,9 +900,7 @@ class GenerationScheduler:
                 # verify exactly like the non-spec sampler's whitelist-then-blacklist
                 # -- no gating to a text-only/unconstrained fallback. ``None`` leaves
                 # the row unmasked.
-                allowed_token_ids = request.skill_state.allowed_token_ids(
-                    self.runtime
-                )
+                allowed_token_ids = request.skill_state.allowed_token_ids(self.runtime)
                 suppressed_token_ids = request.skill_state.suppressed_token_ids(
                     self.runtime
                 )
@@ -1004,9 +1026,7 @@ class GenerationScheduler:
                 # unchanged -- no 0.0 greedy-approximation placeholder. The
                 # macro-step supplies real per-token logprobs for every
                 # subsequently committed token.
-                self._spec_stage_token(
-                    lifecycle, token, logprob=staged_first_logprob
-                )
+                self._spec_stage_token(lifecycle, token, logprob=staged_first_logprob)
             except Exception as exc:
                 self._fail_admitted_spec_request(request, state, exc)
                 progressed = True
@@ -1434,10 +1454,10 @@ class GenerationScheduler:
         cursor = 0
         for run in runs:
             n = len(run)
-            grouped.append(list(flat_tokens[cursor:cursor + n]))
+            grouped.append(list(flat_tokens[cursor : cursor + n]))
             if grouped_logprobs is not None:
                 assert flat_logprobs is not None
-                grouped_logprobs.append(list(flat_logprobs[cursor:cursor + n]))
+                grouped_logprobs.append(list(flat_logprobs[cursor : cursor + n]))
             cursor += n
         return grouped, grouped_logprobs
 
@@ -1552,6 +1572,9 @@ class GenerationScheduler:
         lifecycle.error = exc
         lifecycle.finished = True
         lifecycle.finalized = True
+        # Terminal requests no longer need their prepared host-side encoder
+        # payload. ``has_encoder_input`` remains stable for semantic checks.
+        request.encoder_input = None
         lifecycle.transition(RequestPhase.COMPLETED)
         metrics = lifecycle.build_metrics(decode_tokens=0, cached_tokens=0)
         result = SchedulerResult(
@@ -1582,12 +1605,22 @@ class GenerationScheduler:
             return None
 
         lifecycle = request.lifecycle
-        classification = self.runtime.classify_prefill(
-            request.prefill_tokens,
-            has_image=lifecycle.has_image,
-            image_hash=request.image_hash,
-            adapter_id=request.adapter,
-        )
+        if request.has_encoder_input:
+            # Encoder identity is intentionally absent from the decoder prefix
+            # cache key. Never reuse prompt KV across encoder inputs.
+            classification = PrefillClassification(
+                prompt_length=len(request.prefill_tokens),
+                skip_positions=0,
+                can_reuse=False,
+                use_prefix_attn=False,
+            )
+        else:
+            classification = self.runtime.classify_prefill(
+                request.prefill_tokens,
+                has_image=lifecycle.has_image,
+                image_hash=request.image_hash,
+                adapter_id=request.adapter,
+            )
         reserve_length = max(request.target_length - classification.skip_positions, 1)
         if not self.runtime.can_reserve(reserve_length):
             return None
@@ -1743,13 +1776,6 @@ class GenerationScheduler:
             batch_idx=prefill_slot.batch_idx[:batch_size],
             logprobs_out=staging.sampled_logprobs[:batch_size],
         )
-        hidden_rows: list[Tensor] = []
-        for seq in sequences:
-            hidden_last = seq.state.last_hidden
-            if hidden_last is None:  # pragma: no cover - defensive
-                raise RuntimeError("Missing last_hidden after prefill")
-            hidden_rows.append(hidden_last)
-        hidden_last = torch.stack(hidden_rows, dim=0)
         prefill_slot.step_done_event.record()
         batch_idx = prefill_slot.batch_idx[:batch_size].view(-1)
         # Prefill's first token is text for plain query, but skills like
@@ -1757,6 +1783,13 @@ class GenerationScheduler:
         # has to run for prefill too. The runtime owns the staging.
         runtime_step = None
         if self._hooks.post_sample is not None:
+            hidden_rows: list[Tensor] = []
+            for seq in sequences:
+                hidden_last = seq.state.last_hidden
+                if hidden_last is None:  # pragma: no cover - defensive
+                    raise RuntimeError("Missing last_hidden after prefill")
+                hidden_rows.append(hidden_last)
+            hidden_last = torch.stack(hidden_rows, dim=0)
             runtime_step = self._hooks.post_sample(
                 prefill_slot,
                 sampled_ids=sampled_ids.view(-1),
@@ -1795,15 +1828,15 @@ class GenerationScheduler:
             ),
         )
 
-    def _commit_prefill(
-        self, step: PendingCommit
-    ) -> tuple[list[Token], Tensor | None]:
+    def _commit_prefill(self, step: PendingCommit) -> tuple[list[Token], Tensor | None]:
         """Commit a prefill PendingCommit and return first tokens/logprobs."""
         if step.kind != "prefill":
             raise AssertionError("prefill commit requires a prefill pending commit")
         payload = step.payload
         if not isinstance(payload, PrefillPendingCommit):
-            raise AssertionError("prefill commit requires a PrefillPendingCommit payload")
+            raise AssertionError(
+                "prefill commit requires a PrefillPendingCommit payload"
+            )
         staging = payload.staging
         prepared_sequences = payload.prepared_sequences
         prefill_slot = payload.prefill_slot
@@ -1813,6 +1846,11 @@ class GenerationScheduler:
             prefill_slot.commit_done_event.synchronize()
             for prepared in prepared_sequences:
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared)
+            # launch_prepared_batch already enqueued every decode-visible
+            # conditioning write. The synchronized finalizer only publishes
+            # host ownership, so the original host payload can now be dropped.
+            for sequence in step.sequences:
+                sequence.request.encoder_input = None
             tokens = self._materialize_tokens(
                 token_ids_cpu,
                 step.sequences,
@@ -1893,14 +1931,19 @@ class GenerationScheduler:
                 prefill_start = time.perf_counter()
                 lifecycle.prefill_started_at = prefill_start
                 lifecycle.transition(RequestPhase.PREFILLING)
+                prepare_kwargs = {
+                    "image": request.image,
+                    "image_crops": request.image_crops,
+                    "max_new_tokens": request.remaining_new_tokens,
+                    "lora_slot": request.lora_slot,
+                    "image_hash": request.image_hash,
+                    "adapter_id": request.adapter,
+                }
+                if request.encoder_input is not None:
+                    prepare_kwargs["encoder_input"] = request.encoder_input
                 prepared = self.runtime.prepare_sequence(
                     prompt_tokens=request.prefill_tokens,
-                    image=request.image,
-                    image_crops=request.image_crops,
-                    max_new_tokens=request.remaining_new_tokens,
-                    lora_slot=request.lora_slot,
-                    image_hash=request.image_hash,
-                    adapter_id=request.adapter,
+                    **prepare_kwargs,
                 )
             except Exception as exc:
                 lifecycle.prefill_started_at = None
@@ -1929,8 +1972,7 @@ class GenerationScheduler:
             # modes to the runtime.
             if (
                 bound_batch
-                and prepared.use_prefix_attn
-                != bound_batch[0].prepared.use_prefix_attn
+                and prepared.use_prefix_attn != bound_batch[0].prepared.use_prefix_attn
             ):
                 self.runtime.abort_prepared_sequence(prepared)
                 lifecycle.prefill_started_at = None
@@ -2010,11 +2052,14 @@ class GenerationScheduler:
             prepared_seq = prepared_sequences[0]
             try:
                 with torch.inference_mode():
+                    launch_kwargs = {
+                        "images": [request.image],
+                        "image_crops_list": [request.image_crops],
+                    }
+                    if request.encoder_input is not None:
+                        launch_kwargs["encoder_inputs"] = [request.encoder_input]
                     self.runtime.launch_prepared_batch(
-                        [prepared_seq],
-                        prefill_slot,
-                        images=[request.image],
-                        image_crops_list=[request.image_crops],
+                        [prepared_seq], prefill_slot, **launch_kwargs
                     )
                 lifecycle.prefill_completed_at = time.perf_counter()
                 # Ensure prefill forward completes before cache finalize + release.
@@ -2022,6 +2067,7 @@ class GenerationScheduler:
                     prefill_slot.commit_done_event.record()
                 prefill_slot.commit_done_event.synchronize()
                 self.runtime.finalize_prepared_sequence_after_prefill(prepared_seq)
+                request.encoder_input = None
             except Exception as exc:
                 return fail_bound_batch(exc, fence_compute_stream=True)
 
@@ -2043,11 +2089,16 @@ class GenerationScheduler:
 
         try:
             with torch.inference_mode():
+                launch_kwargs = {
+                    "images": [request.image for request in requests],
+                    "image_crops_list": [request.image_crops for request in requests],
+                }
+                if any(request.encoder_input is not None for request in requests):
+                    launch_kwargs["encoder_inputs"] = [
+                        request.encoder_input for request in requests
+                    ]
                 logits = self.runtime.launch_prepared_batch(
-                    prepared_sequences,
-                    prefill_slot,
-                    images=[request.image for request in requests],
-                    image_crops_list=[request.image_crops for request in requests],
+                    prepared_sequences, prefill_slot, **launch_kwargs
                 )
                 with stream_context(self._compute_stream):
                     self._stage_prefill_sampling_params(
@@ -2162,9 +2213,7 @@ class GenerationScheduler:
 
         return StepPlan(sequences=active)
 
-    def launch_forward_async(
-        self, plan: StepPlan, slot_id: int
-    ) -> LaunchHandle:
+    def launch_forward_async(self, plan: StepPlan, slot_id: int) -> LaunchHandle:
         """Launch the forward pass for a decode step (with stream context).
 
         Wrapper that enters the compute stream context before calling
@@ -2174,9 +2223,7 @@ class GenerationScheduler:
         with stream_context(slot.compute_stream):
             return self._launch_forward_on_stream(plan, slot_id)
 
-    def _launch_forward_on_stream(
-        self, plan: StepPlan, slot_id: int
-    ) -> LaunchHandle:
+    def _launch_forward_on_stream(self, plan: StepPlan, slot_id: int) -> LaunchHandle:
         """Launch the forward pass for a decode step.
 
         IMPORTANT: Caller must already be on the compute stream.
@@ -2471,14 +2518,15 @@ class GenerationScheduler:
                 # The generated prefix was part of prefill, so only tokens
                 # decoded after prefill should be retained as generated suffix.
                 generated_tokens = seq.skill_state.tokens[
-                    seq.request.generated_prefix_length:
+                    seq.request.generated_prefix_length :
                 ]
-                self.runtime.retain_sequence_prefix(
-                    seq.state,
-                    generated_tokens,
-                    adapter_id=seq.request.adapter,
-                    image_hash=seq.request.image_hash,
-                )
+                if not seq.request.has_encoder_input:
+                    self.runtime.retain_sequence_prefix(
+                        seq.state,
+                        generated_tokens,
+                        adapter_id=seq.request.adapter,
+                        image_hash=seq.request.image_hash,
+                    )
             finally:
                 # Retention is part of the cache path, but release is resource
                 # ownership. If retention hits an invariant bug, still release
@@ -2517,7 +2565,9 @@ class GenerationScheduler:
                 continue
             suppress_rows.append((i, suppress))
         all_greedy = all(seq.request.temperature <= 0.0 for seq in sequences)
-        any_return_logprobs = any(seq.request.return_logprobs is True for seq in sequences)
+        any_return_logprobs = any(
+            seq.request.return_logprobs is True for seq in sequences
+        )
         return (
             allowed_tokens,
             suppressed_tokens,
@@ -2682,9 +2732,7 @@ class GenerationScheduler:
             return bool(declared)
         return bool(allowed) or bool(suppressed)
 
-    def _build_mask(
-        self, sequences: List[RequestLifecycle], slot
-    ) -> "_MaskPlan":
+    def _build_mask(self, sequences: List[RequestLifecycle], slot) -> "_MaskPlan":
         """Build the decode sampling mask and stage it async on the slot.
 
         Runs after commit (so skill_state is current) while the forward is in
@@ -2814,7 +2862,9 @@ class GenerationScheduler:
             # Apply per-skill token suppression (blacklist).
             for i, suppressed in enumerate(suppressed_tokens):
                 if suppressed:
-                    idx = torch.tensor(suppressed, device=logits.device, dtype=torch.long)
+                    idx = torch.tensor(
+                        suppressed, device=logits.device, dtype=torch.long
+                    )
                     logits[i, idx] = float("-inf")
 
         want_logprobs = logprobs_out is not None and any_return_logprobs
@@ -2840,6 +2890,24 @@ class GenerationScheduler:
             logits[i, idx] = float("-inf")
 
         if all_greedy:
+            if self._hooks.sample_greedy is not None:
+                if logprobs is not None:
+                    raise ValueError(
+                        "custom greedy sampling does not support token logprobs"
+                    )
+                if batch_idx is None:
+                    raise AssertionError(
+                        "batch_idx is required for custom greedy sampling"
+                    )
+                sampled = self._hooks.sample_greedy(
+                    logits,
+                    out_view,
+                    sequences=sequences,
+                    batch_idx=batch_idx,
+                )
+                if sampled is not out_view:
+                    out_view.copy_(sampled)
+                return out_view, None, None, None
             if logprobs is None:
                 torch.argmax(logits, dim=-1, out=out_view)
                 return out_view, None, None, None
@@ -2848,6 +2916,8 @@ class GenerationScheduler:
             temps.zero_()
             top_ps.fill_(1.0)
         else:
+            if self._hooks.sample_greedy is not None:
+                raise ValueError("custom greedy sampling requires greedy requests")
             if batch_idx is None:
                 raise AssertionError("batch_idx is required for non-greedy sampling")
             batch_idx = batch_idx.view(-1)[:batch]
@@ -2914,15 +2984,16 @@ class GenerationScheduler:
         if logprobs_cpu is None:
             return [None] * len(sequences)
         return [
-            float(logprobs_cpu[i].item()) if seq.request.return_logprobs is True else None
+            float(logprobs_cpu[i].item())
+            if seq.request.return_logprobs is True
+            else None
             for i, seq in enumerate(sequences)
         ]
 
     def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
-        eos_id = self.runtime.prompt_template.eos_id
         is_text = isinstance(last_token, TextToken)
-        eos_hit = is_text and last_token.token_id == eos_id
+        eos_hit = is_text and last_token.token_id in self._eos_token_ids
         if is_text and not eos_hit:
             # A skill (e.g. chat) may terminate a turn on its own token — a
             # ChatML-style ``<|im_end|>`` can differ from the model's ``eos_id``.
@@ -2977,9 +3048,7 @@ class GenerationScheduler:
         # Finalization can raise (e.g., malformed tokens during decode). Catch
         # and package the error so only the offending request fails.
         try:
-            finalize = seq.skill_state.finalize(
-                self.runtime, reason=finish_reason
-            )
+            finalize = seq.skill_state.finalize(self.runtime, reason=finish_reason)
             tokens = finalize.tokens
             output = finalize.output
             finalization_failed = False
@@ -3003,9 +3072,7 @@ class GenerationScheduler:
                 )
                 finish_reason = "error"
                 tokens = []
-                output = {
-                    "error": "Internal logprobs/token alignment mismatch"
-                }
+                output = {"error": "Internal logprobs/token alignment mismatch"}
                 logprobs = None
 
         decode_tokens = max(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import threading
 from concurrent.futures import Future
@@ -17,11 +18,20 @@ from kestrel.engine import (
 )
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
-from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillSpec, SkillState
+from kestrel.skills import (
+    DecodeStep,
+    SkillFinalizeResult,
+    SkillRegistry,
+    SkillSpec,
+    SkillState,
+)
 
 
 def _make_request(
-    *, request_id: int = 1, image: np.ndarray | bytes | None = None
+    *,
+    request_id: int = 1,
+    image: np.ndarray | bytes | None = None,
+    encoder_input: object | None = None,
 ) -> _AutoregressiveRequest:
     return _AutoregressiveRequest(
         request_id=request_id,
@@ -37,6 +47,7 @@ def _make_request(
         stream_queue=None,
         skill=SimpleNamespace(),
         request_context=object(),
+        encoder_input=encoder_input,
         adapter=None,
     )
 
@@ -92,10 +103,10 @@ class _FakeImagePreprocessor:
 
     def __init__(self, futures: list[Future[object]] | None = None) -> None:
         self.futures = futures or [Future()]
-        self.submissions: list[np.ndarray | bytes] = []
+        self.submissions: list[object] = []
 
-    def submit(self, image: np.ndarray | bytes) -> Future[object]:
-        self.submissions.append(image)
+    def submit(self, value: object) -> Future[object]:
+        self.submissions.append(value)
         return self.futures.pop(0)
 
 
@@ -106,12 +117,16 @@ class _FakeRuntime:
         prefix_cache: object | None,
         prefix_hit: bool,
         image_preprocessor: _FakeImagePreprocessor | None = None,
+        encoder_input_preprocessor: _FakeImagePreprocessor | None = None,
     ) -> None:
         self.prefix_cache = prefix_cache
         self.config = SimpleNamespace(vision=object())
         self._prefix_hit = prefix_hit
         self.cache_checks: list[tuple[list[object], bytes | None, str | None]] = []
         self._image_preprocessor = image_preprocessor or _FakeImagePreprocessor()
+        self._encoder_input_preprocessor = (
+            encoder_input_preprocessor or _FakeImagePreprocessor()
+        )
 
     def check_prefix_cache(
         self, tokens_list: list[object], image_hash: bytes | None, adapter: str | None
@@ -121,6 +136,11 @@ class _FakeRuntime:
 
     def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[object]:
         return self._image_preprocessor.submit(image)
+
+    def preprocess_encoder_input_async(
+        self, encoder_input: object
+    ) -> Future[object]:
+        return self._encoder_input_preprocessor.submit(encoder_input)
 
     def shutdown(self) -> None:  # pragma: no cover
         pass
@@ -155,6 +175,97 @@ def test_admission_coordinator_immediately_admits_text_only_request() -> None:
     assert not coordinator.has_pending()
     assert preprocessor.submissions == []
     assert failures == []
+
+
+def test_admission_coordinator_prepares_encoder_input_and_drops_raw_payload() -> None:
+    encoder_input = object()
+    encoder_input_future: Future[object] = Future()
+    encoder_input_preprocessor = _FakeImagePreprocessor([encoder_input_future])
+    coordinator = _AdmissionCoordinator(
+        runtime=_FakeRuntime(
+            prefix_cache=None,
+            prefix_hit=False,
+            encoder_input_preprocessor=encoder_input_preprocessor,
+        ),
+        wake_event=threading.Event(),
+        fail_request=lambda *_: None,
+    )
+    req = _make_request(encoder_input=encoder_input)
+
+    assert coordinator.submit(req) is None
+    encoder_input_future.set_result("prepared-encoder-input")
+    ready = coordinator.take_ready()
+
+    assert ready is not None
+    assert ready.encoder_input == "prepared-encoder-input"
+    assert ready.req is req
+    assert req.encoder_input is None
+    assert encoder_input_preprocessor.submissions == [encoder_input]
+
+
+def test_encoder_input_disables_image_prefix_reuse() -> None:
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    encoder_input = object()
+    crop_future: Future[object] = Future()
+    encoder_input_future: Future[object] = Future()
+    image_preprocessor = _FakeImagePreprocessor([crop_future])
+    encoder_input_preprocessor = _FakeImagePreprocessor([encoder_input_future])
+    runtime = _FakeRuntime(
+        prefix_cache=object(),
+        prefix_hit=True,
+        image_preprocessor=image_preprocessor,
+        encoder_input_preprocessor=encoder_input_preprocessor,
+    )
+    coordinator = _AdmissionCoordinator(
+        runtime=runtime,
+        wake_event=threading.Event(),
+        fail_request=lambda *_: None,
+    )
+
+    assert coordinator.submit(
+        _make_request(image=image, encoder_input=encoder_input)
+    ) is None
+    assert runtime.cache_checks == []
+    assert image_preprocessor.submissions == [image]
+    assert encoder_input_preprocessor.submissions == [encoder_input]
+
+    crop_future.set_result("crops")
+    assert coordinator.take_ready() is None
+    encoder_input_future.set_result("prepared-encoder-input")
+    ready = coordinator.take_ready()
+    assert ready is not None
+    assert ready.crops == "crops"
+    assert ready.encoder_input == "prepared-encoder-input"
+
+
+def test_encoder_input_failure_cancels_concurrent_image_preprocessing() -> None:
+    crop_future: Future[object] = Future()
+    encoder_input_future: Future[object] = Future()
+    failures: list[tuple[_AutoregressiveRequest, BaseException]] = []
+    coordinator = _AdmissionCoordinator(
+        runtime=_FakeRuntime(
+            prefix_cache=None,
+            prefix_hit=False,
+            image_preprocessor=_FakeImagePreprocessor([crop_future]),
+            encoder_input_preprocessor=_FakeImagePreprocessor(
+                [encoder_input_future]
+            ),
+        ),
+        wake_event=threading.Event(),
+        fail_request=_record_failure(failures),
+    )
+    req = _make_request(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+        encoder_input=object(),
+    )
+
+    assert coordinator.submit(req) is None
+    encoder_input_future.set_exception(ValueError("bad audio"))
+    assert coordinator.take_ready() is None
+
+    assert crop_future.cancelled()
+    assert failures == [(req, encoder_input_future.exception())]
+    assert not coordinator.has_pending()
 
 
 def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
@@ -273,6 +384,17 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     assert str(failures[0][1]) == "crop failed"
 
 
+def test_transcribe_only_runtime_skips_legacy_query_warmup() -> None:
+    engine = object.__new__(InferenceEngine)
+    engine._skills_override = SkillRegistry([SkillSpec("transcribe")])
+
+    async def query(**_kwargs: object) -> None:
+        raise AssertionError("query warmup must not run")
+
+    engine.query = query  # type: ignore[method-assign]
+    asyncio.run(engine._warmup_query_pipeline())
+
+
 def test_extract_private_logprobs_setting() -> None:
     engine = object.__new__(InferenceEngine)
 
@@ -380,7 +502,9 @@ def test_build_generation_request_consumes_generated_prefix() -> None:
         tokens=(TextToken(10), TextToken(11)),
         logprobs=(-0.1, -0.2),
     )
-    runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
+    runtime = SimpleNamespace(
+        max_seq_length=32, image_prefix_length=0, spec=None
+    )
 
     generation_req, skill_state = engine._build_generation_request(runtime, req, None)
 
@@ -398,10 +522,26 @@ def test_build_generation_request_rejects_skill_stop_in_generated_prefix() -> No
     req.max_new_tokens = 4
     req.skill = _PrefixSkill(stop_token_ids=(11,))
     req.generated_prefix = GeneratedPrefix(tokens=(TextToken(10), TextToken(11)))
-    runtime = SimpleNamespace(max_seq_length=32, image_prefix_length=0)
+    runtime = SimpleNamespace(
+        max_seq_length=32, image_prefix_length=0, spec=None
+    )
 
     with pytest.raises(ValueError, match="must not contain stop tokens"):
         engine._build_generation_request(runtime, req, None)
+
+
+def test_build_generation_request_rejects_encoder_input_with_spec_decode() -> None:
+    engine = object.__new__(InferenceEngine)
+    req = _make_request()
+    runtime = SimpleNamespace(spec=object())
+
+    with pytest.raises(ValueError, match="require non-speculative"):
+        engine._build_generation_request(
+            runtime,
+            req,
+            None,
+            encoder_input=object(),
+        )
 
 
 def test_extract_private_suppress_next_token_ids_setting() -> None:

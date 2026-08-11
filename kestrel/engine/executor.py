@@ -13,9 +13,8 @@ import logging
 import queue
 import threading
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol
-
-import numpy as np
 
 from kestrel.runtime import AutoregressiveRuntime
 from kestrel.scheduler import (
@@ -40,6 +39,14 @@ from kestrel.engine._types import (
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class _PendingAdmission:
+    req: _AutoregressiveRequest
+    crops_future: Future[Any] | None
+    encoder_input_future: Future[Any] | None
+    prefix_cache_hit: bool
+
+
 class _AdmissionCoordinator:
     def __init__(
         self,
@@ -50,100 +57,157 @@ class _AdmissionCoordinator:
         self._runtime = runtime
         self._wake_event = wake_event
         self._fail_request = fail_request
-        # Image preprocessing payloads are opaque — the runtime decides
-        # what they contain (Moondream's ``OverlapCropOutput``,
-        # Gemma 4's pixel_values bundle, etc.) and threads them back
-        # into ``launch_prepared_batch``.
-        self._pending_crops: Dict[
-            int, tuple[_AutoregressiveRequest, "Future[Any]"]
-        ] = {}
-        self._ready_crops: queue.Queue[int] = queue.Queue()
+        # Both preprocessing payloads are opaque. Image crops expand decoder
+        # positions; an encoder input conditions an encoder-decoder model without
+        # changing decoder length. A request becomes admissible only when every
+        # preprocessing future it owns is ready.
+        self._pending: Dict[int, _PendingAdmission] = {}
+        self._ready: queue.Queue[int] = queue.Queue()
 
     def has_pending(self) -> bool:
-        return bool(self._pending_crops)
+        return bool(self._pending)
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending_crops)
+        return len(self._pending)
 
     def submit(self, req: _AutoregressiveRequest) -> Optional[_ReadyAdmission]:
-        if req.image is None:
-            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
-
-        if isinstance(req.image, (list, tuple)):
-            # Multi-image chat: the single-image prefix cache and overlap-crop
-            # precompute don't apply (the marker interleaver crops each image
-            # inline). Decode/validate each element up front so unsupported
-            # bytes fail THIS request at admission. Deferring the decode to
-            # encode_image() runs it mid-prefill in scheduler.advance(), where
-            # the exception is treated as a fatal AR-advance failure that drops
-            # every in-flight request rather than just this one.
-            from kestrel.utils.image import decode_to_srgb
-
-            try:
-                req.image = tuple(decode_to_srgb(im) for im in req.image)
-            except Exception as exc:
-                self._fail_request(req, exc)
-                return None
-            return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=False)
-
-        if self._runtime.prefix_cache is not None:
-            req.image_hash = _hash_image(req.image)
-            prefill_tokens = list(req.prompt_tokens) + list(req.generated_prefix.tokens)
-            if self._runtime.check_prefix_cache(
-                prefill_tokens, req.image_hash, req.adapter
-            ):
-                return _ReadyAdmission(req=req, crops=None, prefix_cache_hit=True)
-
+        crops_future: Future[Any] | None = None
+        encoder_input_future: Future[Any] | None = None
+        prefix_cache_hit = False
         try:
-            future = self._runtime.preprocess_image_async(req.image)
+            if isinstance(req.image, (list, tuple)):
+                # Multi-image chat: the single-image prefix cache and
+                # overlap-crop precompute don't apply. Decode/validate each
+                # element up front so a bad image fails only this request.
+                from kestrel.utils.image import decode_to_srgb
+
+                req.image = tuple(decode_to_srgb(im) for im in req.image)
+            elif req.image is not None:
+                # Encoder-conditioned prompts are never eligible for decoder
+                # prefix reuse: the cache key does not include encoder identity.
+                if req.encoder_input is None and self._runtime.prefix_cache is not None:
+                    req.image_hash = _hash_image(req.image)
+                    prefill_tokens = list(req.prompt_tokens) + list(
+                        req.generated_prefix.tokens
+                    )
+                    prefix_cache_hit = self._runtime.check_prefix_cache(
+                        prefill_tokens, req.image_hash, req.adapter
+                    )
+                if not prefix_cache_hit:
+                    crops_future = self._runtime.preprocess_image_async(req.image)
+
+            if req.encoder_input is not None:
+                encoder_input_future = self._runtime.preprocess_encoder_input_async(
+                    req.encoder_input
+                )
         except Exception as exc:
+            if crops_future is not None and not crops_future.done():
+                crops_future.cancel()
+            if encoder_input_future is not None and not encoder_input_future.done():
+                encoder_input_future.cancel()
             self._fail_request(req, exc)
             return None
 
+        if crops_future is None and encoder_input_future is None:
+            return _ReadyAdmission(
+                req=req,
+                crops=None,
+                encoder_input=None,
+                prefix_cache_hit=prefix_cache_hit,
+            )
+
         req_id = req.request_id
-        self._pending_crops[req_id] = (req, future)
-        future.add_done_callback(
-            lambda _future, rid=req_id: self._on_crops_ready(rid)
+        self._pending[req_id] = _PendingAdmission(
+            req=req,
+            crops_future=crops_future,
+            encoder_input_future=encoder_input_future,
+            prefix_cache_hit=prefix_cache_hit,
         )
+        for future in (crops_future, encoder_input_future):
+            if future is not None:
+                future.add_done_callback(
+                    lambda _future, rid=req_id: self._on_ready(rid)
+                )
         return None
 
     def take_ready(self) -> Optional[_ReadyAdmission]:
         while True:
             try:
-                req_id = self._ready_crops.get_nowait()
+                req_id = self._ready.get_nowait()
             except queue.Empty:
                 return None
 
-            pending = self._pending_crops.pop(req_id, None)
+            pending = self._pending.get(req_id)
             if pending is None:
                 continue
-
-            req, future = pending
-            try:
-                crops = future.result()
-            except Exception as exc:
-                self._fail_request(req, exc)
+            futures = (pending.crops_future, pending.encoder_input_future)
+            failed: BaseException | None = None
+            for future in futures:
+                if future is None or not future.done():
+                    continue
+                try:
+                    failed = future.exception()
+                except BaseException as exc:
+                    failed = exc
+                if failed is not None:
+                    break
+            if failed is not None:
+                self._pending.pop(req_id, None)
+                for future in futures:
+                    if future is not None and not future.done():
+                        future.cancel()
+                self._fail_request(pending.req, failed)
                 continue
-            return _ReadyAdmission(req=req, crops=crops, prefix_cache_hit=False)
+            if any(future is not None and not future.done() for future in futures):
+                continue
+
+            self._pending.pop(req_id, None)
+            try:
+                crops = (
+                    pending.crops_future.result()
+                    if pending.crops_future is not None
+                    else None
+                )
+                encoder_input = (
+                    pending.encoder_input_future.result()
+                    if pending.encoder_input_future is not None
+                    else None
+                )
+            except Exception as exc:
+                for future in futures:
+                    if future is not None and not future.done():
+                        future.cancel()
+                self._fail_request(pending.req, exc)
+                continue
+            # The raw input is no longer needed once preprocessing succeeds.
+            # Keep only the model-owned prepared payload throughout generation.
+            pending.req.encoder_input = None
+            return _ReadyAdmission(
+                req=pending.req,
+                crops=crops,
+                encoder_input=encoder_input,
+                prefix_cache_hit=pending.prefix_cache_hit,
+            )
 
     def fail_all(self, error: Optional[BaseException] = None) -> None:
         exc = error or RuntimeError("Engine shut down")
-        for req, future in list(self._pending_crops.values()):
-            if future and not future.done():
-                future.cancel()
-            self._fail_request(req, exc)
-        self._pending_crops.clear()
+        for pending in list(self._pending.values()):
+            for future in (pending.crops_future, pending.encoder_input_future):
+                if future is not None and not future.done():
+                    future.cancel()
+            self._fail_request(pending.req, exc)
+        self._pending.clear()
         self._drain_ready_notifications()
 
-    def _on_crops_ready(self, request_id: int) -> None:
-        self._ready_crops.put(request_id)
+    def _on_ready(self, request_id: int) -> None:
+        self._ready.put(request_id)
         self._wake_event.set()
 
     def _drain_ready_notifications(self) -> None:
         while True:
             try:
-                self._ready_crops.get_nowait()
+                self._ready.get_nowait()
             except queue.Empty:
                 break
 
@@ -185,7 +249,7 @@ class AutoregressiveExecutor:
         skills: "SkillRegistry",
         adapter_provider: Optional[AdapterProvider],
         build_generation_request: Callable[
-            [AutoregressiveRuntime, "_AutoregressiveRequest", Any],
+            [AutoregressiveRuntime, "_AutoregressiveRequest", Any, Any],
             "tuple[GenerationRequest, SkillState]",
         ],
         to_engine_result: Callable[[SchedulerResult], EngineResult],
@@ -297,7 +361,7 @@ class AutoregressiveExecutor:
         req = ready.req
         try:
             generation_req, skill_state = self._build_generation_request(
-                self._runtime, req, ready.crops
+                self._runtime, req, ready.crops, ready.encoder_input
             )
         except Exception as exc:
             self._admission_failures.append(Completion(request=req, error=exc))

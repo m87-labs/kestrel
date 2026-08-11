@@ -17,8 +17,51 @@ from kestrel.scheduler.types import (
     RequestLifecycle,
     RequestPhase,
 )
+from kestrel.skills import SkillRegistry
 
 from tests.scheduler._fake_runtime import FakeRuntime
+
+
+class _LegacyTextRuntime(FakeRuntime):
+    """Pre-extension injected runtime with the original text-only signatures."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.runtime_api_version = 1
+
+    def prepare_sequence(
+        self,
+        prompt_tokens,
+        *,
+        image=None,
+        image_crops=None,
+        max_new_tokens=None,
+        lora_slot=0,
+        image_hash=None,
+        adapter_id=None,
+    ):
+        self.legacy_prepare_called = True
+        return super().prepare_sequence(
+            prompt_tokens,
+            image=image,
+            image_crops=image_crops,
+            max_new_tokens=max_new_tokens,
+            lora_slot=lora_slot,
+            image_hash=image_hash,
+            adapter_id=adapter_id,
+        )
+
+    def launch_prepared_batch(
+        self,
+        prepared_sequences,
+        prefill_slot,
+        *,
+        images=None,
+        image_crops_list=None,
+    ):
+        del prepared_sequences, prefill_slot, images, image_crops_list
+        self.legacy_launch_called = True
+        raise RuntimeError("legacy launch reached")
 
 
 @dataclass
@@ -36,6 +79,7 @@ def _make_request(
     request_id: int = 1,
     max_new_tokens: int = 8,
     generated_prefix_tokens: list[TextToken] | None = None,
+    encoder_input: object | None = None,
 ) -> GenerationRequest:
     request = GenerationRequest(
         request_id=request_id,
@@ -45,6 +89,7 @@ def _make_request(
         skill=object(),
         request_context=object(),
         generated_prefix=GeneratedPrefix(tokens=tuple(generated_prefix_tokens or [])),
+        encoder_input=encoder_input,
     )
     lifecycle = RequestLifecycle(
         request=request,
@@ -84,8 +129,45 @@ def _make_scheduler(
     scheduler.waiting.push(request)
     scheduler.running = RunningQueue()
     scheduler._completed = deque()
-    scheduler._select_prefill_batch = lambda capacity_remaining: [_make_candidate(request)]
+    scheduler._select_prefill_batch = lambda capacity_remaining: [
+        _make_candidate(request)
+    ]
     return scheduler
+
+
+def test_scheduler_defaults_new_optional_runtime_capabilities() -> None:
+    runtime = _LegacyTextRuntime(device="cpu")
+
+    scheduler = GenerationScheduler(
+        runtime,
+        compute_stream=None,
+        skill_registry=SkillRegistry([]),
+    )
+
+    assert scheduler._hooks.sample_greedy is None
+    assert scheduler._eos_token_ids == frozenset({runtime.prompt_template.eos_id})
+
+
+def test_text_prefill_omits_encoder_kwargs_for_legacy_runtime() -> None:
+    request = _make_request(max_new_tokens=0)
+    request.lifecycle.lora_slot_ready = True
+    prepared = SimpleNamespace(
+        state=SequenceState(batch_idx=1, length=1, max_length=1),
+        use_prefix_attn=False,
+    )
+    runtime = _LegacyTextRuntime(prepare_result=prepared)
+    scheduler = _make_scheduler(request, runtime)
+    scheduler._compute_stream = None
+
+    progressed = GenerationScheduler._launch_prefill_step(
+        scheduler,
+        PipelineState(),
+    )
+
+    assert progressed is True
+    assert runtime.legacy_prepare_called is True
+    assert runtime.legacy_launch_called is True
+    assert scheduler._completed[0].output == {"error": "legacy launch reached"}
 
 
 def test_make_prefill_candidate_classifies_prompt_and_generated_prefix() -> None:
@@ -101,10 +183,28 @@ def test_make_prefill_candidate_classifies_prompt_and_generated_prefix() -> None
     assert candidate.reserve_length == request.target_length
 
 
+def test_make_prefill_candidate_never_reuses_encoder_conditioned_prompt() -> None:
+    request = _make_request(encoder_input=object())
+    request.encoder_input = None
+    runtime = FakeRuntime()
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+
+    candidate = GenerationScheduler._make_prefill_candidate(scheduler, request)
+
+    assert candidate is not None
+    assert runtime.classify_calls == []
+    assert candidate.classification.skip_positions == 0
+    assert candidate.classification.can_reuse is False
+    assert candidate.reserve_length == request.target_length
+
+
 def test_launch_prefill_step_prefills_generated_prefix_then_remaining_tokens() -> None:
+    encoder_input = object()
     request = _make_request(
         max_new_tokens=5,
         generated_prefix_tokens=[TextToken(10), TextToken(11)],
+        encoder_input=encoder_input,
     )
     request.lifecycle.lora_slot_ready = True
     runtime = FakeRuntime(prepare_exc=RuntimeError("prepare failed"))
@@ -121,6 +221,7 @@ def test_launch_prefill_step_prefills_generated_prefix_then_remaining_tokens() -
         TextToken(11),
     ]
     assert runtime.prepare_calls[0]["max_new_tokens"] == 3
+    assert runtime.prepare_calls[0]["encoder_input"] is encoder_input
 
 
 @pytest.mark.parametrize("failure_stage", ["adapter", "prepare"])
@@ -129,7 +230,9 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
 ) -> None:
     request = _make_request()
     runtime = FakeRuntime(
-        prepare_exc=RuntimeError("prepare failed") if failure_stage == "prepare" else None
+        prepare_exc=RuntimeError("prepare failed")
+        if failure_stage == "prepare"
+        else None
     )
     scheduler = _make_scheduler(request, runtime)
     pipeline = PipelineState()
@@ -149,6 +252,7 @@ def test_launch_prefill_step_dequeues_requests_that_fail_to_bind(
     assert len(scheduler._completed) == 1
     assert scheduler._completed[0].request_id == request.request_id
     assert request.lifecycle.phase == RequestPhase.COMPLETED
+    assert request.encoder_input is None
     assert len(runtime.released_prefill_slots) == 1
 
 
@@ -249,8 +353,5 @@ def test_advance_rejects_only_request_that_cannot_fit_kv_cache() -> None:
     assert completed[0].request_id == oversized.request_id
     assert completed[0].finish_reason == "error"
     assert completed[0].output == {
-        "error": (
-            "Insufficient KV cache capacity for request 42 "
-            "(needs 9 tokens)."
-        )
+        "error": ("Insufficient KV cache capacity for request 42 (needs 9 tokens).")
     }
