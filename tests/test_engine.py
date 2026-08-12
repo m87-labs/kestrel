@@ -457,7 +457,7 @@ def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
     engine = object.__new__(InferenceEngine)
     engine._default_model = "fake"
     engine._runtimes = {
-        "fake": SimpleNamespace(prompt_template=SimpleNamespace(eos_id=2)),
+        "fake": SimpleNamespace(eos_token_ids=(2, 3)),
     }
 
     prefix = GeneratedPrefix(tokens=(TextToken(10),))
@@ -485,7 +485,7 @@ def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
         )
     with pytest.raises(ValueError, match="must not contain EOS"):
         engine._validate_generated_prefix_for_request(
-            GeneratedPrefix(tokens=(TextToken(2),), logprobs=(-0.1,)),
+            GeneratedPrefix(tokens=(TextToken(3),), logprobs=(-0.1,)),
             max_new_tokens=4,
             return_logprobs=True,
             streaming=False,

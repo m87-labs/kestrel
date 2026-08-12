@@ -320,6 +320,11 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self.tokenizer = load_tokenizer(
             self._spec.tokenizer_id,
             getattr(cfg, "tokenizer_path", None),
+            revision=(
+                self._spec.revision
+                if self._spec.tokenizer_id == self._spec.repo_id
+                else None
+            ),
         )
         self.tokenizer.post_processor = None
         self.prompt_template = Qwen35PromptTemplate()
@@ -501,6 +506,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             source,
             device=self.device,
             dtype=self.dtype,
+            revision=self._spec.revision,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:

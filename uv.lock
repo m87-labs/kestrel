@@ -560,7 +560,7 @@ wheels = [
 
 [[package]]
 name = "kestrel"
-version = "0.6.0"
+version = "0.5.0"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
@@ -587,7 +587,7 @@ eval = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.20" },
-    { name = "kestrel-kernels", specifier = ">=0.4.9,<0.6" },
+    { name = "kestrel-kernels", specifier = "==0.4.9" },
     { name = "kestrel-native", specifier = "==0.1.6" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "safetensors", specifier = ">=0.4" },

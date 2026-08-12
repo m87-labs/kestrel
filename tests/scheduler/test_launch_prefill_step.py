@@ -22,46 +22,10 @@ from kestrel.skills import SkillRegistry
 from tests.scheduler._fake_runtime import FakeRuntime
 
 
-class _LegacyTextRuntime(FakeRuntime):
-    """Pre-extension injected runtime with the original text-only signatures."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.runtime_api_version = 1
-
-    def prepare_sequence(
-        self,
-        prompt_tokens,
-        *,
-        image=None,
-        image_crops=None,
-        max_new_tokens=None,
-        lora_slot=0,
-        image_hash=None,
-        adapter_id=None,
-    ):
-        self.legacy_prepare_called = True
-        return super().prepare_sequence(
-            prompt_tokens,
-            image=image,
-            image_crops=image_crops,
-            max_new_tokens=max_new_tokens,
-            lora_slot=lora_slot,
-            image_hash=image_hash,
-            adapter_id=adapter_id,
-        )
-
-    def launch_prepared_batch(
-        self,
-        prepared_sequences,
-        prefill_slot,
-        *,
-        images=None,
-        image_crops_list=None,
-    ):
-        del prepared_sequences, prefill_slot, images, image_crops_list
-        self.legacy_launch_called = True
-        raise RuntimeError("legacy launch reached")
+class _EmptyEosRuntime(FakeRuntime):
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        return ()
 
 
 @dataclass
@@ -135,39 +99,27 @@ def _make_scheduler(
     return scheduler
 
 
-def test_scheduler_defaults_new_optional_runtime_capabilities() -> None:
-    runtime = _LegacyTextRuntime(device="cpu")
+def test_scheduler_requires_uniform_sampling_hooks() -> None:
+    runtime = FakeRuntime(device="cpu")
+    del runtime.sampling_hooks
 
-    scheduler = GenerationScheduler(
-        runtime,
-        compute_stream=None,
-        skill_registry=SkillRegistry([]),
-    )
-
-    assert scheduler._hooks.sample_greedy is None
-    assert scheduler._eos_token_ids == frozenset({runtime.prompt_template.eos_id})
+    with pytest.raises(TypeError, match="must define sampling_hooks"):
+        GenerationScheduler(
+            runtime,
+            compute_stream=None,
+            skill_registry=SkillRegistry([]),
+        )
 
 
-def test_text_prefill_omits_encoder_kwargs_for_legacy_runtime() -> None:
-    request = _make_request(max_new_tokens=0)
-    request.lifecycle.lora_slot_ready = True
-    prepared = SimpleNamespace(
-        state=SequenceState(batch_idx=1, length=1, max_length=1),
-        use_prefix_attn=False,
-    )
-    runtime = _LegacyTextRuntime(prepare_result=prepared)
-    scheduler = _make_scheduler(request, runtime)
-    scheduler._compute_stream = None
+def test_scheduler_requires_nonempty_runtime_eos_ids() -> None:
+    runtime = _EmptyEosRuntime(device="cpu")
 
-    progressed = GenerationScheduler._launch_prefill_step(
-        scheduler,
-        PipelineState(),
-    )
-
-    assert progressed is True
-    assert runtime.legacy_prepare_called is True
-    assert runtime.legacy_launch_called is True
-    assert scheduler._completed[0].output == {"error": "legacy launch reached"}
+    with pytest.raises(ValueError, match="eos_token_ids must not be empty"):
+        GenerationScheduler(
+            runtime,
+            compute_stream=None,
+            skill_registry=SkillRegistry([]),
+        )
 
 
 def test_make_prefill_candidate_classifies_prompt_and_generated_prefix() -> None:

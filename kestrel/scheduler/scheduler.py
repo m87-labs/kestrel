@@ -47,7 +47,6 @@ from .pipeline import (
 from kestrel_kernels.sampling import sample_step_from_logits
 from .transfer import RenderBuffer
 from kestrel.runtime.sampling import SamplingHooks
-from kestrel.runtime._compat import resolve_runtime_contract
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -305,11 +304,27 @@ class GenerationScheduler:
         # The runtime owns all storage and D2H for its side-channel
         # values; the scheduler only manages sampled token ids +
         # logprobs.
-        runtime_contract = resolve_runtime_contract(runtime)
-        self._hooks: SamplingHooks = runtime_contract.sampling_hooks
+        try:
+            hooks = runtime.sampling_hooks
+        except AttributeError as exc:
+            raise TypeError(
+                "autoregressive runtimes must define sampling_hooks"
+            ) from exc
+        if not isinstance(hooks, SamplingHooks):
+            raise TypeError("runtime.sampling_hooks must be SamplingHooks")
+        self._hooks = hooks
         if self._hooks.sample_greedy is not None and runtime.spec is not None:
             raise ValueError("custom greedy sampling requires non-speculative decoding")
-        self._eos_token_ids = runtime_contract.eos_token_ids
+        try:
+            self._eos_token_ids = frozenset(map(int, runtime.eos_token_ids))
+        except AttributeError as exc:
+            raise TypeError(
+                "autoregressive runtimes must define eos_token_ids"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise TypeError("runtime.eos_token_ids must contain integer ids") from exc
+        if not self._eos_token_ids:
+            raise ValueError("runtime.eos_token_ids must not be empty")
         self._pending_token_ids = torch.zeros(
             (runtime.max_batch_slots,),
             dtype=torch.long,

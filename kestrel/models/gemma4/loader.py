@@ -23,22 +23,22 @@ _UNSUPPORTED_WEIGHT_PREFIXES = (
 )
 
 
-def _snapshot(source: str | Path) -> Path:
+def _snapshot(source: str | Path, *, revision: str | None = None) -> Path:
     path = Path(source).expanduser()
     if path.exists():
         if not path.is_dir():
             raise ValueError(f"Gemma model_path must be a directory, got {path}")
         return path
-    return Path(
-        snapshot_download(
-            str(source),
-            allow_patterns=[
-                "config.json",
-                "*.safetensors",
-                "model.safetensors.index.json",
-            ],
-        )
-    )
+    kwargs: dict[str, object] = {
+        "allow_patterns": [
+            "config.json",
+            "*.safetensors",
+            "model.safetensors.index.json",
+        ]
+    }
+    if revision is not None:
+        kwargs["revision"] = revision
+    return Path(snapshot_download(str(source), **kwargs))
 
 
 def load_weights(source: str | Path, model: torch.nn.Module) -> None:
@@ -101,8 +101,9 @@ def load_model(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    revision: str | None = None,
 ) -> Gemma4InferenceModel:
-    snapshot = _snapshot(source)
+    snapshot = _snapshot(source, revision=revision)
     config_path = snapshot / "config.json"
     with open(config_path, "r", encoding="utf-8") as handle:
         config = Gemma4Config.from_dict(json.load(handle))

@@ -281,6 +281,20 @@ class AutoregressiveExecutor:
     # -- ingress (event-loop thread) ----------------------------------
 
     def submit(self, request: _AutoregressiveRequest) -> None:
+        if (
+            request.max_new_tokens > 0
+            and self._runtime.sampling_hooks.sample_greedy is not None
+        ):
+            error: str | None = None
+            # Spell this as the accepted relation so NaN cannot slip through:
+            # both ``nan > 0`` and ``nan <= 0`` are false.
+            if not request.temperature <= 0.0:
+                error = "custom greedy sampling requires greedy requests"
+            elif request.return_logprobs is True:
+                error = "custom greedy sampling does not support token logprobs"
+            if error is not None:
+                self._fail_via_admission(request, ValueError(error))
+                return
         ready = self._admission.submit(request)
         if ready is not None:
             self._admit_ready(ready)

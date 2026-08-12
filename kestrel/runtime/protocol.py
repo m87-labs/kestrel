@@ -95,7 +95,6 @@ class AutoregressiveRuntime(Runtime, Protocol):
     """
 
     # Capacity / shape
-    runtime_api_version: int
     max_batch_size: int
     max_batch_slots: int
     max_seq_length: int

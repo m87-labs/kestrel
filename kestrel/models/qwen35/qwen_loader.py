@@ -354,6 +354,7 @@ def _load_sharded_safetensors(
     shard_names: list[str],
     *,
     device: torch.device,
+    revision: str | None = None,
 ) -> tuple[list[str], list[str]]:
     expected_state = model.state_dict()
     expected_keys = set(expected_state)
@@ -365,7 +366,10 @@ def _load_sharded_safetensors(
     unexpected: list[str] = []
     device_arg = _torch_device_arg(device)
     shard_paths = [
-        (shard_name, _resolve_checkpoint_file(source, shard_name))
+        (
+            shard_name,
+            _resolve_checkpoint_file(source, shard_name, revision=revision),
+        )
         for shard_name in shard_names
     ]
     scale_inv_by_key = _load_scale_inv_tensors(shard_paths, device_arg=device_arg)
@@ -472,7 +476,12 @@ def _load_sharded_safetensors(
     return missing, sorted(unexpected)
 
 
-def _resolve_checkpoint_file(source: str | Path, filename: str) -> str:
+def _resolve_checkpoint_file(
+    source: str | Path,
+    filename: str,
+    *,
+    revision: str | None = None,
+) -> str:
     if isinstance(source, Path):
         root = source if source.is_dir() else source.parent
         path = root / filename
@@ -481,7 +490,8 @@ def _resolve_checkpoint_file(source: str | Path, filename: str) -> str:
                 f"Qwen checkpoint is missing required file {path}"
             )
         return str(path)
-    return hf_hub_download(source, filename)
+    kwargs = {} if revision is None else {"revision": revision}
+    return hf_hub_download(source, filename, **kwargs)
 
 
 def load_qwen35_model(
@@ -489,8 +499,11 @@ def load_qwen35_model(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    revision: str | None = None,
 ) -> Qwen3_5ForConditionalGeneration:
-    config_path = _resolve_checkpoint_file(source, "config.json")
+    config_path = _resolve_checkpoint_file(
+        source, "config.json", revision=revision
+    )
     with open(config_path, "r", encoding="utf-8") as handle:
         config_data: dict[str, Any] = json.load(handle)
     config = Qwen3_5Config.from_dict(config_data)
@@ -503,7 +516,7 @@ def load_qwen35_model(
         torch.set_default_dtype(old_dtype)
 
     index_path = _resolve_checkpoint_file(
-        source, "model.safetensors.index.json"
+        source, "model.safetensors.index.json", revision=revision
     )
     with open(index_path, "r", encoding="utf-8") as handle:
         index = json.load(handle)
@@ -514,6 +527,7 @@ def load_qwen35_model(
         source,
         shard_names,
         device=device,
+        revision=revision,
     )
     if unexpected or missing:
         raise RuntimeError(

@@ -17,7 +17,6 @@ from kestrel.runtime.tokens import Token
 class UncachedPagedRuntime:
     """Own page reservation and sequence state for uncached paged inference."""
 
-    runtime_api_version = 2
     prefix_cache = None
     decode_path = "auto"
     generated_decode = None

@@ -53,9 +53,8 @@ def ensure_model_weights(
 def probe_supported_model_configs(model_ids: Sequence[str] | None = None) -> None:
     """Best-effort access check for the configured models' HF configs.
 
-    External model registrars are imported on demand, so probing the complete
-    installed registry would execute every installed provider. Startup passes
-    only the ids hosted by this engine instance.
+    Startup passes only the ids hosted by this engine instance, avoiding
+    unrelated registry probes when a process has registered multiple models.
     """
     try:
         from huggingface_hub import hf_hub_download

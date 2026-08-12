@@ -484,8 +484,6 @@ class _LayerPagedCache(torch.nn.Module):
 class MoondreamRuntime:
     """High-level runtime for paged text-only Moondream inference."""
 
-    runtime_api_version = 2
-
     def __init__(
         self,
         cfg: RuntimeConfig,
@@ -675,6 +673,11 @@ class MoondreamRuntime:
         self.tokenizer = load_tokenizer(
             self._spec.tokenizer_id,
             cfg.tokenizer_path,
+            revision=(
+                self._spec.revision
+                if self._spec.tokenizer_id == self._spec.repo_id
+                else None
+            ),
         )
         # TokenizerConfig satisfies the PromptTemplate protocol directly.
         self.prompt_template = self.config.tokenizer

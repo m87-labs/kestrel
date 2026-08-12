@@ -44,7 +44,6 @@ from kestrel.runtime import (
     TextToken,
     Token,
 )
-from kestrel.runtime._compat import resolve_runtime_contract
 from kestrel.scheduler import (
     GeneratedPrefix,
     GenerationRequest,
@@ -1334,7 +1333,9 @@ class InferenceEngine:
                 "settings._logprobs is true"
             )
 
-        eos_token_ids = resolve_runtime_contract(self.runtime).eos_token_ids
+        eos_token_ids = frozenset(map(int, self.runtime.eos_token_ids))
+        if not eos_token_ids:
+            raise ValueError("runtime.eos_token_ids must not be empty")
         for token in generated_prefix.tokens:
             if isinstance(token, TextToken) and token.token_id in eos_token_ids:
                 raise ValueError(

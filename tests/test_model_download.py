@@ -6,6 +6,8 @@ import huggingface_hub
 
 import kestrel.models
 from kestrel.model_download import ensure_model_weights, probe_supported_model_configs
+from kestrel.models.gemma4 import loader as gemma_loader
+from kestrel.models.qwen35 import qwen_loader
 
 
 def test_config_probe_only_resolves_configured_model_ids(monkeypatch) -> None:
@@ -87,3 +89,82 @@ def test_weight_download_uses_modelspec_revision(monkeypatch, tmp_path) -> None:
             {"revision": "pinned-revision"},
         )
     ]
+
+
+def test_gemma_snapshot_uses_declared_revision(monkeypatch, tmp_path) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def snapshot_download(repo_id: str, **kwargs: object) -> str:
+        calls.append((repo_id, kwargs))
+        return str(tmp_path)
+
+    monkeypatch.setattr(gemma_loader, "snapshot_download", snapshot_download)
+
+    assert gemma_loader._snapshot(
+        "owner/gemma", revision="immutable-commit"
+    ) == tmp_path
+    assert calls == [
+        (
+            "owner/gemma",
+            {
+                "allow_patterns": [
+                    "config.json",
+                    "*.safetensors",
+                    "model.safetensors.index.json",
+                ],
+                "revision": "immutable-commit",
+            },
+        )
+    ]
+
+
+def test_gemma_snapshot_keeps_local_source_local(monkeypatch, tmp_path) -> None:
+    def unexpected_download(*args: object, **kwargs: object) -> str:
+        raise AssertionError("local Gemma source must not use the Hub")
+
+    monkeypatch.setattr(gemma_loader, "snapshot_download", unexpected_download)
+
+    assert gemma_loader._snapshot(
+        tmp_path, revision="immutable-commit"
+    ) == tmp_path
+
+
+def test_qwen_shard_download_uses_declared_revision(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def hf_hub_download(
+        repo_id: str, filename: str, **kwargs: object
+    ) -> str:
+        calls.append((repo_id, filename, kwargs))
+        return "/cache/model.safetensors"
+
+    monkeypatch.setattr(qwen_loader, "hf_hub_download", hf_hub_download)
+
+    assert qwen_loader._resolve_checkpoint_file(
+        "owner/qwen",
+        "model-00001-of-00002.safetensors",
+        revision="immutable-commit",
+    ) == "/cache/model.safetensors"
+    assert calls == [
+        (
+            "owner/qwen",
+            "model-00001-of-00002.safetensors",
+            {"revision": "immutable-commit"},
+        )
+    ]
+
+
+def test_qwen_checkpoint_keeps_local_source_local(monkeypatch, tmp_path) -> None:
+    checkpoint = tmp_path / "config.json"
+    checkpoint.write_text("{}", encoding="utf-8")
+
+    def unexpected_download(*args: object, **kwargs: object) -> str:
+        raise AssertionError("local Qwen source must not use the Hub")
+
+    monkeypatch.setattr(qwen_loader, "hf_hub_download", unexpected_download)
+
+    assert qwen_loader._resolve_checkpoint_file(
+        tmp_path,
+        "config.json",
+        revision="immutable-commit",
+    ) == str(checkpoint)

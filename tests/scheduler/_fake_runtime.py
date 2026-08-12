@@ -110,7 +110,6 @@ class FakeRuntime:
         # Identity
         self.model_name = model_name
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
-        self.runtime_api_version = 2
         # No speculative decoding in the fake; decode one token per step.
         self.spec = None
         self.decode_path = "auto"
@@ -188,8 +187,7 @@ class FakeRuntime:
 
     @property
     def eos_token_ids(self) -> tuple[int, ...]:
-        # A property keeps legacy tests that replace ``prompt_template``
-        # representative of the real runtime-level termination contract.
+        # Keep termination metadata derived from the fake's active template.
         return (int(self.prompt_template.eos_id), *self.additional_eos_token_ids)
 
     # Capacity queries -------------------------------------------------
