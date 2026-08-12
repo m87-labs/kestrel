@@ -33,10 +33,10 @@ def ensure_model_weights(
         spec = get_spec(model)
         if repo_id is None:
             repo_id = spec.repo_id
+            if revision is None:
+                revision = spec.revision
         if filename is None:
             filename = spec.filename
-        if revision is None:
-            revision = spec.revision
 
     if repo_id is None or filename is None:
         return None

@@ -62,7 +62,7 @@ def test_config_probe_without_ids_keeps_legacy_all_model_behavior(monkeypatch) -
     assert resolved == ["registered"]
 
 
-def test_weight_download_uses_modelspec_revision(monkeypatch, tmp_path) -> None:
+def test_weight_download_revision_follows_selected_repo(monkeypatch, tmp_path) -> None:
     calls: list[tuple[str, str, dict[str, object]]] = []
     spec = SimpleNamespace(
         repo_id="owner/model",
@@ -82,12 +82,30 @@ def test_weight_download_uses_modelspec_revision(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
 
     assert ensure_model_weights("configured-model") == downloaded
+    assert (
+        ensure_model_weights("configured-model", repo_id="fork/model")
+        == downloaded
+    )
+    assert (
+        ensure_model_weights(
+            "configured-model",
+            repo_id="fork/model",
+            revision="fork-revision",
+        )
+        == downloaded
+    )
     assert calls == [
         (
             "owner/model",
             "model.safetensors",
             {"revision": "pinned-revision"},
-        )
+        ),
+        ("fork/model", "model.safetensors", {}),
+        (
+            "fork/model",
+            "model.safetensors",
+            {"revision": "fork-revision"},
+        ),
     ]
 
 
