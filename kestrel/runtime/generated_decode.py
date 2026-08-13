@@ -236,6 +236,7 @@ class GeneratedDecode:
             spec.weight_root,
             layer_prefix=spec.weight_layer_prefix,
             arch=f"sm{properties.major}{properties.minor}",
+            device_sms=int(properties.multi_processor_count),
         )
         if not programs:
             return None
