@@ -69,8 +69,9 @@ class PagedDecodeBindings:
         return _merge_disjoint(
             "decode",
             paged=inputs,
-            extra=(self.extra_runtime_inputs(runtime)
-                   if self.extra_runtime_inputs else {}),
+            extra=(
+                self.extra_runtime_inputs(runtime) if self.extra_runtime_inputs else {}
+            ),
         )
 
     def slot_inputs(self, slot: Any, capacity: int) -> Mapping[str, Any]:
@@ -84,8 +85,9 @@ class PagedDecodeBindings:
         return _merge_disjoint(
             "decode slot",
             standard=inputs,
-            extra=(self.extra_slot_inputs(slot, capacity)
-                   if self.extra_slot_inputs else {}),
+            extra=(
+                self.extra_slot_inputs(slot, capacity) if self.extra_slot_inputs else {}
+            ),
         )
 
     @staticmethod
@@ -102,13 +104,15 @@ class GeneratedDecodeSpec:
     weight_root: torch.nn.Module
     weight_layer_prefix: str
     bindings: GeneratedDecodeBindings
-    capacity_inputs: Callable[
-        [int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]
-    ] | None = None
+    capacity_inputs: (
+        Callable[[int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]]
+        | None
+    ) = None
     preparations: Sequence[DeviceInputPreparation] = ()
     not_ready_inputs: frozenset[str] = frozenset()
     preparation_callbacks: Mapping[str, Callable[[Any, int], None]] = field(
-        default_factory=dict)
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,8 @@ def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, An
             if name in merged:
                 raise RuntimeError(
                     f"generated {label} input {name!r} is owned by "
-                    f"{owners[name]} and {namespace}")
+                    f"{owners[name]} and {namespace}"
+                )
             merged[name] = value
             owners[name] = namespace
     return merged
@@ -138,11 +143,13 @@ def _required_engine_inputs(descriptor: Mapping[str, Any]) -> tuple[str, ...]:
         for item in descriptor["device_program"]["argument_plan"]["arguments"]
         if item["source"] == "external"
     }
-    return tuple(dict.fromkeys(
-        item["logical_name"]
-        for item in descriptor["device_program"]["physical_abi"]["operands"]
-        if item["abi_name"] in arguments and item["owner"] == "engine"
-    ))
+    return tuple(
+        dict.fromkeys(
+            item["logical_name"]
+            for item in descriptor["device_program"]["physical_abi"]["operands"]
+            if item["abi_name"] in arguments and item["owner"] == "engine"
+        )
+    )
 
 
 def _preparation_plan(
@@ -151,9 +158,7 @@ def _preparation_plan(
     ready: set[str],
     preparations: Sequence[DeviceInputPreparation],
 ) -> tuple[DeviceInputPreparation, ...]:
-    producers = {
-        output: step for step in preparations for output in step.produces
-    }
+    producers = {output: step for step in preparations for output in step.produces}
     selected = []
     visiting = set()
 
@@ -164,7 +169,8 @@ def _preparation_plan(
             step = producers[name]
         except KeyError as exc:
             raise RuntimeError(
-                f"generated input {name!r} is neither ready nor prepared") from exc
+                f"generated input {name!r} is neither ready nor prepared"
+            ) from exc
         if step.name in visiting:
             raise RuntimeError(f"generated input preparation cycle at {step.name!r}")
         if step not in selected:
@@ -216,7 +222,9 @@ class GeneratedDecode:
 
     @classmethod
     def try_create(
-        cls, runtime: Any, spec: GeneratedDecodeSpec,
+        cls,
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
     ) -> "GeneratedDecode | None":
         if (
             not spec.bindings.is_eligible(runtime)
@@ -249,23 +257,32 @@ class GeneratedDecode:
             materialize_weights,
         )
 
-        self._programs = {program.capacity: program for program in programs}
+        self._programs = tuple(programs)
         self._spec = spec
         contracts = {repr(program.descriptor["weights"]) for program in programs}
         if len(contracts) != 1:
             raise RuntimeError(
-                f"generated {spec.label} capacities disagree on weight storage")
-        self.state_requirements_by_capacity = {
-            program.capacity: _state_requirements(program.descriptor)
-            for program in programs
-        }
+                f"generated {spec.label} capacities disagree on weight storage"
+            )
+        self.state_requirements_by_capacity = {}
+        for program in programs:
+            requirements = _state_requirements(program.descriptor)
+            existing = self.state_requirements_by_capacity.setdefault(
+                program.capacity, requirements
+            )
+            if existing != requirements:
+                raise RuntimeError(
+                    f"generated {spec.label} programs at capacity="
+                    f"{program.capacity} disagree on carried state"
+                )
         state_sets = {
             tuple(item.buffer for item in requirements)
             for requirements in self.state_requirements_by_capacity.values()
         }
         if len(state_sets) != 1:
             raise RuntimeError(
-                f"generated {spec.label} capacities disagree on carried state")
+                f"generated {spec.label} capacities disagree on carried state"
+            )
         self.state_buffers = next(iter(state_sets))
 
         ambient_stream = torch.cuda.current_stream(runtime.device)
@@ -286,11 +303,13 @@ class GeneratedDecode:
         self._slots = {}
         plans = {}
         for slot in runtime.decode_slots:
-            for capacity, program in self._programs.items():
+            for program_index, program in enumerate(self._programs):
+                capacity = program.capacity
                 requirements = self.state_requirements_by_capacity[capacity]
                 capacity_inputs = (
                     dict(spec.capacity_inputs(capacity, requirements))
-                    if spec.capacity_inputs else {}
+                    if spec.capacity_inputs
+                    else {}
                 )
                 inputs = _merge_disjoint(
                     spec.label,
@@ -306,9 +325,11 @@ class GeneratedDecode:
                 plans.setdefault(tuple(step.name for step in plan), plan)
                 construction_batch = min(capacity, int(runtime.max_batch_size))
                 extents = derive_runtime_extents(
-                    program.descriptor, inputs, active_batch=construction_batch)
+                    program.descriptor, inputs, active_batch=construction_batch
+                )
                 launch_extents = dict(
-                    spec.bindings.launch_extents(slot, construction_batch))
+                    spec.bindings.launch_extents(slot, construction_batch)
+                )
                 extents.update(launch_extents)
                 bindings = assemble_bindings(
                     program.descriptor,
@@ -320,22 +341,26 @@ class GeneratedDecode:
                 )
                 scalar_names = frozenset(
                     item["name"]
-                    for item in program.descriptor["device_program"]
-                    ["argument_plan"]["arguments"]
+                    for item in program.descriptor["device_program"]["argument_plan"][
+                        "arguments"
+                    ]
                     if item["transport"] == "scalar"
                 )
                 unknown = launch_extents.keys() - scalar_names
                 if unknown:
                     raise RuntimeError(
                         f"generated {spec.label} has unknown launch extents "
-                        f"{sorted(unknown)}")
-                self._slots[(int(slot.slot_id), capacity)] = _BoundInvocation(
-                    program.bind(bindings), scalar_names,
+                        f"{sorted(unknown)}"
+                    )
+                self._slots[(int(slot.slot_id), program_index)] = _BoundInvocation(
+                    program.bind(bindings),
+                    scalar_names,
                     frozenset(launch_extents),
                 )
         if len(plans) != 1:
             raise RuntimeError(
-                f"generated {spec.label} capacities disagree on input preparation")
+                f"generated {spec.label} capacities disagree on input preparation"
+            )
         self._input_preparation_plan = next(iter(plans.values()))
         missing = {
             step.name for step in self._input_preparation_plan
@@ -343,43 +368,61 @@ class GeneratedDecode:
         if missing:
             raise RuntimeError(
                 f"generated {spec.label} has no preparation callbacks for "
-                f"{sorted(missing)}")
+                f"{sorted(missing)}"
+            )
 
-    def _capacity_for(self, batch_size: int) -> int | None:
-        return next(
-            (capacity for capacity in sorted(self._programs)
-             if capacity >= int(batch_size)),
-            None,
-        )
+    def _program_for(self, batch_size: int) -> tuple[int, Any] | None:
+        batch_size = int(batch_size)
+        candidates = []
+        for index, program in enumerate(self._programs):
+            static_batch = program.static_extent_bindings.get("active_batch")
+            if static_batch is not None and int(static_batch) != batch_size:
+                continue
+            if int(program.capacity) < batch_size:
+                continue
+            candidates.append(
+                (static_batch is None, int(program.capacity), index, program)
+            )
+        if not candidates:
+            return None
+        _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
+        return index, program
 
     def supports(self, batch_size: int) -> bool:
-        return self._capacity_for(batch_size) is not None
+        return self._program_for(batch_size) is not None
 
     def state_requirements_for(
-        self, batch_size: int,
+        self,
+        batch_size: int,
     ) -> tuple[StateRepresentationRequirement, ...]:
-        capacity = self._capacity_for(batch_size)
-        if capacity is None:
+        selected = self._program_for(batch_size)
+        if selected is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
-        return self.state_requirements_by_capacity[capacity]
+        _index, program = selected
+        return self.state_requirements_by_capacity[program.capacity]
 
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
-        capacity = self._capacity_for(batch_size)
-        if capacity is None:
+        selected = self._program_for(batch_size)
+        if selected is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
+        program_index, _program = selected
         for step in self._input_preparation_plan:
             self._spec.preparation_callbacks[step.name](slot, int(batch_size))
-        bound = self._slots[(int(slot.slot_id), capacity)]
+        bound = self._slots[(int(slot.slot_id), program_index)]
         extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         missing = bound.required_launch_extents - extents.keys()
         if missing:
             raise RuntimeError(
-                f"generated {self._spec.label} launch misses {sorted(missing)}")
-        bound.invocation.launch(**{
-            name: value for name, value in extents.items()
-            if name in bound.scalar_names
-        })
+                f"generated {self._spec.label} launch misses {sorted(missing)}"
+            )
+        bound.invocation.launch(
+            **{
+                name: value
+                for name, value in extents.items()
+                if name in bound.scalar_names
+            }
+        )
 
 
 __all__ = [
