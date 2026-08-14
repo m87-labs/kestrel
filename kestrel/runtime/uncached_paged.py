@@ -17,6 +17,8 @@ class UncachedPagedRuntime:
     """Own page reservation and sequence state for uncached paged inference."""
 
     prefix_cache = None
+    decode_path = "auto"
+    generated_decode = None
 
     @property
     def model_name(self) -> str:
