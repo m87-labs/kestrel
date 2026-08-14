@@ -240,8 +240,15 @@ Adapters are automatically downloaded and cached on first use.
 RuntimeConfig(
     model="moondream3-preview",  # or "moondream2" / "moondream3.1-9B-A2B"
     max_batch_size=4,            # Max concurrent requests
+    decode_path="auto",          # "auto", "native", or fail-closed "generated"
 )
 ```
+
+`decode_path="native"` disables generated decode construction. For Qwen 3.5
+and Gemma 4, `decode_path="generated"` requires compatible bundled programs
+covering every active batch size up to `max_batch_size`; construction or decode
+fails instead of falling back to native execution. Moondream currently supports
+only the default `"auto"` policy.
 
 To run from local files instead of the registered HuggingFace weights or
 tokenizer, keep `model` set to the matching registered architecture and pass

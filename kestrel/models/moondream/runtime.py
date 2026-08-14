@@ -492,6 +492,12 @@ class MoondreamRuntime:
         kv_pool: KVMemoryPool,
         compute_stream: torch.cuda.Stream | None,
     ) -> None:
+        self.decode_path = getattr(cfg, "decode_path", "auto")
+        if self.decode_path != "auto":
+            raise ValueError(
+                "Moondream runtimes currently support only decode_path='auto'"
+            )
+        self.generated_decode = None
         self._cfg = cfg
         self.device = cfg.resolved_device()
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE

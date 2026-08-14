@@ -5,6 +5,7 @@ import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from typing import Literal
 
 import torch
 
@@ -30,6 +31,9 @@ _MPS_PAGES_BY_TOTAL_GIB = (
     (None, 65536), # 96+ GB Ultra
 )
 _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+DecodePath = Literal["auto", "native", "generated"]
 
 
 def _format_cuda_version(version: int | str | None) -> str | None:
@@ -169,8 +173,17 @@ class RuntimeConfig:
     model: str = "moondream3-preview"
     service_name: str = "local"
     tokenizer_path: str | Path | None = None
+    # Decode implementation policy. ``generated`` is fail-closed: runtimes
+    # that support it must bind compatible generated programs for the complete
+    # configured batch domain and may not fall back to native decode.
+    decode_path: DecodePath = "auto"
 
     def __post_init__(self):
+        if self.decode_path not in ("auto", "native", "generated"):
+            raise ValueError(
+                "decode_path must be 'auto', 'native', or 'generated'"
+            )
+
         normalized_service_name = self.service_name.strip()
         self.service_name = normalized_service_name or "local"
         if not _SERVICE_NAME_PATTERN.fullmatch(self.service_name):
@@ -275,4 +288,4 @@ class RuntimeConfig:
         raise RuntimeError(" ".join(details))
 
 
-__all__ = ["RuntimeConfig"]
+__all__ = ["DecodePath", "RuntimeConfig"]

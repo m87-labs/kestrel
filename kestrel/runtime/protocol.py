@@ -29,6 +29,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
+from kestrel.config import DecodePath
 from kestrel.runtime.spec import SpecDecodeCaps
 from kestrel.runtime.state import (
     PrefillClassification,
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
     import numpy as np
     import torch
     from torch import Tensor
+
+    from kestrel.runtime.generated_decode import GeneratedDecode
 
 
 class ExecutionShape(Enum):
@@ -102,6 +105,12 @@ class AutoregressiveRuntime(Runtime, Protocol):
     # behavior; a non-``None`` value advertises a drafter the scheduler can use.
     # Inert until scheduler integration reads it.
     spec: SpecDecodeCaps | None
+
+    # Runtime-wide decode implementation policy and the optional generated
+    # component it selected. All autoregressive runtimes expose both fields;
+    # ``generated_decode`` is ``None`` when this shared component is absent.
+    decode_path: DecodePath
+    generated_decode: GeneratedDecode | None
 
     # Streams
     copy_stream: Any

@@ -22,7 +22,6 @@ from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
 from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
-from .generated_decode import create_generated_decode
 from .image import MAX_IMAGE_TOKENS, MAX_PATCHES, preprocess_image
 from .loader import load_model
 from .paged_cache import paged_kv_specs
@@ -60,6 +59,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             )
 
         self._model_name = cfg.model
+        self.decode_path = getattr(cfg, "decode_path", "auto")
         from kestrel.models.registry import get_spec
 
         model_spec = get_spec(self._model_name)
@@ -157,7 +157,21 @@ class Gemma4Runtime(UncachedPagedRuntime):
             pool=self._kv_pool,
             dtype=self.dtype,
         )
-        self._generated_decode = create_generated_decode(self)
+        self._initialize_generated_decode()
+
+    def _initialize_generated_decode(self) -> None:
+        """Apply the runtime-wide decode policy after model state is ready."""
+
+        self.generated_decode = None
+        if self.decode_path == "native":
+            return
+
+        from .generated_decode import create_generated_decode
+
+        self.generated_decode = create_generated_decode(
+            self,
+            required=self.decode_path == "generated",
+        )
 
     def _configure_model(self, cfg: Any) -> None:
         vision = self.model.model.vision_tower
@@ -458,12 +472,19 @@ class Gemma4Runtime(UncachedPagedRuntime):
     def decode_with_slot(self, slot: Any, batch_size: int) -> None:
         if batch_size == 0:
             return
+        use_generated = (
+            self.generated_decode is not None
+            and self.generated_decode.supports(batch_size)
+        )
+        if not use_generated and self.decode_path == "generated":
+            raise RuntimeError(
+                "required generated Gemma decode does not cover "
+                f"active batch size {batch_size}"
+            )
         with torch.cuda.stream(slot.compute_stream):
-            if (
-                self._generated_decode is not None
-                and self._generated_decode.supports(batch_size)
-            ):
-                self._generated_decode.run(slot, batch_size)
+            if use_generated:
+                assert self.generated_decode is not None
+                self.generated_decode.run(slot, batch_size)
             else:
                 self._run_native_decode(slot, batch_size)
 

@@ -202,6 +202,31 @@ class GeneratedDecode:
     """Select bundled capacities and bind them to one serving runtime."""
 
     @classmethod
+    def _resolve_programs(
+        cls, runtime: Any, spec: GeneratedDecodeSpec,
+    ) -> tuple[Any, ...]:
+        if (
+            not spec.bindings.is_eligible(runtime)
+            or runtime.device.type != "cuda"
+            or runtime.dtype is not torch.bfloat16
+        ):
+            return ()
+        try:
+            from kestrel_kernels.generated_decode import resolve_compatible_programs
+        except ModuleNotFoundError as exc:
+            if exc.name != "kestrel_kernels.generated_decode":
+                raise
+            return ()
+
+        properties = torch.cuda.get_device_properties(runtime.device)
+        return tuple(resolve_compatible_programs(
+            spec.weight_root,
+            layer_prefix=spec.weight_layer_prefix,
+            arch=f"sm{properties.major}{properties.minor}",
+            device_sms=int(properties.multi_processor_count),
+        ))
+
+    @classmethod
     def require(
         cls,
         runtime: Any,
@@ -209,16 +234,17 @@ class GeneratedDecode:
         *,
         capacity: int,
     ) -> "GeneratedDecode":
-        generated = cls.try_create(runtime, spec)
-        if generated is None:
+        programs = cls._resolve_programs(runtime, spec)
+        if not programs:
             raise RuntimeError(
                 f"{spec.label} requires a compatible bundled generated-decode program"
             )
-        if not generated.supports(capacity):
-            raise RuntimeError(
-                f"generated {spec.label} decode does not cover capacity={capacity}"
-            )
-        return generated
+        return cls(
+            runtime,
+            spec=spec,
+            programs=programs,
+            required_capacity=capacity,
+        )
 
     @classmethod
     def try_create(
@@ -226,39 +252,39 @@ class GeneratedDecode:
         runtime: Any,
         spec: GeneratedDecodeSpec,
     ) -> "GeneratedDecode | None":
-        if (
-            not spec.bindings.is_eligible(runtime)
-            or runtime.device.type != "cuda"
-            or runtime.dtype is not torch.bfloat16
-        ):
-            return None
-        try:
-            from kestrel_kernels.generated_decode import resolve_compatible_programs
-        except ModuleNotFoundError as exc:
-            if exc.name != "kestrel_kernels.generated_decode":
-                raise
-            return None
-
-        properties = torch.cuda.get_device_properties(runtime.device)
-        programs = resolve_compatible_programs(
-            spec.weight_root,
-            layer_prefix=spec.weight_layer_prefix,
-            arch=f"sm{properties.major}{properties.minor}",
-            device_sms=int(properties.multi_processor_count),
-        )
+        programs = cls._resolve_programs(runtime, spec)
         if not programs:
             return None
         return cls(runtime, spec=spec, programs=programs)
 
-    def __init__(self, runtime: Any, *, spec: GeneratedDecodeSpec, programs) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        spec: GeneratedDecodeSpec,
+        programs,
+        required_capacity: int | None = None,
+    ) -> None:
+        self._programs = tuple(programs)
+        self._spec = spec
+        if required_capacity is not None:
+            missing = [
+                batch_size
+                for batch_size in range(1, int(required_capacity) + 1)
+                if not self.supports(batch_size)
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"generated {spec.label} decode does not cover active batch "
+                    f"sizes {missing}"
+                )
+
         from kestrel_kernels.generated_decode import (
             assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
         )
 
-        self._programs = tuple(programs)
-        self._spec = spec
         contracts = {repr(program.descriptor["weights"]) for program in programs}
         if len(contracts) != 1:
             raise RuntimeError(

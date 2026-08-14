@@ -281,6 +281,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
         self._spec = get_spec(cfg.model)
         self._model_name = cfg.model
+        self.decode_path = getattr(cfg, "decode_path", "auto")
         self.max_batch_size = getattr(cfg, "max_batch_size", 1)
         self.max_batch_slots = self.max_batch_size + 2
         self._padding_batch_idx = self.max_batch_slots - 1
@@ -429,7 +430,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         )
         self.decode_slots: Sequence[Any] = self._decode_slots
         self._decode_caches = tuple(self._new_cache() for _ in self._decode_slots)
-        self._decode_megakernel = None
         self._decode_graphs = DecodeGraphManager[DecodeSlot](
             enabled=self._use_cuda_graphs,
             device=self.device,
@@ -445,19 +445,34 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
         self.spatial_tables = None
 
-        from .generated_decode import create_generated_decode
+        self._initialize_generated_decode()
 
-        self._decode_megakernel = create_generated_decode(self)
+        if self._use_cuda_graphs:
+            self._decode_graphs.ensure_ready(self._decode_slots)
+
+    def _initialize_generated_decode(self) -> None:
+        """Apply the runtime-wide decode policy before graph capture."""
+
+        self.generated_decode = None
         self._decode_state_coordinator = None
         self._native_decode_state_requirements = ()
-        if self._decode_megakernel is not None:
+        if self.decode_path == "native":
+            return
+
+        from .generated_decode import create_generated_decode
+
+        self.generated_decode = create_generated_decode(
+            self,
+            required=self.decode_path == "generated",
+        )
+        if self.generated_decode is not None:
             from kestrel.runtime.carried_state import CarriedStateCoordinator
 
             native_requirements = {
                 _native_decode_state_requirements(
                     generated, self._linear_state_pool)
                 for generated
-                in self._decode_megakernel.state_requirements_by_capacity.values()
+                in self.generated_decode.state_requirements_by_capacity.values()
             }
             if len(native_requirements) != 1:
                 raise RuntimeError(
@@ -465,7 +480,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             self._native_decode_state_requirements = next(
                 iter(native_requirements))
             self._decode_state_coordinator = CarriedStateCoordinator(
-                buffers=self._decode_megakernel.state_buffers,
+                buffers=self.generated_decode.state_buffers,
                 rows=range(self.max_batch_slots),
                 transitions={
                     "gdn_recurrent_state": (
@@ -473,9 +488,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
                     ),
                 },
             )
-
-        if self._use_cuda_graphs:
-            self._decode_graphs.ensure_ready(self._decode_slots)
 
     @property
     def cuda_graphs_enabled(self) -> bool:
@@ -698,7 +710,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
         if batch_size == 0:
             return
-        megakernel = getattr(self, "_decode_megakernel", None)
+        megakernel = self.generated_decode
+        use_generated = (
+            megakernel is not None and megakernel.supports(batch_size)
+        )
+        if not use_generated and self.decode_path == "generated":
+            raise RuntimeError(
+                "required generated Qwen decode does not cover "
+                f"active batch size {batch_size}"
+            )
         coordinator = getattr(self, "_decode_state_coordinator", None)
         rows = (
             tuple(
@@ -708,7 +728,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
             if coordinator is not None
             else ()
         )
-        if megakernel is not None and megakernel.supports(batch_size):
+        if use_generated:
+            assert megakernel is not None
             stream = getattr(slot, "compute_stream", None)
             stream_context = (
                 torch.cuda.stream(stream) if stream is not None else nullcontext())

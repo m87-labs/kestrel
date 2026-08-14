@@ -19,7 +19,9 @@ def _state_tensors(state_pool: Any, field: str) -> list[torch.Tensor | None]:
     ]
 
 
-def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
+def create_generated_decode(
+    runtime: Any, *, required: bool = False,
+) -> GeneratedDecode | None:
     bindings = PagedDecodeBindings(
         runtime._paged_kv,
         extra_runtime_inputs=lambda bound_runtime: {
@@ -57,30 +59,32 @@ def create_generated_decode(runtime: Any) -> GeneratedDecode | None:
             "gdn_recurrent_state": recurrent,
         }
 
-    return GeneratedDecode.try_create(
-        runtime,
-        GeneratedDecodeSpec(
-            label="Qwen",
-            weight_root=runtime.model,
-            weight_layer_prefix="model.language_model.layers",
-            bindings=bindings,
-            capacity_inputs=state_inputs,
-            preparations=(
-                DeviceInputPreparation(
-                    "gather_rope_deltas", ("rope_deltas",), ("batch_idx",)),
-                DeviceInputPreparation(
-                    "prepare_position_ids",
-                    ("position_ids",),
-                    ("input_pos", "rope_deltas"),
-                ),
+    spec = GeneratedDecodeSpec(
+        label="Qwen",
+        weight_root=runtime.model,
+        weight_layer_prefix="model.language_model.layers",
+        bindings=bindings,
+        capacity_inputs=state_inputs,
+        preparations=(
+            DeviceInputPreparation(
+                "gather_rope_deltas", ("rope_deltas",), ("batch_idx",)),
+            DeviceInputPreparation(
+                "prepare_position_ids",
+                ("position_ids",),
+                ("input_pos", "rope_deltas"),
             ),
-            not_ready_inputs=frozenset({"position_ids"}),
-            preparation_callbacks={
-                "gather_rope_deltas": runtime._gather_decode_rope_deltas,
-                "prepare_position_ids": runtime._prepare_decode_position_ids,
-            },
         ),
+        not_ready_inputs=frozenset({"position_ids"}),
+        preparation_callbacks={
+            "gather_rope_deltas": runtime._gather_decode_rope_deltas,
+            "prepare_position_ids": runtime._prepare_decode_position_ids,
+        },
     )
+    if required:
+        return GeneratedDecode.require(
+            runtime, spec, capacity=runtime.max_batch_size
+        )
+    return GeneratedDecode.try_create(runtime, spec)
 
 
 __all__ = ["create_generated_decode"]

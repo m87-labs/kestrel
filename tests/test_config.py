@@ -37,6 +37,28 @@ def test_runtime_config_preserves_model_path_device_positional_args() -> None:
     assert cfg.tokenizer_path is None
 
 
+def test_runtime_config_rejects_invalid_decode_path_before_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.model_download as model_download
+
+    monkeypatch.setattr(
+        model_download,
+        "ensure_model_weights",
+        lambda _model: pytest.fail("invalid decode_path must fail before download"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="decode_path must be 'auto', 'native', or 'generated'",
+    ):
+        RuntimeConfig(
+            model_path=None,
+            device="cpu",
+            decode_path="fallback",  # type: ignore[arg-type]
+        )
+
+
 def test_torch_cuda_driver_version_falls_back_to_libcuda(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
