@@ -10,6 +10,8 @@ from kestrel.models.moondream.runtime import MoondreamRuntime
 def _forward_runtime(monkeypatch: pytest.MonkeyPatch):
     runtime = MoondreamRuntime.__new__(MoondreamRuntime)
     runtime.model = SimpleNamespace(text=object())
+    runtime.decode_path = "auto"
+    runtime.generated_decode = None
     runtime._embed_packed_token_batch = lambda *args: torch.ones(1, 1, 2)
     slot = SimpleNamespace(
         decode_token_ids=torch.zeros(1, dtype=torch.int64),
@@ -28,6 +30,64 @@ def _forward_runtime(monkeypatch: pytest.MonkeyPatch):
         lambda hidden, text, *, out: out.fill_(1),
     )
     return runtime, slot
+
+
+def test_generated_decode_owns_selected_step_without_native_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, slot = _forward_runtime(monkeypatch)
+
+    class Generated:
+        @staticmethod
+        def supports(batch_size: int) -> bool:
+            return batch_size == 1
+
+        @staticmethod
+        def run(bound_slot, batch_size: int) -> None:
+            assert batch_size == 1
+            torch.testing.assert_close(
+                bound_slot.hidden_last[:1], torch.ones(1, 2)
+            )
+            bound_slot.hidden_last[:1].fill_(3)
+
+    runtime.generated_decode = Generated()
+    runtime._megakernel_decode_hidden = lambda *_args: pytest.fail(
+        "selected generated decode must not run the legacy megakernel"
+    )
+    runtime._native_decode_hidden = lambda *_args: pytest.fail(
+        "selected generated decode must not run native decode"
+    )
+
+    runtime._run_decode_forward(slot, 1)
+
+    torch.testing.assert_close(slot.hidden_last, torch.full((1, 2), 3.0))
+
+
+def test_required_generated_decode_never_falls_back() -> None:
+    runtime = MoondreamRuntime.__new__(MoondreamRuntime)
+    runtime.decode_path = "generated"
+    runtime.generated_decode = SimpleNamespace(supports=lambda _batch: False)
+    runtime.model = SimpleNamespace(text=object())
+    runtime._embed_packed_token_batch = lambda *_args: torch.ones(1, 1, 2)
+    runtime._megakernel_decode_hidden = lambda *_args: pytest.fail(
+        "required generated decode must not run the legacy megakernel"
+    )
+    runtime._native_decode_hidden = lambda *_args: pytest.fail(
+        "required generated decode must not run native decode"
+    )
+    slot = SimpleNamespace(
+        decode_token_ids=torch.zeros(1, dtype=torch.int64),
+        decode_coord_values=torch.zeros(1, 1),
+        decode_size_values=torch.zeros(1, 2),
+        logits=torch.zeros(1, 3),
+        hidden_last=torch.zeros(1, 2),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="required generated Moondream decode does not cover active batch size 1",
+    ):
+        runtime._run_decode_forward(slot, 1)
 
 
 def test_graphs_on_capacity_ineligibility_falls_back_for_only_this_step(
