@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import torch
 
-from kestrel.models.moondream.generated_decode import MoondreamDecodeBindings
+from kestrel.models.moondream.generated_decode import (
+    _engine_weight_buffers,
+    _logical_weight_sources,
+    MoondreamDecodeBindings,
+)
 from kestrel.models.moondream.runtime import _FP8_KV_SUPPORTED_SMS
 
 
@@ -18,6 +22,38 @@ def _cache(value: float) -> SimpleNamespace:
 
 def test_sm86_uses_checkpoint_fp8_kv_for_generated_decode() -> None:
     assert 86 in _FP8_KV_SUPPORTED_SMS
+
+
+def test_moondream_exposes_logical_moe_sources_and_engine_slabs() -> None:
+    class Experts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(2, 3))
+            self.register_buffer("scale", torch.empty(2))
+
+    fused = torch.nn.Module()
+    fused.up_experts = Experts()
+    fused.down_experts = Experts()
+    block = torch.nn.Module()
+    block.mlp = torch.nn.ModuleDict({
+        "router": torch.nn.Linear(3, 2),
+        "mlp": fused,
+    })
+    text = torch.nn.Module()
+    text.blocks = torch.nn.ModuleList([block])
+    text.moe_up_w_slab = torch.empty(1, dtype=torch.uint8)
+    text.moe_up_scale_slab = torch.empty(1)
+
+    sources = _logical_weight_sources(text)
+    buffers = _engine_weight_buffers(text)
+
+    assert sources["blocks.0.mlp.down_experts.weight"] is fused.down_experts.weight
+    assert sources["blocks.0.mlp.down_experts.scale"] is fused.down_experts.scale
+    assert sources["blocks.0.mlp.up_experts.weight"] is fused.up_experts.weight
+    assert sources["blocks.0.mlp.up_experts.scale"] is fused.up_experts.scale
+    assert set(buffers) == {"moe_up_w_slab", "moe_up_scale_slab"}
+    assert buffers["moe_up_w_slab"] is text.moe_up_w_slab
+    assert buffers["moe_up_scale_slab"] is text.moe_up_scale_slab
 
 
 def test_moondream_bindings_expose_compiler_runtime_resources() -> None:

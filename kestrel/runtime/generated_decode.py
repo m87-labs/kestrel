@@ -108,6 +108,7 @@ class GeneratedDecodeSpec:
     weight_layer_prefix: str
     bindings: GeneratedDecodeBindings
     weight_sources: Mapping[str, torch.Tensor] | None = None
+    engine_buffers: Mapping[str, torch.Tensor] | None = None
     weight_storage: Any | None = None
     capacity_inputs: (
         Callable[[int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]]
@@ -680,6 +681,8 @@ class GeneratedDecode:
             materialization_options = {}
             if spec.weight_sources is not None:
                 materialization_options["weight_sources"] = spec.weight_sources
+            if spec.engine_buffers is not None:
+                materialization_options["engine_buffers"] = spec.engine_buffers
             if spec.weight_storage is None:
                 self.weight_storage = materialize_weights(
                     spec.weight_root,

@@ -38,10 +38,12 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         device=torch.device("cuda", 0),
         dtype=torch.bfloat16,
     )
+    weight_sources = {"logical.weight": torch.empty(1)}
     spec = SimpleNamespace(
         bindings=SimpleNamespace(is_eligible=lambda value: value is runtime),
         weight_root=Mock(),
         weight_layer_prefix="model.layers",
+        weight_sources=weight_sources,
     )
     properties = SimpleNamespace(major=10, minor=0, multi_processor_count=148)
 
@@ -59,6 +61,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         layer_prefix="model.layers",
         arch="sm100",
         device_sms=148,
+        weight_sources=weight_sources,
     )
 
 
