@@ -79,6 +79,9 @@ class MoondreamDecodeBindings:
             "mK": [cache.k_cache[:, :, 0, :] for cache in caches],
             "mV": [cache.v_cache[:, :, 0, :] for cache in caches],
             "page_table": runtime.page_table.page_table,
+            # Scalar launch arguments need a construction-time placeholder;
+            # ``launch_extents`` supplies the live maximum position for every run.
+            "kv_len": 1,
         }
 
     def slot_inputs(self, slot: Any, capacity: int) -> Mapping[str, Any]:
