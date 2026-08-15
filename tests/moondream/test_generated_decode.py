@@ -110,7 +110,10 @@ def test_moondream_bindings_expose_compiler_runtime_resources() -> None:
         torch.Size((3, 1, 2)),
         torch.Size((3, 1, 2)),
     ]
-    assert all(tensor.dtype is torch.float32 for tensor in inputs["tau_pos"])
+    assert inputs["tau_pos"].shape == (2, 5, 2)
+    assert inputs["tau_pos"].dtype is torch.float32
+    torch.testing.assert_close(inputs["mK_dequant_scale"], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(inputs["mV_dequant_scale"], torch.tensor([2.0, 3.0]))
 
 
 def test_moondream_slot_bindings_use_stable_hidden_and_metadata_buffers() -> None:
