@@ -95,7 +95,9 @@ def test_moondream_bindings_expose_compiler_runtime_resources() -> None:
         "mK",
         "mV",
         "page_table",
+        "kv_len",
     }
+    assert inputs["kv_len"] == 1
     torch.testing.assert_close(
         inputs["rope_cos"],
         torch.tensor([[1.0, 2.0, 1.0, 2.0], [5.0, 6.0, 5.0, 6.0]]),
