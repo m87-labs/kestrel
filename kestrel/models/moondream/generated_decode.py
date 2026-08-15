@@ -68,14 +68,18 @@ class MoondreamDecodeBindings:
         rope_cos, rope_sin = _rope_tables(runtime.model.text)
         caches = [layer.cache for layer in self.layers]
         return {
-            "tau_pos": [
-                block.attn._tau_pos_table.detach().float().contiguous()
+            "tau_pos": torch.stack([
+                block.attn._tau_pos_table.detach().float()
                 for block in runtime.model.text.blocks
-            ],
+            ]).contiguous(),
             "rope_cos": rope_cos,
             "rope_sin": rope_sin,
-            "mK_dequant_scale": [cache.k_scale_tensor for cache in caches],
-            "mV_dequant_scale": [cache.v_scale_tensor for cache in caches],
+            "mK_dequant_scale": torch.stack([
+                cache.k_scale_tensor for cache in caches
+            ]).contiguous(),
+            "mV_dequant_scale": torch.stack([
+                cache.v_scale_tensor for cache in caches
+            ]).contiguous(),
             "mK": [cache.k_cache[:, :, 0, :] for cache in caches],
             "mV": [cache.v_cache[:, :, 0, :] for cache in caches],
             "page_table": runtime.page_table.page_table,
