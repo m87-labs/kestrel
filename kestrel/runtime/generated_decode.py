@@ -104,6 +104,8 @@ class GeneratedDecodeSpec:
     weight_root: torch.nn.Module
     weight_layer_prefix: str
     bindings: GeneratedDecodeBindings
+    weight_sources: Mapping[str, torch.Tensor] | None = None
+    engine_buffers: Mapping[str, torch.Tensor] | None = None
     capacity_inputs: (
         Callable[[int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]]
         | None
@@ -258,6 +260,7 @@ class GeneratedDecode:
             layer_prefix=spec.weight_layer_prefix,
             arch=f"sm{properties.major}{properties.minor}",
             device_sms=int(properties.multi_processor_count),
+            weight_sources=spec.weight_sources,
         ))
 
     @classmethod
@@ -365,6 +368,8 @@ class GeneratedDecode:
                 spec.weight_root,
                 self._programs[0].descriptor,
                 layer_prefix=spec.weight_layer_prefix,
+                engine_buffers=spec.engine_buffers,
+                weight_sources=spec.weight_sources,
             )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
