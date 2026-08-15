@@ -8,6 +8,30 @@ import torch
 from kestrel.runtime.generated_decode import GeneratedDecode, GeneratedDecodeSpec
 
 
+def _logical_weight_sources(text: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Expose Moondream's compiler namespace without changing module ownership."""
+
+    sources = dict(text.named_parameters(remove_duplicate=False))
+    sources.update(dict(text.named_buffers(remove_duplicate=False)))
+    for layer, block in enumerate(text.blocks):
+        if not hasattr(block.mlp, "router"):
+            continue
+        fused = block.mlp["mlp"]
+        prefix = f"blocks.{layer}.mlp."
+        sources[prefix + "up_experts.weight"] = fused.up_experts.weight
+        sources[prefix + "up_experts.scale"] = fused.up_experts.scale
+        sources[prefix + "down_experts.weight"] = fused.down_experts.weight
+        sources[prefix + "down_experts.scale"] = fused.down_experts.scale
+    return sources
+
+
+def _engine_weight_buffers(text: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        "moe_up_w_slab": text.moe_up_w_slab,
+        "moe_up_scale_slab": text.moe_up_scale_slab,
+    }
+
+
 def _rope_tables(text: Any) -> tuple[torch.Tensor, torch.Tensor]:
     cache = text.cos_sin_cache.float()
     if int(cache.shape[-1]) % 2:
@@ -81,6 +105,8 @@ def create_generated_decode(
         label="Moondream",
         weight_root=runtime.model.text,
         weight_layer_prefix="blocks",
+        weight_sources=_logical_weight_sources(runtime.model.text),
+        engine_buffers=_engine_weight_buffers(runtime.model.text),
         bindings=MoondreamDecodeBindings(runtime.layer_caches),
     )
     if required:
