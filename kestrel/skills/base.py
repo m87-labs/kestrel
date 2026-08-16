@@ -7,7 +7,7 @@ types they exchange with the kernel. Concrete skills live with their model.
 
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 if False:  # pragma: no cover - type-checking imports
     import numpy as np
@@ -21,6 +21,37 @@ if False:  # pragma: no cover - type-checking imports
 AR_DEFAULT_TEMPERATURE = 0.2
 AR_DEFAULT_TOP_P = 0.9
 AR_DEFAULT_MAX_NEW_TOKENS = 768
+
+
+class CapabilityInvoker(Protocol):
+    """Submit one ordinary leaf request for the orchestrated capability."""
+
+    async def __call__(
+        self,
+        prompt: Mapping[str, object],
+        *,
+        image: "Optional[np.ndarray | bytes]" = None,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> object: ...
+
+
+class CapabilityOrchestrator(Protocol):
+    """Model-owned composition of ordinary requests for one capability.
+
+    The orchestrator never enters the scheduler. It receives a narrowly scoped
+    ``invoke`` callback that submits one ordinary request for the same skill,
+    so windowing, retries, and result aggregation can remain model policy while
+    every leaf request keeps the normal admission, batching, and lifecycle.
+    """
+
+    async def run(
+        self,
+        invoke: CapabilityInvoker,
+        *,
+        image: "Optional[np.ndarray | bytes]",
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +95,26 @@ class BuiltRequest:
     # decoder-prefix positions and never contributes to decoder KV length. The
     # runtime owns its asynchronous preprocessing and per-sequence device state.
     encoder_input: object | None = None
+    # A skill can require selected-token log probabilities for its own final
+    # result semantics (for example, transcript confidence). The engine enables
+    # the existing scheduler logprob path even when the caller did not request
+    # the private diagnostic setting.
+    capture_logprobs: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSkillPrompt:
+    """Runtime-resolved decoder prompt and exact generated-token budget.
+
+    Most skills return their ordinary prompt tokens and unchanged budget via
+    :meth:`SkillSpec.prepare_prompt`. A skill whose prompt depends on the
+    runtime tokenizer may override that hook and return an updated immutable
+    request context alongside the exact budget required after tokenization.
+    """
+
+    request_context: object
+    tokens: Sequence["Token"]
+    max_new_tokens: int
 
 
 def parse_settings(
@@ -110,6 +161,17 @@ class SkillSpec:
 
     name: str
 
+    def orchestrator(self) -> Optional[CapabilityOrchestrator]:
+        """Return an optional outer request orchestrator for this capability.
+
+        Most skills are one scheduler request and inherit ``None``. A model
+        whose customer operation is a dependent sequence of ordinary requests
+        may return an orchestrator without teaching the engine or scheduler its
+        domain-specific policy.
+        """
+
+        return None
+
     def build_request(
         self,
         image: "Optional[np.ndarray | bytes]",
@@ -146,6 +208,20 @@ class SkillSpec:
     ) -> Sequence["Token"]:
         raise NotImplementedError
 
+    def prepare_prompt(
+        self,
+        runtime: "AutoregressiveRuntime",
+        request_context: object,
+        max_new_tokens: int,
+    ) -> PreparedSkillPrompt:
+        """Resolve runtime-tokenizer-dependent prompt state before admission."""
+
+        return PreparedSkillPrompt(
+            request_context=request_context,
+            tokens=tuple(self.build_prompt_tokens(runtime, request_context)),
+            max_new_tokens=max_new_tokens,
+        )
+
     def create_state(
         self,
         runtime: "AutoregressiveRuntime",
@@ -162,6 +238,7 @@ class DecodeStep:
     token: "Token"
     position: int
     phase: str = "answer"
+    logprob: float | None = None
 
 
 @dataclass(slots=True)

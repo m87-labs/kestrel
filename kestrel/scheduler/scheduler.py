@@ -291,8 +291,14 @@ class GenerationScheduler:
         self._skills = skill_registry
         # Per-step sampling contract. Optional hooks the runtime
         # can implement:
+        #   * process_logits — apply model-owned, batched in-place logits
+        #     transformations before generic sampling.
+        #   * adjust_sampling_params — modify per-row temperature/top-p after
+        #     request values are gathered and before ordinary sampling.
         #   * sample_greedy — replace ordinary argmax for runtimes with a
         #     batched constrained-greedy device path.
+        #   * score_sampled_tokens — replace generic sampling-distribution
+        #     logprobs with model-owned selected-token scores.
         #   * post_sample — run any model-specific GPU work alongside
         #     sampling (Moondream: coord/size decode from hidden states),
         #     return an opaque handle.
@@ -313,8 +319,13 @@ class GenerationScheduler:
         if not isinstance(hooks, SamplingHooks):
             raise TypeError("runtime.sampling_hooks must be SamplingHooks")
         self._hooks = hooks
-        if self._hooks.sample_greedy is not None and runtime.spec is not None:
-            raise ValueError("custom greedy sampling requires non-speculative decoding")
+        if (
+            self._hooks.process_logits is not None
+            or self._hooks.adjust_sampling_params is not None
+            or self._hooks.sample_greedy is not None
+            or self._hooks.score_sampled_tokens is not None
+        ) and runtime.spec is not None:
+            raise ValueError("custom sampling hooks require non-speculative decoding")
         try:
             self._eos_token_ids = frozenset(map(int, runtime.eos_token_ids))
         except AttributeError as exc:
@@ -2882,6 +2893,17 @@ class GenerationScheduler:
                     )
                     logits[i, idx] = float("-inf")
 
+        if self._hooks.process_logits is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom logits processing"
+                )
+            self._hooks.process_logits(
+                logits,
+                sequences=sequences,
+                batch_idx=batch_idx,
+            )
+
         want_logprobs = logprobs_out is not None and any_return_logprobs
         logprobs = logprobs_out[:batch] if want_logprobs else None
         out_view = out[:batch]
@@ -2941,6 +2963,20 @@ class GenerationScheduler:
             torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
             torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
 
+        if self._hooks.adjust_sampling_params is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom sampling parameters"
+                )
+            if temps is None or top_ps is None:
+                raise AssertionError("sampling parameter buffers are required")
+            self._hooks.adjust_sampling_params(
+                temps,
+                top_ps,
+                sequences=sequences,
+                batch_idx=batch_idx,
+            )
+
         sample_kwargs = {
             "out": out_view,
             "generator": self._sampling_rng,
@@ -2964,6 +3000,20 @@ class GenerationScheduler:
                 temps.index_select(0, baseline_row_idx),
             )
             logprobs.index_copy_(0, baseline_row_idx, base_logprobs)
+        if logprobs is not None and self._hooks.score_sampled_tokens is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom sampled-token scoring"
+                )
+            self._hooks.score_sampled_tokens(
+                logits,
+                sampled_ids=out_view,
+                token_logprobs=logprobs,
+                sequences=sequences,
+                batch_idx=batch_idx,
+                temperatures=temps,
+                top_ps=top_ps,
+            )
         return out_view, temps, top_ps, logprobs
 
     @staticmethod

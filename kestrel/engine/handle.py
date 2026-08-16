@@ -19,13 +19,18 @@ model id so callers bind a model once instead of repeating ``model=``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from kestrel.runtime import ExecutionShape
 
 if TYPE_CHECKING:
     from kestrel.engine.core import InferenceEngine
-    from kestrel.engine._types import EngineResult, EngineStream, ModelStream
+    from kestrel.engine._types import (
+        CapabilityStream,
+        EngineResult,
+        EngineStream,
+        ModelStream,
+    )
 
 
 class ModelHandle:
@@ -141,7 +146,7 @@ class ModelHandle:
         self,
         task: str,
         prompt: dict[str, Any],
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         """Route one capability call by the bound model's execution shape.
 
         A single-pass model interprets the whole prompt in its forward pass
@@ -174,51 +179,79 @@ class ModelHandle:
             return await submission
         self._require_default_ar(task)
         settings = owned_prompt.pop("settings", None)
-        stream = bool(owned_prompt.get("stream", False))
         image = owned_prompt.pop("image", None)
+        skill = self._engine._skill_registry().resolve(task)
+        orchestrator = skill.orchestrator()
+        if orchestrator is not None:
+
+            async def invoke(
+                leaf_prompt: Mapping[str, object],
+                *,
+                image: Optional[Any] = None,
+                settings: Optional[Mapping[str, object]] = None,
+            ) -> object:
+                prompt_copy = dict(leaf_prompt)
+                submission = self._engine._run_skill(
+                    task,
+                    image=image,
+                    prompt=prompt_copy,
+                    settings=settings,
+                    stream=bool(prompt_copy.get("stream", False)),
+                )
+                del prompt_copy, image, settings
+                return await submission
+
+            submission = orchestrator.run(
+                invoke,
+                image=image,
+                prompt=owned_prompt,
+                settings=settings,
+            )
+            del orchestrator, skill, owned_prompt, settings, image
+            return await submission
         submission = self._engine._run_skill(
             task,
             image=image,
             prompt=owned_prompt,
             settings=settings,
-            stream=stream,
+            stream=bool(owned_prompt.get("stream", False)),
         )
-        del owned_prompt, settings, image
+        del skill, owned_prompt, settings, image
         return await submission
 
     async def chat(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("chat", prompt)
 
     async def query(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("query", prompt)
 
     async def caption(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("caption", prompt)
 
     async def detect(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("detect", prompt)
 
     async def point(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("point", prompt)
 
     async def segment(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("segment", prompt)
 
     async def transcribe(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("transcribe", prompt)
 
     def __repr__(self) -> str:

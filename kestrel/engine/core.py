@@ -52,6 +52,7 @@ from kestrel.scheduler import (
 )
 from kestrel.skills import (
     DecodeStep,
+    PreparedSkillPrompt,
     SkillRegistry,
     SkillState,
 )
@@ -526,6 +527,8 @@ class InferenceEngine:
         )
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        if built.capture_logprobs:
+            return_logprobs = True
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         # A skill may carry media it pulled out of its own prompt (e.g. an
@@ -1045,8 +1048,23 @@ class InferenceEngine:
                 raise TypeError("image must be an np.ndarray/bytes, or a list of them")
             image_obj = image
 
+        prepared_prompt = skill_spec.prepare_prompt(
+            self.runtime,
+            request_context,
+            max_new_tokens,
+        )
+        if not isinstance(prepared_prompt, PreparedSkillPrompt):
+            raise TypeError("skill prepare_prompt must return PreparedSkillPrompt")
+        if not isinstance(prepared_prompt.max_new_tokens, int) or isinstance(
+            prepared_prompt.max_new_tokens, bool
+        ):
+            raise TypeError("skill prepared max_new_tokens must be an integer")
+        if prepared_prompt.max_new_tokens <= 0:
+            raise ValueError("skill prepared max_new_tokens must be positive")
+        request_context = prepared_prompt.request_context
+        max_new_tokens = prepared_prompt.max_new_tokens
         prompt_str = skill_spec.prompt_text(request_context)
-        tokens = list(skill_spec.build_prompt_tokens(self.runtime, request_context))
+        tokens = list(prepared_prompt.tokens)
         norm_temperature = self._normalize_temperature(temperature)
         norm_top_p = self._normalize_top_p(top_p)
         self._warn_if_outside_mps_sampler_envelope(norm_temperature, norm_top_p)
@@ -1076,6 +1094,7 @@ class InferenceEngine:
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
         )
+        del prepared_prompt
         await self._queue.put(payload)
         return future, req_id
 
@@ -1756,10 +1775,19 @@ class InferenceEngine:
             raise ValueError(
                 "settings._generated_prefix.tokens must not contain stop tokens"
             )
-        for token in request_obj.generated_prefix.tokens:
+        prefix_logprobs = request_obj.generated_prefix.logprobs
+        for index, token in enumerate(request_obj.generated_prefix.tokens):
             skill_state.consume_step(
                 runtime,
-                DecodeStep(token=token, position=skill_state.token_count),
+                DecodeStep(
+                    token=token,
+                    position=skill_state.token_count,
+                    logprob=(
+                        None
+                        if prefix_logprobs is None
+                        else prefix_logprobs[index]
+                    ),
+                ),
             )
         self._validate_suppress_next_token_ids(
             runtime,

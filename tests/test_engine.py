@@ -20,11 +20,25 @@ from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler import GeneratedPrefix
 from kestrel.skills import (
     DecodeStep,
+    PreparedSkillPrompt,
     SkillFinalizeResult,
     SkillRegistry,
     SkillSpec,
     SkillState,
 )
+
+
+def test_default_prepared_skill_prompt_preserves_tokens_context_and_budget() -> None:
+    context = object()
+    skill = _PrefixSkill()
+
+    prepared = skill.prepare_prompt(object(), context, 7)
+
+    assert prepared == PreparedSkillPrompt(
+        request_context=context,
+        tokens=(),
+        max_new_tokens=7,
+    )
 
 
 def _make_request(
