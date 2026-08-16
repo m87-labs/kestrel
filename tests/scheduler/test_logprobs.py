@@ -11,7 +11,9 @@ from kestrel.models.moondream.runtime import TextToken
 from kestrel.scheduler.scheduler import GenerationScheduler, _MaskPlan
 from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
-from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillState
+from kestrel.runtime.sampling import SamplingHooks
+from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillRegistry, SkillState
+from tests.scheduler._fake_runtime import FakeRuntime
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ def _make_lifecycle_with_state(
 def _scheduler(batch: int = 1) -> GenerationScheduler:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = SimpleNamespace()
+    scheduler._hooks = SamplingHooks()
     scheduler._sampling_rng = torch.Generator()
     scheduler._sampling_temps = torch.empty((batch,), dtype=torch.float32)
     scheduler._sampling_top_ps = torch.empty((batch,), dtype=torch.float32)
@@ -315,6 +318,91 @@ def test_sample_batch_omits_logprob_keyword_without_opt_in(
 
     assert sampled.tolist() == [3]
     assert logprobs is None
+
+
+def test_scheduler_rejects_custom_greedy_with_speculative_decode() -> None:
+    runtime = FakeRuntime()
+    runtime.spec = object()  # type: ignore[assignment]
+    runtime.sampling_hooks = SamplingHooks(
+        sample_greedy=lambda logits, out, **_kwargs: out
+    )
+
+    with pytest.raises(ValueError, match="requires non-speculative"):
+        GenerationScheduler(
+            runtime,
+            compute_stream=None,
+            skill_registry=SkillRegistry([]),
+        )
+
+
+def test_sample_batch_calls_custom_greedy_after_static_and_one_shot_masks() -> None:
+    calls: list[tuple[list[int], int]] = []
+    scheduler = _scheduler()
+
+    def sample_greedy(
+        logits: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        sequences: list[object],
+        batch_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        calls.append((batch_idx.tolist(), len(sequences)))
+        assert torch.isneginf(logits[0, 0])
+        assert torch.isneginf(logits[0, 1])
+        torch.argmax(logits, dim=-1, out=out)
+        return out
+
+    scheduler._hooks = SamplingHooks(sample_greedy=sample_greedy)
+    sampled, _, _, _ = GenerationScheduler._sample_batch(
+        scheduler,
+        torch.tensor([[5.0, 4.0, 3.0]], dtype=torch.float32),
+        [
+            _sequence(
+                temperature=0.0,
+                return_logprobs=None,
+                suppressed_token_ids=[0],
+                suppress_next_token_ids=(1,),
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([7], dtype=torch.long),
+    )
+
+    assert calls == [([7], 1)]
+    assert sampled.tolist() == [2]
+
+
+@pytest.mark.parametrize(
+    ("temperature", "return_logprobs", "message"),
+    [
+        (0.7, None, "requires greedy requests"),
+        (0.0, True, "does not support token logprobs"),
+    ],
+)
+def test_sample_batch_rejects_unsupported_custom_greedy_modes(
+    temperature: float,
+    return_logprobs: bool | None,
+    message: str,
+) -> None:
+    scheduler = _scheduler()
+    scheduler._hooks = SamplingHooks(
+        sample_greedy=lambda _logits, out, **_kwargs: out
+    )
+
+    with pytest.raises(ValueError, match=message):
+        GenerationScheduler._sample_batch(
+            scheduler,
+            torch.zeros((1, 8), dtype=torch.float32),
+            [
+                _sequence(
+                    temperature=temperature,
+                    return_logprobs=return_logprobs,
+                )
+            ],  # type: ignore[list-item]
+            torch.empty((1,), dtype=torch.long),
+            batch_idx=torch.tensor([0], dtype=torch.long),
+            logprobs_out=torch.empty((1,), dtype=torch.float32),
+        )
 
 
 def test_sample_batch_uses_sampler_for_greedy_logprobs(

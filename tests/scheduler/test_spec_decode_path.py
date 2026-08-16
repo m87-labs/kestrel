@@ -340,6 +340,29 @@ def test_spec_finish_on_eos_within_run_retires_and_completes() -> None:
     assert completed[0].finish_reason == "stop"
 
 
+def test_spec_finish_on_additional_runtime_eos_id() -> None:
+    dec = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12, 1000, 13]]},
+    )
+    rt = _spec_runtime(dec, eos_id=999)
+    rt.additional_eos_token_ids = (1000,)
+    sched = _make_scheduler(rt)
+    request = _enqueue(sched, 0, prompt_len=3, max_new=20)
+    sched._spec_admit()
+
+    while sched._spec_decode_step():
+        pass
+
+    assert [int(token.token_id) for token in request.lifecycle.skill_state.tokens] == [
+        11,
+        12,
+        1000,
+    ]
+    assert sched.pop_completed()[0].finish_reason == "stop"
+
+
 def test_spec_finish_on_max_new_tokens() -> None:
     dec = _FakeDecoder(
         n_rows=1,

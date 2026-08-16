@@ -328,6 +328,7 @@ class InferenceEngine:
 
             threading.Thread(
                 target=probe_supported_model_configs,
+                args=(tuple(self._model_ids),),
                 name="kestrel-hf-config-probe",
                 daemon=True,
             ).start()
@@ -454,7 +455,15 @@ class InferenceEngine:
         return self._kv_pool
 
     async def _warmup_query_pipeline(self) -> None:
-        """Ensure the high-level query path is exercised before serving traffic."""
+        """Warm the legacy query pipeline when the default model serves it.
+
+        Runtime construction owns model-kernel/AOT warmup. This engine-level
+        request exists only to exercise the historical query path and must not
+        prevent a transcribe-only autoregressive model from starting.
+        """
+
+        if "query" not in self._skill_registry().names():
+            return
 
         try:
             warmup_settings: Dict[str, object] = {
@@ -528,6 +537,7 @@ class InferenceEngine:
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
             image=effective_image,
+            encoder_input=built.encoder_input,
             temperature=built.temperature,
             top_p=built.top_p,
             _logprobs=return_logprobs,
@@ -548,6 +558,7 @@ class InferenceEngine:
         skill: str,
         adapter: Optional[str] = None,
         image: Optional[np.ndarray | bytes] = None,
+        encoder_input: object | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -567,6 +578,7 @@ class InferenceEngine:
             request_context=request_context,
             adapter=adapter,
             image=image,
+            encoder_input=encoder_input,
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
@@ -577,7 +589,7 @@ class InferenceEngine:
         )
         # Ingress owns the request payload; the remainder of this frame only
         # needs the result future, which may stay pending for a full decode.
-        del request_context, image
+        del request_context, image, encoder_input
         del generated_prefix, suppress_next_token_ids
         return await future
 
@@ -757,6 +769,7 @@ class InferenceEngine:
         skill: str,
         adapter: Optional[str] = None,
         image: Optional[np.ndarray | bytes] = None,
+        encoder_input: object | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         _logprobs: Optional[bool] = None,
@@ -777,6 +790,7 @@ class InferenceEngine:
             request_context=request_context,
             adapter=adapter,
             image=image,
+            encoder_input=encoder_input,
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
@@ -990,6 +1004,7 @@ class InferenceEngine:
         request_context: object,
         adapter: Optional[str],
         image: Optional[np.ndarray | bytes],
+        encoder_input: object | None,
         temperature: Optional[float],
         top_p: Optional[float],
         return_logprobs: Optional[bool],
@@ -1047,6 +1062,7 @@ class InferenceEngine:
             prompt_tokens=tokens,
             image=image_obj,
             image_hash=None,  # Computed in scheduler thread if prefix cache enabled
+            encoder_input=encoder_input,
             max_new_tokens=max_new_tokens,
             temperature=norm_temperature,
             top_p=norm_top_p,
@@ -1317,9 +1333,11 @@ class InferenceEngine:
                 "settings._logprobs is true"
             )
 
-        eos_id = self.runtime.prompt_template.eos_id
+        eos_token_ids = frozenset(map(int, self.runtime.eos_token_ids))
+        if not eos_token_ids:
+            raise ValueError("runtime.eos_token_ids must not be empty")
         for token in generated_prefix.tokens:
-            if isinstance(token, TextToken) and token.token_id == eos_id:
+            if isinstance(token, TextToken) and token.token_id in eos_token_ids:
                 raise ValueError(
                     "settings._generated_prefix.tokens must not contain EOS"
                 )
@@ -1677,7 +1695,12 @@ class InferenceEngine:
         runtime: AutoregressiveRuntime,
         req: _AutoregressiveRequest,
         image_crops: Any,
+        encoder_input: Any = None,
     ) -> tuple[GenerationRequest, SkillState]:
+        if encoder_input is not None and runtime.spec is not None:
+            raise ValueError(
+                "encoder inputs require non-speculative autoregressive decoding"
+            )
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)
         if req.image is None and image_crops is None:
@@ -1703,6 +1726,7 @@ class InferenceEngine:
             image_hash=req.image_hash,
             image_crops=image_crops,
             image_length=image_length,
+            encoder_input=encoder_input,
             submitted_at=req.submitted_at,
             skill=req.skill,
             request_context=req.request_context,

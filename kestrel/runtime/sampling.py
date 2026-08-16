@@ -6,12 +6,10 @@ ids + logprobs. Anything model-specific that has to happen *around*
 that sampling step (e.g. Moondream's per-step coord/size decode from
 hidden states) plugs in here.
 
-A runtime exposes its hooks by assigning a :class:`SamplingHooks`
-value to ``runtime.sampling_hooks``. Runtimes that don't need any
-custom behaviour can leave the attribute unset — the scheduler uses
-``SamplingHooks()`` as the default and, because every field is
-``None``, the per-step path collapses to "sample tokens, ship them
-home as ``TextToken``s." The runtime owns all storage and D2H for any
+A runtime exposes its hooks through ``runtime.sampling_hooks``. Runtimes that
+don't need custom behaviour expose ``SamplingHooks()`` and, because every field
+is ``None``, the per-step path collapses to "sample tokens, ship them home as
+``TextToken``s." The runtime owns all storage and D2H for any
 extra per-step values; the scheduler treats the handle the post-sample
 hook returns as opaque.
 """
@@ -28,31 +26,42 @@ class SamplingHooks:
 
     Wiring:
 
-    1. Scheduler samples token ids on the compute stream and records
+    1. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
+       skill and request-level masks have been applied.
+    2. Scheduler samples token ids on the compute stream and records
        ``ready_event`` once they're written to the staging buffer.
-    2. ``post_sample(...)`` fires next (compute stream) — runtime runs
+    3. ``post_sample(...)`` fires next (compute stream) — runtime runs
        any GPU work it needs (e.g. decode side-values from
        ``hidden_last``) and initiates its own D2H against
        ``ready_event``. It returns an opaque handle the runtime
        understands later.
-    3. Scheduler initiates its own D2H for token ids + logprobs.
-    4. ``prepare_decode_inputs(...)`` fires before the next decode
+    4. Scheduler initiates its own D2H for token ids + logprobs.
+    5. ``prepare_decode_inputs(...)`` fires before the next decode
        launch — runtime gathers any model-specific decode inputs from
        its own per-batch-idx state (the scheduler gathers token ids
        generically).
-    5. On commit, scheduler reads CPU-side token ids + logprobs and
+    6. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
     """
 
+    # sample_greedy(logits, out, *, sequences, batch_idx) -> Tensor
+    # Runs for the first prefill sample and every non-speculative decode sample
+    # after all static and one-shot masks. The hook must write the selected ids
+    # into ``out`` with one batched device path and must not synchronize or read
+    # device values on the host. It is restricted to greedy sampling without
+    # token logprobs. Runtimes exposing it must leave ``spec`` disabled until
+    # their speculative decoder implements equivalent semantics.
+    sample_greedy: Callable[..., Any] | None = None
+
     # post_sample(slot, *, sampled_ids, hidden_last, sequences,
     #             batch_idx, temperatures, top_ps, token_logprobs,
     #             ready_event) -> Any
-    # Decode-only. Receives the runtime's DecodeSlot so it can write
+    # Receives the runtime's prefill/decode slot so it can write
     # per-step side-values into slot-local staging and run its own D2H
     # against ``ready_event``. Returns an opaque handle threaded back
-    # into ``materialize_tokens``. Prefill skips this hook entirely
-    # (prefill's first token is always plain text).
+    # into ``materialize_tokens``. It runs for prefill too because a skill may
+    # constrain the first sampled token to a model-specific token type.
     post_sample: Callable[..., Any] | None = None
 
     # materialize_tokens(token_ids_cpu, sequences, batch_idx, step_handle) -> list[Token]

@@ -59,6 +59,28 @@ def test_modelspec_skills_factory_is_honored() -> None:
     assert spec.skills() is sentinel
 
 
+def test_modelspec_revision_does_not_shift_existing_positional_metadata() -> None:
+    runtime = lambda *args, **kwargs: None
+    skills = lambda: SkillRegistry([])
+    spec = ModelSpec(
+        "m",
+        runtime,
+        skills,
+        "owner/model",
+        "model.safetensors",
+        "safetensors",
+        "owner/tokenizer",
+        {"width": 32},
+    )
+
+    assert spec.repo_id == "owner/model"
+    assert spec.filename == "model.safetensors"
+    assert spec.checkpoint_format == "safetensors"
+    assert spec.tokenizer_id == "owner/tokenizer"
+    assert spec.default_config == {"width": 32}
+    assert spec.revision is None
+
+
 def test_moondream31_a2b_uses_md3_runtime_metadata() -> None:
     spec = get_spec("moondream3.1-9B-A2B")
 

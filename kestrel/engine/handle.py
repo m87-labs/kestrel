@@ -216,6 +216,11 @@ class ModelHandle:
     ) -> "EngineResult | EngineStream | ModelStream":
         return await self._capability("segment", prompt)
 
+    async def transcribe(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream":
+        return await self._capability("transcribe", prompt)
+
     def __repr__(self) -> str:
         return f"ModelHandle(model_id={self._model!r}, tasks={self.tasks})"
 

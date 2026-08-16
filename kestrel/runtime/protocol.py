@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from kestrel.config import DecodePath
 from kestrel.runtime.spec import SpecDecodeCaps
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.runtime.state import (
     PrefillClassification,
     PreparedSequence,
@@ -99,6 +100,11 @@ class AutoregressiveRuntime(Runtime, Protocol):
     max_seq_length: int
     image_prefix_length: int
     vocab_size: int
+    # Model-level terminal token ids. Kept on the runtime rather than the
+    # prompt-template surface because encoder-conditioned decoders need not
+    # expose a text/chat prompt template at all.
+    eos_token_ids: Sequence[int]
+    sampling_hooks: SamplingHooks
 
     # Speculative decoding capability. ``None`` (the default on every runtime
     # today) means one token per decode step, identical to non-speculative
@@ -145,6 +151,8 @@ class AutoregressiveRuntime(Runtime, Protocol):
         self, image: np.ndarray | bytes
     ) -> Future[Any]: ...
 
+    def preprocess_encoder_input_async(self, encoder_input: object) -> Future[Any]: ...
+
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...
 
@@ -170,6 +178,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
         *,
         image: np.ndarray | None = ...,
         image_crops: Any | None = ...,
+        encoder_input: object | None = ...,
         max_new_tokens: int | None = ...,
         lora_slot: int = ...,
         image_hash: bytes | None = ...,
@@ -183,11 +192,30 @@ class AutoregressiveRuntime(Runtime, Protocol):
         *,
         images: Sequence[np.ndarray | None] | None = ...,
         image_crops_list: Sequence[Any] | None = ...,
-    ) -> Tensor: ...
+        encoder_inputs: Sequence[object | None] | None = ...,
+    ) -> Tensor:
+        """Enqueue prefill and return the batch's next-token logits.
+
+        Before returning, the runtime must enqueue every device write that
+        the first decode can observe—including encoder conditioning and
+        cross-attention K/V—on its compute stream. A host synchronization is
+        not required: the scheduler preserves optimistic decode and may
+        enqueue that decode before CPU-side prefill commit, relying on stream
+        ordering for correctness.
+        """
+        ...
 
     def finalize_prepared_sequence_after_prefill(
         self, prepared: PreparedSequence
-    ) -> None: ...
+    ) -> None:
+        """Publish host ownership after prefill completion is synchronized.
+
+        Optimistic decode may already have been enqueued or completed when
+        this hook runs. It therefore finalizes host-side cache/ownership
+        metadata only; it must not install or mutate decode-visible device
+        conditioning.
+        """
+        ...
 
     def abort_prepared_sequence(self, prepared: PreparedSequence) -> None: ...
 

@@ -60,6 +60,10 @@ class BuiltRequest:
     # the image pipeline instead of the top-level ``image`` argument; ``None``
     # leaves any caller-supplied ``image`` in force.
     image: "Optional[np.ndarray | bytes]" = None
+    # Optional encoder-side payload. Unlike ``image``, it is not expanded into
+    # decoder-prefix positions and never contributes to decoder KV length. The
+    # runtime owns its asynchronous preprocessing and per-sequence device state.
+    encoder_input: object | None = None
 
 
 def parse_settings(

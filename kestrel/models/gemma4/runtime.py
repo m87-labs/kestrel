@@ -70,12 +70,22 @@ class Gemma4Runtime(UncachedPagedRuntime):
             model_source,
             device=self.device,
             dtype=self.dtype,
+            revision=model_spec.revision,
         )
         self._config = self.model.config
         self._configure_model(cfg)
-        self.tokenizer = load_tokenizer(model_spec.tokenizer_id, cfg.tokenizer_path)
+        self.tokenizer = load_tokenizer(
+            model_spec.tokenizer_id,
+            cfg.tokenizer_path,
+            revision=(
+                model_spec.revision
+                if model_spec.tokenizer_id == model_spec.repo_id
+                else None
+            ),
+        )
         self.tokenizer.post_processor = None
         self.prompt_template = Gemma4PromptTemplate(self._model_name)
+        self.eos_token_ids = (self.prompt_template.eos_id,)
 
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.spec = None
@@ -334,12 +344,15 @@ class Gemma4Runtime(UncachedPagedRuntime):
         *,
         image: Any = None,
         image_crops: Any = None,
+        encoder_input: object | None = None,
         max_new_tokens: int | None = None,
         lora_slot: int = 0,
         image_hash: bytes | None = None,
         adapter_id: str | None = None,
     ) -> Any:
         del image
+        if encoder_input is not None:
+            raise ValueError("Gemma4Runtime does not support encoder inputs")
         tokens, image_tokens, text_length = self._prepare_prompt(
             prompt_tokens,
             image_crops=image_crops,
@@ -366,8 +379,13 @@ class Gemma4Runtime(UncachedPagedRuntime):
         *,
         images: Sequence[Any] | None = None,
         image_crops_list: Sequence[Any] | None = None,
+        encoder_inputs: Sequence[object | None] | None = None,
     ) -> torch.Tensor:
         del images
+        if encoder_inputs is not None and any(
+            item is not None for item in encoder_inputs
+        ):
+            raise ValueError("Gemma4Runtime does not support encoder inputs")
         batch_size = len(prepared_sequences)
         if not 0 < batch_size <= self.max_batch_size:
             raise ValueError(

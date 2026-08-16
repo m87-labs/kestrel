@@ -320,9 +320,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self.tokenizer = load_tokenizer(
             self._spec.tokenizer_id,
             getattr(cfg, "tokenizer_path", None),
+            revision=(
+                self._spec.revision
+                if self._spec.tokenizer_id == self._spec.repo_id
+                else None
+            ),
         )
         self.tokenizer.post_processor = None
         self.prompt_template = Qwen35PromptTemplate()
+        self.eos_token_ids = (self.prompt_template.eos_id,)
 
         # Conservative fixed reservation for image requests. Actual prompt
         # insertion uses the per-image processor count.
@@ -500,6 +506,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             source,
             device=self.device,
             dtype=self.dtype,
+            revision=self._spec.revision,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:
@@ -538,11 +545,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
         *,
         image: Optional[Any] = None,
         image_crops: Optional[QwenImageInputs] = None,
+        encoder_input: object | None = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
         image_hash: Optional[bytes] = None,
         adapter_id: Optional[str] = None,
     ) -> Any:
+        if encoder_input is not None:
+            raise ValueError("Qwen35Runtime does not support encoder inputs")
+
         from kestrel.runtime.tokens import TextToken
         from kestrel.runtime.tokens import ImageMarker
 
@@ -645,7 +656,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
         *,
         images: Optional[Sequence[Any]] = None,
         image_crops_list: Optional[Sequence[Optional[QwenImageInputs]]] = None,
+        encoder_inputs: Optional[Sequence[object | None]] = None,
     ) -> torch.Tensor:
+        if encoder_inputs is not None and any(
+            item is not None for item in encoder_inputs
+        ):
+            raise ValueError("Qwen35Runtime does not support encoder inputs")
         batch_size = len(prepared_sequences)
         if batch_size == 0:
             raise ValueError("prepared_sequences must be non-empty")

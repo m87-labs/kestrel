@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
+
+import pytest
 
 from kestrel.engine import (
     AutoregressiveExecutor,
@@ -22,6 +24,7 @@ from kestrel.engine import (
     EngineMetrics,
     _AutoregressiveRequest,
 )
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.scheduler import SchedulerResult
 from kestrel.scheduler.types import RequestMetrics
 
@@ -57,6 +60,7 @@ def _executor() -> AutoregressiveExecutor:
         max_batch_slots=2,
         active_sequences={},
         release_sequence=lambda state: None,
+        sampling_hooks=SamplingHooks(),
     )
     ex._admission_capacity = 4
     ex._to_engine_result = _fake_to_engine_result
@@ -198,6 +202,42 @@ def test_admission_failure_surfaces_as_completion() -> None:
     assert len(tick.completed) == 1
     assert isinstance(tick.completed[0].error, ValueError)
     assert ex.has_work is False
+
+
+@pytest.mark.parametrize(
+    ("configure", "message"),
+    [
+        (lambda request: setattr(request, "return_logprobs", True), "logprobs"),
+        (lambda request: setattr(request, "temperature", 0.5), "greedy requests"),
+        (
+            lambda request: setattr(request, "temperature", float("nan")),
+            "greedy requests",
+        ),
+    ],
+)
+def test_unsupported_custom_greedy_request_fails_before_admission(
+    configure: Callable[[_AutoregressiveRequest], None],
+    message: str,
+) -> None:
+    ex = _executor()
+    ex._runtime.sampling_hooks = SamplingHooks(
+        sample_greedy=lambda logits, out, **_kwargs: out
+    )
+    admitted: list[_AutoregressiveRequest] = []
+    ex._admission.submit = lambda request: admitted.append(request)
+    rejected = _pending(5)
+    configure(rejected)
+    supported = _pending(6)
+
+    ex.submit(rejected)
+    ex.submit(supported)
+
+    assert admitted == [supported]
+    tick = ex.advance()
+    assert len(tick.completed) == 1
+    assert tick.completed[0].request is rejected
+    assert isinstance(tick.completed[0].error, ValueError)
+    assert message in str(tick.completed[0].error)
 
 
 def test_advance_raising_preserves_queued_admission_failures() -> None:

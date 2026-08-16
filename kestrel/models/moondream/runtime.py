@@ -673,9 +673,15 @@ class MoondreamRuntime:
         self.tokenizer = load_tokenizer(
             self._spec.tokenizer_id,
             cfg.tokenizer_path,
+            revision=(
+                self._spec.revision
+                if self._spec.tokenizer_id == self._spec.repo_id
+                else None
+            ),
         )
         # TokenizerConfig satisfies the PromptTemplate protocol directly.
         self.prompt_template = self.config.tokenizer
+        self.eos_token_ids = (self.prompt_template.eos_id,)
 
         head_dim = self.config.text.dim // self.config.text.n_heads
         self.head_dim = head_dim
@@ -1236,6 +1242,9 @@ class MoondreamRuntime:
     def preprocess_image_async(self, image):
         """Return a Future for Moondream's overlap-crop preprocessing."""
         return self._image_preprocessor.submit(image, self.config.vision)
+
+    def preprocess_encoder_input_async(self, encoder_input: object):
+        raise ValueError("MoondreamRuntime does not support encoder inputs")
 
     def shutdown(self) -> None:
         """Release runtime resources (Runtime protocol).
@@ -1804,6 +1813,7 @@ class MoondreamRuntime:
         *,
         image: Optional[np.ndarray] = None,
         image_crops: Optional[OverlapCropOutput] = None,
+        encoder_input: object | None = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
         image_hash: bytes | None = None,
@@ -1825,6 +1835,9 @@ class MoondreamRuntime:
         at launch time, allowing preparation to proceed even when all prefill
         slots are occupied by in-flight prefills.
         """
+
+        if encoder_input is not None:
+            raise ValueError("MoondreamRuntime does not support encoder inputs")
 
         # 1. Normalize inputs
         tokens_list = list(prompt_tokens)
@@ -1981,6 +1994,7 @@ class MoondreamRuntime:
         *,
         images: Sequence[Optional[np.ndarray]] | None = None,
         image_crops_list: Sequence[Optional[OverlapCropOutput]] | None = None,
+        encoder_inputs: Sequence[object | None] | None = None,
     ) -> Tensor:
         """Launch GPU prefill for one or more prepared sequences.
 
@@ -1994,6 +2008,10 @@ class MoondreamRuntime:
             raise ValueError(
                 f"Prefill batch size {batch_size} exceeds max_batch_size={self.max_batch_size}"
             )
+        if encoder_inputs is not None and any(
+            item is not None for item in encoder_inputs
+        ):
+            raise ValueError("MoondreamRuntime does not support encoder inputs")
 
         if images is None:
             images = [None] * batch_size

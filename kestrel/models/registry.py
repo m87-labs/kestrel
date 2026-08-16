@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kestrel.config import RuntimeConfig
     from kestrel.runtime import Runtime
     from kestrel.skills import SkillRegistry
 
@@ -39,14 +38,17 @@ class ModelSpec:
     skills: Callable[[], "SkillRegistry"] = lambda: _empty_skill_registry()
 
     # --- Autoregressive / HuggingFace bootstrap hints (optional) ---
-    # Consumed by a specific runtime family's weight loader + tokenizer
-    # (Moondream's). A single-pass spec whose factory owns loading omits
-    # them; the kernel never reads these — it only calls ``runtime``.
+    # Consumed by an autoregressive runtime family's weight loader and
+    # tokenizer. A single-pass spec whose factory owns loading omits them;
+    # the kernel never reads these — it only calls ``runtime``.
     repo_id: Optional[str] = None
     filename: Optional[str] = None
     checkpoint_format: Optional[str] = None
     tokenizer_id: Optional[str] = None
     default_config: Dict[str, Any] = field(default_factory=dict)
+    # Immutable revision for artifacts hosted by ``repo_id``. Runtimes also
+    # apply it to the tokenizer when ``tokenizer_id`` names that same repo.
+    revision: Optional[str] = None
 
 
 def _empty_skill_registry() -> "SkillRegistry":

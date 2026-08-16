@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.runtime.state import (
     PreparedSequence,
     PrefillClassification,
@@ -19,6 +20,7 @@ class UncachedPagedRuntime:
     prefix_cache = None
     decode_path = "auto"
     generated_decode = None
+    sampling_hooks = SamplingHooks()
 
     @property
     def model_name(self) -> str:
@@ -46,6 +48,11 @@ class UncachedPagedRuntime:
 
     def preprocess_image_async(self, image: Any) -> Any:
         return self._image_preprocessor.submit(image)
+
+    def preprocess_encoder_input_async(self, encoder_input: object) -> Any:
+        raise ValueError(
+            f"{type(self).__name__} does not support encoder inputs"
+        )
 
     def shutdown(self) -> None:
         self._image_preprocessor.shutdown()

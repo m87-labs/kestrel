@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -35,6 +36,7 @@ from kestrel.runtime import (
     SequenceState,
 )
 from kestrel.runtime.tokens import Token
+from kestrel.runtime.sampling import SamplingHooks
 
 
 class _FakePageTable:
@@ -112,6 +114,7 @@ class FakeRuntime:
         self.spec = None
         self.decode_path = "auto"
         self.generated_decode = None
+        self.sampling_hooks = SamplingHooks()
 
         # Capacity / shape
         self.max_batch_size = max_batch_size
@@ -119,6 +122,8 @@ class FakeRuntime:
         self.max_seq_length = max_seq_length
         self.image_prefix_length = image_prefix_length
         self.vocab_size = vocab_size
+        self.prompt_template = SimpleNamespace(eos_id=0)
+        self.additional_eos_token_ids: tuple[int, ...] = ()
 
         # Device + streams
         self.device: torch.device = (
@@ -172,11 +177,18 @@ class FakeRuntime:
         self.classify_calls: list[Sequence[Token]] = []
         self.prepare_calls: list[dict[str, Any]] = []
         self.launch_calls: list[Sequence[PreparedSequence]] = []
+        self.launch_kwargs: list[dict[str, Any]] = []
+        self.encoder_input_preprocess_calls: list[Any] = []
         self.finalized_prepared: list[PreparedSequence] = []
         self.aborted_prepared: list[PreparedSequence] = []
         self.retained_prefixes: list[dict[str, Any]] = []
         self.released_sequences: list[SequenceState] = []
         self.decode_calls: list[tuple[Any, int]] = []
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        # Keep termination metadata derived from the fake's active template.
+        return (int(self.prompt_template.eos_id), *self.additional_eos_token_ids)
 
     # Capacity queries -------------------------------------------------
     def can_reserve(self, total_length: int) -> bool:
@@ -189,6 +201,12 @@ class FakeRuntime:
     def preprocess_image_async(self, image: Any) -> Future:
         fut: Future = Future()
         fut.set_result(image)
+        return fut
+
+    def preprocess_encoder_input_async(self, encoder_input: Any) -> Future:
+        self.encoder_input_preprocess_calls.append(encoder_input)
+        fut: Future = Future()
+        fut.set_result(encoder_input)
         return fut
 
     def shutdown(self) -> None:
@@ -239,12 +257,22 @@ class FakeRuntime:
             use_prefix_attn=False,
         )
 
+    def check_prefix_cache(
+        self,
+        prompt_tokens: Sequence[Token],
+        image_hash: bytes | None,
+        adapter_id: str | None,
+    ) -> bool:
+        del prompt_tokens, image_hash, adapter_id
+        return False
+
     def prepare_sequence(
         self,
         prompt_tokens: Sequence[Token],
         *,
         image: Any = None,
         image_crops: Any = None,
+        encoder_input: Any = None,
         max_new_tokens: int | None = None,
         lora_slot: int = 0,
         image_hash: bytes | None = None,
@@ -255,6 +283,7 @@ class FakeRuntime:
                 "prompt_tokens": prompt_tokens,
                 "image": image,
                 "image_crops": image_crops,
+                "encoder_input": encoder_input,
                 "max_new_tokens": max_new_tokens,
                 "lora_slot": lora_slot,
                 "image_hash": image_hash,
@@ -276,8 +305,16 @@ class FakeRuntime:
         *,
         images: Sequence[Any] | None = None,
         image_crops_list: Sequence[Any] | None = None,
+        encoder_inputs: Sequence[Any] | None = None,
     ) -> torch.Tensor:
         self.launch_calls.append(prepared_sequences)
+        self.launch_kwargs.append(
+            {
+                "images": images,
+                "image_crops_list": image_crops_list,
+                "encoder_inputs": encoder_inputs,
+            }
+        )
         if self._launch_logits is not None:
             return self._launch_logits
         return torch.zeros(len(prepared_sequences), 1)
