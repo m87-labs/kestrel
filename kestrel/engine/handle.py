@@ -25,7 +25,12 @@ from kestrel.runtime import ExecutionShape
 
 if TYPE_CHECKING:
     from kestrel.engine.core import InferenceEngine
-    from kestrel.engine._types import EngineResult, EngineStream, ModelStream
+    from kestrel.engine._types import (
+        CapabilityStream,
+        EngineResult,
+        EngineStream,
+        ModelStream,
+    )
 
 
 class ModelHandle:
@@ -141,7 +146,7 @@ class ModelHandle:
         self,
         task: str,
         prompt: dict[str, Any],
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         """Route one capability call by the bound model's execution shape.
 
         A single-pass model interprets the whole prompt in its forward pass
@@ -216,37 +221,37 @@ class ModelHandle:
 
     async def chat(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("chat", prompt)
 
     async def query(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("query", prompt)
 
     async def caption(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("caption", prompt)
 
     async def detect(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("detect", prompt)
 
     async def point(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("point", prompt)
 
     async def segment(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("segment", prompt)
 
     async def transcribe(
         self, **prompt: Any
-    ) -> "EngineResult | EngineStream | ModelStream":
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("transcribe", prompt)
 
     def __repr__(self) -> str:

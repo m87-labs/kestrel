@@ -6,6 +6,8 @@ keeps working after the split from a single module into a package.
 
 from kestrel.engine._types import (
     Completion,
+    CapabilityStream,
+    CapabilityUpdate,
     EngineMetrics,
     EngineResult,
     EngineStream,
@@ -29,6 +31,8 @@ __all__ = [
     "EngineResult",
     "EngineMetrics",
     "EngineStream",
+    "CapabilityStream",
+    "CapabilityUpdate",
     "ModelStream",
     "ModelStreamUpdate",
     "Executor",

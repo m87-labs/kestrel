@@ -114,6 +114,103 @@ class EngineStream(AsyncIterator[StreamUpdate]):
 
 
 @dataclass(slots=True)
+class CapabilityUpdate:
+    """One coalescible progress snapshot from compound capability work."""
+
+    task: str
+    index: int
+    output: Dict[str, object]
+
+
+_EmitCapabilityUpdate = Callable[[Dict[str, object]], None]
+_CapabilityProducer = Callable[[_EmitCapabilityUpdate], Awaitable[EngineResult]]
+
+
+class CapabilityStream(AsyncIterator[CapabilityUpdate]):
+    """Bounded progress stream for a multi-request capability operation.
+
+    Updates are snapshots rather than an append-only event log. If a consumer
+    is slower than the producer, the pending snapshot is replaced by the most
+    recent one. This keeps memory bounded while ``result()`` remains usable by
+    callers that do not iterate progress.
+    """
+
+    __slots__ = ("task", "_queue", "_producer", "_index", "_closed")
+
+    def __init__(self, task: str, producer: _CapabilityProducer) -> None:
+        if not isinstance(task, str) or not task:
+            raise ValueError("CapabilityStream task must be a non-empty string")
+        self.task = task
+        self._queue: asyncio.Queue[CapabilityUpdate] = asyncio.Queue(maxsize=1)
+        self._index = 0
+        self._closed = False
+
+        def emit(output: Dict[str, object]) -> None:
+            if self._closed:
+                return
+            if not isinstance(output, dict):
+                raise TypeError("capability progress output must be a dict")
+            update = CapabilityUpdate(
+                task=self.task,
+                index=self._index,
+                output=dict(output),
+            )
+            self._index += 1
+            if self._queue.full():
+                self._queue.get_nowait()
+            self._queue.put_nowait(update)
+
+        self._producer = asyncio.create_task(producer(emit))
+
+    def __aiter__(self) -> "CapabilityStream":
+        return self
+
+    async def __anext__(self) -> CapabilityUpdate:
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        if self._producer.done():
+            await self._producer
+            raise StopAsyncIteration
+        next_update = asyncio.create_task(self._queue.get())
+        done, _ = await asyncio.wait(
+            (next_update, self._producer),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if next_update in done:
+            return next_update.result()
+        next_update.cancel()
+        try:
+            await next_update
+        except asyncio.CancelledError:
+            pass
+        await self._producer
+        raise StopAsyncIteration
+
+    async def result(self) -> EngineResult:
+        return await self._producer
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._producer.done():
+            self._producer.cancel()
+        try:
+            await self._producer
+        except asyncio.CancelledError:
+            pass
+
+    async def __aenter__(self) -> "CapabilityStream":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is not None:
+            await self.aclose()
+        else:
+            await self.result()
+
+
+@dataclass(slots=True)
 class ModelStreamUpdate:
     """One model-defined update from a stateful streaming session."""
 
