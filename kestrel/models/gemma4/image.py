@@ -6,9 +6,9 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-import kestrel_native
 import numpy as np
 import torch
+import torch.nn.functional as F
 from kestrel.utils.image import decode_to_srgb
 
 
@@ -68,9 +68,19 @@ def preprocess_image(
     resized_w = grid_w * PATCH_SIZE
 
     num_valid = grid_h * grid_w
+    pixels = torch.from_numpy(array).permute(2, 0, 1)
     if array.shape[:2] != (resized_h, resized_w):
-        array = kestrel_native.resize_bicubic(array, resized_h, resized_w)
-    pixels = torch.from_numpy(array)
+        # Match Gemma4ImageProcessor's uint8 antialiased bicubic boundary.
+        # The generic native resize has different edge and antialias semantics,
+        # which changes the vision tokens before model execution.
+        pixels = F.interpolate(
+            pixels.unsqueeze(0),
+            size=(resized_h, resized_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
+    pixels = pixels.permute(1, 2, 0).contiguous()
     patches = (
         pixels.reshape(
             grid_h,

@@ -536,6 +536,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         pixel_position_ids: torch.Tensor,
         padding_positions: torch.Tensor,
     ) -> torch.Tensor:
+        pixel_values = 2 * (pixel_values - 0.5)
         hidden_states = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
         positions = pixel_position_ids.clamp(min=0)
         position_embeddings = (
@@ -574,7 +575,7 @@ class Gemma4VisionPooler(nn.Module):
         weights = F.one_hot(kernel_idxs.long(), length).float() / k_squared
         output = weights.transpose(1, 2) @ hidden_states.float()
         mask = torch.logical_not((weights == 0).all(dim=1))
-        return output.to(hidden_states.dtype), mask
+        return output, mask
 
     def forward(
         self,
@@ -593,7 +594,7 @@ class Gemma4VisionPooler(nn.Module):
             hidden_states, padding_positions = self._avg_pool_by_positions(
                 hidden_states, pixel_position_ids, output_length
             )
-        hidden_states = hidden_states * self.root_hidden_size
+        hidden_states = hidden_states.float() * self.root_hidden_size
         return hidden_states, padding_positions
 
 
@@ -828,7 +829,11 @@ class Gemma4VisionModel(nn.Module):
         hidden_states = hidden_states[pooler_mask]
 
         if self.config.standardize:
-            hidden_states = (hidden_states - self.std_bias) * self.std_scale
+            hidden_states = (
+                hidden_states - self.std_bias.float()
+            ) * self.std_scale.float()
+
+        hidden_states = hidden_states.to(inputs_embeds.dtype)
 
         return hidden_states
 
