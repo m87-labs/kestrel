@@ -578,8 +578,8 @@ def test_sample_batch_applies_model_owned_sampling_params_before_sampling(
         scheduler,
         torch.ones((2, 3), dtype=torch.float32),
         [
-            _sequence(temperature=0.8),
-            _sequence(temperature=0.6),
+            _sequence(temperature=0.8, return_logprobs=False),
+            _sequence(temperature=0.6, return_logprobs=False),
         ],  # type: ignore[list-item]
         torch.empty((2,), dtype=torch.long),
         batch_idx=torch.tensor([0, 1], dtype=torch.long),
