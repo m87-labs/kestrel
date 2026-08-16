@@ -28,23 +28,25 @@ class SamplingHooks:
 
     1. ``process_logits(...)`` optionally transforms the masked logits in place
        before generic greedy, temperature, top-p, or logprob sampling.
-    2. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
+    2. ``adjust_sampling_params(...)`` may mutate the per-row temperature and
+       top-p buffers before ordinary sampling.
+    3. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
        skill, model, and request-level masks have been applied.
-    3. Scheduler samples token ids on the compute stream.
-    4. ``score_sampled_tokens(...)`` may replace the generic sampler's staged
+    4. Scheduler samples token ids on the compute stream.
+    5. ``score_sampled_tokens(...)`` may replace the generic sampler's staged
        logprob with a model-owned score derived from the final masked logits.
-    5. Scheduler records ``ready_event`` once token ids and logprobs are ready.
-    6. ``post_sample(...)`` fires next (compute stream) — runtime runs
+    6. Scheduler records ``ready_event`` once token ids and logprobs are ready.
+    7. ``post_sample(...)`` fires next (compute stream) — runtime runs
        any GPU work it needs (e.g. decode side-values from
        ``hidden_last``) and initiates its own D2H against
        ``ready_event``. It returns an opaque handle the runtime
        understands later.
-    7. Scheduler initiates its own D2H for token ids + logprobs.
-    8. ``prepare_decode_inputs(...)`` fires before the next decode
+    8. Scheduler initiates its own D2H for token ids + logprobs.
+    9. ``prepare_decode_inputs(...)`` fires before the next decode
        launch — runtime gathers any model-specific decode inputs from
        its own per-batch-idx state (the scheduler gathers token ids
        generically).
-    9. On commit, scheduler reads CPU-side token ids + logprobs and
+    10. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
     """
@@ -58,6 +60,16 @@ class SamplingHooks:
     # leave ``spec`` disabled until their speculative decoder implements the
     # same transformation.
     process_logits: Callable[..., None] | None = None
+
+    # adjust_sampling_params(temperatures, top_ps, *, sequences, batch_idx)
+    # Mutates the scheduler-owned float32 per-row sampling parameters after
+    # request values have been gathered and before ordinary sampling. This is
+    # for model phases that require deterministic selection while later phases
+    # retain the caller's requested sampling policy (for example Whisper's
+    # one-token language identification). It must not synchronize or read
+    # device values on the host. Runtimes exposing it must leave speculative
+    # decoding disabled until the speculative path implements the same policy.
+    adjust_sampling_params: Callable[..., None] | None = None
 
     # sample_greedy(logits, out, *, sequences, batch_idx) -> Tensor
     # Runs for the first prefill sample and every non-speculative decode sample

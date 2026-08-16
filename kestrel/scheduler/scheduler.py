@@ -293,6 +293,8 @@ class GenerationScheduler:
         # can implement:
         #   * process_logits — apply model-owned, batched in-place logits
         #     transformations before generic sampling.
+        #   * adjust_sampling_params — modify per-row temperature/top-p after
+        #     request values are gathered and before ordinary sampling.
         #   * sample_greedy — replace ordinary argmax for runtimes with a
         #     batched constrained-greedy device path.
         #   * score_sampled_tokens — replace generic sampling-distribution
@@ -319,6 +321,7 @@ class GenerationScheduler:
         self._hooks = hooks
         if (
             self._hooks.process_logits is not None
+            or self._hooks.adjust_sampling_params is not None
             or self._hooks.sample_greedy is not None
             or self._hooks.score_sampled_tokens is not None
         ) and runtime.spec is not None:
@@ -2959,6 +2962,20 @@ class GenerationScheduler:
             top_ps = self._sampling_top_ps[:batch]
             torch.index_select(self._sampling_temps_by_batch, 0, batch_idx, out=temps)
             torch.index_select(self._sampling_top_ps_by_batch, 0, batch_idx, out=top_ps)
+
+        if self._hooks.adjust_sampling_params is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom sampling parameters"
+                )
+            if temps is None or top_ps is None:
+                raise AssertionError("sampling parameter buffers are required")
+            self._hooks.adjust_sampling_params(
+                temps,
+                top_ps,
+                sequences=sequences,
+                batch_idx=batch_idx,
+            )
 
         sample_kwargs = {
             "out": out_view,
