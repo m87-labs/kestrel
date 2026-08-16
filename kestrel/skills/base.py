@@ -7,7 +7,7 @@ types they exchange with the kernel. Concrete skills live with their model.
 
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 if False:  # pragma: no cover - type-checking imports
     import numpy as np
@@ -21,6 +21,37 @@ if False:  # pragma: no cover - type-checking imports
 AR_DEFAULT_TEMPERATURE = 0.2
 AR_DEFAULT_TOP_P = 0.9
 AR_DEFAULT_MAX_NEW_TOKENS = 768
+
+
+class CapabilityInvoker(Protocol):
+    """Submit one ordinary leaf request for the orchestrated capability."""
+
+    async def __call__(
+        self,
+        prompt: Mapping[str, object],
+        *,
+        image: "Optional[np.ndarray | bytes]" = None,
+        settings: Optional[Mapping[str, object]] = None,
+    ) -> object: ...
+
+
+class CapabilityOrchestrator(Protocol):
+    """Model-owned composition of ordinary requests for one capability.
+
+    The orchestrator never enters the scheduler. It receives a narrowly scoped
+    ``invoke`` callback that submits one ordinary request for the same skill,
+    so windowing, retries, and result aggregation can remain model policy while
+    every leaf request keeps the normal admission, batching, and lifecycle.
+    """
+
+    async def run(
+        self,
+        invoke: CapabilityInvoker,
+        *,
+        image: "Optional[np.ndarray | bytes]",
+        prompt: Mapping[str, object],
+        settings: Optional[Mapping[str, object]],
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +140,17 @@ class SkillSpec:
     """
 
     name: str
+
+    def orchestrator(self) -> Optional[CapabilityOrchestrator]:
+        """Return an optional outer request orchestrator for this capability.
+
+        Most skills are one scheduler request and inherit ``None``. A model
+        whose customer operation is a dependent sequence of ordinary requests
+        may return an orchestrator without teaching the engine or scheduler its
+        domain-specific policy.
+        """
+
+        return None
 
     def build_request(
         self,

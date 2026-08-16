@@ -20,7 +20,13 @@ import pytest
 
 from kestrel.engine import InferenceEngine, ModelHandle
 from kestrel.runtime import ExecutionShape
-from kestrel.skills import BuiltRequest, SkillRegistry, SkillSpec
+from kestrel.skills import (
+    BuiltRequest,
+    CapabilityInvoker,
+    CapabilityOrchestrator,
+    SkillRegistry,
+    SkillSpec,
+)
 from kestrel.models.moondream.skills import CaptionSkill, SegmentSkill
 from kestrel.skills import QuerySkill
 
@@ -62,6 +68,32 @@ class _TranscribeSkill(SkillSpec):
             top_p=1.0,
             encoder_input=prompt["audio"],
         )
+
+
+class _WindowOrchestrator(CapabilityOrchestrator):
+    async def run(
+        self,
+        invoke: CapabilityInvoker,
+        *,
+        image: Any,
+        prompt: Any,
+        settings: Any,
+    ) -> object:
+        outputs = []
+        for index, audio in enumerate(prompt["windows"]):
+            outputs.append(
+                await invoke(
+                    {"audio": audio, "window": index},
+                    image=image,
+                    settings=settings,
+                )
+            )
+        return tuple(outputs)
+
+
+class _CompoundTranscribeSkill(_TranscribeSkill):
+    def orchestrator(self) -> CapabilityOrchestrator:
+        return _WindowOrchestrator()
 
 
 def _engine() -> InferenceEngine:
@@ -272,6 +304,58 @@ def test_transcribe_verb_routes_audio_through_model_skill() -> None:
     assert captured["task"] == "transcribe"
     assert captured["image"] is None
     assert captured["prompt"] == {"audio": b"RIFF..."}
+
+
+def test_capability_orchestrator_composes_ordinary_leaf_requests() -> None:
+    eng = _engine()
+    skills = SkillRegistry([_CompoundTranscribeSkill()])
+    eng._runtimes["ar-model"].skills = lambda: skills
+    calls: list[dict[str, Any]] = []
+
+    async def run_skill(
+        task: str,
+        *,
+        image: Any,
+        prompt: Any,
+        settings: Any,
+        stream: Any,
+    ) -> str:
+        calls.append(
+            {
+                "task": task,
+                "image": image,
+                "prompt": dict(prompt),
+                "settings": settings,
+                "stream": stream,
+            }
+        )
+        return f"leaf-{prompt['window']}"
+
+    eng._run_skill = run_skill  # type: ignore[method-assign]
+    result = asyncio.run(
+        eng.model("ar-model").transcribe(
+            windows=[b"first", b"second"],
+            settings={"max_tokens": 32},
+        )
+    )
+
+    assert result == ("leaf-0", "leaf-1")
+    assert calls == [
+        {
+            "task": "transcribe",
+            "image": None,
+            "prompt": {"audio": b"first", "window": 0},
+            "settings": {"max_tokens": 32},
+            "stream": False,
+        },
+        {
+            "task": "transcribe",
+            "image": None,
+            "prompt": {"audio": b"second", "window": 1},
+            "settings": {"max_tokens": 32},
+            "stream": False,
+        },
+    ]
 
 
 def test_capability_lifts_settings_and_mirrors_stream() -> None:

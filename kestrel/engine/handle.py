@@ -19,7 +19,7 @@ model id so callers bind a model once instead of repeating ``model=``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from kestrel.runtime import ExecutionShape
 
@@ -174,16 +174,44 @@ class ModelHandle:
             return await submission
         self._require_default_ar(task)
         settings = owned_prompt.pop("settings", None)
-        stream = bool(owned_prompt.get("stream", False))
         image = owned_prompt.pop("image", None)
+        skill = self._engine._skill_registry().resolve(task)
+        orchestrator = skill.orchestrator()
+        if orchestrator is not None:
+
+            async def invoke(
+                leaf_prompt: Mapping[str, object],
+                *,
+                image: Optional[Any] = None,
+                settings: Optional[Mapping[str, object]] = None,
+            ) -> object:
+                prompt_copy = dict(leaf_prompt)
+                submission = self._engine._run_skill(
+                    task,
+                    image=image,
+                    prompt=prompt_copy,
+                    settings=settings,
+                    stream=bool(prompt_copy.get("stream", False)),
+                )
+                del prompt_copy, image, settings
+                return await submission
+
+            submission = orchestrator.run(
+                invoke,
+                image=image,
+                prompt=owned_prompt,
+                settings=settings,
+            )
+            del orchestrator, skill, owned_prompt, settings, image
+            return await submission
         submission = self._engine._run_skill(
             task,
             image=image,
             prompt=owned_prompt,
             settings=settings,
-            stream=stream,
+            stream=bool(owned_prompt.get("stream", False)),
         )
-        del owned_prompt, settings, image
+        del skill, owned_prompt, settings, image
         return await submission
 
     async def chat(
