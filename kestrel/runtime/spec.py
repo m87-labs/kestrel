@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
 if TYPE_CHECKING:
     import torch
 
+    from kestrel.runtime.state import SequenceState
     from kestrel.runtime.tokens import Token
 
 
@@ -241,7 +242,7 @@ class SpecDecoder(Protocol):
 
     def admit(
         self,
-        state: Any,
+        state: "SequenceState",
         prompt_tokens: "Sequence[Token]",
         *,
         request_context: object,
@@ -325,7 +326,7 @@ class SpecDecoder(Protocol):
 
     def step(
         self,
-        states: Sequence[Any],
+        states: Sequence["SequenceState"],
         *,
         allowed_token_ids: Sequence[Sequence[int] | None] | None = None,
         suppressed_token_ids: Sequence[Sequence[int] | None] | None = None,
@@ -380,7 +381,7 @@ class SpecDecoder(Protocol):
         """
         ...
 
-    def retire(self, state: Any) -> None:
+    def retire(self, state: "SequenceState") -> None:
         """Release the pool row held by a finished sequence's ``state``."""
         ...
 

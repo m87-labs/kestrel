@@ -125,7 +125,7 @@ class _FakeDecoder:
         if self._admit_side_values is not None:
             state.admit_side_values = self._admit_side_values
         self.admitted.append(row)
-        want_logprobs = getattr(state, "return_logprobs", None) is True
+        want_logprobs = state.return_logprobs
         self.admit_kwargs[row] = {
             # The *typed* prompt tokens the scheduler forwards (the non-spec
             # ``prepare_sequence`` contract): asserted to survive admission whole,
@@ -140,7 +140,7 @@ class _FakeDecoder:
             "suppress_next_token_ids": suppress_next_token_ids,
             "temperature": temperature,
             "top_p": top_p,
-            "return_logprobs": getattr(state, "return_logprobs", None),
+            "return_logprobs": state.return_logprobs,
         }
         # New contract: ``admit`` returns ``(first_token_id, first_logprob)``.
         # ``first_logprob`` is the real selected-token logprob when the request

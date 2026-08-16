@@ -40,6 +40,8 @@ class SequenceState:
     cache_lock_node: TreeNode | None = None
     cache_owned_page_count: int = 0  # Pages belonging to cache (not freed on release)
     reused_page_count: int = 0  # Pages reused from cache hit (for metrics)
+    # Uniform request contract used by both ordinary and speculative decode.
+    return_logprobs: bool = False
 
     def __post_init__(self) -> None:
         if self.prompt_length is None:

@@ -889,13 +889,8 @@ class GenerationScheduler:
                 prompt_length=kv_prompt_length,
                 image_length=request.image_length,
                 lora_slot=request.lora_slot,
+                return_logprobs=request.return_logprobs is True,
             )
-            # The spec decoder reads ``return_logprobs`` off the state to decide
-            # whether ``step`` computes per-committed-token logprobs for this row
-            # (matching the non-spec sampler, which gates the logprob gather on
-            # the request). ``SequenceState`` is a plain dataclass, so attach it
-            # as an extra attribute the decoder picks up via ``getattr``.
-            state.return_logprobs = request.return_logprobs is True
 
             # Run the skill's prefill hook BEFORE building the mask + admitting:
             # ``admit`` prefills *and* samples the first (bonus) token in one
