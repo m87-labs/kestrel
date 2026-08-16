@@ -26,24 +26,36 @@ class SamplingHooks:
 
     Wiring:
 
-    1. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
-       skill and request-level masks have been applied.
-    2. Scheduler samples token ids on the compute stream and records
+    1. ``process_logits(...)`` optionally transforms the masked logits in place
+       before generic greedy, temperature, top-p, or logprob sampling.
+    2. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
+       skill, model, and request-level masks have been applied.
+    3. Scheduler samples token ids on the compute stream and records
        ``ready_event`` once they're written to the staging buffer.
-    3. ``post_sample(...)`` fires next (compute stream) — runtime runs
+    4. ``post_sample(...)`` fires next (compute stream) — runtime runs
        any GPU work it needs (e.g. decode side-values from
        ``hidden_last``) and initiates its own D2H against
        ``ready_event``. It returns an opaque handle the runtime
        understands later.
-    4. Scheduler initiates its own D2H for token ids + logprobs.
-    5. ``prepare_decode_inputs(...)`` fires before the next decode
+    5. Scheduler initiates its own D2H for token ids + logprobs.
+    6. ``prepare_decode_inputs(...)`` fires before the next decode
        launch — runtime gathers any model-specific decode inputs from
        its own per-batch-idx state (the scheduler gathers token ids
        generically).
-    6. On commit, scheduler reads CPU-side token ids + logprobs and
+    7. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
     """
+
+    # process_logits(logits, *, sequences, batch_idx) -> None
+    # Mutates the batched logits in place after static skill masks and before
+    # request-level one-shot suppression and generic sampling. This is the hook
+    # for model decoding grammars that compose with every ordinary sampling mode
+    # (for example, history-dependent timestamp constraints). It must not
+    # synchronize or read device values on the host. Runtimes exposing it must
+    # leave ``spec`` disabled until their speculative decoder implements the
+    # same transformation.
+    process_logits: Callable[..., None] | None = None
 
     # sample_greedy(logits, out, *, sequences, batch_idx) -> Tensor
     # Runs for the first prefill sample and every non-speculative decode sample

@@ -95,6 +95,11 @@ class BuiltRequest:
     # decoder-prefix positions and never contributes to decoder KV length. The
     # runtime owns its asynchronous preprocessing and per-sequence device state.
     encoder_input: object | None = None
+    # A skill can require selected-token log probabilities for its own final
+    # result semantics (for example, transcript confidence). The engine enables
+    # the existing scheduler logprob path even when the caller did not request
+    # the private diagnostic setting.
+    capture_logprobs: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +238,7 @@ class DecodeStep:
     token: "Token"
     position: int
     phase: str = "answer"
+    logprob: float | None = None
 
 
 @dataclass(slots=True)

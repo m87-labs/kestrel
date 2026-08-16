@@ -527,6 +527,8 @@ class InferenceEngine:
         )
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
+        if built.capture_logprobs:
+            return_logprobs = True
         generated_prefix = self._extract_generated_prefix(settings)
         suppress_next_token_ids = self._extract_suppress_next_token_ids(settings)
         # A skill may carry media it pulled out of its own prompt (e.g. an
@@ -1773,10 +1775,19 @@ class InferenceEngine:
             raise ValueError(
                 "settings._generated_prefix.tokens must not contain stop tokens"
             )
-        for token in request_obj.generated_prefix.tokens:
+        prefix_logprobs = request_obj.generated_prefix.logprobs
+        for index, token in enumerate(request_obj.generated_prefix.tokens):
             skill_state.consume_step(
                 runtime,
-                DecodeStep(token=token, position=skill_state.token_count),
+                DecodeStep(
+                    token=token,
+                    position=skill_state.token_count,
+                    logprob=(
+                        None
+                        if prefix_logprobs is None
+                        else prefix_logprobs[index]
+                    ),
+                ),
             )
         self._validate_suppress_next_token_ids(
             runtime,

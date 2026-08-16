@@ -291,6 +291,8 @@ class GenerationScheduler:
         self._skills = skill_registry
         # Per-step sampling contract. Optional hooks the runtime
         # can implement:
+        #   * process_logits — apply model-owned, batched in-place logits
+        #     transformations before generic sampling.
         #   * sample_greedy — replace ordinary argmax for runtimes with a
         #     batched constrained-greedy device path.
         #   * post_sample — run any model-specific GPU work alongside
@@ -313,8 +315,11 @@ class GenerationScheduler:
         if not isinstance(hooks, SamplingHooks):
             raise TypeError("runtime.sampling_hooks must be SamplingHooks")
         self._hooks = hooks
-        if self._hooks.sample_greedy is not None and runtime.spec is not None:
-            raise ValueError("custom greedy sampling requires non-speculative decoding")
+        if (
+            self._hooks.process_logits is not None
+            or self._hooks.sample_greedy is not None
+        ) and runtime.spec is not None:
+            raise ValueError("custom sampling hooks require non-speculative decoding")
         try:
             self._eos_token_ids = frozenset(map(int, runtime.eos_token_ids))
         except AttributeError as exc:
@@ -2881,6 +2886,17 @@ class GenerationScheduler:
                         suppressed, device=logits.device, dtype=torch.long
                     )
                     logits[i, idx] = float("-inf")
+
+        if self._hooks.process_logits is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom logits processing"
+                )
+            self._hooks.process_logits(
+                logits,
+                sequences=sequences,
+                batch_idx=batch_idx,
+            )
 
         want_logprobs = logprobs_out is not None and any_return_logprobs
         logprobs = logprobs_out[:batch] if want_logprobs else None

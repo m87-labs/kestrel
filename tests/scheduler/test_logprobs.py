@@ -159,6 +159,21 @@ def test_scheduler_result_returns_requested_token_logprobs() -> None:
     assert result.logprobs == [-1.25, -0.5]
 
 
+def test_decode_step_exposes_selected_logprob_before_skill_consumption() -> None:
+    seen: list[float | None] = []
+
+    class _CapturingState(_SkillStateStub):
+        def consume_step(self, runtime: object, step: DecodeStep) -> None:
+            seen.append(step.logprob)
+            super().consume_step(runtime, step)
+
+    seq = _make_lifecycle_with_state(_CapturingState, return_logprobs=True)
+    seq.stage_token(SimpleNamespace(), TextToken(10), logprob=-0.75)
+
+    assert seen == [-0.75]
+    assert seq.logprobs == [-0.75]
+
+
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
     request = GenerationRequest(
         request_id=7,
@@ -327,12 +342,96 @@ def test_scheduler_rejects_custom_greedy_with_speculative_decode() -> None:
         sample_greedy=lambda logits, out, **_kwargs: out
     )
 
-    with pytest.raises(ValueError, match="requires non-speculative"):
+    with pytest.raises(ValueError, match="require non-speculative"):
         GenerationScheduler(
             runtime,
             compute_stream=None,
             skill_registry=SkillRegistry([]),
         )
+
+
+def test_scheduler_rejects_custom_logits_processing_with_speculative_decode() -> None:
+    runtime = FakeRuntime()
+    runtime.spec = object()  # type: ignore[assignment]
+    runtime.sampling_hooks = SamplingHooks(
+        process_logits=lambda logits, **_kwargs: logits.zero_()
+    )
+
+    with pytest.raises(ValueError, match="require non-speculative"):
+        GenerationScheduler(
+            runtime,
+            compute_stream=None,
+            skill_registry=SkillRegistry([]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("temperature", "return_logprobs"),
+    ((0.0, None), (0.7, True)),
+)
+def test_sample_batch_processes_logits_before_generic_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+    temperature: float,
+    return_logprobs: bool | None,
+) -> None:
+    calls: list[tuple[list[int], int]] = []
+    scheduler = _scheduler()
+
+    def process_logits(
+        logits: torch.Tensor,
+        *,
+        sequences: list[object],
+        batch_idx: torch.Tensor,
+    ) -> None:
+        calls.append((batch_idx.tolist(), len(sequences)))
+        assert torch.isneginf(logits[0, 0])
+        logits[0, 1] = -float("inf")
+
+    scheduler._hooks = SamplingHooks(process_logits=process_logits)
+    if temperature > 0.0:
+        scheduler._sampling_temps_by_batch.fill_(temperature)
+
+    def fake_sample_step_from_logits(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_p: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        logprobs_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert torch.isneginf(logits[0, 0])
+        assert torch.isneginf(logits[0, 1])
+        sampled = torch.tensor([2], dtype=torch.long)
+        if logprobs_out is not None:
+            logprobs_out.fill_(-0.25)
+        if out is not None:
+            out.copy_(sampled)
+            return out
+        return sampled
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        fake_sample_step_from_logits,
+    )
+    sampled, _, _, logprobs = GenerationScheduler._sample_batch(
+        scheduler,
+        torch.tensor([[5.0, 4.0, 3.0]], dtype=torch.float32),
+        [
+            _sequence(
+                temperature=temperature,
+                return_logprobs=return_logprobs,
+                suppressed_token_ids=[0],
+            )
+        ],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
+        logprobs_out=torch.empty((1,), dtype=torch.float32),
+    )
+
+    assert calls == [([0], 1)]
+    assert sampled.tolist() == [2]
+    assert (logprobs is not None) is (return_logprobs is True)
 
 
 def test_sample_batch_calls_custom_greedy_after_static_and_one_shot_masks() -> None:
@@ -365,10 +464,10 @@ def test_sample_batch_calls_custom_greedy_after_static_and_one_shot_masks() -> N
             )
         ],  # type: ignore[list-item]
         torch.empty((1,), dtype=torch.long),
-        batch_idx=torch.tensor([7], dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
     )
 
-    assert calls == [([7], 1)]
+    assert calls == [([0], 1)]
     assert sampled.tolist() == [2]
 
 

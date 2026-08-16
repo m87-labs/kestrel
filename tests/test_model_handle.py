@@ -70,6 +70,24 @@ class _TranscribeSkill(SkillSpec):
         )
 
 
+class _ConfidenceTranscribeSkill(_TranscribeSkill):
+    def build_request(
+        self,
+        image: Any,
+        prompt: Any,
+        settings: Any,
+    ) -> BuiltRequest:
+        built = super().build_request(image, prompt, settings)
+        return BuiltRequest(
+            request_context=built.request_context,
+            max_new_tokens=built.max_new_tokens,
+            temperature=built.temperature,
+            top_p=built.top_p,
+            encoder_input=built.encoder_input,
+            capture_logprobs=True,
+        )
+
+
 class _WindowOrchestrator(CapabilityOrchestrator):
     async def run(
         self,
@@ -289,6 +307,30 @@ def test_transcribe_releases_encoder_input_from_result_await_frames() -> None:
 
         result_future.set_result("RESULT")
         assert await task == "RESULT"
+
+    asyncio.run(run())
+
+
+def test_skill_can_require_internal_logprob_capture() -> None:
+    async def run() -> None:
+        eng = _engine()
+        registry = SkillRegistry(
+            [QuerySkill(), CaptionSkill(), SegmentSkill(), _ConfidenceTranscribeSkill()]
+        )
+        eng._runtimes["ar-model"].skills = lambda: registry
+        eng._runtimes["ar-model"].tasks = lambda: registry.names()
+        captured: dict[str, Any] = {}
+
+        async def submit_request(**kwargs: Any):
+            captured.update(kwargs)
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("RESULT")
+            return future, 1
+
+        eng._submit_request = submit_request  # type: ignore[method-assign]
+
+        assert await eng.model("ar-model").transcribe(audio=b"audio") == "RESULT"
+        assert captured["return_logprobs"] is True
 
     asyncio.run(run())
 

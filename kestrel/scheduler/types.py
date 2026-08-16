@@ -126,6 +126,10 @@ class RequestLifecycle:
         *,
         logprob: float | None = None,
     ) -> None:
+        if self.request.return_logprobs is True and logprob is None:
+            raise RuntimeError(
+                "Missing token logprob for request that asked for logprobs"
+            )
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
         if self.phase not in (
@@ -137,13 +141,11 @@ class RequestLifecycle:
         step = DecodeStep(
             token=token,
             position=self.skill_state.token_count,
+            logprob=logprob,
         )
         self.skill_state.consume_step(runtime, step)
         if self.request.return_logprobs is True:
-            if logprob is None:
-                raise RuntimeError(
-                    "Missing token logprob for request that asked for logprobs"
-                )
+            assert logprob is not None
             self.logprobs.append(float(logprob))
         callback = self.request.stream_callback
         if callback is not None:
