@@ -75,12 +75,14 @@ def _executor() -> AutoregressiveExecutor:
             ex._scheduler._completed.pop(0) for _ in list(ex._scheduler._completed)
         ],
         enqueue_request=lambda req, state: None,
+        cancel_request=lambda request_id: False,
     )
     ex._admission = SimpleNamespace(
         has_pending=lambda: False,
         pending_count=0,
         take_ready=lambda: None,
         fail_all=lambda exc: None,
+        discard_cancelled=lambda: False,
     )
     return ex
 
@@ -175,6 +177,20 @@ def test_ingress_capacity_counts_active_and_preprocessing_requests() -> None:
 
     ex._admission.pending_count = 1
     assert ex.has_ingress_capacity is False
+
+
+def test_cancelled_active_request_is_forwarded_to_scheduler() -> None:
+    ex = _executor()
+    request = _pending(7)
+    request.cancel_event.set()
+    ex._active[request.request_id] = request
+    cancelled: list[int] = []
+    ex._scheduler.cancel_request = lambda request_id: (
+        cancelled.append(request_id) or True
+    )
+
+    assert ex._discard_cancelled() is True
+    assert cancelled == [7]
 
 
 def test_shutdown_fails_in_flight_requests() -> None:
@@ -314,12 +330,14 @@ def test_shutdown_retires_spec_rows_through_the_decoder() -> None:
         # Model the decoder reclaiming its pool row: the freed row index
         # becomes reusable for a future admit.
         free_rows.add(state.batch_idx)
+        state.batch_idx = -1
 
     def _release_sequence(st: Any) -> None:
         released_via_release_sequence.append(st)
 
     decoder = SimpleNamespace(retire=_retire)
     state = SimpleNamespace(batch_idx=7, lora_slot=3)
+    original_batch_idx = state.batch_idx
 
     ex = _executor()
     ex._runtime = SimpleNamespace(
@@ -341,8 +359,8 @@ def test_shutdown_retires_spec_rows_through_the_decoder() -> None:
     # Adapter slot the spec admit acquired was released.
     assert released_slots == [state.lora_slot]
     # The row is freed from the registry and reusable (decoder reclaimed it).
-    assert state.batch_idx not in ex._runtime.active_sequences
-    assert state.batch_idx in free_rows
+    assert original_batch_idx not in ex._runtime.active_sequences
+    assert original_batch_idx in free_rows
 
 
 def test_shutdown_retires_base_model_spec_row_with_zero_slot() -> None:

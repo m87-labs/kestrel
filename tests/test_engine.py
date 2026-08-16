@@ -366,6 +366,29 @@ def test_admission_coordinator_promotes_completed_crops() -> None:
     assert failures == []
 
 
+def test_admission_coordinator_cancels_abandoned_preprocessing() -> None:
+    crop_future: Future[object] = Future()
+    coordinator = _AdmissionCoordinator(
+        runtime=_FakeRuntime(
+            prefix_cache=None,
+            prefix_hit=False,
+            image_preprocessor=_FakeImagePreprocessor([crop_future]),
+        ),
+        wake_event=threading.Event(),
+        fail_request=lambda *_: None,
+    )
+    request = _make_request(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+    )
+
+    assert coordinator.submit(request) is None
+    request.cancel_event.set()
+
+    assert coordinator.discard_cancelled() is True
+    assert crop_future.cancelled()
+    assert not coordinator.has_pending()
+
+
 def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
     image = np.zeros((4, 4, 3), dtype=np.uint8)
     failed_future: Future[object] = Future()
