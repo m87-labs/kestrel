@@ -34,7 +34,6 @@ tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
 rotary_embedding = _KERNELS.rotary.rotary_embedding
 _fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
 _kestrel_linear = _KERNELS.linear.linear
-_gelu_cute = _KERNELS.gelu.gelu_cute
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -105,7 +104,7 @@ def attn(
     kv_dim = n_kv_heads * head_dim
     if hasattr(module, "tau") and module.tau is not None:
         tau_wqwv = module.tau["wqwv"]
-        gelu_out = _gelu_cute(qkv_out, out=scratch_pool.get("gelu") if scratch_pool else None)
+        gelu_out = F.gelu(qkv_out, approximate="tanh")
         tok_qv_lin = _kestrel_linear(gelu_out, tau_wqwv)
         # _tau_pos_table is built by build_tau_pos_tables() after weight loading.
         tau_tail_apply_into(
