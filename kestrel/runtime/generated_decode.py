@@ -198,6 +198,40 @@ def _state_requirements(descriptor: Mapping[str, Any]):
     )
 
 
+def _select_program(programs: Sequence[Any], batch_size: int) -> tuple[int, Any] | None:
+    batch_size = int(batch_size)
+    candidates = []
+    for index, program in enumerate(programs):
+        static_extents = program.static_extent_bindings
+        if static_extents.keys() - {"active_batch"}:
+            continue
+        static_batch = static_extents.get("active_batch")
+        if static_batch is not None and int(static_batch) != batch_size:
+            continue
+        if int(program.capacity) < batch_size:
+            continue
+        candidates.append((static_batch is None, int(program.capacity), index, program))
+    if not candidates:
+        return None
+    _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
+    return index, program
+
+
+def _selectable_programs(
+    programs: Sequence[Any], max_batch_size: int
+) -> tuple[Any, ...]:
+    selected_indexes = set()
+    for batch_size in range(1, int(max_batch_size) + 1):
+        selected = _select_program(programs, batch_size)
+        if selected is not None:
+            selected_indexes.add(selected[0])
+    return tuple(
+        program
+        for index, program in enumerate(programs)
+        if index in selected_indexes
+    )
+
+
 class GeneratedDecode:
     """Select bundled capacities and bind them to one serving runtime."""
 
@@ -255,6 +289,9 @@ class GeneratedDecode:
         programs = cls._resolve_programs(runtime, spec)
         if not programs:
             return None
+        programs = _selectable_programs(programs, runtime.max_batch_size)
+        if not programs:
+            return None
         return cls(runtime, spec=spec, programs=programs)
 
     def __init__(
@@ -265,7 +302,8 @@ class GeneratedDecode:
         programs,
         required_capacity: int | None = None,
     ) -> None:
-        self._programs = tuple(programs)
+        available_programs = tuple(programs)
+        self._programs = available_programs
         self._spec = spec
         if required_capacity is not None:
             missing = [
@@ -279,19 +317,25 @@ class GeneratedDecode:
                     f"sizes {missing}"
                 )
 
+        self._programs = _selectable_programs(
+            available_programs, runtime.max_batch_size
+        )
+        if not self._programs:
+            raise ValueError("generated decode has no selectable batch artifact")
+
         from kestrel_kernels.generated_decode import (
             assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
         )
 
-        contracts = {repr(program.descriptor["weights"]) for program in programs}
+        contracts = {repr(program.descriptor["weights"]) for program in self._programs}
         if len(contracts) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on weight storage"
             )
         self.state_requirements_by_capacity = {}
-        for program in programs:
+        for program in self._programs:
             requirements = _state_requirements(program.descriptor)
             existing = self.state_requirements_by_capacity.setdefault(
                 program.capacity, requirements
@@ -319,7 +363,7 @@ class GeneratedDecode:
         with torch.cuda.stream(runtime.compute_stream):
             self.weight_storage = materialize_weights(
                 spec.weight_root,
-                programs[0].descriptor,
+                self._programs[0].descriptor,
                 layer_prefix=spec.weight_layer_prefix,
             )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
@@ -349,13 +393,29 @@ class GeneratedDecode:
                     preparations=spec.preparations,
                 )
                 plans.setdefault(tuple(step.name for step in plan), plan)
-                construction_batch = min(capacity, int(runtime.max_batch_size))
+                construction_batch = int(
+                    program.static_extent_bindings.get(
+                        "active_batch",
+                        min(capacity, int(runtime.max_batch_size)),
+                    )
+                )
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch
                 )
                 launch_extents = dict(
                     spec.bindings.launch_extents(slot, construction_batch)
                 )
+                static_extents = program.static_extent_bindings
+                mismatched = {
+                    name: (static_extents[name], launch_extents[name])
+                    for name in static_extents.keys() & launch_extents.keys()
+                    if int(static_extents[name]) != int(launch_extents[name])
+                }
+                if mismatched:
+                    raise RuntimeError(
+                        f"generated {spec.label} construction extents disagree "
+                        f"with static artifact bindings {mismatched}"
+                    )
                 extents.update(launch_extents)
                 bindings = assemble_bindings(
                     program.descriptor,
@@ -372,7 +432,7 @@ class GeneratedDecode:
                     ]
                     if item["transport"] == "scalar"
                 )
-                unknown = launch_extents.keys() - scalar_names
+                unknown = launch_extents.keys() - scalar_names - static_extents.keys()
                 if unknown:
                     raise RuntimeError(
                         f"generated {spec.label} has unknown launch extents "
@@ -398,21 +458,7 @@ class GeneratedDecode:
             )
 
     def _program_for(self, batch_size: int) -> tuple[int, Any] | None:
-        batch_size = int(batch_size)
-        candidates = []
-        for index, program in enumerate(self._programs):
-            static_batch = program.static_extent_bindings.get("active_batch")
-            if static_batch is not None and int(static_batch) != batch_size:
-                continue
-            if int(program.capacity) < batch_size:
-                continue
-            candidates.append(
-                (static_batch is None, int(program.capacity), index, program)
-            )
-        if not candidates:
-            return None
-        _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
-        return index, program
+        return _select_program(self._programs, batch_size)
 
     def supports(self, batch_size: int) -> bool:
         return self._program_for(batch_size) is not None
