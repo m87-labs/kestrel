@@ -97,6 +97,21 @@ class BuiltRequest:
     encoder_input: object | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedSkillPrompt:
+    """Runtime-resolved decoder prompt and exact generated-token budget.
+
+    Most skills return their ordinary prompt tokens and unchanged budget via
+    :meth:`SkillSpec.prepare_prompt`. A skill whose prompt depends on the
+    runtime tokenizer may override that hook and return an updated immutable
+    request context alongside the exact budget required after tokenization.
+    """
+
+    request_context: object
+    tokens: Sequence["Token"]
+    max_new_tokens: int
+
+
 def parse_settings(
     settings: Optional[Mapping[str, object]],
     *,
@@ -187,6 +202,20 @@ class SkillSpec:
         request_context: object,
     ) -> Sequence["Token"]:
         raise NotImplementedError
+
+    def prepare_prompt(
+        self,
+        runtime: "AutoregressiveRuntime",
+        request_context: object,
+        max_new_tokens: int,
+    ) -> PreparedSkillPrompt:
+        """Resolve runtime-tokenizer-dependent prompt state before admission."""
+
+        return PreparedSkillPrompt(
+            request_context=request_context,
+            tokens=tuple(self.build_prompt_tokens(runtime, request_context)),
+            max_new_tokens=max_new_tokens,
+        )
 
     def create_state(
         self,
