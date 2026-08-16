@@ -32,6 +32,7 @@ def test_progress_is_coalesced_and_result_does_not_require_iteration() -> None:
         assert update.task == "transcribe"
         assert update.index == 1
         assert update.output == {"text": "latest"}
+        assert update.text == "latest"
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
 

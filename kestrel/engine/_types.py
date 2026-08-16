@@ -121,6 +121,13 @@ class CapabilityUpdate:
     index: int
     output: Dict[str, object]
 
+    @property
+    def text(self) -> str:
+        """Portable text snapshot shared with token-stream updates."""
+
+        value = self.output.get("text", "")
+        return value if isinstance(value, str) else ""
+
 
 _EmitCapabilityUpdate = Callable[[Dict[str, object]], None]
 _CapabilityProducer = Callable[[_EmitCapabilityUpdate], Awaitable[EngineResult]]
