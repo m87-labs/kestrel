@@ -531,7 +531,7 @@ def test_sample_batch_applies_model_owned_selected_token_scores(
 def test_sample_batch_applies_model_owned_sampling_params_before_sampling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scheduler = _scheduler()
+    scheduler = _scheduler(batch=2)
     observed: list[tuple[list[int], list[int]]] = []
 
     def adjust_sampling_params(
