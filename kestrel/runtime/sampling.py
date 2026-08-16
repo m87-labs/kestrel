@@ -30,19 +30,21 @@ class SamplingHooks:
        before generic greedy, temperature, top-p, or logprob sampling.
     2. ``sample_greedy(...)`` optionally replaces ordinary argmax after all
        skill, model, and request-level masks have been applied.
-    3. Scheduler samples token ids on the compute stream and records
-       ``ready_event`` once they're written to the staging buffer.
-    4. ``post_sample(...)`` fires next (compute stream) — runtime runs
+    3. Scheduler samples token ids on the compute stream.
+    4. ``score_sampled_tokens(...)`` may replace the generic sampler's staged
+       logprob with a model-owned score derived from the final masked logits.
+    5. Scheduler records ``ready_event`` once token ids and logprobs are ready.
+    6. ``post_sample(...)`` fires next (compute stream) — runtime runs
        any GPU work it needs (e.g. decode side-values from
        ``hidden_last``) and initiates its own D2H against
        ``ready_event``. It returns an opaque handle the runtime
        understands later.
-    5. Scheduler initiates its own D2H for token ids + logprobs.
-    6. ``prepare_decode_inputs(...)`` fires before the next decode
+    7. Scheduler initiates its own D2H for token ids + logprobs.
+    8. ``prepare_decode_inputs(...)`` fires before the next decode
        launch — runtime gathers any model-specific decode inputs from
        its own per-batch-idx state (the scheduler gathers token ids
        generically).
-    7. On commit, scheduler reads CPU-side token ids + logprobs and
+    9. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
     """
@@ -65,6 +67,18 @@ class SamplingHooks:
     # token logprobs. Runtimes exposing it must leave ``spec`` disabled until
     # their speculative decoder implements equivalent semantics.
     sample_greedy: Callable[..., Any] | None = None
+
+    # score_sampled_tokens(logits, *, sampled_ids, token_logprobs,
+    #                      sequences, batch_idx, temperatures, top_ps) -> None
+    # Optionally overwrites the scheduler-owned float32 ``token_logprobs``
+    # buffer after ordinary sampling and before its ready event / D2H. This is
+    # for model-defined score semantics that differ from the sampling
+    # distribution (for example Whisper's untempered selected-token score used
+    # by language confidence and fallback). It must mutate the supplied buffer
+    # in place without synchronizing or reading device values on the host.
+    # Runtimes exposing it must leave speculative decoding disabled until their
+    # speculative decoder supplies the same scores.
+    score_sampled_tokens: Callable[..., None] | None = None
 
     # post_sample(slot, *, sampled_ids, hidden_last, sequences,
     #             batch_idx, temperatures, top_ps, token_logprobs,

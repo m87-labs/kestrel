@@ -295,6 +295,8 @@ class GenerationScheduler:
         #     transformations before generic sampling.
         #   * sample_greedy — replace ordinary argmax for runtimes with a
         #     batched constrained-greedy device path.
+        #   * score_sampled_tokens — replace generic sampling-distribution
+        #     logprobs with model-owned selected-token scores.
         #   * post_sample — run any model-specific GPU work alongside
         #     sampling (Moondream: coord/size decode from hidden states),
         #     return an opaque handle.
@@ -318,6 +320,7 @@ class GenerationScheduler:
         if (
             self._hooks.process_logits is not None
             or self._hooks.sample_greedy is not None
+            or self._hooks.score_sampled_tokens is not None
         ) and runtime.spec is not None:
             raise ValueError("custom sampling hooks require non-speculative decoding")
         try:
@@ -2980,6 +2983,20 @@ class GenerationScheduler:
                 temps.index_select(0, baseline_row_idx),
             )
             logprobs.index_copy_(0, baseline_row_idx, base_logprobs)
+        if logprobs is not None and self._hooks.score_sampled_tokens is not None:
+            if batch_idx is None:
+                raise AssertionError(
+                    "batch_idx is required for custom sampled-token scoring"
+                )
+            self._hooks.score_sampled_tokens(
+                logits,
+                sampled_ids=out_view,
+                token_logprobs=logprobs,
+                sequences=sequences,
+                batch_idx=batch_idx,
+                temperatures=temps,
+                top_ps=top_ps,
+            )
         return out_view, temps, top_ps, logprobs
 
     @staticmethod

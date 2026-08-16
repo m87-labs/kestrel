@@ -365,6 +365,21 @@ def test_scheduler_rejects_custom_logits_processing_with_speculative_decode() ->
         )
 
 
+def test_scheduler_rejects_custom_token_scoring_with_speculative_decode() -> None:
+    runtime = FakeRuntime()
+    runtime.spec = object()  # type: ignore[assignment]
+    runtime.sampling_hooks = SamplingHooks(
+        score_sampled_tokens=lambda _logits, **_kwargs: None
+    )
+
+    with pytest.raises(ValueError, match="require non-speculative"):
+        GenerationScheduler(
+            runtime,
+            compute_stream=None,
+            skill_registry=SkillRegistry([]),
+        )
+
+
 @pytest.mark.parametrize(
     ("temperature", "return_logprobs"),
     ((0.0, None), (0.7, True)),
@@ -432,6 +447,70 @@ def test_sample_batch_processes_logits_before_generic_sampling(
     assert calls == [([0], 1)]
     assert sampled.tolist() == [2]
     assert (logprobs is not None) is (return_logprobs is True)
+
+
+def test_sample_batch_applies_model_owned_selected_token_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    observed: list[tuple[list[int], list[int]]] = []
+
+    def score_sampled_tokens(
+        logits: torch.Tensor,
+        *,
+        sampled_ids: torch.Tensor,
+        token_logprobs: torch.Tensor,
+        sequences: list[object],
+        batch_idx: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ps: torch.Tensor,
+    ) -> None:
+        assert logits.shape == (1, 3)
+        assert len(sequences) == 1
+        assert temperatures.tolist() == [0.0]
+        assert top_ps.tolist() == [1.0]
+        observed.append((sampled_ids.tolist(), batch_idx.tolist()))
+        token_logprobs.fill_(-2.5)
+
+    scheduler._hooks = SamplingHooks(
+        score_sampled_tokens=score_sampled_tokens
+    )
+
+    def fake_sample_step_from_logits(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_p: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        logprobs_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del logits, temperatures, top_p, generator
+        assert logprobs_out is not None
+        logprobs_out.fill_(0.0)
+        sampled = torch.tensor([2], dtype=torch.long)
+        if out is not None:
+            out.copy_(sampled)
+            return out
+        return sampled
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        fake_sample_step_from_logits,
+    )
+    sampled, _, _, logprobs = GenerationScheduler._sample_batch(
+        scheduler,
+        torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32),
+        [_sequence(temperature=0.0, return_logprobs=True)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([7], dtype=torch.long),
+        logprobs_out=torch.empty((1,), dtype=torch.float32),
+    )
+
+    assert sampled.tolist() == [2]
+    assert observed == [([2], [7])]
+    assert logprobs is not None
+    torch.testing.assert_close(logprobs, torch.tensor([-2.5]))
 
 
 def test_sample_batch_calls_custom_greedy_after_static_and_one_shot_masks() -> None:
