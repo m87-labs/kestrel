@@ -153,6 +153,15 @@ class AutoregressiveRuntime(Runtime, Protocol):
 
     def preprocess_encoder_input_async(self, encoder_input: object) -> Future[Any]: ...
 
+    def image_kv_length(
+        self,
+        prompt_tokens: Sequence[Token],
+        image: Any,
+        image_crops: Any,
+    ) -> int:
+        """Return image KV positions added beyond the typed prompt tokens."""
+        ...
+
     # Slot lifecycle
     def acquire_prefill_slot(self, slot_id: int | None = ...) -> Any: ...
 
