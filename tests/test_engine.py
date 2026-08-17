@@ -544,6 +544,35 @@ def test_build_generation_request_rejects_skill_stop_in_generated_prefix() -> No
         engine._build_generation_request(runtime, req, None)
 
 
+def test_build_generation_request_uses_runtime_image_kv_length() -> None:
+    engine = object.__new__(InferenceEngine)
+    req = _make_request(image=b"image")
+    req.skill = _PrefixSkill()
+    runtime = SimpleNamespace(
+        max_seq_length=32,
+        spec=None,
+        image_kv_length=lambda prompt_tokens, image, image_crops: 5,
+    )
+
+    generation_req, _ = engine._build_generation_request(runtime, req, object())
+
+    assert generation_req.image_length == 5
+    assert generation_req.target_length == 15
+
+
+@pytest.mark.parametrize("invalid", [-1, 1.5, True])
+def test_build_generation_request_rejects_invalid_image_kv_length(invalid) -> None:
+    engine = object.__new__(InferenceEngine)
+    req = _make_request(image=b"image")
+    runtime = SimpleNamespace(
+        spec=None,
+        image_kv_length=lambda prompt_tokens, image, image_crops: invalid,
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        engine._build_generation_request(runtime, req, object())
+
+
 def test_build_generation_request_rejects_encoder_input_with_spec_decode() -> None:
     engine = object.__new__(InferenceEngine)
     req = _make_request()

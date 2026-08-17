@@ -209,6 +209,19 @@ class FakeRuntime:
         fut.set_result(encoder_input)
         return fut
 
+    def image_kv_length(
+        self,
+        prompt_tokens: Sequence[Any],
+        image: Any,
+        image_crops: Any,
+    ) -> int:
+        del prompt_tokens, image_crops
+        if image is None:
+            return 0
+        if isinstance(image, (list, tuple)):
+            return len(image) * (self.image_prefix_length - 1)
+        return self.image_prefix_length
+
     def shutdown(self) -> None:
         pass
 
