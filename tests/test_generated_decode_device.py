@@ -1,16 +1,20 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from kestrel.runtime.generated_decode import GeneratedDecode
 
 
-def _program(capacity, *, active_batch=None):
+def _program(capacity, *, active_batch=None, minimum_batch=1):
     static = {} if active_batch is None else {"active_batch": active_batch}
     return SimpleNamespace(
         capacity=capacity,
         static_extent_bindings=static,
+        runtime_extent_minimums=(
+            {} if minimum_batch == 1 else {"active_batch": minimum_batch}
+        ),
     )
 
 
@@ -43,7 +47,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
     )
 
 
-def test_program_selection_preserves_dynamic_and_exact_same_capacity_variants():
+def test_program_selection_rejects_overlapping_same_capacity_variants():
     generated = GeneratedDecode.__new__(GeneratedDecode)
     dynamic_b2 = _program(2)
     dynamic_b4 = _program(4)
@@ -61,7 +65,37 @@ def test_program_selection_preserves_dynamic_and_exact_same_capacity_variants():
     assert generated._program_for(1)[1] is dynamic_b2
     assert generated._program_for(2)[1] is dynamic_b2
     assert generated._program_for(3)[1] is dynamic_b4
-    assert generated._program_for(4)[1] is exact_b4
+    with pytest.raises(RuntimeError, match="ambiguously overlap"):
+        generated._program_for(4)
     assert generated._program_for(5)[1] is dynamic_b8
-    assert generated._program_for(8)[1] is exact_b8
+    with pytest.raises(RuntimeError, match="ambiguously overlap"):
+        generated._program_for(8)
     assert generated._program_for(9) is None
+
+
+def test_program_selection_partitions_dynamic_runtime_intervals():
+    generated = GeneratedDecode.__new__(GeneratedDecode)
+    b1 = _program(1, active_batch=1)
+    b2 = _program(2, minimum_batch=2)
+    b4 = _program(4, minimum_batch=3)
+    b8 = _program(8, minimum_batch=5)
+    generated._programs = (b1, b2, b4, b8)
+
+    assert [generated._program_for(batch_size)[1] for batch_size in range(1, 9)] == [
+        b1,
+        b2,
+        b4,
+        b4,
+        b8,
+        b8,
+        b8,
+        b8,
+    ]
+
+
+def test_program_selection_rejects_invalid_runtime_interval():
+    generated = GeneratedDecode.__new__(GeneratedDecode)
+    generated._programs = (_program(4, minimum_batch=5),)
+
+    with pytest.raises(RuntimeError, match="invalid active-batch interval"):
+        generated._program_for(4)
