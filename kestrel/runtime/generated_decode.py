@@ -122,6 +122,30 @@ class _BoundInvocation:
     required_launch_extents: frozenset[str]
 
 
+def _active_batch_interval(program: Any) -> tuple[int, int]:
+    """Return the inclusive request-count interval served by one program."""
+
+    capacity = int(program.capacity)
+    minimum = int(
+        getattr(program, "runtime_extent_minimums", {}).get("active_batch", 1)
+    )
+    if not 1 <= minimum <= capacity:
+        raise RuntimeError(
+            "generated decode program has invalid active-batch interval "
+            f"[{minimum}, {capacity}]"
+        )
+    static = program.static_extent_bindings.get("active_batch")
+    if static is not None:
+        static = int(static)
+        if not minimum <= static <= capacity:
+            raise RuntimeError(
+                "generated decode program has invalid static active batch "
+                f"{static} outside [{minimum}, {capacity}]"
+            )
+        return static, static
+    return minimum, capacity
+
+
 def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, Any]:
     merged = {}
     owners = {}
@@ -205,15 +229,18 @@ def _select_program(programs: Sequence[Any], batch_size: int) -> tuple[int, Any]
         static_extents = program.static_extent_bindings
         if static_extents.keys() - {"active_batch"}:
             continue
-        static_batch = static_extents.get("active_batch")
-        if static_batch is not None and int(static_batch) != batch_size:
+        minimum_batch, maximum_batch = _active_batch_interval(program)
+        if not minimum_batch <= batch_size <= maximum_batch:
             continue
-        if int(program.capacity) < batch_size:
-            continue
-        candidates.append((static_batch is None, int(program.capacity), index, program))
+        static_batch = program.static_extent_bindings.get("active_batch")
+        candidates.append(
+            (static_batch is None, int(program.capacity), index, program)
+        )
     if not candidates:
         return None
-    _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
+    _dynamic, _capacity, index, program = min(
+        candidates, key=lambda item: item[:3]
+    )
     return index, program
 
 
@@ -375,6 +402,9 @@ class GeneratedDecode:
         for slot in runtime.decode_slots:
             for program_index, program in enumerate(self._programs):
                 capacity = program.capacity
+                minimum_batch, maximum_batch = _active_batch_interval(program)
+                if minimum_batch > int(runtime.max_batch_size):
+                    continue
                 requirements = self.state_requirements_by_capacity[capacity]
                 capacity_inputs = (
                     dict(spec.capacity_inputs(capacity, requirements))
@@ -393,11 +423,8 @@ class GeneratedDecode:
                     preparations=spec.preparations,
                 )
                 plans.setdefault(tuple(step.name for step in plan), plan)
-                construction_batch = int(
-                    program.static_extent_bindings.get(
-                        "active_batch",
-                        min(capacity, int(runtime.max_batch_size)),
-                    )
+                construction_batch = min(
+                    maximum_batch, int(runtime.max_batch_size)
                 )
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch
