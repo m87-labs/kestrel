@@ -232,16 +232,15 @@ def _select_program(programs: Sequence[Any], batch_size: int) -> tuple[int, Any]
         minimum_batch, maximum_batch = _active_batch_interval(program)
         if not minimum_batch <= batch_size <= maximum_batch:
             continue
-        candidates.append((int(program.capacity), index, program))
+        static_batch = program.static_extent_bindings.get("active_batch")
+        candidates.append(
+            (static_batch is None, int(program.capacity), index, program)
+        )
     if not candidates:
         return None
-    candidates.sort(key=lambda item: item[:-1])
-    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-        raise RuntimeError(
-            "generated decode programs ambiguously overlap at "
-            f"active batch {batch_size} and capacity {candidates[0][0]}"
-        )
-    _capacity, index, program = candidates[0]
+    _dynamic, _capacity, index, program = min(
+        candidates, key=lambda item: item[:3]
+    )
     return index, program
 
 

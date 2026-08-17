@@ -47,7 +47,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
     )
 
 
-def test_program_selection_rejects_overlapping_same_capacity_variants():
+def test_program_selection_preserves_legacy_static_preference():
     generated = GeneratedDecode.__new__(GeneratedDecode)
     dynamic_b2 = _program(2)
     dynamic_b4 = _program(4)
@@ -65,11 +65,9 @@ def test_program_selection_rejects_overlapping_same_capacity_variants():
     assert generated._program_for(1)[1] is dynamic_b2
     assert generated._program_for(2)[1] is dynamic_b2
     assert generated._program_for(3)[1] is dynamic_b4
-    with pytest.raises(RuntimeError, match="ambiguously overlap"):
-        generated._program_for(4)
+    assert generated._program_for(4)[1] is exact_b4
     assert generated._program_for(5)[1] is dynamic_b8
-    with pytest.raises(RuntimeError, match="ambiguously overlap"):
-        generated._program_for(8)
+    assert generated._program_for(8)[1] is exact_b8
     assert generated._program_for(9) is None
 
 
