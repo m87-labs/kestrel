@@ -245,20 +245,48 @@ def test_gemma_required_generated_never_falls_back_to_native(
         runtime.decode_with_slot(SimpleNamespace(compute_stream=object()), 2)
 
 
-def test_moondream_explicit_decode_path_refuses_before_runtime_work() -> None:
-    cfg = SimpleNamespace(
-        decode_path="native",
-        resolved_device=lambda: pytest.fail(
-            "unsupported policy must fail before runtime work"
+def test_moondream_native_does_not_construct_generated_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.moondream import generated_decode as md_generated
+
+    runtime = object.__new__(MoondreamRuntime)
+    runtime.decode_path = "native"
+    monkeypatch.setattr(
+        md_generated,
+        "create_generated_decode",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native mode must not construct generated decode"
         ),
     )
 
-    with pytest.raises(
-        ValueError,
-        match="Moondream runtimes currently support only decode_path='auto'",
-    ):
-        MoondreamRuntime(
-            cfg,
-            kv_pool=object(),
-            compute_stream=None,
+    runtime._initialize_generated_decode()
+
+    assert runtime.generated_decode is None
+
+
+def test_moondream_required_generated_unavailable_refuses_before_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.moondream import generated_decode as md_generated
+
+    runtime = object.__new__(MoondreamRuntime)
+    runtime.decode_path = "generated"
+    runtime._decode_graphs = SimpleNamespace(
+        ensure_ready=lambda _slots: pytest.fail(
+            "required generated failure must precede graph capture"
         )
+    )
+    calls: list[bool] = []
+
+    def unavailable(_runtime, *, required: bool = False):
+        calls.append(required)
+        raise RuntimeError("no compatible generated program")
+
+    monkeypatch.setattr(md_generated, "create_generated_decode", unavailable)
+
+    with pytest.raises(RuntimeError, match="no compatible generated program"):
+        runtime._initialize_generated_decode()
+
+    assert calls == [True]
+    assert runtime.generated_decode is None
