@@ -2,6 +2,12 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
+## Unreleased
+
+- Added `openai/whisper-large-v3-turbo` transcription and English translation,
+  including bounded long-form files, live PCM, progressive results, segment and
+  word timestamps, language detection, and prompts.
+
 ## 0.5.0 — 2026-08-02
 
 Kestrel now serves Qwen 3.5, Qwen 3.6, and Gemma 4 alongside the Moondream

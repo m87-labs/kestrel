@@ -12,7 +12,7 @@ from .protocols import (
 from .registry import ModelSpec, get_spec, known_models, register
 
 # Model packages register their specs at import time.
-from . import gemma4, moondream, qwen35  # noqa: F401
+from . import gemma4, moondream, qwen35, whisper  # noqa: F401
 
 __all__ = [
     "CaptionPromptTemplate",

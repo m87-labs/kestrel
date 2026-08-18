@@ -69,3 +69,31 @@ def test_producer_failure_reaches_iterator_and_result() -> None:
             await stream.result()
 
     asyncio.run(scenario())
+
+
+def test_cancelled_next_does_not_steal_a_later_update() -> None:
+    async def scenario() -> None:
+        publish = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def produce(emit):
+            await publish.wait()
+            emit({"text": "kept"})
+            await finish.wait()
+            return _result("done")
+
+        stream = CapabilityStream("transcribe", produce)
+        pending_next = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        pending_next.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_next
+
+        publish.set()
+        update = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert update.output == {"text": "kept"}
+
+        finish.set()
+        assert (await stream.result()).output == {"text": "done"}
+
+    asyncio.run(scenario())
