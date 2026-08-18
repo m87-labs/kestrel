@@ -89,6 +89,31 @@ def test_qwen_required_generated_unavailable_refuses_before_graph_capture(
     assert runtime.generated_decode is None
 
 
+@pytest.mark.parametrize(
+    ("decode_path", "expected_captures"),
+    (("generated", 0), ("auto", 1), ("native", 1)),
+)
+def test_qwen_captures_native_graphs_only_when_native_decode_is_reachable(
+    decode_path: str,
+    expected_captures: int,
+) -> None:
+    captures: list[object] = []
+    slots = (object(), object())
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.decode_path = decode_path
+    runtime._use_cuda_graphs = True
+    runtime._decode_slots = slots
+    runtime._decode_graphs = SimpleNamespace(
+        ensure_ready=lambda actual_slots: captures.append(actual_slots)
+    )
+
+    runtime._initialize_native_decode_graphs()
+
+    assert len(captures) == expected_captures
+    if captures:
+        assert captures == [slots]
+
+
 def test_generated_requirement_unavailable_refuses_before_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
