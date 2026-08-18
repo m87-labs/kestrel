@@ -452,8 +452,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self.spatial_tables = None
 
         self._initialize_generated_decode()
+        self._initialize_native_decode_graphs()
 
-        if self._use_cuda_graphs:
+    def _initialize_native_decode_graphs(self) -> None:
+        """Capture native graphs only when native decode remains reachable."""
+
+        if self._use_cuda_graphs and self.decode_path != "generated":
             self._decode_graphs.ensure_ready(self._decode_slots)
 
     def _initialize_generated_decode(self) -> None:
