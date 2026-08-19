@@ -25,6 +25,7 @@ def create_generated_decode(
     bindings = PagedDecodeBindings(
         runtime._paged_kv,
         extra_runtime_inputs=lambda bound_runtime: {
+            "rope_delta_table": bound_runtime._decode_rope_deltas,
             "rope_inv_freq": (
                 bound_runtime.model.model.language_model.rotary_emb.inv_freq),
         },

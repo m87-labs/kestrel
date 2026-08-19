@@ -54,6 +54,20 @@ class UncachedPagedRuntime:
             f"{type(self).__name__} does not support encoder inputs"
         )
 
+    def image_kv_length(
+        self,
+        prompt_tokens: Sequence[Token],
+        image: Any,
+        image_crops: Any,
+    ) -> int:
+        """Return image KV positions added beyond the typed prompt tokens."""
+        del prompt_tokens, image_crops
+        if image is None:
+            return 0
+        if isinstance(image, (list, tuple)):
+            return len(image) * (self.image_prefix_length - 1)
+        return self.image_prefix_length
+
     def shutdown(self) -> None:
         self._image_preprocessor.shutdown()
 

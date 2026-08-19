@@ -452,8 +452,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self.spatial_tables = None
 
         self._initialize_generated_decode()
+        self._initialize_native_decode_graphs()
 
-        if self._use_cuda_graphs:
+    def _initialize_native_decode_graphs(self) -> None:
+        """Capture native graphs only when native decode remains reachable."""
+
+        if self._use_cuda_graphs and self.decode_path != "generated":
             self._decode_graphs.ensure_ready(self._decode_slots)
 
     def _initialize_generated_decode(self) -> None:
@@ -498,6 +502,34 @@ class Qwen35Runtime(UncachedPagedRuntime):
     @property
     def cuda_graphs_enabled(self) -> bool:
         return self._use_cuda_graphs
+
+    def image_kv_length(
+        self,
+        prompt_tokens: Sequence[Any],
+        image: Any,
+        image_crops: Any,
+    ) -> int:
+        """Return the exact Qwen vision expansion after preprocessing."""
+        if image is None:
+            return 0
+        if not isinstance(image_crops, QwenImageInputs):
+            return super().image_kv_length(prompt_tokens, image, image_crops)
+
+        from kestrel.runtime.tokens import ImageMarker
+
+        num_images = int(image_crops.image_grid_thw.shape[0])
+        grid_tokens = int(image_crops.image_grid_thw.prod(-1).sum().item()) // 4
+        if grid_tokens != int(image_crops.num_image_tokens):
+            raise ValueError(
+                "Qwen preprocessed image token count does not match its grid"
+            )
+        marker_count = sum(isinstance(token, ImageMarker) for token in prompt_tokens)
+        if marker_count not in (0, num_images):
+            raise ValueError(
+                "Qwen image marker count must be zero or match preprocessed images"
+            )
+        inserted_tokens = int(image_crops.num_image_tokens) + 2 * num_images
+        return inserted_tokens - marker_count
 
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
@@ -558,7 +590,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         from kestrel.runtime.tokens import ImageMarker
 
         tokens_list = list(prompt_tokens)
-        text_only_len = len(tokens_list)
         num_image_tokens = 0
         num_images = 0
         chat_crops = None
@@ -627,13 +658,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 tokens_list = tokens_list[:offset] + image_block + tokens_list[offset:]
 
         new_tokens = 128 if max_new_tokens is None else max_new_tokens
-        budget_for_finalize = (
-            text_only_len
-            + (self.image_prefix_length if image is not None else 0)
-            + new_tokens
-        )
-        actual_kv_budget = len(tokens_list) + new_tokens
-        target_length = max(budget_for_finalize, actual_kv_budget)
+        target_length = len(tokens_list) + new_tokens
         prepared = self._prepare_uncached_sequence(
             tokens=tokens_list,
             target_length=target_length,

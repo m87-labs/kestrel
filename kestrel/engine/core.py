@@ -1731,16 +1731,23 @@ class InferenceEngine:
             )
         prompt_tokens = req.prompt_tokens
         stream_cb = self._build_stream_callback(req)
-        if req.image is None and image_crops is None:
-            image_length = 0
-        elif isinstance(req.image, (list, tuple)):
-            # Multi-image chat: each image expands one ImageMarker token — which
-            # is already counted in prompt_length — into an image_prefix_length
-            # patch block, so it adds image_prefix_length - 1 KV positions per
-            # image. (target_length = prompt_length + image_length + max_new.)
-            image_length = len(req.image) * (runtime.image_prefix_length - 1)
-        else:
-            image_length = runtime.image_prefix_length
+        image_length = (
+            0
+            if req.image is None and image_crops is None
+            else runtime.image_kv_length(
+                prompt_tokens,
+                req.image,
+                image_crops,
+            )
+        )
+        if (
+            isinstance(image_length, bool)
+            or not isinstance(image_length, int)
+            or image_length < 0
+        ):
+            raise ValueError(
+                "runtime image_kv_length must return a non-negative integer"
+            )
         adapter = req.adapter
         request_obj = GenerationRequest(
             request_id=req.request_id,

@@ -1246,6 +1246,15 @@ class MoondreamRuntime:
     def preprocess_encoder_input_async(self, encoder_input: object):
         raise ValueError("MoondreamRuntime does not support encoder inputs")
 
+    def image_kv_length(self, prompt_tokens, image, image_crops) -> int:
+        """Return image KV positions added beyond the typed prompt tokens."""
+        del prompt_tokens, image_crops
+        if image is None:
+            return 0
+        if isinstance(image, (list, tuple)):
+            return len(image) * (self.image_prefix_length - 1)
+        return self.image_prefix_length
+
     def shutdown(self) -> None:
         """Release runtime resources (Runtime protocol).
 
