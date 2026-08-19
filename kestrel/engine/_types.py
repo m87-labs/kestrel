@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import (
@@ -397,6 +398,7 @@ class _AutoregressiveRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 @dataclass(slots=True)

@@ -2,7 +2,7 @@
 
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Literal
@@ -177,8 +177,18 @@ class RuntimeConfig:
     # that support it must bind compatible generated programs for the complete
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
+    # Backend-owned, namespaced options. Keeping these in one mapping avoids
+    # adding model-specific fields to the shared engine configuration.
+    runtime_options: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self):
+        if not isinstance(self.runtime_options, dict) or not all(
+            isinstance(name, str) and name for name in self.runtime_options
+        ):
+            raise TypeError(
+                "runtime_options must be a dictionary with nonempty string keys"
+            )
+        self.runtime_options = dict(self.runtime_options)
         if self.decode_path not in ("auto", "native", "generated"):
             raise ValueError(
                 "decode_path must be 'auto', 'native', or 'generated'"

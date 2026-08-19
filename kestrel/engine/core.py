@@ -1023,6 +1023,14 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
+        cancel_event = threading.Event()
+
+        def wake_cancelled_request(completed: asyncio.Future[EngineResult]) -> None:
+            if completed.cancelled():
+                cancel_event.set()
+                self._scheduler_event.set()
+
+        future.add_done_callback(wake_cancelled_request)
 
         skill_spec = self._skill_registry().resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
@@ -1093,6 +1101,7 @@ class InferenceEngine:
             return_logprobs=return_logprobs,
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
+            cancel_event=cancel_event,
         )
         del prepared_prompt
         await self._queue.put(payload)

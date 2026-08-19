@@ -110,6 +110,7 @@ class _FakeDecoder:
         state,
         prompt_token_ids,
         *,
+        request_context=None,
         image=None,
         image_crops=None,
         allowed_token_ids=None,
@@ -124,13 +125,14 @@ class _FakeDecoder:
         if self._admit_side_values is not None:
             state.admit_side_values = self._admit_side_values
         self.admitted.append(row)
-        want_logprobs = getattr(state, "return_logprobs", None) is True
+        want_logprobs = state.return_logprobs
         self.admit_kwargs[row] = {
             # The *typed* prompt tokens the scheduler forwards (the non-spec
             # ``prepare_sequence`` contract): asserted to survive admission whole,
             # not be stripped to ``int(t.token_id)`` (which would raise on
             # ImageMarker/Coord/Size tokens that lack ``token_id``).
             "prompt_tokens": list(prompt_token_ids),
+            "request_context": request_context,
             "image": image,
             "image_crops": image_crops,
             "allowed_token_ids": allowed_token_ids,
@@ -138,7 +140,7 @@ class _FakeDecoder:
             "suppress_next_token_ids": suppress_next_token_ids,
             "temperature": temperature,
             "top_p": top_p,
-            "return_logprobs": getattr(state, "return_logprobs", None),
+            "return_logprobs": state.return_logprobs,
         }
         # New contract: ``admit`` returns ``(first_token_id, first_logprob)``.
         # ``first_logprob`` is the real selected-token logprob when the request
@@ -338,6 +340,118 @@ def test_spec_finish_on_eos_within_run_retires_and_completes() -> None:
     completed = sched.pop_completed()
     assert [c.request_id for c in completed] == [0]
     assert completed[0].finish_reason == "stop"
+
+
+def test_spec_retire_may_invalidate_state_batch_index() -> None:
+    class _InvalidatingDecoder(_FakeDecoder):
+        def retire(self, state) -> None:  # noqa: ANN001
+            super().retire(state)
+            state.batch_idx = -1
+
+    decoder = _InvalidatingDecoder(
+        n_rows=1,
+        first_tokens={0: 999},
+        plans={0: []},
+    )
+    runtime = _spec_runtime(decoder, eos_id=999)
+    scheduler = _make_scheduler(runtime)
+    request = _enqueue(scheduler, 0, prompt_len=3, max_new=2)
+
+    assert scheduler._spec_admit() is True
+
+    assert request.lifecycle.state.batch_idx == -1
+    assert decoder.retired == [0]
+    assert runtime.active_sequences == {}
+
+
+def test_cancelled_running_spec_request_retires_transactional_row() -> None:
+    decoder = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+    )
+    runtime = _spec_runtime(decoder)
+    scheduler = _make_scheduler(runtime)
+    request = _enqueue(scheduler, 17, prompt_len=3, max_new=8)
+
+    assert scheduler._spec_admit() is True
+    assert scheduler.cancel_request(request.request_id) is True
+
+    assert decoder.retired == [0]
+    assert runtime.active_sequences == {}
+    assert list(scheduler.running) == []
+    (result,) = scheduler.pop_completed()
+    assert result.request_id == request.request_id
+    assert result.finish_reason == "cancelled"
+
+
+def test_cancelled_waiting_spec_request_never_claims_a_row() -> None:
+    decoder = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+    )
+    scheduler = _make_scheduler(_spec_runtime(decoder))
+    request = _enqueue(scheduler, 19, prompt_len=3, max_new=8)
+
+    assert scheduler.cancel_request(request.request_id) is True
+
+    assert decoder.admitted == []
+    assert decoder.retired == []
+    assert list(scheduler.waiting) == []
+    (result,) = scheduler.pop_completed()
+    assert result.finish_reason == "cancelled"
+
+
+def test_cancelled_spec_request_defers_row_reuse_until_pending_step_commits() -> None:
+    decoder = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+    )
+    runtime = _spec_runtime(decoder)
+    scheduler = _make_scheduler(runtime)
+    request = _enqueue(scheduler, 18, prompt_len=3, max_new=8)
+
+    assert scheduler._spec_admit() is True
+    lifecycle = request.lifecycle
+    state = lifecycle.state
+    assert scheduler._spec_decode_step() is True
+    assert lifecycle.inflight_refs == 1
+    assert [token.token_id for token in lifecycle.skill_state.tokens] == [11]
+
+    assert scheduler.cancel_request(request.request_id) is True
+    assert decoder.retired == []
+    assert state.batch_idx in runtime.active_sequences
+
+    scheduler._drain_spec()
+    assert decoder.retired == [0]
+    assert runtime.active_sequences == {}
+    assert [token.token_id for token in lifecycle.skill_state.tokens] == [11]
+
+
+def test_cancelled_pending_cohort_skips_discarded_token_materialization() -> None:
+    decoder = _FakeDecoder(
+        n_rows=1,
+        first_tokens={0: 11},
+        plans={0: [[12]]},
+    )
+    runtime = _spec_runtime(decoder)
+    scheduler = _make_scheduler(runtime)
+    request = _enqueue(scheduler, 20, prompt_len=3, max_new=8)
+
+    assert scheduler._spec_admit() is True
+    assert scheduler._spec_decode_step() is True
+    assert scheduler.cancel_request(request.request_id) is True
+
+    def fail_materialization(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("discarded zombie tokens must not be materialized")
+
+    scheduler._materialize_spec_tokens = fail_materialization
+    scheduler._drain_spec()
+
+    assert decoder.retired == [0]
+    assert runtime.active_sequences == {}
 
 
 def test_spec_finish_on_additional_runtime_eos_id() -> None:
@@ -954,6 +1068,7 @@ def test_spec_admit_forwards_image_mask_and_sampling_params() -> None:
 
     assert sched._spec_admit() is True
     kw = dec.admit_kwargs[0]
+    assert kw["request_context"] is req.request_context
     assert kw["image"] is img
     assert list(kw["allowed_token_ids"]) == [12, 13]
     assert list(kw["suppressed_token_ids"]) == [99]

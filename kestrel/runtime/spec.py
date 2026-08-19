@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
 if TYPE_CHECKING:
     import torch
 
+    from kestrel.runtime.state import SequenceState
     from kestrel.runtime.tokens import Token
 
 
@@ -241,9 +242,10 @@ class SpecDecoder(Protocol):
 
     def admit(
         self,
-        state: Any,
+        state: "SequenceState",
         prompt_tokens: "Sequence[Token]",
         *,
+        request_context: object,
         image: Any | None = None,
         image_crops: Any | None = None,
         allowed_token_ids: Sequence[int] | None = None,
@@ -253,6 +255,12 @@ class SpecDecoder(Protocol):
         top_p: float = 1.0,
     ) -> "tuple[int, float | None]":
         """Prefill ``prompt_tokens`` into a free pool row for ``state``.
+
+        ``request_context`` is the opaque, model-owned value returned by the
+        request's skill.  The scheduler never inspects it; it is forwarded so
+        a decoder can honor request-local model policy that is not part of the
+        generic sampling envelope (for example a decoding strategy, grammar,
+        or deterministic RNG seed).
 
         ``prompt_tokens`` is the request's *typed* prefill sequence -- the same
         ``Sequence[Token]`` the non-spec ``AutoregressiveRuntime.prepare_sequence``
@@ -318,7 +326,7 @@ class SpecDecoder(Protocol):
 
     def step(
         self,
-        states: Sequence[Any],
+        states: Sequence["SequenceState"],
         *,
         allowed_token_ids: Sequence[Sequence[int] | None] | None = None,
         suppressed_token_ids: Sequence[Sequence[int] | None] | None = None,
@@ -373,7 +381,7 @@ class SpecDecoder(Protocol):
         """
         ...
 
-    def retire(self, state: Any) -> None:
+    def retire(self, state: "SequenceState") -> None:
         """Release the pool row held by a finished sequence's ``state``."""
         ...
 
@@ -390,6 +398,11 @@ class SpecDecodeCaps:
     the proposer consumes (e.g. DFlash's ``target_layer_ids``); an empty tuple
     means the proposer needs no target hidden states.
 
+    ``proposer`` is optional for runtimes whose speculative algorithm is an
+    integrated model forward rather than a separable draft-then-verify pair.
+    Such runtimes advertise their algorithm through ``decoder`` alone. At
+    least one of ``proposer`` or ``decoder`` must be present.
+
     ``decoder`` is the runtime's :class:`SpecDecoder` — the per-macro-step
     entry point the scheduler drives (draft + verify + accept + commit). It is
     optional only so the inert scaffolding (and its CPU-only tests) can still
@@ -397,6 +410,10 @@ class SpecDecodeCaps:
     actually wants the scheduler to speculate must set it.
     """
 
-    proposer: SpecProposer
+    proposer: SpecProposer | None = None
     capture_hidden_layers: tuple[int, ...] = ()
     decoder: SpecDecoder | None = None
+
+    def __post_init__(self) -> None:
+        if self.proposer is None and self.decoder is None:
+            raise ValueError("speculative decoding requires a proposer or decoder")

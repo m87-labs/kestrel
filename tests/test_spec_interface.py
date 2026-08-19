@@ -6,6 +6,8 @@ No model construction, no GPU.
 
 from __future__ import annotations
 
+import pytest
+
 from kestrel.runtime.spec import (
     DraftResult,
     SpecDecodeCaps,
@@ -45,6 +47,18 @@ def test_spec_decode_caps_defaults_to_no_hidden_layers() -> None:
     # The spec-step decoder is optional on the scaffolding (CPU tests build caps
     # that only advertise a proposer); it defaults to None.
     assert caps.decoder is None
+
+
+def test_integrated_decoder_does_not_require_separate_proposer() -> None:
+    decoder = _StubDecoder()
+    caps = SpecDecodeCaps(decoder=decoder)
+    assert caps.proposer is None
+    assert caps.decoder is decoder
+
+
+def test_spec_decode_caps_rejects_empty_capability() -> None:
+    with pytest.raises(ValueError, match="requires a proposer or decoder"):
+        SpecDecodeCaps()
 
 
 class _StubState:

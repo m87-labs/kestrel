@@ -424,6 +424,54 @@ class GenerationScheduler:
         request.skill_state = skill_state
         self.waiting.push(request)
 
+    def cancel_request(self, request_id: int) -> bool:
+        """Finalize one queued or running request at a scheduler-safe boundary."""
+
+        request = next(
+            (item for item in self.waiting if item.request_id == request_id),
+            None,
+        )
+        if request is not None:
+            self.waiting.remove(request)
+            lifecycle = request.lifecycle
+            if lifecycle.lora_slot_ready and request.lora_slot:
+                self.runtime.release_adapter_slot(request.lora_slot)
+                request.lora_slot = 0
+                lifecycle.lora_slot_ready = False
+            request.encoder_input = None
+            lifecycle.finish_reason = "cancelled"
+            lifecycle.finished = True
+            lifecycle.finalized = True
+            lifecycle.completed_at = time.perf_counter()
+            lifecycle.first_token_time = lifecycle.completed_at
+            lifecycle.transition(RequestPhase.COMPLETED)
+            self._completed.append(self._build_result(lifecycle))
+            return True
+
+        sequence = next(
+            (
+                item
+                for item in self.running
+                if item.request.request_id == request_id
+            ),
+            None,
+        )
+        if sequence is None:
+            return False
+        # Non-speculative prefill has a separate in-flight ownership protocol:
+        # unlike decode, its launch is not represented by ``inflight_refs``.
+        # It therefore cannot be retired from this generic safe point yet.
+        # The caller's future is still cancelled, and the existing path drains
+        # that request normally. Integrated speculative decoders use explicit
+        # transactional rows and can be retired here or by their pending step.
+        if self.runtime.spec is None:
+            return False
+        self.running.remove(sequence)
+        self._finalize_sequence(sequence, "cancelled")
+        if self.runtime.spec is not None and sequence.inflight_refs == 0:
+            self._retire_spec_row(sequence.state)
+        return True
+
     def _materialize_tokens(
         self,
         token_ids_cpu: Tensor,
@@ -841,13 +889,8 @@ class GenerationScheduler:
                 prompt_length=kv_prompt_length,
                 image_length=request.image_length,
                 lora_slot=request.lora_slot,
+                return_logprobs=request.return_logprobs is True,
             )
-            # The spec decoder reads ``return_logprobs`` off the state to decide
-            # whether ``step`` computes per-committed-token logprobs for this row
-            # (matching the non-spec sampler, which gates the logprob gather on
-            # the request). ``SequenceState`` is a plain dataclass, so attach it
-            # as an extra attribute the decoder picks up via ``getattr``.
-            state.return_logprobs = request.return_logprobs is True
 
             # Run the skill's prefill hook BEFORE building the mask + admitting:
             # ``admit`` prefills *and* samples the first (bonus) token in one
@@ -964,6 +1007,7 @@ class GenerationScheduler:
                     first_token_id, first_logprob = decoder.admit(
                         state,
                         prompt_tokens,
+                        request_context=request.request_context,
                         image=request.image,
                         image_crops=request.image_crops,
                         allowed_token_ids=allowed_token_ids,
@@ -1115,6 +1159,7 @@ class GenerationScheduler:
         # sentinel means ``admit`` never reserved one, so there is nothing to
         # retire.
         if state.batch_idx >= 0:
+            batch_idx = state.batch_idx
             if decoder is not None:
                 try:
                     decoder.retire(state)
@@ -1125,7 +1170,7 @@ class GenerationScheduler:
             # failure path it is absent; on the admit-token materialization
             # failure path it was registered just before -- pop it
             # unconditionally so neither leaves a dangling entry.
-            self.runtime.active_sequences.pop(state.batch_idx, None)
+            self.runtime.active_sequences.pop(batch_idx, None)
         lifecycle = request.lifecycle
         if lifecycle.lora_slot_ready and request.lora_slot:
             # Release the LoRA slot we acquired for this failed admission so its
@@ -1154,8 +1199,9 @@ class GenerationScheduler:
         ``lora_slot == 0`` (a base-model request), so this is unconditional.
         """
         decoder = self.runtime.spec.decoder
+        batch_idx = state.batch_idx
         decoder.retire(state)
-        self.runtime.active_sequences.pop(state.batch_idx, None)
+        self.runtime.active_sequences.pop(batch_idx, None)
         self.runtime.release_adapter_slot(state.lora_slot)
 
     def _spec_decode_step(self) -> bool:
@@ -1501,6 +1547,19 @@ class GenerationScheduler:
         # ``tokens``/``logprobs`` resolve lazily off the (already-landed) D2H;
         # ``side_values`` holds device tensors read at ``step`` time.
         tokens = result.tokens
+        if all(seq.finalized for seq in active):
+            # Cancellation/finalization can turn an entire pending macro-step
+            # into zombies. Resolving ``tokens`` above fences its device work;
+            # do not run model-specific materialization for values that will be
+            # discarded. Apart from avoiding wasted CPU work, this ensures a
+            # cancelled row can always reach its retirement path even if its
+            # token materializer rejects output that no caller will observe.
+            for seq in active:
+                seq.inflight_refs -= 1
+                if seq.inflight_refs == 0:
+                    seq.transition(RequestPhase.COMPLETED)
+                    self._retire_spec_row(seq.state)
+            return
         logprobs = result.logprobs  # None when nobody requested logprobs
         side_values = result.side_values
         # Type the whole step's committed ids up front (coord/size via the
