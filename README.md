@@ -89,9 +89,8 @@ asyncio.run(main())
 ## Whisper transcription
 
 Whisper uses its Hugging Face repository ID as the model name. The checkpoint
-is resolved at Kestrel's pinned revision, and the optimized execution backend
-must be installed and registered by the Kestrel distribution before the engine
-is created.
+is resolved at Kestrel's pinned revision, and execution uses the same packaged
+Kestrel kernels and generated-decode runtime as the other CUDA models.
 
 ```python
 import asyncio

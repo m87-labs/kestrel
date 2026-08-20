@@ -1,7 +1,7 @@
 """Inference-only eager Whisper math used as a test correctness oracle.
 
 This module intentionally owns no ``nn.Module`` or ``Parameter`` objects. The
-shipping prefill and generated-decode backends consume the same typed weights;
+shipping prefill and generated-decode paths consume the same typed weights;
 these functional forwards validate their tensor contracts without shipping an
 alternate runtime implementation.
 """

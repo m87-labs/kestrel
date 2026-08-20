@@ -83,7 +83,7 @@ def create_generated_decode(
     )
     if required:
         return GeneratedDecode.require(
-            runtime, spec, capacity=runtime.max_batch_size
+            runtime, spec, batch_sizes=range(1, runtime.max_batch_size + 1)
         )
     return GeneratedDecode.try_create(runtime, spec)
 

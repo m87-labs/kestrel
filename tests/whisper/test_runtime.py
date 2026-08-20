@@ -17,7 +17,7 @@ from kestrel.models.whisper import MODEL_NAME, _runtime_factory
 from kestrel.models.whisper.audio import AudioSource, PreparedAudio
 from kestrel.models.whisper.config import WhisperPreprocessorConfig, WhisperTurboConfig
 from kestrel.models.whisper.runtime import WhisperRuntime, WhisperRuntimeComponents
-from kestrel.models.whisper.runtime_abi import WhisperBackendBindings
+from kestrel.models.whisper.runtime_abi import WhisperExecutionBindings
 from kestrel.models.whisper.skill import (
     TranscribeRequest,
     WhisperTranscribeSkill,
@@ -105,25 +105,33 @@ class _FakeSession:
     def launch(self, slot_id: int, batch_size: int) -> None:
         self.launches.append((slot_id, batch_size))
         slot = self.buffers[slot_id]
-        slot.logits_out[:batch_size].fill_(7.0 if self.kind == "prefill" else 11.0)
+        slot.logits_out[:batch_size].fill_(7.0)
+
+    def run(self, slot: Any, batch_size: int) -> None:
+        self.warmup_calls += 1
+        if self.warmup_failures:
+            self.warmup_failures -= 1
+            raise RuntimeError(f"{self.kind} warmup failed")
+        self.launches.append((int(slot.slot_id), int(batch_size)))
+        slot.logits[:batch_size].fill_(11.0)
 
     def shutdown(self) -> None:
         self.shutdown_calls += 1
 
 
-class _FakeFactory:
+class _FakeSessionFactory:
     def __init__(self, *, decode_warmup_failures: int = 0) -> None:
         self.decode_warmup_failures = decode_warmup_failures
-        self.bindings: WhisperBackendBindings | None = None
+        self.bindings: WhisperExecutionBindings | None = None
         self.prefill: _FakeSession | None = None
         self.decode: _FakeSession | None = None
 
-    def create_prefill(self, bindings: WhisperBackendBindings) -> _FakeSession:
+    def create_prefill(self, bindings: WhisperExecutionBindings) -> _FakeSession:
         self.bindings = bindings
         self.prefill = _FakeSession("prefill", bindings.prefill_buffers)
         return self.prefill
 
-    def create_decode(self, bindings: WhisperBackendBindings) -> _FakeSession:
+    def create_decode(self, bindings: WhisperExecutionBindings) -> _FakeSession:
         assert self.bindings is bindings
         self.decode = _FakeSession(
             "decode",
@@ -134,7 +142,7 @@ class _FakeFactory:
 
     def native_provenance(
         self,
-        bindings: WhisperBackendBindings,
+        bindings: WhisperExecutionBindings,
         decode_session: _FakeSession,
     ) -> dict[str, Any]:
         assert self.bindings is bindings
@@ -142,8 +150,8 @@ class _FakeFactory:
         return {}
 
 
-class _FailingDecodeFactory(_FakeFactory):
-    def create_decode(self, bindings: WhisperBackendBindings) -> _FakeSession:
+class _FailingDecodeFactory(_FakeSessionFactory):
+    def create_decode(self, bindings: WhisperExecutionBindings) -> _FakeSession:
         assert self.bindings is bindings
         raise RuntimeError("generated decode construction failed")
 
@@ -203,7 +211,7 @@ def _components(config, weights, factory) -> WhisperRuntimeComponents:
             WhisperControlTokens(suppress_tokens=()),
         ),
         weights=weights,
-        backend_factory=factory,
+        session_factory=factory,
     )
 
 
@@ -301,29 +309,6 @@ def test_production_runtime_rejects_unverified_local_checkpoint_overrides(
         )
 
 
-def test_production_runtime_requires_backend_before_loading_assets(monkeypatch) -> None:
-    import kestrel.models.whisper.runtime as runtime_module
-
-    def missing_backend():
-        raise RuntimeError("backend unavailable")
-
-    def loaded_assets():
-        raise AssertionError("assets loaded")
-
-    monkeypatch.setattr(runtime_module, "_CUTE_JIT_ENABLED_AT_RUNTIME_IMPORT", False)
-    monkeypatch.setattr(runtime_module, "is_cute_jit_enabled", lambda: False)
-    monkeypatch.setattr(runtime_module, "create_backend", missing_backend)
-    monkeypatch.setattr(runtime_module, "WhisperAssets", loaded_assets)
-    cfg = SimpleNamespace(model=MODEL_NAME, model_path=None, tokenizer_path=None)
-
-    with pytest.raises(RuntimeError, match="backend unavailable"):
-        runtime_module._load_production_components(
-            cfg,
-            device=torch.device("cuda"),
-            dtype=torch.bfloat16,
-        )
-
-
 def _explicit_prefix() -> list[TextToken]:
     return [
         TextToken(token_id=50258),
@@ -337,7 +322,7 @@ def test_prepared_audio_cross_row_and_prefix_slot_lifecycle(
     runtime_weights,
     prepared_audio,
 ) -> None:
-    factory = _FakeFactory()
+    factory = _FakeSessionFactory()
     runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
     cross_key_ptr = runtime.cross_kv.keys.data_ptr()
     prepared = runtime.prepare_sequence(
@@ -392,7 +377,7 @@ def test_prefill_rejects_replaced_audio_and_abort_releases_every_owner(
     runtime_weights,
     prepared_audio,
 ) -> None:
-    factory = _FakeFactory()
+    factory = _FakeSessionFactory()
     runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
     prepared = runtime.prepare_sequence(
         _explicit_prefix(),
@@ -421,7 +406,7 @@ def test_generated_decode_pads_to_compiled_capacity_with_noop_row(
     runtime_model_config,
     runtime_weights,
 ) -> None:
-    factory = _FakeFactory()
+    factory = _FakeSessionFactory()
     runtime = _make_runtime(
         runtime_model_config,
         runtime_weights,
@@ -450,7 +435,7 @@ def test_timestamp_grammar_stages_generic_batch_aligned_constraints(
     runtime_weights,
     prepared_audio,
 ) -> None:
-    factory = _FakeFactory()
+    factory = _FakeSessionFactory()
     runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
     skill = WhisperTranscribeSkill()
     explicit = WhisperTranscribeState(
@@ -529,7 +514,9 @@ def test_sampled_token_scores_use_untempered_masked_model_distribution(
     runtime_model_config,
     runtime_weights,
 ) -> None:
-    runtime = _make_runtime(runtime_model_config, runtime_weights, _FakeFactory())
+    runtime = _make_runtime(
+        runtime_model_config, runtime_weights, _FakeSessionFactory()
+    )
     hook = runtime.sampling_hooks.score_sampled_tokens
     assert hook is not None
     logits = torch.tensor(
@@ -574,7 +561,9 @@ def test_logits_constraint_staging_is_owned_by_each_pipeline_slot(
     runtime_weights,
     prepared_audio,
 ) -> None:
-    runtime = _make_runtime(runtime_model_config, runtime_weights, _FakeFactory())
+    runtime = _make_runtime(
+        runtime_model_config, runtime_weights, _FakeSessionFactory()
+    )
     skill = WhisperTranscribeSkill()
     explicit = WhisperTranscribeState(
         skill,
@@ -655,18 +644,18 @@ def test_warmup_retries_only_the_backend_that_failed(
     runtime_model_config,
     runtime_weights,
 ) -> None:
-    factory = _FakeFactory(decode_warmup_failures=1)
+    factory = _FakeSessionFactory(decode_warmup_failures=1)
     runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
     with pytest.raises(RuntimeError, match="decode warmup failed"):
         runtime.warmup()
     runtime.warmup()
     runtime.warmup()
     assert factory.prefill is not None and factory.prefill.warmup_calls == 1
-    assert factory.decode is not None and factory.decode.warmup_calls == 2
+    assert factory.decode is not None and factory.decode.warmup_calls == 3
     runtime.shutdown()
     runtime.shutdown()
     assert factory.prefill.shutdown_calls == 1
-    assert factory.decode.shutdown_calls == 1
+    assert factory.decode.shutdown_calls == 0
 
 
 def _constructor_cfg() -> SimpleNamespace:
@@ -685,7 +674,7 @@ def test_async_preprocessor_accepts_only_validated_audio_source(
     runtime_model_config,
     runtime_weights,
 ) -> None:
-    factory = _FakeFactory()
+    factory = _FakeSessionFactory()
     runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
     source = AudioSource(
         value=np.zeros(1600, dtype=np.float32),

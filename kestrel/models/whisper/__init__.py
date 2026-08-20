@@ -1,9 +1,4 @@
-"""First-class Whisper large-v3-turbo inference for Kestrel.
-
-Kestrel owns the model, transcription behavior, and runtime orchestration.
-Optimized distributions register the generated execution backend explicitly;
-the eager correctness oracle lives only in the test package.
-"""
+"""First-class Whisper large-v3-turbo inference for Kestrel."""
 
 from __future__ import annotations
 
@@ -13,7 +8,6 @@ from typing import Any
 from kestrel.models.registry import ModelSpec, register
 
 from .assets import CHECKPOINT_REVISION, MODEL_NAME, REPO_ID
-from .runtime_abi import register_backend
 
 
 def _runtime_factory(cfg: Any, **kwargs: Any) -> Any:
@@ -65,5 +59,4 @@ __all__ = [
     "CHECKPOINT_REVISION",
     "MODEL_NAME",
     "REPO_ID",
-    "register_backend",
 ]

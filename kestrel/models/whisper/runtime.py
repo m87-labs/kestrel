@@ -1,9 +1,9 @@
 """Optimized autoregressive runtime integration for Whisper Turbo.
 
 This module owns scheduler-facing lifecycle and stable state.  Production
-forward work is delegated exclusively to the dedicated custom-prefill session
-and the generated single-token decode session described in :mod:`runtime_abi`.
-The eager model in :mod:`model` is never imported here.
+forward work is delegated exclusively to the public custom-prefill session and
+Kestrel's shared generated-decode runtime. The eager model in :mod:`model` is
+never imported here.
 """
 
 from __future__ import annotations
@@ -50,14 +50,14 @@ from .alignment import (
 from .assets import CHECKPOINT_REVISION, MODEL_NAME, REPO_ID, WhisperAssets
 from .audio import AudioSource, PreparedAudio, prepare_audio
 from .config import WhisperPreprocessorConfig, WhisperTurboConfig
+from .generated_decode import create_generated_decode
+from .prefill_session import NativeWhisperPrefillSession
 from .runtime_abi import (
-    WhisperBackendBindings,
-    WhisperBackendFactory,
+    WhisperExecutionBindings,
     WhisperCrossArenas,
     WhisperDecodeBuffers,
     WhisperPrefillBuffers,
     WhisperSelfKVArenas,
-    create_backend,
     validate_resident_buffers,
 )
 from .tokenizer import WhisperTokenizer
@@ -145,21 +145,85 @@ def _validated_packed_receipts(
     )
 
 
+def _native_provenance(
+    bindings: WhisperExecutionBindings,
+    decode_session: Any,
+) -> dict[str, Any]:
+    capacities = tuple(
+        capacity
+        for capacity in (1, 2, 4, 8)
+        if capacity <= 1 << (int(bindings.max_batch_size) - 1).bit_length()
+    )
+    identities = sorted(
+        (dict(receipt) for receipt in decode_session.artifact_receipts),
+        key=lambda receipt: int(receipt["capacity"]),
+    )
+    if tuple(int(identity["capacity"]) for identity in identities) != capacities:
+        raise RuntimeError(
+            "Whisper generated decode did not resolve every required AOT capacity"
+        )
+    archives = sorted(
+        {
+            (
+                str(identity["archive_path"]),
+                int(identity["archive_size_bytes"]),
+                str(identity["archive_sha256"]),
+                str(identity["archive_root"]),
+            )
+            for identity in identities
+        }
+    )
+    prefill_slots = sorted(slot.slot_id for slot in bindings.prefill_buffers)
+    return {
+        "prefill": {
+            "backend": "cuda-graph",
+            "implementation_modules": [
+                "kestrel.models.whisper.prefill_stem",
+                "kestrel.models.whisper.prefill_encoder",
+                "kestrel.models.whisper.prefill_decoder_prefix",
+            ],
+            "native_kernels_required": True,
+            "aot_required": True,
+            "graph_coverage": [
+                {"slot_id": slot_id, "batch_size": batch_size}
+                for slot_id in prefill_slots
+                for batch_size in range(1, int(bindings.max_batch_size) + 1)
+            ],
+        },
+        "decode": {
+            "backend": "generated-aot",
+            "aot_family": "whisper_large_v3_turbo",
+            "aot_required": True,
+            "batch_capacities": list(capacities),
+            "slot_ids": sorted(slot.slot_id for slot in bindings.decode_buffers),
+            "bundle_archives": [
+                {
+                    "path": path,
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                    "root": root,
+                }
+                for path, size_bytes, sha256, root in archives
+            ],
+            "artifact_identities": identities,
+        },
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class WhisperRuntimeComponents:
     """Explicit dependency injection for CPU lifecycle/integration tests.
 
     Production construction never receives this object: it resolves the pinned
-    assets and the CUDA backend factory internally.  Tests still exercise the
-    real scheduler/page-table/slot lifecycle while substituting enqueue-only
-    fake sessions, rather than routing production through the eager oracle.
+    assets and builds the public native sessions directly. Tests may substitute
+    enqueue-only sessions while exercising the real scheduler and slot lifecycle.
     """
 
     config: WhisperTurboConfig
     preprocessor_config: WhisperPreprocessorConfig
     tokenizer: WhisperTokenizer
     weights: WhisperModelWeights
-    backend_factory: WhisperBackendFactory
+    session_factory: Any | None = None
 
 
 @dataclass(slots=True)
@@ -174,7 +238,7 @@ class WhisperPrefillSlot:
     metadata: PackedBuffer
     logits: Tensor
 
-    def backend_buffers(self) -> WhisperPrefillBuffers:
+    def execution_buffers(self) -> WhisperPrefillBuffers:
         return WhisperPrefillBuffers(
             slot_id=self.slot_id,
             input_features=self.features.gpu,
@@ -235,7 +299,6 @@ def _load_production_components(
             f"{CHECKPOINT_REVISION!r}"
         )
 
-    backend_factory = create_backend()
     assets = WhisperAssets()
     config = WhisperTurboConfig.from_assets(assets)
     preprocessor_config = WhisperPreprocessorConfig.from_assets(assets)
@@ -253,7 +316,6 @@ def _load_production_components(
         preprocessor_config=preprocessor_config,
         tokenizer=tokenizer,
         weights=weights,
-        backend_factory=backend_factory,
     )
 
 
@@ -293,7 +355,6 @@ class WhisperRuntime(UncachedPagedRuntime):
 
         owned = self.__dict__
         for name in (
-            "_decode_session",
             "_prefill_session",
             "_audio_preprocessor",
         ):
@@ -551,7 +612,9 @@ class WhisperRuntime(UncachedPagedRuntime):
                 raise RuntimeError("Whisper resident batch_idx pointers must be unique")
             self._logits_constraints_by_batch_idx_ptr[pointer] = constraints
 
-        prefill_buffers = tuple(slot.backend_buffers() for slot in self._prefill_slots)
+        prefill_buffers = tuple(
+            slot.execution_buffers() for slot in self._prefill_slots
+        )
         decode_buffers = tuple(
             WhisperDecodeBuffers(
                 slot_id=slot.slot_id,
@@ -570,42 +633,54 @@ class WhisperRuntime(UncachedPagedRuntime):
             prefill_buffers=prefill_buffers,
             decode_buffers=decode_buffers,
         )
-        bindings = WhisperBackendBindings(
-            config=self._config,
-            weights=components.weights,
+        bindings = WhisperExecutionBindings(
             cross_kv=self.cross_kv,
             self_kv=self.self_kv,
-            page_table=self.page_table.page_table,
             prefill_buffers=prefill_buffers,
             decode_buffers=decode_buffers,
             max_batch_size=self.max_batch_size,
             compute_stream=self._compute_stream,
         )
 
-        self._prefill_session = components.backend_factory.create_prefill(bindings)
-        self._decode_session = components.backend_factory.create_decode(bindings)
+        if components.session_factory is None:
+            capability = torch.cuda.get_device_capability(self.device)
+            if capability[0] not in (9, 10):
+                raise RuntimeError(
+                    "Optimized Whisper serving currently supports Hopper and "
+                    f"Blackwell, got compute capability {capability[0]}."
+                    f"{capability[1]}"
+                )
+            self._prefill_session = NativeWhisperPrefillSession(
+                bindings,
+                components.weights,
+                require_packed=True,
+            )
+            self._decode_session = create_generated_decode(self, components.weights)
+            backend_provenance = _native_provenance(bindings, self._decode_session)
+        else:
+            self._prefill_session = components.session_factory.create_prefill(bindings)
+            self._decode_session = components.session_factory.create_decode(bindings)
+            backend_provenance = components.session_factory.native_provenance(
+                bindings, self._decode_session
+            )
         self._audio_preprocessor = AsyncPreprocessor(
             partial(prepare_audio, config=self._preprocessor_config),
             workers=derive_preprocessing_workers(self.max_batch_size),
-        )
-        backend_provenance = components.backend_factory.native_provenance(
-            bindings, self._decode_session
         )
         if not isinstance(backend_provenance, dict):
             raise TypeError("Whisper native provenance must be a dict")
         if production and not backend_provenance:
             raise RuntimeError(
-                "Production Whisper backend did not declare native provenance"
+                "Production Whisper execution did not declare native provenance"
             )
         if production and (
             backend_provenance.get("prefill", {}).get("aot_required") is not True
             or backend_provenance.get("decode", {}).get("aot_required") is not True
         ):
             raise RuntimeError(
-                "Production Whisper backend provenance must require AOT prefill "
-                "and decode"
+                "Production Whisper provenance must require AOT prefill and decode"
             )
-        # Fail during construction if a backend leaks tensors, devices, or
+        # Fail during construction if provenance leaks tensors, devices, or
         # another non-serializable implementation detail into this API.
         self._native_provenance_spec = json.loads(json.dumps(backend_provenance))
         self._native_provenance: dict[str, Any] = {}
@@ -1197,10 +1272,21 @@ class WhisperRuntime(UncachedPagedRuntime):
                 )
             # Resident slot tensors were bound at session construction. The
             # generated launch reads token_ids/input_pos/batch_idx and writes logits.
-            self._decode_session.launch(slot_id, launch_capacity)
+            self._decode_session.run(slot, launch_capacity)
+
+    def _warmup_decode(self) -> None:
+        slot = self._decode_slots[0]
+        with stream_context(self._compute_stream):
+            for capacity in self._decode_batch_capacities:
+                slot.decode_token_ids[:capacity].zero_()
+                slot.meta.input_pos.gpu[:capacity].zero_()
+                slot.meta.batch_idx.gpu[:capacity].zero_()
+                self._decode_session.run(slot, capacity)
+                if self._compute_stream is not None:
+                    self._compute_stream.synchronize()
 
     def warmup(self) -> None:
-        """Warm each backend once; successful halves are not repeated on retry."""
+        """Warm each execution path once; successful paths are not repeated."""
 
         with self._warmup_lock:
             if self._closed:
@@ -1247,7 +1333,7 @@ class WhisperRuntime(UncachedPagedRuntime):
                 self._sampling_artifact_receipts = receipt_capture.receipts
                 self._constraints_warmed = True
             if not self._decode_warmed:
-                self._decode_session.warmup()
+                self._warmup_decode()
                 self._decode_warmed = True
             if self._require_native and not self._native_provenance:
                 if not self._native_provenance_spec:
@@ -1281,7 +1367,7 @@ class WhisperRuntime(UncachedPagedRuntime):
                 }
 
     def shutdown(self) -> None:
-        """Stop CPU workers, fence queued GPU work, and close both sessions."""
+        """Stop CPU workers, fence queued GPU work, and release native state."""
 
         with self._lifecycle_lock:
             if self._closed:
@@ -1300,11 +1386,11 @@ class WhisperRuntime(UncachedPagedRuntime):
                 torch.cuda.synchronize(self.device)
         except BaseException as exc:
             errors.append(exc)
-        for session in (self._decode_session, self._prefill_session):
-            try:
-                session.shutdown()
-            except BaseException as exc:
-                errors.append(exc)
+        try:
+            self._prefill_session.shutdown()
+        except BaseException as exc:
+            errors.append(exc)
+        self._decode_session = None
         self._alignment_decoder = None
         owned_rows = set(self.active_sequences).union(self._owned_cross_rows)
         for row in owned_rows:

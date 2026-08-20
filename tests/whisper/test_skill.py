@@ -139,7 +139,7 @@ def test_model_is_registered_with_its_hugging_face_identity() -> None:
     assert spec.revision == CHECKPOINT_REVISION
     assert spec.filename is None
     assert spec.skills().names() == ("transcribe",)
-    # Construction is covered with explicit fake backend sessions in
+    # Construction is covered with explicit fake execution sessions in
     # test_runtime.py. Calling the production factory here would correctly try
     # to resolve the pinned checkpoint and CUDA artifacts, which is outside this
     # registration-only CPU test.

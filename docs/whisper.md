@@ -3,12 +3,12 @@
 Kestrel serves `openai/whisper-large-v3-turbo` through the same model-bound
 capability interface as its other model families. The public package owns the
 model configuration, checkpoint loading, audio preparation, decoding policy,
-long-form orchestration, timestamps, and result schema. A separately packaged
-optimized backend supplies generated device programs through Kestrel's explicit
-Whisper backend contract.
+long-form orchestration, timestamps, result schema, and optimized execution.
+Generated decode programs are resolved through Kestrel's shared packed-kernel
+runtime, just like the other CUDA model families.
 
-There is no eager serving fallback. Creating the model without a registered
-backend fails before checkpoint weights are loaded.
+There is no eager serving fallback. Creating the model without compatible
+packed prefill, sampling, and generated-decode artifacts fails closed.
 
 ## Basic usage
 
@@ -148,14 +148,9 @@ final = await stream.result()
 Live PCM does not accept clip ranges. The iterator is closed on success,
 failure, or cancellation when it provides `aclose()`.
 
-## Backend boundary
+## Native execution
 
-Backend packages call `kestrel.models.whisper.register_backend` with a callable
-that creates an object implementing `create_prefill`, `create_decode`, and
-`native_provenance`. Registration is explicit and process-wide: Kestrel does
-not scan entry points, guess between installed implementations, or import a
-specific backend package name from model code.
-
-The backend owns only optimized execution sessions and artifact provenance.
-It does not own or replace model inputs, output semantics, long-form behavior,
-tokenization, or checkpoint loading.
+Kestrel owns the complete Whisper runtime. Prefill uses packed Kestrel kernels
+inside fixed-shape CUDA graphs, and decode uses the shared generated-decode
+binder over artifacts packaged with `kestrel-kernels`. The compiler source is
+not imported by the installed runtime.

@@ -1,28 +1,14 @@
-"""Backend contract for Whisper prefill and generated decode.
-
-The public model owns preprocessing, weights, scheduling, and the complete
-Whisper runtime. Optimized distributions supply the two execution sessions:
-
-* prefill composes public Kestrel kernels for the complete encoder and decoder
-  control-prefix launch;
-* the generated megakernel session owns only one-token decoder launches.
-
-Neither protocol permits an eager serving fallback. Keeping this small boundary
-lets a packaged backend provide architecture-specific artifacts without moving
-model behavior or customer-facing code out of Kestrel.
-"""
+"""Resident buffer contracts shared by Whisper execution components."""
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import torch
 from torch import Tensor
 
 from .config import WhisperTurboConfig
-from .weights import WhisperModelWeights
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,14 +136,11 @@ class WhisperDecodeBuffers:
 
 
 @dataclass(frozen=True, slots=True)
-class WhisperBackendBindings:
-    """Immutable construction inputs shared by the two backend sessions."""
+class WhisperExecutionBindings:
+    """Resident buffers shared by prefill and injected test sessions."""
 
-    config: WhisperTurboConfig
-    weights: WhisperModelWeights
     cross_kv: WhisperCrossArenas
     self_kv: WhisperSelfKVArenas
-    page_table: Tensor
     prefill_buffers: tuple[WhisperPrefillBuffers, ...]
     decode_buffers: tuple[WhisperDecodeBuffers, ...]
     max_batch_size: int
@@ -182,80 +165,6 @@ class WhisperPrefillSession(Protocol):
     def launch(self, slot_id: int, batch_size: int) -> None: ...
 
     def shutdown(self) -> None: ...
-
-
-class WhisperDecodeSession(Protocol):
-    """Generated single-token decoder session; logits remain unsampled."""
-
-    @property
-    def artifact_identities(self) -> tuple[dict[str, object], ...]: ...
-
-    def warmup(self) -> None: ...
-
-    def launch(self, slot_id: int, batch_size: int) -> None: ...
-
-    def shutdown(self) -> None: ...
-
-
-class WhisperBackendFactory(Protocol):
-    """Prepack weights and bind stable buffers without retaining eager code."""
-
-    def create_prefill(
-        self, bindings: WhisperBackendBindings
-    ) -> WhisperPrefillSession: ...
-
-    def create_decode(
-        self, bindings: WhisperBackendBindings
-    ) -> WhisperDecodeSession: ...
-
-    def native_provenance(
-        self,
-        bindings: WhisperBackendBindings,
-        decode_session: WhisperDecodeSession,
-    ) -> dict[str, Any]:
-        """Return the JSON-safe native artifact contract for these bindings."""
-        ...
-
-
-WhisperBackendProvider = Callable[[], WhisperBackendFactory]
-
-_BACKEND_LOCK = threading.Lock()
-_BACKEND_PROVIDER: WhisperBackendProvider | None = None
-
-
-def register_backend(provider: WhisperBackendProvider) -> None:
-    """Register the process-wide optimized Whisper backend provider.
-
-    Kestrel owns the model implementation, while a separately packaged backend
-    owns generated device programs. Registration is explicit so importing the
-    public model never scans plugins or silently selects an implementation.
-    """
-
-    if not callable(provider):
-        raise TypeError("Whisper backend provider must be callable")
-    global _BACKEND_PROVIDER
-    with _BACKEND_LOCK:
-        if _BACKEND_PROVIDER is not None and _BACKEND_PROVIDER is not provider:
-            raise RuntimeError("A different Whisper backend is already registered")
-        _BACKEND_PROVIDER = provider
-
-
-def create_backend() -> WhisperBackendFactory:
-    """Create the registered backend or fail before allocating model state."""
-
-    with _BACKEND_LOCK:
-        provider = _BACKEND_PROVIDER
-    if provider is None:
-        raise RuntimeError(
-            "No optimized Whisper backend is registered. Install and import the "
-            "backend package supplied with this Kestrel distribution before "
-            "creating openai/whisper-large-v3-turbo."
-        )
-    backend = provider()
-    required = ("create_prefill", "create_decode", "native_provenance")
-    if any(not callable(getattr(backend, name, None)) for name in required):
-        raise TypeError("Whisper backend does not implement the required contract")
-    return backend
 
 
 def validate_resident_buffers(
@@ -348,16 +257,11 @@ def validate_resident_buffers(
 
 
 __all__ = [
-    "WhisperBackendBindings",
-    "WhisperBackendFactory",
-    "WhisperBackendProvider",
+    "WhisperExecutionBindings",
     "WhisperCrossArenas",
     "WhisperDecodeBuffers",
-    "WhisperDecodeSession",
     "WhisperPrefillBuffers",
     "WhisperPrefillSession",
     "WhisperSelfKVArenas",
-    "create_backend",
-    "register_backend",
     "validate_resident_buffers",
 ]

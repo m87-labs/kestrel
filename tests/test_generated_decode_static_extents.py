@@ -86,7 +86,15 @@ def _programs(*names: str):
     return tuple(_Program(name, *definitions[name], launches) for name in names)
 
 
-def _build(monkeypatch, programs, *, bindings=None, max_batch_size=8):
+def _build(
+    monkeypatch,
+    programs,
+    *,
+    bindings=None,
+    max_batch_size=8,
+    weight_sources=None,
+    materialize_calls=None,
+):
     launches = programs[0].launches
     kernels = ModuleType("kestrel_kernels")
     generated = ModuleType("kestrel_kernels.generated_decode")
@@ -94,9 +102,13 @@ def _build(monkeypatch, programs, *, bindings=None, max_batch_size=8):
     generated.derive_runtime_extents = lambda _descriptor, _inputs, *, active_batch: {
         "active_batch": int(active_batch)
     }
-    generated.materialize_weights = lambda *_args, **_kwargs: SimpleNamespace(
-        buffers={}
-    )
+
+    def materialize_weights(*_args, **kwargs):
+        if materialize_calls is not None:
+            materialize_calls.append(kwargs)
+        return SimpleNamespace(buffers={})
+
+    generated.materialize_weights = materialize_weights
     monkeypatch.setitem(sys.modules, "kestrel_kernels", kernels)
     monkeypatch.setitem(sys.modules, "kestrel_kernels.generated_decode", generated)
     monkeypatch.setattr(
@@ -117,10 +129,26 @@ def _build(monkeypatch, programs, *, bindings=None, max_batch_size=8):
         weight_root=SimpleNamespace(),
         weight_layer_prefix="layers",
         bindings=bindings or _Bindings(),
+        weight_sources=weight_sources,
     )
     return runtime_decode.GeneratedDecode(
         runtime, spec=spec, programs=programs
     ), launches
+
+
+def test_generated_decode_materializes_explicit_weight_sources(monkeypatch):
+    sources = {"model.layers.0.weight": object()}
+    calls = []
+
+    _build(
+        monkeypatch,
+        _programs("b1"),
+        max_batch_size=1,
+        weight_sources=sources,
+        materialize_calls=calls,
+    )
+
+    assert calls == [{"layer_prefix": "layers", "weight_sources": sources}]
 
 
 def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypatch):
@@ -225,4 +253,5 @@ def test_required_generated_decode_rejects_all_unreachable_artifacts(monkeypatch
         RuntimeError,
         match=r"does not cover active batch sizes \[1, 2, 3, 4\]",
     ):
-        runtime_decode.GeneratedDecode.require(runtime, spec, capacity=4)
+        runtime_decode.GeneratedDecode.require(
+            runtime, spec, batch_sizes=range(1, 5))

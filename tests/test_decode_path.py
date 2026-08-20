@@ -136,7 +136,7 @@ def test_generated_requirement_unavailable_refuses_before_construction(
         GeneratedDecode.require(
             object(),
             SimpleNamespace(label="Qwen"),
-            capacity=4,
+            batch_sizes=range(1, 5),
         )
 
     assert constructions == []
@@ -165,7 +165,7 @@ def test_generated_requirement_covers_complete_batch_domain(
         GeneratedDecode.require(
             object(),
             SimpleNamespace(label="Qwen"),
-            capacity=4,
+            batch_sizes=range(1, 5),
         )
 
 
