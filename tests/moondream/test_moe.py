@@ -283,6 +283,53 @@ def _build_moe_slab_text(cls):
     return text
 
 
+def test_moe_up_slab_releases_bf16_placeholders_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.moondream import _moe_layout
+    from kestrel.models.moondream.layers import build_dense_mlp, build_moe_mlp
+
+    blocks = nn.ModuleList(
+        [
+            nn.ModuleDict({"mlp": build_dense_mlp(8, 32, torch.bfloat16)}),
+            nn.ModuleDict({"mlp": build_moe_mlp(8, 16, 4, torch.bfloat16, top_k=2)}),
+            nn.ModuleDict({"mlp": build_moe_mlp(8, 16, 4, torch.bfloat16, top_k=2)}),
+        ]
+    )
+    text = _moe_layout.MoEUpSlabModuleDict({"blocks": blocks})
+    old_weights = [
+        text.blocks[index].mlp["mlp"].up_experts.weight
+        for index in (1, 2)
+    ]
+    assert all(weight.dtype == torch.bfloat16 and weight.numel() for weight in old_weights)
+
+    real_zeros = torch.zeros
+    observed_placeholder_shapes: list[tuple[int, ...]] = []
+
+    def recording_zeros(*shape, **kwargs):
+        observed_placeholder_shapes.extend(
+            tuple(text.blocks[index].mlp["mlp"].up_experts.weight.shape)
+            for index in (1, 2)
+        )
+        return real_zeros(*shape, **kwargs)
+
+    monkeypatch.setattr(_moe_layout.torch, "zeros", recording_zeros)
+    slab, _ = _moe_layout.build_md3_moe_up_slab(
+        text,
+        num_experts=4,
+        two_inter=32,
+        hidden=8,
+        device="cpu",
+    )
+
+    assert observed_placeholder_shapes[:2] == [(0,), (0,)]
+    assert slab.shape == (3, 4, 32, 8)
+    assert all(
+        text.blocks[index].mlp["mlp"].up_experts.weight.numel() == 0
+        for index in (1, 2)
+    )
+
+
 def _moe_up_views(text):
     return [
         (li, text.blocks[li].mlp["mlp"].up_experts)

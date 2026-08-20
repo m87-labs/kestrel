@@ -74,10 +74,33 @@ def build_md3_moe_up_slab(
     stay zero (the megakernel never tiles them). Returns ``(up_w_slab, up_scale_slab)``; the caller
     fills each MoE layer's view via :func:`set_md3_moe_up_layer`."""
     n_layers = len(text.blocks)
+
+    # ``build_moe_mlp`` has already materialized one bf16 up-projection
+    # parameter per MoE layer.  The FP8 checkpoint never loads those
+    # placeholders: the slab below replaces them with uint8 views.  Drop all
+    # placeholder storages before requesting the single large slab, otherwise
+    # model construction transiently holds both layouts (12 GiB of bf16
+    # placeholders plus the 6 GiB FP8 slab for MD3) and cannot fit on a 24 GiB
+    # Ampere GPU.
+    target_device = torch.device(device)
+    for block in text.blocks:
+        if not hasattr(block.mlp, "router"):
+            continue
+        up_experts = block.mlp["mlp"].up_experts
+        up_experts.weight = nn.Parameter(
+            torch.empty(0, dtype=torch.uint8, device=target_device),
+            requires_grad=False,
+        )
+    if target_device.type == "cuda":
+        # The slab is one contiguous allocation whereas the discarded
+        # placeholders were per-layer allocations.  Return their cached CUDA
+        # segments before allocating the slab so the driver can satisfy it.
+        torch.cuda.empty_cache()
+
     up_w_slab = torch.zeros(
-        n_layers, num_experts, two_inter, hidden, dtype=torch.uint8, device=device)
+        n_layers, num_experts, two_inter, hidden, dtype=torch.uint8, device=target_device)
     up_scale_slab = torch.zeros(
-        n_layers, num_experts, two_inter, dtype=torch.float32, device=device)
+        n_layers, num_experts, two_inter, dtype=torch.float32, device=target_device)
     # Stash the slabs on the text module: THE contract the megakernel session asserts against (each
     # MoE layer's up_experts view must alias these). Plain attributes -- not buffers -- so they do
     # not appear twice in the state_dict (the per-layer views already round-trip the bytes).
