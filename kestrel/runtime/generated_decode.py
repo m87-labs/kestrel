@@ -1,5 +1,6 @@
 """Runtime binding for compiler-generated decode bundles."""
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -101,9 +102,10 @@ class PagedDecodeBindings:
 @dataclass(frozen=True)
 class GeneratedDecodeSpec:
     label: str
-    weight_root: torch.nn.Module
+    weight_root: Any
     weight_layer_prefix: str
     bindings: GeneratedDecodeBindings
+    weight_sources: Mapping[str, torch.Tensor] | None = None
     capacity_inputs: (
         Callable[[int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]]
         | None
@@ -233,14 +235,10 @@ def _select_program(programs: Sequence[Any], batch_size: int) -> tuple[int, Any]
         if not minimum_batch <= batch_size <= maximum_batch:
             continue
         static_batch = program.static_extent_bindings.get("active_batch")
-        candidates.append(
-            (static_batch is None, int(program.capacity), index, program)
-        )
+        candidates.append((static_batch is None, int(program.capacity), index, program))
     if not candidates:
         return None
-    _dynamic, _capacity, index, program = min(
-        candidates, key=lambda item: item[:3]
-    )
+    _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
     return index, program
 
 
@@ -253,9 +251,7 @@ def _selectable_programs(
         if selected is not None:
             selected_indexes.add(selected[0])
     return tuple(
-        program
-        for index, program in enumerate(programs)
-        if index in selected_indexes
+        program for index, program in enumerate(programs) if index in selected_indexes
     )
 
 
@@ -264,7 +260,9 @@ class GeneratedDecode:
 
     @classmethod
     def _resolve_programs(
-        cls, runtime: Any, spec: GeneratedDecodeSpec,
+        cls,
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
     ) -> tuple[Any, ...]:
         if (
             not spec.bindings.is_eligible(runtime)
@@ -280,12 +278,19 @@ class GeneratedDecode:
             return ()
 
         properties = torch.cuda.get_device_properties(runtime.device)
-        return tuple(resolve_compatible_programs(
-            spec.weight_root,
-            layer_prefix=spec.weight_layer_prefix,
-            arch=f"sm{properties.major}{properties.minor}",
-            device_sms=int(properties.multi_processor_count),
-        ))
+        resolution_options = {}
+        weight_sources = getattr(spec, "weight_sources", None)
+        if weight_sources is not None:
+            resolution_options["weight_sources"] = weight_sources
+        return tuple(
+            resolve_compatible_programs(
+                spec.weight_root,
+                layer_prefix=spec.weight_layer_prefix,
+                arch=f"sm{properties.major}{properties.minor}",
+                device_sms=int(properties.multi_processor_count),
+                **resolution_options,
+            )
+        )
 
     @classmethod
     def require(
@@ -293,7 +298,7 @@ class GeneratedDecode:
         runtime: Any,
         spec: GeneratedDecodeSpec,
         *,
-        capacity: int,
+        batch_sizes: Sequence[int],
     ) -> "GeneratedDecode":
         programs = cls._resolve_programs(runtime, spec)
         if not programs:
@@ -304,7 +309,7 @@ class GeneratedDecode:
             runtime,
             spec=spec,
             programs=programs,
-            required_capacity=capacity,
+            required_batch_sizes=batch_sizes,
         )
 
     @classmethod
@@ -327,16 +332,16 @@ class GeneratedDecode:
         *,
         spec: GeneratedDecodeSpec,
         programs,
-        required_capacity: int | None = None,
+        required_batch_sizes: Sequence[int] = (),
     ) -> None:
         available_programs = tuple(programs)
         self._programs = available_programs
         self._spec = spec
-        if required_capacity is not None:
+        if required_batch_sizes:
             missing = [
-                batch_size
-                for batch_size in range(1, int(required_capacity) + 1)
-                if not self.supports(batch_size)
+                int(batch_size)
+                for batch_size in required_batch_sizes
+                if not self.supports(int(batch_size))
             ]
             if missing:
                 raise RuntimeError(
@@ -388,10 +393,14 @@ class GeneratedDecode:
         runtime.compute_stream.wait_event(model_ready)
         weights_ready = torch.cuda.Event()
         with torch.cuda.stream(runtime.compute_stream):
+            materialization_options = {}
+            if spec.weight_sources is not None:
+                materialization_options["weight_sources"] = spec.weight_sources
             self.weight_storage = materialize_weights(
                 spec.weight_root,
                 self._programs[0].descriptor,
                 layer_prefix=spec.weight_layer_prefix,
+                **materialization_options,
             )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
@@ -423,9 +432,7 @@ class GeneratedDecode:
                     preparations=spec.preparations,
                 )
                 plans.setdefault(tuple(step.name for step in plan), plan)
-                construction_batch = min(
-                    maximum_batch, int(runtime.max_batch_size)
-                )
+                construction_batch = min(maximum_batch, int(runtime.max_batch_size))
                 extents = derive_runtime_extents(
                     program.descriptor, inputs, active_batch=construction_batch
                 )
@@ -489,6 +496,16 @@ class GeneratedDecode:
 
     def supports(self, batch_size: int) -> bool:
         return self._program_for(batch_size) is not None
+
+    @property
+    def artifact_receipts(self) -> tuple[dict[str, Any], ...]:
+        """Return exact packed-artifact identities for the selected programs."""
+
+        return tuple(
+            json.loads(json.dumps(program.artifact_receipt, default=dict))
+            for program in self._programs
+            if program.artifact_receipt is not None
+        )
 
     def state_requirements_for(
         self,

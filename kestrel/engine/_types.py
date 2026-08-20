@@ -31,6 +31,7 @@ from kestrel.runtime import Token
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
 from kestrel.skills import SkillSpec, SkillState
 
+
 @dataclass(slots=True)
 class EngineMetrics:
     """Token counts and timing for a single request."""
@@ -179,10 +180,24 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
             await self._producer
             raise StopAsyncIteration
         next_update = asyncio.create_task(self._queue.get())
-        done, _ = await asyncio.wait(
-            (next_update, self._producer),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _ = await asyncio.wait(
+                (next_update, self._producer),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if next_update.cancel():
+                try:
+                    await next_update
+                except asyncio.CancelledError:
+                    pass
+            elif not self._queue.full():
+                # Cancellation may arrive after queue.get() has consumed the
+                # snapshot but before asyncio.wait() returns it. Restore that
+                # snapshot unless the producer has already published a newer
+                # one, which supersedes it under the coalescing contract.
+                self._queue.put_nowait(next_update.result())
+            raise
         if next_update in done:
             return next_update.result()
         next_update.cancel()
