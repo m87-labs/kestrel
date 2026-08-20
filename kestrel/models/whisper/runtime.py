@@ -414,6 +414,7 @@ class WhisperRuntime(UncachedPagedRuntime):
             process_logits=self._process_logits,
             adjust_sampling_params=self._adjust_sampling_params,
             score_sampled_tokens=self._score_sampled_tokens,
+            require_packed_greedy_logprobs=self._require_native,
         )
 
         self._compute_stream = (
@@ -1225,6 +1226,17 @@ class WhisperRuntime(UncachedPagedRuntime):
                             constraints,
                             require_packed=self._require_native,
                         )
+                        if self._require_native:
+                            _SAMPLING.greedy_logprobs_from_logits(
+                                logits,
+                                out=torch.empty(
+                                    (1,), dtype=torch.int64, device=self.device
+                                ),
+                                logprobs_out=torch.empty(
+                                    (1,), dtype=torch.float32, device=self.device
+                                ),
+                                require_packed=True,
+                            )
                     if self._compute_stream is not None:
                         # A packed receipt certifies a completed warmup launch,
                         # not merely a host enqueue. Keep this synchronization

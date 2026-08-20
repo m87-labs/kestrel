@@ -44,7 +44,10 @@ from .pipeline import (
     PrefillLaunch,
     PrefillPendingCommit,
 )
-from kestrel_kernels.sampling import sample_step_from_logits
+from kestrel_kernels.sampling import (
+    greedy_logprobs_from_logits,
+    sample_step_from_logits,
+)
 from .transfer import RenderBuffer
 from kestrel.runtime.sampling import SamplingHooks
 
@@ -2948,6 +2951,14 @@ class GenerationScheduler:
             if logprobs is None:
                 torch.argmax(logits, dim=-1, out=out_view)
                 return out_view, None, None, None
+            if self._hooks.score_sampled_tokens is not None:
+                greedy_logprobs_from_logits(
+                    logits,
+                    out=out_view,
+                    logprobs_out=logprobs,
+                    require_packed=self._hooks.require_packed_greedy_logprobs,
+                )
+                return out_view, None, None, logprobs
             temps = self._sampling_temps[:batch]
             top_ps = self._sampling_top_ps[:batch]
             temps.zero_()

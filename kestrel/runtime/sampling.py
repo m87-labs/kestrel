@@ -83,14 +83,20 @@ class SamplingHooks:
     # score_sampled_tokens(logits, *, sampled_ids, token_logprobs,
     #                      sequences, batch_idx, temperatures, top_ps) -> None
     # Optionally overwrites the scheduler-owned float32 ``token_logprobs``
-    # buffer after ordinary sampling and before its ready event / D2H. This is
-    # for model-defined score semantics that differ from the sampling
-    # distribution (for example Whisper's untempered selected-token score used
-    # by language confidence and fallback). It must mutate the supplied buffer
-    # in place without synchronizing or reading device values on the host.
+    # buffer after non-greedy sampling and before its ready event / D2H. Greedy
+    # requests receive the same untempered selected-token model score directly
+    # from the fused greedy reduction. This hook handles model score semantics
+    # after sampling transforms (for example Whisper's temperature fallback).
+    # It must mutate the supplied buffer in place without synchronizing or
+    # reading device values on the host.
     # Runtimes exposing it must leave speculative decoding disabled until their
     # speculative decoder supplies the same scores.
     score_sampled_tokens: Callable[..., None] | None = None
+
+    # Require the fused greedy/logprob operation to resolve from the packed
+    # kernel bundle. Production runtimes use this to prevent a silent torch
+    # fallback; source-only development runtimes leave it false.
+    require_packed_greedy_logprobs: bool = False
 
     # post_sample(slot, *, sampled_ids, hidden_last, sequences,
     #             batch_idx, temperatures, top_ps, token_logprobs,
