@@ -79,7 +79,7 @@ def build_md3_moe_up_slab(
     # parameter per MoE layer.  The FP8 checkpoint never loads those
     # placeholders: the slab below replaces them with uint8 views.  Drop all
     # placeholder storages before requesting the single large slab, otherwise
-    # model construction transiently holds both layouts (12 GiB of bf16
+    # model construction transiently holds both layouts (10 GiB of bf16
     # placeholders plus the 6 GiB FP8 slab for MD3) and cannot fit on a 24 GiB
     # Ampere GPU.
     target_device = torch.device(device)

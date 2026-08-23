@@ -88,7 +88,7 @@ from .decode_slot import DecodeSlot, create_decode_slot
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 768
-_FP8_KV_SUPPORTED_SMS = frozenset({86, 87, 89, 90, 100, 110, 120})
+_FP8_KV_SUPPORTED_SMS = frozenset({80, 86, 87, 89, 90, 100, 110, 120})
 
 
 @contextlib.contextmanager

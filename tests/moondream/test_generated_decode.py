@@ -20,8 +20,8 @@ def _cache(value: float) -> SimpleNamespace:
     )
 
 
-def test_sm86_uses_checkpoint_fp8_kv_for_generated_decode() -> None:
-    assert 86 in _FP8_KV_SUPPORTED_SMS
+def test_ampere_uses_checkpoint_fp8_kv_for_generated_decode() -> None:
+    assert {80, 86}.issubset(_FP8_KV_SUPPORTED_SMS)
 
 
 def test_moondream_exposes_logical_moe_sources_and_engine_slabs() -> None:
