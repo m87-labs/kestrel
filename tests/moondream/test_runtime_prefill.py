@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from kestrel.models.moondream import runtime as runtime_mod
@@ -61,12 +64,14 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
         paged_kv_seqlens_k,
         last_token_positions,
         input_staging,
+        prefill_scratch,
         block_sequence_ids=None,
     ):
         captured["position_ids_contiguous"] = position_ids.is_contiguous()
         captured["batch_idx_contiguous"] = batch_idx.is_contiguous()
         del attn_mask, position_ids, batch_idx, lora_slot, use_prefix_attn
         del input_staging, block_sequence_ids
+        captured["prefill_scratch"] = prefill_scratch
         captured["paged_kv_seqlens_q"] = paged_kv_seqlens_q
         captured["paged_kv_seqlens_k"] = paged_kv_seqlens_k
         captured["last_token_positions"] = last_token_positions
@@ -79,6 +84,12 @@ def _make_runtime(seq_lens: dict[int, int]) -> tuple[runtime_mod.MoondreamRuntim
 
 
 def _make_prefill_slot() -> runtime_mod.PrefillSlot:
+    text_config = SimpleNamespace(
+        dim=4,
+        n_heads=2,
+        n_kv_heads=1,
+        moe=SimpleNamespace(num_experts=3),
+    )
     return runtime_mod.PrefillSlot(
         slot_id=0,
         batch_idx=torch.zeros(8, dtype=torch.int64),
@@ -89,6 +100,12 @@ def _make_prefill_slot() -> runtime_mod.PrefillSlot:
         size_staging=torch.empty(0),
         coord_cpu=torch.empty(0),
         size_cpu=torch.empty(0),
+        scratch=runtime_mod.PrefillScratch(
+            16,
+            text_config,
+            torch.device("cpu"),
+            torch.float32,
+        ),
         input_staging=runtime_mod.PrefillInputStaging(
             max_batch_size=8,
             max_seq_length=16,
@@ -111,6 +128,7 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() 
     )
 
     assert logits.shape == (2, 8)
+    assert captured["prefill_scratch"] is slot.scratch
     assert captured["position_ids_contiguous"]
     assert captured["batch_idx_contiguous"]
     assert captured["paged_kv_seqlens_q"] is None
@@ -159,3 +177,36 @@ def test_launch_prepared_batch_keeps_paged_kv_q_lengths_for_padded_q_lengths() -
         captured["last_token_positions"],
         torch.tensor([0, 2], dtype=torch.long),
     )
+
+
+def test_prefill_scratch_reuses_preallocated_storage() -> None:
+    text_config = SimpleNamespace(
+        dim=4,
+        n_heads=2,
+        n_kv_heads=1,
+        moe=SimpleNamespace(num_experts=3),
+    )
+    scratch = runtime_mod.PrefillScratch(
+        16,
+        text_config,
+        torch.device("cpu"),
+        torch.float32,
+    )
+
+    first = scratch.buffers_for(6)
+    second = scratch.buffers_for(6)
+
+    assert set(first) == {(6, 8), (6, 4), (6, 3)}
+    assert first[(6, 8)].data_ptr() == scratch.qkv_out.data_ptr()
+    assert first[(6, 4)].data_ptr() == scratch.tok_qv_lin.data_ptr()
+    assert first[(6, 3)].data_ptr() == scratch.router_logits.data_ptr()
+    assert all(first[key].data_ptr() == second[key].data_ptr() for key in first)
+
+
+def test_launch_prepared_batch_requires_prefill_scratch() -> None:
+    runtime, _ = _make_runtime({1: 1})
+    slot = _make_prefill_slot()
+    slot.scratch = None
+
+    with pytest.raises(RuntimeError, match="missing scratch buffers"):
+        runtime.launch_prepared_batch([_make_prepared(1, 10)], slot)

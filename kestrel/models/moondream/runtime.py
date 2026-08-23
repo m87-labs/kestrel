@@ -137,7 +137,7 @@ class PrefillScratch:
         self.tok_qv_lin = torch.empty(max_tokens, tau_out_dim, dtype=dtype, device=device)
         self.router_logits = torch.empty(max_tokens, n_experts, dtype=dtype, device=device) if n_experts else None
 
-    def ensure_size(self, tokens: int):
+    def ensure_size(self, tokens: int) -> None:
         """Grow buffers if needed (rare — only if tokens > initial max_tokens)."""
         if tokens <= self.qkv_out.size(0):
             return
@@ -146,6 +146,17 @@ class PrefillScratch:
         self.tok_qv_lin = torch.empty(tokens, self.tok_qv_lin.size(1), dtype=dtype, device=device)
         if self.router_logits is not None:
             self.router_logits = torch.empty(tokens, self.router_logits.size(1), dtype=dtype, device=device)
+
+    def buffers_for(self, tokens: int) -> dict[tuple[int, int], Tensor]:
+        """Return correctly sized views over this slot's persistent buffers."""
+        self.ensure_size(tokens)
+        buffers = {
+            (tokens, self.qkv_out.size(1)): self.qkv_out[:tokens],
+            (tokens, self.tok_qv_lin.size(1)): self.tok_qv_lin[:tokens],
+        }
+        if self.router_logits is not None:
+            buffers[(tokens, self.router_logits.size(1))] = self.router_logits[:tokens]
+        return buffers
 
 
 class PrefillInputStaging:
@@ -2034,6 +2045,9 @@ class MoondreamRuntime:
         input_staging = prefill_slot.input_staging
         if input_staging is None:
             raise RuntimeError("Prefill slot is missing input staging buffers")
+        prefill_scratch = prefill_slot.scratch
+        if prefill_scratch is None:
+            raise RuntimeError("Prefill slot is missing scratch buffers")
 
         lora_slots = [prepared.state.lora_slot for prepared in prepared_sequences]
         if batch_size > 1 and any(slot != 0 for slot in lora_slots):
@@ -2144,6 +2158,7 @@ class MoondreamRuntime:
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 last_token_positions=last_token_positions,
                 input_staging=input_staging,
+                prefill_scratch=prefill_scratch,
             )
 
             gather_idx = last_token_positions.to(dtype=torch.long).view(
@@ -2269,6 +2284,7 @@ class MoondreamRuntime:
         paged_kv_seqlens_k: Tensor,
         last_token_positions: Tensor,
         input_staging: PrefillInputStaging,
+        prefill_scratch: PrefillScratch,
     ) -> tuple[Tensor, Tensor]:
         if batch_idx.ndim != 2:
             raise ValueError("batch_idx must be rank-2")
@@ -2336,21 +2352,7 @@ class MoondreamRuntime:
                 active_lora_max_rank=active_lora_max_rank,
             )
 
-        # Build scratch buffer pool for prefill to avoid per-layer allocations.
-        tc = self.config.text
-        head_dim = tc.dim // tc.n_heads
-        scratch_pool = {
-            (M, tc.dim + 2 * tc.n_kv_heads * head_dim): torch.empty(
-                M, tc.dim + 2 * tc.n_kv_heads * head_dim,
-                dtype=inputs_embeds.dtype, device=self.device),  # QKV
-            (M, 2 * tc.n_heads): torch.empty(
-                M, 2 * tc.n_heads,
-                dtype=inputs_embeds.dtype, device=self.device),  # tau_wqwv
-        }
-        if tc.moe and tc.moe.num_experts:
-            scratch_pool[(M, tc.moe.num_experts)] = torch.empty(
-                M, tc.moe.num_experts,
-                dtype=inputs_embeds.dtype, device=self.device)  # router
+        scratch_pool = prefill_scratch.buffers_for(int(M))
 
         hidden = text_decoder(
             inputs_embeds,
