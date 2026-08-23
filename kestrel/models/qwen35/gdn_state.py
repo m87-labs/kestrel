@@ -99,31 +99,6 @@ class LinearAttentionState:
         self.replay_checkpoint_states.index_copy_(0, indices, checkpoint_rows)
         self.replay_lengths.index_fill_(0, indices, 0)
 
-    def allocate_zeroed(
-        self,
-        *,
-        conv_shape: tuple[int, ...],
-        recurrent_shape: tuple[int, ...],
-        conv_dtype: torch.dtype,
-        recurrent_dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        for name, shape, dtype in (
-            ("conv_states", conv_shape, conv_dtype),
-            ("recurrent_states", recurrent_shape, recurrent_dtype),
-        ):
-            tensor = getattr(self, name)
-            if tensor is None:
-                setattr(
-                    self,
-                    name,
-                    torch.zeros(shape, dtype=dtype, device=device),
-                )
-            elif tuple(tensor.shape) != shape:
-                raise RuntimeError(f"Qwen GDN {name} shape changed")
-
-        self._ensure_replay_state(self.recurrent_states)
-
     def clear(self, row: int | None = None) -> None:
         for tensor in (
             self.conv_states,

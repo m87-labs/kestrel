@@ -291,7 +291,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 state_indices = state_indices.to(
                     device=conv_state.device,
                     dtype=torch.long,
-                ).view(-1)
+                ).view(-1).contiguous()
+        else:
+            state_indices = (
+                None
+                if gdn_state_indices is None
+                else gdn_state_indices.to(
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                ).view(-1).contiguous()
+            )
 
         in_proj = self.in_proj(hidden_states)
         mixed_qkv, z, b, a = torch.split(
@@ -362,16 +371,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
-            if (
-                layer.recurrent_states is None
-                or tuple(layer.recurrent_states.shape) != recurrent_shape
-            ):
-                layer.recurrent_states = torch.empty(
-                    recurrent_shape,
-                    device=mixed_qkv.device,
-                    dtype=torch.float32,
+            if state_indices is None:
+                if (
+                    layer.recurrent_states is None
+                    or tuple(layer.recurrent_states.shape) != recurrent_shape
+                ):
+                    layer.recurrent_states = torch.empty(
+                        recurrent_shape,
+                        device=mixed_qkv.device,
+                        dtype=torch.float32,
+                    )
+                packed_recurrent_state = layer.recurrent_states
+            else:
+                expected_tail = (
+                    self.num_v_heads,
+                    self.head_v_dim,
+                    self.head_k_dim,
                 )
-            packed_recurrent_state = layer.recurrent_states
+                if (
+                    layer.recurrent_states is None
+                    or layer.recurrent_states.dtype != torch.bfloat16
+                    or tuple(layer.recurrent_states.shape[1:]) != expected_tail
+                    or not layer.recurrent_states.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "Qwen generated prefill requires contiguous BF16 "
+                        "value-major recurrent state"
+                    )
+                if int(state_indices.numel()) != num_sequences:
+                    raise RuntimeError(
+                        "Qwen generated prefill requires one recurrent-state "
+                        "index per packed sequence"
+                    )
+                packed_recurrent_state = layer.recurrent_states
             layer.has_previous_state = True
             if seq_idx is None:
                 seq_idx = _packed_seq_idx_from_cu_seqlens(
@@ -408,10 +440,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 recurrence_cu_seqlens,
                 output_final_state=True,
                 final_state=packed_recurrent_state,
+                final_state_indices=state_indices,
             )
-            # Seed ReplaySSM from the packed prefill's committed recurrent state.
-            seed_layer = cache_params.layers[self.layer_idx]
-            seed_layer._reset_replay_rows(seed_layer.recurrent_states, None)
+            if state_indices is None:
+                # Native decode consumes ReplaySSM state seeded from the packed
+                # prefill's committed FP32 recurrence.
+                layer._reset_replay_rows(layer.recurrent_states, None)
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)

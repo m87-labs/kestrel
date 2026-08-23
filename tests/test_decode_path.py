@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from kestrel.models.gemma4.runtime import Gemma4Runtime
 from kestrel.models.moondream.runtime import MoondreamRuntime
@@ -29,6 +30,9 @@ def test_qwen_native_does_not_construct_generated_decode(
 ) -> None:
     runtime = object.__new__(Qwen35Runtime)
     runtime.decode_path = "native"
+    calls = []
+    runtime._linear_state_pool = SimpleNamespace(
+        initialize_native_recurrent=lambda: calls.append("native"))
     monkeypatch.setattr(
         qwen_generated,
         "create_generated_decode",
@@ -40,7 +44,7 @@ def test_qwen_native_does_not_construct_generated_decode(
     runtime._initialize_generated_decode()
 
     assert runtime.generated_decode is None
-    assert runtime._decode_state_coordinator is None
+    assert calls == ["native"]
 
 
 def test_gemma_native_does_not_construct_generated_decode(
@@ -89,29 +93,36 @@ def test_qwen_required_generated_unavailable_refuses_before_graph_capture(
     assert runtime.generated_decode is None
 
 
-@pytest.mark.parametrize(
-    ("decode_path", "expected_captures"),
-    (("generated", 0), ("auto", 1), ("native", 1)),
-)
-def test_qwen_captures_native_graphs_only_when_native_decode_is_reachable(
-    decode_path: str,
-    expected_captures: int,
-) -> None:
-    captures: list[object] = []
-    slots = (object(), object())
+def test_qwen_selected_generated_never_captures_native_decode_graphs() -> None:
     runtime = object.__new__(Qwen35Runtime)
-    runtime.decode_path = decode_path
     runtime._use_cuda_graphs = True
-    runtime._decode_slots = slots
+    runtime._decode_slots = (object(),)
     runtime._decode_graphs = SimpleNamespace(
-        ensure_ready=lambda actual_slots: captures.append(actual_slots)
-    )
+        ensure_ready=lambda _slots: pytest.fail(
+            "generated state must not prepare native decode graphs"))
 
-    runtime._initialize_native_decode_graphs()
+    def select_generated():
+        runtime.generated_decode = _Generated(supported=True)
 
-    assert len(captures) == expected_captures
-    if captures:
-        assert captures == [slots]
+    runtime._initialize_generated_decode = select_generated
+    runtime._initialize_decode_execution()
+
+
+def test_qwen_native_selection_captures_decode_graphs() -> None:
+    runtime = object.__new__(Qwen35Runtime)
+    runtime._use_cuda_graphs = True
+    runtime._decode_slots = (object(),)
+    captures = []
+    runtime._decode_graphs = SimpleNamespace(
+        ensure_ready=lambda slots: captures.append(slots))
+
+    def select_native():
+        runtime.generated_decode = None
+
+    runtime._initialize_generated_decode = select_native
+    runtime._initialize_decode_execution()
+
+    assert captures == [runtime._decode_slots]
 
 
 def test_generated_requirement_unavailable_refuses_before_construction(
@@ -173,14 +184,13 @@ def test_qwen_required_generated_never_falls_back_to_native() -> None:
     runtime = object.__new__(Qwen35Runtime)
     runtime.decode_path = "generated"
     runtime.generated_decode = _Generated(supported=False)
-    runtime._decode_state_coordinator = None
     runtime._decode_graphs = SimpleNamespace(
         run=lambda *_args: pytest.fail("generated mode must not run native decode")
     )
 
     with pytest.raises(
         RuntimeError,
-        match="required generated Qwen decode does not cover active batch size 3",
+        match="selected generated Qwen decode does not cover active batch size 3",
     ):
         runtime.decode_with_slot(object(), 3)
 
@@ -195,7 +205,6 @@ def test_qwen_selected_generated_failure_never_falls_back_to_native() -> None:
 
     generated.run = fail_generated
     runtime.generated_decode = generated
-    runtime._decode_state_coordinator = None
     runtime._decode_graphs = SimpleNamespace(
         run=lambda *_args: pytest.fail("generated mode must not run native decode")
     )
@@ -204,19 +213,81 @@ def test_qwen_selected_generated_failure_never_falls_back_to_native() -> None:
         runtime.decode_with_slot(object(), 2)
 
 
-def test_qwen_auto_preserves_native_fallback() -> None:
-    native_batches: list[int] = []
+def test_qwen_auto_selected_generated_state_refuses_native_fallback() -> None:
     runtime = object.__new__(Qwen35Runtime)
     runtime.decode_path = "auto"
     runtime.generated_decode = _Generated(supported=False)
-    runtime._decode_state_coordinator = None
     runtime._decode_graphs = SimpleNamespace(
-        run=lambda _slot, batch_size: native_batches.append(batch_size)
+        run=lambda *_args: pytest.fail("generated state must not run native decode")
     )
 
-    runtime.decode_with_slot(object(), 3)
+    with pytest.raises(
+        RuntimeError,
+        match="selected generated Qwen decode does not cover active batch size 3",
+    ):
+        runtime.decode_with_slot(object(), 3)
 
-    assert native_batches == [3]
+
+def test_qwen_auto_without_generated_program_selects_native_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.decode_path = "auto"
+    calls = []
+    runtime._linear_state_pool = SimpleNamespace(
+        initialize_native_recurrent=lambda: calls.append("native"))
+    monkeypatch.setattr(
+        qwen_generated, "create_generated_decode", lambda *_args, **_kwargs: None)
+
+    runtime._initialize_generated_decode()
+
+    assert runtime.generated_decode is None
+    assert calls == ["native"]
+
+
+def test_qwen_auto_probe_cannot_allocate_generated_then_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.qwen35.cache import Qwen35LinearStatePool
+    from kestrel.runtime.carried_state import StatePhysicalForm
+
+    config = SimpleNamespace(
+        layer_types=("linear_attention",),
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=3,
+        linear_conv_kernel_dim=4,
+    )
+    pool = Qwen35LinearStatePool(
+        config=config,
+        max_batch_slots=4,
+        device=torch.device("cpu"),
+        replay_capacity=2,
+    )
+    pool.initialize_from_config(config, dtype=torch.bfloat16)
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.decode_path = "auto"
+    runtime._linear_state_pool = pool
+
+    def touches_generated_state(*_args, **_kwargs):
+        pool.recurrent_tensors_for_form(StatePhysicalForm(
+            "materialized",
+            ("state_row", "value_head", "value", "key"),
+            "bf16",
+        ))
+        return None
+
+    monkeypatch.setattr(
+        qwen_generated, "create_generated_decode", touches_generated_state)
+
+    with pytest.raises(RuntimeError, match="cannot switch to native replay"):
+        runtime._initialize_generated_decode()
+
+    storage = pool.layers[0]
+    assert storage is not None and storage.recurrent_states is not None
+    assert storage.recurrent_states.dtype == torch.bfloat16
+    assert storage.replay_checkpoint_states is None
 
 
 def test_gemma_required_generated_never_falls_back_to_native(
