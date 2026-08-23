@@ -118,6 +118,26 @@ class GeneratedDecodeSpec:
 
 
 @dataclass(frozen=True)
+class _GeneratedDecodePlan:
+    """Resolved programs kept stable across slot allocation and binding."""
+
+    runtime: Any
+    spec: GeneratedDecodeSpec
+    max_batch_size: int
+    compatible_programs: tuple[Any, ...]
+    selectable_programs: tuple[Any, ...]
+
+    @property
+    def slot_capacity(self) -> int:
+        """Physical rows required by every program this runtime can select."""
+
+        return max(
+            (int(program.capacity) for program in self.selectable_programs),
+            default=0,
+        )
+
+
+@dataclass(frozen=True)
 class _BoundInvocation:
     invocation: Any
     scalar_names: frozenset[str]
@@ -291,14 +311,55 @@ class GeneratedDecode:
         ))
 
     @classmethod
+    def plan(
+        cls,
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
+    ) -> _GeneratedDecodePlan:
+        """Resolve once so slot storage and later bindings use one program set."""
+
+        max_batch_size = int(runtime.max_batch_size)
+        compatible_programs = cls._resolve_programs(runtime, spec)
+        return _GeneratedDecodePlan(
+            runtime=runtime,
+            spec=spec,
+            max_batch_size=max_batch_size,
+            compatible_programs=compatible_programs,
+            selectable_programs=_selectable_programs(
+                compatible_programs, max_batch_size
+            ),
+        )
+
+    @staticmethod
+    def _validate_plan(
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
+        plan: _GeneratedDecodePlan,
+    ) -> None:
+        if plan.runtime is not runtime:
+            raise ValueError("generated decode plan belongs to a different runtime")
+        if plan.spec is not spec:
+            raise ValueError("generated decode plan belongs to a different spec")
+        if plan.max_batch_size != int(runtime.max_batch_size):
+            raise ValueError(
+                "generated decode plan batch limit changed between resolution "
+                "and binding"
+            )
+
+    @classmethod
     def require(
         cls,
         runtime: Any,
         spec: GeneratedDecodeSpec,
         *,
         capacity: int,
+        plan: _GeneratedDecodePlan | None = None,
     ) -> "GeneratedDecode":
-        programs = cls._resolve_programs(runtime, spec)
+        if plan is None:
+            programs = cls._resolve_programs(runtime, spec)
+        else:
+            cls._validate_plan(runtime, spec, plan)
+            programs = plan.compatible_programs
         if not programs:
             raise RuntimeError(
                 f"{spec.label} requires a compatible bundled generated-decode program"
@@ -315,11 +376,17 @@ class GeneratedDecode:
         cls,
         runtime: Any,
         spec: GeneratedDecodeSpec,
+        *,
+        plan: _GeneratedDecodePlan | None = None,
     ) -> "GeneratedDecode | None":
-        programs = cls._resolve_programs(runtime, spec)
-        if not programs:
-            return None
-        programs = _selectable_programs(programs, runtime.max_batch_size)
+        if plan is None:
+            programs = cls._resolve_programs(runtime, spec)
+            if not programs:
+                return None
+            programs = _selectable_programs(programs, runtime.max_batch_size)
+        else:
+            cls._validate_plan(runtime, spec, plan)
+            programs = plan.selectable_programs
         if not programs:
             return None
         return cls(runtime, spec=spec, programs=programs)
