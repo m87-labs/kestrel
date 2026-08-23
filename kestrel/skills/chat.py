@@ -307,6 +307,7 @@ class ChatSkillState(SkillState):
         self._reasoning_tokens: List[int] = []
         self._answer_tokens: List[int] = []
         self._streaming = bool(chat_request.stream)
+        self._reasoning_stream_offset = 0
         self._answer_stream_offset = 0
         self._answer_id: Optional[int] = None
         self._stop_ids: Optional[Set[int]] = None
@@ -387,6 +388,18 @@ class ChatSkillState(SkillState):
             return None
         chunk = text[self._answer_stream_offset :]
         self._answer_stream_offset = len(text)
+        return chunk or None
+
+    def pop_reasoning_stream_delta(
+        self, runtime: "MoondreamRuntime"
+    ) -> Optional[str]:
+        if not self._streaming or not self._reasoning_tokens:
+            return None
+        text = runtime.tokenizer.decode(self._reasoning_tokens)
+        if len(text) <= self._reasoning_stream_offset:
+            return None
+        chunk = text[self._reasoning_stream_offset :]
+        self._reasoning_stream_offset = len(text)
         return chunk or None
 
     def finalize(

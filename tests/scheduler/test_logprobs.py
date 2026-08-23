@@ -43,6 +43,18 @@ class _FailingFinalizeSkillState(_SkillStateStub):
         raise RuntimeError("finalize failed")
 
 
+class _ReasoningStreamSkillState(_SkillStateStub):
+    def __init__(self, request: GenerationRequest) -> None:
+        super().__init__(request)
+        self._reasoning_pending = True
+
+    def pop_reasoning_stream_delta(self, runtime: object) -> str | None:
+        if not self._reasoning_pending:
+            return None
+        self._reasoning_pending = False
+        return "think"
+
+
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
     request = GenerationRequest(
         request_id=7,
@@ -173,6 +185,25 @@ def test_decode_step_exposes_selected_logprob_before_skill_consumption() -> None
 
     assert seen == [-0.75]
     assert seq.logprobs == [-0.75]
+
+
+def test_stage_token_emits_reasoning_without_answer_text() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(
+        _ReasoningStreamSkillState,
+        return_logprobs=None,
+    )
+    seq.request.stream_callback = updates.append
+
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+    seq.stage_token(SimpleNamespace(), TextToken(11))
+
+    assert len(updates) == 1
+    assert updates[0].request_id == 7
+    assert updates[0].token == TextToken(10)
+    assert updates[0].token_index == 0
+    assert updates[0].text == ""
+    assert updates[0].reasoning == "think"
 
 
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:

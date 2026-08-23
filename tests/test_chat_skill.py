@@ -87,9 +87,11 @@ def _chat_runtime(chat: bool = True) -> SimpleNamespace:
     )
 
 
-def _ctx(messages, reasoning: bool = False) -> ChatRequest:
+def _ctx(messages, reasoning: bool = False, stream: bool = False) -> ChatRequest:
     built = ChatSkill().build_request(
-        None, {"messages": messages, "reasoning": reasoning}, None
+        None,
+        {"messages": messages, "reasoning": reasoning, "stream": stream},
+        None,
     )
     return built.request_context
 
@@ -344,6 +346,33 @@ def test_state_reasoning_splits_thinking_and_answer() -> None:
         "content": "ans",
         "reasoning": "think",
     }
+
+
+def test_state_streams_reasoning_separately_from_answer() -> None:
+    runtime = _chat_runtime()
+    state = ChatSkill().create_state(
+        runtime,
+        SimpleNamespace(),
+        _ctx(
+            [{"role": "user", "content": "hi"}],
+            reasoning=True,
+            stream=True,
+        ),
+    )
+    state.on_prefill(runtime)
+
+    _drive(state, runtime, _ords("t"))
+    assert state.pop_reasoning_stream_delta(runtime) == "t"
+    assert state.pop_stream_delta(runtime) is None
+
+    state.consume_step(
+        runtime,
+        DecodeStep(token=TextToken(token_id=THINK_E), position=1),
+    )
+    _drive(state, runtime, [DNL])
+    _drive(state, runtime, _ords("a"))
+    assert state.pop_reasoning_stream_delta(runtime) is None
+    assert state.pop_stream_delta(runtime) == "a"
 
 
 # -- Moondream flatten-into-query subclass --------------------------------
