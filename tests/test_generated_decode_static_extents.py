@@ -197,6 +197,78 @@ def test_generated_decode_skips_artifacts_above_runtime_batch_limit(monkeypatch)
     ]
 
 
+def test_generated_decode_plan_reports_selected_physical_slot_capacity(monkeypatch):
+    programs = _programs("b8")
+    monkeypatch.setattr(
+        runtime_decode.GeneratedDecode,
+        "_resolve_programs",
+        classmethod(lambda _cls, _runtime, _spec: programs),
+    )
+    runtime = SimpleNamespace(max_batch_size=1)
+    spec = object()
+
+    plan = runtime_decode.GeneratedDecode.plan(runtime, spec)
+
+    assert plan.spec is spec
+    assert plan.max_batch_size == 1
+    assert [program.name for program in plan.selectable_programs] == ["b8"]
+    assert plan.slot_capacity == 8
+
+
+def test_generated_decode_plan_reuses_exact_resolution_when_binding(monkeypatch):
+    programs = _programs("b1")
+    runtime = SimpleNamespace(max_batch_size=1)
+    spec = object()
+    plan = runtime_decode._GeneratedDecodePlan(
+        runtime=runtime,
+        spec=spec,
+        max_batch_size=1,
+        compatible_programs=programs,
+        selectable_programs=programs,
+    )
+    monkeypatch.setattr(
+        runtime_decode.GeneratedDecode,
+        "_resolve_programs",
+        classmethod(
+            lambda _cls, _runtime, _spec: pytest.fail(
+                "binding must reuse the pre-allocation resolution"
+            )
+        ),
+    )
+    constructions = []
+    monkeypatch.setattr(
+        runtime_decode.GeneratedDecode,
+        "__init__",
+        lambda self, *args, **kwargs: constructions.append((args, kwargs)),
+    )
+
+    generated = runtime_decode.GeneratedDecode.try_create(
+        runtime, spec, plan=plan
+    )
+
+    assert generated is not None
+    assert constructions[0][1]["programs"] is programs
+
+
+def test_generated_decode_plan_rejects_another_runtime():
+    runtime = SimpleNamespace(max_batch_size=1)
+    other_runtime = SimpleNamespace(max_batch_size=1)
+    spec = object()
+    programs = _programs("b1")
+    plan = runtime_decode._GeneratedDecodePlan(
+        runtime=runtime,
+        spec=spec,
+        max_batch_size=1,
+        compatible_programs=programs,
+        selectable_programs=programs,
+    )
+
+    with pytest.raises(ValueError, match="belongs to a different runtime"):
+        runtime_decode.GeneratedDecode.try_create(
+            other_runtime, spec, plan=plan
+        )
+
+
 def test_optional_generated_decode_falls_back_when_all_artifacts_are_unreachable(
     monkeypatch,
 ):

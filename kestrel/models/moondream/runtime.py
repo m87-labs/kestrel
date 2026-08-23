@@ -123,6 +123,15 @@ def _count_image_markers(tokens) -> int:
     return sum(1 for t in tokens if isinstance(t, ImageMarker))
 
 
+def _decode_slot_storage_capacity(
+    logical_capacity: int,
+    generated_capacity: int,
+) -> int:
+    """Keep scheduler capacity logical while satisfying generated program ABIs."""
+
+    return max(int(logical_capacity), int(generated_capacity))
+
+
 class PrefillScratch:
     """Pre-allocated scratch buffers for prefill to avoid per-layer allocations."""
 
@@ -814,6 +823,23 @@ class MoondreamRuntime:
                 dtype=self.dtype,
             )
 
+        generated_decode_plan = None
+        if self.decode_path != "native":
+            from .generated_decode import _prepare_generated_decode
+
+            generated_decode_plan = _prepare_generated_decode(self)
+        # Generated programs may round a logical C1 request up to a B8 physical
+        # ABI. Only the per-slot storage follows that ABI capacity; scheduler and
+        # page-table admission continue to use ``self.max_batch_slots``.
+        decode_slot_capacity = _decode_slot_storage_capacity(
+            self.max_batch_slots,
+            (
+                generated_decode_plan.slot_capacity
+                if generated_decode_plan is not None
+                else 0
+            ),
+        )
+
         # Create two ping-pong decode slots for pipelined decoding.
         # Each slot has its own staging buffers, paged-KV metadata buffers,
         # and RenderBuffer, but they share the decode compute stream and copy stream.
@@ -824,7 +850,7 @@ class MoondreamRuntime:
                 slot_id=slot_id,
                 device=self.device,
                 dtype=self.dtype,
-                max_batch_slots=self.max_batch_slots,
+                max_batch_slots=decode_slot_capacity,
                 kv_cache_pages=n_pages,
                 vocab_size=vocab_size,
                 hidden_dim=hidden_dim,
@@ -835,7 +861,7 @@ class MoondreamRuntime:
             )
             for slot_id in range(2)
         ]
-        self._initialize_generated_decode()
+        self._initialize_generated_decode(generated_decode_plan)
         # A shipped megakernel is already a single eager launch. Resolve its AOT
         # buckets once and omit only their redundant native CUDA graphs. Generic
         # generated programs take precedence; the legacy whole-model path remains
@@ -900,7 +926,7 @@ class MoondreamRuntime:
         self._allocate_vision_buffers()
         self._capture_vision_graphs()
 
-    def _initialize_generated_decode(self) -> None:
+    def _initialize_generated_decode(self, plan=None) -> None:
         """Apply the runtime-wide decode policy before graph capture."""
 
         self.generated_decode = None
@@ -909,10 +935,17 @@ class MoondreamRuntime:
 
         from .generated_decode import create_generated_decode
 
-        self.generated_decode = create_generated_decode(
-            self,
-            required=self.decode_path == "generated",
-        )
+        if plan is None:
+            self.generated_decode = create_generated_decode(
+                self,
+                required=self.decode_path == "generated",
+            )
+        else:
+            self.generated_decode = create_generated_decode(
+                self,
+                required=self.decode_path == "generated",
+                plan=plan,
+            )
 
     def _maybe_release_cuda_allocator_cache(self) -> None:
         """Release cached allocator blocks before CUDA graph capture.

@@ -5,9 +5,14 @@ import torch
 from kestrel.models.moondream.generated_decode import (
     _engine_weight_buffers,
     _logical_weight_sources,
+    _prepare_generated_decode,
     MoondreamDecodeBindings,
 )
-from kestrel.models.moondream.runtime import _FP8_KV_SUPPORTED_SMS
+from kestrel.models.moondream.runtime import (
+    _decode_slot_storage_capacity,
+    _FP8_KV_SUPPORTED_SMS,
+)
+from kestrel.runtime.generated_decode import GeneratedDecode
 
 
 def _cache(value: float) -> SimpleNamespace:
@@ -138,3 +143,37 @@ def test_moondream_slot_bindings_use_stable_hidden_and_metadata_buffers() -> Non
         "active_batch": 4,
         "kv_len": 7,
     }
+
+
+def test_moondream_allocates_selected_generated_program_abi_capacity(
+    monkeypatch,
+) -> None:
+    text = torch.nn.Module()
+    text.blocks = torch.nn.ModuleList()
+    text.moe_up_w_slab = torch.empty(1, dtype=torch.uint8)
+    text.moe_up_scale_slab = torch.empty(1)
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        max_batch_slots=3,
+        model=SimpleNamespace(text=text),
+        layer_caches=(),
+    )
+    program = SimpleNamespace(
+        capacity=8,
+        static_extent_bindings={},
+        runtime_extent_minimums={},
+    )
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "_resolve_programs",
+        classmethod(lambda _cls, _runtime, _spec: (program,)),
+    )
+
+    plan = _prepare_generated_decode(runtime)
+    storage_capacity = _decode_slot_storage_capacity(
+        runtime.max_batch_slots, plan.slot_capacity
+    )
+
+    assert plan.slot_capacity == 8
+    assert storage_capacity == 8
+    assert runtime.max_batch_slots == 3
