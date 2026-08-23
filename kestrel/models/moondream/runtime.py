@@ -88,6 +88,7 @@ from .decode_slot import DecodeSlot, create_decode_slot
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 768
+_FP8_KV_SUPPORTED_SMS = frozenset({80, 86, 87, 89, 90, 100, 110, 120})
 
 
 @contextlib.contextmanager
@@ -493,10 +494,6 @@ class MoondreamRuntime:
         compute_stream: torch.cuda.Stream | None,
     ) -> None:
         self.decode_path = getattr(cfg, "decode_path", "auto")
-        if self.decode_path != "auto":
-            raise ValueError(
-                "Moondream runtimes currently support only decode_path='auto'"
-            )
         self.generated_decode = None
         self._cfg = cfg
         self.device = cfg.resolved_device()
@@ -633,8 +630,6 @@ class MoondreamRuntime:
 
         device_cc_major, device_cc_minor = get_device_capability(self.device)
         device_sm = device_cc_major * 10 + device_cc_minor
-        fp8_kv_supported_sms = {87, 89, 90, 100, 110, 120}
-
         # The whole-model decode megakernel now reads/appends the engine's fp8 (e4m3) KV pool
         # DIRECTLY: its ``kv_pool_layer`` builds a Uint8 (e4m3-byte) pool view and its attention read
         # + qkv-epi append carry the per-layer k/v dequant scales (bit-compatible with native
@@ -647,7 +642,7 @@ class MoondreamRuntime:
             and self._kv_layer_v_scales is not None
             and self.page_size == 1
             and hasattr(torch, "float8_e4m3fn")
-            and device_sm in fp8_kv_supported_sms
+            and device_sm in _FP8_KV_SUPPORTED_SMS
         ):
             self.kv_cache_dtype = torch.float8_e4m3fn
         else:
@@ -661,8 +656,10 @@ class MoondreamRuntime:
                         "falling back to standard KV cache.",
                         stacklevel=2,
                     )
-                elif device_sm not in fp8_kv_supported_sms:
-                    sm_list = "/".join(f"SM{sm}" for sm in sorted(fp8_kv_supported_sms))
+                elif device_sm not in _FP8_KV_SUPPORTED_SMS:
+                    sm_list = "/".join(
+                        f"SM{sm}" for sm in sorted(_FP8_KV_SUPPORTED_SMS)
+                    )
                     warnings.warn(
                         f"KV scales found in checkpoint but FP8 KV cache currently requires {sm_list} "
                         "decode kernels; falling back to standard KV cache.",
@@ -838,17 +835,29 @@ class MoondreamRuntime:
             )
             for slot_id in range(2)
         ]
+        self._initialize_generated_decode()
         # A shipped megakernel is already a single eager launch. Resolve its AOT
-        # buckets once and omit only their redundant native CUDA graphs.
+        # buckets once and omit only their redundant native CUDA graphs. Generic
+        # generated programs take precedence; the legacy whole-model path remains
+        # an automatic fallback for still-unmigrated architectures.
         megakernel_target = megakernel_decode.deploy_target(
             self.model_name, self.device
         )
         self._megakernel_buckets = frozenset(
             batch_size
             for batch_size in make_decode_graph_batch_sizes(self.max_batch_size)
-            if megakernel_target is not None
-            and self._lora_workspace is None
-            and megakernel_decode.has_megakernel(*megakernel_target, batch_size)
+            if (
+                self.generated_decode is not None
+                and self.generated_decode.supports(batch_size)
+            )
+            or (
+                self.decode_path == "auto"
+                and megakernel_target is not None
+                and self._lora_workspace is None
+                and megakernel_decode.has_megakernel(
+                    *megakernel_target, batch_size
+                )
+            )
         )
         self._decode_graphs = DecodeGraphManager[DecodeSlot](
             enabled=self._use_cuda_graphs,
@@ -890,6 +899,20 @@ class MoondreamRuntime:
         # Allocate vision encoder buffers (always, for consistency)
         self._allocate_vision_buffers()
         self._capture_vision_graphs()
+
+    def _initialize_generated_decode(self) -> None:
+        """Apply the runtime-wide decode policy before graph capture."""
+
+        self.generated_decode = None
+        if self.decode_path == "native":
+            return
+
+        from .generated_decode import create_generated_decode
+
+        self.generated_decode = create_generated_decode(
+            self,
+            required=self.decode_path == "generated",
+        )
 
     def _maybe_release_cuda_allocator_cache(self) -> None:
         """Release cached allocator blocks before CUDA graph capture.
@@ -2495,7 +2518,20 @@ class MoondreamRuntime:
             slot.decode_coord_values[:batch_size],
             slot.decode_size_values[:batch_size],
         )
-        if batch_size in self._megakernel_buckets:
+        use_generated = (
+            self.generated_decode is not None
+            and self.generated_decode.supports(batch_size)
+        )
+        if use_generated:
+            slot.hidden_last[:batch_size].copy_(embeds[:, 0, :])
+            self.generated_decode.run(slot, batch_size)
+            hidden = slot.hidden_last[:batch_size].unsqueeze(1)
+        elif self.decode_path == "generated":
+            raise RuntimeError(
+                "required generated Moondream decode does not cover "
+                f"active batch size {batch_size}"
+            )
+        elif batch_size in self._megakernel_buckets:
             try:
                 hidden = self._megakernel_decode_hidden(slot, batch_size, embeds)
             except megakernel_decode.MegakernelNotEligible as exc:
