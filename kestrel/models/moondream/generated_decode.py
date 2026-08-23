@@ -5,7 +5,11 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from kestrel.runtime.generated_decode import GeneratedDecode, GeneratedDecodeSpec
+from kestrel.runtime.generated_decode import (
+    GeneratedDecode,
+    GeneratedDecodeSpec,
+    _GeneratedDecodePlan,
+)
 
 
 def _logical_weight_sources(text: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -103,11 +107,7 @@ class MoondreamDecodeBindings:
         }
 
 
-def create_generated_decode(
-    runtime: Any,
-    *,
-    required: bool = False,
-) -> GeneratedDecode | None:
+def _prepare_generated_decode(runtime: Any) -> _GeneratedDecodePlan:
     spec = GeneratedDecodeSpec(
         label="Moondream",
         weight_root=runtime.model.text,
@@ -116,13 +116,29 @@ def create_generated_decode(
         engine_buffers=_engine_weight_buffers(runtime.model.text),
         bindings=MoondreamDecodeBindings(runtime.layer_caches),
     )
+    return GeneratedDecode.plan(runtime, spec)
+
+
+def create_generated_decode(
+    runtime: Any,
+    *,
+    required: bool = False,
+    plan: _GeneratedDecodePlan | None = None,
+) -> GeneratedDecode | None:
+    if plan is None:
+        plan = _prepare_generated_decode(runtime)
+    spec = plan.spec
     if required:
         return GeneratedDecode.require(
             runtime,
             spec,
-            capacity=runtime.max_batch_size,
+            batch_sizes=range(1, runtime.max_batch_size + 1),
+            plan=plan,
         )
-    return GeneratedDecode.try_create(runtime, spec)
+    return GeneratedDecode.try_create(runtime, spec, plan=plan)
 
 
-__all__ = ["MoondreamDecodeBindings", "create_generated_decode"]
+__all__ = [
+    "MoondreamDecodeBindings",
+    "create_generated_decode",
+]
