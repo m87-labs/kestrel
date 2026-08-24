@@ -2,7 +2,7 @@
 
 ![Kestrel Overview](https://raw.githubusercontent.com/m87-labs/kestrel/main/assets/kestrel-overview.png)
 
-High-performance inference engine for vision-language models.
+High-performance inference engine for multimodal models.
 
 Kestrel is the inference engine behind [Photon](https://moondream.ai/p/photon), Moondream's on-device deployment option. Most Moondream users should install via `pip install moondream`; this repository provides the engine directly and supports additional model families.
 
@@ -11,8 +11,8 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 ## Features
 
 - **Async micro-batching** — Cooperative scheduler batches heterogeneous requests without compromising per-request latency
-- **Streaming** — Real-time token streaming for query and caption tasks
-- **Multi-task** — Visual Q&A, captioning, point detection, object detection, and segmentation
+- **Streaming** — Real-time token and transcription progress
+- **Multi-task** — Vision-language generation, spatial reasoning, and speech transcription
 - **Paged KV cache** — Efficient memory management for high concurrency
 - **Prefix caching** — Radix tree-based caching for repeated prompts and images
 - **LoRA adapters** — Parameter-efficient fine-tuning support with automatic cloud loading
@@ -48,6 +48,7 @@ Kestrel supports these model families:
 | Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 | Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, and 31B base/instruction variants |
+| Whisper large-v3-turbo | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | Transcription, translation, long-form audio, and word timestamps |
 
 ## Quick Start
 
@@ -84,6 +85,54 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Whisper transcription
+
+Whisper uses its Hugging Face repository ID as the model name. The checkpoint
+is resolved at Kestrel's pinned revision, and execution uses the same packaged
+Kestrel kernels and generated-decode runtime as the other CUDA models.
+
+```python
+import asyncio
+from pathlib import Path
+
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
+
+WHISPER_MODEL = "openai/whisper-large-v3-turbo"
+
+
+async def main():
+    engine = await InferenceEngine.create(
+        RuntimeConfig(
+            model=WHISPER_MODEL,
+            max_batch_size=4,
+        )
+    )
+    whisper = engine.model(WHISPER_MODEL)
+    try:
+        result = await whisper.transcribe(
+            audio=Path("meeting.m4a"),
+            timestamps="word",
+        )
+        print(result.output["text"])
+        for segment in result.output["segments"]:
+            for word in segment.get("words", []):
+                print(
+                    f"{word['start']:7.2f}  {word['end']:7.2f}  {word['word']}"
+                )
+    finally:
+        await engine.shutdown()
+
+
+asyncio.run(main())
+```
+
+Kestrel accepts encoded paths, bytes, bounded binary streams, raw mono PCM,
+and asynchronous PCM iterators. Long paths are decoded incrementally. See
+[Whisper transcription](docs/whisper.md) for supported formats, progressive
+and live input, translation, prompting, clipping, quality controls, and exact
+resource limits.
 
 ## Tasks
 

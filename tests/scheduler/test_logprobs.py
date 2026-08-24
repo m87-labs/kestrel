@@ -482,7 +482,7 @@ def test_sample_batch_applies_model_owned_selected_token_scores(
     ) -> None:
         assert logits.shape == (1, 3)
         assert len(sequences) == 1
-        assert temperatures.tolist() == [0.0]
+        torch.testing.assert_close(temperatures, torch.tensor([0.7]))
         assert top_ps.tolist() == [1.0]
         observed.append((sampled_ids.tolist(), batch_idx.tolist()))
         token_logprobs.fill_(-2.5)
@@ -516,16 +516,57 @@ def test_sample_batch_applies_model_owned_selected_token_scores(
     sampled, _, _, logprobs = GenerationScheduler._sample_batch(
         scheduler,
         torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32),
-        [_sequence(temperature=0.0, return_logprobs=True)],  # type: ignore[list-item]
+        [_sequence(temperature=0.7, return_logprobs=True)],  # type: ignore[list-item]
         torch.empty((1,), dtype=torch.long),
-        batch_idx=torch.tensor([7], dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
         logprobs_out=torch.empty((1,), dtype=torch.float32),
     )
 
     assert sampled.tolist() == [2]
-    assert observed == [([2], [7])]
+    assert observed == [([2], [0])]
     assert logprobs is not None
     torch.testing.assert_close(logprobs, torch.tensor([-2.5]))
+
+
+def test_sample_batch_fuses_greedy_model_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    scheduler._hooks = SamplingHooks(
+        score_sampled_tokens=lambda *_args, **_kwargs: pytest.fail(
+            "greedy model scores should already be complete"
+        )
+    )
+
+    def fake_greedy(
+        logits: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        logprobs_out: torch.Tensor,
+        require_packed: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert logits.shape == (1, 3)
+        assert require_packed is False
+        out.fill_(2)
+        logprobs_out.fill_(-0.25)
+        return out, logprobs_out
+
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.greedy_logprobs_from_logits",
+        fake_greedy,
+    )
+    sampled, temps, top_ps, logprobs = GenerationScheduler._sample_batch(
+        scheduler,
+        torch.tensor([[1.0, 2.0, 3.0]]),
+        [_sequence(temperature=0.0, return_logprobs=True)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
+        logprobs_out=torch.empty((1,), dtype=torch.float32),
+    )
+
+    assert sampled.tolist() == [2]
+    assert temps is None and top_ps is None
+    assert logprobs is not None and logprobs.tolist() == [-0.25]
 
 
 def test_sample_batch_applies_model_owned_sampling_params_before_sampling(
