@@ -13,6 +13,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
+from kestrel_kernels import get_runtime
 from torch import nn
 
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
@@ -63,6 +64,7 @@ class _PackedPrefillBatch:
     position_ids: torch.Tensor
     cu_seq_lens_q: Optional[torch.Tensor]
     sequence_lengths: tuple[int, ...]
+    topology_token: object
     seq_idx: Optional[torch.Tensor]
     batch_indices: torch.Tensor
     max_length: int
@@ -1258,6 +1260,13 @@ class Qwen35Runtime(UncachedPagedRuntime):
         )
 
         batch_size = len(prepared_sequences)
+        sequence_lengths = tuple(lengths)
+        cu_seq_lens_q, topology_token = (
+            get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=sequence_lengths,
+                device=self.device,
+            )
+        )
 
         return _PackedPrefillBatch(
             input_ids=scratch.text_meta.input_ids.gpu[:, :total_tokens],
@@ -1268,8 +1277,9 @@ class Qwen35Runtime(UncachedPagedRuntime):
             # and seq_idx are valid for batch_size == 1. This lets a single
             # sequence take the same packed_prefill path as batched prefill
             # instead of the separate uniform_native_prefill branch.
-            cu_seq_lens_q=scratch.text_meta.cu_seq_lens_q.gpu[: batch_size + 1],
-            sequence_lengths=tuple(lengths),
+            cu_seq_lens_q=cu_seq_lens_q,
+            sequence_lengths=sequence_lengths,
+            topology_token=topology_token,
             seq_idx=scratch.text_meta.seq_idx.gpu[:, :total_tokens],
             batch_indices=scratch.text_meta.batch_indices.gpu[:batch_size],
             max_length=max(lengths),
@@ -1333,6 +1343,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             paged_kv_seqlens_k=packed.paged_kv_seqlens_k,
             cu_seq_lens_q=packed.cu_seq_lens_q,
             sequence_lengths=packed.sequence_lengths,
+            topology_token=packed.topology_token,
             seq_idx=packed.seq_idx,
             gdn_state_indices=(
                 packed.batch_indices if self.generated_decode is not None else None),

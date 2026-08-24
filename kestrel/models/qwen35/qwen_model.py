@@ -294,6 +294,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         *,
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_lengths: Sequence[int] | None = None,
+        topology_token: object | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
     ):
@@ -483,6 +484,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 workspace=workspace,
                 output_final_state=True,
                 sequence_lengths=sequence_lengths,
+                topology_token=topology_token,
                 final_state=packed_recurrent_state,
                 final_state_indices=state_indices,
             )
@@ -884,6 +886,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         paged_kv_seqlens_k: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_lengths: Sequence[int] | None = None,
+        topology_token: object | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -897,6 +900,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 attention_mask=attention_mask,
                 cu_seq_lens_q=cu_seq_lens_q,
                 sequence_lengths=sequence_lengths,
+                topology_token=topology_token,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
             )
@@ -1222,6 +1226,7 @@ class Qwen3_5TextModel(nn.Module):
         paged_kv_seqlens_k: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_lengths: Sequence[int] | None = None,
+        topology_token: object | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
     ) -> _TextModelOutput:
@@ -1280,6 +1285,7 @@ class Qwen3_5TextModel(nn.Module):
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 cu_seq_lens_q=cu_seq_lens_q,
                 sequence_lengths=sequence_lengths,
+                topology_token=topology_token,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
             )
@@ -1371,6 +1377,7 @@ class Qwen3_5Model(nn.Module):
         paged_kv_seqlens_k: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_lengths: Sequence[int] | None = None,
+        topology_token: object | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
         vision_bilinear_indices: torch.Tensor | None = None,
@@ -1415,6 +1422,7 @@ class Qwen3_5Model(nn.Module):
             paged_kv_seqlens_k=paged_kv_seqlens_k,
             cu_seq_lens_q=cu_seq_lens_q,
             sequence_lengths=sequence_lengths,
+            topology_token=topology_token,
             seq_idx=seq_idx,
             gdn_state_indices=gdn_state_indices,
         )
