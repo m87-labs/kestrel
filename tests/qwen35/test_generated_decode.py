@@ -8,7 +8,10 @@ from kestrel.models.qwen35.cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
 )
-from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
+from kestrel.models.qwen35.qwen_model import (
+    Qwen3_5GatedDeltaNet,
+    _PackedGatedDeltaPrefillWorkspaceCache,
+)
 from kestrel.runtime import generated_decode as runtime_generated
 from kestrel.runtime.carried_state import (
     StatePhysicalForm,
@@ -161,7 +164,7 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
         assert torch.count_nonzero(state[3]) > 0
 
 
-def test_indexed_prefill_passes_the_authoritative_bf16_pool_to_chunk_kernel():
+def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     config = SimpleNamespace(
         hidden_size=4,
         linear_num_key_heads=1,
@@ -173,29 +176,33 @@ def test_indexed_prefill_passes_the_authoritative_bf16_pool_to_chunk_kernel():
         layer_types=("linear_attention",),
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    assert not hasattr(module, "packed_prefill_prepare")
+    assert not hasattr(module, "packed_recurrent_prefill")
     module.supports_packed_gdn = lambda *_args: True
     module.causal_conv1d_packed = lambda *, x, final_state, **_kwargs: x
-
-    def prepare(mixed_qkv, *_args):
-        tokens = mixed_qkv.shape[1]
-        q = torch.zeros((1, tokens, 1, 2), dtype=torch.bfloat16)
-        v = torch.zeros((1, tokens, 2, 2), dtype=torch.bfloat16)
-        g = torch.zeros((1, tokens, 2), dtype=torch.float32)
-        beta = torch.zeros((1, tokens, 2), dtype=torch.bfloat16)
-        return q, q.clone(), v, g, beta
-
-    module.packed_prefill_prepare = prepare
+    workspace = SimpleNamespace(
+        out=torch.empty((1, 3, 2, 2), dtype=torch.bfloat16),
+        can_serve=lambda *_args, **_kwargs: True,
+    )
+    module.allocate_packed_gdn_prefill_workspace = (
+        lambda *_args, **_kwargs: workspace
+    )
     captured = {}
 
-    def recurrent(query, _key, value, _g, _beta, _cu, **kwargs):
+    def combined(mixed_qkv, _a, _b, _A_log, _dt_bias, _cu, **kwargs):
         state = kwargs["final_state"]
         indices = kwargs["final_state_indices"]
-        captured.update(state=state, indices=indices)
+        captured.update(
+            mixed_qkv=mixed_qkv,
+            state=state,
+            indices=indices,
+            workspace=kwargs["workspace"],
+        )
         state[indices[0]].fill_(1)
         state[indices[1]].fill_(2)
-        return torch.zeros_like(value), state
+        return torch.zeros_like(workspace.out), state
 
-    module.packed_recurrent_prefill = recurrent
+    module.packed_gated_delta_rule_prefill = combined
     pool = _state_pool(config)
     recurrent_states = pool.recurrent_tensors_for_form(_generated_form())
     cache = Qwen35InferenceCache(
@@ -217,10 +224,45 @@ def test_indexed_prefill_passes_the_authoritative_bf16_pool_to_chunk_kernel():
     assert state is not None
     assert captured["state"] is state
     assert torch.equal(captured["indices"], indices)
+    assert captured["workspace"] is workspace
     assert torch.all(state[3] == 1)
     assert torch.all(state[1] == 2)
     assert torch.count_nonzero(state[0]) == 0
     assert cache.layers[0].replay_checkpoint_states is None
+
+
+def test_packed_gdn_prefill_workspace_cache_reuses_capacity():
+    mixed_qkv = torch.empty((1, 3, 8), dtype=torch.bfloat16)
+    a = torch.empty((1, 3, 2), dtype=torch.bfloat16)
+    contract_checks = []
+
+    def can_serve(candidate, *_args, **_kwargs):
+        contract_checks.append(None)
+        return candidate.shape[1] <= 4
+
+    workspace = SimpleNamespace(
+        can_serve=can_serve,
+    )
+    allocations = []
+
+    def allocate(*_args, **_kwargs):
+        allocations.append(None)
+        return workspace
+
+    cache = _PackedGatedDeltaPrefillWorkspaceCache()
+    assert cache.get(mixed_qkv, a, head_dim=2, allocate=allocate) is workspace
+    assert cache.get(mixed_qkv, a, head_dim=2, allocate=allocate) is workspace
+    assert len(allocations) == 1
+    assert contract_checks == []
+
+    shorter_mixed_qkv = mixed_qkv[:, :2]
+    shorter_a = a[:, :2]
+    assert (
+        cache.get(shorter_mixed_qkv, shorter_a, head_dim=2, allocate=allocate)
+        is workspace
+    )
+    assert len(allocations) == 1
+    assert len(contract_checks) == 1
 
 
 def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(

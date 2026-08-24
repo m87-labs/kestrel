@@ -35,15 +35,17 @@ _kestrel_causal_conv1d_packed = _kestrel_runtime.gated_delta.causal_conv1d_packe
 _kestrel_causal_conv1d_update_indexed = (
     _kestrel_runtime.gated_delta.causal_conv1d_update_indexed
 )
-_kestrel_packed_prefill_prepare = _kestrel_runtime.gated_delta.packed_prefill_prepare
+_kestrel_allocate_packed_gdn_prefill_workspace = (
+    _kestrel_runtime.gated_delta.allocate_packed_gated_delta_prefill_workspace
+)
+_kestrel_packed_gated_delta_rule_prefill = (
+    _kestrel_runtime.gated_delta.packed_gated_delta_rule_prefill
+)
 _kestrel_packed_recurrent_decode_replay_indexed = (
     _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_decode_replay_indexed
 )
 _kestrel_packed_recurrent_decode_replay_indexed_gqa = (
     _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_decode_replay_indexed_gqa
-)
-_kestrel_packed_recurrent_prefill = (
-    _kestrel_runtime.gated_delta.packed_recurrent_gated_delta_rule_prefill
 )
 _kestrel_gated_rmsnorm = _kestrel_runtime.gated_delta.gated_rmsnorm
 _kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
@@ -71,6 +73,40 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+
+
+@dataclass
+class _PackedGatedDeltaPrefillWorkspaceCache:
+    workspace: Any | None = None
+    _served_signature: tuple[Any, ...] | None = None
+
+    def get(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        *,
+        head_dim: int,
+        allocate,
+    ):
+        signature = (
+            mixed_qkv.device,
+            mixed_qkv.dtype,
+            tuple(mixed_qkv.shape),
+            a.device,
+            a.dtype,
+            tuple(a.shape),
+            int(head_dim),
+        )
+        workspace = self.workspace
+        if workspace is not None and self._served_signature == signature:
+            return workspace
+        if workspace is None or not workspace.can_serve(
+            mixed_qkv, a, head_dim=head_dim
+        ):
+            workspace = allocate(mixed_qkv, a, head_dim=head_dim)
+            self.workspace = workspace
+        self._served_signature = signature
+        return workspace
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:
@@ -228,15 +264,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.causal_conv1d_packed = _kestrel_causal_conv1d_packed
         self.causal_conv1d_update_indexed = _kestrel_causal_conv1d_update_indexed
-        self.packed_prefill_prepare = _kestrel_packed_prefill_prepare
+        self.allocate_packed_gdn_prefill_workspace = (
+            _kestrel_allocate_packed_gdn_prefill_workspace
+        )
+        self.packed_gated_delta_rule_prefill = (
+            _kestrel_packed_gated_delta_rule_prefill
+        )
         self.packed_recurrent_decode_replay_indexed = (
             _kestrel_packed_recurrent_decode_replay_indexed
         )
         self.packed_recurrent_decode_replay_indexed_gqa = (
             _kestrel_packed_recurrent_decode_replay_indexed_gqa
         )
-        self.packed_recurrent_prefill = _kestrel_packed_recurrent_prefill
         self.supports_packed_gdn = _kestrel_supports_packed_gdn
+        self._prefill_workspace_cache = _PackedGatedDeltaPrefillWorkspaceCache()
 
         self.in_proj = nn.Linear(
             self.hidden_size,
@@ -424,20 +465,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 final_state=packed_conv_state,
             )
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            query, key, value, g, beta = self.packed_prefill_prepare(
+            workspace = self._prefill_workspace_cache.get(
+                mixed_qkv,
+                a,
+                head_dim=self.head_k_dim,
+                allocate=self.allocate_packed_gdn_prefill_workspace,
+            )
+            core_attn_out, _ = self.packed_gated_delta_rule_prefill(
                 mixed_qkv,
                 a,
                 b,
                 self.A_log,
                 self.dt_bias,
-            )
-            core_attn_out, _ = self.packed_recurrent_prefill(
-                query,
-                key,
-                value,
-                g,
-                beta,
                 recurrence_cu_seqlens,
+                workspace=workspace,
                 output_final_state=True,
                 final_state=packed_recurrent_state,
                 final_state_indices=state_indices,
@@ -1153,6 +1194,12 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        self._gdn_prefill_workspace_cache = _PackedGatedDeltaPrefillWorkspaceCache()
+        for layer in self.layers:
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn._prefill_workspace_cache = (
+                    self._gdn_prefill_workspace_cache
+                )
         self.norm = _rmsnorm_state(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
     def forward(
