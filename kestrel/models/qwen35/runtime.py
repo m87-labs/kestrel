@@ -40,6 +40,7 @@ from .prompt_template import (
     Qwen35PromptTemplate,
     VISION_END_ID,
     VISION_START_ID,
+    VIDEO_PAD_ID,
     _NEWLINE_ID,
     _USER_ID,
 )
@@ -76,6 +77,28 @@ class QwenImageInputs:
 
 
 @dataclass
+class QwenVideoInputs:
+    """Native Qwen video patches or cached embeddings for one ordered clip.
+
+    Device-resident callers may provide ``pixel_values`` plus precomputed
+    fixed-grid vision metadata for the initial vision encode. A later exact
+    replay may instead provide ``vision_embeddings``; the two payloads are
+    mutually exclusive. The small ``video_grid_thw`` tensor remains the
+    authority for temporal-pair and M-RoPE layout.
+    """
+
+    pixel_values: torch.Tensor | None
+    video_grid_thw: torch.Tensor
+    num_video_tokens: int
+    timestamps_seconds: tuple[float, ...] = ()
+    vision_embeddings: torch.Tensor | None = None
+    vision_bilinear_indices: torch.Tensor | None = None
+    vision_bilinear_weights: torch.Tensor | None = None
+    vision_position_ids: torch.Tensor | None = None
+    vision_cu_seqlens: torch.Tensor | None = None
+
+
+@dataclass
 class _PackedPrefillBatch:
     input_ids: torch.Tensor
     cache_position_ids: torch.Tensor
@@ -95,6 +118,7 @@ class _PackedPrefillBatch:
     vision_bilinear_weights: Optional[torch.Tensor] = None
     vision_position_ids: Optional[torch.Tensor] = None
     vision_cu_seqlens: Optional[torch.Tensor] = None
+    vision_embeddings: Optional[torch.Tensor] = None
 
 
 class _QwenImagePreprocessor:
@@ -512,6 +536,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
         """Return the exact Qwen vision expansion after preprocessing."""
         if image is None:
             return 0
+        if isinstance(image_crops, QwenVideoInputs):
+            return len(self._video_prompt_block(image_crops))
         if not isinstance(image_crops, QwenImageInputs):
             return super().image_kv_length(prompt_tokens, image, image_crops)
 
@@ -530,6 +556,99 @@ class Qwen35Runtime(UncachedPagedRuntime):
             )
         inserted_tokens = int(image_crops.num_image_tokens) + 2 * num_images
         return inserted_tokens - marker_count
+
+    def _video_prompt_block(self, video: QwenVideoInputs) -> list[Any]:
+        """Expand one native video placeholder into timestamped temporal groups."""
+
+        from kestrel.runtime.tokens import TextToken
+
+        grids = video.video_grid_thw
+        if tuple(grids.shape) != (1, 3):
+            raise ValueError("Qwen video_grid_thw must have shape [1, 3]")
+        grid_t, grid_h, grid_w = (int(value) for value in grids[0])
+        if grid_t <= 0 or grid_h <= 0 or grid_w <= 0:
+            raise ValueError("Qwen video grid dimensions must be positive")
+        spatial = int(self.architecture.vision_config.spatial_merge_size)
+        if grid_h % spatial or grid_w % spatial:
+            raise ValueError(
+                "Qwen video grid dimensions must be divisible by the spatial merge size"
+            )
+        frame_tokens = (grid_h // spatial) * (grid_w // spatial)
+        expected_tokens = grid_t * frame_tokens
+        if video.num_video_tokens != expected_tokens:
+            raise ValueError(
+                "Qwen video token count does not match its temporal/spatial grid"
+            )
+        timestamps = video.timestamps_seconds
+        if len(timestamps) != grid_t:
+            raise ValueError(
+                "Qwen video timestamps must contain one value per temporal patch"
+            )
+        if any(not np.isfinite(value) or value < 0 for value in timestamps):
+            raise ValueError("Qwen video timestamps must be finite and non-negative")
+        if any(
+            current <= previous
+            for previous, current in zip(timestamps, timestamps[1:])
+        ):
+            raise ValueError("Qwen video timestamps must increase")
+
+        block: list[TextToken] = []
+        for timestamp in timestamps:
+            timestamp_ids = self.tokenizer.encode(f"<{timestamp:.1f} seconds>").ids
+            block.extend(
+                TextToken(token_id=int(token_id))
+                for token_id in timestamp_ids
+            )
+            block.append(TextToken(token_id=VISION_START_ID))
+            block.extend(
+                TextToken(token_id=VIDEO_PAD_ID)
+                for _ in range(frame_tokens)
+            )
+            block.append(TextToken(token_id=VISION_END_ID))
+        return block
+
+    @torch.inference_mode()
+    def encode_video(self, video: QwenVideoInputs) -> torch.Tensor:
+        """Encode native, device-resident Qwen video patches once.
+
+        The returned merged embeddings may be supplied in a later
+        ``QwenVideoInputs`` instance to replay text prefill without decoding or
+        re-encoding the source frames.
+        """
+
+        if video.pixel_values is None or video.vision_embeddings is not None:
+            raise ValueError("encode_video requires pixel_values and no embeddings")
+        metadata = (
+            video.vision_bilinear_indices,
+            video.vision_bilinear_weights,
+            video.vision_position_ids,
+            video.vision_cu_seqlens,
+        )
+        if any(value is None for value in metadata):
+            raise ValueError(
+                "encode_video requires precomputed device-resident vision metadata"
+            )
+        if video.pixel_values.device != self.device:
+            raise ValueError("video pixels must be on the runtime device")
+        for value in metadata:
+            assert value is not None
+            if value.device != self.device:
+                raise ValueError("video vision metadata must be on the runtime device")
+
+        features = self.model.model.get_image_features(
+            video.pixel_values,
+            video.video_grid_thw,
+            bilinear_indices=video.vision_bilinear_indices,
+            bilinear_weights=video.vision_bilinear_weights,
+            position_ids=video.vision_position_ids,
+            cu_seqlens=video.vision_cu_seqlens,
+        )
+        embeddings = torch.cat(features, dim=0)
+        if int(embeddings.shape[0]) != int(video.num_video_tokens):
+            raise RuntimeError(
+                "Qwen video encoder output count does not match video tokens"
+            )
+        return embeddings
 
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
@@ -576,7 +695,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         prompt_tokens: Sequence[Any],
         *,
         image: Optional[Any] = None,
-        image_crops: Optional[QwenImageInputs] = None,
+        image_crops: Optional[QwenImageInputs | QwenVideoInputs] = None,
         encoder_input: object | None = None,
         max_new_tokens: Optional[int] = None,
         lora_slot: int = 0,
@@ -592,6 +711,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         tokens_list = list(prompt_tokens)
         num_image_tokens = 0
         num_images = 0
+        inserted_vision_tokens = 0
         chat_crops = None
         if image is not None:
             if image_crops is None:
@@ -601,52 +721,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 # image is never preprocessed twice.
                 image_crops = self._image_preprocessor.process(image)
                 chat_crops = image_crops
-            grids = image_crops.image_grid_thw
-            num_images = int(grids.shape[0])
-            spatial = int(
-                self.architecture.vision_config.spatial_merge_size
-            )
-            # Per-image token count, computed the same way the position-id /
-            # vision-metadata paths expect (so the expanded pad count matches).
-            per_image = []
-            for i in range(num_images):
-                gt, gh, gw = (int(v) for v in grids[i])
-                per_image.append(gt * (gh // spatial) * (gw // spatial))
-            num_image_tokens = sum(per_image)
+            spatial = int(self.architecture.vision_config.spatial_merge_size)
+            if isinstance(image_crops, QwenVideoInputs):
+                if any(isinstance(token, ImageMarker) for token in tokens_list):
+                    raise ValueError("Qwen video prompts do not accept image markers")
+                video_block = self._video_prompt_block(image_crops)
 
-            markers = [
-                (i, t.index)
-                for i, t in enumerate(tokens_list)
-                if isinstance(t, ImageMarker)
-            ]
-            if markers:
-                # Chat path: the chat skill emitted one ImageMarker per image at
-                # its content position. Replace each with that image's vision
-                # block: <|vision_start|> + <|image_pad|>×N + <|vision_end|>.
-                if len(markers) != num_images:
-                    raise RuntimeError(
-                        f"Qwen chat prompt has {len(markers)} image marker(s) "
-                        f"but {num_images} image(s) were provided"
-                    )
-                for pos, idx in sorted(markers, reverse=True):
-                    block = (
-                        [TextToken(token_id=VISION_START_ID)]
-                        + [TextToken(token_id=IMAGE_PAD_ID)] * per_image[idx]
-                        + [TextToken(token_id=VISION_END_ID)]
-                    )
-                    tokens_list[pos : pos + 1] = block
-            else:
-                # Query path: no marker in the prompt; splice a single vision
-                # block after the first user-turn opener.
-                if num_images != 1:
-                    raise RuntimeError(
-                        "Qwen prompt without image markers supports exactly one image"
-                    )
-                image_block = (
-                    [TextToken(token_id=VISION_START_ID)]
-                    + [TextToken(token_id=IMAGE_PAD_ID)] * num_image_tokens
-                    + [TextToken(token_id=VISION_END_ID)]
-                )
                 query_template = self.prompt_template.query()
                 offset = derive_image_insertion_offset(
                     tokens_list,
@@ -655,7 +735,64 @@ class Qwen35Runtime(UncachedPagedRuntime):
                         len(query_template.prefix) if query_template else 0
                     ),
                 )
-                tokens_list = tokens_list[:offset] + image_block + tokens_list[offset:]
+                tokens_list = tokens_list[:offset] + video_block + tokens_list[offset:]
+                inserted_vision_tokens = len(video_block)
+            else:
+                grids = image_crops.image_grid_thw
+                num_images = int(grids.shape[0])
+                # Per-image token count, computed the same way the position-id /
+                # vision-metadata paths expect (so the expanded pad count matches).
+                per_image = []
+                for i in range(num_images):
+                    gt, gh, gw = (int(v) for v in grids[i])
+                    per_image.append(gt * (gh // spatial) * (gw // spatial))
+                num_image_tokens = sum(per_image)
+
+                markers = [
+                    (i, t.index)
+                    for i, t in enumerate(tokens_list)
+                    if isinstance(t, ImageMarker)
+                ]
+                if markers:
+                    # Chat path: the chat skill emitted one ImageMarker per image at
+                    # its content position. Replace each with that image's vision
+                    # block: <|vision_start|> + <|image_pad|>×N + <|vision_end|>.
+                    if len(markers) != num_images:
+                        raise RuntimeError(
+                            f"Qwen chat prompt has {len(markers)} image marker(s) "
+                            f"but {num_images} image(s) were provided"
+                        )
+                    for pos, idx in sorted(markers, reverse=True):
+                        block = (
+                            [TextToken(token_id=VISION_START_ID)]
+                            + [TextToken(token_id=IMAGE_PAD_ID)] * per_image[idx]
+                            + [TextToken(token_id=VISION_END_ID)]
+                        )
+                        tokens_list[pos : pos + 1] = block
+                else:
+                    # Query path: no marker in the prompt; splice a single vision
+                    # block after the first user-turn opener.
+                    if num_images != 1:
+                        raise RuntimeError(
+                            "Qwen prompt without image markers supports exactly one image"
+                        )
+                    image_block = (
+                        [TextToken(token_id=VISION_START_ID)]
+                        + [TextToken(token_id=IMAGE_PAD_ID)] * num_image_tokens
+                        + [TextToken(token_id=VISION_END_ID)]
+                    )
+                    query_template = self.prompt_template.query()
+                    offset = derive_image_insertion_offset(
+                        tokens_list,
+                        user_turn_opener=(IM_START_ID, _USER_ID, _NEWLINE_ID),
+                        fallback_offset=1 + (
+                            len(query_template.prefix) if query_template else 0
+                        ),
+                    )
+                    tokens_list = tokens_list[:offset] + image_block + tokens_list[offset:]
+                inserted_vision_tokens = num_image_tokens + 2 * num_images
+        elif isinstance(image_crops, QwenVideoInputs):
+            raise ValueError("Qwen video inputs require a non-None video owner")
 
         new_tokens = 128 if max_new_tokens is None else max_new_tokens
         target_length = len(tokens_list) + new_tokens
@@ -663,7 +800,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             tokens=tokens_list,
             target_length=target_length,
             image_length=(
-                num_image_tokens + 2 * num_images if image is not None else 0
+                inserted_vision_tokens if image is not None else 0
             ),
             lora_slot=lora_slot,
             adapter_id=adapter_id,
@@ -680,7 +817,9 @@ class Qwen35Runtime(UncachedPagedRuntime):
         prefill_slot: Any,
         *,
         images: Optional[Sequence[Any]] = None,
-        image_crops_list: Optional[Sequence[Optional[QwenImageInputs]]] = None,
+        image_crops_list: Optional[
+            Sequence[Optional[QwenImageInputs | QwenVideoInputs]]
+        ] = None,
         encoder_inputs: Optional[Sequence[object | None]] = None,
     ) -> torch.Tensor:
         if encoder_inputs is not None and any(
@@ -958,14 +1097,30 @@ class Qwen35Runtime(UncachedPagedRuntime):
         start: int,
         end: int,
         mm_token_type_ids: np.ndarray,
-        image_grid_thw: np.ndarray,
+        vision_grid_thw: np.ndarray,
+        vision_modality_type: int,
     ) -> int:
+        if vision_modality_type not in (1, 2):
+            raise ValueError("Qwen vision modality type must be image (1) or video (2)")
         spatial_merge_size = int(
             self.architecture.vision_config.spatial_merge_size
         )
+        # The processor writes one timestamped video-pad group per temporal
+        # patch. Qwen's M-RoPE implementation therefore expands [T, H, W] into
+        # T logical [1, H, W] grids before assigning multimodal positions.
+        if vision_modality_type == 2:
+            position_grid_thw = np.repeat(
+                vision_grid_thw,
+                vision_grid_thw[:, 0],
+                axis=0,
+            ).copy()
+            position_grid_thw[:, 0] = 1
+        else:
+            position_grid_thw = vision_grid_thw
+
         cursor = start
         current_pos = 0
-        image_idx = 0
+        vision_idx = 0
         while cursor < end:
             modality_type = int(mm_token_type_ids[cursor - start])
             group_end = cursor + 1
@@ -982,20 +1137,20 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 )
                 out[:, 0, cursor:group_end] = positions
                 current_pos += text_len
-            elif modality_type == 1:
-                if image_idx >= image_grid_thw.shape[0]:
-                    raise RuntimeError("Qwen image grid metadata ended early")
+            elif modality_type == vision_modality_type:
+                if vision_idx >= position_grid_thw.shape[0]:
+                    raise RuntimeError("Qwen vision grid metadata ended early")
                 grid_t, grid_h_raw, grid_w_raw = (
-                    int(v) for v in image_grid_thw[image_idx]
+                    int(v) for v in position_grid_thw[vision_idx]
                 )
-                image_idx += 1
+                vision_idx += 1
                 grid_h = grid_h_raw // spatial_merge_size
                 grid_w = grid_w_raw // spatial_merge_size
-                image_len = grid_t * grid_h * grid_w
-                if image_len != group_end - cursor:
+                vision_len = grid_t * grid_h * grid_w
+                if vision_len != group_end - cursor:
                     raise RuntimeError(
-                        "Qwen image token count does not match image grid: "
-                        f"tokens={group_end - cursor}, grid={image_len}"
+                        "Qwen vision token count does not match vision grid: "
+                        f"tokens={group_end - cursor}, grid={vision_len}"
                     )
                 offset = current_pos
                 temporal = np.repeat(np.arange(grid_t, dtype=np.int64), grid_h * grid_w)
@@ -1009,12 +1164,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 out[2, 0, cursor:group_end] = width + offset
                 current_pos += max(grid_h_raw, grid_w_raw) // spatial_merge_size
             else:
-                raise NotImplementedError("Qwen packed prefill does not support video")
+                raise RuntimeError(
+                    "Qwen prompt contains a vision placeholder for the wrong "
+                    f"modality: expected={vision_modality_type}, got={modality_type}"
+                )
 
             cursor = group_end
 
-        if image_idx != image_grid_thw.shape[0]:
-            raise RuntimeError("Qwen image grid metadata has unused rows")
+        if vision_idx != position_grid_thw.shape[0]:
+            raise RuntimeError("Qwen vision grid metadata has unused rows")
         return int(out[:, 0, start:end].max()) + 1 - (end - start)
 
     def _fill_vision_metadata(
@@ -1105,11 +1263,11 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self,
         scratch: Qwen35PrefillScratch,
         *,
-        total_tokens: int,
-        batch_size: int,
-        has_images: bool,
+        copy_pixel_values: bool,
+        copy_vision_grid: bool,
+        copy_vision_metadata: bool,
         pixel_rows: int,
-        image_grid_rows: int,
+        vision_grid_rows: int,
         vision_sequence_count: int,
     ) -> None:
         # One H2D for every text-metadata field (input ids, positions, slot
@@ -1118,13 +1276,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
         # field to its live length, so shipping the whole packed buffer
         # (including unused tails) is safe.
         scratch.text_meta.copy_to_gpu()
-        if has_images:
+        if copy_pixel_values:
             if scratch.pixel_values is None:
                 raise RuntimeError("Qwen pixel scratch was not allocated")
             scratch.pixel_values.copy_to_gpu(pixel_rows)
+        if copy_vision_grid:
             if scratch.image_grid_thw is None:
-                raise RuntimeError("Qwen image grid scratch was not allocated")
-            scratch.image_grid_thw.copy_to_gpu(image_grid_rows)
+                raise RuntimeError("Qwen vision grid scratch was not allocated")
+            scratch.image_grid_thw.copy_to_gpu(vision_grid_rows)
+        if copy_vision_metadata:
             if (
                 scratch.vision_bilinear_indices is None
                 or scratch.vision_bilinear_weights is None
@@ -1169,7 +1329,9 @@ class Qwen35Runtime(UncachedPagedRuntime):
         prepared_sequences: Sequence[Any],
         *,
         prefill_slot: Any,
-        image_crops_list: Sequence[Optional[QwenImageInputs]],
+        image_crops_list: Sequence[
+            Optional[QwenImageInputs | QwenVideoInputs]
+        ],
         batch_indices: Sequence[int],
     ) -> _PackedPrefillBatch:
         from kestrel.runtime.tokens import TextToken
@@ -1178,16 +1340,32 @@ class Qwen35Runtime(UncachedPagedRuntime):
             raise ValueError("image_crops_list length must match prepared_sequences")
         if len(prepared_sequences) != len(batch_indices):
             raise ValueError("batch_indices length must match prepared_sequences")
+        video_inputs = [
+            crops for crops in image_crops_list if isinstance(crops, QwenVideoInputs)
+        ]
+        if video_inputs and (
+            len(prepared_sequences) != 1 or len(video_inputs) != 1
+        ):
+            raise NotImplementedError(
+                "Qwen native video prefill currently supports one sequence per batch"
+            )
 
         token_rows: list[list[int]] = []
         crop_grid_rows: list[np.ndarray | None] = []
+        vision_modality_types: list[int | None] = []
         lengths: list[int] = []
         total_tokens = 0
-        pixel_rows = 0
-        pixel_dim = 0
-        image_grid_rows = 0
-        vision_sequence_count = 0
-        has_images = False
+        staged_pixel_rows = 0
+        staged_pixel_dim = 0
+        vision_grid_rows = 0
+        staged_vision_sequence_count = 0
+        has_vision = False
+        direct_pixel_values: torch.Tensor | None = None
+        direct_vision_embeddings: torch.Tensor | None = None
+        direct_vision_bilinear_indices: torch.Tensor | None = None
+        direct_vision_bilinear_weights: torch.Tensor | None = None
+        direct_vision_position_ids: torch.Tensor | None = None
+        direct_vision_cu_seqlens: torch.Tensor | None = None
 
         for prepared, crops in zip(prepared_sequences, image_crops_list):
             tokens = prepared.tokens_list
@@ -1204,34 +1382,153 @@ class Qwen35Runtime(UncachedPagedRuntime):
             lengths.append(length)
             total_tokens += length
             if crops is not None:
-                has_images = True
-                crop_pixels = crops.pixel_values
-                if crop_pixels.ndim != 2:
-                    raise ValueError("Qwen image pixel_values must be rank-2")
-                if pixel_dim == 0:
-                    pixel_dim = int(crop_pixels.shape[1])
-                elif pixel_dim != int(crop_pixels.shape[1]):
-                    raise ValueError("Qwen image pixel feature dimension changed")
-                pixel_rows += int(crop_pixels.shape[0])
-                grid_np = crops.image_grid_thw.detach().cpu().numpy().astype(
+                has_vision = True
+                is_video = isinstance(crops, QwenVideoInputs)
+                grid = (
+                    crops.video_grid_thw
+                    if is_video
+                    else crops.image_grid_thw
+                )
+                grid_np = grid.detach().cpu().numpy().astype(
                     np.int64, copy=False
                 )
                 if grid_np.ndim != 2 or grid_np.shape[1] != 3:
-                    raise ValueError("Qwen image_grid_thw must have shape [N, 3]")
+                    raise ValueError("Qwen vision grid must have shape [N, 3]")
+                if np.any(grid_np <= 0):
+                    raise ValueError("Qwen vision grid dimensions must be positive")
+                spatial_merge_size = int(
+                    self.architecture.vision_config.spatial_merge_size
+                )
+                if np.any(grid_np[:, 1:] % spatial_merge_size):
+                    raise ValueError(
+                        "Qwen vision grid dimensions must be divisible by the "
+                        "spatial merge size"
+                    )
+                expected_vision_tokens = int(
+                    grid_np.prod(axis=1).sum()
+                ) // (spatial_merge_size**2)
+                declared_vision_tokens = int(
+                    crops.num_video_tokens
+                    if is_video
+                    else crops.num_image_tokens
+                )
+                if declared_vision_tokens != expected_vision_tokens:
+                    raise ValueError(
+                        "Qwen vision token count does not match its grid: "
+                        f"declared={declared_vision_tokens}, "
+                        f"grid={expected_vision_tokens}"
+                    )
+
+                if is_video:
+                    assert isinstance(crops, QwenVideoInputs)
+                    has_pixels = crops.pixel_values is not None
+                    has_embeddings = crops.vision_embeddings is not None
+                    if has_pixels == has_embeddings:
+                        raise ValueError(
+                            "Qwen video inputs require exactly one of pixel_values "
+                            "or vision_embeddings"
+                        )
+                    if has_embeddings:
+                        assert crops.vision_embeddings is not None
+                        embeddings = crops.vision_embeddings
+                        if embeddings.ndim != 2:
+                            raise ValueError(
+                                "Qwen video vision_embeddings must be rank-2"
+                            )
+                        if int(embeddings.shape[0]) != declared_vision_tokens:
+                            raise ValueError(
+                                "Qwen cached video embedding count does not match "
+                                "its placeholders"
+                            )
+                        if embeddings.device != self.device:
+                            raise ValueError(
+                                "Qwen cached video embeddings must be on the "
+                                "runtime device"
+                            )
+                        direct_vision_embeddings = embeddings
+                    else:
+                        assert crops.pixel_values is not None
+                        pixels = crops.pixel_values
+                        if pixels.ndim != 2:
+                            raise ValueError(
+                                "Qwen video pixel_values must be rank-2"
+                            )
+                        expected_pixel_rows = int(grid_np.prod(axis=1).sum())
+                        if int(pixels.shape[0]) != expected_pixel_rows:
+                            raise ValueError(
+                                "Qwen video patch count does not match its grid: "
+                                f"patches={int(pixels.shape[0])}, "
+                                f"grid={expected_pixel_rows}"
+                            )
+                        if pixels.device != self.device:
+                            raise ValueError(
+                                "Qwen video pixel_values must be on the runtime device"
+                            )
+                        metadata = (
+                            crops.vision_bilinear_indices,
+                            crops.vision_bilinear_weights,
+                            crops.vision_position_ids,
+                            crops.vision_cu_seqlens,
+                        )
+                        if any(value is None for value in metadata):
+                            raise ValueError(
+                                "Qwen device-resident video pixels require precomputed "
+                                "vision metadata"
+                            )
+                        (
+                            direct_vision_bilinear_indices,
+                            direct_vision_bilinear_weights,
+                            direct_vision_position_ids,
+                            direct_vision_cu_seqlens,
+                        ) = metadata
+                        expected_metadata_shapes = (
+                            (4, expected_pixel_rows),
+                            (4, expected_pixel_rows),
+                            (expected_pixel_rows, 2),
+                            (int(grid_np[:, 0].sum()) + 1,),
+                        )
+                        for value, expected_shape in zip(
+                            metadata, expected_metadata_shapes
+                        ):
+                            assert value is not None
+                            if tuple(value.shape) != expected_shape:
+                                raise ValueError(
+                                    "Qwen video vision metadata has shape "
+                                    f"{tuple(value.shape)}; expected {expected_shape}"
+                                )
+                            if value.device != self.device:
+                                raise ValueError(
+                                    "Qwen video vision metadata must be on the "
+                                    "runtime device"
+                                )
+                        direct_pixel_values = pixels
+                else:
+                    assert isinstance(crops, QwenImageInputs)
+                    crop_pixels = crops.pixel_values
+                    if crop_pixels.ndim != 2:
+                        raise ValueError("Qwen image pixel_values must be rank-2")
+                    if staged_pixel_dim == 0:
+                        staged_pixel_dim = int(crop_pixels.shape[1])
+                    elif staged_pixel_dim != int(crop_pixels.shape[1]):
+                        raise ValueError("Qwen image pixel feature dimension changed")
+                    staged_pixel_rows += int(crop_pixels.shape[0])
+                    staged_vision_sequence_count += int(grid_np[:, 0].sum())
+
                 crop_grid_rows.append(grid_np)
-                image_grid_rows += int(grid_np.shape[0])
-                vision_sequence_count += int(grid_np[:, 0].sum())
+                vision_modality_types.append(2 if is_video else 1)
+                vision_grid_rows += int(grid_np.shape[0])
             else:
                 crop_grid_rows.append(None)
+                vision_modality_types.append(None)
 
         scratch = self._prefill_scratch_for(
             prefill_slot,
             total_tokens=total_tokens,
             batch_size=len(prepared_sequences),
-            pixel_rows=pixel_rows,
-            pixel_dim=pixel_dim,
-            image_grid_rows=image_grid_rows,
-            vision_sequence_count=vision_sequence_count,
+            pixel_rows=staged_pixel_rows,
+            pixel_dim=staged_pixel_dim,
+            image_grid_rows=vision_grid_rows,
+            vision_sequence_count=staged_vision_sequence_count,
         )
 
         offset = 0
@@ -1239,8 +1536,14 @@ class Qwen35Runtime(UncachedPagedRuntime):
         grid_offset = 0
         scratch.text_meta.cu_seq_lens_q.np[0] = 0
 
-        for row, (token_ids, crops, grid_np, batch_idx) in enumerate(
-            zip(token_rows, image_crops_list, crop_grid_rows, batch_indices)
+        for row, (token_ids, crops, grid_np, modality_type, batch_idx) in enumerate(
+            zip(
+                token_rows,
+                image_crops_list,
+                crop_grid_rows,
+                vision_modality_types,
+                batch_indices,
+            )
         ):
             length = lengths[row]
             end = offset + length
@@ -1270,45 +1573,63 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 )
                 scratch.text_meta.rope_deltas.np[row, 0] = 0
             else:
-                mm_types[ids_np == IMAGE_PAD_ID] = 1
+                assert modality_type is not None
+                placeholder_id = (
+                    VIDEO_PAD_ID if modality_type == 2 else IMAGE_PAD_ID
+                )
+                mm_types[ids_np == placeholder_id] = modality_type
                 assert grid_np is not None
+                declared_vision_tokens = int(
+                    crops.num_video_tokens
+                    if isinstance(crops, QwenVideoInputs)
+                    else crops.num_image_tokens
+                )
+                placeholder_count = int(np.count_nonzero(ids_np == placeholder_id))
+                if placeholder_count != declared_vision_tokens:
+                    raise ValueError(
+                        "Qwen vision placeholder count does not match inputs: "
+                        f"placeholders={placeholder_count}, "
+                        f"vision_tokens={declared_vision_tokens}"
+                    )
                 grid_end = grid_offset + grid_np.shape[0]
                 if scratch.image_grid_thw is None:
-                    raise RuntimeError("Qwen image grid scratch was not allocated")
+                    raise RuntimeError("Qwen vision grid scratch was not allocated")
                 scratch.image_grid_thw.np[grid_offset:grid_end] = grid_np
                 scratch.text_meta.rope_deltas.np[row, 0] = self._fill_multimodal_position_ids(
                     scratch.text_meta.position_ids.np,
                     start=offset,
                     end=end,
                     mm_token_type_ids=mm_types,
-                    image_grid_thw=grid_np,
+                    vision_grid_thw=grid_np,
+                    vision_modality_type=modality_type,
                 )
-                pixel_end = pixel_offset + int(crops.pixel_values.shape[0])
-                if scratch.pixel_values is None:
-                    raise RuntimeError("Qwen pixel scratch was not allocated")
-                scratch.pixel_values.cpu[pixel_offset:pixel_end].copy_(
-                    crops.pixel_values
-                )
-                pixel_offset = pixel_end
+                if isinstance(crops, QwenImageInputs):
+                    pixel_end = pixel_offset + int(crops.pixel_values.shape[0])
+                    if scratch.pixel_values is None:
+                        raise RuntimeError("Qwen pixel scratch was not allocated")
+                    scratch.pixel_values.cpu[pixel_offset:pixel_end].copy_(
+                        crops.pixel_values
+                    )
+                    pixel_offset = pixel_end
                 grid_offset = grid_end
             offset += length
 
-        if has_images:
+        if staged_pixel_rows:
             self._fill_vision_metadata(
                 scratch,
                 crop_grid_rows,
-                pixel_rows=pixel_rows,
-                vision_sequence_count=vision_sequence_count,
+                pixel_rows=staged_pixel_rows,
+                vision_sequence_count=staged_vision_sequence_count,
             )
 
         self._copy_prefill_metadata_to_gpu(
             scratch,
-            total_tokens=total_tokens,
-            batch_size=len(prepared_sequences),
-            has_images=has_images,
-            pixel_rows=pixel_rows,
-            image_grid_rows=image_grid_rows,
-            vision_sequence_count=vision_sequence_count,
+            copy_pixel_values=staged_pixel_rows > 0,
+            copy_vision_grid=has_vision,
+            copy_vision_metadata=staged_pixel_rows > 0,
+            pixel_rows=staged_pixel_rows,
+            vision_grid_rows=vision_grid_rows,
+            vision_sequence_count=staged_vision_sequence_count,
         )
         prefill_slot.batch_idx[: len(prepared_sequences)].copy_(
             scratch.text_meta.batch_indices.gpu[: len(prepared_sequences)]
@@ -1339,35 +1660,60 @@ class Qwen35Runtime(UncachedPagedRuntime):
             slot_mapping=scratch.text_meta.slot_mapping.gpu[:, :total_tokens],
             rope_deltas=scratch.text_meta.rope_deltas.gpu[:batch_size],
             pixel_values=(
-                scratch.pixel_values.gpu[:pixel_rows]
-                if has_images and scratch.pixel_values is not None
-                else None
+                direct_pixel_values
+                if direct_pixel_values is not None
+                else (
+                    scratch.pixel_values.gpu[:staged_pixel_rows]
+                    if staged_pixel_rows and scratch.pixel_values is not None
+                    else None
+                )
             ),
             image_grid_thw=(
-                scratch.image_grid_thw.gpu[:image_grid_rows]
-                if has_images and scratch.image_grid_thw is not None
+                scratch.image_grid_thw.gpu[:vision_grid_rows]
+                if has_vision and scratch.image_grid_thw is not None
                 else None
             ),
             vision_bilinear_indices=(
-                scratch.vision_bilinear_indices.gpu[:, :pixel_rows]
-                if has_images and scratch.vision_bilinear_indices is not None
-                else None
+                direct_vision_bilinear_indices
+                if direct_vision_bilinear_indices is not None
+                else (
+                    scratch.vision_bilinear_indices.gpu[:, :staged_pixel_rows]
+                    if staged_pixel_rows
+                    and scratch.vision_bilinear_indices is not None
+                    else None
+                )
             ),
             vision_bilinear_weights=(
-                scratch.vision_bilinear_weights.gpu[:, :pixel_rows]
-                if has_images and scratch.vision_bilinear_weights is not None
-                else None
+                direct_vision_bilinear_weights
+                if direct_vision_bilinear_weights is not None
+                else (
+                    scratch.vision_bilinear_weights.gpu[:, :staged_pixel_rows]
+                    if staged_pixel_rows
+                    and scratch.vision_bilinear_weights is not None
+                    else None
+                )
             ),
             vision_position_ids=(
-                scratch.vision_position_ids.gpu[:pixel_rows]
-                if has_images and scratch.vision_position_ids is not None
-                else None
+                direct_vision_position_ids
+                if direct_vision_position_ids is not None
+                else (
+                    scratch.vision_position_ids.gpu[:staged_pixel_rows]
+                    if staged_pixel_rows and scratch.vision_position_ids is not None
+                    else None
+                )
             ),
             vision_cu_seqlens=(
-                scratch.vision_cu_seqlens.gpu[: vision_sequence_count + 1]
-                if has_images and scratch.vision_cu_seqlens is not None
-                else None
+                direct_vision_cu_seqlens
+                if direct_vision_cu_seqlens is not None
+                else (
+                    scratch.vision_cu_seqlens.gpu[
+                        : staged_vision_sequence_count + 1
+                    ]
+                    if staged_pixel_rows and scratch.vision_cu_seqlens is not None
+                    else None
+                )
             ),
+            vision_embeddings=direct_vision_embeddings,
         )
 
     def _forward_packed_prefill(
@@ -1385,6 +1731,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             vision_bilinear_weights=packed.vision_bilinear_weights,
             vision_position_ids=packed.vision_position_ids,
             vision_cu_seqlens=packed.vision_cu_seqlens,
+            vision_embeddings=packed.vision_embeddings,
             cache_position_ids=packed.cache_position_ids,
             slot_mapping=packed.slot_mapping,
             page_table=packed.paged_kv_page_table,
@@ -1451,4 +1798,4 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _decode_cache_for_slot(self, slot: DecodeSlot) -> Qwen35InferenceCache:
         return self._decode_caches[int(slot.slot_id)]
 
-__all__ = ["Qwen35Runtime", "QwenImageInputs"]
+__all__ = ["Qwen35Runtime", "QwenImageInputs", "QwenVideoInputs"]

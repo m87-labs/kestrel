@@ -71,6 +71,7 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+    vision_embeddings: torch.Tensor | None = None
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:
@@ -1288,11 +1289,16 @@ class Qwen3_5Model(nn.Module):
         vision_bilinear_weights: torch.Tensor | None = None,
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
+        vision_embeddings: torch.Tensor | None = None,
     ) -> _TextModelOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
+        if pixel_values is not None and vision_embeddings is not None:
+            raise ValueError(
+                "pixel_values and precomputed vision_embeddings are mutually exclusive"
+            )
         if pixel_values is not None:
-            image_embeds = self.get_image_features(
+            image_features = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 bilinear_indices=vision_bilinear_indices,
@@ -1300,18 +1306,28 @@ class Qwen3_5Model(nn.Module):
                 position_ids=vision_position_ids,
                 cu_seqlens=vision_cu_seqlens,
             )
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_token_mask = input_ids == self.config.image_token_id
-            image_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
+            vision_embeddings = torch.cat(image_features, dim=0)
+        if vision_embeddings is not None:
+            vision_embeddings = vision_embeddings.to(
+                inputs_embeds.device,
+                inputs_embeds.dtype,
+            )
+            vision_token_mask = (input_ids == self.config.image_token_id) | (
+                input_ids == self.config.video_token_id
+            )
+            vision_mask = vision_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
                 inputs_embeds.device
             )
-            if inputs_embeds[image_mask].numel() != image_embeds.numel():
+            if inputs_embeds[vision_mask].numel() != vision_embeddings.numel():
                 raise ValueError(
-                    "Image features and image tokens do not match, "
-                    f"tokens: {image_token_mask.sum()}, "
-                    f"features: {image_embeds.shape[0]}"
+                    "Vision features and placeholder tokens do not match, "
+                    f"tokens: {vision_token_mask.sum()}, "
+                    f"features: {vision_embeddings.shape[0]}"
                 )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                vision_mask,
+                vision_embeddings,
+            )
 
         outputs = self.language_model(
             input_ids=None,
@@ -1332,6 +1348,7 @@ class Qwen3_5Model(nn.Module):
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            vision_embeddings=vision_embeddings,
         )
 
 

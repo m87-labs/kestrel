@@ -3,7 +3,7 @@
 from kestrel.models.registry import ModelSpec, register
 
 from .prompt_template import Qwen35PromptTemplate
-from .runtime import Qwen35Runtime
+from .runtime import Qwen35Runtime, QwenVideoInputs
 from .skills import build_skill_registry
 
 
@@ -39,4 +39,4 @@ for _repo_id in _VARIANTS:
     )
 
 
-__all__ = ["Qwen35PromptTemplate", "Qwen35Runtime"]
+__all__ = ["Qwen35PromptTemplate", "Qwen35Runtime", "QwenVideoInputs"]
