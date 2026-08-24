@@ -2,8 +2,63 @@ from types import SimpleNamespace
 
 import torch
 
+from kestrel.models.qwen35 import runtime as qwen_runtime
 from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
 from kestrel.models.qwen35.runtime import Qwen35Runtime, _PackedPrefillBatch
+from kestrel.runtime.tokens import TextToken
+
+
+def test_builder_binds_topology_from_ordered_host_lengths(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    topology_token = object()
+    bound_cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    def bind_packed_prefill_topology(*, sequence_lengths, device):
+        observed["sequence_lengths"] = sequence_lengths
+        observed["device"] = device
+        return bound_cu_seqlens, topology_token
+
+    monkeypatch.setattr(
+        qwen_runtime,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            gated_delta=SimpleNamespace(
+                bind_packed_prefill_topology=bind_packed_prefill_topology
+            )
+        ),
+    )
+
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.device = torch.device("cpu")
+    runtime.dtype = torch.float32
+    runtime.page_table = SimpleNamespace(
+        n_pages=8,
+        page_size=1,
+        page_table_cpu=(tuple(range(8)), tuple(range(8, 16))),
+        page_table=torch.tensor(
+            (tuple(range(8)), tuple(range(8, 16))), dtype=torch.int32
+        ),
+    )
+    prefill_slot = SimpleNamespace(batch_idx=torch.zeros(2, dtype=torch.int64))
+    prepared = (
+        SimpleNamespace(tokens_list=(TextToken(11), TextToken(12))),
+        SimpleNamespace(tokens_list=(TextToken(21), TextToken(22), TextToken(23))),
+    )
+
+    packed = runtime._build_packed_prefill_batch(
+        prepared,
+        prefill_slot=prefill_slot,
+        image_crops_list=(None, None),
+        batch_indices=(0, 1),
+    )
+
+    assert observed == {
+        "sequence_lengths": (2, 3),
+        "device": torch.device("cpu"),
+    }
+    assert packed.cu_seq_lens_q is bound_cu_seqlens
+    assert packed.sequence_lengths == (2, 3)
+    assert packed.topology_token is topology_token
 
 
 def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
@@ -22,6 +77,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
         position_ids=marker,
         cu_seq_lens_q=marker,
         sequence_lengths=(544, 137),
+        topology_token=marker,
         seq_idx=marker,
         batch_indices=marker,
         max_length=544,
@@ -37,6 +93,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     assert hidden is output.last_hidden_state
     assert returned_cache is cache
     assert observed["sequence_lengths"] == (544, 137)
+    assert observed["topology_token"] is marker
     assert observed["max"] == 544
 
 
@@ -95,8 +152,10 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         cache_params=cache,
         cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
         sequence_lengths=(3,),
+        topology_token=fake,
         seq_idx=torch.zeros((1, 3), dtype=torch.int32),
     )
 
     assert result.shape == (1, 3, 1)
     assert observed["sequence_lengths"] == (3,)
+    assert observed["topology_token"] is fake
