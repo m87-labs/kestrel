@@ -1,0 +1,102 @@
+from types import SimpleNamespace
+
+import torch
+
+from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
+from kestrel.models.qwen35.runtime import Qwen35Runtime, _PackedPrefillBatch
+
+
+def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
+    observed: dict[str, object] = {}
+    cache = SimpleNamespace(advance_to=lambda length: observed.setdefault("max", length))
+    output = SimpleNamespace(last_hidden_state=object(), past_key_values=cache)
+    model = SimpleNamespace(model=lambda **kwargs: observed.update(kwargs) or output)
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.model = model
+    runtime._new_cache = lambda: cache
+
+    marker = object()
+    packed = _PackedPrefillBatch(
+        input_ids=marker,
+        cache_position_ids=marker,
+        position_ids=marker,
+        cu_seq_lens_q=marker,
+        sequence_lengths=(544, 137),
+        seq_idx=marker,
+        batch_indices=marker,
+        max_length=544,
+        last_token_offsets=marker,
+        paged_kv_page_table=marker,
+        paged_kv_seqlens_k=marker,
+        slot_mapping=marker,
+        rope_deltas=marker,
+    )
+
+    hidden, returned_cache = runtime._forward_packed_prefill(packed)
+
+    assert hidden is output.last_hidden_state
+    assert returned_cache is cache
+    assert observed["sequence_lengths"] == (544, 137)
+    assert observed["max"] == 544
+
+
+def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
+    observed: dict[str, object] = {}
+    layer = SimpleNamespace(
+        conv_states=None,
+        recurrent_states=None,
+        has_previous_state=False,
+        _reset_replay_rows=lambda state, indices: None,
+    )
+    cache = SimpleNamespace(
+        layers=[layer],
+        has_previous_state=lambda layer_idx: False,
+    )
+    conv1d = SimpleNamespace(
+        weight=torch.ones((1, 1, 1)),
+        bias=None,
+    )
+
+    def recurrent(*args, **kwargs):
+        observed.update(kwargs)
+        return torch.zeros((1, 3, 1)), None
+
+    fake = SimpleNamespace(
+        layer_idx=0,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_k_dim=1,
+        head_v_dim=1,
+        conv_dim=1,
+        conv_kernel_size=1,
+        value_dim=1,
+        activation="silu",
+        A_log=torch.zeros((1,)),
+        dt_bias=torch.zeros((1,)),
+        conv1d=conv1d,
+        in_proj=lambda hidden: torch.zeros((1, 3, 4)),
+        supports_packed_gdn=lambda *args: True,
+        causal_conv1d_packed=lambda **kwargs: kwargs["x"],
+        packed_prefill_prepare=lambda *args: (
+            torch.zeros((1, 3, 1, 1)),
+            torch.zeros((1, 3, 1, 1)),
+            torch.zeros((1, 3, 1, 1)),
+            torch.zeros((1, 3, 1)),
+            torch.zeros((1, 3, 1)),
+        ),
+        packed_recurrent_prefill=recurrent,
+        norm=lambda value, gate: value,
+        out_proj=lambda value: value,
+    )
+
+    result = Qwen3_5GatedDeltaNet.forward(
+        fake,
+        torch.zeros((1, 3, 1)),
+        cache_params=cache,
+        cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+        sequence_lengths=(3,),
+        seq_idx=torch.zeros((1, 3), dtype=torch.int32),
+    )
+
+    assert result.shape == (1, 3, 1)
+    assert observed["sequence_lengths"] == (3,)
