@@ -25,7 +25,7 @@ class Qwen35PrefillScratch:
     # surface the fill code uses. Field set:
     #   input_ids, cache_position_ids, seq_idx, mm_token_type_ids, position_ids,
     #   slot_mapping, batch_indices, last_positions, last_token_offsets,
-    #   cu_seq_lens_q, rope_deltas
+    #   rope_deltas
     text_meta: PackedBuffer
     paged_kv_page_table: Tensor
     paged_kv_seqlens_k: Tensor
@@ -63,7 +63,6 @@ class Qwen35PrefillScratch:
                 ("batch_indices", (batch_capacity,), torch.int64),
                 ("last_positions", (batch_capacity,), torch.int32),
                 ("last_token_offsets", (batch_capacity,), torch.long),
-                ("cu_seq_lens_q", (batch_capacity + 1,), torch.int32),
                 ("rope_deltas", (batch_capacity, 1), torch.long),
             ],
             device=device,
