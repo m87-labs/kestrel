@@ -81,6 +81,7 @@ class _PackedPrefillBatch:
     cache_position_ids: torch.Tensor
     position_ids: torch.Tensor
     cu_seq_lens_q: Optional[torch.Tensor]
+    sequence_lengths: tuple[int, ...]
     seq_idx: Optional[torch.Tensor]
     batch_indices: torch.Tensor
     max_length: int
@@ -1330,6 +1331,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             # sequence take the same packed_prefill path as batched prefill
             # instead of the separate uniform_native_prefill branch.
             cu_seq_lens_q=scratch.text_meta.cu_seq_lens_q.gpu[: batch_size + 1],
+            sequence_lengths=tuple(lengths),
             seq_idx=scratch.text_meta.seq_idx.gpu[:, :total_tokens],
             batch_indices=scratch.text_meta.batch_indices.gpu[:batch_size],
             max_length=max(lengths),
@@ -1390,6 +1392,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             page_table=packed.paged_kv_page_table,
             paged_kv_seqlens_k=packed.paged_kv_seqlens_k,
             cu_seq_lens_q=packed.cu_seq_lens_q,
+            sequence_lengths=packed.sequence_lengths,
             seq_idx=packed.seq_idx,
         )
         outputs.past_key_values.advance_to(packed.max_length)
