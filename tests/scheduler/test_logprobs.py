@@ -8,10 +8,11 @@ import torch
 
 from kestrel.models.moondream.region import SpatialDecodeTables
 from kestrel.models.moondream.runtime import TextToken
+from kestrel.runtime.sampling import SamplingHooks
+from kestrel.scheduler.pipeline import DecodeLaunch, LaunchHandle
 from kestrel.scheduler.scheduler import GenerationScheduler, _MaskPlan
 from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
-from kestrel.runtime.sampling import SamplingHooks
 from kestrel.skills import DecodeStep, SkillFinalizeResult, SkillRegistry, SkillState
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -1010,6 +1011,131 @@ def test_sample_batch_plan_waits_through_event_abstraction(
 
     assert event.waits == 1
     assert sampled.tolist() == [1]
+
+
+def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EventStub:
+        def __init__(self) -> None:
+            self.records = 0
+
+        def record(self) -> None:
+            self.records += 1
+
+    class PendingStub:
+        def index_copy_(self, *_args) -> None:
+            raise AssertionError("fused greedy tail must skip pending index_copy")
+
+    batch_indices = torch.tensor([1, 4], dtype=torch.long)
+    sampled_ids = torch.empty((2,), dtype=torch.long)
+    step_done = EventStub()
+    commit_done = EventStub()
+    transfer = object()
+    slot = SimpleNamespace(
+        compute_stream=object(),
+        logits=torch.tensor([[1.0, 4.0], [5.0, 2.0]]),
+        hidden_last=torch.empty((2, 1)),
+        sampled_ids=sampled_ids,
+        sampled_logprobs=torch.empty((2,), dtype=torch.float32),
+        meta=SimpleNamespace(batch_idx=SimpleNamespace(gpu=batch_indices)),
+        step_done_event=step_done,
+        commit_done_event=commit_done,
+        render=SimpleNamespace(transfer=lambda *_args, **_kwargs: transfer),
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    other_slot = SimpleNamespace(compute_stream=object())
+    assert other_slot.compute_stream is not slot.compute_stream
+    scheduler.runtime = SimpleNamespace(decode_slots=(other_slot, slot))
+    scheduler._hooks = SamplingHooks()
+    scheduler._pending_token_ids = PendingStub()
+    scheduler._greedy_tail_workspaces = (object(), object())
+    scheduler._sample_batch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("eligible greedy tail must not call generic sampling")
+    )
+    calls = []
+
+    def fused(logits, batch_idx, pending, workspace, *, out):
+        calls.append((logits, batch_idx, pending, workspace, out))
+        out.copy_(torch.tensor([1, 0]))
+        return out
+
+    monkeypatch.setattr("kestrel.scheduler.scheduler.greedy_tail_from_logits", fused)
+    sequences = [
+        SimpleNamespace(packed_pending_ready=False),
+        SimpleNamespace(packed_pending_ready=False),
+    ]
+    handle = LaunchHandle(
+        kind="decode",
+        sequences=sequences,
+        payload=DecodeLaunch(slot_id=1),
+    )
+    plan = _MaskPlan(
+        disallow=None,
+        event=None,
+        suppress_rows=[],
+        all_greedy=True,
+        any_return_logprobs=False,
+    )
+
+    result = scheduler._finalize_sampling_on_stream(handle, plan)
+
+    assert len(calls) == 1
+    assert calls[0][1].data_ptr() == batch_indices.data_ptr()
+    assert torch.equal(calls[0][1], batch_indices)
+    assert calls[0][2] is scheduler._pending_token_ids
+    assert calls[0][3] is scheduler._greedy_tail_workspaces[1]
+    assert calls[0][4] is sampled_ids
+    assert sampled_ids.tolist() == [1, 0]
+    assert step_done.records == 1
+    assert commit_done.records == 1
+    assert all(sequence.packed_pending_ready for sequence in sequences)
+    assert result.transfer is transfer
+
+
+@pytest.mark.parametrize(
+    ("plan", "hooks"),
+    [
+        (None, SamplingHooks()),
+        (
+            _MaskPlan(None, None, [], False, False),
+            SamplingHooks(),
+        ),
+        (
+            _MaskPlan(None, None, [], True, True),
+            SamplingHooks(),
+        ),
+        (
+            _MaskPlan(torch.zeros((1, 1), dtype=torch.bool), None, [], True, False),
+            SamplingHooks(),
+        ),
+        (
+            _MaskPlan(None, None, [(0, (1,))], True, False),
+            SamplingHooks(),
+        ),
+        (
+            _MaskPlan(None, None, [], True, False),
+            SamplingHooks(process_logits=lambda *_args, **_kwargs: None),
+        ),
+        (
+            _MaskPlan(None, None, [], True, False),
+            SamplingHooks(adjust_sampling_params=lambda *_args, **_kwargs: None),
+        ),
+        (
+            _MaskPlan(None, None, [], True, False),
+            SamplingHooks(sample_greedy=lambda *_args, **_kwargs: None),
+        ),
+        (
+            _MaskPlan(None, None, [], True, False),
+            SamplingHooks(score_sampled_tokens=lambda *_args, **_kwargs: None),
+        ),
+    ],
+)
+def test_greedy_tail_eligibility_rejects_modified_sampling(plan, hooks) -> None:
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler._hooks = hooks
+
+    assert not scheduler._can_publish_greedy_tail(plan)
 
 
 @pytest.mark.parametrize("temperature", [0.7, 0.0])

@@ -1,40 +1,38 @@
 """Flexible batching scheduler for Moondream text inference."""
 
+import logging
+import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from itertools import islice
 from typing import Deque, List, Optional, Sequence
 
-import time
-import logging
-
 import torch
+from kestrel_kernels.sampling import (
+    allocate_greedy_tail_workspace,
+    greedy_logprobs_from_logits,
+    greedy_tail_from_logits,
+    sample_step_from_logits,
+)
 from torch import Tensor
 
 from kestrel.device import NoopEvent, stream_context, synchronize
-from kestrel.utils import CpuGpuBuffer
+from kestrel.models.moondream.lora import AdapterProvider
 from kestrel.runtime import (
+    AutoregressiveRuntime,
     PrefillClassification,
     PreparedSequence,
-    AutoregressiveRuntime,
     SequenceState,
     TextToken,
     Token,
 )
-from kestrel.models.moondream.lora import AdapterProvider
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.skills import (
     SkillRegistry,
     SkillState,
 )
+from kestrel.utils import CpuGpuBuffer
 
-from .queues import RequestQueue, RunningQueue
-from .types import (
-    GenerationRequest,
-    RequestLifecycle,
-    RequestPhase,
-    SchedulerResult,
-    StepPlan,
-)
 from .pipeline import (
     DecodeLaunch,
     DecodePendingCommit,
@@ -44,13 +42,15 @@ from .pipeline import (
     PrefillLaunch,
     PrefillPendingCommit,
 )
-from kestrel_kernels.sampling import (
-    greedy_logprobs_from_logits,
-    sample_step_from_logits,
-)
+from .queues import RequestQueue, RunningQueue
 from .transfer import RenderBuffer
-from kestrel.runtime.sampling import SamplingHooks
-
+from .types import (
+    GenerationRequest,
+    RequestLifecycle,
+    RequestPhase,
+    SchedulerResult,
+    StepPlan,
+)
 
 _LOGGER = logging.getLogger(__name__)
 # Greedily build a prefill batch until aggregate query tokens reaches this floor.
@@ -343,6 +343,13 @@ class GenerationScheduler:
             (runtime.max_batch_slots,),
             dtype=torch.long,
             device=runtime.device,
+        )
+        self._greedy_tail_workspaces = tuple(
+            allocate_greedy_tail_workspace(
+                runtime.max_batch_size,
+                device=runtime.device,
+            )
+            for _ in runtime.decode_slots
         )
         # Persistent per-batch sampling parameters on GPU to avoid per-step
         # CPU->GPU copies during sampling/spatial decode.
@@ -2391,16 +2398,32 @@ class GenerationScheduler:
         # Reuse batch indices already copied in launch_forward_async
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
 
-        # Sample tokens directly into per-slot staging buffer for D2H.
-        # This prevents race with next step's sampling writing to shared buffer.
-        sampled_ids, temps, top_ps, sampled_logprobs = self._sample_batch(
-            logits,
-            sequences,
-            slot.sampled_ids,
-            batch_idx=batch_idx,
-            logprobs_out=slot.sampled_logprobs[:batch_size],
-            plan=plan,
-        )
+        # The ordinary all-greedy case publishes slot staging and next-step
+        # pending state in one launch. All constrained, processed, scored, and
+        # stochastic cases keep the generic sampling path below.
+        pending_published = self._can_publish_greedy_tail(plan)
+        if pending_published:
+            sampled_ids = greedy_tail_from_logits(
+                logits,
+                batch_idx,
+                self._pending_token_ids,
+                self._greedy_tail_workspaces[handle.slot_id],
+                out=slot.sampled_ids,
+            )
+            temps = None
+            top_ps = None
+            sampled_logprobs = None
+        else:
+            # Sample directly into per-slot staging to avoid racing the next
+            # step's write to the other ping-pong slot.
+            sampled_ids, temps, top_ps, sampled_logprobs = self._sample_batch(
+                logits,
+                sequences,
+                slot.sampled_ids,
+                batch_idx=batch_idx,
+                logprobs_out=slot.sampled_logprobs[:batch_size],
+                plan=plan,
+            )
 
         # Record event once sampled_ids staging is ready. The copy stream
         # waits on this for the D2H below, and the runtime's post_sample
@@ -2421,8 +2444,9 @@ class GenerationScheduler:
                 ready_event=slot.step_done_event,
             )
 
-        # Write to shared pending buffer for next step's input gathering.
-        self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
+        if not pending_published:
+            # The fused greedy tail has already published these rows.
+            self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
 
         # Record a second event after pending writes so we can safely release/reuse
         # batch indices (e.g. finalize a sequence and admit a new one into the same
@@ -2448,6 +2472,20 @@ class GenerationScheduler:
                 slot_id=handle.slot_id,
                 runtime_step=runtime_step,
             ),
+        )
+
+    def _can_publish_greedy_tail(self, plan: "_MaskPlan | None") -> bool:
+        return bool(
+            plan is not None
+            and plan.all_greedy
+            and not plan.any_return_logprobs
+            and plan.disallow is None
+            and plan.event is None
+            and not plan.suppress_rows
+            and self._hooks.process_logits is None
+            and self._hooks.adjust_sampling_params is None
+            and self._hooks.sample_greedy is None
+            and self._hooks.score_sampled_tokens is None
         )
 
     def commit_step(self, step: PendingCommit) -> None:
