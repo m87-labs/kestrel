@@ -37,6 +37,28 @@ def test_runtime_config_preserves_model_path_device_positional_args() -> None:
     assert cfg.tokenizer_path is None
 
 
+def test_runtime_config_copies_namespaced_runtime_options() -> None:
+    options = {"backend.graph_limit": 384}
+    cfg = RuntimeConfig(
+        model_path="/weights/model.safetensors",
+        device="cpu",
+        runtime_options=options,
+    )
+
+    options["backend.graph_limit"] = 1
+    assert cfg.runtime_options == {"backend.graph_limit": 384}
+
+
+@pytest.mark.parametrize("options", [[], {"": 1}, {1: "value"}])
+def test_runtime_config_rejects_invalid_runtime_options(options) -> None:  # noqa: ANN001
+    with pytest.raises(TypeError, match="nonempty string keys"):
+        RuntimeConfig(
+            model_path="/weights/model.safetensors",
+            device="cpu",
+            runtime_options=options,
+        )
+
+
 def test_runtime_config_rejects_invalid_decode_path_before_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

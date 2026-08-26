@@ -72,6 +72,8 @@ class _AdmissionCoordinator:
         return len(self._pending)
 
     def submit(self, req: _AutoregressiveRequest) -> Optional[_ReadyAdmission]:
+        if req.cancel_event.is_set():
+            return None
         crops_future: Future[Any] | None = None
         encoder_input_future: Future[Any] | None = None
         prefix_cache_hit = False
@@ -141,6 +143,9 @@ class _AdmissionCoordinator:
             pending = self._pending.get(req_id)
             if pending is None:
                 continue
+            if pending.req.cancel_event.is_set():
+                self._discard_pending(req_id, pending)
+                continue
             futures = (pending.crops_future, pending.encoder_input_future)
             failed: BaseException | None = None
             for future in futures:
@@ -189,6 +194,28 @@ class _AdmissionCoordinator:
                 encoder_input=encoder_input,
                 prefix_cache_hit=pending.prefix_cache_hit,
             )
+
+    def discard_cancelled(self) -> bool:
+        """Cancel preprocessing and forget requests abandoned by their caller."""
+
+        cancelled = [
+            (request_id, pending)
+            for request_id, pending in self._pending.items()
+            if pending.req.cancel_event.is_set()
+        ]
+        for request_id, pending in cancelled:
+            self._discard_pending(request_id, pending)
+        return bool(cancelled)
+
+    def _discard_pending(
+        self,
+        request_id: int,
+        pending: _PendingAdmission,
+    ) -> None:
+        self._pending.pop(request_id, None)
+        for future in (pending.crops_future, pending.encoder_input_future):
+            if future is not None and not future.done():
+                future.cancel()
 
     def fail_all(self, error: Optional[BaseException] = None) -> None:
         exc = error or RuntimeError("Engine shut down")
@@ -320,7 +347,8 @@ class AutoregressiveExecutor:
 
     def advance(self) -> TickResult:
         scheduler = self._scheduler
-        progressed = self._promote_ready()
+        progressed = self._discard_cancelled()
+        progressed = self._promote_ready() or progressed
 
         if scheduler.has_pending_work():
             progressed = scheduler.advance() or progressed
@@ -373,6 +401,8 @@ class AutoregressiveExecutor:
 
     def _admit_ready(self, ready: _ReadyAdmission) -> None:
         req = ready.req
+        if req.cancel_event.is_set():
+            return
         try:
             generation_req, skill_state = self._build_generation_request(
                 self._runtime, req, ready.crops, ready.encoder_input
@@ -406,6 +436,14 @@ class AutoregressiveExecutor:
         generation_req.lifecycle = lifecycle
         self._scheduler.enqueue_request(generation_req, skill_state)
         self._active[req.request_id] = req
+
+    def _discard_cancelled(self) -> bool:
+        progressed = self._admission.discard_cancelled()
+        for request_id, request in tuple(self._active.items()):
+            if not request.cancel_event.is_set():
+                continue
+            progressed = self._scheduler.cancel_request(request_id) or progressed
+        return progressed
 
     def _promote_ready(self) -> bool:
         promoted = False
@@ -459,8 +497,9 @@ class AutoregressiveExecutor:
         for state in runtime_sequences:
             try:
                 if decoder is not None:
+                    batch_idx = state.batch_idx
                     decoder.retire(state)
-                    self._runtime.active_sequences.pop(state.batch_idx, None)
+                    self._runtime.active_sequences.pop(batch_idx, None)
                     self._runtime.release_adapter_slot(
                         getattr(state, "lora_slot", 0)
                     )
