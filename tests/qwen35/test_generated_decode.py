@@ -272,6 +272,7 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
     rope_inv_freq = object()
     page_table = object()
     runtime = SimpleNamespace(
+        max_batch_size=4,
         _decode_rope_deltas=rope_deltas,
         _gather_decode_rope_deltas=lambda *_args: None,
         _prepare_decode_position_ids=lambda *_args: None,
@@ -288,9 +289,10 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
     )
     captured = {}
 
-    def capture(_cls, bound_runtime, spec):
+    def capture(_cls, bound_runtime, spec, *, required_batch_sizes=()):
         assert bound_runtime is runtime
         captured["spec"] = spec
+        captured["required_batch_sizes"] = tuple(required_batch_sizes)
         return object()
 
     monkeypatch.setattr(
@@ -302,6 +304,7 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
     result = qwen_generated.create_generated_decode(runtime)
 
     assert result is not None
+    assert captured["required_batch_sizes"] == (1, 2, 3, 4)
     spec = captured["spec"]
     inputs = spec.bindings.runtime_inputs(runtime)
     assert inputs["page_table"] is page_table
@@ -364,6 +367,7 @@ def test_generated_capacity_inputs_resolve_state_after_cached_field_snapshot(
     config = _linear_config()
     pool = _state_pool(config)
     runtime = SimpleNamespace(
+        max_batch_size=4,
         _decode_rope_deltas=object(),
         _gather_decode_rope_deltas=lambda *_args: None,
         _prepare_decode_position_ids=lambda *_args: None,
@@ -380,13 +384,15 @@ def test_generated_capacity_inputs_resolve_state_after_cached_field_snapshot(
     )
     captured = {}
 
-    def capture(_cls, _runtime, spec):
+    def capture(_cls, _runtime, spec, *, required_batch_sizes=()):
         captured["spec"] = spec
+        captured["required_batch_sizes"] = tuple(required_batch_sizes)
         return object()
 
     monkeypatch.setattr(
         qwen_generated.GeneratedDecode, "try_create", classmethod(capture))
     qwen_generated.create_generated_decode(runtime)
+    assert captured["required_batch_sizes"] == (1, 2, 3, 4)
     requirement = StateRepresentationRequirement(
         "gdn_recurrent_state",
         "materialized",

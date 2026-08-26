@@ -213,19 +213,50 @@ def test_qwen_selected_generated_failure_never_falls_back_to_native() -> None:
         runtime.decode_with_slot(object(), 2)
 
 
-def test_qwen_auto_selected_generated_state_refuses_native_fallback() -> None:
+def test_qwen_auto_incomplete_generated_domain_selects_native_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = object.__new__(Qwen35Runtime)
     runtime.decode_path = "auto"
-    runtime.generated_decode = _Generated(supported=False)
-    runtime._decode_graphs = SimpleNamespace(
-        run=lambda *_args: pytest.fail("generated state must not run native decode")
+    runtime.max_batch_size = 4
+    runtime._paged_kv = ()
+    runtime._decode_rope_deltas = object()
+    runtime._gather_decode_rope_deltas = lambda *_args: None
+    runtime._prepare_decode_position_ids = lambda *_args: None
+    runtime.model = SimpleNamespace(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(
+                rotary_emb=SimpleNamespace(inv_freq=object())
+            )
+        )
+    )
+    runtime.page_table = SimpleNamespace(page_table=object())
+    calls = []
+    runtime._linear_state_pool = SimpleNamespace(
+        initialize_native_recurrent=lambda: calls.append("native")
+    )
+    partial = SimpleNamespace(
+        capacity=2,
+        runtime_extent_minimums={},
+        static_extent_bindings={"active_batch": 2},
+    )
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "_resolve_programs",
+        classmethod(lambda _cls, _runtime, _spec: (partial,)),
+    )
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail(
+            "incomplete auto coverage must not allocate generated-only state"
+        ),
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="selected generated Qwen decode does not cover active batch size 3",
-    ):
-        runtime.decode_with_slot(object(), 3)
+    runtime._initialize_generated_decode()
+
+    assert runtime.generated_decode is None
+    assert calls == ["native"]
 
 
 def test_qwen_auto_without_generated_program_selects_native_state(
