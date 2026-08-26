@@ -213,7 +213,7 @@ def test_qwen_selected_generated_failure_never_falls_back_to_native() -> None:
         runtime.decode_with_slot(object(), 2)
 
 
-def test_qwen_auto_incomplete_generated_domain_selects_native_before_construction(
+def test_qwen_auto_sparse_generated_domain_selects_native_before_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = object.__new__(Qwen35Runtime)
@@ -235,15 +235,18 @@ def test_qwen_auto_incomplete_generated_domain_selects_native_before_constructio
     runtime._linear_state_pool = SimpleNamespace(
         initialize_native_recurrent=lambda: calls.append("native")
     )
-    partial = SimpleNamespace(
-        capacity=2,
-        runtime_extent_minimums={},
-        static_extent_bindings={"active_batch": 2},
+    sparse_programs = tuple(
+        SimpleNamespace(
+            capacity=batch_size,
+            runtime_extent_minimums={},
+            static_extent_bindings={"active_batch": batch_size},
+        )
+        for batch_size in (1, 2, 4)
     )
     monkeypatch.setattr(
         GeneratedDecode,
         "_resolve_programs",
-        classmethod(lambda _cls, _runtime, _spec: (partial,)),
+        classmethod(lambda _cls, _runtime, _spec: sparse_programs),
     )
     monkeypatch.setattr(
         GeneratedDecode,
