@@ -2403,12 +2403,17 @@ class GenerationScheduler:
         # stochastic cases keep the generic sampling path below.
         pending_published = self._can_publish_greedy_tail(plan)
         if pending_published:
+            # Every active sequence's batch_idx comes from PageTable's
+            # free_batch_idx pool, whose rows are within the pending-token
+            # buffer. Reuse the exact staged indices without a synchronizing
+            # device-side bounds filter for fallback vocabularies.
             sampled_ids = greedy_tail_from_logits(
                 logits,
                 batch_idx,
                 self._pending_token_ids,
                 self._greedy_tail_workspaces[handle.slot_id],
                 out=slot.sampled_ids,
+                batch_indices_in_bounds=True,
             )
             temps = None
             top_ps = None

@@ -1024,6 +1024,8 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
             self.records += 1
 
     class PendingStub:
+        shape = (8,)
+
         def index_copy_(self, *_args) -> None:
             raise AssertionError("fused greedy tail must skip pending index_copy")
 
@@ -1055,8 +1057,25 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     )
     calls = []
 
-    def fused(logits, batch_idx, pending, workspace, *, out):
-        calls.append((logits, batch_idx, pending, workspace, out))
+    def fused(
+        logits,
+        batch_idx,
+        pending,
+        workspace,
+        *,
+        out,
+        batch_indices_in_bounds=False,
+    ):
+        calls.append(
+            (
+                logits,
+                batch_idx,
+                pending,
+                workspace,
+                out,
+                batch_indices_in_bounds,
+            )
+        )
         out.copy_(torch.tensor([1, 0]))
         return out
 
@@ -1086,6 +1105,9 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     assert calls[0][2] is scheduler._pending_token_ids
     assert calls[0][3] is scheduler._greedy_tail_workspaces[1]
     assert calls[0][4] is sampled_ids
+    assert calls[0][5] is True
+    assert torch.all(calls[0][1] >= 0)
+    assert torch.all(calls[0][1] < scheduler._pending_token_ids.shape[0])
     assert sampled_ids.tolist() == [1, 0]
     assert step_done.records == 1
     assert commit_done.records == 1
