@@ -159,7 +159,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 class Qwen3_5RMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
         self.variance_epsilon = eps
         self.gated_rmsnorm = _kestrel_gated_rmsnorm
 
