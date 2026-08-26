@@ -4,9 +4,47 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-- Added `openai/whisper-large-v3-turbo` transcription and English translation,
-  including bounded long-form files, live PCM, progressive results, segment and
-  word timestamps, language detection, and prompts.
+## 0.6.0 — 2026-08-26
+
+Kestrel 0.6.0 adds production speech transcription and substantially expands
+the fast, precompiled serving path on NVIDIA Blackwell. It also improves Qwen
+numerical consistency and makes partial generated-decode coverage fall back
+safely before requests begin.
+
+### Speech transcription
+
+- Added `openai/whisper-large-v3-turbo` transcription and English translation
+  for long-form audio files and live PCM streams.
+- Progressive results include segment and word timestamps, with language
+  detection and prompt support for domain-specific vocabulary.
+
+### Faster Blackwell inference
+
+- Qwen 3.5, Qwen 3.6, and Gemma 4 now use expanded precompiled B200 paths
+  across supported prefill and decode workloads, including on-GPU token
+  selection. These workloads require no compiler or JIT setup in the deployed
+  application.
+- Updated to `kestrel-kernels` 0.5.0. CUDA payloads are split into automatically
+  installed companion packages on Linux and Windows, keeping every individual
+  wheel within PyPI's file-size limit.
+
+### Model fidelity
+
+- Qwen recurrent state now remains in BF16 across prefill and decode on the
+  optimized path, aligning the numerical behavior of both phases without
+  giving up the B200 acceleration.
+- Corrected Gemma 4 image preprocessing and pooling to match the checkpoint's
+  reference behavior, and corrected Moondream tau-attention activation
+  semantics.
+
+### Serving reliability
+
+- Kestrel enables generated decode only when the installed bundle covers the
+  complete configured batch range. Partial coverage now selects the regular
+  optimized runtime during initialization instead of failing during a request.
+- Concurrent engine starts now share one initialization, failed prefill work
+  releases its cache and workspace resources, and multimodal requests reserve
+  KV cache from their exact image-token requirements.
 
 ## 0.5.0 — 2026-08-02
 
