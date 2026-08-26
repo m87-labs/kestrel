@@ -1,6 +1,6 @@
 [project]
 name = "kestrel"
-version = "0.5.0"
+version = "0.6.0"
 description = "A fast, efficient inference engine for multimodal models"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
@@ -13,6 +13,8 @@ dependencies = [
     "httpx>=0.27",
     "kestrel-native==0.1.8",
     "kestrel-kernels==0.5.0",
+    "kestrel-kernels-bundle-a==0.5.0; sys_platform == 'linux' or sys_platform == 'win32'",
+    "kestrel-kernels-bundle-b==0.5.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "huggingface-hub>=0.20",
     "numpy>=1.26",
 ]

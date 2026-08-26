@@ -49,25 +49,6 @@ from .qwen_image import preprocess_image
 _PREFILL_SCRATCH_TOKENS = 1024
 
 
-def _native_decode_state_requirements(generated, linear_state_pool):
-    from kestrel.runtime.carried_state import StateRepresentationRequirement
-
-    native = []
-    for requirement in generated:
-        form = (
-            linear_state_pool.replay_recurrent_form
-            if requirement.buffer == "gdn_recurrent_state"
-            else requirement.physical_form
-        )
-        native.append(StateRepresentationRequirement(
-            requirement.buffer,
-            form.representation,
-            form.storage_axis_order,
-            form.storage_dtype,
-        ))
-    return tuple(native)
-
-
 @dataclass
 class QwenImageInputs:
     pixel_values: torch.Tensor
@@ -451,22 +432,19 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
         self.spatial_tables = None
 
+        self._initialize_decode_execution()
+
+    def _initialize_decode_execution(self) -> None:
         self._initialize_generated_decode()
-        self._initialize_native_decode_graphs()
-
-    def _initialize_native_decode_graphs(self) -> None:
-        """Capture native graphs only when native decode remains reachable."""
-
-        if self._use_cuda_graphs and self.decode_path != "generated":
+        if self._use_cuda_graphs and self.generated_decode is None:
             self._decode_graphs.ensure_ready(self._decode_slots)
 
     def _initialize_generated_decode(self) -> None:
         """Apply the runtime-wide decode policy before graph capture."""
 
         self.generated_decode = None
-        self._decode_state_coordinator = None
-        self._native_decode_state_requirements = ()
         if self.decode_path == "native":
+            self._linear_state_pool.initialize_native_recurrent()
             return
 
         from .generated_decode import create_generated_decode
@@ -475,29 +453,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
             self,
             required=self.decode_path == "generated",
         )
-        if self.generated_decode is not None:
-            from kestrel.runtime.carried_state import CarriedStateCoordinator
-
-            native_requirements = {
-                _native_decode_state_requirements(
-                    generated, self._linear_state_pool)
-                for generated
-                in self.generated_decode.state_requirements_by_capacity.values()
-            }
-            if len(native_requirements) != 1:
-                raise RuntimeError(
-                    "generated decode capacities imply different native state forms")
-            self._native_decode_state_requirements = next(
-                iter(native_requirements))
-            self._decode_state_coordinator = CarriedStateCoordinator(
-                buffers=self.generated_decode.state_buffers,
-                rows=range(self.max_batch_slots),
-                transitions={
-                    "gdn_recurrent_state": (
-                        self._linear_state_pool.transition_recurrent_form
-                    ),
-                },
-            )
+        if self.generated_decode is None:
+            self._linear_state_pool.initialize_native_recurrent()
 
     @property
     def cuda_graphs_enabled(self) -> bool:
@@ -755,38 +712,19 @@ class Qwen35Runtime(UncachedPagedRuntime):
         use_generated = (
             megakernel is not None and megakernel.supports(batch_size)
         )
-        if not use_generated and self.decode_path == "generated":
+        if megakernel is not None and not use_generated:
             raise RuntimeError(
-                "required generated Qwen decode does not cover "
+                "selected generated Qwen decode does not cover "
                 f"active batch size {batch_size}"
             )
-        coordinator = getattr(self, "_decode_state_coordinator", None)
-        rows = (
-            tuple(
-                int(row)
-                for row in slot.meta.batch_idx.cpu[:batch_size].tolist()
-            )
-            if coordinator is not None
-            else ()
-        )
         if use_generated:
             assert megakernel is not None
             stream = getattr(slot, "compute_stream", None)
             stream_context = (
                 torch.cuda.stream(stream) if stream is not None else nullcontext())
             with stream_context:
-                if coordinator is not None:
-                    coordinator.prepare(
-                        megakernel.state_requirements_for(batch_size), rows)
                 megakernel.run(slot, batch_size)
             return
-        if coordinator is not None:
-            stream = getattr(slot, "compute_stream", None)
-            stream_context = (
-                torch.cuda.stream(stream) if stream is not None else nullcontext())
-            with stream_context:
-                coordinator.prepare(
-                    self._native_decode_state_requirements, rows)
         self._decode_graphs.run(slot, batch_size)
 
     def _zero_decode_graph_padding(
@@ -1375,6 +1313,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
         packed: _PackedPrefillBatch,
     ) -> tuple[torch.Tensor, Qwen35InferenceCache]:
         cache = self._new_cache()
+        if self.generated_decode is not None:
+            self._linear_state_pool.bind_generated_prefill_state(cache)
         outputs = self.model.model(
             input_ids=packed.input_ids,
             past_key_values=cache,
@@ -1391,6 +1331,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
             paged_kv_seqlens_k=packed.paged_kv_seqlens_k,
             cu_seq_lens_q=packed.cu_seq_lens_q,
             seq_idx=packed.seq_idx,
+            gdn_state_indices=(
+                packed.batch_indices if self.generated_decode is not None else None),
         )
         outputs.past_key_values.advance_to(packed.max_length)
         return outputs.last_hidden_state, outputs.past_key_values
@@ -1426,7 +1368,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             # copied into the persistent decode pool.
             copy_replay_payload=False,
         )
-        self._mark_decode_state_coherent(host_batch_indices)
         rope_deltas = rope_deltas.to(device=self.device, dtype=torch.long)
         if rope_deltas.ndim == 1:
             rope_deltas = rope_deltas.view(-1, 1)
@@ -1441,12 +1382,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             self._decode_rope_deltas[int(batch_idx)].zero_()
         if hasattr(self, "_linear_state_pool"):
             self._linear_state_pool.clear(int(batch_idx))
-        self._mark_decode_state_coherent((int(batch_idx),))
-
-    def _mark_decode_state_coherent(self, rows: Sequence[int]) -> None:
-        coordinator = getattr(self, "_decode_state_coordinator", None)
-        if coordinator is not None:
-            coordinator.mark_coherent(rows)
 
     def _decode_cache_for_slot(self, slot: DecodeSlot) -> Qwen35InferenceCache:
         return self._decode_caches[int(slot.slot_id)]

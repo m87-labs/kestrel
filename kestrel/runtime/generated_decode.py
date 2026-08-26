@@ -317,9 +317,16 @@ class GeneratedDecode:
         cls,
         runtime: Any,
         spec: GeneratedDecodeSpec,
+        *,
+        required_batch_sizes: Sequence[int] = (),
     ) -> "GeneratedDecode | None":
         programs = cls._resolve_programs(runtime, spec)
         if not programs:
+            return None
+        if any(
+            _select_program(programs, int(batch_size)) is None
+            for batch_size in required_batch_sizes
+        ):
             return None
         programs = _selectable_programs(programs, runtime.max_batch_size)
         if not programs:
