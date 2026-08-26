@@ -4,6 +4,12 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.6.1 — 2026-08-26
+
+- Corrected Gemma 4 reasoning-enabled queries so direct answers are returned
+  as answers and reasoning channel headers are parsed without appearing in
+  customer-visible output.
+
 ## 0.6.0 — 2026-08-26
 
 Kestrel 0.6.0 adds production speech transcription and substantially expands
