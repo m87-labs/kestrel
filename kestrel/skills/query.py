@@ -184,6 +184,9 @@ class QuerySkillState(SkillState):
         self._query_template: Optional[QueryTemplate] = None
         self._reasoning_enabled = bool(query_request.reasoning)
         self._collecting_reasoning = self._reasoning_enabled
+        self._reasoning_start_tokens: List[int] = []
+        self._reasoning_start_seen = False
+        self._reasoning_start_prefix: Optional[Tuple[int, ...]] = None
         self._reasoning_tokens: List[int] = []
         self._answer_tokens: List[int] = []
         self._reasoning_chunks: List[Tuple[List[int], List[Tuple[float, float]]]] = []
@@ -277,6 +280,18 @@ class QuerySkillState(SkillState):
                     )
                     self._post_reasoning_idx = 0
                     return None
+                reasoning_start = self._reasoning_start_prefix or ()
+                if reasoning_start and not self._reasoning_start_seen:
+                    expected_id = reasoning_start[len(self._reasoning_start_tokens)]
+                    if token_id == expected_id:
+                        self._reasoning_start_tokens.append(token_id)
+                        if len(self._reasoning_start_tokens) == len(reasoning_start):
+                            self._reasoning_start_seen = True
+                            self._reasoning_start_tokens.clear()
+                        return None
+                    self._switch_to_direct_answer()
+                    self._answer_tokens.append(token_id)
+                    return None
                 if token_id == self._start_ground_id or token_id == self._end_ground_id:
                     self._flush_current_chunk()
                     self._pending_coord = None
@@ -323,6 +338,8 @@ class QuerySkillState(SkillState):
         reason: str,
     ) -> SkillFinalizeResult:
         if self._reasoning_enabled:
+            if self._reasoning_start_tokens and not self._reasoning_start_seen:
+                self._switch_to_direct_answer()
             self._flush_current_chunk()
 
         tokenizer = runtime.tokenizer
@@ -380,12 +397,27 @@ class QuerySkillState(SkillState):
         self._current_chunk_points.clear()
         self._pending_coord = None
 
+    def _switch_to_direct_answer(self) -> None:
+        self._collecting_reasoning = False
+        self._answer_tokens.extend(self._reasoning_start_tokens)
+        self._reasoning_start_tokens.clear()
+        self._answer_stream_offset = 0
+
     def _ensure_token_ids(self, runtime: "AutoregressiveRuntime") -> None:
         if self._answer_id is not None:
             return
         pt = runtime.prompt_template
         self._answer_id = pt.answer_id
         template = self._get_query_template(runtime)
+        scalar_start = template.reasoning_start_token_id
+        sequence_start = tuple(template.reasoning_start_token_ids)
+        if scalar_start is not None and sequence_start:
+            raise ValueError(
+                "query template must not set both reasoning start token fields"
+            )
+        self._reasoning_start_prefix = (
+            (int(scalar_start),) if scalar_start is not None else sequence_start
+        )
         self._start_ground_id = template.start_ground_points_id
         self._end_ground_id = template.end_ground_id
 

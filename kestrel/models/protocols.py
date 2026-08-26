@@ -35,6 +35,11 @@ class QueryTemplate:
     answer_suppressed_token_ids: List[int] = field(default_factory=list)
     start_ground_points_id: Optional[int] = None
     end_ground_id: Optional[int] = None
+    # Some formats, such as Gemma 4, decide per response whether to reason.
+    # These fields follow the original dataclass fields to preserve positional
+    # construction. Models must set at most one marker form.
+    reasoning_start_token_id: Optional[int] = None
+    reasoning_start_token_ids: List[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

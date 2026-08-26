@@ -15,6 +15,8 @@ TURN_ID = 105
 END_OF_TURN_ID = 106
 NEWLINE_ID = 107
 THINK_ID = 98
+START_OF_CHANNEL_ID = 100
+THOUGHT_ID = 45_518
 END_OF_CHANNEL_ID = 101
 SYSTEM_ROLE_ID = 9731
 USER_ROLE_ID = 2364
@@ -56,6 +58,11 @@ class Gemma4PromptTemplate:
             post_reasoning_prefix=[],
             prefix_when_reasoning=list(_TURN_USER_PREFIX_WITH_THINK_IDS),
             stop_token_ids=stop_token_ids,
+            reasoning_start_token_ids=[
+                START_OF_CHANNEL_ID,
+                THOUGHT_ID,
+                NEWLINE_ID,
+            ],
         )
 
 
@@ -67,6 +74,8 @@ __all__ = [
     "Gemma4PromptTemplate",
     "IMAGE_TOKEN_ID",
     "START_OF_IMAGE_ID",
+    "START_OF_CHANNEL_ID",
     "THINK_ID",
+    "THOUGHT_ID",
     "TOOL_RESPONSE_ID",
 ]
