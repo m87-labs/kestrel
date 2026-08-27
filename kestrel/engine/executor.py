@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol
@@ -37,6 +38,9 @@ from kestrel.engine._types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+# Qwen3-ASR preprocessing measured about 1 ms warm on the H100 host; a 5 ms
+# idle-only window absorbed sibling completion skew without delaying lone requests.
+_IDLE_ADMISSION_BATCH_WAIT_S = 0.005
 
 
 @dataclass(slots=True)
@@ -131,10 +135,16 @@ class _AdmissionCoordinator:
                 )
         return None
 
-    def take_ready(self) -> Optional[_ReadyAdmission]:
+    def take_ready(self, timeout: float = 0.0) -> Optional[_ReadyAdmission]:
+        deadline = time.perf_counter() + timeout
         while True:
             try:
-                req_id = self._ready.get_nowait()
+                remaining = deadline - time.perf_counter()
+                req_id = (
+                    self._ready.get_nowait()
+                    if remaining <= 0
+                    else self._ready.get(timeout=remaining)
+                )
             except queue.Empty:
                 return None
 
@@ -320,7 +330,9 @@ class AutoregressiveExecutor:
 
     def advance(self) -> TickResult:
         scheduler = self._scheduler
-        progressed = self._promote_ready()
+        progressed = self._promote_ready(
+            coalesce=not scheduler.has_pending_work(),
+        )
 
         if scheduler.has_pending_work():
             progressed = scheduler.advance() or progressed
@@ -407,14 +419,27 @@ class AutoregressiveExecutor:
         self._scheduler.enqueue_request(generation_req, skill_state)
         self._active[req.request_id] = req
 
-    def _promote_ready(self) -> bool:
+    def _promote_ready(self, *, coalesce: bool = False) -> bool:
         promoted = False
+        deadline: float | None = None
+        promoted_count = 0
         while len(self._scheduler.waiting) < self._admission_capacity:
-            ready = self._admission.take_ready()
+            timeout = None
+            if (
+                coalesce
+                and promoted
+                and promoted_count < self._runtime.max_batch_size
+                and self._admission.pending_count
+            ):
+                if deadline is None:
+                    deadline = time.perf_counter() + _IDLE_ADMISSION_BATCH_WAIT_S
+                timeout = max(0.0, deadline - time.perf_counter())
+            ready = self._admission.take_ready(0.0 if timeout is None else timeout)
             if ready is None:
                 break
             self._admit_ready(ready)
             promoted = True
+            promoted_count += 1
         return promoted
 
     def _collect(self) -> List[Completion]:

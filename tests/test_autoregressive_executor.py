@@ -79,7 +79,7 @@ def _executor() -> AutoregressiveExecutor:
     ex._admission = SimpleNamespace(
         has_pending=lambda: False,
         pending_count=0,
-        take_ready=lambda: None,
+        take_ready=lambda _timeout=0.0: None,
         fail_all=lambda exc: None,
     )
     return ex
@@ -175,6 +175,34 @@ def test_ingress_capacity_counts_active_and_preprocessing_requests() -> None:
 
     ex._admission.pending_count = 1
     assert ex.has_ingress_capacity is False
+
+
+def test_idle_executor_collects_a_ready_preprocessing_cohort() -> None:
+    ex = _executor()
+    ex._runtime.max_batch_size = 4
+    waiting = ex._scheduler.waiting
+    ready = [object(), object()]
+    timeouts = []
+
+    def take_ready(timeout=0.0):
+        timeouts.append(timeout)
+        if not ready:
+            return None
+        ex._admission.pending_count -= 1
+        return ready.pop(0)
+
+    ex._admission.pending_count = len(ready)
+    ex._admission.take_ready = take_ready
+    ex._admit_ready = waiting.append
+    launched = []
+    ex._scheduler.has_pending_work = lambda: bool(waiting)
+    ex._scheduler.advance = lambda: launched.append(len(waiting)) or True
+
+    ex.advance()
+
+    assert launched == [2]
+    assert timeouts[0] == 0.0
+    assert 0 < timeouts[1] <= 0.005
 
 
 def test_shutdown_fails_in_flight_requests() -> None:
