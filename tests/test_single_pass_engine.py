@@ -40,6 +40,9 @@ class _StubSinglePass:
             raise ValueError("forward failed")
         return {"task": task, "inputs": inputs}
 
+    def tasks(self) -> tuple[str, ...]:
+        return ("segment", "boom")
+
     def shutdown(self) -> None:
         pass
 
@@ -96,6 +99,39 @@ async def _run(task: str, inputs: Any) -> Any:
 def test_run_routes_single_pass_through_kernel_loop() -> None:
     result = asyncio.run(_run("segment", {"points": [[1, 2]]}))
     assert result.output == {"task": "segment", "inputs": {"points": [[1, 2]]}}
+
+
+def test_default_model_can_be_single_pass() -> None:
+    async def go() -> None:
+        ar = FakeRuntime(model_name="unused-ar", device="cpu")
+        sp = _StubSinglePass("sp-default")
+        engine = _engine_with(ar, sp)
+        engine._default_model = sp.model_name
+        engine._model_ids = [sp.model_name]
+        engine._runtimes = {sp.model_name: sp}
+        engine._loop = asyncio.get_running_loop()
+        engine._initialized = True
+        engine._init_task = None
+
+        thread = threading.Thread(
+            target=engine._scheduler_loop, name="kernel", daemon=True
+        )
+        thread.start()
+        try:
+            result = await asyncio.wait_for(
+                engine.model().segment(points=[[1, 2]]), timeout=5.0
+            )
+            assert result.output == {
+                "task": "segment",
+                "inputs": {"points": [[1, 2]]},
+            }
+        finally:
+            engine._shutdown = True
+            engine._scheduler_queue.put(None)
+            engine._scheduler_event.set()
+            thread.join(timeout=5.0)
+
+    asyncio.run(go())
 
 
 def test_run_propagates_forward_error() -> None:
