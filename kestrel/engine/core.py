@@ -222,8 +222,8 @@ class InferenceEngine:
         runtime = self._runtimes.get(self._default_model)
         if runtime is None:
             raise RuntimeError("InferenceEngine has not been started")
-        # The default model is always autoregressive; co-hosted models are
-        # reached via ``run`` / their single-pass lane, never this property.
+        if runtime.execution_shape is not ExecutionShape.AUTOREGRESSIVE:
+            raise RuntimeError("The default model is not autoregressive")
         return cast(AutoregressiveRuntime, runtime)
 
     def _skill_registry(self) -> SkillRegistry:
@@ -240,7 +240,9 @@ class InferenceEngine:
             return self._skills_override
         runtime = self._runtimes.get(self._default_model)
         if runtime is not None:
-            return runtime.skills()
+            if runtime.execution_shape is ExecutionShape.AUTOREGRESSIVE:
+                return cast(AutoregressiveRuntime, runtime).skills()
+            return SkillRegistry([])
         from kestrel.models.registry import get_spec
 
         return get_spec(self._default_model).skills()
@@ -464,6 +466,11 @@ class InferenceEngine:
         prevent a transcribe-only autoregressive model from starting.
         """
 
+        runtime = self._runtimes.get(self._default_model)
+        if runtime is None or runtime.execution_shape is not (
+            ExecutionShape.AUTOREGRESSIVE
+        ):
+            return
         if "query" not in self._skill_registry().names():
             return
 
@@ -823,14 +830,18 @@ class InferenceEngine:
         self._paused_event.clear()
         self._scheduler_event.set()
         self._paused_event.wait(timeout)
-        synchronize(self.runtime.device)
+        runtime = self._runtimes.get(self._default_model)
+        if runtime is not None:
+            synchronize(runtime.device)
 
     def resume(self) -> None:
         """Resume scheduler progress after a pause."""
 
         if self._shutdown:
             return
-        synchronize(self.runtime.device)
+        runtime = self._runtimes.get(self._default_model)
+        if runtime is not None:
+            synchronize(runtime.device)
         self._paused_event.clear()
         self._paused_flag.clear()
         self._run_gate.set()
@@ -994,11 +1005,15 @@ class InferenceEngine:
         other non-autoregressive model advertises its own ``runtime.tasks()``
         once built.
         """
-        if model_id == self._default_model:
-            return self._skill_registry().names()
         runtime = self._runtimes.get(model_id)
         if runtime is not None:
+            if model_id == self._default_model and (
+                runtime.execution_shape is ExecutionShape.AUTOREGRESSIVE
+            ):
+                return self._skill_registry().names()
             return tuple(runtime.tasks())
+        if model_id == self._default_model:
+            return self._skill_registry().names()
         raise ValueError(f"Unknown model {model_id!r}")
 
     def _orchestrator_for(
@@ -1006,7 +1021,10 @@ class InferenceEngine:
     ) -> Optional[CapabilityOrchestrator]:
         """Return model-owned composition for a capability, if any."""
 
-        if model_id == self._default_model:
+        runtime = self._runtimes.get(model_id)
+        if model_id == self._default_model and runtime is not None and (
+            runtime.execution_shape is ExecutionShape.AUTOREGRESSIVE
+        ):
             return self._skill_registry().resolve(task).orchestrator()
         from kestrel.models.registry import get_spec
 
@@ -1494,16 +1512,20 @@ class InferenceEngine:
                     f"No runtime registered for default model {self._default_model!r}"
                 )
             set_device(runtime.device)
-            # The default (autoregressive) lane. Its pipeline owns the device's
-            # CUDA-graph capture, so pause/drain is handled specially below.
-            ar_executor = AutoregressiveExecutor(
-                runtime,
-                compute_stream=self._compute_stream,
-                skills=self._skill_registry(),
-                adapter_provider=self._adapter_provider,
-                build_generation_request=self._build_generation_request,
-                to_engine_result=self._to_engine_result,
-                wake_event=self._scheduler_event,
+            # Autoregressive requests are untagged and therefore belong to the
+            # default model. Other default execution shapes simply omit this lane.
+            ar_executor = (
+                AutoregressiveExecutor(
+                    cast(AutoregressiveRuntime, runtime),
+                    compute_stream=self._compute_stream,
+                    skills=self._skill_registry(),
+                    adapter_provider=self._adapter_provider,
+                    build_generation_request=self._build_generation_request,
+                    to_engine_result=self._to_engine_result,
+                    wake_event=self._scheduler_event,
+                )
+                if runtime.execution_shape is ExecutionShape.AUTOREGRESSIVE
+                else None
             )
             # One single-pass lane per registered single-pass model. The kernel
             # folds advance() over every lane; single-pass forwards interleave
@@ -1562,7 +1584,7 @@ class InferenceEngine:
                 self._deliver_model_stream_update(update)
 
         def any_work() -> bool:
-            return ar_executor.has_work or any(
+            return (ar_executor is not None and ar_executor.has_work) or any(
                 sp.has_work for sp in single_pass.values()
             ) or any(stream.has_work for stream in streaming.values())
 
@@ -1576,8 +1598,13 @@ class InferenceEngine:
                         # CUDA graphs). Only the AR lane has graph state;
                         # single-pass forwards are one-shot, so draining the
                         # AR pipeline is sufficient.
-                        deliver(ar_executor.drain())
-                        with runtime.graph_capture_lock:
+                        if ar_executor is not None:
+                            deliver(ar_executor.drain())
+                            with cast(
+                                AutoregressiveRuntime, runtime
+                            ).graph_capture_lock:
+                                synchronize(runtime.device)
+                        else:
                             synchronize(runtime.device)
                         paused_event.set()
                         if shutdown_requested and not any_work():
@@ -1591,13 +1618,22 @@ class InferenceEngine:
                     # window so a large client backlog cannot starve device
                     # progress while several batches remain available for
                     # overlap.
-                    while ar_executor.has_ingress_capacity:
+                    while ar_executor is None or ar_executor.has_ingress_capacity:
                         try:
                             item = self._scheduler_queue.get_nowait()
                         except queue.Empty:
                             break
                         if item is None:
                             shutdown_requested = True
+                            continue
+                        if ar_executor is None:
+                            self._fail_request(
+                                item,
+                                ValueError(
+                                    "The default model is not autoregressive"
+                                ),
+                            )
+                            progressed = True
                             continue
                         ar_executor.submit(item)
                         progressed = True
@@ -1643,21 +1679,24 @@ class InferenceEngine:
                     # Advance the autoregressive lane. Its pipeline is the
                     # shared device state, so a failure here is fatal to the
                     # kernel — tear everything down.
-                    try:
-                        tick = ar_executor.advance()
-                    except Exception as exc:
-                        self._scheduler_error = exc
-                        _LOGGER.exception("Autoregressive advance failed", exc_info=exc)
-                        deliver(ar_executor.shutdown(exc))
-                        for lane in single_pass.values():
-                            deliver(lane.shutdown(exc))
-                        for lane in streaming.values():
-                            deliver(lane.shutdown(exc))
-                        self._fail_all_pending(exc)
-                        return
-                    if tick.completed:
-                        deliver(tick.completed)
-                    progressed = tick.progressed or progressed
+                    if ar_executor is not None:
+                        try:
+                            tick = ar_executor.advance()
+                        except Exception as exc:
+                            self._scheduler_error = exc
+                            _LOGGER.exception(
+                                "Autoregressive advance failed", exc_info=exc
+                            )
+                            deliver(ar_executor.shutdown(exc))
+                            for lane in single_pass.values():
+                                deliver(lane.shutdown(exc))
+                            for lane in streaming.values():
+                                deliver(lane.shutdown(exc))
+                            self._fail_all_pending(exc)
+                            return
+                        if tick.completed:
+                            deliver(tick.completed)
+                        progressed = tick.progressed or progressed
 
                     # Advance each single-pass lane in isolation: a single
                     # forward blowing up must fail only that lane's in-flight
@@ -1719,7 +1758,8 @@ class InferenceEngine:
                             wake_event.wait()
                         wake_event.clear()
         finally:
-            deliver(ar_executor.shutdown())
+            if ar_executor is not None:
+                deliver(ar_executor.shutdown())
             for lane in single_pass.values():
                 deliver(lane.shutdown())
             for lane in streaming.values():
