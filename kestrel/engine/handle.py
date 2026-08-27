@@ -170,6 +170,35 @@ class ModelHandle:
         if runtime is not None and (
             runtime.execution_shape is ExecutionShape.SINGLE_PASS
         ):
+            orchestrator = self._engine._orchestrator_for(self._model, task)
+            if orchestrator is not None:
+                self._require(task)
+                settings = owned_prompt.pop("settings", None)
+                image = owned_prompt.pop("image", None)
+
+                async def invoke(
+                    leaf_prompt: Mapping[str, object],
+                    *,
+                    image: Optional[Any] = None,
+                    settings: Optional[Mapping[str, object]] = None,
+                ) -> object:
+                    inputs = dict(leaf_prompt)
+                    if image is not None:
+                        inputs["image"] = image
+                    if settings is not None:
+                        inputs["settings"] = settings
+                    submission = self._engine.run(self._model, task, inputs)
+                    del inputs, image, settings
+                    return await submission
+
+                submission = orchestrator.run(
+                    invoke,
+                    image=image,
+                    prompt=owned_prompt,
+                    settings=settings,
+                )
+                del orchestrator, owned_prompt, settings, image
+                return await submission
             submission = self.run(task, owned_prompt)
             del owned_prompt
             return await submission

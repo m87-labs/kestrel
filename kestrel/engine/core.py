@@ -51,6 +51,7 @@ from kestrel.scheduler import (
     StreamUpdate,
 )
 from kestrel.skills import (
+    CapabilityOrchestrator,
     DecodeStep,
     PreparedSkillPrompt,
     SkillRegistry,
@@ -999,6 +1000,22 @@ class InferenceEngine:
         if runtime is not None:
             return tuple(runtime.tasks())
         raise ValueError(f"Unknown model {model_id!r}")
+
+    def _orchestrator_for(
+        self, model_id: str, task: str
+    ) -> Optional[CapabilityOrchestrator]:
+        """Return model-owned composition for a capability, if any."""
+
+        if model_id == self._default_model:
+            return self._skill_registry().resolve(task).orchestrator()
+        from kestrel.models.registry import get_spec
+
+        try:
+            spec = get_spec(model_id)
+        except ValueError:
+            # Injected runtimes need not have global registry metadata.
+            return None
+        return spec.orchestrators().get(task)
 
     async def _submit_request(
         self,

@@ -12,11 +12,11 @@ package's ``__init__.py`` (see ``kestrel/models/moondream/__init__.py``).
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
 
 if TYPE_CHECKING:
     from kestrel.runtime import Runtime
-    from kestrel.skills import SkillRegistry
+    from kestrel.skills import CapabilityOrchestrator, SkillRegistry
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,12 @@ class ModelSpec:
     # Immutable revision for artifacts hosted by ``repo_id``. Runtimes also
     # apply it to the tokenizer when ``tokenizer_id`` names that same repo.
     revision: Optional[str] = None
+    # Optional model-owned composition around ordinary capability requests.
+    # This is execution-shape independent: each leaf still runs through the
+    # model's normal autoregressive or single-pass lane.
+    orchestrators: Callable[
+        [], "Mapping[str, CapabilityOrchestrator]"
+    ] = lambda: _empty_orchestrators()
 
 
 def _empty_skill_registry() -> "SkillRegistry":
@@ -60,6 +66,10 @@ def _empty_skill_registry() -> "SkillRegistry":
     from kestrel.skills import SkillRegistry
 
     return SkillRegistry([])
+
+
+def _empty_orchestrators() -> "Mapping[str, CapabilityOrchestrator]":
+    return {}
 
 
 _REGISTRY: Dict[str, ModelSpec] = {}
