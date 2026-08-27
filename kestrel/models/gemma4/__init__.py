@@ -14,6 +14,8 @@ _VARIANTS = [
     "google/gemma-4-E4B",
     "google/gemma-4-31B-it",
     "google/gemma-4-31B",
+    "google/gemma-4-26B-A4B-it",
+    "google/gemma-4-26B-A4B",
 ]
 
 for _repo_id in _VARIANTS:

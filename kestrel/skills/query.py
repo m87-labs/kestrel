@@ -238,8 +238,7 @@ class QuerySkillState(SkillState):
         runtime: "AutoregressiveRuntime",
         step: DecodeStep,
     ) -> None:
-        if self._reasoning_enabled:
-            self._ensure_token_ids(runtime)
+        self._ensure_token_ids(runtime)
         self.append_token(step.token)
 
         template = self._get_query_template(runtime)
@@ -258,7 +257,14 @@ class QuerySkillState(SkillState):
             # Don't collect injected tokens as answer tokens
             return None
 
-        if not self._reasoning_enabled:
+        if (
+            not self._reasoning_enabled
+            and not self._collecting_reasoning
+            and self._consume_optional_reasoning_start(step.token)
+        ):
+            return None
+
+        if not self._reasoning_enabled and not self._collecting_reasoning:
             if isinstance(step.token, TextToken):
                 self._answer_tokens.append(step.token.token_id)
             return None
@@ -337,9 +343,9 @@ class QuerySkillState(SkillState):
         *,
         reason: str,
     ) -> SkillFinalizeResult:
+        if self._reasoning_start_tokens and not self._reasoning_start_seen:
+            self._switch_to_direct_answer()
         if self._reasoning_enabled:
-            if self._reasoning_start_tokens and not self._reasoning_start_seen:
-                self._switch_to_direct_answer()
             self._flush_current_chunk()
 
         tokenizer = runtime.tokenizer
@@ -402,6 +408,28 @@ class QuerySkillState(SkillState):
         self._answer_tokens.extend(self._reasoning_start_tokens)
         self._reasoning_start_tokens.clear()
         self._answer_stream_offset = 0
+
+    def _consume_optional_reasoning_start(self, token: Token) -> bool:
+        """Hide a model-emitted reasoning channel in direct-answer mode."""
+
+        prefix = self._reasoning_start_prefix or ()
+        if (
+            not prefix
+            or self._reasoning_start_seen
+            or self._answer_tokens
+            or not isinstance(token, TextToken)
+        ):
+            return False
+        expected_id = prefix[len(self._reasoning_start_tokens)]
+        if token.token_id != expected_id:
+            self._switch_to_direct_answer()
+            return False
+        self._reasoning_start_tokens.append(token.token_id)
+        if len(self._reasoning_start_tokens) == len(prefix):
+            self._reasoning_start_seen = True
+            self._reasoning_start_tokens.clear()
+            self._collecting_reasoning = True
+        return True
 
     def _ensure_token_ids(self, runtime: "AutoregressiveRuntime") -> None:
         if self._answer_id is not None:

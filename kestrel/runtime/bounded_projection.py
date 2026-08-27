@@ -244,6 +244,7 @@ def bind_declared_packed_projections(
         packed_bounds: dict[str, torch.Tensor] = {}
         source_bound_keys: list[str] = []
         bound_values: dict[str, list[torch.Tensor]] = {}
+        incomplete_bounds = False
         if is_bounded and child.use_bounds:
             for bound_name in (
                 "input_min",
@@ -257,10 +258,13 @@ def bind_declared_packed_projections(
                 ]
                 missing = [key for key in keys if key not in state_dict]
                 if missing:
-                    raise KeyError(
-                        f"packed projection {module_name!r} is missing bounds: "
-                        + ", ".join(repr(key) for key in missing)
-                    )
+                    if require_complete:
+                        raise KeyError(
+                            f"packed projection {module_name!r} is missing bounds: "
+                            + ", ".join(repr(key) for key in missing)
+                        )
+                    incomplete_bounds = True
+                    break
                 values = [state_dict[key] for key in keys]
                 if any(
                     value.ndim != 0
@@ -274,6 +278,9 @@ def bind_declared_packed_projections(
                     )
                 bound_values[bound_name] = values
                 source_bound_keys.extend(keys)
+
+            if incomplete_bounds:
+                continue
 
             for bound_name in ("input_min", "input_max"):
                 values = bound_values[bound_name]

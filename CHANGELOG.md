@@ -4,6 +4,7 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+- Added Gemma 4 26B-A4B base and instruction-tuned checkpoint support.
 - Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription for
   files and live PCM, with long-form chunking, progressive results, language
   and prompt controls, forced alignment, and word or character timestamps

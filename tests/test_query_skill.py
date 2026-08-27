@@ -289,6 +289,55 @@ def test_gemma4_channel_marker_preserves_reasoning_answer_split(
     }
 
 
+@pytest.mark.parametrize(
+    "model_name", ("google/gemma-4-E2B-it", "google/gemma-4-26B-A4B-it")
+)
+def test_gemma4_direct_answer_hides_model_emitted_reasoning_channel(
+    model_name: str,
+) -> None:
+    runtime = SimpleNamespace(
+        prompt_template=Gemma4PromptTemplate(model_name),
+        tokenizer=_VisibleTokenizer(),
+    )
+    context = QueryRequest(question="hi", image=None, reasoning=False, stream=True)
+    state = QuerySkill().create_state(runtime, SimpleNamespace(), context)
+
+    for position, token_id in enumerate(
+        [
+            START_OF_CHANNEL_ID,
+            THOUGHT_ID,
+            NEWLINE_ID,
+            42,
+            END_OF_CHANNEL_ID,
+            43,
+            END_OF_TURN_ID,
+        ]
+    ):
+        state.consume_step(
+            runtime, DecodeStep(TextToken(token_id=token_id), position=position)
+        )
+
+    assert state.pop_stream_delta(runtime) == "<43>"
+    result = state.finalize(runtime, reason="stop")
+    assert result.output == {"answer": "<43>"}
+
+
+def test_direct_answer_preserves_partial_reasoning_prefix_mismatch() -> None:
+    runtime = _Runtime(reasoning_start_token_ids=[30, 31, 32])
+    runtime.tokenizer = _VisibleTokenizer()
+    context = QueryRequest(question="hi", image=None, reasoning=False, stream=True)
+    state = QuerySkill().create_state(runtime, SimpleNamespace(), context)
+
+    state.consume_step(runtime, DecodeStep(TextToken(token_id=30), position=0))
+    assert state.pop_stream_delta(runtime) is None
+    state.consume_step(runtime, DecodeStep(TextToken(token_id=42), position=1))
+
+    assert state.pop_stream_delta(runtime) == "<30><42>"
+    assert state.finalize(runtime, reason="stop").output == {
+        "answer": "<30><42>"
+    }
+
+
 def test_reasoning_start_partial_mismatch_restores_buffered_answer_tokens() -> None:
     runtime = _Runtime(reasoning_start_token_ids=[30, 31, 32])
     runtime.tokenizer = _VisibleTokenizer()
