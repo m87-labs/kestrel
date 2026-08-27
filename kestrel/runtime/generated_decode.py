@@ -293,6 +293,27 @@ class GeneratedDecode:
         )
 
     @classmethod
+    def resolve_slot_capacity(
+        cls,
+        runtime: Any,
+        spec: GeneratedDecodeSpec,
+        *,
+        required_batch_sizes: Sequence[int] = (),
+    ) -> int | None:
+        """Return the physical row capacity needed by selectable programs."""
+
+        programs = cls._resolve_programs(runtime, spec)
+        if any(
+            _select_program(programs, int(batch_size)) is None
+            for batch_size in required_batch_sizes
+        ):
+            return None
+        selected = _selectable_programs(programs, runtime.max_batch_size)
+        if not selected:
+            return None
+        return max(int(program.capacity) for program in selected)
+
+    @classmethod
     def require(
         cls,
         runtime: Any,
