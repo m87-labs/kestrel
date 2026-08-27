@@ -59,6 +59,12 @@ def test_modelspec_skills_factory_is_honored() -> None:
     assert spec.skills() is sentinel
 
 
+def test_modelspec_orchestrator_factory_is_honored() -> None:
+    sentinel = object()
+    spec = _spec(orchestrators=lambda: {"transcribe": sentinel})
+    assert spec.orchestrators()["transcribe"] is sentinel
+
+
 def test_modelspec_revision_does_not_shift_existing_positional_metadata() -> None:
     runtime = lambda *args, **kwargs: None
     skills = lambda: SkillRegistry([])

@@ -400,6 +400,39 @@ def test_capability_orchestrator_composes_ordinary_leaf_requests() -> None:
     ]
 
 
+def test_single_pass_capability_orchestrator_uses_single_pass_leaves() -> None:
+    eng = _engine()
+    eng._runtimes["sp-model"] = _StubSinglePass("sp-model", ("transcribe",))
+    eng._orchestrator_for = lambda _model, _task: _WindowOrchestrator()
+    calls = []
+
+    async def run(model: str, task: str, inputs: Any) -> str:
+        calls.append((model, task, inputs))
+        return f"leaf-{inputs['window']}"
+
+    eng.run = run  # type: ignore[method-assign]
+    result = asyncio.run(
+        eng.model("sp-model").transcribe(
+            windows=[b"first", b"second"],
+            settings={"max_tokens": 32},
+        )
+    )
+
+    assert result == ("leaf-0", "leaf-1")
+    assert calls == [
+        (
+            "sp-model",
+            "transcribe",
+            {"audio": b"first", "window": 0, "settings": {"max_tokens": 32}},
+        ),
+        (
+            "sp-model",
+            "transcribe",
+            {"audio": b"second", "window": 1, "settings": {"max_tokens": 32}},
+        ),
+    ]
+
+
 def test_capability_lifts_settings_and_mirrors_stream() -> None:
     """settings (sampling) is lifted out of the model prompt as its own arg.
     stream is passed to the engine to select streaming delivery AND left in
