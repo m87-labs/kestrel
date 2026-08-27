@@ -2,8 +2,6 @@
 
 All notable changes since `v0.1.2` are documented in this file.
 
-## Unreleased
-
 ## 0.6.1 — 2026-08-26
 
 - Corrected Gemma 4 reasoning-enabled queries so direct answers are returned
