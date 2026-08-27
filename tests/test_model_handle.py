@@ -210,8 +210,9 @@ def test_unsupported_capability_raises_clearly() -> None:
 def _capture_run_skill(captured: dict[str, Any]):
     """Return a stub ``_run_skill`` that records how the handle called it."""
 
-    async def run_skill(task: str, *, image: Any, prompt: Any,
-                        settings: Any, stream: Any) -> str:
+    async def run_skill(
+        task: str, *, image: Any, prompt: Any, settings: Any, stream: Any
+    ) -> str:
         captured.update(
             task=task, image=image, prompt=prompt, settings=settings, stream=stream
         )
@@ -442,9 +443,7 @@ def test_capability_lifts_settings_and_mirrors_stream() -> None:
     captured: dict[str, Any] = {}
     eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
     h = eng.model("ar-model")
-    asyncio.run(
-        h.caption(length="short", stream=True, settings={"temperature": 0.5})
-    )
+    asyncio.run(h.caption(length="short", stream=True, settings={"temperature": 0.5}))
     assert captured["task"] == "caption"
     assert captured["settings"] == {"temperature": 0.5}  # lifted out
     assert captured["stream"] is True  # selects streaming delivery
@@ -484,7 +483,15 @@ def test_capability_verbs_are_uniform_kwargs() -> None:
     """
     import inspect
 
-    for verb in ("query", "caption", "detect", "point", "segment", "transcribe"):
+    for verb in (
+        "query",
+        "caption",
+        "detect",
+        "point",
+        "segment",
+        "transcribe",
+        "align",
+    ):
         params = list(inspect.signature(getattr(ModelHandle, verb)).parameters.values())
         assert [p.name for p in params] == ["self", "prompt"], verb
         assert params[1].kind is inspect.Parameter.VAR_KEYWORD, (

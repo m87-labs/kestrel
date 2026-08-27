@@ -49,6 +49,8 @@ Kestrel supports these model families:
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 | Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, and 31B base/instruction variants |
 | Whisper large-v3-turbo | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | Transcription, translation, long-form audio, and word timestamps |
+| Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B-hf](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf), [1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
+| Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
 
 ## Quick Start
 
@@ -86,11 +88,11 @@ async def main():
 asyncio.run(main())
 ```
 
-## Whisper transcription
+## Speech transcription
 
-Whisper uses its Hugging Face repository ID as the model name. The checkpoint
-is resolved at Kestrel's pinned revision, and execution uses the same packaged
-Kestrel kernels and generated-decode runtime as the other CUDA models.
+Whisper, Qwen3-ASR, and Parakeet use the same model-bound `transcribe`
+capability. Choose a Hugging Face repository ID from the model table; Kestrel
+resolves its pinned revision and selects that model's optimized runtime.
 
 ```python
 import asyncio
@@ -99,19 +101,19 @@ from pathlib import Path
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
-WHISPER_MODEL = "openai/whisper-large-v3-turbo"
+MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
 
 
 async def main():
     engine = await InferenceEngine.create(
         RuntimeConfig(
-            model=WHISPER_MODEL,
+            model=MODEL,
             max_batch_size=4,
         )
     )
-    whisper = engine.model(WHISPER_MODEL)
+    model = engine.model(MODEL)
     try:
-        result = await whisper.transcribe(
+        result = await model.transcribe(
             audio=Path("meeting.m4a"),
             timestamps="word",
         )
@@ -130,9 +132,8 @@ asyncio.run(main())
 
 Kestrel accepts encoded paths, bytes, bounded binary streams, raw mono PCM,
 and asynchronous PCM iterators. Long paths are decoded incrementally. See
-[Whisper transcription](docs/whisper.md) for supported formats, progressive
-and live input, translation, prompting, clipping, quality controls, and exact
-resource limits.
+[Speech-to-text models](docs/asr.md) for the shared interface and model
+capability matrix, model-specific options, formats, and resource limits.
 
 ## Tasks
 

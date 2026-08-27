@@ -6,11 +6,14 @@ import asyncio
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Sequence, TypeVar, cast
+from typing import Awaitable, Callable, Mapping, Sequence, cast
 
 import kestrel_native
 import numpy as np
 from kestrel.engine import CapabilityStream, EngineMetrics, EngineResult
+from kestrel.models.asr.audio import snapshot_file_like
+from kestrel.models.asr.contract import TranscriptionRequest
+from kestrel.models.asr.longform import settled_to_thread
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills import CapabilityInvoker, CapabilityOrchestrator
 from torch import Tensor
@@ -19,10 +22,7 @@ from .audio import (
     _MAX_NATIVE_AUDIO_VALUES,
     _pcm_to_float32,
     _raw_shape_and_size,
-    _snapshot_encoded_file_like,
-    _validate_sample_rate,
     validate_audio_source,
-    validate_clip_range,
 )
 from .quality import (
     TranscriptionQualityPolicy,
@@ -40,7 +40,6 @@ _LIVE_STABILITY_SECONDS = 1
 _TIMESTAMP_BEGIN_ID = 50365
 _TIMESTAMP_VOCAB_END = 51866
 _TIMESTAMP_SECONDS = 0.02
-_BlockingResult = TypeVar("_BlockingResult")
 
 
 def _checked_positive_int(value: object, name: str) -> int:
@@ -1196,23 +1195,6 @@ async def _open_native_reader(audio: bytes | str | Path) -> object:
         raise
 
 
-async def _settled_to_thread(
-    call: Callable[..., _BlockingResult],
-    *args: object,
-) -> _BlockingResult:
-    """Run an owned blocking call without leaving it behind on cancellation."""
-
-    running = asyncio.create_task(asyncio.to_thread(call, *args))
-    try:
-        return await asyncio.shield(running)
-    except asyncio.CancelledError:
-        try:
-            await running
-        except BaseException:
-            pass
-        raise
-
-
 def _snapshot_short_pcm(
     audio: np.ndarray | Tensor,
     sample_rate: object,
@@ -1450,7 +1432,7 @@ async def _run_long_file(
     )
 
     while True:
-        window = await _settled_to_thread(windows.current)
+        window = await settled_to_thread(windows.current)
         if window is None:
             break
         window_duration = int(window.size) / windows.sample_rate
@@ -1536,7 +1518,7 @@ async def _run_long_file(
                 *committed_text_token_ids,
             )[-128:]
 
-        await _settled_to_thread(windows.advance, advance)
+        await settled_to_thread(windows.advance, advance)
         if emit is not None:
             output_language = leaf.language if language is None else language
             completed_seconds = min(
@@ -1618,32 +1600,22 @@ class WhisperLongFormOrchestrator(CapabilityOrchestrator):
         prompt: Mapping[str, object],
         settings: Mapping[str, object] | None,
     ) -> object:
-        policy = parse_quality_policy(settings)
-        stream_requested = prompt.get("stream", False)
-        if not isinstance(stream_requested, bool):
-            raise TypeError("stream must be a boolean")
-        timestamps = prompt.get("timestamps", "segment")
-        if not isinstance(timestamps, str) or timestamps not in {
-            "none",
-            "segment",
-            "word",
-        }:
+        if image is not None:
+            raise ValueError("transcribe does not accept an image")
+        transcription = TranscriptionRequest.from_prompt(prompt)
+        if transcription.timestamps == "character":
             raise ValueError("timestamps must be 'none', 'segment', or 'word'")
-        task = prompt.get("task", "transcribe")
-        if not isinstance(task, str) or task not in {"transcribe", "translate"}:
-            raise ValueError("task must be 'transcribe' or 'translate'")
-        condition_on_previous_text = prompt.get("condition_on_previous_text", True)
-        if not isinstance(condition_on_previous_text, bool):
-            raise TypeError("condition_on_previous_text must be a boolean")
-        clip_start, clip_end = validate_clip_range(
-            prompt.get("clip_start_seconds", 0.0),
-            prompt.get("clip_end_seconds"),
-        )
-        audio = prompt.get("audio")
+        policy = parse_quality_policy(settings)
+        stream_requested = transcription.stream
+        clip_start = transcription.clip_start_seconds
+        clip_end = transcription.clip_end_seconds
+        audio = transcription.audio
         if callable(getattr(audio, "__aiter__", None)):
             if clip_start != 0.0 or clip_end is not None:
                 raise ValueError("clip ranges are not supported for live PCM")
-            rate = _validate_sample_rate(prompt.get("sample_rate"))
+            if transcription.sample_rate is None:
+                raise ValueError("sample_rate is required for live PCM")
+            rate = transcription.sample_rate
             if stream_requested:
 
                 async def produce(
@@ -1670,12 +1642,12 @@ class WhisperLongFormOrchestrator(CapabilityOrchestrator):
                 settings=settings,
                 policy=policy,
             )
-        if prompt.get("sample_rate") is not None:
+        if transcription.sample_rate is not None:
             if stream_requested and isinstance(audio, (np.ndarray, Tensor)):
-                owned_audio = await _settled_to_thread(
+                owned_audio = await settled_to_thread(
                     _snapshot_short_pcm,
                     audio,
-                    prompt.get("sample_rate"),
+                    transcription.sample_rate,
                     clip_start,
                     clip_end,
                 )
@@ -1687,10 +1659,9 @@ class WhisperLongFormOrchestrator(CapabilityOrchestrator):
                 settings=settings,
                 policy=policy,
             )
-        encoded_file = await _settled_to_thread(_snapshot_encoded_file_like, audio)
-        if encoded_file is not None:
-            prompt = {**prompt, "audio": encoded_file}
-            audio = encoded_file
+        if callable(getattr(audio, "read", None)):
+            audio = await settled_to_thread(snapshot_file_like, audio)
+            prompt = {**prompt, "audio": audio}
         if isinstance(audio, (bytes, str, Path)):
             reader = await _open_native_reader(audio)
         else:
