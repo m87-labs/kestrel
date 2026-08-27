@@ -196,6 +196,7 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
             mixed_qkv=mixed_qkv,
             state=state,
             indices=indices,
+            indices_allocator_owned=kwargs["final_state_indices_allocator_owned"],
             workspace=kwargs["workspace"],
         )
         state[indices[0]].fill_(1)
@@ -218,12 +219,14 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
         cache_params=cache,
         cu_seq_lens_q=torch.tensor([0, 1, 3], dtype=torch.int32),
         gdn_state_indices=indices,
+        gdn_state_indices_allocator_owned=True,
     )
 
     state = recurrent_states[0]
     assert state is not None
     assert captured["state"] is state
     assert torch.equal(captured["indices"], indices)
+    assert captured["indices_allocator_owned"] is True
     assert captured["workspace"] is workspace
     assert torch.all(state[3] == 1)
     assert torch.all(state[1] == 2)
