@@ -67,7 +67,6 @@ class _PackedPrefillBatch:
     sequence_lengths: tuple[int, ...]
     topology_token: object
     seq_idx: Optional[torch.Tensor]
-    batch_indices: torch.Tensor
     max_length: int
     last_token_offsets: torch.Tensor
     paged_kv_page_table: torch.Tensor
@@ -704,7 +703,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             last_hidden, cache = self._forward_packed_prefill(packed)
             hidden_rows = last_hidden[0].index_select(0, packed.last_token_offsets)
             self._store_packed_sequence_caches(
-                packed.batch_indices,
                 cache,
                 rope_deltas=packed.rope_deltas,
                 host_batch_indices=batch_indices,
@@ -1291,7 +1289,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             sequence_lengths=sequence_lengths,
             topology_token=topology_token,
             seq_idx=scratch.text_meta.seq_idx.gpu[:, :total_tokens],
-            batch_indices=scratch.text_meta.batch_indices.gpu[:batch_size],
             max_length=max(lengths),
             last_token_offsets=scratch.text_meta.last_token_offsets.gpu[:batch_size],
             paged_kv_page_table=scratch.paged_kv_page_table[:batch_size],
@@ -1334,9 +1331,9 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self,
         packed: _PackedPrefillBatch,
     ) -> tuple[torch.Tensor, Qwen35InferenceCache]:
-        cache = self._new_cache()
-        if self.generated_decode is not None:
-            self._linear_state_pool.bind_generated_prefill_state(cache)
+        cache = self._new_cache(
+            prepare_gdn_replay_state=self.generated_decode is None
+        )
         outputs = self.model.model(
             input_ids=packed.input_ids,
             past_key_values=cache,
@@ -1355,22 +1352,24 @@ class Qwen35Runtime(UncachedPagedRuntime):
             sequence_lengths=packed.sequence_lengths,
             topology_token=packed.topology_token,
             seq_idx=packed.seq_idx,
-            gdn_state_indices=(
-                packed.batch_indices if self.generated_decode is not None else None),
         )
         outputs.past_key_values.advance_to(packed.max_length)
         return outputs.last_hidden_state, outputs.past_key_values
 
-    def _new_cache(self) -> Qwen35InferenceCache:
+    def _new_cache(
+        self,
+        *,
+        prepare_gdn_replay_state: bool = True,
+    ) -> Qwen35InferenceCache:
         return Qwen35InferenceCache(
             config=self.architecture.text_config,
             paged_kv=self._paged_kv,
             replay_capacity=self._linear_state_pool.replay_capacity,
+            prepare_gdn_replay_state=prepare_gdn_replay_state,
         )
 
     def _store_packed_sequence_caches(
         self,
-        batch_idx: torch.Tensor,
         cache: Qwen35InferenceCache,
         *,
         rope_deltas: torch.Tensor,
@@ -1378,18 +1377,16 @@ class Qwen35Runtime(UncachedPagedRuntime):
     ) -> None:
         if not isinstance(cache, Qwen35InferenceCache):
             raise RuntimeError("Qwen engine decode requires paged hybrid caches")
-        indices = batch_idx.to(device=self.device, dtype=torch.long).view(-1)
-        batch_size = int(indices.shape[0])
-        if len(host_batch_indices) != batch_size:
-            raise ValueError("host batch indices must match packed batch size")
-        self._linear_state_pool.capture_batch_from_cache(
-            indices,
+        rows = tuple(host_batch_indices)
+        batch_size = len(rows)
+        indices = self._linear_state_pool.capture_batch_from_cache(
+            rows,
             cache,
             batch_size=batch_size,
-            # Packed prefill starts from a fresh cache. Each GDN layer has just
-            # checkpointed its final recurrent state and reset every replay
-            # cursor, so K/U/G payload bytes are unreachable and need not be
-            # copied into the persistent decode pool.
+            # Native GDN prefill has just checkpointed its final recurrence and
+            # reset every replay cursor, so K/U/G payload bytes are unreachable.
+            # Generated decode transports materialized state and owns no replay
+            # payload at all.
             copy_replay_payload=False,
         )
         rope_deltas = rope_deltas.to(device=self.device, dtype=torch.long)

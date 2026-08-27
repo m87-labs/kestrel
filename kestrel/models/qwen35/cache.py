@@ -43,6 +43,7 @@ class Qwen35InferenceCache:
         config: Any,
         paged_kv: Sequence[PagedKVCache | None],
         replay_capacity: int,
+        prepare_gdn_replay_state: bool = True,
     ) -> None:
         layer_types = tuple(config.layer_types)
         if len(paged_kv) != len(layer_types):
@@ -62,6 +63,7 @@ class Qwen35InferenceCache:
             layers.append(layer)
         self.layers = tuple(layers)
         self.seq_length = 0
+        self.prepare_gdn_replay_state = bool(prepare_gdn_replay_state)
 
     def has_previous_state(self, layer_idx: int | None = None) -> bool:
         if layer_idx is None:
@@ -204,13 +206,25 @@ class Qwen35LinearStatePool:
 
     def capture_batch_from_cache(
         self,
-        batch_idx: torch.Tensor,
+        batch_indices: Sequence[int],
         cache: Qwen35InferenceCache,
         *,
         batch_size: int,
         copy_replay_payload: bool = True,
-    ) -> None:
-        indices = batch_idx[:batch_size].to(device=self.device, dtype=torch.long)
+    ) -> torch.Tensor:
+        rows = tuple(batch_indices)
+        if any(type(row) is not int for row in rows):
+            raise ValueError("Qwen GDN state rows must be host integers")
+        if len(rows) != batch_size:
+            raise ValueError("Qwen GDN state rows must match packed batch size")
+        if len(set(rows)) != len(rows):
+            raise ValueError("Qwen GDN state rows must be unique")
+        if any(row < 0 or row >= self.max_batch_slots for row in rows):
+            raise ValueError("Qwen GDN state row is outside the runtime pool")
+        indices = torch.tensor(rows, device=self.device, dtype=torch.long)
+        if self._recurrent_mode not in ("generated", "native"):
+            raise RuntimeError("Qwen recurrent decode representation is not selected")
+        captures: list[tuple[LinearAttentionState, LinearAttentionState]] = []
         for layer_idx, storage in enumerate(self.layers):
             if storage is None:
                 continue
@@ -219,35 +233,25 @@ class Qwen35LinearStatePool:
                 raise ValueError("Cannot capture mismatched Qwen linear state")
             if not src_layer.has_previous_state:
                 raise RuntimeError("Cannot capture uninitialized Qwen GDN state")
-            self._capture_conv_rows(
-                storage, src_layer, indices, batch_size=batch_size)
+            self._validate_conv_rows(storage, src_layer, batch_size=batch_size)
             if self._recurrent_mode == "generated":
-                target = storage.recurrent_states
-                if target is None or src_layer.recurrent_states is not target:
-                    raise RuntimeError(
-                        "Qwen prefill did not write the generated recurrent pool")
-                continue
-            if self._recurrent_mode != "native":
-                raise RuntimeError("Qwen recurrent decode representation is not selected")
-            self._validate_prefill_recurrent(src_layer, batch_size=batch_size)
-            storage.copy_rows_from(
-                src_layer, indices, copy_replay_payload=copy_replay_payload)
+                self._validate_generated_recurrent_rows(
+                    storage, src_layer, batch_size=batch_size)
+            else:
+                self._validate_prefill_recurrent(src_layer, batch_size=batch_size)
+            captures.append((storage, src_layer))
 
-    def bind_generated_prefill_state(self, cache: Qwen35InferenceCache) -> None:
-        """Expose the authoritative BF16 pool as packed-prefill final state."""
-
-        if self._recurrent_mode != "generated":
-            raise RuntimeError("Qwen generated recurrent state is not initialized")
-        for layer_idx, storage in enumerate(self.layers):
-            if storage is None:
-                continue
-            target = storage.recurrent_states
-            if target is None:
-                raise RuntimeError("Qwen generated recurrent state is incomplete")
-            layer = cache.layers[layer_idx]
-            if not isinstance(layer, LinearAttentionState):
-                raise ValueError("Cannot bind mismatched Qwen linear state")
-            layer.recurrent_states = target
+        # Validate every layer before the first persistent state write so a
+        # malformed later layer cannot leave a partially committed batch.
+        for storage, src_layer in captures:
+            if self._recurrent_mode == "generated":
+                self._capture_conv_rows(storage, src_layer, indices)
+                self._capture_generated_recurrent_rows(
+                    storage, src_layer, indices)
+            else:
+                storage.copy_rows_from(
+                    src_layer, indices, copy_replay_payload=copy_replay_payload)
+        return indices
 
     def bind_to_cache(self, cache: Qwen35InferenceCache) -> None:
         """Bind cache linear layers directly to runtime-owned persistent state."""
@@ -305,17 +309,84 @@ class Qwen35LinearStatePool:
         storage: LinearAttentionState,
         src_layer: LinearAttentionState,
         indices: torch.Tensor,
-        *,
-        batch_size: int = 1,
     ) -> None:
-        conv_states = src_layer.conv_states
-        if conv_states is None or conv_states.shape[0] != batch_size:
+        assert storage.conv_states is not None
+        assert src_layer.conv_states is not None
+        storage.conv_states.index_copy_(0, indices, src_layer.conv_states)
+
+    def _validate_conv_rows(
+        self,
+        storage: LinearAttentionState,
+        src_layer: LinearAttentionState,
+        *,
+        batch_size: int,
+    ) -> None:
+        source = src_layer.conv_states
+        target = storage.conv_states
+        expected_source = (batch_size, *self._conv_shape[1:])
+        if (
+            source is None
+            or tuple(source.shape) != expected_source
+            or source.device != self.device
+            or not source.is_contiguous()
+        ):
             raise RuntimeError(
                 "Qwen GDN prefill convolution batch must match capture batch"
             )
-        if storage.conv_states is None:
-            raise RuntimeError("Qwen GDN convolution pool is not initialized")
-        storage.conv_states.index_copy_(0, indices, conv_states)
+        if (
+            target is None
+            or tuple(target.shape) != self._conv_shape
+            or target.dtype != source.dtype
+            or target.device != self.device
+            or not target.is_contiguous()
+        ):
+            raise RuntimeError("Qwen GDN convolution pool is incomplete")
+
+    def _capture_generated_recurrent_rows(
+        self,
+        storage: LinearAttentionState,
+        src_layer: LinearAttentionState,
+        indices: torch.Tensor,
+    ) -> None:
+        assert src_layer.recurrent_states is not None
+        assert storage.recurrent_states is not None
+        value_major = (
+            src_layer.recurrent_states.transpose(-1, -2)
+            .to(
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )
+        )
+        storage.recurrent_states.index_copy_(0, indices, value_major)
+
+    def _validate_generated_recurrent_rows(
+        self,
+        storage: LinearAttentionState,
+        src_layer: LinearAttentionState,
+        *,
+        batch_size: int,
+    ) -> None:
+        source = src_layer.recurrent_states
+        target = storage.recurrent_states
+        expected_source = (batch_size, *self._key_major_recurrent_shape[1:])
+        if (
+            source is None
+            or tuple(source.shape) != expected_source
+            or source.dtype != torch.float32
+            or source.device != self.device
+            or not source.is_contiguous()
+        ):
+            raise RuntimeError(
+                "Qwen generated prefill requires contiguous sequence-major FP32 state"
+            )
+        if (
+            target is None
+            or tuple(target.shape) != self._value_major_recurrent_shape
+            or target.dtype != torch.bfloat16
+            or target.device != self.device
+            or not target.is_contiguous()
+        ):
+            raise RuntimeError("Qwen generated recurrent state pool is incomplete")
 
     @staticmethod
     def _validate_prefill_recurrent(

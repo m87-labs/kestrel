@@ -127,30 +127,37 @@ def test_generated_state_pool_rejects_incompatible_physical_forms(form):
         _state_pool().recurrent_tensors_for_form(form)
 
 
-def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
+def test_generated_prefill_commits_fp32_state_to_bf16_pool_rows():
     config = _linear_config()
     pool = _state_pool(config)
     recurrent = pool.recurrent_tensors_for_form(_generated_form())
     cache = _inference_cache(config)
-    pool.bind_generated_prefill_state(cache)
-    indices = torch.tensor([3, 1], dtype=torch.long)
 
     for layer_idx in (0, 2):
         target = recurrent[layer_idx]
         layer = cache.layers[layer_idx]
         assert target is not None
-        assert layer.recurrent_states is target
-        target[3].fill_(layer_idx + 1)
-        target[1].fill_(layer_idx + 2)
+        source = torch.arange(24, dtype=torch.float32).reshape(2, 2, 2, 3)
+        layer.recurrent_states = source.add(layer_idx * 100)
         layer.conv_states = torch.full(
             (2, 10, 4), layer_idx + 3, dtype=torch.bfloat16)
         layer.has_previous_state = True
 
-    pool.capture_batch_from_cache(indices, cache, batch_size=2)
+    pool.capture_batch_from_cache((3, 1), cache, batch_size=2)
 
     for layer_idx in (0, 2):
         storage = pool.layers[layer_idx]
+        source = cache.layers[layer_idx].recurrent_states
         assert storage is not None and storage.conv_states is not None
+        assert source is not None
+        assert torch.equal(
+            storage.recurrent_states[3],
+            source[0].transpose(-1, -2).to(torch.bfloat16),
+        )
+        assert torch.equal(
+            storage.recurrent_states[1],
+            source[1].transpose(-1, -2).to(torch.bfloat16),
+        )
         assert torch.all(storage.conv_states[3] == layer_idx + 3)
         assert torch.all(storage.conv_states[1] == layer_idx + 3)
         assert storage.replay_checkpoint_states is None
@@ -164,7 +171,51 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
         assert torch.count_nonzero(state[3]) > 0
 
 
-def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
+@pytest.mark.parametrize(
+    ("rows", "batch_size"),
+    (((1, 1), 2), ((-1,), 1), ((4,), 1), ((1,), 2), ((1.0,), 1)),
+)
+def test_generated_prefill_rejects_invalid_host_rows_before_writes(rows, batch_size):
+    pool = _state_pool()
+    recurrent = pool.recurrent_tensors_for_form(_generated_form())
+    cache = _inference_cache()
+
+    with pytest.raises(ValueError, match="state rows|state row"):
+        pool.capture_batch_from_cache(rows, cache, batch_size=batch_size)
+
+    for layer_idx in (0, 2):
+        state = recurrent[layer_idx]
+        assert state is not None
+        assert torch.count_nonzero(state) == 0
+
+
+def test_generated_prefill_validates_all_layers_before_first_write():
+    config = _linear_config()
+    pool = _state_pool(config)
+    recurrent = pool.recurrent_tensors_for_form(_generated_form())
+    cache = _inference_cache(config)
+
+    for layer_idx in (0, 2):
+        layer = cache.layers[layer_idx]
+        layer.conv_states = torch.ones((1, 10, 4), dtype=torch.bfloat16)
+        layer.recurrent_states = torch.ones((1, 2, 2, 3), dtype=torch.float32)
+        layer.has_previous_state = True
+    cache.layers[2].recurrent_states = cache.layers[2].recurrent_states.to(
+        torch.bfloat16
+    )
+
+    with pytest.raises(RuntimeError, match="sequence-major FP32"):
+        pool.capture_batch_from_cache((3,), cache, batch_size=1)
+
+    for layer_idx in (0, 2):
+        state = recurrent[layer_idx]
+        storage = pool.layers[layer_idx]
+        assert state is not None and storage is not None
+        assert torch.count_nonzero(state) == 0
+        assert torch.count_nonzero(storage.conv_states) == 0
+
+
+def test_generated_prefill_uses_fast_fp32_recurrence_without_replay_state():
     config = SimpleNamespace(
         hidden_size=4,
         linear_num_key_heads=1,
@@ -187,6 +238,7 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     module.allocate_packed_gdn_prefill_workspace = (
         lambda *_args, **_kwargs: workspace
     )
+    module.norm.forward = lambda value, _gate: value
     captured = {}
 
     def combined(mixed_qkv, _a, _b, _A_log, _dt_bias, _cu, **kwargs):
@@ -198,37 +250,65 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
             indices=indices,
             workspace=kwargs["workspace"],
         )
-        state[indices[0]].fill_(1)
-        state[indices[1]].fill_(2)
+        state[0].fill_(1)
+        state[1].fill_(2)
         return torch.zeros_like(workspace.out), state
 
     module.packed_gated_delta_rule_prefill = combined
-    pool = _state_pool(config)
-    recurrent_states = pool.recurrent_tensors_for_form(_generated_form())
     cache = Qwen35InferenceCache(
         config=config,
         paged_kv=(None,),
         replay_capacity=2,
+        prepare_gdn_replay_state=False,
     )
-    pool.bind_generated_prefill_state(cache)
-    indices = torch.tensor([3, 1], dtype=torch.long)
+    cache.layers[0]._reset_replay_rows = lambda *_args: pytest.fail(
+        "generated prefill must not allocate replay state"
+    )
 
     module(
         torch.zeros((1, 3, 4), dtype=torch.bfloat16),
         cache_params=cache,
         cu_seq_lens_q=torch.tensor([0, 1, 3], dtype=torch.int32),
-        gdn_state_indices=indices,
     )
 
-    state = recurrent_states[0]
+    state = cache.layers[0].recurrent_states
     assert state is not None
+    assert state.shape == (2, 2, 2, 2)
+    assert state.dtype == torch.float32
     assert captured["state"] is state
-    assert torch.equal(captured["indices"], indices)
+    assert captured["indices"] is None
     assert captured["workspace"] is workspace
-    assert torch.all(state[3] == 1)
+    assert torch.all(state[0] == 1)
     assert torch.all(state[1] == 2)
-    assert torch.count_nonzero(state[0]) == 0
     assert cache.layers[0].replay_checkpoint_states is None
+
+
+def test_packed_prefill_rejects_direct_state_indices():
+    config = SimpleNamespace(
+        hidden_size=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=2,
+        rms_norm_eps=1e-6,
+        layer_types=("linear_attention",),
+    )
+    module = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    module.supports_packed_gdn = lambda *_args: True
+    cache = Qwen35InferenceCache(
+        config=config,
+        paged_kv=(None,),
+        replay_capacity=2,
+    )
+
+    with pytest.raises(RuntimeError, match="committed after recurrence"):
+        module(
+            torch.zeros((1, 3, 4), dtype=torch.bfloat16),
+            cache_params=cache,
+            cu_seq_lens_q=torch.tensor([0, 1, 3], dtype=torch.int32),
+            gdn_state_indices=torch.tensor([3, 1], dtype=torch.long),
+        )
 
 
 def test_packed_gdn_prefill_workspace_cache_reuses_capacity():

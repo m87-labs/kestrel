@@ -68,9 +68,12 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     model = SimpleNamespace(model=lambda **kwargs: observed.update(kwargs) or output)
     runtime = object.__new__(Qwen35Runtime)
     runtime.model = model
-    runtime._new_cache = lambda: cache
+    runtime._new_cache = lambda **kwargs: (
+        observed.update(new_cache=kwargs) or cache
+    )
 
     marker = object()
+    runtime.generated_decode = marker
     packed = _PackedPrefillBatch(
         input_ids=marker,
         cache_position_ids=marker,
@@ -79,7 +82,6 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
         sequence_lengths=(544, 137),
         topology_token=marker,
         seq_idx=marker,
-        batch_indices=marker,
         max_length=544,
         last_token_offsets=marker,
         paged_kv_page_table=marker,
@@ -94,6 +96,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     assert returned_cache is cache
     assert observed["sequence_lengths"] == (544, 137)
     assert observed["topology_token"] is marker
+    assert observed["new_cache"] == {"prepare_gdn_replay_state": False}
     assert observed["max"] == 544
 
 
@@ -103,16 +106,22 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         conv_states=None,
         recurrent_states=None,
         has_previous_state=False,
-        _reset_replay_rows=lambda state, indices: None,
+        _reset_replay_rows=lambda state, indices: observed.update(
+            replay_reset_state=state,
+            replay_reset_indices=indices,
+        ),
     )
     cache = SimpleNamespace(
         layers=[layer],
         has_previous_state=lambda layer_idx: False,
+        prepare_gdn_replay_state=True,
     )
     conv1d = SimpleNamespace(
         weight=torch.ones((1, 1, 1)),
         bias=None,
     )
+
+    workspace = SimpleNamespace()
 
     def recurrent(*args, **kwargs):
         observed.update(kwargs)
@@ -134,14 +143,11 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         in_proj=lambda hidden: torch.zeros((1, 3, 4)),
         supports_packed_gdn=lambda *args: True,
         causal_conv1d_packed=lambda **kwargs: kwargs["x"],
-        packed_prefill_prepare=lambda *args: (
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1)),
-            torch.zeros((1, 3, 1)),
+        _prefill_workspace_cache=SimpleNamespace(
+            get=lambda *_args, **_kwargs: workspace,
         ),
-        packed_recurrent_prefill=recurrent,
+        allocate_packed_gdn_prefill_workspace=lambda *_args, **_kwargs: workspace,
+        packed_gated_delta_rule_prefill=recurrent,
         norm=lambda value, gate: value,
         out_proj=lambda value: value,
     )
@@ -159,3 +165,6 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
     assert result.shape == (1, 3, 1)
     assert observed["sequence_lengths"] == (3,)
     assert observed["topology_token"] is fake
+    assert observed["final_state_indices"] is None
+    assert observed["replay_reset_state"] is layer.recurrent_states
+    assert observed["replay_reset_indices"] is None
