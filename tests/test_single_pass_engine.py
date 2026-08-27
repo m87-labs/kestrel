@@ -32,13 +32,14 @@ class _StubSinglePass:
         self.model_name = model_name
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
+        self.batch_capacity = 2
         self.calls: list[tuple[str, Any]] = []
 
-    def forward(self, task: str, inputs: Any) -> Any:
+    def forward(self, task: str, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         self.calls.append((task, inputs))
         if task == "boom":
             raise ValueError("forward failed")
-        return {"task": task, "inputs": inputs}
+        return tuple({"task": task, "inputs": value} for value in inputs)
 
     def tasks(self) -> tuple[str, ...]:
         return ("segment", "boom")
@@ -88,7 +89,9 @@ async def _run(task: str, inputs: Any) -> Any:
     thread = threading.Thread(target=engine._scheduler_loop, name="kernel", daemon=True)
     thread.start()
     try:
-        return await asyncio.wait_for(engine.run(sp.model_name, task, inputs), timeout=5.0)
+        return await asyncio.wait_for(
+            engine.run(sp.model_name, task, inputs), timeout=5.0
+        )
     finally:
         engine._shutdown = True
         engine._scheduler_queue.put(None)
@@ -390,7 +393,9 @@ def test_single_pass_lane_crash_does_not_kill_the_kernel() -> None:
             thread.start()
             try:
                 # The bad lane crashes on its request; the good lane still works.
-                with pytest.raises(RuntimeError, match="Engine shut down|lane exploded"):
+                with pytest.raises(
+                    RuntimeError, match="Engine shut down|lane exploded"
+                ):
                     await asyncio.wait_for(
                         engine.run("bad-sp", "segment", {}), timeout=5.0
                     )

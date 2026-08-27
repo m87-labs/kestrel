@@ -34,12 +34,15 @@ class _SPStub:
         self.model_name = model_name
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
+        self.batch_capacity = 1
 
     def tasks(self) -> tuple[str, ...]:
         return ("segment",)
 
-    def forward(self, task: str, inputs: Any) -> Any:  # pragma: no cover - unused here
-        return {"task": task, "inputs": inputs}
+    def forward(
+        self, task: str, inputs: tuple[Any, ...]
+    ) -> tuple[Any, ...]:  # pragma: no cover - unused here
+        return tuple({"task": task, "inputs": value} for value in inputs)
 
     def shutdown(self) -> None:
         pass

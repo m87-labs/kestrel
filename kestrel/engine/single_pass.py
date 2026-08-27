@@ -1,21 +1,16 @@
 """The single-pass executor lane.
 
-A single-pass driver (:class:`~kestrel.runtime.SinglePassRuntime`) fulfils
-a request with one ``forward(task, inputs)`` that enqueues kernels and
-returns result tensors *without* a host sync. This executor owns the
-pipeline around that call — a slot pool, a completion event per in-flight
-forward, and result delivery — so a single-pass forward overlaps
-autoregressive decode on the shared stream (async launch + deferred
-collect, the autoregressive pipeline's trick generalized to a second
-lane).
+A single-pass driver (:class:`~kestrel.runtime.SinglePassRuntime`) fulfils a
+same-task request cohort with one ``forward(task, inputs)``. This executor owns
+cohort formation, completion events, and per-request result delivery.
 
 It presents the same uniform :class:`Executor` face the kernel folds over
 (``submit`` / ``advance`` -> :class:`TickResult` / ``shutdown``) and emits
 :class:`Completion` values; like the autoregressive lane, it never touches
 the event loop.
 
-First cut: one in-flight forward (``max_in_flight=1``). Adding slots or
-batching is a parameter change here, not a new abstraction.
+One forward is in flight by default; each forward may contain up to the
+runtime's declared ``batch_capacity``.
 """
 
 from __future__ import annotations
@@ -24,7 +19,7 @@ import asyncio
 import logging
 import queue
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 from kestrel.device import make_event, stream_context
 from kestrel.runtime import SinglePassRuntime
@@ -96,14 +91,14 @@ def _single_pass_result(request_id: int, output: Any) -> EngineResult:
 class _InFlight:
     """A forward whose kernels are enqueued and whose result is pending.
 
-    ``error`` is set instead of ``output``/``done_event`` when the
+    ``error`` is set instead of ``outputs``/``done_event`` when the
     ``forward`` call raised at launch; it surfaces as an error completion
     on the next collect, keeping launch failures on the same path as
     results.
     """
 
-    request: _SinglePassRequest
-    output: Any
+    requests: tuple[_SinglePassRequest, ...]
+    outputs: tuple[Any, ...]
     done_event: Any  # torch.cuda.Event | NoopEvent | None
     error: Optional[BaseException] = None
 
@@ -122,7 +117,11 @@ class SinglePassExecutor:
         self._device = runtime.device
         self._stream = compute_stream
         self._max_in_flight = max_in_flight
+        if runtime.batch_capacity < 1:
+            raise ValueError("single-pass batch_capacity must be positive")
+        self._batch_capacity = runtime.batch_capacity
         self._queue: "queue.Queue[_SinglePassRequest]" = queue.Queue()
+        self._deferred: _SinglePassRequest | None = None
         self._in_flight: List[_InFlight] = []
 
     # -- ingress (event-loop thread) ----------------------------------
@@ -134,7 +133,11 @@ class SinglePassExecutor:
 
     @property
     def has_work(self) -> bool:
-        return bool(self._in_flight) or not self._queue.empty()
+        return (
+            bool(self._in_flight)
+            or self._deferred is not None
+            or not self._queue.empty()
+        )
 
     @property
     def has_in_flight(self) -> bool:
@@ -159,9 +162,14 @@ class SinglePassExecutor:
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")
         completions: List[Completion] = [
-            Completion(request=f.request, error=exc) for f in self._in_flight
+            Completion(request=request, error=exc)
+            for in_flight in self._in_flight
+            for request in in_flight.requests
         ]
         self._in_flight = []
+        if self._deferred is not None:
+            completions.append(Completion(request=self._deferred, error=exc))
+            self._deferred = None
         while True:
             try:
                 req = self._queue.get_nowait()
@@ -177,27 +185,62 @@ class SinglePassExecutor:
         launched = False
         while len(self._in_flight) < self._max_in_flight:
             try:
-                req = self._queue.get_nowait()
+                requests = self._take_batch()
             except queue.Empty:
                 break
-            launched = self._launch_one(req) or launched
+            launched = self._launch_batch(requests) or launched
         return launched
 
-    def _launch_one(self, req: _SinglePassRequest) -> bool:
+    def _take_batch(self) -> tuple[_SinglePassRequest, ...]:
+        if self._deferred is None:
+            first = self._queue.get_nowait()
+        else:
+            first, self._deferred = self._deferred, None
+        requests = [first]
+        while len(requests) < self._batch_capacity:
+            try:
+                request = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if request.task != first.task:
+                self._deferred = request
+                break
+            requests.append(request)
+        return tuple(requests)
+
+    def _launch_batch(self, requests: Sequence[_SinglePassRequest]) -> bool:
         try:
             with stream_context(self._stream):
-                output = self._runtime.forward(req.task, req.inputs)
+                outputs = tuple(
+                    self._runtime.forward(
+                        requests[0].task,
+                        tuple(request.inputs for request in requests),
+                    )
+                )
+                if len(outputs) != len(requests):
+                    raise ValueError(
+                        "single-pass forward returned "
+                        f"{len(outputs)} results for {len(requests)} requests"
+                    )
                 done_event = make_event(self._device)
                 done_event.record()
         except Exception as exc:
-            # Launch-time failure: hold the error so it surfaces as a
-            # completion on the next collect, uniform with normal results.
             self._in_flight.append(
-                _InFlight(request=req, output=None, done_event=None, error=exc)
+                _InFlight(
+                    requests=tuple(requests),
+                    outputs=(),
+                    done_event=None,
+                    error=exc,
+                )
             )
             return True
         self._in_flight.append(
-            _InFlight(request=req, output=output, done_event=done_event, error=None)
+            _InFlight(
+                requests=tuple(requests),
+                outputs=outputs,
+                done_event=done_event,
+                error=None,
+            )
         )
         return True
 
@@ -209,13 +252,20 @@ class SinglePassExecutor:
         completed: List[Completion] = []
         for f in self._in_flight:
             if f.error is not None:
-                completed.append(Completion(request=f.request, error=f.error))
+                completed.extend(
+                    Completion(request=request, error=f.error) for request in f.requests
+                )
             elif f.done_event.query():
-                completed.append(
-                    Completion(
-                        request=f.request,
-                        result=_single_pass_result(f.request.request_id, f.output),
+                completed.extend(
+                    (
+                        Completion(request=request, error=output)
+                        if isinstance(output, BaseException)
+                        else Completion(
+                            request=request,
+                            result=_single_pass_result(request.request_id, output),
+                        )
                     )
+                    for request, output in zip(f.requests, f.outputs, strict=True)
                 )
             else:
                 still.append(f)

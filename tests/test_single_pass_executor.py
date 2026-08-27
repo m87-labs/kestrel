@@ -9,7 +9,6 @@ integration is covered separately by the engine e2e test.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -29,13 +28,19 @@ class _StubDriver:
         # reports done immediately, so collect() fires on the next tick.
         self.device = torch.device("cpu")
         self.execution_shape = ExecutionShape.SINGLE_PASS
+        self.batch_capacity = 2
         self.calls: list[tuple[str, Any]] = []
 
-    def forward(self, task: str, inputs: Any) -> Any:
+    def forward(self, task: str, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         self.calls.append((task, inputs))
         if task == "boom":
             raise ValueError("forward failed")
-        return {"task": task, "inputs": inputs}
+        return tuple(
+            ValueError("invalid input")
+            if value == "bad"
+            else {"task": task, "inputs": value}
+            for value in inputs
+        )
 
     def shutdown(self) -> None:
         pass
@@ -84,7 +89,7 @@ def test_forward_error_becomes_error_completion() -> None:
 
 
 def test_one_in_flight_at_a_time() -> None:
-    """Default max_in_flight=1: a second job waits until the first frees."""
+    """Default max_in_flight=1: a second task waits until the first frees."""
     driver = _StubDriver()
     ex = SinglePassExecutor(driver, compute_stream=None, max_in_flight=1)
     ex.submit(_req(3, "a", 1))
@@ -99,6 +104,33 @@ def test_one_in_flight_at_a_time() -> None:
     tick2 = ex.advance()
     assert [c.request.request_id for c in tick2.completed] == [4]
     assert ex.has_work is False
+
+
+def test_same_task_requests_share_one_forward() -> None:
+    driver = _StubDriver()
+    ex = SinglePassExecutor(driver, compute_stream=None)
+    ex.submit(_req(8, "segment", 1))
+    ex.submit(_req(9, "segment", 2))
+
+    tick = ex.advance()
+
+    assert driver.calls == [("segment", (1, 2))]
+    assert [completion.result.output for completion in tick.completed] == [
+        {"task": "segment", "inputs": 1},
+        {"task": "segment", "inputs": 2},
+    ]
+
+
+def test_one_invalid_input_does_not_fail_its_batch() -> None:
+    ex = SinglePassExecutor(_StubDriver(), compute_stream=None)
+    ex.submit(_req(10, "segment", "bad"))
+    ex.submit(_req(11, "segment", "valid"))
+
+    tick = ex.advance()
+
+    assert isinstance(tick.completed[0].error, ValueError)
+    assert tick.completed[1].error is None
+    assert tick.completed[1].result.output["inputs"] == "valid"
 
 
 def test_idle_executor_reports_no_work() -> None:
