@@ -147,9 +147,7 @@ class AutoregressiveRuntime(Runtime, Protocol):
     # Gemma's resize+normalize), so the dispatch lives here. Async so
     # the engine can hide preprocessing latency behind admission /
     # other work.
-    def preprocess_image_async(
-        self, image: np.ndarray | bytes
-    ) -> Future[Any]: ...
+    def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[Any]: ...
 
     def preprocess_encoder_input_async(self, encoder_input: object) -> Future[Any]: ...
 
@@ -245,18 +243,15 @@ class AutoregressiveRuntime(Runtime, Protocol):
 class SinglePassRuntime(Runtime, Protocol):
     """Runtime that fulfills a request with a single forward.
 
-    No KV cache, no decode loop. The driver is pure compute: ``forward``
-    enqueues the kernels for one forward and returns the result tensors
-    *without* a host sync. The engine supplies the compute stream shared
-    with the autoregressive lane when it constructs the runtime. The
-    executor owns the completion event, slot, and result delivery (the
-    driver↔executor split mirrors the autoregressive path, where the
-    model computes and the scheduler owns the pipeline).
+    No KV cache. ``forward`` runs one same-task request cohort and returns one
+    result per input. The engine supplies the compute stream shared with the
+    autoregressive lane and owns cohort formation, completion events, and
+    result delivery.
 
-    A synchronous ``forward`` (one that blocks on its own result) would
-    stall the kernel loop and defeat interleaving — implementations must
-    not call ``.item()`` / ``.cpu()`` / ``torch.cuda.synchronize`` before
-    returning.
+    Runtimes should return after enqueueing device work when their algorithm
+    permits it. A runtime that needs host decisions may finish the forward
+    synchronously; that blocks interleaving with other engine lanes until it
+    returns.
     """
 
     # Capability names this runtime serves, e.g. ("segment_masks",). The
@@ -265,11 +260,17 @@ class SinglePassRuntime(Runtime, Protocol):
     # contract — declared here, not discovered via getattr.
     def tasks(self) -> Sequence[str]: ...
 
-    def preprocess_image_async(
-        self, image: np.ndarray | bytes
-    ) -> Future[Any]: ...
+    def preprocess_image_async(self, image: np.ndarray | bytes) -> Future[Any]: ...
 
-    def forward(self, task: str, inputs: Any) -> Any: ...
+    # Maximum number of same-task requests accepted by one forward.
+    batch_capacity: int
+
+    # Per-request validation failures are returned in their result position so
+    # one malformed input does not fail the rest of its cohort. Raising fails
+    # the whole forward and is reserved for batch-wide execution failures.
+    def forward(
+        self, task: str, inputs: Sequence[Any]
+    ) -> Sequence[Any | BaseException]: ...
 
 
 class StreamingRuntime(Runtime, Protocol):
