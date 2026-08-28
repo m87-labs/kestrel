@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -32,7 +33,7 @@ from kestrel.runtime.tokens import TextToken, Token
 from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 from kestrel.utils import CpuGpuBuffer
 
-from kestrel.models.asr.audio import DecodedAudio, decode_audio
+from kestrel.models.asr.audio import MAX_SHORT_AUDIO_SECONDS, DecodedAudio, decode_audio
 from kestrel.models.asr.contract import TranscriptionRequest
 
 from .alignment import LoadedForcedAligner, align_transcript, load_forced_aligner
@@ -272,6 +273,25 @@ class Qwen3AsrRuntime(UncachedPagedRuntime):
         return features.to(self.dtype), masks
 
     def preprocess_encoder_input_async(self, encoder_input: object) -> Any:
+        if isinstance(encoder_input, TranscriptionRequest):
+            audio = encoder_input.audio
+            short_pcm = (
+                isinstance(audio, (np.ndarray, torch.Tensor))
+                and encoder_input.sample_rate == 16_000
+                and encoder_input.clip_start_seconds == 0
+                and encoder_input.clip_end_seconds is None
+                and audio.ndim == 1
+                and int(audio.shape[0]) <= MAX_SHORT_AUDIO_SECONDS * 16_000
+            )
+            if short_pcm:
+                # A completed future lets one already-decoded PCM burst reach
+                # admission together without delaying an individual request.
+                completed: Future[Any] = Future()
+                try:
+                    completed.set_result(self._prepare_audio(encoder_input))
+                except Exception as exc:
+                    completed.set_exception(exc)
+                return completed
         return self._audio_preprocessor.submit(encoder_input)
 
     def preprocess_image_async(self, image: object) -> None:

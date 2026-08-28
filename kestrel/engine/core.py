@@ -1183,9 +1183,24 @@ class InferenceEngine:
                 self._fail_request(request, self._scheduler_failed_error())
                 continue
             self._scheduler_queue.put(request)
+            shutdown = False
+            for _ in range(self.runtime.max_batch_size - 1):
+                try:
+                    queued = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if queued is None:
+                    shutdown = True
+                    break
+                self._scheduler_queue.put(queued)
+
             self._scheduler_event.set()
             if self._scheduler_error is not None:
                 self._fail_all_pending(self._scheduler_failed_error())
+            if shutdown:
+                self._scheduler_queue.put(None)
+                self._scheduler_event.set()
+                break
 
         while not self._queue.empty():
             pending = self._queue.get_nowait()

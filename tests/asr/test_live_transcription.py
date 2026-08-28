@@ -92,6 +92,31 @@ def test_qwen_live_pcm_does_not_strand_a_tiny_final_tail() -> None:
     assert result.output["duration_seconds"] == 30.01
 
 
+def test_qwen_short_pcm_goes_directly_to_inference(monkeypatch) -> None:
+    def unexpected_open(*_args):
+        raise AssertionError("opened short PCM")
+
+    monkeypatch.setattr(
+        "kestrel.models.qwen3_asr.longform.open_audio_source",
+        unexpected_open,
+    )
+    audio = np.zeros(8 * 16_000, dtype=np.float32)
+
+    async def invoke(prompt, *, image=None, settings=None):
+        assert prompt["audio"] is audio
+        return _result(1, "short")
+
+    result = asyncio.run(
+        Qwen3AsrLongFormOrchestrator().run(
+            invoke,
+            image=None,
+            prompt={"audio": audio, "sample_rate": 16_000},
+            settings=None,
+        )
+    )
+    assert result.output["text"] == "short"
+
+
 def test_qwen_short_file_stream_uses_capability_updates(monkeypatch) -> None:
     class Source:
         duration_seconds = 10.0

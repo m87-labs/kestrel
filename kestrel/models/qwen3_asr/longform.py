@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
+import numpy as np
+from torch import Tensor
+
 from kestrel.engine import CapabilityStream, EngineResult
 from kestrel.skills.base import CapabilityInvoker, CapabilityOrchestrator
 
@@ -21,6 +24,17 @@ from kestrel.models.asr.longform import (
 
 _CHUNK_SECONDS = {"none": 1_200, "segment": 30, "word": 180}
 _NO_SPACE_LANGUAGES = frozenset({"ja", "th", "yue", "zh"})
+
+
+def _fits_one_chunk(request: TranscriptionRequest, seconds: int) -> bool:
+    audio = request.audio
+    rate = request.sample_rate
+    return (
+        isinstance(audio, (np.ndarray, Tensor))
+        and rate is not None
+        and audio.ndim == 1
+        and int(audio.shape[0]) <= seconds * rate
+    )
 
 
 def _join_text(parts: list[str], languages: list[str]) -> str:
@@ -335,6 +349,8 @@ class Qwen3AsrLongFormOrchestrator(CapabilityOrchestrator):
                 settings=settings,
             )
         timestamps = request.timestamps
+        if not request.stream and _fits_one_chunk(request, _CHUNK_SECONDS[timestamps]):
+            return await invoke(prompt, image=image, settings=settings)
         audio = await settled_to_thread(snapshot_file_like, request.audio)
         owned_prompt = {**prompt, "audio": audio}
         source = await settled_to_thread(open_audio_source, audio, request)
