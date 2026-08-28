@@ -1333,6 +1333,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             seq_idx=packed.seq_idx,
             gdn_state_indices=(
                 packed.batch_indices if self.generated_decode is not None else None),
+            gdn_state_indices_allocator_owned=self.generated_decode is not None,
         )
         outputs.past_key_values.advance_to(packed.max_length)
         return outputs.last_hidden_state, outputs.past_key_values

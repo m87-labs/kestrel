@@ -294,6 +294,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
+        gdn_state_indices_allocator_owned: bool = False,
     ):
         if attention_mask is not None:
             raise RuntimeError("Qwen GDN requires packed sequence metadata")
@@ -482,6 +483,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 output_final_state=True,
                 final_state=packed_recurrent_state,
                 final_state_indices=state_indices,
+                final_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
             )
             if state_indices is None:
                 # Native decode consumes ReplaySSM state seeded from the packed
@@ -882,6 +884,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
+        gdn_state_indices_allocator_owned: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_states = normalized_hidden_states
 
@@ -894,6 +897,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 cu_seq_lens_q=cu_seq_lens_q,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
+                gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -1218,6 +1222,7 @@ class Qwen3_5TextModel(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
+        gdn_state_indices_allocator_owned: bool = False,
     ) -> _TextModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1275,6 +1280,7 @@ class Qwen3_5TextModel(nn.Module):
                 cu_seq_lens_q=cu_seq_lens_q,
                 seq_idx=seq_idx,
                 gdn_state_indices=gdn_state_indices,
+                gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
             )
 
         hidden_states = (
@@ -1365,6 +1371,7 @@ class Qwen3_5Model(nn.Module):
         cu_seq_lens_q: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
+        gdn_state_indices_allocator_owned: bool = False,
         vision_bilinear_indices: torch.Tensor | None = None,
         vision_bilinear_weights: torch.Tensor | None = None,
         vision_position_ids: torch.Tensor | None = None,
@@ -1408,6 +1415,7 @@ class Qwen3_5Model(nn.Module):
             cu_seq_lens_q=cu_seq_lens_q,
             seq_idx=seq_idx,
             gdn_state_indices=gdn_state_indices,
+            gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
         )
 
         return _TextModelOutput(
