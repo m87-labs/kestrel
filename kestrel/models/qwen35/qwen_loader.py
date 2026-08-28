@@ -10,7 +10,6 @@ from typing import Any
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
-from safetensors.torch import load_file
 
 from .qwen_config import Qwen3_5Config
 from .qwen_model import Qwen3_5ForConditionalGeneration, Qwen3_5RMSNormGated
@@ -41,6 +40,7 @@ _FP8_TEXT_DENSE_WEIGHT_RE = re.compile(
     r"(?!experts\.)"
     r".+\.weight$"
 )
+_DEQUANT_CHUNK_ROWS = 1024
 
 
 def _torch_device_arg(device: torch.device) -> str:
@@ -129,11 +129,11 @@ def _loadable_tensor(
         value = _dequantize_fp8_weight(value, scale_inv, expected_shape, key=key)
     if key.endswith("visual.patch_embed.proj.weight") and value.ndim == 5:
         value = value.reshape(value.shape[0], -1)
-        if value.shape != expected_shape:
-            raise ValueError(
-                "Qwen vision patch projection weight has unexpected shape after "
-                f"flattening: got {tuple(value.shape)}, expected {tuple(expected_shape)}"
-            )
+    if value.shape != expected_shape:
+        raise ValueError(
+            f"Qwen weight {key!r} has shape {tuple(value.shape)}, "
+            f"expected {tuple(expected_shape)}"
+        )
     if key in qwen_rms_norm_weight_keys:
         return value.to(torch.float32) + 1.0
     return value
@@ -182,14 +182,23 @@ def _dequantize_fp8_weight(
             f"Qwen FP8 weight scale {_scale_inv_key(key)!r} has shape "
             f"{tuple(scale_inv.shape)}, expected {expected_scale_shape}"
         )
-    expanded_scale = scale_inv.repeat_interleave(block_m, dim=0).repeat_interleave(
-        block_n,
-        dim=1,
-    )
-    expanded_scale = expanded_scale[: value.shape[0], : value.shape[1]]
-    return (value.to(torch.float32) * expanded_scale.to(torch.float32)).to(
-        torch.bfloat16
-    )
+    output = torch.empty(value.shape, dtype=torch.bfloat16, device=value.device)
+    scale_fp32 = scale_inv.to(torch.float32)
+    for row_start in range(0, value.shape[0], _DEQUANT_CHUNK_ROWS):
+        row_end = min(row_start + _DEQUANT_CHUNK_ROWS, value.shape[0])
+        scale_row_start = row_start // block_m
+        scale_row_end = (row_end + block_m - 1) // block_m
+        expanded_scale = scale_fp32[
+            scale_row_start:scale_row_end
+        ].repeat_interleave(block_m, dim=0)
+        expanded_scale = expanded_scale[
+            : row_end - row_start
+        ].repeat_interleave(block_n, dim=1)
+        expanded_scale = expanded_scale[:, : value.shape[1]]
+        chunk = value[row_start:row_end].to(torch.float32)
+        chunk.mul_(expanded_scale)
+        output[row_start:row_end].copy_(chunk)
+    return output
 
 
 def _load_fp8_expert_weight_and_scale(
@@ -252,33 +261,68 @@ def _interleave_gate_up_weight(gate: torch.Tensor, up: torch.Tensor) -> torch.Te
     )
 
 
-def _load_ready_fused_projections(
-    model: torch.nn.Module,
-    pending: dict[str, dict[str, torch.Tensor]],
-    pending_parts: dict[str, tuple[str, ...]],
+def _copy_fused_projection_part(
+    expected_state: dict[str, torch.Tensor],
+    tensor_shapes: dict[str, torch.Size],
+    *,
+    checkpoint_key: str,
+    fused_key: str,
+    part: str,
+    parts: tuple[str, ...],
+    value: torch.Tensor,
+    loaded_parts: dict[str, set[str]],
     loaded_keys: set[str],
 ) -> None:
-    compatible_state = {}
-    for fused_key, part_tensors in list(pending.items()):
-        parts = pending_parts[fused_key]
-        if not all(part in part_tensors for part in parts):
-            continue
-        if parts == _MLP_GATE_UP_WEIGHT_PARTS:
-            compatible_state[fused_key] = _interleave_gate_up_weight(
-                part_tensors["gate_proj.weight"],
-                part_tensors["up_proj.weight"],
+    target = expected_state[fused_key]
+    if value.shape != tensor_shapes[checkpoint_key]:
+        raise ValueError(
+            f"checkpoint tensor {checkpoint_key!r} changed shape while loading"
+        )
+    seen = loaded_parts.setdefault(fused_key, set())
+    if part in seen:
+        raise ValueError(f"duplicate fused projection part {checkpoint_key!r}")
+    if parts == _MLP_GATE_UP_WEIGHT_PARTS:
+        expected_target_shape = (2 * value.shape[0], *value.shape[1:])
+        if target.shape != expected_target_shape:
+            raise ValueError(
+                f"fused target {fused_key!r} has shape {tuple(target.shape)}, "
+                f"expected {expected_target_shape}"
             )
-        else:
-            compatible_state[fused_key] = torch.cat(
-                [part_tensors[part] for part in parts],
-                dim=0,
+        slot = parts.index(part)
+        target_blocks = target.reshape(
+            target.shape[0] // 16,
+            2,
+            8,
+            *target.shape[1:],
+        )
+        source_blocks = value.reshape(
+            value.shape[0] // 8,
+            8,
+            *value.shape[1:],
+        )
+        with torch.no_grad():
+            target_blocks[:, slot].copy_(source_blocks)
+    else:
+        prefix = checkpoint_key[: -len(part)]
+        expected_target_shape = (
+            sum(tensor_shapes[f"{prefix}{item}"][0] for item in parts),
+            *value.shape[1:],
+        )
+        if target.shape != expected_target_shape:
+            raise ValueError(
+                f"fused target {fused_key!r} has shape {tuple(target.shape)}, "
+                f"expected {expected_target_shape}"
             )
-        loaded_keys.add(fused_key)
-        del pending[fused_key]
-        del pending_parts[fused_key]
+        offset = sum(
+            tensor_shapes[f"{prefix}{previous}"][0]
+            for previous in parts[: parts.index(part)]
+        )
+        with torch.no_grad():
+            target.narrow(0, offset, value.shape[0]).copy_(value)
 
-    if compatible_state:
-        model.load_state_dict(compatible_state, strict=False)
+    seen.add(part)
+    if seen == set(parts):
+        loaded_keys.add(fused_key)
 
 
 def _load_ready_packed_experts(
@@ -380,8 +424,7 @@ def _load_sharded_safetensors(
     expected_state = model.state_dict()
     expected_keys = set(expected_state)
     loaded_keys: set[str] = set()
-    pending_fused: dict[str, dict[str, torch.Tensor]] = {}
-    pending_fused_parts: dict[str, tuple[str, ...]] = {}
+    loaded_fused_parts: dict[str, set[str]] = {}
     pending_experts: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
     qwen_rms_norm_weight_keys = _qwen_rms_norm_weight_keys(model)
     qwen_gdn_norm_weight_keys = _qwen_gdn_norm_weight_keys(model)
@@ -394,35 +437,43 @@ def _load_sharded_safetensors(
         )
         for shard_name in shard_names
     ]
+    tensor_shapes: dict[str, torch.Size] = {}
+    for _shard_name, shard_path in shard_paths:
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key in tensor_shapes:
+                    raise ValueError(f"duplicate Qwen checkpoint tensor {key!r}")
+                tensor_shapes[key] = torch.Size(handle.get_slice(key).get_shape())
     scale_inv_by_key = _load_scale_inv_tensors(shard_paths, device_arg=device_arg)
 
     for _shard_name, shard_path in shard_paths:
-        shard_state = load_file(shard_path, device=device_arg)
-        compatible_state = {}
-        for key, value in shard_state.items():
-            if key.startswith("mtp."):
-                continue
-            if key.endswith(".weight_scale_inv"):
-                continue
-            if key in expected_keys:
-                scale_key = _scale_inv_key(key)
-                compatible_state[key] = _loadable_tensor(
-                    key,
-                    value,
-                    qwen_rms_norm_weight_keys,
-                    expected_state[key].shape,
-                    scale_inv_by_key.get(scale_key),
-                    convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
-                    exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
-                )
-                loaded_keys.add(key)
-                continue
-            fused_parts = _fused_projection_keys(key)
-            fused_handled = False
-            for fused_key, part, parts in fused_parts:
-                if fused_key in expected_keys:
-                    pending_fused.setdefault(fused_key, {})[part] = (
-                        _loadable_tensor(
+        with safe_open(shard_path, framework="pt", device=device_arg) as handle:
+            for key in handle.keys():
+                if key.startswith("mtp."):
+                    continue
+                if key.endswith(".weight_scale_inv"):
+                    continue
+                value = handle.get_tensor(key)
+                if key in expected_keys:
+                    scale_key = _scale_inv_key(key)
+                    loaded = _loadable_tensor(
+                        key,
+                        value,
+                        qwen_rms_norm_weight_keys,
+                        expected_state[key].shape,
+                        scale_inv_by_key.get(scale_key),
+                        convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                        exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
+                    )
+                    with torch.no_grad():
+                        expected_state[key].copy_(loaded)
+                    loaded_keys.add(key)
+                    continue
+                fused_parts = _fused_projection_keys(key)
+                fused_handled = False
+                for fused_key, part, parts in fused_parts:
+                    if fused_key in expected_keys:
+                        loaded = _loadable_tensor(
                             key,
                             value,
                             set(),
@@ -430,65 +481,60 @@ def _load_sharded_safetensors(
                             scale_inv_by_key.get(_scale_inv_key(key)),
                             convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
                         )
-                    )
-                    pending_fused_parts[fused_key] = parts
-                    fused_handled = True
-                    break
-            if fused_handled:
-                continue
-            expert_part = _expert_projection_key(key)
-            if expert_part is not None:
-                target_key, expert_idx, part = expert_part
-                if target_key in expected_keys:
-                    if expected_state[target_key].dtype == torch.uint8:
-                        target_shape = expected_state[target_key].shape
-                        if target_key.endswith("gate_up_proj"):
-                            expected_part_shape = torch.Size(
-                                (target_shape[1] // 2, target_shape[2])
-                            )
-                        else:
-                            expected_part_shape = torch.Size(
-                                (target_shape[1], target_shape[2])
-                            )
-                        weight, scale = _load_fp8_expert_weight_and_scale(
-                            value,
-                            scale_inv_by_key.get(_scale_inv_key(key)),
-                            expected_part_shape,
-                            key=key,
+                        _copy_fused_projection_part(
+                            expected_state,
+                            tensor_shapes,
+                            checkpoint_key=key,
+                            fused_key=fused_key,
+                            part=part,
+                            parts=parts,
+                            value=loaded,
+                            loaded_parts=loaded_fused_parts,
+                            loaded_keys=loaded_keys,
                         )
-                        expert_entry = pending_experts.setdefault(
-                            target_key, {}
-                        ).setdefault(expert_idx, {})
-                        expert_entry[part] = weight
-                        expert_entry[f"{part}_scale_inv"] = scale
-                        continue
-                    pending_experts.setdefault(target_key, {}).setdefault(
-                        expert_idx, {}
-                    )[part] = _loadable_tensor(
-                        key,
-                        value,
-                        set(),
-                        value.shape,
-                        scale_inv_by_key.get(_scale_inv_key(key)),
-                        convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
-                    )
+                        fused_handled = True
+                        break
+                if fused_handled:
                     continue
-            unexpected.append(key)
-        model.load_state_dict(compatible_state, strict=False)
-        _load_ready_fused_projections(
-            model,
-            pending_fused,
-            pending_fused_parts,
-            loaded_keys,
-        )
+                expert_part = _expert_projection_key(key)
+                if expert_part is not None:
+                    target_key, expert_idx, part = expert_part
+                    if target_key in expected_keys:
+                        if expected_state[target_key].dtype == torch.uint8:
+                            target_shape = expected_state[target_key].shape
+                            if target_key.endswith("gate_up_proj"):
+                                expected_part_shape = torch.Size(
+                                    (target_shape[1] // 2, target_shape[2])
+                                )
+                            else:
+                                expected_part_shape = torch.Size(
+                                    (target_shape[1], target_shape[2])
+                                )
+                            weight, scale = _load_fp8_expert_weight_and_scale(
+                                value,
+                                scale_inv_by_key.get(_scale_inv_key(key)),
+                                expected_part_shape,
+                                key=key,
+                            )
+                            expert_entry = pending_experts.setdefault(
+                                target_key, {}
+                            ).setdefault(expert_idx, {})
+                            expert_entry[part] = weight
+                            expert_entry[f"{part}_scale_inv"] = scale
+                            continue
+                        pending_experts.setdefault(target_key, {}).setdefault(
+                            expert_idx, {}
+                        )[part] = _loadable_tensor(
+                            key,
+                            value,
+                            set(),
+                            value.shape,
+                            scale_inv_by_key.get(_scale_inv_key(key)),
+                            convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                        )
+                        continue
+                unexpected.append(key)
         _load_ready_packed_experts(model, pending_experts, loaded_keys)
-        del shard_state, compatible_state
-    _load_ready_fused_projections(
-        model,
-        pending_fused,
-        pending_fused_parts,
-        loaded_keys,
-    )
     _load_ready_packed_experts(model, pending_experts, loaded_keys)
 
     missing = [
@@ -559,7 +605,11 @@ def load_qwen35_model(
         )
     if config.text_config.tie_word_embeddings:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
-    return model.to(device=device).eval()
+    model = model.to(device=device).eval()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+    return model
 
 
 __all__ = ["load_qwen35_model"]

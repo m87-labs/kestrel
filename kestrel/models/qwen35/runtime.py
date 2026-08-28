@@ -18,6 +18,7 @@ from torch import nn
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
+from kestrel.runtime.paged_resources import bound_kv_cache_pages
 from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
@@ -340,7 +341,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 stacklevel=2,
             )
         self.page_size = int(getattr(cfg, "page_size", 1))
-        self._kv_cache_pages = int(getattr(cfg, "kv_cache_pages", 65536))
+        self._kv_cache_pages = bound_kv_cache_pages(
+            int(getattr(cfg, "kv_cache_pages", 65536)),
+            page_size=self.page_size,
+            max_batch_size=self.max_batch_size,
+            max_seq_length=self.max_seq_length,
+        )
         self.page_table = PageTable(
             n_pages=self._kv_cache_pages,
             page_size=self.page_size,

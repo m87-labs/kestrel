@@ -15,7 +15,11 @@ from kestrel.runtime.compilation import (
     materialize_dynamic_batch_domain,
 )
 from kestrel.runtime.decode_slot import create_decode_slot
-from kestrel.runtime.paged_resources import PrefillSlot, decode_slot_rows
+from kestrel.runtime.paged_resources import (
+    PrefillSlot,
+    bound_kv_cache_pages,
+    decode_slot_rows,
+)
 from kestrel.runtime.preprocessing import derive_image_insertion_offset
 from kestrel.runtime.preprocessing import derive_preprocessing_workers
 from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
@@ -91,10 +95,14 @@ class Gemma4Runtime(UncachedPagedRuntime):
         self.spec = None
         self.max_batch_size = cfg.max_batch_size
         self.page_size = cfg.page_size
-        self._kv_cache_pages = cfg.kv_cache_pages
-        self.max_seq_length = min(
-            self._config.text_config.max_position_embeddings,
-            2048,
+        self.max_seq_length = int(
+            self._config.text_config.max_position_embeddings
+        )
+        self._kv_cache_pages = bound_kv_cache_pages(
+            cfg.kv_cache_pages,
+            page_size=self.page_size,
+            max_batch_size=self.max_batch_size,
+            max_seq_length=self.max_seq_length,
         )
         self.image_prefix_length = MAX_IMAGE_TOKENS + 2
         self._vision_stager = BatchedTensorStager(
