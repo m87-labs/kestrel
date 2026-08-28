@@ -36,8 +36,6 @@ _STREAM_CHUNK_SECONDS = 180
 _LIVE_LEFT_SECONDS = 10
 _LIVE_CHUNK_SECONDS = 2
 _LIVE_RIGHT_SECONDS = 2
-# Match AudioChunks so a durable commit cannot strand an undecodable PCM tail.
-_MIN_COMMIT_TAIL_SECONDS = 0.5
 # H100: bounded previews plus the exact commit process 180s in 2.57s versus
 # ~24s for repeatedly decoding the growing full window.
 
@@ -64,7 +62,6 @@ async def _live_windows(
     chunk_frames = _LIVE_CHUNK_SECONDS * source.sample_rate
     right_frames = _LIVE_RIGHT_SECONDS * source.sample_rate
     left_frames = _LIVE_LEFT_SECONDS * source.sample_rate
-    min_tail_frames = max(1, round(_MIN_COMMIT_TAIL_SECONDS * source.sample_rate))
 
     def ready() -> bool:
         block_frames = min(source.buffered_frames, source.window_frames)
@@ -105,7 +102,9 @@ async def _live_windows(
         async for chunk in iterator:
             saw_chunk = True
             source.append(chunk)
-            while source.buffered_frames >= source.window_frames + min_tail_frames:
+            while (
+                source.buffered_frames >= source.window_frames + source.min_tail_frames
+            ):
                 if previews:
                     while ready():
                         yield await asyncio.to_thread(preview)

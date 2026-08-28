@@ -29,6 +29,11 @@ class LiveAudioBuffer:
         self.target_sample_rate = target_sample_rate
         self.window_frames = round(window_seconds * sample_rate)
         self.update_frames = round(update_seconds * sample_rate)
+        # Match AudioChunks so a commit cannot strand an undecodable PCM tail.
+        self.min_tail_frames = min(
+            self.window_frames,
+            max(1, round(0.5 * sample_rate)),
+        )
         if not 0 < self.update_frames <= self.window_frames:
             raise ValueError("live update interval must fit within its window")
         self.max_total_frames = sample_rate * MAX_AUDIO_SECONDS
@@ -38,7 +43,7 @@ class LiveAudioBuffer:
         self._last_evaluated_frames = 0
         self._start = 0
         self._storage = np.empty(
-            self.window_frames + MAX_LIVE_CHUNK_VALUES,
+            self.window_frames + self.min_tail_frames + MAX_LIVE_CHUNK_VALUES,
             dtype=np.float32,
         )
 
@@ -53,10 +58,6 @@ class LiveAudioBuffer:
     @property
     def clip_start_seconds(self) -> float:
         return 0.0
-
-    @property
-    def full(self) -> bool:
-        return self.buffered_frames >= self.window_frames
 
     @property
     def ready_for_update(self) -> bool:
@@ -144,6 +145,8 @@ class LiveAudioBuffer:
 async def live_audio_windows(
     chunks: object,
     buffer: LiveAudioBuffer,
+    *,
+    previews: bool,
 ) -> AsyncIterator[tuple[DecodedAudio, bool]]:
     """Yield provisional and committed windows from one owned async source."""
 
@@ -159,18 +162,29 @@ async def live_audio_windows(
         async for chunk in iterator:
             saw_chunk = True
             buffer.append(chunk)
-            while buffer.full:
-                frames = min(buffer.buffered_frames, buffer.window_frames)
-                window = await asyncio.to_thread(buffer.snapshot)
-                buffer.advance(frames)
+            while (
+                buffer.buffered_frames >= buffer.window_frames + buffer.min_tail_frames
+            ):
+                window = await asyncio.to_thread(
+                    buffer.snapshot, frame_count=buffer.window_frames
+                )
+                buffer.advance(buffer.window_frames)
                 yield window, True
-            if buffer.ready_for_update:
+            if previews and buffer.ready_for_update:
                 yield await asyncio.to_thread(buffer.snapshot), False
         if not saw_chunk:
             raise ValueError("live audio must yield at least one PCM chunk")
+        while buffer.buffered_frames > buffer.window_frames:
+            frames = min(
+                buffer.window_frames,
+                buffer.buffered_frames - buffer.min_tail_frames,
+            )
+            window = await asyncio.to_thread(buffer.snapshot, frame_count=frames)
+            buffer.advance(frames)
+            yield window, True
         if buffer.buffered_frames:
             frames = buffer.buffered_frames
-            window = await asyncio.to_thread(buffer.snapshot)
+            window = await asyncio.to_thread(buffer.snapshot, frame_count=frames)
             buffer.advance(frames)
             yield window, True
     finally:

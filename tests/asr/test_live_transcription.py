@@ -68,6 +68,30 @@ def test_qwen_live_pcm_revises_then_commits() -> None:
     assert closed is True
 
 
+def test_qwen_live_pcm_does_not_strand_a_tiny_final_tail() -> None:
+    exact_sizes = []
+
+    async def audio():
+        yield np.zeros(30 * 16_000, dtype=np.float32)
+        yield np.zeros(160, dtype=np.float32)
+
+    async def invoke(prompt, *, image=None, settings=None):
+        exact_sizes.append(prompt["audio"].size)
+        return _result(1, "final")
+
+    result = asyncio.run(
+        Qwen3AsrLongFormOrchestrator().run(
+            invoke,
+            image=None,
+            prompt={"audio": audio(), "sample_rate": 16_000},
+            settings=None,
+        )
+    )
+    assert sum(exact_sizes) == 30 * 16_000 + 160
+    assert min(exact_sizes) == 8_000
+    assert result.output["duration_seconds"] == 30.01
+
+
 def test_qwen_short_file_stream_uses_capability_updates(monkeypatch) -> None:
     class Source:
         duration_seconds = 10.0

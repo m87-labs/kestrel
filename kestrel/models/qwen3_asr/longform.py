@@ -251,7 +251,7 @@ async def _run_live_pcm(
     accumulator = _Accumulator(source, request.timestamps)
     invocations: list[EngineResult] = []
     previous_text = None
-    windows = live_audio_windows(request.audio, source)
+    windows = live_audio_windows(request.audio, source, previews=emit is not None)
     try:
         async for chunk, commit in windows:
             result = await _invoke_leaf(
