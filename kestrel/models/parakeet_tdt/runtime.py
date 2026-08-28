@@ -24,6 +24,7 @@ from kestrel.models.asr.contract import (
 )
 
 from .contract import parse_request
+from .decode_graph import _TdtBatchGraphDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
 from .tokenizer import ParakeetTokenizer
@@ -123,6 +124,18 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        self._batch_decoder = None
+        if (
+            bool(getattr(cfg, "enable_cuda_graphs", True))
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            stream = compute_stream or torch.cuda.current_stream(self.device)
+            self._batch_decoder = _TdtBatchGraphDecoder(
+                self.model,
+                max_batch=self.batch_capacity,
+                compute_stream=stream,
+            )
 
     @property
     def model_name(self) -> str:
@@ -402,11 +415,19 @@ class ParakeetTdtRuntime:
                         ):
                             results[index] = value
                         continue
-                    output = self.model.generate(
-                        features,
-                        mask,
-                        max_tokens=max_tokens,
-                    )
+                    if self._batch_decoder is None or features.shape[0] == 1:
+                        output = self.model.generate(
+                            features,
+                            mask,
+                            max_tokens=max_tokens,
+                        )
+                    else:
+                        encoded, valid = self.model.encode(features, mask)
+                        output = self._batch_decoder.generate(
+                            encoded,
+                            valid,
+                            max_tokens=max_tokens,
+                        )
                     packed = torch.cat(
                         (
                             output.lengths[:, None],

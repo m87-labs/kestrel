@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -323,6 +324,70 @@ class TdtOutput:
     encoder_frame_seconds: float = 0.08
 
 
+def _decode_batch(
+    config: ParakeetTdtConfig,
+    valid_lengths: list[int],
+    max_tokens: int | None,
+    device: torch.device,
+    step: Callable[[list[int], list[bool]], list[list[int]]],
+) -> TdtOutput:
+    batch = len(valid_lengths)
+    frames = [0] * batch
+    steps_remaining = [
+        config.max_symbols_per_step * length for length in valid_lengths
+    ]
+    tokens_remaining = [max_tokens] * batch
+    sequences = [[config.blank_token_id] for _ in range(batch)]
+    durations = [[0] for _ in range(batch)]
+
+    while True:
+        active = [
+            frame < valid_length
+            and steps > 0
+            and (tokens is None or tokens > 0)
+            for frame, valid_length, steps, tokens in zip(
+                frames,
+                valid_lengths,
+                steps_remaining,
+                tokens_remaining,
+                strict=True,
+            )
+        ]
+        if not any(active):
+            break
+        decisions = step(frames, active)
+        for index, ((token_id, duration_index), is_active) in enumerate(
+            zip(decisions, active, strict=True)
+        ):
+            if not is_active:
+                continue
+            duration = config.durations[duration_index]
+            if token_id == config.blank_token_id and duration == 0:
+                duration = 1
+            sequences[index].append(token_id)
+            durations[index].append(duration)
+            frames[index] += duration
+            steps_remaining[index] -= 1
+            remaining_tokens = tokens_remaining[index]
+            if token_id != config.blank_token_id and remaining_tokens is not None:
+                tokens_remaining[index] = remaining_tokens - 1
+
+    lengths = torch.tensor([len(sequence) for sequence in sequences], device=device)
+    width = int(lengths.max())
+    sequence_tensor = torch.tensor(
+        [
+            sequence + [config.blank_token_id] * (width - len(sequence))
+            for sequence in sequences
+        ],
+        device=device,
+    )
+    duration_tensor = torch.tensor(
+        [duration + [0] * (width - len(duration)) for duration in durations],
+        device=device,
+    )
+    return TdtOutput(sequence_tensor, duration_tensor, lengths)
+
+
 class ParakeetTdt(nn.Module):
     def __init__(self, config: ParakeetTdtConfig) -> None:
         super().__init__()
@@ -437,12 +502,6 @@ class ParakeetTdt(nn.Module):
     ) -> TdtOutput:
         batch = encoded.shape[0]
         valid_lengths = valid.sum(-1).tolist()
-        frames = [0] * batch
-        steps_remaining = [
-            self.config.max_symbols_per_step * length for length in valid_lengths
-        ]
-        tokens_remaining = [max_tokens] * batch
-
         token = torch.full(
             (batch, 1),
             self.config.blank_token_id,
@@ -450,23 +509,10 @@ class ParakeetTdt(nn.Module):
             device=encoded.device,
         )
         decoder_hidden, state = self.decoder(token, None)
-        sequences = [[self.config.blank_token_id] for _ in range(batch)]
-        durations = [[0] for _ in range(batch)]
         batch_indices = torch.arange(batch, device=encoded.device)
 
-        while True:
-            active = [
-                frame < valid_length and steps > 0 and (tokens is None or tokens > 0)
-                for frame, valid_length, steps, tokens in zip(
-                    frames,
-                    valid_lengths,
-                    steps_remaining,
-                    tokens_remaining,
-                    strict=True,
-                )
-            ]
-            if not any(active):
-                break
+        def step(frames: list[int], active: list[bool]) -> list[list[int]]:
+            nonlocal decoder_hidden, state
             frame_indices = torch.tensor(frames, device=encoded.device)
             logits = self.joint(
                 encoded[batch_indices, frame_indices.clamp_max(encoded.shape[1] - 1)][
@@ -480,25 +526,12 @@ class ParakeetTdt(nn.Module):
             )
             decisions = torch.stack((token_ids, duration_indices), dim=1).tolist()
 
-            emitted = []
-            for index, ((token_id, duration_index), is_active) in enumerate(
-                zip(decisions, active, strict=True)
-            ):
-                is_emitted = is_active and token_id != self.config.blank_token_id
-                emitted.append(is_emitted)
-                if not is_active:
-                    continue
-                duration = self.config.durations[duration_index]
-                if token_id == self.config.blank_token_id and duration == 0:
-                    duration = 1
-                sequences[index].append(token_id)
-                durations[index].append(duration)
-                frames[index] += duration
-                steps_remaining[index] -= 1
-                remaining_tokens = tokens_remaining[index]
-                if is_emitted and remaining_tokens is not None:
-                    tokens_remaining[index] = remaining_tokens - 1
-
+            emitted = [
+                is_active and token_id != self.config.blank_token_id
+                for (token_id, _duration_index), is_active in zip(
+                    decisions, active, strict=True
+                )
+            ]
             if any(emitted):
                 candidate_hidden, candidate_state = self.decoder(
                     token_ids[:, None], state
@@ -514,23 +547,15 @@ class ParakeetTdt(nn.Module):
                     torch.where(state_mask, candidate, current)
                     for candidate, current in zip(candidate_state, state, strict=True)
                 )
+            return decisions
 
-        lengths = torch.tensor(
-            [len(sequence) for sequence in sequences], device=encoded.device
+        return _decode_batch(
+            self.config,
+            valid_lengths,
+            max_tokens,
+            encoded.device,
+            step,
         )
-        width = int(lengths.max())
-        sequence_tensor = torch.tensor(
-            [
-                sequence + [self.config.blank_token_id] * (width - len(sequence))
-                for sequence in sequences
-            ],
-            device=encoded.device,
-        )
-        duration_tensor = torch.tensor(
-            [duration + [0] * (width - len(duration)) for duration in durations],
-            device=encoded.device,
-        )
-        return TdtOutput(sequence_tensor, duration_tensor, lengths)
 
 
 __all__ = ["ParakeetTdt", "TdtOutput", "TdtState"]

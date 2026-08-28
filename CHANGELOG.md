@@ -7,7 +7,8 @@ All notable changes since `v0.1.2` are documented in this file.
 - Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription,
   including long-form files, live PCM, progressive results, language and prompt
   controls, forced alignment, and word or character timestamps where supported,
-  with batched concurrent Qwen3-ASR transcription for short 16 kHz PCM.
+  with batched concurrent Qwen3-ASR transcription for short 16 kHz PCM and
+  faster batched Parakeet TDT decoding on NVIDIA GPUs.
 
 ## 0.6.1 — 2026-08-26
 
