@@ -79,7 +79,7 @@ def _executor() -> AutoregressiveExecutor:
     ex._admission = SimpleNamespace(
         has_pending=lambda: False,
         pending_count=0,
-        take_ready=lambda _timeout=0.0: None,
+        take_ready=lambda: None,
         fail_all=lambda exc: None,
     )
     return ex
@@ -177,21 +177,23 @@ def test_ingress_capacity_counts_active_and_preprocessing_requests() -> None:
     assert ex.has_ingress_capacity is False
 
 
-def test_idle_executor_collects_a_ready_preprocessing_cohort() -> None:
+def test_ready_request_does_not_wait_for_preprocessing_siblings() -> None:
     ex = _executor()
     ex._runtime.max_batch_size = 4
     waiting = ex._scheduler.waiting
-    ready = [object(), object()]
-    timeouts = []
+    ready = [object()]
+    calls = 0
 
-    def take_ready(timeout=0.0):
-        timeouts.append(timeout)
+    def take_ready():
+        nonlocal calls
+        calls += 1
         if not ready:
             return None
-        ex._admission.pending_count -= 1
         return ready.pop(0)
 
-    ex._admission.pending_count = len(ready)
+    # One sibling is still preprocessing. Its completion must not delay the
+    # request that is already ready.
+    ex._admission.pending_count = 1
     ex._admission.take_ready = take_ready
     ex._admit_ready = waiting.append
     launched = []
@@ -200,9 +202,8 @@ def test_idle_executor_collects_a_ready_preprocessing_cohort() -> None:
 
     ex.advance()
 
-    assert launched == [2]
-    assert timeouts[0] == 0.0
-    assert 0 < timeouts[1] <= 0.005
+    assert launched == [1]
+    assert calls == 2
 
 
 def test_shutdown_fails_in_flight_requests() -> None:
