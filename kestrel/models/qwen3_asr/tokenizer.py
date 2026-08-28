@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
+from tokenizers.models import BPE
 
 
 LANGUAGES = {
@@ -61,7 +63,37 @@ def language_code(language: str) -> str:
 
 class Qwen3AsrTokenizer:
     def __init__(self, path: str | Path) -> None:
-        self.backend = Tokenizer.from_file(str(path))
+        root = Path(path)
+        with (root / "tokenizer_config.json").open(encoding="utf-8") as file:
+            config = json.load(file)
+        backend = Tokenizer(
+            BPE.from_file(str(root / "vocab.json"), str(root / "merges.txt"))
+        )
+        backend.normalizer = normalizers.NFC()
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(
+                    Regex(
+                        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|"
+                        r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+                        r"\s+(?!\S)|\s+"
+                    ),
+                    behavior="isolated",
+                ),
+                pre_tokenizers.ByteLevel(
+                    add_prefix_space=False,
+                    trim_offsets=True,
+                    use_regex=False,
+                ),
+            ]
+        )
+        backend.decoder = decoders.ByteLevel()
+        for raw_id, raw_token in config["added_tokens_decoder"].items():
+            token = AddedToken(**raw_token)
+            backend.add_tokens([token])
+            if backend.token_to_id(token.content) != int(raw_id):
+                raise ValueError("Qwen3-ASR tokenizer token IDs are not contiguous")
+        self.backend = backend
         self.audio_token_id = self._token_id("<|audio_pad|>")
 
     def _token_id(self, token: str) -> int:

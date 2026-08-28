@@ -28,7 +28,7 @@ def resolve_checkpoint(
                 local_files_only=local_files_only,
             )
         )
-    missing = [name for name in filenames if not (root / name).is_file()]
+    missing = [pattern for pattern in filenames if not any(root.glob(pattern))]
     if missing:
         raise FileNotFoundError(f"checkpoint is missing files: {missing}")
     return root.resolve()

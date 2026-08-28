@@ -60,7 +60,7 @@ def _audio_config(raw: dict[str, Any]) -> AudioEncoderConfig:
         encoder_layers=raw["encoder_layers"],
         downsample_hidden_size=raw["downsample_hidden_size"],
         num_mel_bins=raw["num_mel_bins"],
-        max_position_embeddings=raw["max_position_embeddings"],
+        max_position_embeddings=raw.get("max_position_embeddings", 13),
         n_window=raw["n_window"],
         n_window_infer=raw["n_window_infer"],
         output_dim=raw["output_dim"],
@@ -91,19 +91,21 @@ class Qwen3AsrConfig:
     audio_token_id: int
     eos_token_ids: tuple[int, ...]
     pad_token_id: int
-    timestamp_token_id: int
 
     @classmethod
-    def from_json_file(cls, path: str | Path) -> "Qwen3AsrConfig":
-        with Path(path).open(encoding="utf-8") as file:
+    def from_checkpoint(cls, path: str | Path) -> "Qwen3AsrConfig":
+        root = Path(path)
+        with (root / "config.json").open(encoding="utf-8") as file:
             raw = json.load(file)
+        with (root / "generation_config.json").open(encoding="utf-8") as file:
+            generation = json.load(file)
+        thinker = raw["thinker_config"]
         config = cls(
-            audio=_audio_config(raw["audio_config"]),
-            text=_text_config(raw["text_config"]),
-            audio_token_id=raw["audio_token_id"],
-            eos_token_ids=tuple(raw["eos_token_id"]),
-            pad_token_id=raw["pad_token_id"],
-            timestamp_token_id=raw["timestamp_token_id"],
+            audio=_audio_config(thinker["audio_config"]),
+            text=_text_config(thinker["text_config"]),
+            audio_token_id=thinker["audio_token_id"],
+            eos_token_ids=tuple(generation["eos_token_id"]),
+            pad_token_id=generation["pad_token_id"],
         )
         config.validate()
         return config
@@ -154,7 +156,6 @@ class ForcedAlignerConfig:
             config.audio_token_id,
             (),
             0,
-            config.timestamp_token_id,
         ).validate()
         return config
 

@@ -49,7 +49,7 @@ Kestrel supports these model families:
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 | Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, and 31B base/instruction variants |
 | Whisper large-v3-turbo | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | Transcription, translation, long-form audio, and word timestamps |
-| Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B-hf](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf), [1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
+| Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
 | Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
 
 ## Quick Start
@@ -101,7 +101,7 @@ from pathlib import Path
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
-MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
+MODEL = "Qwen/Qwen3-ASR-0.6B"
 
 
 async def main():

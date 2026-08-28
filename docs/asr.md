@@ -4,8 +4,8 @@ Kestrel serves four speech-to-text checkpoints through the same model-bound
 `transcribe` capability:
 
 - `openai/whisper-large-v3-turbo`
-- `Qwen/Qwen3-ASR-0.6B-hf`
-- `Qwen/Qwen3-ASR-1.7B-hf`
+- `Qwen/Qwen3-ASR-0.6B`
+- `Qwen/Qwen3-ASR-1.7B`
 - `nvidia/parakeet-tdt-0.6b-v3`
 
 ## Basic usage
@@ -16,7 +16,7 @@ from pathlib import Path
 from kestrel.config import RuntimeConfig
 from kestrel.engine import InferenceEngine
 
-MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
+MODEL = "Qwen/Qwen3-ASR-0.6B"
 
 engine = await InferenceEngine.create(RuntimeConfig(model=MODEL))
 model = engine.model(MODEL)
