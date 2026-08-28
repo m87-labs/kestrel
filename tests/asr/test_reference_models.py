@@ -244,7 +244,6 @@ def test_qwen_prefill_and_decode_match_transformers() -> None:
                 499,
                 (2, 3),
                 0,
-                500,
             )
         )
     model.load_state_dict(reference.state_dict(), assign=True)
