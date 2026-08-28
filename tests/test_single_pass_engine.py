@@ -230,6 +230,39 @@ def test_worker_fails_ar_if_scheduler_dies_after_forwarding() -> None:
     asyncio.run(go())
 
 
+def test_worker_forwards_one_queued_ar_batch_before_waking_scheduler() -> None:
+    async def go() -> None:
+        engine = _engine_with(
+            FakeRuntime(model_name="ar-default", device="cpu", max_batch_size=2),
+            _StubSinglePass(),
+        )
+        engine._queue = asyncio.Queue()
+        requests = [object(), object(), object()]
+        for request in requests:
+            engine._queue.put_nowait(request)
+        engine._queue.put_nowait(None)
+
+        class _WakeEvent:
+            queue_sizes = []
+
+            def set(self) -> None:
+                self.queue_sizes.append(engine._scheduler_queue.qsize())
+
+        wake_event = _WakeEvent()
+        engine._scheduler_event = wake_event
+
+        await asyncio.wait_for(engine._worker_loop(), timeout=1.0)
+
+        assert wake_event.queue_sizes == [2, 3, 4]
+        assert [engine._scheduler_queue.get_nowait() for _ in range(4)] == [
+            *requests,
+            None,
+        ]
+        assert engine._scheduler_queue.empty()
+
+    asyncio.run(go())
+
+
 def test_run_rejects_unknown_model() -> None:
     async def go() -> None:
         ar = FakeRuntime(model_name="ar-default", device="cpu")
