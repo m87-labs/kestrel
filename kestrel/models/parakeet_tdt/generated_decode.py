@@ -74,7 +74,7 @@ class _TdtDecodeBindings:
 class _TdtBatchGeneratedDecoder:
     """Run one complete TDT decision per generated kernel launch."""
 
-    minimum_batch = 2
+    minimum_batch = 1
 
     @classmethod
     def create(
