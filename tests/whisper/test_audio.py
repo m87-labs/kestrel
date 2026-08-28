@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import kestrel.models.asr.audio as asr_audio_module
 import kestrel.models.whisper.audio as audio_module
 from kestrel.models.whisper.audio import (
     AudioSource,
@@ -119,7 +120,7 @@ def test_binary_file_like_fails_closed_on_type_and_byte_limit(monkeypatch) -> No
     with pytest.raises(TypeError, match="must return bytes"):
         validate_audio_source(io.StringIO("encoded"))
 
-    monkeypatch.setattr(audio_module, "_MAX_FILE_LIKE_ENCODED_BYTES", 8)
+    monkeypatch.setattr(asr_audio_module, "_MAX_ENCODED_BYTES", 8)
     with pytest.raises(ValueError, match="8-byte input limit"):
         validate_audio_source(io.BytesIO(b"123456789"))
 

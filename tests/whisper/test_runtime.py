@@ -19,7 +19,7 @@ from kestrel.models.whisper.config import WhisperPreprocessorConfig, WhisperTurb
 from kestrel.models.whisper.runtime import WhisperRuntime, WhisperRuntimeComponents
 from kestrel.models.whisper.runtime_abi import WhisperExecutionBindings
 from kestrel.models.whisper.skill import (
-    TranscribeRequest,
+    WhisperDecodeContext,
     WhisperTranscribeSkill,
     WhisperTranscribeState,
 )
@@ -441,7 +441,7 @@ def test_timestamp_grammar_stages_generic_batch_aligned_constraints(
     explicit = WhisperTranscribeState(
         skill,
         SimpleNamespace(),
-        TranscribeRequest(
+        WhisperDecodeContext(
             language="en",
             timestamps="segment",
             max_transcript_tokens=4,
@@ -453,7 +453,7 @@ def test_timestamp_grammar_stages_generic_batch_aligned_constraints(
     automatic = WhisperTranscribeState(
         skill,
         SimpleNamespace(),
-        TranscribeRequest(
+        WhisperDecodeContext(
             language=None,
             timestamps="segment",
             max_transcript_tokens=4,
@@ -568,7 +568,7 @@ def test_logits_constraint_staging_is_owned_by_each_pipeline_slot(
     explicit = WhisperTranscribeState(
         skill,
         SimpleNamespace(),
-        TranscribeRequest(
+        WhisperDecodeContext(
             language="en",
             timestamps="segment",
             max_transcript_tokens=4,
@@ -580,7 +580,7 @@ def test_logits_constraint_staging_is_owned_by_each_pipeline_slot(
     automatic = WhisperTranscribeState(
         skill,
         SimpleNamespace(),
-        TranscribeRequest(
+        WhisperDecodeContext(
             language=None,
             timestamps="segment",
             max_transcript_tokens=4,

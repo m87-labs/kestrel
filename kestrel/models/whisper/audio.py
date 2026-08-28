@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 import kestrel_native
 import numpy as np
 import torch
+from kestrel.models.asr.audio import snapshot_file_like
+from kestrel.models.asr.features import mel_filters
 from torch import Tensor
 
 from .config import WhisperPreprocessorConfig
@@ -37,9 +38,6 @@ _TORCH_INTEGER_DTYPES = frozenset(
 # to mono before this reaches Whisper.
 _MAX_ENCODED_DECODE_SAMPLE_VALUES = 30 * 48_000 * 8
 _MAX_NATIVE_AUDIO_VALUES = 32 * 1024 * 1024
-_MAX_FILE_LIKE_ENCODED_BYTES = 64 * 1024 * 1024
-_FILE_LIKE_READ_BYTES = 1024 * 1024
-_MAX_FILE_LIKE_READ_CALLS = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,51 +219,6 @@ def _raw_shape_and_size(audio: np.ndarray | Tensor) -> tuple[tuple[int, ...], in
     return tuple(audio.shape), int(audio.size)
 
 
-def _snapshot_encoded_file_like(audio: object) -> bytes | None:
-    """Read one blocking binary file-like object with a hard byte ceiling.
-
-    The current stream position is respected. Returning ``None`` means the
-    object has no file-like ``read`` method; malformed binary streams fail
-    explicitly rather than being mistaken for raw PCM.
-    """
-
-    read = getattr(audio, "read", None)
-    if not callable(read):
-        return None
-    encoded = bytearray()
-    read_calls = 0
-    while len(encoded) <= _MAX_FILE_LIKE_ENCODED_BYTES:
-        read_calls += 1
-        if read_calls > _MAX_FILE_LIKE_READ_CALLS:
-            raise ValueError(
-                "encoded audio file-like object made insufficient read progress"
-            )
-        wanted = min(
-            _FILE_LIKE_READ_BYTES,
-            _MAX_FILE_LIKE_ENCODED_BYTES + 1 - len(encoded),
-        )
-        chunk = read(wanted)
-        if not isinstance(chunk, bytes):
-            raise TypeError(
-                "encoded audio file-like objects must return bytes from read(size)"
-            )
-        if len(chunk) > wanted:
-            raise ValueError(
-                "encoded audio file-like read exceeded its requested byte count"
-            )
-        if not chunk:
-            break
-        encoded.extend(chunk)
-    if not encoded:
-        raise ValueError("encoded audio file-like object must not be empty")
-    if len(encoded) > _MAX_FILE_LIKE_ENCODED_BYTES:
-        raise ValueError(
-            "encoded audio file-like object exceeds the "
-            f"{_MAX_FILE_LIKE_ENCODED_BYTES}-byte input limit"
-        )
-    return bytes(encoded)
-
-
 def validate_audio_source(
     audio: object,
     *,
@@ -311,8 +264,8 @@ def validate_audio_source(
     if callable(getattr(audio, "read", None)):
         if sample_rate is not None:
             raise ValueError("sample_rate must be omitted for encoded audio")
-        encoded_file = _snapshot_encoded_file_like(audio)
-        assert encoded_file is not None  # narrowed by the callable read check
+        encoded_file = snapshot_file_like(audio)
+        assert isinstance(encoded_file, bytes)
         return AudioSource(
             value=encoded_file,
             kind="encoded",
@@ -438,60 +391,6 @@ def _validate_decoded_audio_result(
     return waveform, int(sample_rate), audio_format
 
 
-def _hertz_to_mel_slaney(frequency: np.ndarray | float) -> np.ndarray | float:
-    min_log_hertz = 1000.0
-    min_log_mel = 15.0
-    logstep = 27.0 / np.log(6.4)
-    mels = 3.0 * frequency / 200.0
-    if isinstance(frequency, np.ndarray):
-        region = frequency >= min_log_hertz
-        mels[region] = min_log_mel + np.log(frequency[region] / min_log_hertz) * logstep
-    elif frequency >= min_log_hertz:
-        mels = min_log_mel + np.log(frequency / min_log_hertz) * logstep
-    return mels
-
-
-def _mel_to_hertz_slaney(mels: np.ndarray) -> np.ndarray:
-    min_log_hertz = 1000.0
-    min_log_mel = 15.0
-    logstep = np.log(6.4) / 27.0
-    frequencies = 200.0 * mels / 3.0
-    region = mels >= min_log_mel
-    frequencies[region] = min_log_hertz * np.exp(logstep * (mels[region] - min_log_mel))
-    return frequencies
-
-
-@lru_cache(maxsize=4)
-def _mel_filters(
-    n_fft: int,
-    num_mel_filters: int,
-    sampling_rate: int,
-) -> Tensor:
-    """Build the Slaney-normalized bank used by WhisperFeatureExtractor."""
-
-    num_frequency_bins = 1 + n_fft // 2
-    mel_min = _hertz_to_mel_slaney(0.0)
-    mel_max = _hertz_to_mel_slaney(float(sampling_rate // 2))
-    mel_frequencies = np.linspace(mel_min, mel_max, num_mel_filters + 2)
-    filter_frequencies = _mel_to_hertz_slaney(mel_frequencies)
-    fft_frequencies = np.linspace(0, sampling_rate // 2, num_frequency_bins)
-
-    filter_diff = np.diff(filter_frequencies)
-    slopes = np.expand_dims(filter_frequencies, 0) - np.expand_dims(fft_frequencies, 1)
-    down_slopes = -slopes[:, :-2] / filter_diff[:-1]
-    up_slopes = slopes[:, 2:] / filter_diff[1:]
-    filters = np.maximum(np.zeros(1), np.minimum(down_slopes, up_slopes))
-    filters *= np.expand_dims(
-        2.0
-        / (
-            filter_frequencies[2 : num_mel_filters + 2]
-            - filter_frequencies[:num_mel_filters]
-        ),
-        0,
-    )
-    return torch.from_numpy(np.asarray(filters, dtype=np.float32)).contiguous()
-
-
 def log_mel_spectrogram(
     waveform: np.ndarray | Tensor,
     *,
@@ -524,11 +423,11 @@ def log_mel_spectrogram(
     )
     magnitudes = stft[..., :-1].abs().square()
     mel_spec = (
-        _mel_filters(
+        mel_filters(
             config.n_fft,
             config.feature_size,
             config.sampling_rate,
-        ).T
+        )
         @ magnitudes
     )
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()

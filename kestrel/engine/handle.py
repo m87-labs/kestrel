@@ -283,6 +283,11 @@ class ModelHandle:
     ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("transcribe", prompt)
 
+    async def align(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
+        return await self._capability("align", prompt)
+
     def __repr__(self) -> str:
         return f"ModelHandle(model_id={self._model!r}, tasks={self.tasks})"
 

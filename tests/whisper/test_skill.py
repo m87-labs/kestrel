@@ -19,7 +19,7 @@ from kestrel.models.whisper.alignment import (
 )
 from kestrel.models.whisper.audio import AudioSource, PreparedAudio, prepare_audio
 from kestrel.models.whisper.skill import (
-    TranscribeRequest,
+    WhisperDecodeContext,
     WhisperTranscribeSkill,
 )
 from kestrel.models.whisper.tokenizer import WhisperControlTokens, WhisperTokenizer
@@ -158,7 +158,7 @@ def test_explicit_language_builds_complete_control_prefix(runtime) -> None:
         },
         None,
     )
-    assert isinstance(built.request_context, TranscribeRequest)
+    assert isinstance(built.request_context, WhisperDecodeContext)
     assert isinstance(built.encoder_input, AudioSource)
     assert built.capture_logprobs is True
     assert not hasattr(built.request_context, "audio")

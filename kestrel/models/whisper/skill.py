@@ -8,6 +8,7 @@ from functools import cache
 from numbers import Integral, Real
 from typing import Any, Mapping, Optional, Sequence
 
+from kestrel.models.asr.contract import TranscriptionRequest
 from kestrel.runtime.tokens import TextToken
 from kestrel.skills import SkillRegistry
 from kestrel.skills.base import (
@@ -38,21 +39,6 @@ from .tokenizer import (
 
 DEFAULT_TRANSCRIPT_TOKENS = 444
 MAX_INITIAL_PROMPT_TOKENS = 128
-_PROMPT_FIELDS = frozenset(
-    {
-        "audio",
-        "clip_end_seconds",
-        "clip_start_seconds",
-        "sample_rate",
-        "language",
-        "initial_prompt",
-        "condition_on_previous_text",
-        "_previous_text_token_ids",
-        "stream",
-        "task",
-        "timestamps",
-    }
-)
 _SETTING_FIELDS = frozenset(
     {
         "compression_ratio_threshold",
@@ -67,7 +53,7 @@ _SETTING_FIELDS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class TranscribeRequest:
+class WhisperDecodeContext:
     language: str | None
     timestamps: str
     max_transcript_tokens: int
@@ -108,15 +94,9 @@ class WhisperTranscribeSkill(SkillSpec):
             raise ValueError("transcribe does not accept an image")
         if not isinstance(prompt, Mapping):
             raise TypeError("transcribe prompt must be a mapping")
-        if any(not isinstance(name, str) for name in prompt):
-            raise TypeError("transcribe prompt field names must be strings")
-        unknown_prompt = sorted(set(prompt) - _PROMPT_FIELDS)
-        if unknown_prompt:
-            raise ValueError(
-                f"Unsupported transcribe option(s): {', '.join(unknown_prompt)}"
-            )
-        if "audio" not in prompt:
-            raise ValueError("audio must be provided for transcription")
+        public_prompt = dict(prompt)
+        previous_text_value = public_prompt.pop("_previous_text_token_ids", ())
+        transcription = TranscriptionRequest.from_prompt(public_prompt)
 
         if settings is not None and not isinstance(settings, Mapping):
             raise TypeError("transcribe settings must be a mapping or None")
@@ -151,35 +131,8 @@ class WhisperTranscribeSkill(SkillSpec):
         if not 0.0 <= resolved.temperature <= 1.0:
             raise ValueError("settings.temperature must lie in [0, 1]")
 
-        timestamps = prompt.get("timestamps", "segment")
-        if not isinstance(timestamps, str) or timestamps not in {
-            "none",
-            "segment",
-            "word",
-        }:
+        if transcription.timestamps == "character":
             raise ValueError("timestamps must be 'none', 'segment', or 'word'")
-        language_value = prompt.get("language")
-        if language_value is None:
-            language = None
-        else:
-            language = normalize_language_code(language_value)  # type: ignore[arg-type]
-        task = prompt.get("task", "transcribe")
-        if not isinstance(task, str) or task not in {"transcribe", "translate"}:
-            raise ValueError("task must be 'transcribe' or 'translate'")
-        if not isinstance(prompt.get("stream", False), bool):
-            raise TypeError("stream must be a boolean")
-        if not isinstance(prompt.get("condition_on_previous_text", True), bool):
-            raise TypeError("condition_on_previous_text must be a boolean")
-        initial_prompt_value = prompt.get("initial_prompt")
-        if initial_prompt_value is None:
-            initial_prompt = None
-        elif not isinstance(initial_prompt_value, str):
-            raise TypeError("initial_prompt must be a non-empty string or None")
-        elif not initial_prompt_value.strip():
-            raise ValueError("initial_prompt must be a non-empty string or None")
-        else:
-            initial_prompt = initial_prompt_value
-        previous_text_value = prompt.get("_previous_text_token_ids", ())
         if not isinstance(previous_text_value, tuple) or any(
             isinstance(token_id, bool)
             or not isinstance(token_id, int)
@@ -193,18 +146,22 @@ class WhisperTranscribeSkill(SkillSpec):
             )
 
         source = validate_audio_source(
-            prompt["audio"],
-            sample_rate=prompt.get("sample_rate"),
-            clip_start_seconds=prompt.get("clip_start_seconds", 0.0),
-            clip_end_seconds=prompt.get("clip_end_seconds"),
+            transcription.audio,
+            sample_rate=transcription.sample_rate,
+            clip_start_seconds=transcription.clip_start_seconds,
+            clip_end_seconds=transcription.clip_end_seconds,
         )
-        request = TranscribeRequest(
-            language=language,
-            task=task,
-            timestamps=timestamps,
+        request = WhisperDecodeContext(
+            language=(
+                normalize_language_code(transcription.language)
+                if transcription.language is not None
+                else None
+            ),
+            task=transcription.task,
+            timestamps=transcription.timestamps,
             max_transcript_tokens=resolved.max_tokens,
             temperature=resolved.temperature,
-            initial_prompt=initial_prompt,
+            initial_prompt=transcription.initial_prompt,
             previous_text_token_ids=previous_text_value,
             max_tokens_explicit=settings is not None and "max_tokens" in settings,
         )
@@ -213,7 +170,7 @@ class WhisperTranscribeSkill(SkillSpec):
             raise ValueError(
                 f"settings.max_tokens={request.max_transcript_tokens} exceeds the "
                 f"Whisper target-position budget {max_transcript_tokens} for "
-                f"timestamps={timestamps!r}"
+                f"timestamps={transcription.timestamps!r}"
             )
         return BuiltRequest(
             request_context=request,
@@ -227,16 +184,16 @@ class WhisperTranscribeSkill(SkillSpec):
         )
 
     def prompt_text(self, request_context: object) -> str:
-        return "transcribe" if isinstance(request_context, TranscribeRequest) else ""
+        return "transcribe" if isinstance(request_context, WhisperDecodeContext) else ""
 
     def build_prompt_tokens(
         self,
         runtime: Any,
         request_context: object,
     ) -> Sequence[TextToken]:
-        if not isinstance(request_context, TranscribeRequest):
+        if not isinstance(request_context, WhisperDecodeContext):
             raise ValueError(
-                "WhisperTranscribeSkill.build_prompt_tokens requires a TranscribeRequest"
+                "WhisperTranscribeSkill.build_prompt_tokens requires a WhisperDecodeContext"
             )
         tokenizer = _runtime_tokenizer(runtime)
         return [
@@ -254,9 +211,9 @@ class WhisperTranscribeSkill(SkillSpec):
         request_context: object,
         max_new_tokens: int,
     ) -> PreparedSkillPrompt:
-        if not isinstance(request_context, TranscribeRequest):
+        if not isinstance(request_context, WhisperDecodeContext):
             raise ValueError(
-                "WhisperTranscribeSkill.prepare_prompt requires a TranscribeRequest"
+                "WhisperTranscribeSkill.prepare_prompt requires a WhisperDecodeContext"
             )
         tokenizer = _runtime_tokenizer(runtime)
         if (
@@ -334,9 +291,9 @@ class WhisperTranscribeSkill(SkillSpec):
         request: Any,
         request_context: object,
     ) -> "WhisperTranscribeState":
-        if not isinstance(request_context, TranscribeRequest):
+        if not isinstance(request_context, WhisperDecodeContext):
             raise ValueError(
-                "WhisperTranscribeSkill.create_state requires a TranscribeRequest"
+                "WhisperTranscribeSkill.create_state requires a WhisperDecodeContext"
             )
         prepared = getattr(request, "encoder_input", None)
         if not isinstance(prepared, PreparedAudio):
@@ -371,7 +328,7 @@ class WhisperTranscribeState(SkillState):
         self,
         spec: SkillSpec,
         request: Any,
-        transcribe_request: TranscribeRequest,
+        transcribe_request: WhisperDecodeContext,
         tokenizer: WhisperTokenizer,
         prepared_audio: PreparedAudio,
     ) -> None:
@@ -692,7 +649,7 @@ def build_skill_registry() -> SkillRegistry:
 __all__ = [
     "DEFAULT_TRANSCRIPT_TOKENS",
     "MAX_INITIAL_PROMPT_TOKENS",
-    "TranscribeRequest",
+    "WhisperDecodeContext",
     "WhisperTranscribeSkill",
     "WhisperTranscribeState",
     "build_skill_registry",
