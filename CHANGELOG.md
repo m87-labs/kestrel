@@ -4,11 +4,17 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-- Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription,
-  including long-form files, live PCM, progressive results, language and prompt
-  controls, forced alignment, and word or character timestamps where supported,
-  with batched concurrent Qwen3-ASR transcription for short 16 kHz PCM and
-  faster batched Parakeet TDT decoding on NVIDIA GPUs.
+- Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription for
+  files and live PCM, with long-form chunking, progressive results, language
+  and prompt controls, forced alignment, and word or character timestamps
+  where supported.
+- Added concurrent short-audio batching for Qwen3-ASR without an admission
+  delay. Parakeet decoding uses C1-C8 precompiled decision kernels on H100 and
+  B200, including a no-emission fast path.
+- Added single-pass models as a default-model option, batched single-pass
+  requests, and capability orchestration across execution shapes.
+- Corrected Qwen Gated DeltaNet prefill ownership so allocator-managed rows are
+  not redundantly copied.
 
 ## 0.6.1 — 2026-08-26
 

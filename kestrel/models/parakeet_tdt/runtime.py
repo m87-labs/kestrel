@@ -25,6 +25,7 @@ from kestrel.models.asr.contract import (
 
 from .contract import parse_request
 from .decode_graph import _TdtBatchGraphDecoder
+from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
 from .tokenizer import ParakeetTokenizer
@@ -124,9 +125,30 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        self.decode_path = getattr(cfg, "decode_path", "auto")
+        if self.decode_path not in {"auto", "native", "generated"}:
+            raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
         self._batch_decoder = None
+        generated_supported = (
+            self.device.type == "cuda"
+            and torch.cuda.is_available()
+            and self.dtype == torch.bfloat16
+        )
+        if self.decode_path == "generated" and not generated_supported:
+            raise RuntimeError(
+                "Parakeet generated decode requires CUDA with BF16 weights"
+            )
+        if self.decode_path != "native" and generated_supported:
+            stream = compute_stream or torch.cuda.current_stream(self.device)
+            self._batch_decoder = _TdtBatchGeneratedDecoder.create(
+                self.model,
+                max_batch=self.batch_capacity,
+                compute_stream=stream,
+                required=self.decode_path == "generated",
+            )
         if (
-            bool(getattr(cfg, "enable_cuda_graphs", True))
+            self._batch_decoder is None
+            and bool(getattr(cfg, "enable_cuda_graphs", True))
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         ):
@@ -415,7 +437,10 @@ class ParakeetTdtRuntime:
                         ):
                             results[index] = value
                         continue
-                    if self._batch_decoder is None or features.shape[0] == 1:
+                    if (
+                        self._batch_decoder is None
+                        or features.shape[0] < self._batch_decoder.minimum_batch
+                    ):
                         output = self.model.generate(
                             features,
                             mask,
