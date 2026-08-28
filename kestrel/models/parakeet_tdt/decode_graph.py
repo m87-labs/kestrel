@@ -26,6 +26,8 @@ class _TdtDecodeSlot:
 class _TdtBatchGraphDecoder:
     """Replay one exact TDT step while the host owns stopping and results."""
 
+    minimum_batch = 2
+
     def __init__(
         self,
         model: ParakeetTdt,

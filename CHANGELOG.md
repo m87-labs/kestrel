@@ -8,7 +8,8 @@ All notable changes since `v0.1.2` are documented in this file.
   including long-form files, live PCM, progressive results, language and prompt
   controls, forced alignment, and word or character timestamps where supported,
   with batched concurrent Qwen3-ASR transcription for short 16 kHz PCM and
-  faster batched Parakeet TDT decoding on NVIDIA GPUs.
+  C2-C8 Parakeet TDT decision decoding through one precompiled launch per step
+  on H100 and B200.
 
 ## 0.6.1 — 2026-08-26
 

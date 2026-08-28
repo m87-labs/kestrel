@@ -524,6 +524,32 @@ class GeneratedDecode:
         _index, program = selected
         return self.state_requirements_by_capacity[program.capacity]
 
+    def static_launcher(self, slot: Any, batch_size: int) -> Callable[[], None]:
+        """Bind a repeated launch whose inputs and extents stay fixed."""
+
+        if self._input_preparation_plan:
+            raise ValueError(
+                "static generated decode cannot run per-step input preparations"
+            )
+        selected = self._program_for(batch_size)
+        if selected is None:
+            raise ValueError(f"no generated decode capacity covers {batch_size}")
+        program_index, _program = selected
+        bound = self._slots[(int(slot.slot_id), program_index)]
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
+        missing = bound.required_launch_extents - extents.keys()
+        if missing:
+            raise RuntimeError(
+                f"generated {self._spec.label} launch misses {sorted(missing)}"
+            )
+        return bound.invocation.prepare_launch(
+            **{
+                name: value
+                for name, value in extents.items()
+                if name in bound.scalar_names
+            }
+        )
+
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
         selected = self._program_for(batch_size)

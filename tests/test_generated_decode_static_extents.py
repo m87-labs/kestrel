@@ -26,6 +26,9 @@ class _Invocation:
     def launch(self, **extents) -> None:
         self.launches.append((self.name, dict(extents)))
 
+    def prepare_launch(self, **extents):
+        return lambda: self.launch(**extents)
+
 
 @dataclass(frozen=True)
 class _Program:
@@ -167,6 +170,22 @@ def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypa
         ("b8", {"active_batch": 6}),
         ("b8", {"active_batch": 7}),
         ("b8_exact", {}),
+    ]
+
+
+def test_static_launcher_resolves_capacity_once(monkeypatch):
+    generated, launches = _build(
+        monkeypatch,
+        _programs("b1", "b2", "b4", "b8"),
+    )
+
+    launch = generated.static_launcher(SimpleNamespace(slot_id=0), 3)
+    launch()
+    launch()
+
+    assert launches == [
+        ("b4", {"active_batch": 3}),
+        ("b4", {"active_batch": 3}),
     ]
 
 
