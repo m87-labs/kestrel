@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 
 from kestrel.models.qwen35.qwen_loader import (
@@ -8,7 +10,9 @@ from kestrel.models.qwen35.qwen_loader import (
     _dequantize_fp8_weight,
     _interleave_gate_up_weight,
     _materialize_remaining_meta_tensors,
+    _restore_rotary_buffers,
 )
+from kestrel.ops.rotary import default_inv_freq
 
 
 def test_fp8_dequantization_chunks_without_changing_bf16_result() -> None:
@@ -156,3 +160,59 @@ def test_remaining_meta_tensors_materialize_without_replacing_bound_storage() ->
     assert module.pending.device.type == "cpu"
     assert module.pending is module.pending_alias
     assert module.pending_buffer.device.type == "cpu"
+
+
+def test_remaining_meta_tensors_reject_uninitialized_derived_buffers() -> None:
+    module = torch.nn.Module()
+    with torch.device("meta"):
+        module.register_buffer("derived", torch.empty(2), persistent=False)
+
+    try:
+        _materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
+    except RuntimeError as exc:
+        assert "derived buffer" in str(exc)
+    else:
+        raise AssertionError("uninitialized derived buffer was accepted")
+
+
+def test_rotary_buffers_are_recomputed_after_meta_construction() -> None:
+    class Rotary(torch.nn.Module):
+        def __init__(self, size: int) -> None:
+            super().__init__()
+            with torch.device("meta"):
+                self.register_buffer(
+                    "inv_freq", torch.empty(size), persistent=False
+                )
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            visual=SimpleNamespace(rotary_pos_emb=Rotary(4)),
+            language_model=SimpleNamespace(rotary_emb=Rotary(3)),
+        )
+    )
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            head_dim=12,
+            rope_theta=1_000_000.0,
+            partial_rotary_factor=0.5,
+        )
+    )
+
+    _restore_rotary_buffers(model, config, device=torch.device("cpu"))
+
+    torch.testing.assert_close(
+        model.model.visual.rotary_pos_emb.inv_freq,
+        default_inv_freq(8, 10_000.0),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        model.model.language_model.rotary_emb.inv_freq,
+        default_inv_freq(
+            12,
+            1_000_000.0,
+            partial_rotary_factor=0.5,
+        ),
+        rtol=0,
+        atol=0,
+    )
