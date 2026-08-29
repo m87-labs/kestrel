@@ -62,6 +62,10 @@ class Gemma4TextConfig:
     attention_k_eq_v: bool
     num_kv_shared_layers: int
     use_double_wide_mlp: bool
+    enable_moe_block: bool = False
+    num_experts: int | None = None
+    top_k_experts: int | None = None
+    moe_intermediate_size: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.layer_types) != self.num_hidden_layers:
@@ -83,12 +87,40 @@ class Gemma4TextConfig:
             raise ValueError(
                 "text attention heads must be divisible by global K/V heads"
             )
+        moe_values = (
+            self.num_experts,
+            self.top_k_experts,
+            self.moe_intermediate_size,
+        )
+        if self.enable_moe_block:
+            if any(value is None for value in moe_values):
+                raise ValueError(
+                    "Gemma 4 MoE requires num_experts, top_k_experts, and "
+                    "moe_intermediate_size"
+                )
+            assert self.num_experts is not None
+            assert self.top_k_experts is not None
+            assert self.moe_intermediate_size is not None
+            if min(
+                self.num_experts,
+                self.top_k_experts,
+                self.moe_intermediate_size,
+            ) <= 0:
+                raise ValueError("Gemma 4 MoE dimensions must be positive")
+            if self.top_k_experts > self.num_experts:
+                raise ValueError("top_k_experts cannot exceed num_experts")
+        elif any(value is not None for value in moe_values):
+            raise ValueError(
+                "dense Gemma 4 config cannot define MoE dimensions"
+            )
+
+    @property
+    def is_moe(self) -> bool:
+        return self.enable_moe_block
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Gemma4TextConfig":
         _validate_dense_inference(data, "Gemma 4 text config")
-        if bool(data.get("enable_moe_block", False)):
-            raise ValueError("Gemma 4 MoE checkpoints are not supported")
         rope_data = required_config(data, "rope_parameters", "Gemma 4 text")
         num_kv_heads = int(
             required_config(data, "num_key_value_heads", "Gemma 4 text")
@@ -112,6 +144,22 @@ class Gemma4TextConfig:
             },
             num_global_key_value_heads=int(
                 data.get("num_global_key_value_heads") or num_kv_heads
+            ),
+            enable_moe_block=bool(data.get("enable_moe_block", False)),
+            num_experts=(
+                int(data["num_experts"])
+                if data.get("num_experts") is not None
+                else None
+            ),
+            top_k_experts=(
+                int(data["top_k_experts"])
+                if data.get("top_k_experts") is not None
+                else None
+            ),
+            moe_intermediate_size=(
+                int(data["moe_intermediate_size"])
+                if data.get("moe_intermediate_size") is not None
+                else None
             ),
         )
         return cls(**kwargs)

@@ -581,21 +581,30 @@ class MoondreamRuntime:
         captured_k_scales: list[Optional[float]] = [None] * n_layers
         captured_v_scales: list[Optional[float]] = [None] * n_layers
 
-        def _capture_kv_scale(name: str, tensor: torch.Tensor) -> None:
+        def _kv_scale_location(name: str) -> tuple[int, str] | None:
             if not name.startswith("text_model.transformer.h."):
-                return
+                return None
             parts = name.split(".")
             if len(parts) < 6:
-                return
+                return None
             try:
                 layer_idx = int(parts[3])
             except ValueError:
-                return
+                return None
             if not (0 <= layer_idx < n_layers):
-                return
+                return None
             if parts[4] != "kv_quantizer":
-                return
+                return None
             target = parts[5]
+            if target not in {"k_scale", "v_scale"}:
+                return None
+            return layer_idx, target
+
+        def _capture_kv_scale(name: str, tensor: torch.Tensor) -> None:
+            location = _kv_scale_location(name)
+            if location is None:
+                return
+            layer_idx, target = location
             value_tensor = tensor.detach()
             if value_tensor.numel() != 1:
                 return
@@ -609,6 +618,7 @@ class MoondreamRuntime:
             str(cfg.model_path),
             self.model,
             tensor_hook=_capture_kv_scale,
+            tensor_hook_predicate=lambda name: _kv_scale_location(name) is not None,
             region=self.region,
             checkpoint_format=self._spec.checkpoint_format,
         )

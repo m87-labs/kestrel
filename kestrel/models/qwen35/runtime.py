@@ -18,6 +18,7 @@ from torch import nn
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
+from kestrel.runtime.paged_resources import bound_kv_cache_pages
 from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.preprocessing import (
     derive_image_insertion_offset,
@@ -292,6 +293,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         )
         if model_source is None:
             raise ValueError("Qwen model spec must declare repo_id")
+        self._generated_weight_storage = None
         self.model = self._load_model(model_source).eval()
         self.architecture = self.model.config
         text_cfg = self.architecture.text_config
@@ -340,7 +342,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 stacklevel=2,
             )
         self.page_size = int(getattr(cfg, "page_size", 1))
-        self._kv_cache_pages = int(getattr(cfg, "kv_cache_pages", 65536))
+        self._kv_cache_pages = bound_kv_cache_pages(
+            int(getattr(cfg, "kv_cache_pages", 65536)),
+            page_size=self.page_size,
+            max_batch_size=self.max_batch_size,
+            max_seq_length=self.max_seq_length,
+        )
         self.page_table = PageTable(
             n_pages=self._kv_cache_pages,
             page_size=self.page_size,
@@ -394,19 +401,32 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self._prefill_slot_free = list(self._prefill_slots)
         self.prefill_slots: Sequence[Any] = self._prefill_slots
 
+        generated_decode_capacity = None
+        if self.decode_path != "native":
+            from .generated_decode import generated_decode_slot_capacity
+
+            generated_decode_capacity = generated_decode_slot_capacity(
+                self,
+                required=self.decode_path == "generated",
+            )
+        self._decode_row_capacity = max(
+            self.max_batch_slots,
+            generated_decode_capacity or 0,
+        )
+
         self._decode_slots = tuple(
             create_decode_slot(
                 slot_id=i,
                 device=self.device,
                 dtype=self.dtype,
-                max_batch_slots=self.max_batch_slots,
+                max_batch_slots=self._decode_row_capacity,
                 kv_cache_pages=self._kv_cache_pages,
                 vocab_size=int(text_cfg.vocab_size),
                 hidden_dim=int(text_cfg.hidden_size),
-                position_shape=(4, self.max_batch_slots, 1),
+                position_shape=(4, self._decode_row_capacity, 1),
                 scratch_specs={
                     "rope_deltas": (
-                        (self.max_batch_slots, 1),
+                        (self._decode_row_capacity, 1),
                         torch.long,
                     ),
                 },
@@ -491,11 +511,23 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
+        prepare_model = None
+        if self.decode_path != "native":
+            from .generated_decode import prepare_generated_weight_storage
+
+            def prepare_model(model: nn.Module) -> None:
+                self._generated_weight_storage = prepare_generated_weight_storage(
+                    self,
+                    model,
+                    required=self.decode_path == "generated",
+                )
+
         return load_qwen35_model(
             source,
             device=self.device,
             dtype=self.dtype,
             revision=self._spec.revision,
+            prepare_model=prepare_model,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:

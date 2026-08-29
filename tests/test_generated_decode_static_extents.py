@@ -96,6 +96,7 @@ def _build(
     bindings=None,
     max_batch_size=8,
     weight_sources=None,
+    weight_storage=None,
     materialize_calls=None,
 ):
     launches = programs[0].launches
@@ -133,6 +134,7 @@ def _build(
         weight_layer_prefix="layers",
         bindings=bindings or _Bindings(),
         weight_sources=weight_sources,
+        weight_storage=weight_storage,
     )
     return runtime_decode.GeneratedDecode(
         runtime, spec=spec, programs=programs
@@ -152,6 +154,34 @@ def test_generated_decode_materializes_explicit_weight_sources(monkeypatch):
     )
 
     assert calls == [{"layer_prefix": "layers", "weight_sources": sources}]
+
+
+def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
+    storage = SimpleNamespace(buffers={}, weight_contract=repr([]))
+    calls = []
+
+    generated, _launches = _build(
+        monkeypatch,
+        _programs("b1"),
+        max_batch_size=1,
+        weight_storage=storage,
+        materialize_calls=calls,
+    )
+
+    assert generated.weight_storage is storage
+    assert calls == []
+
+
+def test_generated_decode_rejects_mismatched_preloaded_weight_storage(monkeypatch):
+    storage = SimpleNamespace(buffers={}, weight_contract="different")
+
+    with pytest.raises(RuntimeError, match="preloaded generated weights"):
+        _build(
+            monkeypatch,
+            _programs("b1"),
+            max_batch_size=1,
+            weight_storage=storage,
+        )
 
 
 def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypatch):

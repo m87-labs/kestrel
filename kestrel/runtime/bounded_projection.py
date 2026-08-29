@@ -1,6 +1,6 @@
 """Dataflow helpers for bounded sibling projections."""
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import torch
 from torch import nn
@@ -134,9 +134,39 @@ class PackedLinear(nn.Linear):
         self.source_weight_leaf = source_weight_leaf
 
 
+def declared_packed_projection_source_keys(module: nn.Module) -> set[str]:
+    """Return checkpoint keys consumed by declared packed projections."""
+
+    source_keys: set[str] = set()
+    for module_name, child in module.named_modules():
+        if not isinstance(child, (PackedBoundedProjections, PackedLinear)):
+            continue
+        parent_name, separator, _ = module_name.rpartition(".")
+        source_prefix = f"{parent_name}." if separator else ""
+        source_keys.update(
+            f"{source_prefix}{name}.{child.source_weight_leaf}"
+            for name in child.source_names
+        )
+        if isinstance(child, PackedBoundedProjections) and child.use_bounds:
+            source_keys.update(
+                f"{source_prefix}{name}.{bound_name}"
+                for name in child.source_names
+                for bound_name in (
+                    "input_min",
+                    "input_max",
+                    "output_min",
+                    "output_max",
+                )
+            )
+    return source_keys
+
+
 def bind_declared_packed_projections(
     module: nn.Module,
     state_dict: dict[str, torch.Tensor],
+    *,
+    already_bound_targets: Collection[str] = (),
+    require_complete: bool = True,
 ) -> None:
     """Pack declared sibling weights after proving compatible transforms."""
 
@@ -153,7 +183,7 @@ def bind_declared_packed_projections(
         target_weight_key = target_prefix + (
             "linear.weight" if is_bounded else "weight"
         )
-        if target_weight_key in state_dict:
+        if target_weight_key in state_dict or target_weight_key in already_bound_targets:
             continue
 
         source_weight_keys = [
@@ -162,10 +192,33 @@ def bind_declared_packed_projections(
         ]
         missing = [key for key in source_weight_keys if key not in state_dict]
         if missing:
+            if not require_complete:
+                continue
             raise KeyError(
                 f"packed projection {module_name!r} is missing source weights: "
                 + ", ".join(repr(key) for key in missing)
             )
+        if is_bounded and child.use_bounds:
+            required_bound_keys = [
+                f"{source_prefix}{name}.{bound_name}"
+                for bound_name in (
+                    "input_min",
+                    "input_max",
+                    "output_min",
+                    "output_max",
+                )
+                for name in child.source_names
+            ]
+            missing = [
+                key for key in required_bound_keys if key not in state_dict
+            ]
+            if missing:
+                if not require_complete:
+                    continue
+                raise KeyError(
+                    f"packed projection {module_name!r} is missing bounds: "
+                    + ", ".join(repr(key) for key in missing)
+                )
         weights = [state_dict[key] for key in source_weight_keys]
         first_weight = weights[0]
         for key, weight, output_size in zip(
@@ -191,6 +244,7 @@ def bind_declared_packed_projections(
         packed_bounds: dict[str, torch.Tensor] = {}
         source_bound_keys: list[str] = []
         bound_values: dict[str, list[torch.Tensor]] = {}
+        incomplete_bounds = False
         if is_bounded and child.use_bounds:
             for bound_name in (
                 "input_min",
@@ -204,10 +258,13 @@ def bind_declared_packed_projections(
                 ]
                 missing = [key for key in keys if key not in state_dict]
                 if missing:
-                    raise KeyError(
-                        f"packed projection {module_name!r} is missing bounds: "
-                        + ", ".join(repr(key) for key in missing)
-                    )
+                    if require_complete:
+                        raise KeyError(
+                            f"packed projection {module_name!r} is missing bounds: "
+                            + ", ".join(repr(key) for key in missing)
+                        )
+                    incomplete_bounds = True
+                    break
                 values = [state_dict[key] for key in keys]
                 if any(
                     value.ndim != 0
@@ -221,6 +278,9 @@ def bind_declared_packed_projections(
                     )
                 bound_values[bound_name] = values
                 source_bound_keys.extend(keys)
+
+            if incomplete_bounds:
+                continue
 
             for bound_name in ("input_min", "input_max"):
                 values = bound_values[bound_name]

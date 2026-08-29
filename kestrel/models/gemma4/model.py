@@ -6,6 +6,7 @@ from typing import Optional, Sequence
 
 import torch
 from kestrel_kernels import get_runtime
+from kestrel_kernels import moe as _MOE_API
 from kestrel.kv_cache import PagedKVCache
 from kestrel.ops import attention as attention_ops
 from kestrel.ops import rotary as rotary_ops
@@ -28,9 +29,24 @@ from .paged_cache import kv_source_layers
 _dense_runtime = get_runtime().dense
 _attention_runtime = get_runtime().attention
 _rotary_runtime = get_runtime().rotary
+_moe_runtime = get_runtime().moe
 _kestrel_gated_activation_into = _dense_runtime.gated_activation_into
 _prepare_neox_rotary = _rotary_runtime.prepare_neox
 _apply_neox_rotary = _rotary_runtime.apply_neox
+_MOE_DECODE_MAX_TOKENS = 16
+_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
+
+
+def _moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
+    tokens = int(tokens)
+    if tokens <= 0:
+        raise ValueError("tokens must be positive")
+    if tokens <= _MOE_DECODE_MAX_TOKENS:
+        return tokens, "decode"
+    return (
+        max(_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
+        "prefill",
+    )
 
 
 def _rmsnorm_state(
@@ -269,6 +285,140 @@ class Gemma4TextMLP(nn.Module):
         return self.down_proj(hidden)
 
 
+class Gemma4TextExperts(nn.Module):
+
+    def __init__(self, config: Gemma4TextConfig) -> None:
+        super().__init__()
+        if (
+            config.num_experts is None
+            or config.top_k_experts is None
+            or config.moe_intermediate_size is None
+        ):
+            raise ValueError("Gemma 4 MoE config is incomplete")
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k_experts
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                2 * self.intermediate_size,
+                self.hidden_size,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                self.hidden_size,
+                self.intermediate_size,
+            ),
+            requires_grad=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        input_shape = hidden_states.shape
+        flat_hidden = hidden_states.reshape(-1, self.hidden_size)
+        tokens = int(flat_hidden.shape[0])
+        capacity_tokens, capacity_mode = _moe_capacity_for_tokens(tokens)
+        if top_k_index.dtype != torch.int32:
+            top_k_index = top_k_index.to(torch.int32)
+        weight_formats = {
+            torch.bfloat16: "bf16",
+            torch.float16: "fp16",
+            torch.float32: "fp32",
+        }
+        try:
+            weight_format = weight_formats[self.gate_up_proj.dtype]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported Gemma 4 expert dtype {self.gate_up_proj.dtype}"
+            ) from exc
+        spec = _MOE_API.MoeSpec(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            activation="gelu",
+            weight_format=weight_format,
+            dtype=flat_hidden.dtype,
+            backend="auto",
+        )
+        handle = _moe_runtime.prepare(
+            spec,
+            _MOE_API.MoeCapacity(
+                max_tokens=capacity_tokens,
+                mode=capacity_mode,
+            ),
+            device=flat_hidden.device,
+        )
+        weights = _MOE_API.pack_weights(
+            handle.spec,
+            up=self.gate_up_proj,
+            down=self.down_proj,
+            weight_scale_layout="block128",
+        )
+        output = _moe_runtime.forward(
+            handle,
+            x=flat_hidden,
+            topk_ids=top_k_index,
+            topk_weights=top_k_weights,
+            weights=weights,
+        )
+        return output.reshape(input_shape)
+
+
+class Gemma4TextRouter(nn.Module):
+
+    def __init__(self, config: Gemma4TextConfig) -> None:
+        super().__init__()
+        if config.num_experts is None or config.top_k_experts is None:
+            raise ValueError("Gemma 4 MoE router config is incomplete")
+        self.hidden_size = config.hidden_size
+        self.top_k = config.top_k_experts
+        self.norm = _rmsnorm_state(
+            config.hidden_size,
+            config.rms_norm_eps,
+            with_scale=False,
+        )
+        self.scale = nn.Parameter(torch.ones(self.hidden_size))
+        self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = _dense_runtime.rmsnorm(
+            hidden_states,
+            self.norm.weight,
+            self.norm.eps,
+        )
+        hidden_states = hidden_states * self.scale * (self.hidden_size**-0.5)
+        router_logits = self.proj(hidden_states)
+        router_probabilities = F.softmax(
+            router_logits,
+            dim=-1,
+            dtype=torch.float32,
+        )
+        routing_weights, selected_experts = torch.topk(
+            router_probabilities,
+            k=self.top_k,
+            dim=-1,
+        )
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = (
+            routing_weights * self.per_expert_scale[selected_experts]
+        )
+        return routing_weights, selected_experts
+
+
 class Gemma4TextDecoderLayer(nn.Module):
 
     def __init__(
@@ -287,6 +437,19 @@ class Gemma4TextDecoderLayer(nn.Module):
             publishes_kv=publishes_kv,
         )
         self.mlp = Gemma4TextMLP(config, layer_idx)
+        self.enable_moe_block = config.is_moe
+        if self.enable_moe_block:
+            self.experts = Gemma4TextExperts(config)
+            self.router = Gemma4TextRouter(config)
+            self.post_feedforward_layernorm_1 = _rmsnorm_state(
+                config.hidden_size, config.rms_norm_eps
+            )
+            self.pre_feedforward_layernorm_2 = _rmsnorm_state(
+                config.hidden_size, config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm_2 = _rmsnorm_state(
+                config.hidden_size, config.rms_norm_eps
+            )
         self.input_layernorm = _rmsnorm_state(
             config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = _rmsnorm_state(
@@ -352,6 +515,29 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm.eps,
         )
         hidden_states = self.mlp(hidden_states)
+        if self.enable_moe_block:
+            dense_hidden_states = _dense_runtime.rmsnorm(
+                hidden_states,
+                self.post_feedforward_layernorm_1.weight,
+                self.post_feedforward_layernorm_1.eps,
+            )
+            routing_weights, selected_experts = self.router(residual)
+            expert_hidden_states = _dense_runtime.rmsnorm(
+                residual,
+                self.pre_feedforward_layernorm_2.weight,
+                self.pre_feedforward_layernorm_2.eps,
+            )
+            expert_hidden_states = self.experts(
+                expert_hidden_states,
+                selected_experts,
+                routing_weights,
+            )
+            expert_hidden_states = _dense_runtime.rmsnorm(
+                expert_hidden_states,
+                self.post_feedforward_layernorm_2.weight,
+                self.post_feedforward_layernorm_2.eps,
+            )
+            hidden_states = dense_hidden_states + expert_hidden_states
         hidden_states = _dense_runtime.rmsnorm(
             hidden_states,
             self.post_feedforward_layernorm.weight,

@@ -11,6 +11,7 @@ from safetensors import safe_open
 
 from kestrel.runtime.bounded_projection import (
     bind_declared_packed_projections,
+    declared_packed_projection_source_keys,
 )
 
 from .config import Gemma4Config
@@ -52,34 +53,39 @@ def load_weights(source: str | Path, model: torch.nn.Module) -> None:
     else:
         shard_names = ["model.safetensors"]
 
-    state_dict: dict[str, torch.Tensor] = {}
-    for shard_name in shard_names:
-        shard_path = snapshot / shard_name
-        with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
-            for name in handle.keys():
-                if name.startswith(_UNSUPPORTED_WEIGHT_PREFIXES):
-                    continue
-                state_dict[name] = handle.get_tensor(name)
+    expected_state = model.state_dict()
+    expected = set(expected_state)
+    packed_source_keys = declared_packed_projection_source_keys(model)
+    loaded: set[str] = set()
+    seen_checkpoint_names: set[str] = set()
+    pending_packed: dict[str, torch.Tensor] = {}
 
-    bind_declared_packed_projections(model, state_dict)
+    def copy_loaded_targets() -> None:
+        for name in tuple(pending_packed):
+            if name not in expected:
+                continue
+            source_tensor = pending_packed.pop(name)
+            target = expected_state[name]
+            if source_tensor.shape != target.shape:
+                raise ValueError(
+                    f"Gemma checkpoint tensor {name!r} has shape "
+                    f"{tuple(source_tensor.shape)}, expected {tuple(target.shape)}"
+                )
+            with torch.no_grad():
+                target.copy_(source_tensor)
+            loaded.add(name)
 
-    expected = set(model.state_dict())
-    embedding_key = "model.language_model.embed_tokens.weight"
-    if "lm_head.weight" in expected and "lm_head.weight" not in state_dict:
-        try:
-            state_dict["lm_head.weight"] = state_dict[embedding_key]
-        except KeyError as exc:
-            raise KeyError(
-                "tied Gemma checkpoint is missing its text embedding"
-            ) from exc
+    def bind_ready_packed(*, require_complete: bool) -> None:
+        bind_declared_packed_projections(
+            model,
+            pending_packed,
+            already_bound_targets=loaded,
+            require_complete=require_complete,
+        )
+        copy_loaded_targets()
 
-    # Published checkpoints retain K/V parameters for layers whose config
-    # explicitly reuses an earlier producer. The inference module omits those
-    # dead parameters; discard only that exact declared family.
-    shared_kv_members = ("k_proj", "v_proj", "k_norm", "v_norm")
-    for name in tuple(state_dict):
-        if name in expected:
-            continue
+    def is_omitted_shared_kv(name: str) -> bool:
+        shared_kv_members = ("k_proj", "v_proj", "k_norm", "v_norm")
         for member in shared_kv_members:
             marker = f".self_attn.{member}."
             if marker not in name:
@@ -88,12 +94,69 @@ def load_weights(source: str | Path, model: torch.nn.Module) -> None:
             try:
                 attention = model.get_submodule(attention_path)
             except AttributeError:
-                break
-            if not hasattr(attention, member):
-                state_dict.pop(name)
-            break
+                return False
+            return not hasattr(attention, member)
+        return False
 
-    model.load_state_dict(state_dict, strict=True)
+    for shard_name in shard_names:
+        shard_path = snapshot / shard_name
+        with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
+            shard_keys = list(handle.keys())
+        # A shard-wide mmap retained every faulted page through the load. Opening
+        # per tensor cut Gemma 31B host high-water from 74.65 GB to 24.88 GB on
+        # B200 while leaving the 65.45 GB CUDA peak unchanged; warm load time was
+        # 9.81 s versus 9.27 s with the shard-wide mapping.
+        for name in shard_keys:
+            if name in seen_checkpoint_names:
+                raise ValueError(f"duplicate Gemma checkpoint tensor {name!r}")
+            seen_checkpoint_names.add(name)
+            if name.startswith(_UNSUPPORTED_WEIGHT_PREFIXES):
+                continue
+            if (
+                name not in expected
+                and name not in packed_source_keys
+                and is_omitted_shared_kv(name)
+            ):
+                continue
+            with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
+                tensor = handle.get_tensor(name)
+            try:
+                if name in expected:
+                    target = expected_state[name]
+                    if tensor.shape != target.shape:
+                        raise ValueError(
+                            f"Gemma checkpoint tensor {name!r} has shape "
+                            f"{tuple(tensor.shape)}, expected {tuple(target.shape)}"
+                        )
+                    with torch.no_grad():
+                        target.copy_(tensor)
+                    loaded.add(name)
+                else:
+                    pending_packed[name] = tensor
+            finally:
+                del tensor
+        bind_ready_packed(require_complete=False)
+
+    bind_ready_packed(require_complete=True)
+
+    embedding_key = "model.language_model.embed_tokens.weight"
+    if "lm_head.weight" in expected and "lm_head.weight" not in loaded:
+        if embedding_key not in loaded:
+            raise KeyError(
+                "tied Gemma checkpoint is missing its text embedding"
+            )
+        with torch.no_grad():
+            expected_state["lm_head.weight"].copy_(expected_state[embedding_key])
+        loaded.add("lm_head.weight")
+
+    if pending_packed:
+        raise RuntimeError(
+            "Gemma checkpoint contains unexpected tensors: "
+            f"{sorted(pending_packed)[:10]}"
+        )
+    missing = sorted(expected - loaded)
+    if missing:
+        raise RuntimeError(f"Gemma checkpoint is missing tensors: {missing[:10]}")
 
 
 def load_model(

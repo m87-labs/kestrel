@@ -6,7 +6,7 @@ Adapted from the Moondream project (Apache-2.0).
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Collection, Dict, List, Optional
 
 import safetensors
 import torch
@@ -200,6 +200,7 @@ def _assign_md3_text_weights(
             f"text_model.transformer.h.{first_layer_idx}.mlp.experts.weight")
         E, two_inter, hidden = (
             int(first_up.shape[0]), int(first_up.shape[1]), int(first_up.shape[2]))
+        del first_up
         device = first_block["mlp"]["mlp"].up_experts.weight.device
         up_w_slab, up_scale_slab = build_md3_moe_up_slab(
             text, num_experts=E, two_inter=two_inter, hidden=hidden, device=device)
@@ -228,6 +229,7 @@ def _assign_md3_text_weights(
             fused_mlp.down_experts.weight = nn.Parameter(
                 down_weight_uint8.to(device), requires_grad=False)
             fused_mlp.down_experts.register_buffer("scale", down_scale.to(device))
+            del up_weight_uint8, down_weight_uint8
 
     # Tau weights (q/v scaling). Kestrel stores these fused as a single wqwv matrix
     # for performance, but older checkpoints store tau_wq and tau_wv separately.
@@ -454,6 +456,7 @@ def load_text_weights(
     model: nn.Module,
     *,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    tensor_hook_predicate: Callable[[str], bool] | None = None,
     checkpoint_format: Optional[str] = None,
 ) -> None:
     load_moondream_weights(
@@ -461,19 +464,21 @@ def load_text_weights(
         model,
         load_vision=False,
         tensor_hook=tensor_hook,
+        tensor_hook_predicate=tensor_hook_predicate,
         region=None,
         checkpoint_format=checkpoint_format,
     )
 
 
 def _capture_moe_scales(
-    tensors_raw: Dict[str, torch.Tensor],
+    tensor_names: Collection[str],
+    get_raw_tensor: Callable[[str], torch.Tensor],
     n_layers: int,
 ) -> MoEScales:
     """Extract MoE FP8 scales from raw checkpoint tensors."""
     moe_scales = MoEScales.empty(n_layers)
 
-    for name, tensor in tensors_raw.items():
+    for name in tensor_names:
         if not name.startswith("text_model.transformer.h."):
             continue
         parts = name.split(".")
@@ -488,9 +493,12 @@ def _capture_moe_scales(
         if parts[4] != "moe_quant":
             continue
         target = parts[5]
+        if target not in {"up_scale", "down_scale"}:
+            continue
+        tensor = get_raw_tensor(name)
         if target == "up_scale":
             moe_scales.up_scales[layer_idx] = tensor.detach().clone()
-        elif target == "down_scale":
+        else:
             moe_scales.down_scales[layer_idx] = tensor.detach().clone()
 
     return moe_scales
@@ -502,6 +510,7 @@ def load_moondream_weights(
     *,
     load_vision: bool = True,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    tensor_hook_predicate: Callable[[str], bool] | None = None,
     region: Optional[nn.Module] = None,
     checkpoint_format: Optional[str] = None,
 ) -> None:
@@ -516,12 +525,12 @@ def load_moondream_weights(
         return tensor.to(target_dtype)
 
     def assign_weights(
-        all_tensors: dict[str, torch.Tensor],
+        tensor_names: Collection[str],
         getter: Callable[[str], torch.Tensor],
         raw_getter: Callable[[str], torch.Tensor],
     ) -> None:
-        fmt = checkpoint_format or _detect_checkpoint_format(list(all_tensors.keys()))
-        moe_scales = _capture_moe_scales(all_tensors, n_layers)
+        fmt = checkpoint_format or _detect_checkpoint_format(list(tensor_names))
+        moe_scales = _capture_moe_scales(tensor_names, raw_getter, n_layers)
 
         if fmt == "md2":
             _assign_md2_text_weights(getter, model)
@@ -540,20 +549,35 @@ def load_moondream_weights(
 
     if path.endswith(".safetensors"):
         with safetensors_open(path) as get_tensor:
-            all_tensors = {}
+            original_names: dict[str, str] = {}
             for orig_name in get_tensor.keys():
                 name = orig_name.replace("._orig_mod", "")
-                all_tensors[name] = get_tensor(orig_name)
+                previous = original_names.setdefault(name, orig_name)
+                if previous != orig_name:
+                    raise ValueError(
+                        "Checkpoint tensor names collide after removing "
+                        f"'._orig_mod': {previous!r} and {orig_name!r}"
+                    )
 
-            if tensor_hook is not None:
-                for name, tensor in all_tensors.items():
-                    tensor_hook(name, tensor)
+        def get_raw_tensor(name: str) -> torch.Tensor:
+            # Bound resident file-backed pages to the tensors still in use.
+            with safetensors_open(path) as get_tensor:
+                return get_tensor(original_names[name])
 
-            assign_weights(
-                all_tensors,
-                getter=lambda name: convert(all_tensors[name]),
-                raw_getter=lambda name: all_tensors[name],
-            )
+        if tensor_hook is not None:
+            for name in original_names:
+                if (
+                    tensor_hook_predicate is not None
+                    and not tensor_hook_predicate(name)
+                ):
+                    continue
+                tensor_hook(name, get_raw_tensor(name))
+
+        assign_weights(
+            original_names.keys(),
+            getter=lambda name: convert(get_raw_tensor(name)),
+            raw_getter=get_raw_tensor,
+        )
     else:
         # Load .pt checkpoints on CPU first to avoid transient GPU OOM during
         # deserialization. mmap keeps startup fast on repeated local loads.
@@ -567,10 +591,15 @@ def load_moondream_weights(
 
         if tensor_hook is not None:
             for name, value in all_tensors.items():
+                if (
+                    tensor_hook_predicate is not None
+                    and not tensor_hook_predicate(name)
+                ):
+                    continue
                 tensor_hook(name, value)
 
         assign_weights(
-            all_tensors,
+            all_tensors.keys(),
             getter=lambda name: convert(all_tensors[name]),
             raw_getter=lambda name: all_tensors[name],
         )
