@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
+from torch.nn import functional as F
 
 from kestrel.models.gemma4.config import (
     Gemma4Config,
@@ -19,7 +20,11 @@ from kestrel.models.gemma4.loader import (
     load_model,
     load_weights,
 )
-from kestrel.models.gemma4.model import Gemma4InferenceModel, Gemma4TextMLP
+from kestrel.models.gemma4.model import (
+    Gemma4InferenceModel,
+    Gemma4TextAttention,
+    Gemma4TextMLP,
+)
 from kestrel.runtime.bounded_projection import (
     PackedLinear,
     bind_declared_packed_projections,
@@ -144,12 +149,8 @@ def _tiny_generated_weight_descriptor() -> dict[str, object]:
             },
             {
                 "name": "w_qkv_local",
-                "sources": [
-                    "self_attn.q_proj.weight",
-                    "self_attn.k_proj.weight",
-                    "self_attn.v_proj.weight",
-                ],
-                "prep": "concat_rows|cast_bf16",
+                "source": "self_attn.qkv_proj.weight",
+                "prep": "identity",
                 "shape": [16, 8],
                 "dtype": "bf16",
                 "per_layer": True,
@@ -278,6 +279,151 @@ def test_text_mlp_interleaved_checkpoint_layout_matches_gate_up_math(
     torch.testing.assert_close(actual, expected)
 
 
+def test_text_attention_owner_packs_qkv_and_matches_projection_math() -> None:
+    torch.manual_seed(8)
+    config = _tiny_gemma_config().text_config
+    attention = Gemma4TextAttention(
+        config,
+        layer_idx=0,
+        kv_source_layer_idx=0,
+        publishes_kv=True,
+    )
+    q = torch.randn((8, 8))
+    k = torch.randn((4, 8))
+    v = torch.randn((4, 8))
+    packed = {
+        "q_proj.weight": q,
+        "k_proj.weight": k,
+        "v_proj.weight": v,
+    }
+    bind_declared_packed_projections(attention, packed)
+    with torch.no_grad():
+        attention.qkv_proj.weight.copy_(packed["qkv_proj.weight"])
+    hidden = torch.randn((3, 8))
+
+    actual = attention.qkv_proj(hidden).split(
+        attention.qkv_proj.packed_out_features,
+        dim=-1,
+    )
+    expected = tuple(F.linear(hidden, weight) for weight in (q, k, v))
+
+    assert attention.qkv_proj.source_names == ("q_proj", "k_proj", "v_proj")
+    assert not any(
+        name.startswith(("q_proj.", "k_proj.", "v_proj."))
+        for name, _ in attention.named_parameters()
+    )
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(actual_part, expected_part)
+
+
+def test_text_attention_k_equals_v_still_normalizes_k_and_v_separately(
+    monkeypatch,
+) -> None:
+    import kestrel.models.gemma4.model as gemma_model
+
+    torch.manual_seed(9)
+    config = _tiny_gemma_config().text_config
+    attention = Gemma4TextAttention(
+        config,
+        layer_idx=1,
+        kv_source_layer_idx=1,
+        publishes_kv=True,
+    )
+    q = torch.randn((8, 8))
+    k = torch.randn((4, 8))
+    packed = {"q_proj.weight": q, "k_proj.weight": k}
+    bind_declared_packed_projections(attention, packed)
+    with torch.no_grad():
+        attention.qkv_proj.weight.copy_(packed["qkv_proj.weight"])
+
+    observed: dict[str, torch.Tensor] = {}
+
+    class DenseRuntime:
+        @staticmethod
+        def rmsnorm(value, weight, eps):
+            del eps
+            if weight is attention.k_norm.weight:
+                observed["raw_k"] = value.clone()
+                return value + 10
+            if weight is attention.v_norm.weight:
+                observed["raw_v"] = value.clone()
+                return value + 20
+            return value
+
+    class Cache:
+        @staticmethod
+        def update(**kwargs):
+            observed["normalized_k"] = kwargs["k_val"]
+            observed["normalized_v"] = kwargs["v_val"]
+
+    monkeypatch.setattr(gemma_model, "_dense_runtime", DenseRuntime())
+    monkeypatch.setattr(
+        gemma_model,
+        "_apply_neox_rotary",
+        lambda query, key, position: (query, key),
+    )
+    monkeypatch.setattr(
+        gemma_model.attention_ops,
+        "dense_attention",
+        lambda query, key, value, **kwargs: query,
+    )
+    hidden = torch.randn((1, 2, 8))
+
+    attention(
+        hidden,
+        (torch.empty(0), torch.empty(0)),
+        [None, None],
+        Cache(),
+        torch.arange(2),
+        torch.arange(2),
+        None,
+    )
+
+    assert attention.qkv_proj.source_names == ("q_proj", "k_proj", "k_proj")
+    torch.testing.assert_close(observed["raw_k"], observed["raw_v"])
+    torch.testing.assert_close(
+        observed["normalized_k"],
+        observed["raw_k"] + 10,
+    )
+    torch.testing.assert_close(
+        observed["normalized_v"],
+        observed["raw_v"] + 20,
+    )
+
+
+def test_text_attention_shared_kv_packs_only_query() -> None:
+    config = _tiny_gemma_config().text_config
+    config = replace(
+        config,
+        num_kv_shared_layers=1,
+        layer_types=("sliding_attention", "sliding_attention"),
+    )
+    attention = Gemma4TextAttention(
+        config,
+        layer_idx=1,
+        kv_source_layer_idx=0,
+        publishes_kv=False,
+    )
+    q = torch.randn((8, 8))
+    packed = {"q_proj.weight": q}
+
+    bind_declared_packed_projections(attention, packed)
+    with torch.no_grad():
+        attention.qkv_proj.weight.copy_(packed["qkv_proj.weight"])
+    hidden = torch.ones((1, 8))
+
+    assert attention.qkv_proj.source_names == ("q_proj",)
+    assert packed["qkv_proj.weight"] is q
+    torch.testing.assert_close(
+        attention.qkv_proj(hidden),
+        F.linear(hidden, q),
+    )
+    assert not any(
+        name.startswith(("q_proj.", "k_proj.", "v_proj."))
+        for name, _ in attention.named_parameters()
+    )
+
+
 def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retained():
     config = _tiny_gemma_config()
     old_dtype = torch.get_default_dtype()
@@ -302,9 +448,15 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
     _restore_checkpoint_independent_state(model, config, device=torch.device("cpu"))
     materialize_remaining_meta_tensors(model, device=torch.device("cpu"))
     layer = model.model.language_model.layers[0]
-    layer.self_attn.q_proj.weight.data.fill_(1)
-    layer.self_attn.k_proj.weight.data.fill_(2)
-    layer.self_attn.v_proj.weight.data.fill_(3)
+    layer.self_attn.qkv_proj.weight.data.copy_(
+        torch.cat(
+            (
+                torch.full((8, 8), 1, dtype=torch.bfloat16),
+                torch.full((4, 8), 2, dtype=torch.bfloat16),
+                torch.full((4, 8), 3, dtype=torch.bfloat16),
+            )
+        )
+    )
     layer.mlp.gate_up_proj.weight.data.copy_(
         torch.arange(16, dtype=torch.bfloat16).view(16, 1).expand(16, 8)
     )
@@ -312,10 +464,10 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
     finalize_weight_storage_after_loading(model, descriptor, storage)
 
     assert final_bytes == 3 * 16 * 8 * 2
-    assert storage.aliased_source_bytes == 2 * 16 * 8 * 2
-    assert storage.retained_source_bytes == (8 * 8 + 4 * 8 + 4 * 8) * 2
+    assert storage.aliased_source_bytes == 3 * 16 * 8 * 2
+    assert storage.retained_source_bytes == 0
     assert all(
-        retained.name != "w_gate_up_fresh"
+        retained.name not in {"w_gate_up_fresh", "w_qkv_local"}
         for retained in storage.retained_recipes
     )
     assert storage.finalized
@@ -323,6 +475,20 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
     assert torch._C._is_alias_of(
         layer.mlp.gate_up_proj.weight,
         storage.buffers["w_gate_up_fresh"][0],
+    )
+    assert torch._C._is_alias_of(
+        layer.self_attn.qkv_proj.weight,
+        storage.buffers["w_qkv_local"][0],
+    )
+    assert not any(
+        name.endswith(
+            (
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+            )
+        )
+        for name, _ in model.named_parameters()
     )
     assert not any(
         tensor.device.type == "meta"
@@ -333,6 +499,49 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
         for tensor in model.model.language_model.rotary_emb.inv_freq.values()
     )
     assert materialize_weights(model, descriptor) is storage
+
+
+def test_gemma_generated_shared_query_projection_aliases_direct_row() -> None:
+    text_config = replace(
+        _tiny_gemma_config().text_config,
+        num_kv_shared_layers=1,
+        layer_types=("sliding_attention", "sliding_attention"),
+    )
+    config = replace(_tiny_gemma_config(), text_config=text_config)
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("meta"):
+            model = Gemma4InferenceModel(config)
+    finally:
+        torch.set_default_dtype(old_dtype)
+    descriptor = {
+        "weight_layer_prefix": "model.language_model.layers",
+        "weights": [
+            {
+                "name": "w_q_local",
+                "source": "self_attn.qkv_proj.weight",
+                "prep": "identity",
+                "shape": [8, 8],
+                "dtype": "bf16",
+                "per_layer": True,
+                "physical_layers": [1],
+                "kind": "param",
+            },
+        ],
+    }
+
+    storage = allocate_weight_storage_for_loading(
+        model,
+        descriptor,
+        device="cpu",
+    )
+    query = model.model.language_model.layers[1].self_attn.qkv_proj.weight
+
+    assert storage.finalized
+    assert storage.retained_source_bytes == 0
+    assert torch._C._is_alias_of(query, storage.buffers["w_q_local"][0])
+    assert tuple(query.stride()) == tuple(storage.buffers["w_q_local"][0].stride())
 
 
 def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
@@ -371,15 +580,18 @@ def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
             descriptor,
             device="cpu",
         )
-        assert not storage.finalized
+        assert storage.finalized
         storage_box["storage"] = storage
 
     def finalize_model(model: torch.nn.Module) -> None:
         lifecycle.append("finalize")
         storage = storage_box["storage"]
         assert not any(tensor.device.type == "meta" for tensor in model.parameters())
-        finalize_weight_storage_after_loading(model, descriptor, storage)
         assert storage.finalized
+        assert (
+            finalize_weight_storage_after_loading(model, descriptor, storage)
+            is storage
+        )
 
     model = load_model(
         tmp_path,

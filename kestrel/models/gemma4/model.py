@@ -139,22 +139,28 @@ class Gemma4TextAttention(nn.Module):
         use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
         num_kv_heads = attention_kv_heads(config, is_sliding=self.is_sliding)
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
-        )
+        query_out_features = config.num_attention_heads * self.head_dim
         self.q_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
 
         if self.owns_kv:
             self.k_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
             self.v_norm = _rmsnorm_state(
                 self.head_dim, config.rms_norm_eps, with_scale=False)
-            self.k_proj = nn.Linear(
-                config.hidden_size, num_kv_heads * self.head_dim, bias=False
+            kv_out_features = num_kv_heads * self.head_dim
+            self.qkv_proj = PackedLinear(
+                config.hidden_size,
+                (query_out_features, kv_out_features, kv_out_features),
+                source_names=(
+                    "q_proj",
+                    "k_proj",
+                    "k_proj" if use_alternative_attention else "v_proj",
+                ),
             )
-            self.v_proj = (
-                nn.Linear(config.hidden_size, num_kv_heads * self.head_dim, bias=False)
-                if not use_alternative_attention
-                else None
+        else:
+            self.qkv_proj = PackedLinear(
+                config.hidden_size,
+                (query_out_features,),
+                source_names=("q_proj",),
             )
 
         self.o_proj = nn.Linear(
@@ -176,13 +182,12 @@ class Gemma4TextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        query_states = _dense_runtime.rmsnorm(
-            query_states, self.q_norm.weight, self.q_norm.eps)
-
         key_states: Optional[torch.Tensor] = None
         value_states: Optional[torch.Tensor] = None
         if not self.owns_kv:
+            query_states = self.qkv_proj(hidden_states).view(hidden_shape)
+            query_states = _dense_runtime.rmsnorm(
+                query_states, self.q_norm.weight, self.q_norm.eps)
             query_states, _ = _apply_neox_rotary(
                 query_states, None, position_embeddings
             )
@@ -195,10 +200,17 @@ class Gemma4TextAttention(nn.Module):
                 )
             key_states, value_states = source
         else:
-            key_states = self.k_proj(hidden_states).view(hidden_shape)
-            value_states = (
-                self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
+            query_states, key_states, value_states = self.qkv_proj(
+                hidden_states
+            ).split(
+                self.qkv_proj.packed_out_features,
+                dim=-1,
             )
+            query_states = query_states.view(hidden_shape)
+            key_states = key_states.view(hidden_shape)
+            value_states = value_states.view(hidden_shape)
+            query_states = _dense_runtime.rmsnorm(
+                query_states, self.q_norm.weight, self.q_norm.eps)
             key_states = _dense_runtime.rmsnorm(
                 key_states, self.k_norm.weight, self.k_norm.eps)
             query_states, key_states = _apply_neox_rotary(
