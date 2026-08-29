@@ -88,6 +88,24 @@ class _ConfidenceTranscribeSkill(_TranscribeSkill):
         )
 
 
+class _SynthesizeSkill(SkillSpec):
+    def __init__(self) -> None:
+        super().__init__("synthesize")
+
+    def build_request(
+        self,
+        image: Any,
+        prompt: Any,
+        settings: Any,
+    ) -> BuiltRequest:
+        return BuiltRequest(
+            request_context=SimpleNamespace(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+
 class _WindowOrchestrator(CapabilityOrchestrator):
     async def run(
         self,
@@ -117,7 +135,13 @@ class _CompoundTranscribeSkill(_TranscribeSkill):
 def _engine() -> InferenceEngine:
     """Minimal engine with an AR default + a single-pass model registered."""
     ar_skills = SkillRegistry(
-        [QuerySkill(), CaptionSkill(), SegmentSkill(), _TranscribeSkill()]
+        [
+            QuerySkill(),
+            CaptionSkill(),
+            SegmentSkill(),
+            _TranscribeSkill(),
+            _SynthesizeSkill(),
+        ]
     )
     eng = object.__new__(InferenceEngine)
     eng._default_model = "ar-model"
@@ -167,7 +191,7 @@ def test_model_rejects_unknown_id() -> None:
 def test_ar_handle_advertises_skill_vocabulary() -> None:
     eng = _engine()
     h = eng.model("ar-model")
-    assert h.tasks == ("query", "caption", "segment", "transcribe")
+    assert h.tasks == ("query", "caption", "segment", "transcribe", "synthesize")
     assert h.supports("query") is True
     assert h.supports("segment_masks") is False
 
@@ -349,6 +373,33 @@ def test_transcribe_verb_routes_audio_through_model_skill() -> None:
     assert captured["prompt"] == {"audio": b"RIFF..."}
 
 
+def test_synthesize_verb_routes_prompt_through_model_skill() -> None:
+    eng = _engine()
+    captured: dict[str, Any] = {}
+    eng._run_skill = _capture_run_skill(captured)  # type: ignore[method-assign]
+
+    out = asyncio.run(
+        eng.model("ar-model").synthesize(
+            text="Hello from Kestrel",
+            voice="ryan",
+            stream=True,
+        )
+    )
+
+    assert out == "RESULT"
+    assert captured == {
+        "task": "synthesize",
+        "image": None,
+        "prompt": {
+            "text": "Hello from Kestrel",
+            "voice": "ryan",
+            "stream": True,
+        },
+        "settings": None,
+        "stream": True,
+    }
+
+
 def test_capability_orchestrator_composes_ordinary_leaf_requests() -> None:
     eng = _engine()
     skills = SkillRegistry([_CompoundTranscribeSkill()])
@@ -491,6 +542,7 @@ def test_capability_verbs_are_uniform_kwargs() -> None:
         "segment",
         "transcribe",
         "align",
+        "synthesize",
     ):
         params = list(inspect.signature(getattr(ModelHandle, verb)).parameters.values())
         assert [p.name for p in params] == ["self", "prompt"], verb
