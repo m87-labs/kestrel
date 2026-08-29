@@ -36,7 +36,6 @@ def _state_pool(config=None):
         config=config,
         max_batch_slots=4,
         device=torch.device("cpu"),
-        replay_capacity=2,
     )
     pool.initialize_from_config(config, dtype=torch.bfloat16)
     return pool
@@ -55,7 +54,6 @@ def _inference_cache(config=None):
     return Qwen35InferenceCache(
         config=config,
         paged_kv=(None, object(), None),
-        replay_capacity=2,
     )
 
 
@@ -74,32 +72,11 @@ def test_generated_state_pool_is_one_bf16_value_major_representation():
         assert state.shape == (4, 2, 3, 2)
         assert state.dtype == torch.bfloat16
         assert state.is_contiguous()
-        assert storage.replay_checkpoint_states is None
-        assert storage.replay_k is None
-        assert storage.replay_u is None
-        assert storage.replay_g is None
-        assert storage.replay_lengths is None
-
-    with pytest.raises(RuntimeError, match="cannot switch to native replay"):
-        pool.initialize_native_recurrent()
-
-
-def test_native_state_pool_remains_mutually_exclusive_fp32_replay():
-    pool = _state_pool()
-
-    pool.initialize_native_recurrent()
-
-    for layer_idx in (0, 2):
-        storage = pool.layers[layer_idx]
-        assert storage is not None and storage.recurrent_states is not None
-        assert storage.recurrent_states.shape == (4, 2, 2, 3)
-        assert storage.recurrent_states.dtype == torch.float32
-        assert storage.replay_checkpoint_states is not None
-        assert storage.replay_checkpoint_states.shape == (4, 2, 3, 2)
-        assert storage.replay_checkpoint_states.dtype == torch.float32
-
-    with pytest.raises(RuntimeError, match="cannot switch to generated decode"):
-        pool.recurrent_tensors_for_form(_generated_form())
+        assert not hasattr(storage, "replay_checkpoint_states")
+        assert not hasattr(storage, "replay_k")
+        assert not hasattr(storage, "replay_u")
+        assert not hasattr(storage, "replay_g")
+        assert not hasattr(storage, "replay_lengths")
 
 
 @pytest.mark.parametrize(
@@ -132,7 +109,7 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
     pool = _state_pool(config)
     recurrent = pool.recurrent_tensors_for_form(_generated_form())
     cache = _inference_cache(config)
-    pool.bind_generated_prefill_state(cache)
+    pool.bind_prefill_state(cache)
     indices = torch.tensor([3, 1], dtype=torch.long)
 
     for layer_idx in (0, 2):
@@ -153,7 +130,7 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
         assert storage is not None and storage.conv_states is not None
         assert torch.all(storage.conv_states[3] == layer_idx + 3)
         assert torch.all(storage.conv_states[1] == layer_idx + 3)
-        assert storage.replay_checkpoint_states is None
+        assert not hasattr(storage, "replay_checkpoint_states")
     pool.clear(1)
     for layer_idx in (0, 2):
         state = recurrent[layer_idx]
@@ -209,9 +186,8 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     cache = Qwen35InferenceCache(
         config=config,
         paged_kv=(None,),
-        replay_capacity=2,
     )
-    pool.bind_generated_prefill_state(cache)
+    pool.bind_prefill_state(cache)
     indices = torch.tensor([3, 1], dtype=torch.long)
 
     module(
@@ -231,7 +207,32 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     assert torch.all(state[3] == 1)
     assert torch.all(state[1] == 2)
     assert torch.count_nonzero(state[0]) == 0
-    assert cache.layers[0].replay_checkpoint_states is None
+    assert not hasattr(cache.layers[0], "replay_checkpoint_states")
+
+
+def test_cached_gdn_call_requires_the_generated_program():
+    config = SimpleNamespace(
+        hidden_size=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=2,
+        rms_norm_eps=1e-6,
+        layer_types=("linear_attention",),
+    )
+    module = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    cache = Qwen35InferenceCache(config=config, paged_kv=(None,))
+    cache.layers[0].has_previous_state = True
+
+    with pytest.raises(
+        RuntimeError,
+        match="cached decode must run through the generated program",
+    ):
+        module(
+            torch.zeros((1, 1, 4), dtype=torch.bfloat16),
+            cache_params=cache,
+        )
 
 
 def test_packed_gdn_prefill_workspace_cache_reuses_capacity():

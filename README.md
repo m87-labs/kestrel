@@ -294,11 +294,12 @@ RuntimeConfig(
 )
 ```
 
-`decode_path="native"` disables generated decode construction. For Qwen 3.5
-and Gemma 4, `decode_path="generated"` requires compatible bundled programs
-covering every active batch size up to `max_batch_size`; construction or decode
-fails instead of falling back to native execution. Moondream currently supports
-only the default `"auto"` policy.
+`decode_path="native"` disables generated decode construction on runtimes that
+provide a native decode path. Qwen 3.5/3.6 requires compatible bundled generated
+programs for both `"auto"` and `"generated"`, covering every active batch size
+up to `max_batch_size`; construction or decode fails instead of falling back.
+Gemma 4 applies the same fail-closed coverage rule when `"generated"` is
+selected. Moondream currently supports only the default `"auto"` policy.
 
 To run from local files instead of the registered HuggingFace weights or
 tokenizer, keep `model` set to the matching registered architecture and pass
