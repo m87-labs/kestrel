@@ -32,6 +32,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         bindings=SimpleNamespace(is_eligible=lambda value: value is runtime),
         weight_root=Mock(),
         weight_layer_prefix="model.layers",
+        program_names=frozenset({"selected_b1"}),
     )
     properties = SimpleNamespace(major=10, minor=0, multi_processor_count=148)
 
@@ -49,6 +50,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         layer_prefix="model.layers",
         arch="sm100",
         device_sms=148,
+        program_names=frozenset({"selected_b1"}),
     )
 
 
