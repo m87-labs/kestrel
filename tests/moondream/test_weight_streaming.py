@@ -105,6 +105,39 @@ def test_safetensors_tensor_hook_still_visits_normalized_names(monkeypatch) -> N
     ]
 
 
+def test_safetensors_tensor_hook_predicate_avoids_unselected_reads(
+    monkeypatch,
+) -> None:
+    tensors = {
+        "wanted.a": torch.tensor([1.0]),
+        "unused.large": torch.empty(1024),
+        "metadata.scale": torch.tensor([3.0]),
+    }
+    calls: list[str] = []
+    hooked: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        weights, "safetensors_open", _fake_safetensors_open(tensors, calls)
+    )
+    monkeypatch.setattr(
+        weights,
+        "_assign_md2_text_weights",
+        lambda get_tensor, model: get_tensor("wanted.a"),
+    )
+
+    weights.load_moondream_weights(
+        "weights.safetensors",
+        _Model(),
+        load_vision=False,
+        checkpoint_format="md2",
+        tensor_hook=lambda name, tensor: hooked.append((name, tensor.item())),
+        tensor_hook_predicate=lambda name: name == "metadata.scale",
+    )
+
+    assert hooked == [("metadata.scale", 3.0)]
+    assert calls == ["metadata.scale", "wanted.a"]
+
+
 def test_safetensors_normalization_collision_fails_closed(monkeypatch) -> None:
     tensors = {
         "model._orig_mod.text.wte": torch.tensor([1.0]),

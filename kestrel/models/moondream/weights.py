@@ -456,6 +456,7 @@ def load_text_weights(
     model: nn.Module,
     *,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    tensor_hook_predicate: Callable[[str], bool] | None = None,
     checkpoint_format: Optional[str] = None,
 ) -> None:
     load_moondream_weights(
@@ -463,6 +464,7 @@ def load_text_weights(
         model,
         load_vision=False,
         tensor_hook=tensor_hook,
+        tensor_hook_predicate=tensor_hook_predicate,
         region=None,
         checkpoint_format=checkpoint_format,
     )
@@ -508,6 +510,7 @@ def load_moondream_weights(
     *,
     load_vision: bool = True,
     tensor_hook: Callable[[str, torch.Tensor], None] | None = None,
+    tensor_hook_predicate: Callable[[str], bool] | None = None,
     region: Optional[nn.Module] = None,
     checkpoint_format: Optional[str] = None,
 ) -> None:
@@ -563,6 +566,11 @@ def load_moondream_weights(
 
         if tensor_hook is not None:
             for name in original_names:
+                if (
+                    tensor_hook_predicate is not None
+                    and not tensor_hook_predicate(name)
+                ):
+                    continue
                 tensor_hook(name, get_raw_tensor(name))
 
         assign_weights(
@@ -583,6 +591,11 @@ def load_moondream_weights(
 
         if tensor_hook is not None:
             for name, value in all_tensors.items():
+                if (
+                    tensor_hook_predicate is not None
+                    and not tensor_hook_predicate(name)
+                ):
+                    continue
                 tensor_hook(name, value)
 
         assign_weights(
