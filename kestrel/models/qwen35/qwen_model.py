@@ -43,9 +43,7 @@ _kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
 _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
-_kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
 _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
-_kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
 _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
@@ -65,6 +63,7 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+    vision_embeddings: torch.Tensor | None = None
 
 
 @dataclass
@@ -844,12 +843,8 @@ class Qwen3_5VisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.linear_fc1 = nn.Linear(hidden_size, self.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(self.intermediate_size, hidden_size, bias=True)
-        # cuBLASLt fused-MLP GELU epilogue mode that matches ``config.hidden_act``.
-        # The vision encoder uses ``gelu_pytorch_tanh`` (tanh approximation); plain
-        # ``gelu`` maps to the exact (erf) GELU.
+        self.linear_fc1 = nn.Linear(hidden_size, config.intermediate_size, bias=True)
+        self.linear_fc2 = nn.Linear(config.intermediate_size, hidden_size, bias=True)
         if config.hidden_act == "gelu_pytorch_tanh":
             self._gelu_approximate = "tanh"
         elif config.hidden_act == "gelu":
@@ -861,53 +856,20 @@ class Qwen3_5VisionMLP(nn.Module):
             value,
             approximate=self._gelu_approximate or "none",
         )
-    def forward(self, hidden_state, residual=None, hidden_workspace=None):
-        """``linear_fc2(act_fn(linear_fc1(hidden_state)))``, plus ``residual``.
 
-        When ``residual`` is given on CUDA bf16/fp16, fc1+GELU+fc2+bias+residual
-        fuse into a single cuBLASLt call (one kernel instead of the eager
-        fc1/GELU/fc2/add chain), eliminating the per-block GELU launch. Every
-        other case falls back to eager. Called through ``__call__`` so module
-        forward hooks (e.g. the profiler's ``vision.mlp``) still fire.
-        """
-        if (
-            residual is not None
-            and self._gelu_approximate is not None
-            and hidden_state.is_cuda
-            and hidden_state.ndim == 2
-            and hidden_state.dtype in (torch.bfloat16, torch.float16)
-            and self.linear_fc1.weight.dtype == hidden_state.dtype
-            and self.linear_fc2.weight.dtype == hidden_state.dtype
-        ):
-            x = hidden_state.contiguous()
-            residual = residual.contiguous()
-            m = x.shape[0]
-            out = torch.empty_like(residual)
-            if hidden_workspace is not None and hidden_workspace.shape[0] >= m:
-                hidden = hidden_workspace[:m]
-            else:
-                hidden = torch.empty(
-                    (m, self.intermediate_size), device=x.device, dtype=x.dtype
-                )
-            _kestrel_fused_mlp_gelu_bias_residual(
-                out,
-                hidden,
-                x,
-                self.linear_fc1.weight,
-                self.linear_fc1.bias,
-                self.linear_fc2.weight,
-                self.linear_fc2.bias,
-                residual,
-                approximate=self._gelu_approximate,
-            )
-            return out
-        out = self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
-        return out if residual is None else residual + out
+    def forward(self, hidden_state):
+        # Match the reference operation boundaries. The fused residual epilogue
+        # has different BF16 rounding that compounds across the vision stack.
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
 class Qwen3_5VisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
+        self.in_channels = config.in_channels
+        self.temporal_patch_size = config.temporal_patch_size
+        self.patch_size = config.patch_size
+        self.hidden_size = config.hidden_size
         self.proj = nn.Linear(
             config.in_channels
             * config.temporal_patch_size
@@ -918,7 +880,35 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.proj(hidden_states)
+        # Preserve the checkpoint's flattened Linear parameter layout while
+        # using the reference Conv3D accumulation order. The Qwen vision stack
+        # is sensitive enough that the BF16 Linear and Conv3D results diverge
+        # materially after its residual blocks.
+        weight = self.proj.weight.view(
+            self.hidden_size,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        patches = hidden_states.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        output = F.conv3d(
+            patches,
+            weight,
+            self.proj.bias,
+            stride=(
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            ),
+        )
+        return output.view(-1, self.hidden_size)
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):
@@ -934,6 +924,33 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         x = self.norm(x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
+
+
+def _apply_vision_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_dtype = query.dtype
+    key_dtype = key.dtype
+    query = query.float()
+    key = key.float()
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
+    query_half = query.shape[-1] // 2
+    key_half = key.shape[-1] // 2
+    rotated_query = torch.cat(
+        (-query[..., query_half:], query[..., :query_half]),
+        dim=-1,
+    )
+    rotated_key = torch.cat(
+        (-key[..., key_half:], key[..., :key_half]),
+        dim=-1,
+    )
+    query = query * cos + rotated_query * sin
+    key = key * cos + rotated_key * sin
+    return query.to(query_dtype), key.to(key_dtype)
 
 
 class Qwen3_5VisionAttention(nn.Module):
@@ -957,21 +974,38 @@ class Qwen3_5VisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = _kestrel_spatial_rope_apply(
-            query_states, key_states, cos, sin, axis_blocks=1
+        query_states, key_states = _apply_vision_rotary_embedding(
+            query_states,
+            key_states,
+            cos,
+            sin,
         )
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attn_output = dense_attention(
-            query_states,
-            key_states,
-            value_states,
-            scaling=self.scaling,
-            causal=False,
-            cu_seqlens=cu_seqlens,
+        # Qwen's reference SDPA path evaluates each packed temporal sequence
+        # independently. Matching those boundaries is required for BF16 parity.
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        query_chunks = torch.split(query_states, lengths, dim=2)
+        key_chunks = torch.split(key_states, lengths, dim=2)
+        value_chunks = torch.split(value_states, lengths, dim=2)
+        attn_output = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    scale=self.scaling,
+                ).transpose(1, 2)
+                for query, key, value in zip(
+                    query_chunks,
+                    key_chunks,
+                    value_chunks,
+                )
+            ],
+            dim=1,
         )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -992,7 +1026,6 @@ class Qwen3_5VisionBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        mlp_workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""
         cu_seqlens (`torch.Tensor`):
@@ -1003,9 +1036,7 @@ class Qwen3_5VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        hidden_states = self.mlp(
-            self.norm2(hidden_states), hidden_states, mlp_workspace
-        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
@@ -1032,24 +1063,6 @@ class Qwen3_5VisionModel(nn.Module):
             ]
         )
         self.merger = Qwen3_5VisionPatchMerger(config)
-        # One shared fused-MLP fc1/gelu workspace for all blocks (the intermediate
-        # is consumed within each block's fused call and the blocks run
-        # sequentially, so a single buffer suffices instead of one per block).
-        self._mlp_hidden_workspace: torch.Tensor | None = None
-
-    def _mlp_workspace(self, num_tokens, dtype, device) -> torch.Tensor:
-        ws = self._mlp_hidden_workspace
-        if (
-            ws is None
-            or ws.shape[0] < num_tokens
-            or ws.dtype != dtype
-            or ws.device != device
-        ):
-            ws = torch.empty(
-                num_tokens, self.config.intermediate_size, dtype=dtype, device=device
-            )
-            self._mlp_hidden_workspace = ws
-        return ws[:num_tokens]
 
     def forward(
         self,
@@ -1071,23 +1084,11 @@ class Qwen3_5VisionModel(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        # Only the fused (CUDA bf16/fp16) MLP path consumes the workspace; skip
-        # the allocation entirely on eager/CPU/MPS fallbacks.
-        if hidden_states.is_cuda and hidden_states.dtype in (
-            torch.bfloat16,
-            torch.float16,
-        ):
-            mlp_workspace = self._mlp_workspace(
-                seq_len, hidden_states.dtype, hidden_states.device
-            )
-        else:
-            mlp_workspace = None
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
-                mlp_workspace=mlp_workspace,
             )
 
         return self.merger(hidden_states)
@@ -1281,11 +1282,16 @@ class Qwen3_5Model(nn.Module):
         vision_bilinear_weights: torch.Tensor | None = None,
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
+        vision_embeddings: torch.Tensor | None = None,
     ) -> _TextModelOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
+        if pixel_values is not None and vision_embeddings is not None:
+            raise ValueError(
+                "pixel_values and precomputed vision_embeddings are mutually exclusive"
+            )
         if pixel_values is not None:
-            image_embeds = self.get_image_features(
+            image_features = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 bilinear_indices=vision_bilinear_indices,
@@ -1293,18 +1299,28 @@ class Qwen3_5Model(nn.Module):
                 position_ids=vision_position_ids,
                 cu_seqlens=vision_cu_seqlens,
             )
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_token_mask = input_ids == self.config.image_token_id
-            image_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
+            vision_embeddings = torch.cat(image_features, dim=0)
+        if vision_embeddings is not None:
+            vision_embeddings = vision_embeddings.to(
+                inputs_embeds.device,
+                inputs_embeds.dtype,
+            )
+            vision_token_mask = (input_ids == self.config.image_token_id) | (
+                input_ids == self.config.video_token_id
+            )
+            vision_mask = vision_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
                 inputs_embeds.device
             )
-            if inputs_embeds[image_mask].numel() != image_embeds.numel():
+            if inputs_embeds[vision_mask].numel() != vision_embeddings.numel():
                 raise ValueError(
-                    "Image features and image tokens do not match, "
-                    f"tokens: {image_token_mask.sum()}, "
-                    f"features: {image_embeds.shape[0]}"
+                    "Vision features and placeholder tokens do not match, "
+                    f"tokens: {vision_token_mask.sum()}, "
+                    f"features: {vision_embeddings.shape[0]}"
                 )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                vision_mask,
+                vision_embeddings,
+            )
 
         outputs = self.language_model(
             input_ids=None,
@@ -1326,6 +1342,7 @@ class Qwen3_5Model(nn.Module):
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            vision_embeddings=vision_embeddings,
         )
 
 

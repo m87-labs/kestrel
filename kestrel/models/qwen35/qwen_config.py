@@ -193,6 +193,7 @@ class Qwen3_5Config:
     text_config: Qwen3_5TextConfig
     vision_config: Qwen3_5VisionConfig
     image_token_id: int
+    video_token_id: int
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3_5Config":
@@ -220,6 +221,7 @@ class Qwen3_5Config:
                 dict(required_config(data, "vision_config", "Qwen"))
             ),
             image_token_id=int(required_config(data, "image_token_id", "Qwen")),
+            video_token_id=int(required_config(data, "video_token_id", "Qwen")),
         )
 
 
