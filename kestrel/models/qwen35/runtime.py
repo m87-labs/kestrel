@@ -16,7 +16,6 @@ import torch
 from torch import nn
 
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
-from kestrel.runtime.decode_graph import DecodeGraphManager
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.paged_resources import bound_kv_cache_pages
 from kestrel.runtime.tokenizer import load_tokenizer
@@ -264,6 +263,10 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self._spec = get_spec(cfg.model)
         self._model_name = cfg.model
         self.decode_path = getattr(cfg, "decode_path", "auto")
+        if self.decode_path == "native":
+            raise ValueError(
+                "Qwen 3.5/3.6 requires generated decode; native decode was removed"
+            )
         self.max_batch_size = getattr(cfg, "max_batch_size", 1)
         self.max_batch_slots = self.max_batch_size + 2
         self._padding_batch_idx = self.max_batch_slots - 1
@@ -271,20 +274,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
-
-        requested_cuda_graphs = bool(getattr(cfg, "enable_cuda_graphs", False))
-        self._use_cuda_graphs = (
-            requested_cuda_graphs
-            and torch.cuda.is_available()
-            and self.device.type == "cuda"
-        )
-        if requested_cuda_graphs and not self._use_cuda_graphs:
-            warnings.warn(
-                "Qwen 3.5 CUDA graphs are disabled because CUDA is unavailable "
-                "or the runtime device is not CUDA.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
         model_source = (
             Path(cfg.model_path).expanduser()
@@ -365,7 +354,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 f"kv_pool.device ({self._kv_pool.device}) must match runtime "
                 f"device ({self.device})"
             )
-        self._replay_capacity = 16
         self._paged_kv = allocate_paged_kv_layers(
             layer_specs=qwen_paged_kv_specs(text_cfg),
             page_table=self.page_table,
@@ -376,7 +364,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             config=text_cfg,
             max_batch_slots=self.max_batch_slots,
             device=self.device,
-            replay_capacity=self._replay_capacity,
         )
         self._linear_state_pool.initialize_from_config(
             text_cfg, dtype=self.dtype
@@ -401,14 +388,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self._prefill_slot_free = list(self._prefill_slots)
         self.prefill_slots: Sequence[Any] = self._prefill_slots
 
-        generated_decode_capacity = None
-        if self.decode_path != "native":
-            from .generated_decode import generated_decode_slot_capacity
+        from .generated_decode import generated_decode_slot_capacity
 
-            generated_decode_capacity = generated_decode_slot_capacity(
-                self,
-                required=self.decode_path == "generated",
-            )
+        generated_decode_capacity = generated_decode_slot_capacity(
+            self,
+            required=True,
+        )
         self._decode_row_capacity = max(
             self.max_batch_slots,
             generated_decode_capacity or 0,
@@ -436,49 +421,21 @@ class Qwen35Runtime(UncachedPagedRuntime):
             for i in range(2)
         )
         self.decode_slots: Sequence[Any] = self._decode_slots
-        self._decode_caches = tuple(self._new_cache() for _ in self._decode_slots)
-        self._decode_graphs = DecodeGraphManager[DecodeSlot](
-            enabled=self._use_cuda_graphs,
-            device=self.device,
-            max_batch=self.max_batch_size,
-            graph_capture_lock=self.graph_capture_lock,
-            compute_stream=self._compute_stream,
-            run_forward=self._run_decode_forward,
-            prepare_step=self._prepare_decode_slot,
-            zero_padding=self._zero_decode_graph_padding,
-            zero_for_capture=self._zero_decode_graph_capture_buffers,
-        )
         self.active_sequences: dict[int, Any] = {}
 
         self.spatial_tables = None
 
-        self._initialize_decode_execution()
-
-    def _initialize_decode_execution(self) -> None:
         self._initialize_generated_decode()
-        if self._use_cuda_graphs and self.generated_decode is None:
-            self._decode_graphs.ensure_ready(self._decode_slots)
 
     def _initialize_generated_decode(self) -> None:
-        """Apply the runtime-wide decode policy before graph capture."""
-
-        self.generated_decode = None
-        if self.decode_path == "native":
-            self._linear_state_pool.initialize_native_recurrent()
-            return
+        """Construct the required generated Qwen decode implementation."""
 
         from .generated_decode import create_generated_decode
 
         self.generated_decode = create_generated_decode(
             self,
-            required=self.decode_path == "generated",
+            required=True,
         )
-        if self.generated_decode is None:
-            self._linear_state_pool.initialize_native_recurrent()
-
-    @property
-    def cuda_graphs_enabled(self) -> bool:
-        return self._use_cuda_graphs
 
     def image_kv_length(
         self,
@@ -511,16 +468,14 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
-        prepare_model = None
-        if self.decode_path != "native":
-            from .generated_decode import prepare_generated_weight_storage
+        from .generated_decode import prepare_generated_weight_storage
 
-            def prepare_model(model: nn.Module) -> None:
-                self._generated_weight_storage = prepare_generated_weight_storage(
-                    self,
-                    model,
-                    required=self.decode_path == "generated",
-                )
+        def prepare_model(model: nn.Module) -> None:
+            self._generated_weight_storage = prepare_generated_weight_storage(
+                self,
+                model,
+                required=True,
+            )
 
         return load_qwen35_model(
             source,
@@ -741,94 +696,18 @@ class Qwen35Runtime(UncachedPagedRuntime):
         if batch_size == 0:
             return
         megakernel = self.generated_decode
-        use_generated = (
-            megakernel is not None and megakernel.supports(batch_size)
-        )
-        if megakernel is not None and not use_generated:
+        if megakernel is None:
+            raise RuntimeError("Qwen generated decode is not initialized")
+        if not megakernel.supports(batch_size):
             raise RuntimeError(
                 "selected generated Qwen decode does not cover "
                 f"active batch size {batch_size}"
             )
-        if use_generated:
-            assert megakernel is not None
-            stream = getattr(slot, "compute_stream", None)
-            stream_context = (
-                torch.cuda.stream(stream) if stream is not None else nullcontext())
-            with stream_context:
-                megakernel.run(slot, batch_size)
-            return
-        self._decode_graphs.run(slot, batch_size)
-
-    def _zero_decode_graph_padding(
-        self,
-        slot: DecodeSlot,
-        batch_size: int,
-        graph_batch_size: int,
-    ) -> None:
-        padding_batch_idx = int(self._padding_batch_idx)
-        slot.decode_token_ids[batch_size:graph_batch_size].zero_()
-        slot.meta.batch_idx.gpu[batch_size:graph_batch_size].fill_(padding_batch_idx)
-        slot.meta.batch_idx.cpu[batch_size:graph_batch_size].fill_(padding_batch_idx)
-        slot.meta.input_pos.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.input_pos.cpu[batch_size:graph_batch_size].zero_()
-        slot.meta.lora_slot_ids.gpu[batch_size:graph_batch_size].zero_()
-        slot.meta.lora_slot_ids.cpu[batch_size:graph_batch_size].zero_()
-
-    def _zero_decode_graph_capture_buffers(self, slot: DecodeSlot) -> None:
-        text_cfg = self.architecture.text_config
-        self._linear_state_pool.initialize_from_config(text_cfg, dtype=self.dtype)
-        self._linear_state_pool.zero_all()
-        self._decode_rope_deltas.zero_()
-        slot.decode_token_ids.zero_()
-        slot.meta.batch_idx.gpu.zero_()
-        slot.meta.batch_idx.cpu.zero_()
-        slot.meta.input_pos.gpu.zero_()
-        slot.meta.input_pos.cpu.zero_()
-        slot.meta.lora_slot_ids.gpu.zero_()
-        slot.meta.lora_slot_ids.cpu.zero_()
-        slot.paged_kv_page_table.zero_()
-        slot.paged_kv_seqlens_k.zero_()
-        slot.slot_mapping.zero_()
-        slot.cache_position_ids.zero_()
-        slot.position_ids.zero_()
-        slot.scratch["rope_deltas"].zero_()
-        slot.sampled_ids.zero_()
-        slot.sampled_logprobs.zero_()
-        slot.logits.zero_()
-        slot.hidden_last.zero_()
-
-    def _prepare_decode_slot(self, slot: DecodeSlot, batch_size: int) -> None:
-        # Pure-Python step: bind the cache's linear (GDN) layers to the
-        # runtime-owned persistent state. All GPU metadata prep lives in
-        # ``_build_decode_metadata`` and runs inside ``_run_decode_forward`` so
-        # it is captured by the decode CUDA graph (one cudaGraphLaunch) instead
-        # of relaunching the per-step copy/index/fill kernels eagerly. The
-        # captured kernels read the same fixed slot buffers (batch_idx/input_pos
-        # written by the engine before replay; the page table is pre-reserved at
-        # prefill and static during decode), so results are bit-identical.
-        cache = self._decode_cache_for_slot(slot)
-        self._linear_state_pool.bind_to_cache(cache)
-
-    def _build_decode_metadata(
-        self, slot: DecodeSlot, batch_size: int
-    ) -> None:
-        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
-        input_pos = slot.meta.input_pos.gpu[:batch_size]
-        slot.cache_position_ids[:batch_size, 0].copy_(input_pos)
-        self.page_table.populate_paged_kv_metadata(
-            batch_idx=batch_idx,
-            input_pos=input_pos,
-            out_page_table=slot.paged_kv_page_table[:batch_size],
-            out_seqused_k=slot.paged_kv_seqlens_k[:batch_size],
-        )
-        slot.slot_mapping[:batch_size].copy_(
-            self.page_table.build_slot_mapping(
-                batch_idx=batch_idx,
-                positions=slot.cache_position_ids[:batch_size],
-            )
-        )
-        self._gather_decode_rope_deltas(slot, batch_size)
-        self._prepare_decode_position_ids(slot, batch_size)
+        stream = getattr(slot, "compute_stream", None)
+        stream_context = (
+            torch.cuda.stream(stream) if stream is not None else nullcontext())
+        with stream_context:
+            megakernel.run(slot, batch_size)
 
     def _gather_decode_rope_deltas(
         self,
@@ -855,26 +734,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         position_ids = slot.position_ids[:, :batch_size, :]
         position_ids.copy_(cache_position_ids)
         position_ids[1:].add_(slot.scratch["rope_deltas"][:batch_size])
-
-    def _run_decode_forward(self, slot: DecodeSlot, batch_size: int) -> None:
-        self._build_decode_metadata(slot, batch_size)
-        cache = self._decode_cache_for_slot(slot)
-        batch_idx = slot.meta.batch_idx.gpu[:batch_size]
-        cache_position_ids = slot.cache_position_ids[:batch_size]
-        input_ids = slot.decode_token_ids[:batch_size].view(-1, 1)
-        outputs = self.model.model(
-            input_ids=input_ids,
-            past_key_values=cache,
-            position_ids=slot.position_ids[:, :batch_size, :],
-            cache_position_ids=cache_position_ids,
-            slot_mapping=slot.slot_mapping[:batch_size],
-            page_table=slot.paged_kv_page_table[:batch_size],
-            paged_kv_seqlens_k=slot.paged_kv_seqlens_k[:batch_size],
-            gdn_state_indices=batch_idx,
-        )
-        hidden = outputs.last_hidden_state[:, 0, :]
-        slot.hidden_last[:batch_size].copy_(hidden)
-        slot.logits[:batch_size].copy_(self.model.lm_head(hidden))
 
     def _prefill_scratch_for(
         self,
@@ -1345,8 +1204,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         packed: _PackedPrefillBatch,
     ) -> tuple[torch.Tensor, Qwen35InferenceCache]:
         cache = self._new_cache()
-        if self.generated_decode is not None:
-            self._linear_state_pool.bind_generated_prefill_state(cache)
+        self._linear_state_pool.bind_prefill_state(cache)
         outputs = self.model.model(
             input_ids=packed.input_ids,
             past_key_values=cache,
@@ -1363,9 +1221,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
             paged_kv_seqlens_k=packed.paged_kv_seqlens_k,
             cu_seq_lens_q=packed.cu_seq_lens_q,
             seq_idx=packed.seq_idx,
-            gdn_state_indices=(
-                packed.batch_indices if self.generated_decode is not None else None),
-            gdn_state_indices_allocator_owned=self.generated_decode is not None,
+            gdn_state_indices=packed.batch_indices,
+            gdn_state_indices_allocator_owned=True,
         )
         outputs.past_key_values.advance_to(packed.max_length)
         return outputs.last_hidden_state, outputs.past_key_values
@@ -1374,7 +1231,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         return Qwen35InferenceCache(
             config=self.architecture.text_config,
             paged_kv=self._paged_kv,
-            replay_capacity=self._linear_state_pool.replay_capacity,
         )
 
     def _store_packed_sequence_caches(
@@ -1395,11 +1251,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             indices,
             cache,
             batch_size=batch_size,
-            # Packed prefill starts from a fresh cache. Each GDN layer has just
-            # checkpointed its final recurrent state and reset every replay
-            # cursor, so K/U/G payload bytes are unreachable and need not be
-            # copied into the persistent decode pool.
-            copy_replay_payload=False,
         )
         rope_deltas = rope_deltas.to(device=self.device, dtype=torch.long)
         if rope_deltas.ndim == 1:
@@ -1415,8 +1266,5 @@ class Qwen35Runtime(UncachedPagedRuntime):
             self._decode_rope_deltas[int(batch_idx)].zero_()
         if hasattr(self, "_linear_state_pool"):
             self._linear_state_pool.clear(int(batch_idx))
-
-    def _decode_cache_for_slot(self, slot: DecodeSlot) -> Qwen35InferenceCache:
-        return self._decode_caches[int(slot.slot_id)]
 
 __all__ = ["Qwen35Runtime", "QwenImageInputs"]
