@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -35,6 +36,40 @@ def test_packed_linear_binding_waits_for_all_streamed_parts() -> None:
     )
     assert set(state) == {"packed.weight"}
     torch.testing.assert_close(state["packed.weight"], torch.cat((q, k)))
+
+
+def test_packed_linear_binding_honors_interleaved_output_layout() -> None:
+    module = nn.Module()
+    module.packed = PackedLinear(
+        3,
+        (16, 16),
+        source_names=("gate", "up"),
+        output_layout="interleaved_i8",
+    )
+    gate = torch.arange(48, dtype=torch.float32).reshape(16, 3)
+    up = torch.arange(48, 96, dtype=torch.float32).reshape(16, 3)
+    state = {"gate.weight": gate, "up.weight": up}
+
+    bind_declared_packed_projections(module, state)
+
+    expected = torch.stack(
+        (gate.reshape(2, 8, 3), up.reshape(2, 8, 3)), dim=1
+    ).reshape(32, 3)
+    torch.testing.assert_close(state["packed.weight"], expected)
+
+
+@pytest.mark.parametrize(
+    "out_features",
+    ((8, 8, 8), (8, 16), (10, 10)),
+)
+def test_packed_linear_rejects_invalid_interleaved_shape(out_features) -> None:
+    with pytest.raises(ValueError, match="two equal output sizes"):
+        PackedLinear(
+            3,
+            out_features,
+            source_names=tuple(f"source_{index}" for index in range(len(out_features))),
+            output_layout="interleaved_i8",
+        )
 
 
 def test_packed_bounded_binding_waits_for_streamed_bounds() -> None:
