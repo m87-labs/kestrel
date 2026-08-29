@@ -306,6 +306,7 @@ def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
 
     def prepare_model(model: torch.nn.Module) -> None:
         lifecycle.append("prepare")
+        assert all(tensor.device.type == "meta" for tensor in model.parameters())
         storage = allocate_weight_storage_for_loading(
             model,
             descriptor,
