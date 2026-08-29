@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -9,9 +10,11 @@ from kestrel.models.qwen35.qwen_loader import (
     _copy_fused_projection_part,
     _dequantize_fp8_weight,
     _interleave_gate_up_weight,
+    _load_sharded_safetensors,
     _materialize_remaining_meta_tensors,
     _restore_rotary_buffers,
 )
+import kestrel.models.qwen35.qwen_loader as loader_module
 from kestrel.ops.rotary import default_inv_freq
 
 
@@ -142,6 +145,76 @@ def test_bf16_experts_stream_into_final_interleaved_slices() -> None:
         "layer.experts.gate_up_proj",
         "layer.experts.down_proj",
     }
+
+
+def test_sharded_loader_closes_key_handle_before_per_tensor_read(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"fake")
+    source = torch.tensor([[1.0, 2.0]])
+    events: list[tuple[str, int, str | None]] = []
+    next_handle = 0
+
+    class Slice:
+        def get_shape(self):
+            return source.shape
+
+    @contextmanager
+    def fake_safe_open(path, *, framework, device):
+        nonlocal next_handle
+        assert path == str(checkpoint)
+        assert framework == "pt"
+        handle_id = next_handle
+        next_handle += 1
+        tensor_reads = 0
+        events.append(("open", handle_id, device))
+
+        class Handle:
+            def keys(self):
+                events.append(("keys", handle_id, None))
+                return ["weight"]
+
+            def get_slice(self, key):
+                assert key == "weight"
+                events.append(("slice", handle_id, key))
+                return Slice()
+
+            def get_tensor(self, key):
+                nonlocal tensor_reads
+                assert key == "weight"
+                tensor_reads += 1
+                assert tensor_reads == 1
+                events.append(("tensor", handle_id, key))
+                return source
+
+        try:
+            yield Handle()
+        finally:
+            events.append(("close", handle_id, device))
+
+    monkeypatch.setattr(loader_module, "safe_open", fake_safe_open)
+    model = torch.nn.Linear(2, 1, bias=False)
+
+    missing, unexpected = _load_sharded_safetensors(
+        model,
+        tmp_path,
+        [checkpoint.name],
+        device=torch.device("cpu"),
+    )
+
+    assert missing == []
+    assert unexpected == []
+    torch.testing.assert_close(model.weight, source)
+    tensor_handle = next(
+        handle_id for event, handle_id, _ in events if event == "tensor"
+    )
+    tensor_open_index = events.index(("open", tensor_handle, "cpu"))
+    close_event = events[tensor_open_index - 1]
+    assert close_event[0] == "close"
+    key_handle = close_event[1]
+    assert key_handle != tensor_handle
+    assert ("keys", key_handle, None) in events
 
 
 def test_remaining_meta_tensors_materialize_without_replacing_bound_storage() -> None:

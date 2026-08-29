@@ -514,100 +514,105 @@ def _load_sharded_safetensors(
 
     for _shard_name, shard_path in shard_paths:
         with safe_open(shard_path, framework="pt", device=device_arg) as handle:
-            for key in handle.keys():
-                if key.startswith("mtp."):
-                    continue
-                if key.endswith(".weight_scale_inv"):
-                    continue
+            shard_keys = list(handle.keys())
+        # Keep only the tensor currently being copied backed by the shard mmap.
+        # A shard-wide handle retains every faulted page until the entire shard
+        # has loaded, which defeats the bounded-memory loader for large shards.
+        for key in shard_keys:
+            if key.startswith("mtp."):
+                continue
+            if key.endswith(".weight_scale_inv"):
+                continue
+            with safe_open(shard_path, framework="pt", device=device_arg) as handle:
                 value = handle.get_tensor(key)
-                if key in expected_keys:
-                    scale_key = _scale_inv_key(key)
+            if key in expected_keys:
+                scale_key = _scale_inv_key(key)
+                loaded = _loadable_tensor(
+                    key,
+                    value,
+                    qwen_rms_norm_weight_keys,
+                    expected_state[key].shape,
+                    scale_inv_by_key.get(scale_key),
+                    convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                    exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
+                )
+                with torch.no_grad():
+                    expected_state[key].copy_(loaded)
+                loaded_keys.add(key)
+                continue
+            fused_parts = _fused_projection_keys(key)
+            fused_handled = False
+            for fused_key, part, parts in fused_parts:
+                if fused_key in expected_keys:
                     loaded = _loadable_tensor(
                         key,
                         value,
-                        qwen_rms_norm_weight_keys,
-                        expected_state[key].shape,
-                        scale_inv_by_key.get(scale_key),
+                        set(),
+                        value.shape,
+                        scale_inv_by_key.get(_scale_inv_key(key)),
                         convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
-                        exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
                     )
-                    with torch.no_grad():
-                        expected_state[key].copy_(loaded)
-                    loaded_keys.add(key)
-                    continue
-                fused_parts = _fused_projection_keys(key)
-                fused_handled = False
-                for fused_key, part, parts in fused_parts:
-                    if fused_key in expected_keys:
-                        loaded = _loadable_tensor(
-                            key,
-                            value,
-                            set(),
-                            value.shape,
-                            scale_inv_by_key.get(_scale_inv_key(key)),
-                            convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
-                        )
-                        _copy_fused_projection_part(
-                            expected_state,
-                            tensor_shapes,
-                            checkpoint_key=key,
-                            fused_key=fused_key,
-                            part=part,
-                            parts=parts,
-                            value=loaded,
-                            loaded_parts=loaded_fused_parts,
-                            loaded_keys=loaded_keys,
-                        )
-                        fused_handled = True
-                        break
-                if fused_handled:
-                    continue
-                expert_part = _expert_projection_key(key)
-                if expert_part is not None:
-                    target_key, expert_idx, part = expert_part
-                    if target_key in expected_keys:
-                        if expected_state[target_key].dtype == torch.uint8:
-                            target_shape = expected_state[target_key].shape
-                            if target_key.endswith("gate_up_proj"):
-                                expected_part_shape = torch.Size(
-                                    (target_shape[1] // 2, target_shape[2])
-                                )
-                            else:
-                                expected_part_shape = torch.Size(
-                                    (target_shape[1], target_shape[2])
-                                )
-                            weight, scale = _load_fp8_expert_weight_and_scale(
-                                value,
-                                scale_inv_by_key.get(_scale_inv_key(key)),
-                                expected_part_shape,
-                                key=key,
+                    _copy_fused_projection_part(
+                        expected_state,
+                        tensor_shapes,
+                        checkpoint_key=key,
+                        fused_key=fused_key,
+                        part=part,
+                        parts=parts,
+                        value=loaded,
+                        loaded_parts=loaded_fused_parts,
+                        loaded_keys=loaded_keys,
+                    )
+                    fused_handled = True
+                    break
+            if fused_handled:
+                continue
+            expert_part = _expert_projection_key(key)
+            if expert_part is not None:
+                target_key, expert_idx, part = expert_part
+                if target_key in expected_keys:
+                    if expected_state[target_key].dtype == torch.uint8:
+                        target_shape = expected_state[target_key].shape
+                        if target_key.endswith("gate_up_proj"):
+                            expected_part_shape = torch.Size(
+                                (target_shape[1] // 2, target_shape[2])
                             )
-                            expert_entry = pending_experts.setdefault(
-                                target_key, {}
-                            ).setdefault(expert_idx, {})
-                            expert_entry[part] = weight
-                            expert_entry[f"{part}_scale_inv"] = scale
-                            continue
-                        loaded = _loadable_tensor(
-                            key,
+                        else:
+                            expected_part_shape = torch.Size(
+                                (target_shape[1], target_shape[2])
+                            )
+                        weight, scale = _load_fp8_expert_weight_and_scale(
                             value,
-                            set(),
-                            value.shape,
                             scale_inv_by_key.get(_scale_inv_key(key)),
-                            convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                            expected_part_shape,
+                            key=key,
                         )
-                        _copy_bf16_expert_part(
-                            expected_state,
-                            checkpoint_key=key,
-                            target_key=target_key,
-                            expert_idx=expert_idx,
-                            part=part,
-                            value=loaded,
-                            loaded_parts=loaded_expert_parts,
-                            loaded_keys=loaded_keys,
-                        )
+                        expert_entry = pending_experts.setdefault(
+                            target_key, {}
+                        ).setdefault(expert_idx, {})
+                        expert_entry[part] = weight
+                        expert_entry[f"{part}_scale_inv"] = scale
                         continue
-                unexpected.append(key)
+                    loaded = _loadable_tensor(
+                        key,
+                        value,
+                        set(),
+                        value.shape,
+                        scale_inv_by_key.get(_scale_inv_key(key)),
+                        convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                    )
+                    _copy_bf16_expert_part(
+                        expected_state,
+                        checkpoint_key=key,
+                        target_key=target_key,
+                        expert_idx=expert_idx,
+                        part=part,
+                        value=loaded,
+                        loaded_parts=loaded_expert_parts,
+                        loaded_keys=loaded_keys,
+                    )
+                    continue
+            unexpected.append(key)
         _load_ready_packed_experts(model, pending_experts, loaded_keys)
     _load_ready_packed_experts(model, pending_experts, loaded_keys)
 
