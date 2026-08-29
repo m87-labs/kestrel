@@ -344,7 +344,7 @@ class Gemma4TextExperts(nn.Module):
             top_k=self.top_k,
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
-            activation="geglu",
+            activation="gelu",
             weight_format=weight_format,
             dtype=flat_hidden.dtype,
             backend="auto",

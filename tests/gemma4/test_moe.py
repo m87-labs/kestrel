@@ -152,7 +152,7 @@ def test_experts_use_shared_contiguous_geglu_runtime(monkeypatch) -> None:
 
     spec = calls["spec"]
     forward = calls["forward"]
-    assert spec.activation == "geglu"
+    assert spec.activation == "gelu"
     assert spec.backend == "auto"
     assert spec.intermediate_size == config.moe_intermediate_size
     assert forward["weights"].weight_scale_layout == "block128"
