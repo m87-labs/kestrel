@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -325,6 +325,69 @@ def _copy_fused_projection_part(
         loaded_keys.add(fused_key)
 
 
+def _copy_bf16_expert_part(
+    expected_state: dict[str, torch.Tensor],
+    *,
+    checkpoint_key: str,
+    target_key: str,
+    expert_idx: int,
+    part: str,
+    value: torch.Tensor,
+    loaded_parts: dict[str, dict[int, set[str]]],
+    loaded_keys: set[str],
+) -> None:
+    target = expected_state[target_key]
+    if target.dtype != torch.bfloat16:
+        raise ValueError(f"expert target {target_key!r} is not BF16")
+    if not 0 <= expert_idx < target.shape[0]:
+        raise ValueError(f"expert index out of range in {checkpoint_key!r}")
+    seen = loaded_parts.setdefault(target_key, {}).setdefault(expert_idx, set())
+    if part in seen:
+        raise ValueError(f"duplicate expert projection part {checkpoint_key!r}")
+
+    expert_target = target[expert_idx]
+    if target_key.endswith(".gate_up_proj"):
+        parts = _MLP_GATE_UP_WEIGHT_PARTS
+        expected_shape = (
+            expert_target.shape[0] // 2,
+            *expert_target.shape[1:],
+        )
+        if value.shape != expected_shape:
+            raise ValueError(
+                f"expert projection {checkpoint_key!r} has shape {tuple(value.shape)}, "
+                f"expected {tuple(expected_shape)}"
+            )
+        slot = parts.index(part)
+        target_blocks = expert_target.reshape(
+            expert_target.shape[0] // 16,
+            2,
+            8,
+            *expert_target.shape[1:],
+        )
+        source_blocks = value.reshape(
+            value.shape[0] // 8,
+            8,
+            *value.shape[1:],
+        )
+        with torch.no_grad():
+            target_blocks[:, slot].copy_(source_blocks)
+    else:
+        parts = ("down_proj.weight",)
+        if value.shape != expert_target.shape:
+            raise ValueError(
+                f"expert projection {checkpoint_key!r} has shape {tuple(value.shape)}, "
+                f"expected {tuple(expert_target.shape)}"
+            )
+        with torch.no_grad():
+            expert_target.copy_(value)
+
+    seen.add(part)
+    if len(loaded_parts[target_key]) == target.shape[0] and all(
+        item == set(parts) for item in loaded_parts[target_key].values()
+    ):
+        loaded_keys.add(target_key)
+
+
 def _load_ready_packed_experts(
     model: torch.nn.Module,
     pending: dict[str, dict[int, dict[str, torch.Tensor]]],
@@ -425,6 +488,7 @@ def _load_sharded_safetensors(
     expected_keys = set(expected_state)
     loaded_keys: set[str] = set()
     loaded_fused_parts: dict[str, set[str]] = {}
+    loaded_expert_parts: dict[str, dict[int, set[str]]] = {}
     pending_experts: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
     qwen_rms_norm_weight_keys = _qwen_rms_norm_weight_keys(model)
     qwen_gdn_norm_weight_keys = _qwen_gdn_norm_weight_keys(model)
@@ -522,15 +586,23 @@ def _load_sharded_safetensors(
                             expert_entry[part] = weight
                             expert_entry[f"{part}_scale_inv"] = scale
                             continue
-                        pending_experts.setdefault(target_key, {}).setdefault(
-                            expert_idx, {}
-                        )[part] = _loadable_tensor(
+                        loaded = _loadable_tensor(
                             key,
                             value,
                             set(),
                             value.shape,
                             scale_inv_by_key.get(_scale_inv_key(key)),
                             convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
+                        )
+                        _copy_bf16_expert_part(
+                            expected_state,
+                            checkpoint_key=key,
+                            target_key=target_key,
+                            expert_idx=expert_idx,
+                            part=part,
+                            value=loaded,
+                            loaded_parts=loaded_expert_parts,
+                            loaded_keys=loaded_keys,
                         )
                         continue
                 unexpected.append(key)
@@ -563,12 +635,42 @@ def _resolve_checkpoint_file(
     return hf_hub_download(source, filename, **kwargs)
 
 
+def _materialize_remaining_meta_tensors(
+    model: torch.nn.Module,
+    *,
+    device: torch.device,
+) -> None:
+    parameter_replacements: dict[int, torch.nn.Parameter] = {}
+    buffer_replacements: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        for name, parameter in tuple(module._parameters.items()):
+            if parameter is None or parameter.device.type != "meta":
+                continue
+            replacement = parameter_replacements.get(id(parameter))
+            if replacement is None:
+                replacement = torch.nn.Parameter(
+                    torch.empty_like(parameter, device=device),
+                    requires_grad=parameter.requires_grad,
+                )
+                parameter_replacements[id(parameter)] = replacement
+            module._parameters[name] = replacement
+        for name, buffer in tuple(module._buffers.items()):
+            if buffer is None or buffer.device.type != "meta":
+                continue
+            replacement = buffer_replacements.get(id(buffer))
+            if replacement is None:
+                replacement = torch.empty_like(buffer, device=device)
+                buffer_replacements[id(buffer)] = replacement
+            module._buffers[name] = replacement
+
+
 def load_qwen35_model(
     source: str | Path,
     *,
     device: torch.device,
     dtype: torch.dtype,
     revision: str | None = None,
+    prepare_model: Callable[[torch.nn.Module], None] | None = None,
 ) -> Qwen3_5ForConditionalGeneration:
     config_path = _resolve_checkpoint_file(
         source, "config.json", revision=revision
@@ -579,10 +681,14 @@ def load_qwen35_model(
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        with torch.device(device):
+        construction_device = torch.device("meta") if prepare_model else device
+        with torch.device(construction_device):
             model = Qwen3_5ForConditionalGeneration(config)
     finally:
         torch.set_default_dtype(old_dtype)
+    if prepare_model is not None:
+        prepare_model(model)
+        _materialize_remaining_meta_tensors(model, device=device)
 
     index_path = _resolve_checkpoint_file(
         source, "model.safetensors.index.json", revision=revision
@@ -604,8 +710,11 @@ def load_qwen35_model(
             f"missing={missing[:8]} unexpected={unexpected[:8]}"
         )
     if config.text_config.tie_word_embeddings:
-        model.lm_head.weight = model.model.language_model.embed_tokens.weight
-    model = model.to(device=device).eval()
+        embedding_weight = model.model.language_model.embed_tokens.weight
+        with torch.no_grad():
+            model.lm_head.weight.copy_(embedding_weight)
+        model.lm_head.weight = embedding_weight
+    model = model.eval()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()

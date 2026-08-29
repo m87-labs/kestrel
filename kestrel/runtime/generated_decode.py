@@ -106,6 +106,7 @@ class GeneratedDecodeSpec:
     weight_layer_prefix: str
     bindings: GeneratedDecodeBindings
     weight_sources: Mapping[str, torch.Tensor] | None = None
+    weight_storage: Any | None = None
     capacity_inputs: (
         Callable[[int, tuple[StateRepresentationRequirement, ...]], Mapping[str, Any]]
         | None
@@ -403,12 +404,23 @@ class GeneratedDecode:
             materialization_options = {}
             if spec.weight_sources is not None:
                 materialization_options["weight_sources"] = spec.weight_sources
-            self.weight_storage = materialize_weights(
-                spec.weight_root,
-                self._programs[0].descriptor,
-                layer_prefix=spec.weight_layer_prefix,
-                **materialization_options,
-            )
+            if spec.weight_storage is None:
+                self.weight_storage = materialize_weights(
+                    spec.weight_root,
+                    self._programs[0].descriptor,
+                    layer_prefix=spec.weight_layer_prefix,
+                    **materialization_options,
+                )
+            else:
+                expected_contract = repr(self._programs[0].descriptor["weights"])
+                actual_contract = getattr(
+                    spec.weight_storage, "weight_contract", None
+                )
+                if actual_contract != expected_contract:
+                    raise RuntimeError(
+                        "preloaded generated weights do not match the selected program"
+                    )
+                self.weight_storage = spec.weight_storage
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
         ambient_stream.wait_event(weights_ready)

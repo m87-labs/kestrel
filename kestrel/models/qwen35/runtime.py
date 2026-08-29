@@ -293,6 +293,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         )
         if model_source is None:
             raise ValueError("Qwen model spec must declare repo_id")
+        self._generated_weight_storage = None
         self.model = self._load_model(model_source).eval()
         self.architecture = self.model.config
         text_cfg = self.architecture.text_config
@@ -497,11 +498,23 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
+        prepare_model = None
+        if self.decode_path != "native":
+            from .generated_decode import prepare_generated_weight_storage
+
+            def prepare_model(model: nn.Module) -> None:
+                self._generated_weight_storage = prepare_generated_weight_storage(
+                    self,
+                    model,
+                    required=self.decode_path == "generated",
+                )
+
         return load_qwen35_model(
             source,
             device=self.device,
             dtype=self.dtype,
             revision=self._spec.revision,
+            prepare_model=prepare_model,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:
