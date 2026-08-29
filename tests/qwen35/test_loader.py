@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
+from safetensors.torch import save_file
 
 from kestrel.models.qwen35.qwen_loader import (
     _ATTN_QKV_WEIGHT_PARTS,
@@ -16,6 +17,21 @@ from kestrel.models.qwen35.qwen_loader import (
 )
 import kestrel.models.qwen35.qwen_loader as loader_module
 from kestrel.ops.rotary import default_inv_freq
+
+
+class _FusedExpertHolder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.language_model = torch.nn.Module()
+        self.model.language_model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        layer = self.model.language_model.layers[0]
+        layer.mlp = torch.nn.Module()
+        layer.mlp.experts = torch.nn.Module()
+        layer.mlp.experts.gate_up_proj = torch.nn.Parameter(
+            torch.empty((2, 32, 3), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
 
 
 def test_fp8_dequantization_chunks_without_changing_bf16_result() -> None:
@@ -145,6 +161,62 @@ def test_bf16_experts_stream_into_final_interleaved_slices() -> None:
         "layer.experts.gate_up_proj",
         "layer.experts.down_proj",
     }
+
+
+def test_fused_and_separate_expert_checkpoints_load_identical_physical_layout(
+    tmp_path,
+) -> None:
+    gate = torch.arange(2 * 16 * 3, dtype=torch.bfloat16).reshape(2, 16, 3)
+    up = gate + 1000
+    target_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+    fused_dir = tmp_path / "fused"
+    separate_dir = tmp_path / "separate"
+    fused_dir.mkdir()
+    separate_dir.mkdir()
+    save_file(
+        {target_key: torch.cat((gate, up), dim=1)},
+        fused_dir / "model.safetensors",
+    )
+    save_file(
+        {
+            f"model.language_model.layers.0.mlp.experts.{expert}.gate_proj.weight": gate[expert]
+            for expert in range(2)
+        }
+        | {
+            f"model.language_model.layers.0.mlp.experts.{expert}.up_proj.weight": up[expert]
+            for expert in range(2)
+        },
+        separate_dir / "model.safetensors",
+    )
+    fused = _FusedExpertHolder()
+    separate = _FusedExpertHolder()
+
+    fused_result = _load_sharded_safetensors(
+        fused,
+        fused_dir,
+        ["model.safetensors"],
+        device=torch.device("cpu"),
+    )
+    separate_result = _load_sharded_safetensors(
+        separate,
+        separate_dir,
+        ["model.safetensors"],
+        device=torch.device("cpu"),
+    )
+
+    assert fused_result == ([], [])
+    assert separate_result == ([], [])
+    expected = torch.stack(
+        tuple(_interleave_gate_up_weight(gate[i], up[i]) for i in range(2))
+    )
+    torch.testing.assert_close(
+        fused.model.language_model.layers[0].mlp.experts.gate_up_proj,
+        expected,
+    )
+    torch.testing.assert_close(
+        separate.model.language_model.layers[0].mlp.experts.gate_up_proj,
+        expected,
+    )
 
 
 def test_sharded_loader_closes_key_handle_before_per_tensor_read(

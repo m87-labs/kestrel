@@ -14,7 +14,11 @@ from safetensors import safe_open
 from kestrel.ops.rotary import default_inv_freq
 
 from .qwen_config import Qwen3_5Config
-from .qwen_model import Qwen3_5ForConditionalGeneration, Qwen3_5RMSNormGated
+from .qwen_model import (
+    _KESTREL_MOE_GATE_UP_LAYOUT,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5RMSNormGated,
+)
 
 
 _GDN_IN_PROJ_PARTS = (
@@ -43,6 +47,11 @@ _FP8_TEXT_DENSE_WEIGHT_RE = re.compile(
     r".+\.weight$"
 )
 _DEQUANT_CHUNK_ROWS = 1024
+_DIRECT_CHECKPOINT_TENSOR_PREPS = (
+    # Qwen checkpoints store fused expert rows as [all gate, all up]. The
+    # native MoE ABI consumes alternating eight-row gate/up blocks.
+    (".mlp.experts.gate_up_proj", _KESTREL_MOE_GATE_UP_LAYOUT),
+)
 
 
 def _torch_device_arg(device: torch.device) -> str:
@@ -139,6 +148,51 @@ def _loadable_tensor(
     if key in qwen_rms_norm_weight_keys:
         return value.to(torch.float32) + 1.0
     return value
+
+
+def _direct_checkpoint_tensor_prep(key: str) -> str | None:
+    matches = tuple(
+        prep
+        for suffix, prep in _DIRECT_CHECKPOINT_TENSOR_PREPS
+        if key.endswith(suffix)
+    )
+    if len(matches) > 1:
+        raise ValueError(f"Qwen checkpoint tensor {key!r} has ambiguous preparation")
+    return matches[0] if matches else None
+
+
+def _copy_direct_checkpoint_tensor(
+    target: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    key: str,
+    prep: str | None,
+) -> None:
+    if prep is None:
+        target.copy_(value)
+        return
+    if prep != _KESTREL_MOE_GATE_UP_LAYOUT:
+        raise ValueError(
+            f"Qwen checkpoint tensor {key!r} has unsupported preparation {prep!r}"
+        )
+    if value.ndim < 2 or value.shape[-2] % 16 != 0:
+        raise ValueError(
+            f"Qwen fused expert tensor {key!r} cannot form interleaved-i8 "
+            f"gate/up rows from shape {tuple(value.shape)}"
+        )
+    intermediate = value.shape[-2] // 2
+    gate, up = value.split(intermediate, dim=-2)
+    target_blocks = target.reshape(
+        *target.shape[:-2], intermediate // 8, 2, 8, target.shape[-1]
+    )
+    gate_blocks = gate.reshape(
+        *gate.shape[:-2], intermediate // 8, 8, gate.shape[-1]
+    )
+    up_blocks = up.reshape(
+        *up.shape[:-2], intermediate // 8, 8, up.shape[-1]
+    )
+    target_blocks[..., 0, :, :].copy_(gate_blocks)
+    target_blocks[..., 1, :, :].copy_(up_blocks)
 
 
 def _stores_checkpoint_fp8_as_bf16(key: str) -> bool:
@@ -537,7 +591,12 @@ def _load_sharded_safetensors(
                     exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
                 )
                 with torch.no_grad():
-                    expected_state[key].copy_(loaded)
+                    _copy_direct_checkpoint_tensor(
+                        expected_state[key],
+                        loaded,
+                        key=key,
+                        prep=_direct_checkpoint_tensor_prep(key),
+                    )
                 loaded_keys.add(key)
                 continue
             fused_parts = _fused_projection_keys(key)

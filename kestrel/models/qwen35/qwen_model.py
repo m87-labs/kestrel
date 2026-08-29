@@ -59,6 +59,7 @@ _kestrel_moe_runtime = _kestrel_runtime.moe
 _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
+_KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 
 
@@ -638,7 +639,7 @@ class Qwen3_5MLP(nn.Module):
             hidden,
             gate_up,
             activation="silu",
-            layout="interleaved_i8",
+            layout=_KESTREL_MOE_GATE_UP_LAYOUT,
         )
         return self.down_proj(hidden)
 
