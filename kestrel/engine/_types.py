@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -29,7 +28,7 @@ import numpy as np
 
 from kestrel.runtime import Token
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
-from kestrel.skills import SkillSpec, SkillState
+from kestrel.skills import SkillSpec
 
 
 @dataclass(slots=True)
@@ -116,7 +115,7 @@ class EngineStream(AsyncIterator[StreamUpdate]):
 
 @dataclass(slots=True)
 class CapabilityUpdate:
-    """One coalescible progress snapshot from compound capability work."""
+    """One model-defined update from compound capability work."""
 
     task: str
     index: int
@@ -135,21 +134,27 @@ _CapabilityProducer = Callable[[_EmitCapabilityUpdate], Awaitable[EngineResult]]
 
 
 class CapabilityStream(AsyncIterator[CapabilityUpdate]):
-    """Bounded progress stream for a multi-request capability operation.
+    """Progress or output stream for a compound capability operation.
 
-    Updates are snapshots rather than an append-only event log. If a consumer
-    is slower than the producer, the pending snapshot is replaced by the most
-    recent one. This keeps memory bounded while ``result()`` remains usable by
-    callers that do not iterate progress.
+    By default, updates are replaceable snapshots: if a consumer is slower
+    than the producer, only the latest pending snapshot is retained. Pass
+    ``coalesce=False`` for lossless, append-only payloads such as PCM chunks.
+    That mode has the same queueing semantics as autoregressive streams.
     """
 
     __slots__ = ("task", "_queue", "_producer", "_index", "_closed")
 
-    def __init__(self, task: str, producer: _CapabilityProducer) -> None:
+    def __init__(
+        self,
+        task: str,
+        producer: _CapabilityProducer,
+        *,
+        coalesce: bool = True,
+    ) -> None:
         if not isinstance(task, str) or not task:
             raise ValueError("CapabilityStream task must be a non-empty string")
         self.task = task
-        self._queue: asyncio.Queue[CapabilityUpdate] = asyncio.Queue(maxsize=1)
+        self._queue: asyncio.Queue[CapabilityUpdate | None] = asyncio.Queue()
         self._index = 0
         self._closed = False
 
@@ -164,49 +169,30 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
                 output=dict(output),
             )
             self._index += 1
-            if self._queue.full():
+            if coalesce and not self._queue.empty():
                 self._queue.get_nowait()
             self._queue.put_nowait(update)
 
-        self._producer = asyncio.create_task(producer(emit))
+        async def produce() -> EngineResult:
+            try:
+                return await producer(emit)
+            finally:
+                self._queue.put_nowait(None)
+
+        self._producer = asyncio.create_task(produce())
 
     def __aiter__(self) -> "CapabilityStream":
         return self
 
     async def __anext__(self) -> CapabilityUpdate:
-        if not self._queue.empty():
-            return self._queue.get_nowait()
-        if self._producer.done():
+        if self._closed:
+            raise StopAsyncIteration
+        item = await self._queue.get()
+        if item is None:
+            self._closed = True
             await self._producer
             raise StopAsyncIteration
-        next_update = asyncio.create_task(self._queue.get())
-        try:
-            done, _ = await asyncio.wait(
-                (next_update, self._producer),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            if next_update.cancel():
-                try:
-                    await next_update
-                except asyncio.CancelledError:
-                    pass
-            elif not self._queue.full():
-                # Cancellation may arrive after queue.get() has consumed the
-                # snapshot but before asyncio.wait() returns it. Restore that
-                # snapshot unless the producer has already published a newer
-                # one, which supersedes it under the coalescing contract.
-                self._queue.put_nowait(next_update.result())
-            raise
-        if next_update in done:
-            return next_update.result()
-        next_update.cancel()
-        try:
-            await next_update
-        except asyncio.CancelledError:
-            pass
-        await self._producer
-        raise StopAsyncIteration
+        return item
 
     async def result(self) -> EngineResult:
         return await self._producer
@@ -221,6 +207,10 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
             await self._producer
         except asyncio.CancelledError:
             pass
+        finally:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
 
     async def __aenter__(self) -> "CapabilityStream":
         return self
