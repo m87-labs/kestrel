@@ -149,15 +149,17 @@ class RequestLifecycle:
             self.logprobs.append(float(logprob))
         callback = self.request.stream_callback
         if callback is not None:
-            text_delta = self.skill_state.pop_stream_delta(runtime)
-            reasoning_delta = self.skill_state.pop_reasoning_stream_delta(runtime)
+            output = self.skill_state.pop_stream_output(runtime) or {}
+            text = output.get("text", "")
+            reasoning = output.get("reasoning")
             callback(
                 StreamUpdate(
                     request_id=self.request.request_id,
                     token=token,
-                    text=text_delta or "",
+                    text=text if isinstance(text, str) else "",
                     token_index=self.skill_state.token_count - 1,
-                    reasoning=reasoning_delta,
+                    reasoning=reasoning if isinstance(reasoning, str) else None,
+                    output=dict(output),
                 )
             )
 
@@ -277,13 +279,19 @@ class SchedulerResult:
 
 @dataclass
 class StreamUpdate:
-    """Incremental update emitted for every committed decode token."""
+    """One append-only update emitted for every committed decode token.
+
+    ``text`` remains the convenient text-delta surface. ``output`` carries the
+    capability-defined payload for non-text streams and mirrors text deltas as
+    ``{"text": text}``.
+    """
 
     request_id: int
     token: Token
     text: str
     token_index: int
     reasoning: Optional[str] = None
+    output: Dict[str, object] = field(default_factory=dict)
 
 
 StreamCallback = Callable[[StreamUpdate], None]
