@@ -12,6 +12,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
 from kestrel.ops.rotary import default_inv_freq
+from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 from .qwen_config import Qwen3_5Config
 from .qwen_model import (
@@ -701,40 +702,6 @@ def _resolve_checkpoint_file(
     return hf_hub_download(source, filename, **kwargs)
 
 
-def _materialize_remaining_meta_tensors(
-    model: torch.nn.Module,
-    *,
-    device: torch.device,
-) -> None:
-    parameter_replacements: dict[int, torch.nn.Parameter] = {}
-    buffer_replacements: dict[int, torch.Tensor] = {}
-    for module in model.modules():
-        for name, parameter in tuple(module._parameters.items()):
-            if parameter is None or parameter.device.type != "meta":
-                continue
-            replacement = parameter_replacements.get(id(parameter))
-            if replacement is None:
-                replacement = torch.nn.Parameter(
-                    torch.empty_like(parameter, device=device),
-                    requires_grad=parameter.requires_grad,
-                )
-                parameter_replacements[id(parameter)] = replacement
-            module._parameters[name] = replacement
-        for name, buffer in tuple(module._buffers.items()):
-            if buffer is None or buffer.device.type != "meta":
-                continue
-            if name in module._non_persistent_buffers_set:
-                raise RuntimeError(
-                    "Qwen load-time preparation left derived buffer "
-                    f"{type(module).__name__}.{name} uninitialized"
-                )
-            replacement = buffer_replacements.get(id(buffer))
-            if replacement is None:
-                replacement = torch.empty_like(buffer, device=device)
-                buffer_replacements[id(buffer)] = replacement
-            module._buffers[name] = replacement
-
-
 def _restore_rotary_buffers(
     model: Qwen3_5ForConditionalGeneration,
     config: Qwen3_5Config,
@@ -783,7 +750,7 @@ def load_qwen35_model(
     if prepare_model is not None:
         prepare_model(model)
         _restore_rotary_buffers(model, config, device=device)
-        _materialize_remaining_meta_tensors(model, device=device)
+        materialize_remaining_meta_tensors(model, device=device)
 
     index_path = _resolve_checkpoint_file(
         source, "model.safetensors.index.json", revision=revision

@@ -88,6 +88,27 @@ def test_gemma_native_does_not_construct_generated_decode(
     assert runtime.generated_decode is None
 
 
+def test_gemma_auto_without_finalized_load_time_storage_uses_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.gemma4 import generated_decode as gemma_generated
+
+    runtime = object.__new__(Gemma4Runtime)
+    runtime.decode_path = "auto"
+    runtime._generated_weight_storage = None
+    monkeypatch.setattr(
+        gemma_generated,
+        "create_generated_decode",
+        lambda *_args, **_kwargs: pytest.fail(
+            "auto mode cannot materialize a second generated-weight slab"
+        ),
+    )
+
+    runtime._initialize_generated_decode()
+
+    assert runtime.generated_decode is None
+
+
 def test_qwen_required_generated_unavailable_refuses_before_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 import torch
 from huggingface_hub import snapshot_download
@@ -13,6 +14,7 @@ from kestrel.runtime.bounded_projection import (
     bind_declared_packed_projections,
     declared_packed_projection_source_keys,
 )
+from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 from .config import Gemma4Config
 from .model import Gemma4InferenceModel
@@ -159,12 +161,77 @@ def load_weights(source: str | Path, model: torch.nn.Module) -> None:
         raise RuntimeError(f"Gemma checkpoint is missing tensors: {missing[:10]}")
 
 
+def _fill_derived_buffer(
+    module: torch.nn.Module,
+    name: str,
+    value: float,
+    *,
+    device: torch.device,
+) -> None:
+    buffer = module._buffers[name]
+    if buffer.device.type == "meta":
+        module._buffers[name] = torch.full(
+            tuple(buffer.shape), value, dtype=buffer.dtype, device=device
+        )
+    else:
+        with torch.no_grad():
+            buffer.fill_(value)
+
+
+def _restore_checkpoint_independent_state(
+    model: Gemma4InferenceModel,
+    config: Gemma4Config,
+    *,
+    device: torch.device,
+) -> None:
+    """Restore constants intentionally omitted from Gemma checkpoints."""
+
+    for module in model.modules():
+        if (
+            hasattr(module, "eps")
+            and "weight" in module._non_persistent_buffers_set
+            and module._buffers.get("weight") is not None
+        ):
+            _fill_derived_buffer(module, "weight", 1.0, device=device)
+
+    text = model.model.language_model
+    _fill_derived_buffer(
+        text.embed_tokens,
+        "embed_scale",
+        config.text_config.hidden_size**0.5,
+        device=device,
+    )
+    if config.text_config.hidden_size_per_layer_input:
+        _fill_derived_buffer(
+            text.embed_tokens_per_layer,
+            "embed_scale",
+            config.text_config.hidden_size_per_layer_input**0.5,
+            device=device,
+        )
+        _fill_derived_buffer(
+            text,
+            "per_layer_input_scale",
+            2.0**-0.5,
+            device=device,
+        )
+    text.rotary_emb = type(text.rotary_emb)(config.text_config, device=device)
+    vision = model.model.vision_tower
+    vision.encoder.rotary_emb = type(vision.encoder.rotary_emb)(
+        config.vision_config.head_dim,
+        config.vision_config.rope.theta,
+        dimensions=2,
+        device=device,
+    )
+
+
 def load_model(
     source: str | Path,
     *,
     device: torch.device,
     dtype: torch.dtype,
     revision: str | None = None,
+    prepare_model: Callable[[torch.nn.Module], None] | None = None,
+    finalize_model: Callable[[torch.nn.Module], None] | None = None,
 ) -> Gemma4InferenceModel:
     snapshot = _snapshot(source, revision=revision)
     config_path = snapshot / "config.json"
@@ -174,13 +241,20 @@ def load_model(
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        with torch.device(device):
+        construction_device = torch.device("meta") if prepare_model else device
+        with torch.device(construction_device):
             model = Gemma4InferenceModel(config)
     finally:
         torch.set_default_dtype(old_dtype)
+    if prepare_model is not None:
+        prepare_model(model)
+        _restore_checkpoint_independent_state(model, config, device=device)
+        materialize_remaining_meta_tensors(model, device=device)
 
     load_weights(snapshot, model)
     model.lm_head.weight = model.model.language_model.embed_tokens.weight
+    if finalize_model is not None:
+        finalize_model(model)
     return model.to(device=device).eval()
 
 

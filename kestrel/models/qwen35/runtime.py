@@ -468,13 +468,21 @@ class Qwen35Runtime(UncachedPagedRuntime):
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
 
-        from .generated_decode import prepare_generated_weight_storage
+        from kestrel.runtime.generated_decode import (
+            prepare_generated_weight_storage_for_loading,
+        )
+        from .generated_decode import _WEIGHT_LAYER_PREFIX
 
         def prepare_model(model: nn.Module) -> None:
-            self._generated_weight_storage = prepare_generated_weight_storage(
-                self,
-                model,
-                required=True,
+            self._generated_weight_storage = (
+                prepare_generated_weight_storage_for_loading(
+                    self,
+                    model,
+                    label="Qwen",
+                    layer_prefix=_WEIGHT_LAYER_PREFIX,
+                    required_batch_sizes=range(1, self.max_batch_size + 1),
+                    required=True,
+                )
             )
 
         return load_qwen35_model(

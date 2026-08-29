@@ -157,7 +157,9 @@ def test_generated_decode_materializes_explicit_weight_sources(monkeypatch):
 
 
 def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
-    storage = SimpleNamespace(buffers={}, weight_contract=repr([]))
+    storage = SimpleNamespace(
+        buffers={}, weight_contract=repr([]), finalized=True
+    )
     calls = []
 
     generated, _launches = _build(
@@ -173,9 +175,25 @@ def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
 
 
 def test_generated_decode_rejects_mismatched_preloaded_weight_storage(monkeypatch):
-    storage = SimpleNamespace(buffers={}, weight_contract="different")
+    storage = SimpleNamespace(
+        buffers={}, weight_contract="different", finalized=True
+    )
 
     with pytest.raises(RuntimeError, match="preloaded generated weights"):
+        _build(
+            monkeypatch,
+            _programs("b1"),
+            max_batch_size=1,
+            weight_storage=storage,
+        )
+
+
+def test_generated_decode_rejects_unfinalized_preloaded_weight_storage(monkeypatch):
+    storage = SimpleNamespace(
+        buffers={}, weight_contract=repr([]), finalized=False
+    )
+
+    with pytest.raises(RuntimeError, match="not finalized"):
         _build(
             monkeypatch,
             _programs("b1"),

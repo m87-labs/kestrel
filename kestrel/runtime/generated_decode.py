@@ -256,6 +256,187 @@ def _selectable_programs(
     )
 
 
+def _generated_weight_runtime(*, label: str, required: bool) -> Any | None:
+    try:
+        from kestrel_kernels import generated_decode as generated_runtime
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"kestrel_kernels", "kestrel_kernels.generated_decode"}:
+            raise
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode requires load-time weight support"
+            )
+        return None
+    capabilities = (
+        "resolve_compatible_programs",
+        "allocate_weight_storage_for_loading",
+        "finalize_weight_storage_after_loading",
+    )
+    if not all(
+        callable(getattr(generated_runtime, name, None)) for name in capabilities
+    ):
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode requires load-time weight binding "
+                "and finalization support"
+            )
+        return None
+    return generated_runtime
+
+
+def generated_weight_programs_for_loading(
+    runtime: Any,
+    model: torch.nn.Module,
+    *,
+    label: str,
+    layer_prefix: str,
+    required_batch_sizes: Sequence[int],
+    required: bool,
+) -> tuple[Any, ...]:
+    """Resolve the exact load-time program set or fail soft when optional."""
+
+    if runtime.device.type != "cuda" or runtime.dtype is not torch.bfloat16:
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode requires CUDA BF16 model storage"
+            )
+        return ()
+    generated_runtime = _generated_weight_runtime(label=label, required=required)
+    if generated_runtime is None:
+        return ()
+
+    properties = torch.cuda.get_device_properties(runtime.device)
+    programs = tuple(generated_runtime.resolve_compatible_programs(
+        model,
+        layer_prefix=layer_prefix,
+        arch=f"sm{properties.major}{properties.minor}",
+        device_sms=int(properties.multi_processor_count),
+    ))
+    missing = [
+        int(batch_size)
+        for batch_size in required_batch_sizes
+        if _select_program(programs, int(batch_size)) is None
+    ]
+    if missing:
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode has no load-time artifact coverage "
+                f"for batch sizes {missing}"
+            )
+        return ()
+    selected = _selectable_programs(programs, runtime.max_batch_size)
+    if not selected:
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode has no selectable load-time artifact"
+            )
+        return ()
+    contracts = {repr(program.descriptor["weights"]) for program in selected}
+    if len(contracts) != 1:
+        raise RuntimeError(
+            f"generated {label} artifacts disagree on weight storage"
+        )
+    return selected
+
+
+def prepare_generated_weight_storage_for_loading(
+    runtime: Any,
+    model: torch.nn.Module,
+    *,
+    label: str,
+    layer_prefix: str,
+    required_batch_sizes: Sequence[int],
+    required: bool,
+) -> Any | None:
+    """Bind checkpoint targets into the selected generated program's final slabs."""
+
+    selected = generated_weight_programs_for_loading(
+        runtime,
+        model,
+        label=label,
+        layer_prefix=layer_prefix,
+        required_batch_sizes=required_batch_sizes,
+        required=required,
+    )
+    if not selected:
+        return None
+    generated_runtime = _generated_weight_runtime(label=label, required=True)
+    assert generated_runtime is not None
+
+    return generated_runtime.allocate_weight_storage_for_loading(
+        model,
+        selected[0].descriptor,
+        device=runtime.device,
+        layer_prefix=layer_prefix,
+    )
+
+
+def finalize_generated_weight_storage_after_loading(
+    runtime: Any,
+    model: torch.nn.Module,
+    storage: Any,
+    *,
+    label: str,
+    layer_prefix: str,
+    required_batch_sizes: Sequence[int],
+) -> Any:
+    """Finalize retained recipes against the exact selected weight contract."""
+
+    selected = generated_weight_programs_for_loading(
+        runtime,
+        model,
+        label=label,
+        layer_prefix=layer_prefix,
+        required_batch_sizes=required_batch_sizes,
+        required=True,
+    )
+    generated_runtime = _generated_weight_runtime(label=label, required=True)
+    assert generated_runtime is not None
+
+    return generated_runtime.finalize_weight_storage_after_loading(
+        model,
+        selected[0].descriptor,
+        storage,
+        layer_prefix=layer_prefix,
+    )
+
+
+def materialize_remaining_meta_tensors(
+    model: torch.nn.Module,
+    *,
+    device: torch.device,
+) -> None:
+    """Materialize checkpoint-backed tensors not claimed by a load-time layout."""
+
+    parameter_replacements: dict[int, torch.nn.Parameter] = {}
+    buffer_replacements: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        for name, parameter in tuple(module._parameters.items()):
+            if parameter is None or parameter.device.type != "meta":
+                continue
+            replacement = parameter_replacements.get(id(parameter))
+            if replacement is None:
+                replacement = torch.nn.Parameter(
+                    torch.empty_like(parameter, device=device),
+                    requires_grad=parameter.requires_grad,
+                )
+                parameter_replacements[id(parameter)] = replacement
+            module._parameters[name] = replacement
+        for name, buffer in tuple(module._buffers.items()):
+            if buffer is None or buffer.device.type != "meta":
+                continue
+            if name in module._non_persistent_buffers_set:
+                raise RuntimeError(
+                    "load-time preparation left derived buffer "
+                    f"{type(module).__name__}.{name} uninitialized"
+                )
+            replacement = buffer_replacements.get(id(buffer))
+            if replacement is None:
+                replacement = torch.empty_like(buffer, device=device)
+                buffer_replacements[id(buffer)] = replacement
+            module._buffers[name] = replacement
+
+
 class GeneratedDecode:
     """Select bundled capacities and bind them to one serving runtime."""
 
@@ -441,6 +622,10 @@ class GeneratedDecode:
                     raise RuntimeError(
                         "preloaded generated weights do not match the selected program"
                     )
+                if getattr(spec.weight_storage, "finalized", None) is not True:
+                    raise RuntimeError(
+                        "preloaded generated weights were not finalized after loading"
+                    )
                 self.weight_storage = spec.weight_storage
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
@@ -613,4 +798,8 @@ __all__ = [
     "GeneratedDecodeBindings",
     "GeneratedDecodeSpec",
     "PagedDecodeBindings",
+    "finalize_generated_weight_storage_after_loading",
+    "generated_weight_programs_for_loading",
+    "materialize_remaining_meta_tensors",
+    "prepare_generated_weight_storage_for_loading",
 ]
