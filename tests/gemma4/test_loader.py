@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 
 import pytest
@@ -15,6 +16,7 @@ from kestrel.models.gemma4.config import (
 )
 from kestrel.models.gemma4.loader import (
     _restore_checkpoint_independent_state,
+    load_model,
     load_weights,
 )
 from kestrel.models.gemma4.model import Gemma4InferenceModel
@@ -83,6 +85,86 @@ def _tiny_gemma_config() -> Gemma4Config:
         ),
         image_token_id=15,
     )
+
+
+def _rope_config(spec: RopeSpec) -> dict[str, object]:
+    return {
+        "rope_type": spec.kind,
+        "rope_theta": spec.theta,
+        "partial_rotary_factor": spec.partial_rotary_factor,
+        "factor": spec.factor,
+    }
+
+
+def _tiny_gemma_config_data() -> dict[str, object]:
+    config = _tiny_gemma_config()
+    text = asdict(config.text_config)
+    text.pop("rope")
+    text.update(
+        rope_parameters={
+            name: _rope_config(spec)
+            for name, spec in config.text_config.rope.items()
+        },
+        hidden_activation="gelu_pytorch_tanh",
+        attention_bias=False,
+        attention_dropout=0.0,
+    )
+    vision = asdict(config.vision_config)
+    vision.pop("rope")
+    vision.update(
+        rope_parameters=_rope_config(config.vision_config.rope),
+        hidden_activation="gelu_pytorch_tanh",
+        attention_bias=False,
+        attention_dropout=0.0,
+    )
+    return {
+        "tie_word_embeddings": True,
+        "text_config": text,
+        "vision_config": vision,
+        "image_token_id": config.image_token_id,
+    }
+
+
+def _tiny_generated_weight_descriptor() -> dict[str, object]:
+    return {
+        "weight_layer_prefix": "model.language_model.layers",
+        "weights": [
+            {
+                "name": "text_embedding_table",
+                "source": "model.language_model.embed_tokens.weight",
+                "prep": "cast_bf16",
+                "shape": [16, 8],
+                "dtype": "bf16",
+                "per_layer": False,
+                "physical_layers": [None],
+                "kind": "param",
+            },
+            {
+                "name": "w_qkv_local",
+                "sources": [
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                ],
+                "prep": "concat_rows|cast_bf16",
+                "shape": [16, 8],
+                "dtype": "bf16",
+                "per_layer": True,
+                "physical_layers": [0],
+                "kind": "param",
+            },
+            {
+                "name": "w_gate_up_fresh",
+                "source": "mlp.gate_up_proj.weight",
+                "prep": "interleave_gate_up_rows8_axis0|cast_bf16",
+                "shape": [16, 8],
+                "dtype": "bf16",
+                "per_layer": True,
+                "physical_layers": [0],
+                "kind": "param",
+            },
+        ],
+    }
 
 
 def test_load_weights_streams_packed_projection_parts_across_shards(tmp_path) -> None:
@@ -154,45 +236,7 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
             model = Gemma4InferenceModel(config)
     finally:
         torch.set_default_dtype(old_dtype)
-    descriptor = {
-        "weight_layer_prefix": "model.language_model.layers",
-        "weights": [
-            {
-                "name": "text_embedding_table",
-                "source": "model.language_model.embed_tokens.weight",
-                "prep": "cast_bf16",
-                "shape": [16, 8],
-                "dtype": "bf16",
-                "per_layer": False,
-                "physical_layers": [None],
-                "kind": "param",
-            },
-            {
-                "name": "w_qkv_local",
-                "sources": [
-                    "self_attn.q_proj.weight",
-                    "self_attn.k_proj.weight",
-                    "self_attn.v_proj.weight",
-                ],
-                "prep": "concat_rows|cast_bf16",
-                "shape": [16, 8],
-                "dtype": "bf16",
-                "per_layer": True,
-                "physical_layers": [0],
-                "kind": "param",
-            },
-            {
-                "name": "w_gate_up_fresh",
-                "source": "mlp.gate_up_proj.weight",
-                "prep": "interleave_gate_up_rows8_axis0|cast_bf16",
-                "shape": [16, 8],
-                "dtype": "bf16",
-                "per_layer": True,
-                "physical_layers": [0],
-                "kind": "param",
-            },
-        ],
-    }
+    descriptor = _tiny_generated_weight_descriptor()
 
     storage = allocate_weight_storage_for_loading(
         model,
@@ -228,5 +272,86 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
     assert not any(
         tensor.device.type == "meta"
         for tensor in model.model.language_model.rotary_emb.inv_freq.values()
+    )
+    assert materialize_weights(model, descriptor) is storage
+
+
+def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
+    tmp_path,
+) -> None:
+    config = _tiny_gemma_config()
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        reference = Gemma4InferenceModel(config)
+    finally:
+        torch.set_default_dtype(old_dtype)
+    checkpoint = {
+        name: value.detach().clone()
+        for name, value in reference.state_dict().items()
+        if name != "lm_head.weight"
+    }
+    expected_embedding = checkpoint[
+        "model.language_model.embed_tokens.weight"
+    ].clone()
+    (tmp_path / "config.json").write_text(
+        json.dumps(_tiny_gemma_config_data()),
+        encoding="utf-8",
+    )
+    save_file(checkpoint, tmp_path / "model.safetensors")
+
+    descriptor = _tiny_generated_weight_descriptor()
+    lifecycle: list[str] = []
+    storage_box = {}
+
+    def prepare_model(model: torch.nn.Module) -> None:
+        lifecycle.append("prepare")
+        storage = allocate_weight_storage_for_loading(
+            model,
+            descriptor,
+            device="cpu",
+        )
+        assert not storage.finalized
+        storage_box["storage"] = storage
+
+    def finalize_model(model: torch.nn.Module) -> None:
+        lifecycle.append("finalize")
+        storage = storage_box["storage"]
+        assert not any(tensor.device.type == "meta" for tensor in model.parameters())
+        finalize_weight_storage_after_loading(model, descriptor, storage)
+        assert storage.finalized
+
+    model = load_model(
+        tmp_path,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        prepare_model=prepare_model,
+        finalize_model=finalize_model,
+    )
+
+    storage = storage_box["storage"]
+    embedding = model.model.language_model.embed_tokens.weight
+    assert lifecycle == ["prepare", "finalize"]
+    assert storage.finalized
+    assert model.lm_head.weight is embedding
+    assert torch._C._is_alias_of(
+        embedding,
+        storage.buffers["text_embedding_table"],
+    )
+    torch.testing.assert_close(embedding, expected_embedding)
+    assert not any(
+        tensor.device.type == "meta"
+        for tensor in (*model.parameters(), *model.buffers())
+    )
+    assert not any(
+        tensor.device.type == "meta"
+        for tensor in model.model.language_model.rotary_emb.inv_freq.values()
+    )
+    torch.testing.assert_close(
+        model.model.language_model.embed_tokens.embed_scale,
+        torch.full_like(
+            model.model.language_model.embed_tokens.embed_scale,
+            config.text_config.hidden_size**0.5,
+        ),
     )
     assert materialize_weights(model, descriptor) is storage
