@@ -329,12 +329,14 @@ def bind_declared_packed_projections(
                 ),
                 dim=1,
             ).reshape(sum(child.packed_out_features), child.in_features)
+        elif len(weights) == 1:
+            packed_weight = weights[0]
         else:
             packed_weight = torch.cat(weights, dim=0)
         state_dict[target_weight_key] = packed_weight
         for bound_name, value in packed_bounds.items():
             state_dict[target_prefix + bound_name] = value
-        for key in source_weight_keys:
+        for key in dict.fromkeys(source_weight_keys):
             state_dict.pop(key)
-        for key in source_bound_keys:
+        for key in dict.fromkeys(source_bound_keys):
             state_dict.pop(key)
