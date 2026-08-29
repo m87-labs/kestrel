@@ -7,6 +7,7 @@ import torch
 from kestrel.runtime.generated_decode import (
     GeneratedDecode,
     prepare_generated_weight_storage_for_loading,
+    reserve_generated_binding_storage,
 )
 
 
@@ -180,3 +181,77 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
         prepare_generated_weight_storage_for_loading(
             runtime, Mock(), required=True, **options
         )
+
+
+def test_binding_reservation_allocates_every_program_slot_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_kernels import generated_decode as generated_runtime
+
+    programs = tuple(
+        SimpleNamespace(descriptor={"owned_bytes": owned_bytes})
+        for owned_bytes in (10, 20)
+    )
+    storage = SimpleNamespace(finalized=True, buffers={"weight": torch.empty(1)})
+    first = {"slot": 1}
+    second = {"slot": 2}
+    calls = []
+
+    def reserve(descriptor, *, weights, runtime_inputs, device):
+        calls.append((descriptor, weights, runtime_inputs))
+        return (
+            torch.empty(
+                descriptor["owned_bytes"] + runtime_inputs["slot"],
+                dtype=torch.uint8,
+                device=device,
+            ),
+        )
+
+    monkeypatch.setattr(
+        generated_runtime,
+        "reserve_binding_storage",
+        reserve,
+        raising=False,
+    )
+
+    reservation = reserve_generated_binding_storage(
+        programs,
+        weight_storage=storage,
+        runtime_inputs_by_slot=(first, second),
+        device=torch.device("cpu"),
+        label="test",
+        required=True,
+    )
+
+    assert reservation is not None
+    assert [tensor.dtype for tensor in reservation] == [torch.uint8] * 4
+    assert [tensor.numel() for tensor in reservation] == [11, 21, 12, 22]
+    assert calls == [
+        (programs[0].descriptor, storage.buffers, first),
+        (programs[1].descriptor, storage.buffers, first),
+        (programs[0].descriptor, storage.buffers, second),
+        (programs[1].descriptor, storage.buffers, second),
+    ]
+
+
+def test_binding_reservation_fails_soft_only_when_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_kernels import generated_decode as generated_runtime
+
+    monkeypatch.delattr(
+        generated_runtime,
+        "reserve_binding_storage",
+        raising=False,
+    )
+    options = dict(
+        programs=(SimpleNamespace(descriptor={}),),
+        weight_storage=SimpleNamespace(finalized=True, buffers={}),
+        runtime_inputs_by_slot=({},),
+        device=torch.device("cpu"),
+        label="test",
+    )
+
+    assert reserve_generated_binding_storage(required=False, **options) is None
+    with pytest.raises(RuntimeError, match="binding-storage reservation"):
+        reserve_generated_binding_storage(required=True, **options)

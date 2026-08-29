@@ -401,6 +401,60 @@ def finalize_generated_weight_storage_after_loading(
     )
 
 
+def reserve_generated_binding_storage(
+    programs: Sequence[Any],
+    *,
+    weight_storage: Any,
+    runtime_inputs_by_slot: Sequence[Mapping[str, Any]],
+    device: torch.device,
+    label: str,
+    required: bool,
+) -> tuple[torch.Tensor, ...] | None:
+    """Reserve exact allocator-owned storage for later binding assembly.
+
+    Callers keep the shape- and dtype-exact tensors alive while fitting and
+    allocating other resident tensors, then release them immediately before
+    constructing :class:`GeneratedDecode`. The caching allocator can reuse
+    those same size classes for the per-program binding tensors.
+    """
+
+    generated_runtime = _generated_weight_runtime(label=label, required=required)
+    if generated_runtime is None:
+        return None
+    reserve = getattr(generated_runtime, "reserve_binding_storage", None)
+    if not callable(reserve):
+        if required:
+            raise RuntimeError(
+                f"generated {label} decode requires binding-storage reservation"
+            )
+        return None
+    if getattr(weight_storage, "finalized", None) is not True:
+        raise RuntimeError(
+            f"generated {label} binding reservation requires finalized weights"
+        )
+    weights = getattr(weight_storage, "buffers", None)
+    if not isinstance(weights, Mapping):
+        raise RuntimeError(
+            f"generated {label} binding reservation requires weight buffers"
+        )
+    if not programs or not runtime_inputs_by_slot:
+        raise ValueError(
+            "generated binding reservation needs programs and decode slots"
+        )
+
+    return tuple(
+        tensor
+        for runtime_inputs in runtime_inputs_by_slot
+        for program in programs
+        for tensor in reserve(
+            program.descriptor,
+            weights=weights,
+            runtime_inputs=runtime_inputs,
+            device=device,
+        )
+    )
+
+
 def materialize_remaining_meta_tensors(
     model: torch.nn.Module,
     *,
@@ -802,4 +856,5 @@ __all__ = [
     "generated_weight_programs_for_loading",
     "materialize_remaining_meta_tensors",
     "prepare_generated_weight_storage_for_loading",
+    "reserve_generated_binding_storage",
 ]

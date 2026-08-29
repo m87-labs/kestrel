@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import torch
 
 from kestrel.device import make_event, make_stream
-from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
+from kestrel.kv_cache import (
+    KVMemoryPool,
+    PageTable,
+    allocate_paged_kv_layers,
+    fit_and_allocate_paged_kv_storage,
+)
 from kestrel.runtime import ExecutionShape, SequenceState, TextToken, Token
 from kestrel.runtime.compilation import (
     canonicalize_immutable_scalar_buffers,
@@ -37,6 +43,71 @@ from .prompt_template import (
     TURN_ID,
     USER_ROLE_ID,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PagedRuntimeResources:
+    rope_inputs: dict[str, torch.Tensor] | None
+    decode_page_tables: tuple[torch.Tensor, ...]
+    page_table: PageTable
+
+
+def _generated_kv_binding_inputs(
+    layer_specs: Sequence[Any],
+    layer_kinds: Sequence[str],
+) -> dict[str, tuple[Any | None, ...]]:
+    """Describe the exact pre-allocation layer collections for estimation."""
+
+    if len(layer_specs) != len(layer_kinds):
+        raise ValueError("Gemma K/V specs and layer kinds must have equal length")
+    marker = object()
+    inputs = {}
+    for suffix, kind in (
+        ("local", "sliding_attention"),
+        ("global", "full_attention"),
+    ):
+        layers = tuple(
+            marker if spec is not None and actual_kind == kind else None
+            for spec, actual_kind in zip(layer_specs, layer_kinds, strict=True)
+        )
+        inputs[f"mK_{suffix}"] = layers
+        inputs[f"mV_{suffix}"] = layers
+    return inputs
+
+
+def _allocate_decode_page_tables(
+    *,
+    count: int,
+    rows: int,
+    pages: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Allocate exact per-slot page tables without publishing their pointers."""
+
+    return tuple(
+        torch.empty(
+            (rows, pages),
+            dtype=torch.int32,
+            device=device,
+        )
+        for _index in range(int(count))
+    )
+
+
+def _install_decode_page_tables(
+    slots: Sequence[Any], tables: Sequence[torch.Tensor]
+) -> None:
+    """Publish fitted page tables once, before native or generated binding."""
+
+    if len(slots) != len(tables):
+        raise ValueError("decode slots and fitted page tables must have equal length")
+    if not tables:
+        return
+    expected = (int(tables[0].shape[0]), 1)
+    if any(tuple(slot.paged_kv_page_table.shape) != expected for slot in slots):
+        raise RuntimeError("decode page tables must be unbound one-column placeholders")
+    for slot, table in zip(slots, tables, strict=True):
+        slot.paged_kv_page_table = table
 
 
 class Gemma4Runtime(UncachedPagedRuntime):
@@ -134,10 +205,8 @@ class Gemma4Runtime(UncachedPagedRuntime):
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.spec = None
         self.page_size = cfg.page_size
-        self.max_seq_length = int(
-            self._config.text_config.max_position_embeddings
-        )
-        self._kv_cache_pages = bound_kv_cache_pages(
+        self.max_seq_length = int(self._config.text_config.max_position_embeddings)
+        requested_kv_cache_pages = bound_kv_cache_pages(
             cfg.kv_cache_pages,
             page_size=self.page_size,
             max_batch_size=self.max_batch_size,
@@ -164,17 +233,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
         )
         self._copy_stream = make_stream(self.device)
         self.graph_capture_lock = threading.RLock()
-        self.page_table = PageTable(
-            n_pages=self._kv_cache_pages,
-            page_size=self.page_size,
-            max_batch_size=self.max_batch_slots,
-            device=str(self.device),
-            prefix_cache=None,
-            h2d_stream=self._compute_stream,
-        )
-        self.page_table.free_batch_idx.remove(self._padding_batch_idx)
-        self.page_table.reserve(self._padding_batch_idx, 1)
-        self.page_table.commit_block_table([self._padding_batch_idx])
         self._prefill_slot = PrefillSlot(
             slot_id=0,
             batch_idx=torch.zeros(
@@ -197,7 +255,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
                 device=self.device,
                 dtype=self.dtype,
                 max_batch_slots=decode_rows,
-                kv_cache_pages=self._kv_cache_pages,
+                kv_cache_pages=1,
                 vocab_size=text_config.vocab_size,
                 hidden_dim=text_config.hidden_size,
                 position_shape=(decode_rows, 1),
@@ -208,17 +266,127 @@ class Gemma4Runtime(UncachedPagedRuntime):
         )
         self.active_sequences: dict[int, SequenceState] = {}
 
+        kv_layer_specs = paged_kv_specs(text_config)
+        self._generated_rope_inputs = None
+        has_generated_decode = (
+            self.decode_path != "native"
+            and self._generated_weight_storage is not None
+        )
+        if self.decode_path == "generated" and not has_generated_decode:
+            raise RuntimeError(
+                "generated Gemma decode has no finalized load-time weight storage"
+            )
+        self._generated_binding_reservation = None
+        if has_generated_decode:
+            from kestrel.runtime.generated_decode import (
+                generated_weight_programs_for_loading,
+                reserve_generated_binding_storage,
+            )
+            from .generated_decode import _WEIGHT_LAYER_PREFIX
+
+            programs = generated_weight_programs_for_loading(
+                self,
+                self.model,
+                label="Gemma",
+                layer_prefix=_WEIGHT_LAYER_PREFIX,
+                required_batch_sizes=range(1, self.max_batch_size + 1),
+                required=self.decode_path == "generated",
+            )
+            if programs:
+                for program in programs:
+                    program.preload(self.device)
+            sparse_inputs = _generated_kv_binding_inputs(
+                kv_layer_specs,
+                tuple(text_config.layer_types),
+            )
+            if programs:
+                self._generated_binding_reservation = (
+                    reserve_generated_binding_storage(
+                        programs,
+                        weight_storage=self._generated_weight_storage,
+                        runtime_inputs_by_slot=tuple(
+                            sparse_inputs for _slot in self.decode_slots
+                        ),
+                        device=self.device,
+                        label="Gemma",
+                        required=self.decode_path == "generated",
+                    )
+                )
+            if self._generated_binding_reservation is None:
+                has_generated_decode = False
+                self._generated_weight_storage = None
+        rope_builder = None
+        if has_generated_decode:
+            from .generated_decode import _rope_tables
+
+            rope_builder = _rope_tables
+
+        def allocate_paged_resources(pages: int) -> _PagedRuntimeResources:
+            reachable_tokens = min(
+                self.max_seq_length,
+                (int(pages) - 2) * self.page_size,
+            )
+            rope_inputs = (
+                None if rope_builder is None else rope_builder(self, reachable_tokens)
+            )
+            decode_page_tables = _allocate_decode_page_tables(
+                count=len(self.decode_slots),
+                rows=decode_rows,
+                pages=pages,
+                device=self.device,
+            )
+            page_table = PageTable(
+                n_pages=pages,
+                page_size=self.page_size,
+                max_batch_size=self.max_batch_slots,
+                device=str(self.device),
+                prefix_cache=None,
+                h2d_stream=self._compute_stream,
+            )
+            page_table.free_batch_idx.remove(self._padding_batch_idx)
+            page_table.reserve(self._padding_batch_idx, 1)
+            page_table.commit_block_table([self._padding_batch_idx])
+            return _PagedRuntimeResources(
+                rope_inputs=rope_inputs,
+                decode_page_tables=decode_page_tables,
+                page_table=page_table,
+            )
+
+        self._kv_storage, paged_resources = fit_and_allocate_paged_kv_storage(
+            requested_kv_cache_pages,
+            layer_specs=kv_layer_specs,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            pool=self._kv_pool,
+            allocate_additional=allocate_paged_resources,
+        )
+        if paged_resources is None:
+            raise RuntimeError("Gemma paged resource allocation returned no resources")
+        self._kv_cache_pages = self._kv_storage.n_pages
+        self._generated_rope_inputs = paged_resources.rope_inputs
+        _install_decode_page_tables(
+            self.decode_slots,
+            paged_resources.decode_page_tables,
+        )
+        self.page_table = paged_resources.page_table
         self._kv_cache = allocate_paged_kv_layers(
-            layer_specs=paged_kv_specs(text_config),
+            layer_specs=kv_layer_specs,
             page_table=self.page_table,
             pool=self._kv_pool,
             dtype=self.dtype,
+            storage=self._kv_storage,
         )
         self._initialize_generated_decode()
 
     def _initialize_generated_decode(self) -> None:
         """Apply the runtime-wide decode policy after model state is ready."""
 
+        # Generated bindings own exactly the tensors represented by this
+        # reservation. Release it only after every other resident allocation,
+        # so binding assembly can reuse the reserved allocator block.
+        reservation = self._generated_binding_reservation
+        self._generated_binding_reservation = None
+        del reservation
         self.generated_decode = None
         if self.decode_path == "native":
             return
