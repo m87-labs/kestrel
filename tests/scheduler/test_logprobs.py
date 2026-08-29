@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -413,6 +414,28 @@ def test_sample_batch_omits_logprob_keyword_without_opt_in(
 
     assert sampled.tolist() == [3]
     assert logprobs is None
+
+
+def test_sample_batch_requests_packed_sampling_when_runtime_requires_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    scheduler._hooks = SamplingHooks(require_packed_sampling=True)
+    sample = Mock(return_value=torch.tensor([3]))
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        sample,
+    )
+
+    GenerationScheduler._sample_batch(
+        scheduler,
+        torch.zeros((1, 8), dtype=torch.float32),
+        [_sequence(temperature=0.7, return_logprobs=None)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert sample.call_args.kwargs["require_packed"] is True
 
 
 def test_scheduler_rejects_custom_greedy_with_speculative_decode() -> None:

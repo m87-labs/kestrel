@@ -3060,6 +3060,8 @@ class GenerationScheduler:
         }
         if logprobs is not None:
             sample_kwargs["logprobs_out"] = logprobs
+        if self._hooks.require_packed_sampling:
+            sample_kwargs["require_packed"] = True
         sampled_raw = sample_step_from_logits(
             logits,
             temps,
