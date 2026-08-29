@@ -737,7 +737,7 @@ class Qwen3_5Experts(nn.Module):
             activation="swiglu",
             weight_format=self.expert_weight_format,
             dtype=hidden_states.dtype,
-            backend="auto" if self.expert_weight_format == "fp8_e4m3" else "triton",
+            backend="auto",
         )
         handle = _kestrel_moe_runtime.prepare(
             spec,
