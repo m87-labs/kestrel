@@ -21,8 +21,10 @@ def bound_kv_cache_pages(
     page_size = int(page_size)
     max_batch_size = int(max_batch_size)
     max_seq_length = int(max_seq_length)
-    if requested_pages < 1:
-        raise ValueError("requested_pages must be positive")
+    if requested_pages < 2:
+        raise ValueError(
+            "requested_pages must leave room for reserved and padding pages"
+        )
     if page_size < 1:
         raise ValueError("page_size must be positive")
     if max_batch_size < 1:

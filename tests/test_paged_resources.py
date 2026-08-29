@@ -33,7 +33,6 @@ def test_bound_kv_cache_pages_preserves_tighter_user_limit() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("requested_pages", 0),
         ("page_size", 0),
         ("max_batch_size", 0),
         ("max_seq_length", 0),
@@ -52,3 +51,16 @@ def test_bound_kv_cache_pages_rejects_non_positive_inputs(
     kwargs[field] = value
     with pytest.raises(ValueError, match="must be positive"):
         bound_kv_cache_pages(**kwargs)
+
+
+@pytest.mark.parametrize("requested_pages", (0, 1))
+def test_bound_kv_cache_pages_requires_both_reserved_pages(
+    requested_pages: int,
+) -> None:
+    with pytest.raises(ValueError, match="reserved and padding pages"):
+        bound_kv_cache_pages(
+            requested_pages,
+            page_size=1,
+            max_batch_size=1,
+            max_seq_length=32,
+        )
