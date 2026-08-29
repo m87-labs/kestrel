@@ -268,6 +268,11 @@ class Gemma4TextMLP(nn.Module):
             config.hidden_size,
             (self.intermediate_size, self.intermediate_size),
             source_names=("gate_proj", "up_proj"),
+            output_layout=(
+                "interleaved_i8"
+                if self.intermediate_size % 8 == 0
+                else "contiguous"
+            ),
         )
         self.down_proj = nn.Linear(
             self.intermediate_size, config.hidden_size, bias=False
@@ -280,7 +285,7 @@ class Gemma4TextMLP(nn.Module):
             hidden,
             gate_up,
             activation="gelu_tanh",
-            layout="contiguous",
+            layout=self.gate_up_proj.output_layout,
         )
         return self.down_proj(hidden)
 

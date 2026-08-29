@@ -19,8 +19,11 @@ from kestrel.models.gemma4.loader import (
     load_model,
     load_weights,
 )
-from kestrel.models.gemma4.model import Gemma4InferenceModel
-from kestrel.runtime.bounded_projection import PackedLinear
+from kestrel.models.gemma4.model import Gemma4InferenceModel, Gemma4TextMLP
+from kestrel.runtime.bounded_projection import (
+    PackedLinear,
+    bind_declared_packed_projections,
+)
 from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 from kestrel_kernels.generated_decode import (
     allocate_weight_storage_for_loading,
@@ -156,7 +159,7 @@ def _tiny_generated_weight_descriptor() -> dict[str, object]:
             {
                 "name": "w_gate_up_fresh",
                 "source": "mlp.gate_up_proj.weight",
-                "prep": "interleave_gate_up_rows8_axis0|cast_bf16",
+                "prep": "identity",
                 "shape": [16, 8],
                 "dtype": "bf16",
                 "per_layer": True,
@@ -227,6 +230,54 @@ def test_load_weights_rejects_unexpected_checkpoint_tensor(tmp_path) -> None:
         load_weights(tmp_path, _ToyShardedModel())
 
 
+def test_text_mlp_interleaved_checkpoint_layout_matches_gate_up_math(
+    monkeypatch,
+) -> None:
+    import kestrel.models.gemma4.model as gemma_model
+
+    torch.manual_seed(7)
+    config = _tiny_gemma_config().text_config
+    mlp = Gemma4TextMLP(config, layer_idx=0)
+    gate = torch.randn((config.intermediate_size, config.hidden_size))
+    up = torch.randn_like(gate)
+    down = torch.randn((config.hidden_size, config.intermediate_size))
+    packed = {"gate_proj.weight": gate, "up_proj.weight": up}
+    bind_declared_packed_projections(mlp, packed)
+    with torch.no_grad():
+        mlp.gate_up_proj.weight.copy_(packed["gate_up_proj.weight"])
+        mlp.down_proj.weight.copy_(down)
+
+    observed_layouts: list[str] = []
+
+    def gated_activation_into(out, gate_up, *, activation, layout) -> None:
+        observed_layouts.append(layout)
+        assert activation == "gelu_tanh"
+        blocks = gate_up.reshape(*gate_up.shape[:-1], config.intermediate_size // 8, 16)
+        gate_out = blocks[..., :8].reshape_as(out)
+        up_out = blocks[..., 8:].reshape_as(out)
+        out.copy_(torch.nn.functional.gelu(
+            gate_out, approximate="tanh"
+        ) * up_out)
+
+    monkeypatch.setattr(
+        gemma_model,
+        "_kestrel_gated_activation_into",
+        gated_activation_into,
+    )
+    hidden = torch.randn((3, config.hidden_size))
+
+    actual = mlp(hidden)
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.gelu(
+            torch.nn.functional.linear(hidden, gate), approximate="tanh"
+        ) * torch.nn.functional.linear(hidden, up),
+        down,
+    )
+
+    assert observed_layouts == ["interleaved_i8"]
+    torch.testing.assert_close(actual, expected)
+
+
 def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retained():
     config = _tiny_gemma_config()
     old_dtype = torch.get_default_dtype()
@@ -261,10 +312,18 @@ def test_gemma_generated_weight_storage_streams_direct_rows_and_finalizes_retain
     finalize_weight_storage_after_loading(model, descriptor, storage)
 
     assert final_bytes == 3 * 16 * 8 * 2
-    assert storage.aliased_source_bytes == 16 * 8 * 2
-    assert storage.retained_source_bytes == (8 * 8 + 4 * 8 + 4 * 8 + 16 * 8) * 2
+    assert storage.aliased_source_bytes == 2 * 16 * 8 * 2
+    assert storage.retained_source_bytes == (8 * 8 + 4 * 8 + 4 * 8) * 2
+    assert all(
+        retained.name != "w_gate_up_fresh"
+        for retained in storage.retained_recipes
+    )
     assert storage.finalized
     assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
+    assert torch._C._is_alias_of(
+        layer.mlp.gate_up_proj.weight,
+        storage.buffers["w_gate_up_fresh"][0],
+    )
     assert not any(
         tensor.device.type == "meta"
         for tensor in (*model.parameters(), *model.buffers())
@@ -338,6 +397,10 @@ def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
     assert torch._C._is_alias_of(
         embedding,
         storage.buffers["text_embedding_table"],
+    )
+    assert torch._C._is_alias_of(
+        model.model.language_model.layers[0].mlp.gate_up_proj.weight,
+        storage.buffers["w_gate_up_fresh"][0],
     )
     torch.testing.assert_close(embedding, expected_embedding)
     assert not any(
