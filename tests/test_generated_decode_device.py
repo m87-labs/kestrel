@@ -4,7 +4,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from kestrel.runtime.generated_decode import GeneratedDecode
+from kestrel.runtime.generated_decode import (
+    GeneratedDecode,
+    prepare_generated_weight_storage_for_loading,
+)
 
 
 def _program(capacity, *, active_batch=None, minimum_batch=1):
@@ -132,3 +135,48 @@ def test_slot_capacity_refuses_incomplete_required_domain(monkeypatch):
         object(),
         required_batch_sizes=range(1, 5),
     ) is None
+
+
+@pytest.mark.parametrize(
+    "missing_capability",
+    (
+        "allocate_weight_storage_for_loading",
+        "finalize_weight_storage_after_loading",
+    ),
+)
+def test_load_time_weight_preparation_fails_soft_only_when_optional(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_capability: str,
+) -> None:
+    from kestrel_kernels import generated_decode as generated_runtime
+
+    runtime = SimpleNamespace(
+        device=torch.device("cuda", 0),
+        dtype=torch.bfloat16,
+        max_batch_size=1,
+    )
+    program = _program(1, active_batch=1)
+    program.descriptor = {"weights": []}
+    properties = SimpleNamespace(major=9, minor=0, multi_processor_count=132)
+    monkeypatch.setattr(
+        generated_runtime,
+        "resolve_compatible_programs",
+        lambda *_args, **_kwargs: (program,),
+    )
+    monkeypatch.delattr(generated_runtime, missing_capability)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _device: properties
+    )
+
+    options = dict(
+        label="Gemma",
+        layer_prefix="model.language_model.layers",
+        required_batch_sizes=(1,),
+    )
+    assert prepare_generated_weight_storage_for_loading(
+        runtime, Mock(), required=False, **options
+    ) is None
+    with pytest.raises(RuntimeError, match="binding and finalization support"):
+        prepare_generated_weight_storage_for_loading(
+            runtime, Mock(), required=True, **options
+        )

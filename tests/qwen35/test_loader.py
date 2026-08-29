@@ -12,11 +12,11 @@ from kestrel.models.qwen35.qwen_loader import (
     _dequantize_fp8_weight,
     _interleave_gate_up_weight,
     _load_sharded_safetensors,
-    _materialize_remaining_meta_tensors,
     _restore_rotary_buffers,
 )
 import kestrel.models.qwen35.qwen_loader as loader_module
 from kestrel.ops.rotary import default_inv_freq
+from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 
 class _FusedExpertHolder(torch.nn.Module):
@@ -299,7 +299,7 @@ def test_remaining_meta_tensors_materialize_without_replacing_bound_storage() ->
         module.register_buffer("pending_buffer", torch.empty(2))
     bound = module.bound
 
-    _materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
+    materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
 
     assert module.bound is bound
     assert module.pending.device.type == "cpu"
@@ -313,7 +313,7 @@ def test_remaining_meta_tensors_reject_uninitialized_derived_buffers() -> None:
         module.register_buffer("derived", torch.empty(2), persistent=False)
 
     try:
-        _materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
+        materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
     except RuntimeError as exc:
         assert "derived buffer" in str(exc)
     else:

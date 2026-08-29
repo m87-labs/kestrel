@@ -64,17 +64,57 @@ class Gemma4Runtime(UncachedPagedRuntime):
 
         self._model_name = cfg.model
         self.decode_path = getattr(cfg, "decode_path", "auto")
+        self.max_batch_size = cfg.max_batch_size
         from kestrel.models.registry import get_spec
 
         model_spec = get_spec(self._model_name)
         model_source = cfg.model_path if cfg.model_path is not None else model_spec.repo_id
         if model_source is None:
             raise ValueError("Gemma model spec must declare repo_id")
+        self._generated_weight_storage = None
+        prepare_model = None
+        finalize_model = None
+        if self.decode_path != "native":
+            from kestrel.runtime.generated_decode import (
+                finalize_generated_weight_storage_after_loading,
+                prepare_generated_weight_storage_for_loading,
+            )
+            from .generated_decode import _WEIGHT_LAYER_PREFIX
+
+            def prepare_model(model: torch.nn.Module) -> None:
+                self._generated_weight_storage = (
+                    prepare_generated_weight_storage_for_loading(
+                        self,
+                        model,
+                        label="Gemma",
+                        layer_prefix=_WEIGHT_LAYER_PREFIX,
+                        required_batch_sizes=range(1, self.max_batch_size + 1),
+                        required=self.decode_path == "generated",
+                    )
+                )
+
+            def finalize_model(model: torch.nn.Module) -> None:
+                if self._generated_weight_storage is not None:
+                    self._generated_weight_storage = (
+                        finalize_generated_weight_storage_after_loading(
+                            self,
+                            model,
+                            self._generated_weight_storage,
+                            label="Gemma",
+                            layer_prefix=_WEIGHT_LAYER_PREFIX,
+                            required_batch_sizes=range(
+                                1, self.max_batch_size + 1
+                            ),
+                        )
+                    )
+
         self.model = load_model(
             model_source,
             device=self.device,
             dtype=self.dtype,
             revision=model_spec.revision,
+            prepare_model=prepare_model,
+            finalize_model=finalize_model,
         )
         self._config = self.model.config
         self._configure_model(cfg)
@@ -93,7 +133,6 @@ class Gemma4Runtime(UncachedPagedRuntime):
 
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         self.spec = None
-        self.max_batch_size = cfg.max_batch_size
         self.page_size = cfg.page_size
         self.max_seq_length = int(
             self._config.text_config.max_position_embeddings
@@ -182,6 +221,12 @@ class Gemma4Runtime(UncachedPagedRuntime):
 
         self.generated_decode = None
         if self.decode_path == "native":
+            return
+        if self._generated_weight_storage is None:
+            if self.decode_path == "generated":
+                raise RuntimeError(
+                    "generated Gemma decode has no finalized load-time weight storage"
+                )
             return
 
         from .generated_decode import create_generated_decode

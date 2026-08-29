@@ -11,6 +11,9 @@ from kestrel.runtime.generated_decode import (
 )
 
 
+_WEIGHT_LAYER_PREFIX = "model.language_model.layers"
+
+
 def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     positions = torch.arange(
         runtime.max_seq_length,
@@ -60,8 +63,9 @@ def create_generated_decode(
     spec = GeneratedDecodeSpec(
         label="Gemma",
         weight_root=runtime.model,
-        weight_layer_prefix="model.language_model.layers",
+        weight_layer_prefix=_WEIGHT_LAYER_PREFIX,
         bindings=bindings,
+        weight_storage=getattr(runtime, "_generated_weight_storage", None),
     )
     if required:
         return GeneratedDecode.require(
