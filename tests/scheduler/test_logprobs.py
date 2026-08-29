@@ -60,6 +60,14 @@ class _ReasoningStreamSkillState(_SkillStateStub):
         return "think"
 
 
+class _AudioStreamState(_SkillStateStub):
+    def pop_stream_output(self, runtime: object) -> dict[str, object] | None:
+        return {
+            "audio": [0.25, -0.25],
+            "sample_rate": 24_000,
+        }
+
+
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
     request = GenerationRequest(
         request_id=7,
@@ -229,6 +237,21 @@ def test_stage_token_emits_update_without_text_or_reasoning_delta() -> None:
     assert updates[0].token_index == 0
     assert updates[0].text == ""
     assert updates[0].reasoning is None
+
+
+def test_stream_update_preserves_capability_defined_output() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(_AudioStreamState, return_logprobs=None)
+    seq.request.stream_callback = updates.append
+
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+
+    assert len(updates) == 1
+    assert updates[0].text == ""
+    assert updates[0].output == {
+        "audio": [0.25, -0.25],
+        "sample_rate": 24_000,
+    }
 
 
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
