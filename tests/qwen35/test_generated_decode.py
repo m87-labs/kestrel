@@ -364,6 +364,43 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
     )
 
 
+def test_generated_decode_reports_compiled_slot_capacity(monkeypatch):
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        _decode_rope_deltas=object(),
+        _gather_decode_rope_deltas=lambda *_args: None,
+        _prepare_decode_position_ids=lambda *_args: None,
+        _paged_kv=(),
+        _linear_state_pool=object(),
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                language_model=SimpleNamespace(
+                    rotary_emb=SimpleNamespace(inv_freq=object())
+                )
+            )
+        ),
+        page_table=SimpleNamespace(page_table=object()),
+    )
+    captured = {}
+
+    def resolve(_cls, bound_runtime, spec, *, required_batch_sizes=()):
+        captured["runtime"] = bound_runtime
+        captured["spec"] = spec
+        captured["required_batch_sizes"] = tuple(required_batch_sizes)
+        return 8
+
+    monkeypatch.setattr(
+        qwen_generated.GeneratedDecode,
+        "resolve_slot_capacity",
+        classmethod(resolve),
+    )
+
+    assert qwen_generated.generated_decode_slot_capacity(runtime) == 8
+    assert captured["runtime"] is runtime
+    assert captured["required_batch_sizes"] == (1,)
+    assert captured["spec"].label == "Qwen"
+
+
 def test_generated_capacity_inputs_resolve_state_after_cached_field_snapshot(
     monkeypatch,
 ):

@@ -401,19 +401,32 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self._prefill_slot_free = list(self._prefill_slots)
         self.prefill_slots: Sequence[Any] = self._prefill_slots
 
+        generated_decode_capacity = None
+        if self.decode_path != "native":
+            from .generated_decode import generated_decode_slot_capacity
+
+            generated_decode_capacity = generated_decode_slot_capacity(
+                self,
+                required=self.decode_path == "generated",
+            )
+        self._decode_row_capacity = max(
+            self.max_batch_slots,
+            generated_decode_capacity or 0,
+        )
+
         self._decode_slots = tuple(
             create_decode_slot(
                 slot_id=i,
                 device=self.device,
                 dtype=self.dtype,
-                max_batch_slots=self.max_batch_slots,
+                max_batch_slots=self._decode_row_capacity,
                 kv_cache_pages=self._kv_cache_pages,
                 vocab_size=int(text_cfg.vocab_size),
                 hidden_dim=int(text_cfg.hidden_size),
-                position_shape=(4, self.max_batch_slots, 1),
+                position_shape=(4, self._decode_row_capacity, 1),
                 scratch_specs={
                     "rope_deltas": (
-                        (self.max_batch_slots, 1),
+                        (self._decode_row_capacity, 1),
                         torch.long,
                     ),
                 },

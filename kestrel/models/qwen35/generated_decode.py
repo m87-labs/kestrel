@@ -97,9 +97,7 @@ def prepare_generated_weight_storage(
     )
 
 
-def create_generated_decode(
-    runtime: Any, *, required: bool = False,
-) -> GeneratedDecode | None:
+def _generated_decode_spec(runtime: Any) -> GeneratedDecodeSpec:
     bindings = PagedDecodeBindings(
         runtime._paged_kv,
         extra_runtime_inputs=lambda bound_runtime: {
@@ -138,7 +136,7 @@ def create_generated_decode(
             "gdn_recurrent_state": recurrent,
         }
 
-    spec = GeneratedDecodeSpec(
+    return GeneratedDecodeSpec(
         label="Qwen",
         weight_root=runtime.model,
         weight_layer_prefix="model.language_model.layers",
@@ -160,6 +158,28 @@ def create_generated_decode(
             "prepare_position_ids": runtime._prepare_decode_position_ids,
         },
     )
+
+
+def generated_decode_slot_capacity(
+    runtime: Any, *, required: bool = False,
+) -> int | None:
+    required_batch_sizes = range(1, runtime.max_batch_size + 1)
+    capacity = GeneratedDecode.resolve_slot_capacity(
+        runtime,
+        _generated_decode_spec(runtime),
+        required_batch_sizes=required_batch_sizes,
+    )
+    if required and capacity is None:
+        raise RuntimeError(
+            "Qwen requires a compatible bundled generated-decode program"
+        )
+    return capacity
+
+
+def create_generated_decode(
+    runtime: Any, *, required: bool = False,
+) -> GeneratedDecode | None:
+    spec = _generated_decode_spec(runtime)
     if required:
         return GeneratedDecode.require(
             runtime, spec, batch_sizes=range(1, runtime.max_batch_size + 1)
@@ -171,4 +191,8 @@ def create_generated_decode(
     )
 
 
-__all__ = ["create_generated_decode", "prepare_generated_weight_storage"]
+__all__ = [
+    "create_generated_decode",
+    "generated_decode_slot_capacity",
+    "prepare_generated_weight_storage",
+]

@@ -97,3 +97,38 @@ def test_program_selection_rejects_invalid_runtime_interval():
 
     with pytest.raises(RuntimeError, match="invalid active-batch interval"):
         generated._program_for(4)
+
+
+def test_slot_capacity_uses_selected_program_physical_capacity(monkeypatch):
+    runtime = SimpleNamespace(max_batch_size=1)
+    b8 = _program(8)
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "_resolve_programs",
+        classmethod(lambda _cls, _runtime, _spec: (b8,)),
+    )
+
+    assert GeneratedDecode.resolve_slot_capacity(
+        runtime,
+        object(),
+        required_batch_sizes=(1,),
+    ) == 8
+
+
+def test_slot_capacity_refuses_incomplete_required_domain(monkeypatch):
+    runtime = SimpleNamespace(max_batch_size=4)
+    programs = tuple(
+        _program(batch_size, active_batch=batch_size)
+        for batch_size in (1, 2, 4)
+    )
+    monkeypatch.setattr(
+        GeneratedDecode,
+        "_resolve_programs",
+        classmethod(lambda _cls, _runtime, _spec: programs),
+    )
+
+    assert GeneratedDecode.resolve_slot_capacity(
+        runtime,
+        object(),
+        required_batch_sizes=range(1, 5),
+    ) is None
