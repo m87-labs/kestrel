@@ -189,6 +189,8 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
             raise StopAsyncIteration
         item = await self._queue.get()
         if item is None:
+            if self._closed:
+                raise StopAsyncIteration
             self._closed = True
             await self._producer
             raise StopAsyncIteration
@@ -198,15 +200,19 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
         return await self._producer
 
     async def aclose(self) -> None:
-        if self._closed:
+        if self._closed and self._producer.done():
             return
         self._closed = True
         if not self._producer.done():
             self._producer.cancel()
         try:
-            await self._producer
-        except asyncio.CancelledError:
-            pass
+            outcome, = await asyncio.gather(
+                self._producer, return_exceptions=True
+            )
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                raise outcome
         finally:
             while not self._queue.empty():
                 self._queue.get_nowait()
