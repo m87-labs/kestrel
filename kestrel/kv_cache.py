@@ -530,14 +530,16 @@ def fit_and_allocate_paged_kv_storage(
     dtype: torch.dtype,
     pool: KVMemoryPool,
     stream: Any,
+    materialize_fixed: Callable[[], None] | None = None,
     allocate_additional: Callable[[int], _AdditionalStorage] | None = None,
 ) -> tuple[PagedKVStorage, _AdditionalStorage | None]:
     """Allocate the largest exact fixed K/V cache that the device can retain.
 
-    Page-dependent caller resources are allocated first for each probe. The
-    accepted grouped K/V allocation and those resources are returned without
-    being freed or recreated, so pointer stability does not depend on allocator
-    estimates or cache reuse.
+    Fixed runtime resources are materialized once before observing available
+    memory. Page-dependent caller resources are then allocated first for each
+    probe. The accepted grouped K/V allocation and those resources are returned
+    without being freed or recreated, so pointer stability does not depend on
+    allocator estimates or cache reuse.
     """
 
     requested_pages = int(requested_pages)
@@ -545,6 +547,9 @@ def fit_and_allocate_paged_kv_storage(
         raise ValueError(
             "requested_pages must include reserved, padding, and serving pages"
         )
+
+    if materialize_fixed is not None:
+        materialize_fixed()
 
     candidate = requested_pages
     budget_available = pool.budget_available_bytes()

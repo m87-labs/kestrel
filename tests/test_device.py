@@ -1,5 +1,8 @@
 """Tests for the device-agnostic primitive wrappers in ``kestrel.device``."""
 
+from contextlib import contextmanager
+import threading
+
 import pytest
 import torch
 
@@ -9,6 +12,7 @@ from kestrel.device import (
     get_device_capability,
     make_event,
     make_stream,
+    materialize_blas_runtime,
     set_device,
     stream_context,
     synchronize,
@@ -60,6 +64,79 @@ def test_stream_context_with_none_yields_inline() -> None:
     with stream_context(None):
         entered = True
     assert entered
+
+
+def test_materialize_blas_runtime_runs_non_cuda_operation_inline() -> None:
+    thread = threading.get_ident()
+    observed = []
+
+    materialize_blas_runtime(
+        CPU,
+        None,
+        lambda: observed.append(
+            (threading.get_ident(), torch.is_inference_mode_enabled())
+        ),
+    )
+
+    assert observed == [(thread, True)]
+
+
+def test_materialize_blas_runtime_returns_cuda_handle_from_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.device as device_module
+
+    caller_thread = threading.get_ident()
+    events = []
+
+    class Stream:
+        def synchronize(self):
+            events.append(("synchronize", threading.get_ident(), self))
+
+    compute_stream = Stream()
+
+    @contextmanager
+    def cuda_device(device):
+        events.append(("device-enter", threading.get_ident(), device))
+        try:
+            yield
+        finally:
+            events.append(("device-exit", threading.get_ident(), device))
+
+    @contextmanager
+    def use_stream(stream):
+        events.append(("stream-enter", threading.get_ident(), stream))
+        try:
+            yield
+        finally:
+            events.append(("stream-exit", threading.get_ident(), stream))
+
+    monkeypatch.setattr(device_module.torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(device_module, "stream_context", use_stream)
+
+    materialize_blas_runtime(
+        torch.device("cuda:0"),
+        compute_stream,
+        lambda: events.append(
+            (
+                "operation",
+                threading.get_ident(),
+                torch.is_inference_mode_enabled(),
+            )
+        ),
+    )
+
+    worker_threads = {event[1] for event in events}
+    assert caller_thread not in worker_threads
+    assert [event[0] for event in events] == [
+        "device-enter",
+        "stream-enter",
+        "operation",
+        "synchronize",
+        "stream-exit",
+        "device-exit",
+    ]
+    assert events[2][2] is True
 
 
 # --- CUDA path: thin wrappers, only run when present ------------------------

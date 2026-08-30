@@ -13,6 +13,7 @@ from kestrel.models.gemma4.runtime import (
     _allocate_decode_page_tables,
     _generated_kv_binding_inputs,
     _install_decode_page_tables,
+    _materialize_fixed_blas_resources,
 )
 
 
@@ -142,3 +143,33 @@ def test_decode_page_table_placeholders_are_replaced_before_binding() -> None:
                 device=torch.device("cpu"),
             ),
         )
+
+
+def test_fixed_blas_resources_use_resident_output_matmul(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.gemma4 import runtime as runtime_module
+
+    hidden = torch.randn(4, 3, dtype=torch.bfloat16)
+    weight = torch.randn(5, 3, dtype=torch.bfloat16)
+    logits = torch.empty(4, 5, dtype=torch.bfloat16)
+    compute_stream = object()
+    calls = []
+    runtime = SimpleNamespace(
+        device=torch.device("cpu"),
+        _compute_stream=compute_stream,
+        max_batch_size=2,
+        model=SimpleNamespace(lm_head=SimpleNamespace(weight=weight)),
+        decode_slots=(SimpleNamespace(hidden_last=hidden, logits=logits),),
+    )
+
+    def materialize(device, stream, operation):
+        calls.append((device, stream))
+        operation()
+
+    monkeypatch.setattr(runtime_module, "materialize_blas_runtime", materialize)
+
+    _materialize_fixed_blas_resources(runtime)
+
+    assert calls == [(torch.device("cpu"), compute_stream)]
+    torch.testing.assert_close(logits[:2], hidden[:2] @ weight.t())

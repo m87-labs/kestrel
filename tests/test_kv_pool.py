@@ -189,6 +189,63 @@ def test_fitted_paged_kv_storage_retains_first_successful_fragmented_probe(
     ]
 
 
+def test_fitted_paged_kv_storage_materializes_fixed_resources_before_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cuda:0")
+    observed_free = 4096
+    events = []
+
+    @contextmanager
+    def cuda_device(_device):
+        yield
+
+    def materialize_fixed():
+        nonlocal observed_free
+        events.append("materialize")
+        observed_free = 2048
+
+    def mem_get_info(_device):
+        events.append(("observe", observed_free))
+        return observed_free, 8192
+
+    def largest(upper, available_bytes, **_kwargs):
+        events.append(("size", available_bytes))
+        return min(int(upper), 3)
+
+    storage = type("Storage", (), {"n_pages": 3})()
+    monkeypatch.setattr(kv_cache.torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(kv_cache.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(kv_cache.torch.cuda, "mem_get_info", mem_get_info)
+    monkeypatch.setattr(kv_cache, "_largest_storage_pages", largest)
+    monkeypatch.setattr(
+        kv_cache,
+        "allocate_paged_kv_storage",
+        lambda *_args, **_kwargs: storage,
+    )
+
+    fitted, additional = fit_and_allocate_paged_kv_storage(
+        8,
+        layer_specs=specs,
+        page_size=1,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+        materialize_fixed=materialize_fixed,
+    )
+
+    assert fitted is storage
+    assert additional is None
+    assert events[0] == "materialize"
+    assert events.count("materialize") == 1
+    assert all(event != ("observe", 4096) for event in events)
+    assert ("observe", 2048) in events
+    assert ("size", 2048) in events
+
+
 def test_fitted_paged_kv_storage_rejects_capacity_without_serving_page() -> None:
     specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
     two_page_bytes = paged_kv_storage_bytes(

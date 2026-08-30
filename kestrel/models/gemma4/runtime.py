@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 import torch
 
-from kestrel.device import make_event, make_stream
+from kestrel.device import make_event, make_stream, materialize_blas_runtime
 from kestrel.kv_cache import (
     KVMemoryPool,
     PageTable,
@@ -108,6 +108,22 @@ def _install_decode_page_tables(
         raise RuntimeError("decode page tables must be unbound one-column placeholders")
     for slot, table in zip(slots, tables, strict=True):
         slot.paged_kv_page_table = table
+
+
+def _materialize_fixed_blas_resources(runtime: Any) -> None:
+    """Prime the scheduler's exact compute-stream BF16 output matmul path."""
+
+    slot = runtime.decode_slots[0]
+    rows = min(int(runtime.max_batch_size), int(slot.hidden_last.shape[0]))
+    materialize_blas_runtime(
+        runtime.device,
+        runtime._compute_stream,
+        lambda: torch.mm(
+            slot.hidden_last[:rows],
+            runtime.model.lm_head.weight.t(),
+            out=slot.logits[:rows],
+        ),
+    )
 
 
 class Gemma4Runtime(UncachedPagedRuntime):
@@ -360,6 +376,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             dtype=self.dtype,
             pool=self._kv_pool,
             stream=self._compute_stream,
+            materialize_fixed=lambda: _materialize_fixed_blas_resources(self),
             allocate_additional=allocate_paged_resources,
         )
         if paged_resources is None:
