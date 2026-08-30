@@ -171,6 +171,57 @@ def _tiny_generated_weight_descriptor() -> dict[str, object]:
     }
 
 
+def _hf_style_text_checkpoint(
+    model: Gemma4InferenceModel,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    checkpoint = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if name != "lm_head.weight"
+    }
+    expected_packed: dict[str, torch.Tensor] = {}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, PackedLinear):
+            continue
+        target_key = f"{module_name}.weight"
+        packed = checkpoint.pop(target_key)
+        if module.output_layout == "interleaved_i8":
+            block_rows = module.packed_out_features[0] // 8
+            parts = tuple(
+                part.reshape(-1, module.in_features)
+                for part in packed.reshape(block_rows, 2, 8, module.in_features).unbind(
+                    1
+                )
+            )
+        else:
+            parts = packed.split(module.packed_out_features, dim=0)
+
+        parent_name, separator, _ = module_name.rpartition(".")
+        source_prefix = f"{parent_name}." if separator else ""
+        source_tensors: dict[str, torch.Tensor] = {}
+        for source_name, part in zip(module.source_names, parts, strict=True):
+            source_key = f"{source_prefix}{source_name}.{module.source_weight_leaf}"
+            if source_key not in source_tensors:
+                source_tensors[source_key] = part.contiguous().clone()
+        checkpoint.update(source_tensors)
+
+        ordered = tuple(
+            source_tensors[f"{source_prefix}{source_name}.{module.source_weight_leaf}"]
+            for source_name in module.source_names
+        )
+        if module.output_layout == "interleaved_i8":
+            expected = torch.stack(
+                tuple(
+                    part.reshape(block_rows, 8, module.in_features) for part in ordered
+                ),
+                dim=1,
+            ).reshape_as(packed)
+        else:
+            expected = torch.cat(ordered, dim=0)
+        expected_packed[target_key] = expected
+    return checkpoint, expected_packed
+
+
 def test_load_weights_streams_packed_projection_parts_across_shards(tmp_path) -> None:
     gate = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     up = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
@@ -554,14 +605,18 @@ def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
         reference = Gemma4InferenceModel(config)
     finally:
         torch.set_default_dtype(old_dtype)
-    checkpoint = {
-        name: value.detach().clone()
-        for name, value in reference.state_dict().items()
-        if name != "lm_head.weight"
-    }
-    expected_embedding = checkpoint[
-        "model.language_model.embed_tokens.weight"
-    ].clone()
+    checkpoint, expected_packed = _hf_style_text_checkpoint(reference)
+    expected_embedding = checkpoint["model.language_model.embed_tokens.weight"].clone()
+    layer_prefix = "model.language_model.layers"
+    assert f"{layer_prefix}.0.self_attn.qkv_proj.weight" not in checkpoint
+    assert f"{layer_prefix}.0.mlp.gate_up_proj.weight" not in checkpoint
+    assert f"{layer_prefix}.0.self_attn.q_proj.weight" in checkpoint
+    assert f"{layer_prefix}.0.self_attn.k_proj.weight" in checkpoint
+    assert f"{layer_prefix}.0.self_attn.v_proj.weight" in checkpoint
+    assert f"{layer_prefix}.0.mlp.gate_proj.weight" in checkpoint
+    assert f"{layer_prefix}.0.mlp.up_proj.weight" in checkpoint
+    assert f"{layer_prefix}.1.self_attn.v_proj.weight" not in checkpoint
+    assert f"{layer_prefix}.1.self_attn.k_proj.weight" in checkpoint
     (tmp_path / "config.json").write_text(
         json.dumps(_tiny_gemma_config_data()),
         encoding="utf-8",
@@ -613,6 +668,21 @@ def test_load_model_runs_generated_weight_lifecycle_through_tiny_checkpoint(
     assert torch._C._is_alias_of(
         model.model.language_model.layers[0].mlp.gate_up_proj.weight,
         storage.buffers["w_gate_up_fresh"][0],
+    )
+    assert torch._C._is_alias_of(
+        model.model.language_model.layers[0].self_attn.qkv_proj.weight,
+        storage.buffers["w_qkv_local"][0],
+    )
+    loaded_state = model.state_dict()
+    for name, expected in expected_packed.items():
+        assert torch.equal(loaded_state[name], expected)
+    assert torch.equal(
+        storage.buffers["w_gate_up_fresh"][0],
+        expected_packed[f"{layer_prefix}.0.mlp.gate_up_proj.weight"],
+    )
+    assert torch.equal(
+        storage.buffers["w_qkv_local"][0],
+        expected_packed[f"{layer_prefix}.0.self_attn.qkv_proj.weight"],
     )
     torch.testing.assert_close(embedding, expected_embedding)
     assert not any(
