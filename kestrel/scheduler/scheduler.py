@@ -1934,8 +1934,11 @@ class GenerationScheduler:
             ),
         )
 
-    def _commit_prefill(self, step: PendingCommit) -> tuple[list[Token], Tensor | None]:
-        """Commit a prefill PendingCommit and return first tokens/logprobs."""
+    def _commit_prefill(
+        self,
+        step: PendingCommit,
+    ) -> tuple[list[Token], Tensor | None, tuple[bool, ...]]:
+        """Commit prefill and return tokens, logprobs, and cancellation snapshot."""
         if step.kind != "prefill":
             raise AssertionError("prefill commit requires a prefill pending commit")
         payload = step.payload
@@ -1957,6 +1960,16 @@ class GenerationScheduler:
             # host ownership, so the original host payload can now be dropped.
             for sequence in step.sequences:
                 sequence.request.encoder_input = None
+            cancelled = tuple(
+                not sequence.finalized
+                and sequence.request.cancel_event.is_set()
+                for sequence in step.sequences
+            )
+            for sequence, is_cancelled in zip(
+                step.sequences, cancelled, strict=True
+            ):
+                if is_cancelled:
+                    sequence.finalized = True
             tokens = self._materialize_tokens(
                 token_ids_cpu,
                 step.sequences,
@@ -1974,7 +1987,7 @@ class GenerationScheduler:
                 )
             self._release_prefill_staging(staging)
             self.runtime.release_prefill_slot(prefill_slot)
-        return tokens, logprobs_cpu
+        return tokens, logprobs_cpu, cancelled
 
     def _launch_prefill_step(self, pipeline: PipelineState) -> bool:
         """Launch a prefill forward and enqueue it into the shared pipeline.
@@ -2577,16 +2590,18 @@ class GenerationScheduler:
         at commit time and released when their last step completes.
         """
         if step.kind == "prefill":
-            tokens, logprobs_cpu = self._commit_prefill(step)
+            tokens, logprobs_cpu, cancelled = self._commit_prefill(step)
             if len(tokens) != len(step.sequences):
                 raise RuntimeError(
                     "Prefill token count mismatch: "
                     f"{len(tokens)} token(s) for {len(step.sequences)} sequence(s)"
                 )
             logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
-            for seq, token, logprob in zip(step.sequences, tokens, logprobs):
+            for seq, token, logprob, is_cancelled in zip(
+                step.sequences, tokens, logprobs, cancelled, strict=True
+            ):
                 seq.uncommitted_prefill_token = False
-                if seq.request.cancel_event.is_set():
+                if is_cancelled:
                     self.running.remove(seq)
                     self._finalize_sequence(seq, "cancelled")
                     continue
@@ -2617,6 +2632,14 @@ class GenerationScheduler:
         # ``runtime_step`` (e.g. CPU-side aux values, if it owns them).
         payload: DecodePendingCommit = step.payload
         batch_idx_cpu = slot.meta.batch_idx.cpu[: len(step.sequences)]
+        cancelled = tuple(
+            not seq.finalized and seq.request.cancel_event.is_set()
+            for seq in step.sequences
+        )
+        for seq, is_cancelled in zip(step.sequences, cancelled, strict=True):
+            if is_cancelled:
+                self.running.remove(seq)
+                self._finalize_sequence(seq, "cancelled")
         tokens = self._materialize_tokens(
             token_ids_cpu,
             step.sequences,
@@ -2635,11 +2658,6 @@ class GenerationScheduler:
                     seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
                     self._complete_deferred_cancellation(seq)
-                continue
-
-            if seq.request.cancel_event.is_set():
-                self.running.remove(seq)
-                self._finalize_sequence(seq, "cancelled")
                 continue
 
             # Stage token (calls consume_step, emits streaming)
