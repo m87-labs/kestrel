@@ -108,6 +108,29 @@ def test_close_wakes_pending_next() -> None:
     asyncio.run(scenario())
 
 
+def test_close_does_not_swallow_caller_cancellation() -> None:
+    async def scenario() -> None:
+        cleaning = asyncio.Event()
+
+        async def produce(emit):
+            try:
+                await asyncio.Future()
+            finally:
+                cleaning.set()
+                await asyncio.Future()
+
+        stream = CapabilityStream("synthesize", produce, coalesce=False)
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(stream.aclose())
+        await cleaning.wait()
+        closing.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+    asyncio.run(scenario())
+
+
 def test_producer_failure_reaches_iterator_and_result() -> None:
     async def scenario() -> None:
         async def produce(emit):
