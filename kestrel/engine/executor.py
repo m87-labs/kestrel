@@ -365,9 +365,13 @@ class AutoregressiveExecutor:
         )
 
     def drain(self) -> tuple[Completion, ...]:
-        """Complete in-flight pipeline work (used before a pause)."""
+        """Complete in-flight work and settle cancellations while paused."""
         self._scheduler._drain_pipeline()
-        return tuple(self._collect())
+        for request in self._admission.pop_cancelled():
+            self._complete_cancelled(request)
+        completed = self._admission_completions + self._collect()
+        self._admission_completions = []
+        return tuple(completed)
 
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")

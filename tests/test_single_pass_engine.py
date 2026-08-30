@@ -104,6 +104,85 @@ def test_run_routes_single_pass_through_kernel_loop() -> None:
     assert result.output == {"task": "segment", "inputs": {"points": [[1, 2]]}}
 
 
+def test_paused_loop_settles_cancelled_ingress_and_shutdown() -> None:
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        engine = _engine_with(ar, _StubSinglePass())
+        engine._loop = asyncio.get_running_loop()
+        engine._paused_flag.set()
+        engine._run_gate.clear()
+
+        future = engine._loop.create_future()
+        cancelled = threading.Event()
+        cancelled.set()
+        engine._scheduler_queue.put(
+            _AutoregressiveRequest(
+                request_id=1,
+                prompt="",
+                prompt_tokens=(),
+                image=None,
+                image_hash=None,
+                max_new_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                submitted_at=0.0,
+                future=future,
+                stream_queue=None,
+                skill=ar.skills().resolve("query"),
+                request_context=object(),
+                cancel_event=cancelled,
+            )
+        )
+
+        thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+        thread.start()
+        assert (await asyncio.wait_for(future, timeout=5.0)).finish_reason == "cancelled"
+
+        engine._scheduler_queue.put(None)
+        engine._scheduler_event.set()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    asyncio.run(go())
+
+
+def test_paused_shutdown_does_not_wait_for_executor_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BusyExecutor:
+        has_work = True
+
+        def drain(self):  # type: ignore[no-untyped-def]
+            return ()
+
+        def shutdown(self):  # type: ignore[no-untyped-def]
+            return ()
+
+    ar = FakeRuntime(model_name="ar-default", device="cpu")
+    engine = _engine_with(ar, _StubSinglePass())
+    engine._loop = asyncio.new_event_loop()
+    engine._paused_flag.set()
+    engine._run_gate.clear()
+    monkeypatch.setattr(
+        "kestrel.engine.core.AutoregressiveExecutor",
+        lambda *args, **kwargs: BusyExecutor(),
+    )
+
+    engine._scheduler_queue.put(None)
+    thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+    stopped = not thread.is_alive()
+    if not stopped:
+        engine._paused_flag.clear()
+        engine._run_gate.set()
+        engine._scheduler_event.set()
+        thread.join(timeout=5.0)
+
+    engine._loop.close()
+    assert stopped
+
+
 def test_default_model_can_be_single_pass() -> None:
     async def go() -> None:
         ar = FakeRuntime(model_name="unused-ar", device="cpu")

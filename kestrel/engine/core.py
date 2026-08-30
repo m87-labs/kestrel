@@ -576,6 +576,7 @@ class InferenceEngine:
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineResult:
+        cancel_event = threading.Event()
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
@@ -597,12 +598,22 @@ class InferenceEngine:
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=None,
             skill=skill,
+            cancel_event=cancel_event,
         )
         # Ingress owns the request payload; the remainder of this frame only
         # needs the result future, which may stay pending for a full decode.
         del request_context, image, encoder_input
         del generated_prefix, suppress_next_token_ids
-        return await future
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            self._scheduler_event.set()
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
 
     @overload
     async def query(
@@ -1624,6 +1635,27 @@ class InferenceEngine:
                 while True:
                     # If paused, wait until resumed or shutdown completes.
                     if paused_flag.is_set():
+                        # A stream can be closed after its request entered the
+                        # thread queue but before admission. Settle only those
+                        # canceled requests; leave every other request queued.
+                        deferred = []
+                        for _ in range(self._scheduler_queue.qsize()):
+                            try:
+                                item = self._scheduler_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                            if item is None:
+                                shutdown_requested = True
+                            elif (
+                                ar_executor is not None
+                                and item.cancel_event.is_set()
+                            ):
+                                ar_executor.submit(item)
+                            else:
+                                deferred.append(item)
+                        for item in deferred:
+                            self._scheduler_queue.put(item)
+
                         # Drain in-flight work before pause — callers may
                         # mutate runtime state while paused (e.g. rebuild
                         # CUDA graphs). Only the AR lane has graph state;
@@ -1638,7 +1670,7 @@ class InferenceEngine:
                         else:
                             synchronize(runtime.device)
                         paused_event.set()
-                        if shutdown_requested and not any_work():
+                        if shutdown_requested:
                             break
                         run_gate.wait(timeout=0.1)
                         continue
