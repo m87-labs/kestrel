@@ -4,7 +4,7 @@ import numpy as np
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
 from kestrel.runtime import AutoregressiveRuntime, SequenceState, Token
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
@@ -162,7 +162,7 @@ class RequestLifecycle:
                         reasoning=(
                             reasoning if isinstance(reasoning, str) else None
                         ),
-                        output=dict(output),
+                        output=output,
                     )
                 )
 
@@ -294,7 +294,7 @@ class StreamUpdate:
     text: str
     token_index: int
     reasoning: Optional[str] = None
-    output: Dict[str, object] = field(default_factory=dict)
+    output: Mapping[str, object] = field(default_factory=dict)
 
 
 StreamCallback = Callable[[StreamUpdate], None]
