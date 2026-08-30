@@ -74,7 +74,7 @@ def test_close_cancels_compound_producer() -> None:
     asyncio.run(scenario())
 
 
-def test_close_discards_append_only_backlog() -> None:
+def test_context_exit_discards_append_only_backlog() -> None:
     async def scenario() -> None:
         async def produce(emit):
             emit({"audio": b"first"})
@@ -82,10 +82,12 @@ def test_close_discards_append_only_backlog() -> None:
             return _result("done")
 
         stream = CapabilityStream("synthesize", produce, coalesce=False)
-        await stream.result()
-        await stream.aclose()
+        async with stream:
+            pass
 
         assert stream._queue.qsize() == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
 
     asyncio.run(scenario())
 
