@@ -788,6 +788,7 @@ class InferenceEngine:
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
+        cancel_event = threading.Event()
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
@@ -809,8 +810,20 @@ class InferenceEngine:
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=queue,
             skill=skill,
+            cancel_event=cancel_event,
         )
-        return EngineStream(request_id=request_id, queue=queue, result_future=future)
+        wake_event = self._scheduler_event
+
+        def cancel() -> None:
+            cancel_event.set()
+            wake_event.set()
+
+        return EngineStream(
+            request_id=request_id,
+            queue=queue,
+            result_future=future,
+            cancel=cancel,
+        )
 
     # ------------------------------------------------------------------
     # Control APIs
@@ -1050,6 +1063,7 @@ class InferenceEngine:
         suppress_next_token_ids: Optional[tuple[int, ...]],
         stream_queue: Optional[_StreamQueue],
         skill: str,
+        cancel_event: threading.Event | None = None,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -1058,6 +1072,7 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
+        cancel_event = cancel_event or threading.Event()
 
         skill_spec = self._skill_registry().resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
@@ -1128,6 +1143,7 @@ class InferenceEngine:
             return_logprobs=return_logprobs,
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
+            cancel_event=cancel_event,
         )
         del prepared_prompt
         await self._queue.put(payload)
@@ -1833,6 +1849,7 @@ class InferenceEngine:
             return_logprobs=req.return_logprobs,
             generated_prefix=req.generated_prefix,
             suppress_next_token_ids=req.suppress_next_token_ids,
+            cancel_event=req.cancel_event,
         )
         limit = runtime.max_seq_length
         target_total = request_obj.target_length
