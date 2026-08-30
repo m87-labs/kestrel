@@ -656,6 +656,11 @@ class GenerationScheduler:
                 self.commit_step(step)
                 pipeline.on_step_completed()
 
+        # Pause forbids new launches, but closing an already-owned request
+        # must still release its scheduler resources while the engine is idle.
+        with stream_context(self._compute_stream):
+            self._cancel_requests()
+
     # ------------------------------------------------------------------
     # Speculative decode path
     #
