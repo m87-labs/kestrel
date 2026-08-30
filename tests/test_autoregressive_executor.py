@@ -67,6 +67,7 @@ def _executor() -> AutoregressiveExecutor:
     ex._scheduler = SimpleNamespace(
         _completed=[],
         waiting=[],
+        _drain_pipeline=lambda: None,
         has_pending_work=lambda: bool(ex._scheduler._completed),
         advance=lambda: False,
         pop_completed=lambda: [
@@ -230,6 +231,20 @@ def test_admission_failure_surfaces_as_completion() -> None:
     assert len(tick.completed) == 1
     assert isinstance(tick.completed[0].error, ValueError)
     assert ex.has_work is False
+
+
+def test_pause_drain_settles_cancelled_admission() -> None:
+    ex = _executor()
+    request = _pending(5)
+    request.cancel_event.set()
+    ex._admission.pop_cancelled = lambda: [request]
+
+    (completion,) = ex.drain()
+
+    assert completion.request is request
+    assert completion.result is not None
+    assert completion.result.finish_reason == "cancelled"
+    assert ex._admission_completions == []
 
 
 @pytest.mark.parametrize(

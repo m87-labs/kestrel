@@ -76,6 +76,39 @@ def test_engine_stream_close_stops_a_waiter_and_settles() -> None:
     asyncio.run(run())
 
 
+def test_cancelled_submit_waits_for_scheduler_settlement() -> None:
+    async def run() -> None:
+        engine = object.__new__(InferenceEngine)
+        engine._scheduler_event = threading.Event()
+        result_future = asyncio.get_running_loop().create_future()
+        captured: dict[str, threading.Event] = {}
+
+        async def submit_request(**kwargs: object):
+            cancel_event = kwargs["cancel_event"]
+            assert isinstance(cancel_event, threading.Event)
+            captured["cancel_event"] = cancel_event
+            return result_future, 1
+
+        engine._submit_request = submit_request  # type: ignore[method-assign]
+        task = asyncio.create_task(
+            engine.submit(object(), max_new_tokens=8, skill="synthesize")
+        )
+        await asyncio.sleep(0)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert captured["cancel_event"].is_set()
+        assert engine._scheduler_event.is_set()
+        assert not task.done()
+        assert not result_future.cancelled()
+
+        result_future.set_exception(RuntimeError("scheduler stopped"))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+
 def _make_request(
     *,
     request_id: int = 1,
