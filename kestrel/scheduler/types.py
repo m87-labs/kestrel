@@ -1,10 +1,12 @@
 """Typed containers used by the scheduler."""
 
-import numpy as np
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Mapping, Optional, Sequence
+
+import numpy as np
 
 from kestrel.runtime import AutoregressiveRuntime, SequenceState, Token
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
@@ -215,6 +217,7 @@ class GenerationRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     prompt_length: int = field(init=False)
 

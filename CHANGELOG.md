@@ -15,7 +15,7 @@ extends precompiled execution across speech, Qwen, and Gemma workloads.
 - Added Gemma 4 26B-A4B base and instruction-tuned checkpoint support.
 - Added the model-bound `synthesize` capability and append-only streaming
   payloads for generated media such as PCM audio, including lossless compound
-  capability streams.
+  capability streams and explicit cancellation of generated streams.
 - Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription for
   files and live PCM, with long-form chunking, progressive results, language
   and prompt controls, forced alignment, and word or character timestamps

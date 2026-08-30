@@ -502,6 +502,7 @@ class GenerationScheduler:
         progressed = False
         pipeline = self._pipeline
         with stream_context(self._compute_stream):
+            progressed |= self._cancel_requests()
             has_launch = pipeline.has_launch_in_flight()
             has_queued = pipeline.queue_depth() > 0
 
@@ -578,6 +579,31 @@ class GenerationScheduler:
                 progressed = True
         return progressed
 
+    def _cancel_requests(self) -> bool:
+        """Finish closed streams through the scheduler's existing release paths."""
+
+        progressed = False
+        for request in list(self.waiting):
+            if not request.cancel_event.is_set():
+                continue
+            self.waiting.remove(request)
+            self._finish_request_early(request, reason="cancelled")
+            progressed = True
+
+        for seq in list(self.running):
+            if (
+                not seq.request.cancel_event.is_set()
+                # The row is not safe to release until prefill commits it.
+                or seq.uncommitted_prefill_token
+            ):
+                continue
+            self.running.remove(seq)
+            self._finalize_sequence(seq, "cancelled")
+            if self.runtime.spec is not None and seq.inflight_refs == 0:
+                self._retire_spec_row(seq.state)
+            progressed = True
+        return progressed
+
     def _drain_pipeline(self) -> None:
         """Drain in-flight work before prefill / before an engine pause.
 
@@ -639,6 +665,7 @@ class GenerationScheduler:
     def _advance_spec(self) -> bool:
         progressed = False
         with stream_context(self._compute_stream):
+            progressed |= self._cancel_requests()
             progressed |= self._spec_admit()
             progressed |= self._spec_decode_step()
         return progressed
@@ -1225,7 +1252,11 @@ class GenerationScheduler:
         active = [
             seq
             for seq in self.running
-            if not seq.finished and seq.sequence_state is not None
+            if (
+                not seq.finished
+                and seq.sequence_state is not None
+                and not seq.request.cancel_event.is_set()
+            )
         ]
         # Reserve this launch's ref before the commit (see docstring): protects
         # continuing sequences from a premature retire when the commit drops
@@ -1274,6 +1305,7 @@ class GenerationScheduler:
                     seq.inflight_refs -= 1
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
+                        self._complete_deferred_cancellation(seq)
                         self._retire_spec_row(seq.state)
                 else:
                     launchable.append(seq)
@@ -1538,6 +1570,13 @@ class GenerationScheduler:
                 # stuck in FINALIZING forever after its row is retired.
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
+                    self._complete_deferred_cancellation(seq)
+                    self._retire_spec_row(seq.state)
+                continue
+            if seq.request.cancel_event.is_set():
+                self.running.remove(seq)
+                self._finalize_sequence(seq, "cancelled")
+                if seq.inflight_refs == 0:
                     self._retire_spec_row(seq.state)
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
@@ -1591,6 +1630,21 @@ class GenerationScheduler:
             exc,
             exc_info=exc,
         )
+        self._finish_request_early(
+            request,
+            reason="error",
+            error=exc,
+        )
+
+    def _finish_request_early(
+        self,
+        request: GenerationRequest,
+        *,
+        reason: str,
+        error: Exception | None = None,
+    ) -> None:
+        """Finish a request that has not installed a runtime sequence."""
+
         lifecycle = request.lifecycle
         if lifecycle.lora_slot_ready and request.lora_slot:
             # A request can carry a scheduler-owned adapter reference from an
@@ -1604,8 +1658,8 @@ class GenerationScheduler:
             finally:
                 request.lora_slot = 0
                 lifecycle.lora_slot_ready = False
-        lifecycle.finish_reason = "error"
-        lifecycle.error = exc
+        lifecycle.finish_reason = reason
+        lifecycle.error = error
         lifecycle.finished = True
         lifecycle.finalized = True
         # Terminal requests no longer need their prepared host-side encoder
@@ -1616,13 +1670,15 @@ class GenerationScheduler:
         result = SchedulerResult(
             request_id=request.request_id,
             tokens=[],
-            finish_reason="error",
+            finish_reason=reason,
             metrics=metrics,
-            output={"error": str(exc)},
+            output={"error": str(error)} if error is not None else {},
         )
         self._completed.append(result)
 
     def _is_launchable_request(self, request: GenerationRequest) -> bool:
+        if request.cancel_event.is_set():
+            return False
         lifecycle = request.lifecycle
         if lifecycle.phase not in (
             RequestPhase.WAITING_RESOURCES,
@@ -2203,6 +2259,8 @@ class GenerationScheduler:
         """
         if seq.finalized:
             return False
+        if seq.request.cancel_event.is_set():
+            return False
         if seq.inflight_refs >= 2:
             return False
         # Absolute max length (includes prompt)
@@ -2522,8 +2580,12 @@ class GenerationScheduler:
                 )
             logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
             for seq, token, logprob in zip(step.sequences, tokens, logprobs):
-                seq.stage_token(self.runtime, token, logprob=logprob)
                 seq.uncommitted_prefill_token = False
+                if seq.request.cancel_event.is_set():
+                    self.running.remove(seq)
+                    self._finalize_sequence(seq, "cancelled")
+                    continue
+                seq.stage_token(self.runtime, token, logprob=logprob)
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     # Prefill sequences are enqueued into `running` immediately
@@ -2567,6 +2629,12 @@ class GenerationScheduler:
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
+                    self._complete_deferred_cancellation(seq)
+                continue
+
+            if seq.request.cancel_event.is_set():
+                self.running.remove(seq)
+                self._finalize_sequence(seq, "cancelled")
                 continue
 
             # Stage token (calls consume_step, emits streaming)
@@ -3170,7 +3238,12 @@ class GenerationScheduler:
         else:
             seq.transition(RequestPhase.FINALIZING)
 
-        self._completed.append(self._build_result(seq))
+        if reason != "cancelled" or seq.inflight_refs == 0:
+            self._completed.append(self._build_result(seq))
+
+    def _complete_deferred_cancellation(self, seq: RequestLifecycle) -> None:
+        if seq.finish_reason == "cancelled":
+            self._completed.append(self._build_result(seq))
 
     def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"
