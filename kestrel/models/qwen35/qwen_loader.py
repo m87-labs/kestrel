@@ -732,6 +732,7 @@ def load_qwen35_model(
     dtype: torch.dtype,
     revision: str | None = None,
     prepare_model: Callable[[torch.nn.Module], None] | None = None,
+    finalize_model: Callable[[torch.nn.Module], None] | None = None,
 ) -> Qwen3_5ForConditionalGeneration:
     config_path = _resolve_checkpoint_file(
         source, "config.json", revision=revision
@@ -776,6 +777,8 @@ def load_qwen35_model(
         with torch.no_grad():
             model.lm_head.weight.copy_(embedding_weight)
         model.lm_head.weight = embedding_weight
+    if finalize_model is not None:
+        finalize_model(model)
     model = model.eval()
     if device.type == "cuda":
         torch.cuda.synchronize(device)

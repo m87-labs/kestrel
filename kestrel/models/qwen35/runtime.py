@@ -469,6 +469,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         from .qwen_loader import load_qwen35_model
 
         from kestrel.runtime.generated_decode import (
+            finalize_generated_weight_storage_after_loading,
             prepare_generated_weight_storage_for_loading,
         )
         from .generated_decode import _WEIGHT_LAYER_PREFIX
@@ -485,12 +486,28 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 )
             )
 
+        def finalize_model(model: nn.Module) -> None:
+            if self._generated_weight_storage is not None:
+                self._generated_weight_storage = (
+                    finalize_generated_weight_storage_after_loading(
+                        self,
+                        model,
+                        self._generated_weight_storage,
+                        label="Qwen",
+                        layer_prefix=_WEIGHT_LAYER_PREFIX,
+                        required_batch_sizes=range(
+                            1, self.max_batch_size + 1
+                        ),
+                    )
+                )
+
         return load_qwen35_model(
             source,
             device=self.device,
             dtype=self.dtype,
             revision=self._spec.revision,
             prepare_model=prepare_model,
+            finalize_model=finalize_model,
         )
 
     def acquire_prefill_slot(self, slot_id: int) -> Any:
