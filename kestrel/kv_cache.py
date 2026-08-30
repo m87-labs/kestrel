@@ -314,6 +314,7 @@ class PagedKVStorage:
 
 _KV_TENSOR_ALIGNMENT_BYTES = 256
 _AdditionalStorage = TypeVar("_AdditionalStorage")
+_TransientProbe = TypeVar("_TransientProbe")
 
 
 def paged_kv_bytes_per_page(
@@ -532,14 +533,16 @@ def fit_and_allocate_paged_kv_storage(
     stream: Any,
     materialize_fixed: Callable[[], None] | None = None,
     allocate_additional: Callable[[int], _AdditionalStorage] | None = None,
+    validate_transient: Callable[[], _TransientProbe] | None = None,
 ) -> tuple[PagedKVStorage, _AdditionalStorage | None]:
     """Allocate the largest exact fixed K/V cache that the device can retain.
 
     Fixed runtime resources are materialized once before observing available
     memory. Page-dependent caller resources are then allocated first for each
-    probe. The accepted grouped K/V allocation and those resources are returned
-    without being freed or recreated, so pointer stability does not depend on
-    allocator estimates or cache reuse.
+    probe. A caller may then validate its real transient serving path while the
+    candidate K/V allocation is live. The accepted grouped K/V allocation and
+    page-dependent resources are returned without being freed or recreated, so
+    pointer stability does not depend on allocator estimates or cache reuse.
     """
 
     requested_pages = int(requested_pages)
@@ -549,7 +552,8 @@ def fit_and_allocate_paged_kv_storage(
         )
 
     if materialize_fixed is not None:
-        materialize_fixed()
+        with torch.inference_mode():
+            materialize_fixed()
 
     candidate = requested_pages
     budget_available = pool.budget_available_bytes()
@@ -573,9 +577,12 @@ def fit_and_allocate_paged_kv_storage(
             dtype=dtype,
         )
 
-    last_failure: Exception | None = None
+    last_failure: str | None = None
     while candidate >= 3:
         additional = None
+        storage = None
+        transient = None
+        retry_failure = None
         try:
             # Candidate page tables enqueue H2D work, and accepted K/V tensors
             # are consumed on this same stream. Keeping allocation and retry
@@ -628,15 +635,40 @@ def fit_and_allocate_paged_kv_storage(
                     dtype=dtype,
                     pool=pool,
                 )
+                if validate_transient is not None:
+                    with torch.inference_mode():
+                        transient = validate_transient()
+                    # Keep the probe result alive until every operation that
+                    # produced it has completed. This makes the live peak, not
+                    # an allocator estimate, the candidate acceptance gate.
+                    if pool.device.type == "cuda":
+                        if stream is None:
+                            torch.cuda.synchronize(pool.device)
+                        else:
+                            stream.synchronize()
         except (MemoryError, torch.OutOfMemoryError) as exc:
-            last_failure = exc
-            del additional
+            # Do not retain ``exc``: its traceback owns this frame, including
+            # the failed storage and any partially-produced probe output.
+            retry_failure = f"{type(exc).__name__}: {exc}"
+
+        if retry_failure is not None:
+            last_failure = retry_failure
+            if pool.device.type == "cuda":
+                if stream is None:
+                    torch.cuda.synchronize(pool.device)
+                else:
+                    stream.synchronize()
+            transient = None
+            storage = None
+            additional = None
             gc.collect()
             if pool.device.type == "cuda":
                 with torch.cuda.device(pool.device):
                     torch.cuda.empty_cache()
             candidate -= 1
             continue
+        del transient
+        assert storage is not None
         return storage, additional
 
     detail = "" if last_failure is None else f": {last_failure}"

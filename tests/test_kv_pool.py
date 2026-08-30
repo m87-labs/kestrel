@@ -8,6 +8,7 @@ without exceeding a total cap.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import weakref
 
 import pytest
 import torch
@@ -205,6 +206,7 @@ def test_fitted_paged_kv_storage_materializes_fixed_resources_before_sizing(
 
     def materialize_fixed():
         nonlocal observed_free
+        assert torch.is_inference_mode_enabled()
         events.append("materialize")
         observed_free = 2048
 
@@ -244,6 +246,128 @@ def test_fitted_paged_kv_storage_materializes_fixed_resources_before_sizing(
     assert all(event != ("observe", 4096) for event in events)
     assert ("observe", 2048) in events
     assert ("size", 2048) in events
+
+
+def test_fitted_paged_kv_storage_retries_failed_transient_without_retaining_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cpu")
+    original_allocate = allocate_paged_kv_storage
+    backing_refs = []
+    additional_refs = []
+    probe_refs = []
+    probe_attempts = 0
+
+    def allocate_storage(n_pages, **kwargs):
+        storage = original_allocate(n_pages, **kwargs)
+        backing_refs.append(weakref.ref(storage._kv_backing))
+        return storage
+
+    def allocate_additional(n_pages):
+        value = torch.empty(n_pages, dtype=torch.int32)
+        additional_refs.append(weakref.ref(value))
+        return value
+
+    def validate_transient():
+        nonlocal probe_attempts
+        assert torch.is_inference_mode_enabled()
+        probe_attempts += 1
+        if probe_attempts == 1:
+            raise torch.OutOfMemoryError("synthetic live-workspace failure")
+        value = torch.empty(1)
+        probe_refs.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(kv_cache, "allocate_paged_kv_storage", allocate_storage)
+
+    storage, additional = fit_and_allocate_paged_kv_storage(
+        4,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+        allocate_additional=allocate_additional,
+        validate_transient=validate_transient,
+    )
+
+    assert storage.n_pages == 3
+    assert probe_attempts == 2
+    assert backing_refs[0]() is None
+    assert backing_refs[1]() is storage._kv_backing
+    assert additional_refs[0]() is None
+    assert additional_refs[1]() is additional
+    assert probe_refs[0]() is None
+    assert pool.allocated_bytes == paged_kv_storage_bytes(
+        3,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+    )
+
+
+def test_fitted_paged_kv_storage_keeps_transient_alive_through_stream_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cuda:0")
+    probe_ref = None
+
+    class Probe:
+        pass
+
+    class Stream:
+        def synchronize(self):
+            assert probe_ref is not None and probe_ref() is not None
+
+    @contextmanager
+    def cuda_device(_device):
+        yield
+
+    @contextmanager
+    def use_stream(_stream):
+        yield
+
+    def validate_transient():
+        nonlocal probe_ref
+        assert torch.is_inference_mode_enabled()
+        probe = Probe()
+        probe_ref = weakref.ref(probe)
+        return probe
+
+    storage = type("Storage", (), {"n_pages": 3})()
+    monkeypatch.setattr(kv_cache.torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(kv_cache.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        kv_cache.torch.cuda,
+        "mem_get_info",
+        lambda _device: (1 << 30, 1 << 31),
+    )
+    monkeypatch.setattr(kv_cache, "stream_context", use_stream)
+    monkeypatch.setattr(
+        kv_cache,
+        "allocate_paged_kv_storage",
+        lambda *_args, **_kwargs: storage,
+    )
+
+    fitted, additional = fit_and_allocate_paged_kv_storage(
+        3,
+        layer_specs=specs,
+        page_size=1,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=Stream(),
+        validate_transient=validate_transient,
+    )
+
+    assert fitted is storage
+    assert additional is None
+    assert probe_ref is not None and probe_ref() is None
 
 
 def test_fitted_paged_kv_storage_rejects_capacity_without_serving_page() -> None:

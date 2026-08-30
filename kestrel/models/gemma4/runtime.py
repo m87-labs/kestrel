@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -110,19 +111,76 @@ def _install_decode_page_tables(
         slot.paged_kv_page_table = table
 
 
-def _materialize_fixed_blas_resources(runtime: Any) -> None:
-    """Prime the scheduler's exact compute-stream BF16 output matmul path."""
+def _vision_probe_records(runtime: Any) -> tuple[dict[str, torch.Tensor], ...]:
+    """Build a full-patch record for every admitted vision batch row."""
+
+    config = runtime._config.vision_config
+    pooling = int(config.pooling_kernel_size)
+    grid_height = 0
+    grid_width = 0
+    for candidate in range(math.isqrt(MAX_PATCHES), 0, -1):
+        if MAX_PATCHES % candidate:
+            continue
+        other = MAX_PATCHES // candidate
+        if candidate % pooling == 0 and other % pooling == 0:
+            grid_height, grid_width = candidate, other
+            break
+    if not grid_height:
+        raise RuntimeError(
+            "maximum vision patch count has no pooling-aligned rectangular grid"
+        )
+
+    pixel_values = torch.zeros(
+        (MAX_PATCHES, 3 * int(config.patch_size) ** 2),
+        dtype=runtime.dtype,
+    )
+    position_ids = torch.stack(
+        (
+            torch.arange(grid_width).repeat(grid_height),
+            torch.arange(grid_height).repeat_interleave(grid_width),
+        ),
+        dim=-1,
+    )
+    return tuple(
+        {"pixel_values": pixel_values, "position_ids": position_ids}
+        for _row in range(int(runtime.max_batch_size))
+    )
+
+
+def _run_vision_transient_probe(
+    runtime: Any,
+    records: Sequence[dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    """Run the maximum admitted full vision path through its real stager."""
+
+    staged = runtime._vision_stager.stage(records)
+    return runtime.model.model.get_image_features(
+        staged["pixel_values"],
+        staged["position_ids"],
+    ).detach()
+
+
+def _materialize_fixed_runtime_resources(
+    runtime: Any,
+    vision_records: Sequence[dict[str, torch.Tensor]],
+) -> None:
+    """Prime exact scheduler-thread BLAS and maximum vision resources."""
 
     slot = runtime.decode_slots[0]
     rows = min(int(runtime.max_batch_size), int(slot.hidden_last.shape[0]))
-    materialize_blas_runtime(
-        runtime.device,
-        runtime._compute_stream,
-        lambda: torch.mm(
+
+    def warm() -> torch.Tensor:
+        torch.mm(
             slot.hidden_last[:rows],
             runtime.model.lm_head.weight.t(),
             out=slot.logits[:rows],
-        ),
+        )
+        return _run_vision_transient_probe(runtime, vision_records)
+
+    materialize_blas_runtime(
+        runtime.device,
+        runtime._compute_stream,
+        warm,
     )
 
 
@@ -238,6 +296,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             preprocess_image,
             workers=derive_preprocessing_workers(self.max_batch_size),
         )
+        vision_probe_records = _vision_probe_records(self)
 
         text_config = self._config.text_config
         self.vocab_size = int(text_config.vocab_size)
@@ -376,8 +435,15 @@ class Gemma4Runtime(UncachedPagedRuntime):
             dtype=self.dtype,
             pool=self._kv_pool,
             stream=self._compute_stream,
-            materialize_fixed=lambda: _materialize_fixed_blas_resources(self),
+            materialize_fixed=lambda: _materialize_fixed_runtime_resources(
+                self,
+                vision_probe_records,
+            ),
             allocate_additional=allocate_paged_resources,
+            validate_transient=lambda: _run_vision_transient_probe(
+                self,
+                vision_probe_records,
+            ),
         )
         if paged_resources is None:
             raise RuntimeError("Gemma paged resource allocation returned no resources")

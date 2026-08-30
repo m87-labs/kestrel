@@ -14,7 +14,7 @@ on ``runtime._use_cuda_graphs`` which evaluates to False on MPS.
 
 import contextlib
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -93,7 +93,7 @@ def stream_context(stream: Optional[torch.cuda.Stream]):
 def materialize_blas_runtime(
     device: torch.device,
     stream: Optional[torch.cuda.Stream],
-    operation: Callable[[], None],
+    operation: Callable[[], Any],
 ) -> None:
     """Materialize the BLAS handle used by a later scheduler thread.
 
@@ -105,7 +105,8 @@ def materialize_blas_runtime(
 
     if device.type != "cuda":
         with torch.inference_mode():
-            operation()
+            result = operation()
+        del result
         return
 
     failures: list[BaseException] = []
@@ -114,11 +115,12 @@ def materialize_blas_runtime(
         try:
             with torch.cuda.device(device), stream_context(stream):
                 with torch.inference_mode():
-                    operation()
+                    result = operation()
                 if stream is None:
                     torch.cuda.synchronize(device)
                 else:
                     stream.synchronize()
+                del result
         except BaseException as exc:
             failures.append(exc)
 

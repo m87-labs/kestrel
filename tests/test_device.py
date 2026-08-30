@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import threading
+import weakref
 
 import pytest
 import torch
@@ -88,9 +89,14 @@ def test_materialize_blas_runtime_returns_cuda_handle_from_worker(
 
     caller_thread = threading.get_ident()
     events = []
+    result_ref = None
+
+    class Result:
+        pass
 
     class Stream:
         def synchronize(self):
+            assert result_ref is not None and result_ref() is not None
             events.append(("synchronize", threading.get_ident(), self))
 
     compute_stream = Stream()
@@ -114,16 +120,23 @@ def test_materialize_blas_runtime_returns_cuda_handle_from_worker(
     monkeypatch.setattr(device_module.torch.cuda, "device", cuda_device)
     monkeypatch.setattr(device_module, "stream_context", use_stream)
 
-    materialize_blas_runtime(
-        torch.device("cuda:0"),
-        compute_stream,
-        lambda: events.append(
+    def operation():
+        nonlocal result_ref
+        result = Result()
+        result_ref = weakref.ref(result)
+        events.append(
             (
                 "operation",
                 threading.get_ident(),
                 torch.is_inference_mode_enabled(),
             )
-        ),
+        )
+        return result
+
+    materialize_blas_runtime(
+        torch.device("cuda:0"),
+        compute_stream,
+        operation,
     )
 
     worker_threads = {event[1] for event in events}
@@ -137,6 +150,7 @@ def test_materialize_blas_runtime_returns_cuda_handle_from_worker(
         "device-exit",
     ]
     assert events[2][2] is True
+    assert result_ref is not None and result_ref() is None
 
 
 # --- CUDA path: thin wrappers, only run when present ------------------------

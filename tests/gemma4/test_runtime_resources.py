@@ -13,7 +13,8 @@ from kestrel.models.gemma4.runtime import (
     _allocate_decode_page_tables,
     _generated_kv_binding_inputs,
     _install_decode_page_tables,
-    _materialize_fixed_blas_resources,
+    _materialize_fixed_runtime_resources,
+    _vision_probe_records,
 )
 
 
@@ -145,7 +146,7 @@ def test_decode_page_table_placeholders_are_replaced_before_binding() -> None:
         )
 
 
-def test_fixed_blas_resources_use_resident_output_matmul(
+def test_fixed_runtime_resources_use_resident_matmul_and_full_vision_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from kestrel.models.gemma4 import runtime as runtime_module
@@ -155,21 +156,81 @@ def test_fixed_blas_resources_use_resident_output_matmul(
     logits = torch.empty(4, 5, dtype=torch.bfloat16)
     compute_stream = object()
     calls = []
+
+    class Stager:
+        def stage(self, records):
+            calls.append(("stage", len(records)))
+            return {
+                "pixel_values": torch.stack(
+                    [record["pixel_values"] for record in records]
+                ),
+                "position_ids": torch.stack(
+                    [record["position_ids"] for record in records]
+                ),
+            }
+
+    def get_image_features(pixel_values, position_ids):
+        calls.append(
+            ("vision", tuple(pixel_values.shape), tuple(position_ids.shape))
+        )
+        return torch.ones(pixel_values.shape[0], 2)
+
     runtime = SimpleNamespace(
         device=torch.device("cpu"),
         _compute_stream=compute_stream,
         max_batch_size=2,
-        model=SimpleNamespace(lm_head=SimpleNamespace(weight=weight)),
+        model=SimpleNamespace(
+            lm_head=SimpleNamespace(weight=weight),
+            model=SimpleNamespace(get_image_features=get_image_features),
+        ),
         decode_slots=(SimpleNamespace(hidden_last=hidden, logits=logits),),
+        _vision_stager=Stager(),
+    )
+    records = tuple(
+        {
+            "pixel_values": torch.zeros(3, 4),
+            "position_ids": torch.zeros(3, 2, dtype=torch.long),
+        }
+        for _row in range(2)
     )
 
     def materialize(device, stream, operation):
         calls.append((device, stream))
-        operation()
+        result = operation()
+        calls.append(("result", tuple(result.shape)))
 
     monkeypatch.setattr(runtime_module, "materialize_blas_runtime", materialize)
 
-    _materialize_fixed_blas_resources(runtime)
+    _materialize_fixed_runtime_resources(runtime, records)
 
-    assert calls == [(torch.device("cpu"), compute_stream)]
+    assert calls == [
+        (torch.device("cpu"), compute_stream),
+        ("stage", 2),
+        ("vision", (2, 3, 4), (2, 3, 2)),
+        ("result", (2, 2)),
+    ]
     torch.testing.assert_close(logits[:2], hidden[:2] @ weight.t())
+
+
+def test_vision_probe_records_cover_pooling_aligned_max_patch_grid() -> None:
+    runtime = SimpleNamespace(
+        max_batch_size=3,
+        dtype=torch.bfloat16,
+        _config=SimpleNamespace(
+            vision_config=SimpleNamespace(
+                patch_size=16,
+                pooling_kernel_size=3,
+            )
+        ),
+    )
+
+    records = _vision_probe_records(runtime)
+
+    assert len(records) == 3
+    assert tuple(records[0]["pixel_values"].shape) == (2520, 768)
+    assert tuple(records[0]["position_ids"].shape) == (2520, 2)
+    positions = records[0]["position_ids"]
+    width = int(positions[:, 0].max()) + 1
+    height = int(positions[:, 1].max()) + 1
+    assert width * height == 2520
+    assert width % 3 == height % 3 == 0
