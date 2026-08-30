@@ -216,10 +216,11 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if exc_type is not None:
+        try:
+            if exc_type is None:
+                await self.result()
+        finally:
             await self.aclose()
-        else:
-            await self.result()
 
 
 @dataclass(slots=True)

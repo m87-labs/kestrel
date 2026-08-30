@@ -98,11 +98,6 @@ class SamplingHooks:
     # fallback; source-only development runtimes leave it false.
     require_packed_greedy_logprobs: bool = False
 
-    # Require ordinary temperature/top-p sampling to resolve both CUDA
-    # operations from the packed kernel bundle. Production generated runtimes
-    # use this to prevent silent JIT or torch fallbacks.
-    require_packed_sampling: bool = False
-
     # post_sample(slot, *, sampled_ids, hidden_last, sequences,
     #             batch_idx, temperatures, top_ps, token_logprobs,
     #             ready_event) -> Any
@@ -146,6 +141,11 @@ class SamplingHooks:
     # prepare_decode_inputs(slot, batch_idx, batch_size) -> None
     # Default: no-op. Runtime gathers any aux decode inputs into slot.
     prepare_decode_inputs: Callable[..., None] | None = None
+
+    # Require ordinary temperature/top-p sampling to resolve both CUDA
+    # operations from the packed kernel bundle. Production generated runtimes
+    # use this to prevent silent JIT or torch fallbacks.
+    require_packed_sampling: bool = False
 
 
 __all__ = ["SamplingHooks"]
