@@ -119,7 +119,7 @@ def test_cancelled_prefill_waits_for_commit_before_finalizing() -> None:
     scheduler.running.push(sequence)
     finalized: list[tuple[RequestLifecycle, str]] = []
     scheduler._finalize_sequence = lambda seq, reason: finalized.append((seq, reason))
-    scheduler._commit_prefill = lambda _step: ([TextToken(7)], None)
+    scheduler._commit_prefill = lambda _step: ([TextToken(7)], None, (True,))
     step = SimpleNamespace(kind="prefill", sequences=[sequence])
 
     assert scheduler._cancel_requests() is False
