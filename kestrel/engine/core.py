@@ -1635,6 +1635,14 @@ class InferenceEngine:
                 while True:
                     # If paused, wait until resumed or shutdown completes.
                     if paused_flag.is_set():
+                        if paused_event.is_set() and not wake_event.is_set():
+                            run_gate.wait(timeout=0.1)
+                            continue
+
+                        # Clear before scanning so work arriving during the
+                        # scan leaves the event set for another pass.
+                        wake_event.clear()
+
                         # A stream can be closed after its request entered the
                         # thread queue but before admission. Settle only those
                         # canceled requests; leave every other request queued.
