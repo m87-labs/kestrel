@@ -94,11 +94,14 @@ def test_paged_kv_bytes_per_page_counts_sparse_layers_and_page_size() -> None:
         PagedKVLayerSpec(n_heads=1, head_dim=16),
     )
 
-    assert paged_kv_bytes_per_page(
-        specs,
-        page_size=4,
-        dtype=torch.bfloat16,
-    ) == 2 * (2 * 8 + 1 * 16) * 4 * 2
+    assert (
+        paged_kv_bytes_per_page(
+            specs,
+            page_size=4,
+            dtype=torch.bfloat16,
+        )
+        == 2 * (2 * 8 + 1 * 16) * 4 * 2
+    )
 
 
 def test_fitted_paged_kv_storage_respects_consumed_shared_pool_budget() -> None:
@@ -271,9 +274,11 @@ def test_fitted_paged_kv_storage_retries_failed_transient_without_retaining_it(
         additional_refs.append(weakref.ref(value))
         return value
 
-    def validate_transient():
+    def validate_transient(storage, additional):
         nonlocal probe_attempts
         assert torch.is_inference_mode_enabled()
+        assert storage._kv_backing is backing_refs[-1]()
+        assert additional is additional_refs[-1]()
         probe_attempts += 1
         if probe_attempts == 1:
             raise torch.OutOfMemoryError("synthetic live-workspace failure")
@@ -333,9 +338,11 @@ def test_fitted_paged_kv_storage_keeps_transient_alive_through_stream_sync(
     def use_stream(_stream):
         yield
 
-    def validate_transient():
+    def validate_transient(candidate_storage, additional):
         nonlocal probe_ref
         assert torch.is_inference_mode_enabled()
+        assert candidate_storage is storage
+        assert additional is None
         probe = Probe()
         probe_ref = weakref.ref(probe)
         return probe
@@ -553,12 +560,15 @@ def test_grouped_paged_kv_storage_budget_failure_rolls_back() -> None:
 def test_paged_kv_storage_bytes_includes_alignment_padding() -> None:
     specs = (PagedKVLayerSpec(n_heads=1, head_dim=1),)
 
-    assert paged_kv_storage_bytes(
-        3,
-        layer_specs=specs,
-        page_size=1,
-        dtype=torch.float32,
-    ) == 520
+    assert (
+        paged_kv_storage_bytes(
+            3,
+            layer_specs=specs,
+            page_size=1,
+            dtype=torch.float32,
+        )
+        == 520
+    )
 
 
 def test_fitted_storage_requires_three_requested_pages() -> None:
@@ -578,11 +588,14 @@ def test_fitted_storage_requires_three_requested_pages() -> None:
 def test_paged_kv_bytes_per_page_excludes_fixed_alignment_padding() -> None:
     specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
 
-    assert paged_kv_bytes_per_page(
-        specs,
-        page_size=1,
-        dtype=torch.float32,
-    ) == 64
+    assert (
+        paged_kv_bytes_per_page(
+            specs,
+            page_size=1,
+            dtype=torch.float32,
+        )
+        == 64
+    )
 
 
 def test_paged_cache_update_accepts_fused_projection_value_slice() -> None:
@@ -689,9 +702,7 @@ def test_paged_cache_update_accepts_batched_decode_value_slice() -> None:
     torch.testing.assert_close(cache.v_cache, expected_v)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pool_canonicalizes_indexless_cuda_device() -> None:
     """``KVMemoryPool(device='cuda')`` must compare equal to the same
     device built from ``RuntimeConfig`` so shared-pool wiring doesn't

@@ -1,4 +1,3 @@
-
 import gc
 import threading
 import weakref
@@ -49,7 +48,6 @@ def _flatten_bshd_tokens(name: str, tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
-
 class KVMemoryPool:
     """Allocator for paged KV cache storage.
 
@@ -74,9 +72,7 @@ class KVMemoryPool:
         budget_bytes: int | None = None,
     ):
         if budget_bytes is not None and budget_bytes < 0:
-            raise ValueError(
-                f"budget_bytes must be non-negative, got {budget_bytes}"
-            )
+            raise ValueError(f"budget_bytes must be non-negative, got {budget_bytes}")
         self.device = resolve_device(device)
         self.budget_bytes = budget_bytes
         self.allocated_bytes = 0
@@ -145,6 +141,7 @@ class KVMemoryPool:
             if self.budget_bytes is None:
                 return None
             return max(0, self.budget_bytes - self.allocated_bytes)
+
 
 class PagedKVCache(torch.nn.Module):
     def __init__(
@@ -533,7 +530,9 @@ def fit_and_allocate_paged_kv_storage(
     stream: Any,
     materialize_fixed: Callable[[], None] | None = None,
     allocate_additional: Callable[[int], _AdditionalStorage] | None = None,
-    validate_transient: Callable[[], _TransientProbe] | None = None,
+    validate_transient: (
+        Callable[[PagedKVStorage, _AdditionalStorage | None], _TransientProbe] | None
+    ) = None,
 ) -> tuple[PagedKVStorage, _AdditionalStorage | None]:
     """Allocate the largest exact fixed K/V cache that the device can retain.
 
@@ -637,7 +636,7 @@ def fit_and_allocate_paged_kv_storage(
                 )
                 if validate_transient is not None:
                     with torch.inference_mode():
-                        transient = validate_transient()
+                        transient = validate_transient(storage, additional)
                     # Keep the probe result alive until every operation that
                     # produced it has completed. This makes the live peak, not
                     # an allocator estimate, the candidate acceptance gate.
@@ -862,7 +861,9 @@ class PageTable:
         # find empty physical pages
         allocated_pages_list = self.free_pages[-num_pages_to_allocate:]
         # update page table on host first via numpy view (faster than torch.as_tensor)
-        self._page_table_cpu_np[batch_idx, start_page_idx:end_page_idx] = allocated_pages_list
+        self._page_table_cpu_np[batch_idx, start_page_idx:end_page_idx] = (
+            allocated_pages_list
+        )
 
         # update cpu side metadata
         self.page_table_cpu[batch_idx] += allocated_pages_list
@@ -943,9 +944,7 @@ class PageTable:
                 f"got {batch_idx.device}/{input_pos.device}"
             )
         if out_page_table.device != device or out_seqused_k.device != device:
-            raise ValueError(
-                f"out_page_table/out_seqused_k must live on {device}"
-            )
+            raise ValueError(f"out_page_table/out_seqused_k must live on {device}")
 
         batch_idx = batch_idx.to(device=device)
         input_pos = input_pos.to(device=device)

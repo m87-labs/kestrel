@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -13,6 +14,8 @@ from kestrel.device import make_event, make_stream, materialize_blas_runtime
 from kestrel.kv_cache import (
     KVMemoryPool,
     PageTable,
+    PagedKVLayerSpec,
+    PagedKVStorage,
     allocate_paged_kv_layers,
     fit_and_allocate_paged_kv_storage,
 )
@@ -33,7 +36,14 @@ from kestrel.runtime.staging import AsyncPreprocessor, BatchedTensorStager
 from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.uncached_paged import UncachedPagedRuntime
 
-from .image import MAX_IMAGE_TOKENS, MAX_PATCHES, preprocess_image
+from .image import (
+    MAX_IMAGE_TOKENS,
+    MAX_PATCHES,
+    PATCH_SIZE,
+    POOLING_KERNEL_SIZE,
+    GemmaImageInputs,
+    preprocess_image,
+)
 from .loader import load_model
 from .paged_cache import paged_kv_specs
 from .prompt_template import (
@@ -51,6 +61,23 @@ class _PagedRuntimeResources:
     rope_inputs: dict[str, torch.Tensor] | None
     decode_page_tables: tuple[torch.Tensor, ...]
     page_table: PageTable
+
+
+@dataclass(frozen=True, slots=True)
+class _PageTableSnapshot:
+    free_pages: tuple[int, ...]
+    free_batch_idx: tuple[int, ...]
+    page_table_cpu: tuple[tuple[int, ...], ...]
+    capacity: tuple[int, ...]
+    num_blocks_per_row: tuple[int, ...]
+    cpu_mapping: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _ImagePrefillProbeResult:
+    logits: torch.Tensor
+    image_features: tuple[torch.Tensor, ...]
+    prepared_sequences: tuple[Any, ...]
 
 
 def _generated_kv_binding_inputs(
@@ -111,11 +138,22 @@ def _install_decode_page_tables(
         slot.paged_kv_page_table = table
 
 
-def _vision_probe_records(runtime: Any) -> tuple[dict[str, torch.Tensor], ...]:
-    """Build a full-patch record for every admitted vision batch row."""
+def _maximum_vision_grid(config: Any) -> tuple[int, int]:
+    """Validate the fixed Gemma preprocessing contract and return its grid."""
 
-    config = runtime._config.vision_config
     pooling = int(config.pooling_kernel_size)
+    if int(config.patch_size) != PATCH_SIZE:
+        raise ValueError(
+            f"Gemma vision patch_size must be {PATCH_SIZE}, got {config.patch_size}"
+        )
+    if pooling != POOLING_KERNEL_SIZE:
+        raise ValueError(
+            f"Gemma vision pooling_kernel_size must be {POOLING_KERNEL_SIZE}, "
+            f"got {pooling}"
+        )
+    if MAX_IMAGE_TOKENS != MAX_PATCHES // pooling**2:
+        raise RuntimeError("Gemma maximum image-token contract is inconsistent")
+
     grid_height = 0
     grid_width = 0
     for candidate in range(math.isqrt(MAX_PATCHES), 0, -1):
@@ -129,9 +167,23 @@ def _vision_probe_records(runtime: Any) -> tuple[dict[str, torch.Tensor], ...]:
         raise RuntimeError(
             "maximum vision patch count has no pooling-aligned rectangular grid"
         )
+    position_embedding_size = int(config.position_embedding_size)
+    if position_embedding_size < max(grid_height, grid_width):
+        raise ValueError(
+            "Gemma vision position_embedding_size cannot represent the "
+            f"maximum {grid_height}x{grid_width} patch grid"
+        )
+    return grid_height, grid_width
+
+
+def _vision_probe_inputs(runtime: Any) -> tuple[GemmaImageInputs, ...]:
+    """Build a distinct full-patch image input for every admitted batch row."""
+
+    config = runtime._config.vision_config
+    grid_height, grid_width = _maximum_vision_grid(config)
 
     pixel_values = torch.zeros(
-        (MAX_PATCHES, 3 * int(config.patch_size) ** 2),
+        (MAX_PATCHES, 3 * PATCH_SIZE**2),
         dtype=runtime.dtype,
     )
     position_ids = torch.stack(
@@ -142,17 +194,28 @@ def _vision_probe_records(runtime: Any) -> tuple[dict[str, torch.Tensor], ...]:
         dim=-1,
     )
     return tuple(
-        {"pixel_values": pixel_values, "position_ids": position_ids}
+        GemmaImageInputs(
+            pixel_values=pixel_values,
+            image_position_ids=position_ids,
+            num_image_tokens=MAX_IMAGE_TOKENS,
+        )
         for _row in range(int(runtime.max_batch_size))
     )
 
 
 def _run_vision_transient_probe(
     runtime: Any,
-    records: Sequence[dict[str, torch.Tensor]],
+    inputs: Sequence[GemmaImageInputs],
 ) -> torch.Tensor:
     """Run the maximum admitted full vision path through its real stager."""
 
+    records = tuple(
+        {
+            "pixel_values": image.pixel_values,
+            "position_ids": image.image_position_ids,
+        }
+        for image in inputs
+    )
     staged = runtime._vision_stager.stage(records)
     return runtime.model.model.get_image_features(
         staged["pixel_values"],
@@ -162,7 +225,7 @@ def _run_vision_transient_probe(
 
 def _materialize_fixed_runtime_resources(
     runtime: Any,
-    vision_records: Sequence[dict[str, torch.Tensor]],
+    vision_inputs: Sequence[GemmaImageInputs],
 ) -> None:
     """Prime exact scheduler-thread BLAS and maximum vision resources."""
 
@@ -175,13 +238,257 @@ def _materialize_fixed_runtime_resources(
             runtime.model.lm_head.weight.t(),
             out=slot.logits[:rows],
         )
-        return _run_vision_transient_probe(runtime, vision_records)
+        return _run_vision_transient_probe(runtime, vision_inputs)
 
     materialize_blas_runtime(
         runtime.device,
         runtime._compute_stream,
         warm,
     )
+
+
+def _copy_image_features_into_embeddings(
+    inputs_embeds: torch.Tensor,
+    token_rows: Sequence[Sequence[int]],
+    image_features: Sequence[torch.Tensor | None],
+    *,
+    image_token_id: int,
+) -> None:
+    """Copy each contiguous image feature block without a packed duplicate."""
+
+    if len(token_rows) != len(image_features):
+        raise ValueError("token rows and image features must have equal length")
+    if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
+        raise ValueError("prefill embeddings must have shape [1, tokens, hidden]")
+
+    copies = []
+    flat_offset = 0
+    for row_index, (token_row, features) in enumerate(
+        zip(token_rows, image_features, strict=True)
+    ):
+        positions = [
+            index
+            for index, token_id in enumerate(token_row)
+            if int(token_id) == int(image_token_id)
+        ]
+        if features is None:
+            if positions:
+                raise RuntimeError(
+                    f"prefill row {row_index} has image tokens without features"
+                )
+        else:
+            if not isinstance(features, torch.Tensor):
+                raise TypeError(f"image features for row {row_index} must be a tensor")
+            if not positions:
+                raise RuntimeError(
+                    f"prefill row {row_index} has image features without tokens"
+                )
+            start = positions[0]
+            if positions != list(range(start, start + len(positions))):
+                raise RuntimeError(
+                    f"prefill row {row_index} image tokens must be contiguous"
+                )
+            if features.ndim != 2:
+                raise RuntimeError(
+                    f"image features for row {row_index} must be 2D, got "
+                    f"{features.ndim}D"
+                )
+            if int(features.shape[0]) != len(positions):
+                raise RuntimeError(
+                    f"encoded {features.shape[0]} image features for "
+                    f"{len(positions)} image tokens in row {row_index}"
+                )
+            if int(features.shape[1]) != int(inputs_embeds.shape[2]):
+                raise RuntimeError(
+                    f"image features for row {row_index} have shape "
+                    f"{tuple(features.shape)}, expected "
+                    f"({len(positions)}, {inputs_embeds.shape[2]})"
+                )
+            if features.dtype is not inputs_embeds.dtype:
+                raise RuntimeError(
+                    f"image features for row {row_index} have dtype "
+                    f"{features.dtype}, expected {inputs_embeds.dtype}"
+                )
+            if features.device != inputs_embeds.device:
+                raise RuntimeError(
+                    f"image features for row {row_index} are on "
+                    f"{features.device}, expected {inputs_embeds.device}"
+                )
+            copies.append(
+                (
+                    flat_offset + start,
+                    flat_offset + start + len(positions),
+                    features,
+                )
+            )
+        flat_offset += len(token_row)
+
+    if flat_offset != int(inputs_embeds.shape[1]):
+        raise ValueError("token rows do not cover the packed prefill embeddings")
+    for start, end, features in copies:
+        inputs_embeds[0, start:end].copy_(features)
+
+
+def _snapshot_page_table(page_table: PageTable) -> _PageTableSnapshot:
+    if page_table._dirty_rows:
+        raise RuntimeError("transient probe requires a committed candidate page table")
+    return _PageTableSnapshot(
+        free_pages=tuple(page_table.free_pages),
+        free_batch_idx=tuple(page_table.free_batch_idx),
+        page_table_cpu=tuple(tuple(row) for row in page_table.page_table_cpu),
+        capacity=tuple(int(value) for value in page_table.capacity),
+        num_blocks_per_row=tuple(int(value) for value in page_table.num_blocks_per_row),
+        cpu_mapping=page_table._page_table_cpu_tensor.clone(),
+    )
+
+
+def _restore_page_table(
+    page_table: PageTable,
+    snapshot: _PageTableSnapshot,
+) -> None:
+    page_table.free_pages[:] = snapshot.free_pages
+    page_table.free_batch_idx[:] = snapshot.free_batch_idx
+    page_table.page_table_cpu[:] = [list(row) for row in snapshot.page_table_cpu]
+    page_table.capacity[:] = snapshot.capacity
+    page_table.num_blocks_per_row[:] = snapshot.num_blocks_per_row
+    page_table._page_table_cpu_tensor.copy_(snapshot.cpu_mapping)
+    page_table._dirty_rows.clear()
+    page_table._sync_full_page_table()
+
+
+def _run_image_prefill_transient_probe(
+    runtime: Any,
+    vision_inputs: Sequence[GemmaImageInputs],
+    storage: PagedKVStorage,
+    resources: _PagedRuntimeResources | None,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+) -> _ImagePrefillProbeResult:
+    """Run a production image prefill while candidate K/V resources are live."""
+
+    if resources is None:
+        raise RuntimeError("Gemma transient probe requires paged resources")
+    if len(vision_inputs) != int(runtime.max_batch_size):
+        raise ValueError("Gemma transient probe must cover the maximum batch")
+
+    page_table = resources.page_table
+    page_table_snapshot = _snapshot_page_table(page_table)
+    previous_page_table = getattr(runtime, "page_table", None)
+    previous_kv_cache = getattr(runtime, "_kv_cache", None)
+    had_page_table = hasattr(runtime, "page_table")
+    had_kv_cache = hasattr(runtime, "_kv_cache")
+    probe_kv_cache = allocate_paged_kv_layers(
+        layer_specs=layer_specs,
+        page_table=page_table,
+        pool=runtime._kv_pool,
+        dtype=runtime.dtype,
+        storage=storage,
+    )
+    runtime.page_table = page_table
+    runtime._kv_cache = probe_kv_cache
+
+    prepared_sequences = []
+    projected_features: list[torch.Tensor] = []
+    touched_pages: set[int] = set()
+    result = None
+
+    def retain_projected_features(
+        _module: Any,
+        _inputs: tuple[Any, ...],
+        output: torch.Tensor,
+    ) -> None:
+        projected_features.append(output)
+
+    hook = None
+    try:
+        prompt_tokens = tuple(
+            TextToken(token_id=token_id)
+            for token_id in (TURN_ID, USER_ROLE_ID, NEWLINE_ID, NEWLINE_ID)
+        )
+        hook = runtime.model.model.embed_vision.register_forward_hook(
+            retain_projected_features
+        )
+        for image_inputs in vision_inputs:
+            prepared = runtime.prepare_sequence(
+                prompt_tokens,
+                image_crops=image_inputs,
+                max_new_tokens=1,
+            )
+            prepared_sequences.append(prepared)
+            touched_pages.update(
+                page_table.page_table_cpu[int(prepared.state.batch_idx)]
+            )
+        logits = runtime.launch_prepared_batch(
+            prepared_sequences,
+            runtime._prefill_slot,
+            image_crops_list=vision_inputs,
+        )
+        if len(projected_features) != 1:
+            raise RuntimeError(
+                "maximum-batch image prefill must produce one packed feature owner"
+            )
+        result = _ImagePrefillProbeResult(
+            logits=logits,
+            image_features=tuple(projected_features),
+            prepared_sequences=tuple(prepared_sequences),
+        )
+    finally:
+        primary_error = sys.exception()
+        cleanup_failures = []
+
+        def clean(label: str, operation: Any) -> None:
+            try:
+                operation()
+            except BaseException as exc:
+                cleanup_failures.append(f"{label}: {type(exc).__name__}: {exc}")
+
+        def synchronize() -> None:
+            if runtime.device.type == "cuda":
+                runtime._compute_stream.synchronize()
+
+        def abort_prepared() -> None:
+            for prepared in reversed(prepared_sequences):
+                if int(prepared.state.batch_idx) not in page_table.free_batch_idx:
+                    runtime.abort_prepared_sequence(prepared)
+
+        def assert_page_zero_unmapped() -> None:
+            if 0 in touched_pages:
+                raise RuntimeError(
+                    "transient prefill probe mapped reserved physical page 0"
+                )
+
+        def restore_runtime_attributes() -> None:
+            if had_page_table:
+                runtime.page_table = previous_page_table
+            else:
+                del runtime.page_table
+            if had_kv_cache:
+                runtime._kv_cache = previous_kv_cache
+            else:
+                del runtime._kv_cache
+
+        clean("pre-cleanup stream synchronization", synchronize)
+        clean("reserved page-zero mapping validation", assert_page_zero_unmapped)
+        # Probe pages remain unowned after restoring the table. A serving
+        # prefill overwrites each mapped K/V slot before it can be read.
+        clean("prepared-sequence abort", abort_prepared)
+        clean(
+            "accepted page-table restoration",
+            lambda: _restore_page_table(page_table, page_table_snapshot),
+        )
+        clean("prefill-slot restoration", runtime._prefill_slot.batch_idx.zero_)
+        clean("post-cleanup stream synchronization", synchronize)
+        if hook is not None:
+            clean("feature-owner hook removal", hook.remove)
+        clean("runtime resource restoration", restore_runtime_attributes)
+
+        if cleanup_failures:
+            detail = "; ".join(cleanup_failures)
+            if primary_error is None:
+                raise RuntimeError(f"Gemma transient probe cleanup failed: {detail}")
+            primary_error.add_note(f"Gemma transient probe cleanup failures: {detail}")
+
+    assert result is not None
+    return result
 
 
 class Gemma4Runtime(UncachedPagedRuntime):
@@ -213,7 +520,9 @@ class Gemma4Runtime(UncachedPagedRuntime):
         from kestrel.models.registry import get_spec
 
         model_spec = get_spec(self._model_name)
-        model_source = cfg.model_path if cfg.model_path is not None else model_spec.repo_id
+        model_source = (
+            cfg.model_path if cfg.model_path is not None else model_spec.repo_id
+        )
         if model_source is None:
             raise ValueError("Gemma model spec must declare repo_id")
         self._generated_weight_storage = None
@@ -247,9 +556,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
                             self._generated_weight_storage,
                             label="Gemma",
                             layer_prefix=_WEIGHT_LAYER_PREFIX,
-                            required_batch_sizes=range(
-                                1, self.max_batch_size + 1
-                            ),
+                            required_batch_sizes=range(1, self.max_batch_size + 1),
                         )
                     )
 
@@ -296,7 +603,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             preprocess_image,
             workers=derive_preprocessing_workers(self.max_batch_size),
         )
-        vision_probe_records = _vision_probe_records(self)
+        vision_probe_inputs = _vision_probe_inputs(self)
 
         text_config = self._config.text_config
         self.vocab_size = int(text_config.vocab_size)
@@ -344,8 +651,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
         kv_layer_specs = paged_kv_specs(text_config)
         self._generated_rope_inputs = None
         has_generated_decode = (
-            self.decode_path != "native"
-            and self._generated_weight_storage is not None
+            self.decode_path != "native" and self._generated_weight_storage is not None
         )
         if self.decode_path == "generated" and not has_generated_decode:
             raise RuntimeError(
@@ -375,18 +681,16 @@ class Gemma4Runtime(UncachedPagedRuntime):
                 tuple(text_config.layer_types),
             )
             if programs:
-                self._generated_binding_reservation = (
-                    reserve_generated_binding_storage(
-                        programs,
-                        weight_storage=self._generated_weight_storage,
-                        runtime_inputs_by_slot=tuple(
-                            sparse_inputs for _slot in self.decode_slots
-                        ),
-                        device=self.device,
-                        stream=self._compute_stream,
-                        label="Gemma",
-                        required=self.decode_path == "generated",
-                    )
+                self._generated_binding_reservation = reserve_generated_binding_storage(
+                    programs,
+                    weight_storage=self._generated_weight_storage,
+                    runtime_inputs_by_slot=tuple(
+                        sparse_inputs for _slot in self.decode_slots
+                    ),
+                    device=self.device,
+                    stream=self._compute_stream,
+                    label="Gemma",
+                    required=self.decode_path == "generated",
                 )
             if self._generated_binding_reservation is None:
                 has_generated_decode = False
@@ -437,12 +741,17 @@ class Gemma4Runtime(UncachedPagedRuntime):
             stream=self._compute_stream,
             materialize_fixed=lambda: _materialize_fixed_runtime_resources(
                 self,
-                vision_probe_records,
+                vision_probe_inputs,
             ),
             allocate_additional=allocate_paged_resources,
-            validate_transient=lambda: _run_vision_transient_probe(
-                self,
-                vision_probe_records,
+            validate_transient=lambda storage, resources: (
+                _run_image_prefill_transient_probe(
+                    self,
+                    vision_probe_inputs,
+                    storage,
+                    resources,
+                    kv_layer_specs,
+                )
             ),
         )
         if paged_resources is None:
@@ -499,6 +808,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             options={"triton.cudagraphs": False},
         )
         config = self._config.vision_config
+        _maximum_vision_grid(config)
 
         def inputs(batch_size: int) -> tuple[torch.Tensor, ...]:
             return (
@@ -694,9 +1004,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             raise ValueError("Gemma4Runtime does not support encoder inputs")
         batch_size = len(prepared_sequences)
         if not 0 < batch_size <= self.max_batch_size:
-            raise ValueError(
-                f"prefill batch must lie in [1, {self.max_batch_size}]"
-            )
+            raise ValueError(f"prefill batch must lie in [1, {self.max_batch_size}]")
         if image_crops_list is None:
             image_crops_list = [None] * batch_size
         if len(image_crops_list) != batch_size:
@@ -716,28 +1024,24 @@ class Gemma4Runtime(UncachedPagedRuntime):
             token_rows.append([int(token.token_id) for token in tokens])
             lengths.append(len(tokens))
 
-        flat_ids = [token_id for row in token_rows for token_id in row]
-        input_ids = torch.tensor([flat_ids], dtype=torch.long, device=self.device)
-        image_mask = input_ids == self._config.image_token_id
-        model_ids = input_ids.masked_fill(image_mask, 0)
-        inputs_embeds = self.model.model.language_model.embed(model_ids)
-        packed_image_features = [
-            features for features in image_features if features is not None
-        ]
-        feature_count = sum(int(features.shape[0]) for features in packed_image_features)
-        image_token_count = sum(
-            row.count(self._config.image_token_id) for row in token_rows
+        model_ids = torch.tensor(
+            [
+                [
+                    0 if token_id == self._config.image_token_id else token_id
+                    for row in token_rows
+                    for token_id in row
+                ]
+            ],
+            dtype=torch.long,
+            device=self.device,
         )
-        if feature_count != image_token_count:
-            raise RuntimeError(
-                f"encoded {feature_count} image features for "
-                f"{image_token_count} image tokens"
-            )
-        if packed_image_features:
-            inputs_embeds.masked_scatter_(
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds),
-                torch.cat(packed_image_features),
-            )
+        inputs_embeds = self.model.model.language_model.embed(model_ids)
+        _copy_image_features_into_embeddings(
+            inputs_embeds,
+            token_rows,
+            image_features,
+            image_token_id=self._config.image_token_id,
+        )
 
         prefill_slot.batch_idx[:batch_size].copy_(
             torch.tensor(batch_indices, dtype=torch.long, device=self.device)
@@ -751,9 +1055,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             [
                 [
                     batch_idx
-                    for batch_idx, length in zip(
-                        batch_indices, lengths, strict=True
-                    )
+                    for batch_idx, length in zip(batch_indices, lengths, strict=True)
                     for _ in range(length)
                 ]
             ],
