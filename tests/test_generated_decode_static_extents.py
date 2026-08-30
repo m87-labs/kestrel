@@ -112,6 +112,7 @@ def _build(
     weight_sources=None,
     weight_storage=None,
     materialize_calls=None,
+    extension_helper=True,
 ):
     launches = programs[0].launches
     kernels = ModuleType("kestrel_kernels")
@@ -143,13 +144,12 @@ def _build(
         ),
         default=None,
     )
-    generated.extend_weight_storage = lambda storage, _module, descriptor, **kwargs: (
-        storage
-        if getattr(storage, "matches", False)
-        else SimpleNamespace(
-            buffers={}, base=storage, descriptor=descriptor, options=kwargs
+    if extension_helper:
+        generated.extend_weight_storage = (
+            lambda storage, _module, descriptor, **kwargs: SimpleNamespace(
+                buffers={}, base=storage, descriptor=descriptor, options=kwargs
+            )
         )
-    )
     monkeypatch.setitem(sys.modules, "kestrel_kernels", kernels)
     monkeypatch.setitem(sys.modules, "kestrel_kernels.generated_decode", generated)
     monkeypatch.setattr(
@@ -210,6 +210,7 @@ def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
         max_batch_size=1,
         weight_storage=storage,
         materialize_calls=calls,
+        extension_helper=False,
     )
 
     assert generated.weight_storage is storage
