@@ -152,7 +152,11 @@ def test_paused_shutdown_does_not_wait_for_executor_work(
     class BusyExecutor:
         has_work = True
 
+        def __init__(self) -> None:
+            self.drains = 0
+
         def drain(self):  # type: ignore[no-untyped-def]
+            self.drains += 1
             return ()
 
         def shutdown(self):  # type: ignore[no-untyped-def]
@@ -163,12 +167,23 @@ def test_paused_shutdown_does_not_wait_for_executor_work(
     engine._loop = asyncio.new_event_loop()
     engine._paused_flag.set()
     engine._run_gate.clear()
+    executor = BusyExecutor()
     monkeypatch.setattr(
         "kestrel.engine.core.AutoregressiveExecutor",
-        lambda *args, **kwargs: BusyExecutor(),
+        lambda *args, **kwargs: executor,
     )
 
-    engine._scheduler_queue.put(None)
+    class ShutdownAfterIdleWait(threading.Event):
+        waits = 0
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.waits += 1
+            if self.waits == 2:
+                engine._scheduler_queue.put(None)
+                engine._scheduler_event.set()
+            return False
+
+    engine._run_gate = ShutdownAfterIdleWait()
     thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
     thread.start()
     thread.join(timeout=1.0)
@@ -181,6 +196,7 @@ def test_paused_shutdown_does_not_wait_for_executor_work(
 
     engine._loop.close()
     assert stopped
+    assert executor.drains == 2  # initial pause and shutdown, not the idle poll
 
 
 def test_default_model_can_be_single_pass() -> None:
