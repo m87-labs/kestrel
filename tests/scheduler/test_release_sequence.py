@@ -18,8 +18,13 @@ from kestrel.scheduler.pipeline import (
 )
 from kestrel.scheduler.queues import RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler
-from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
 from kestrel.runtime.sampling import SamplingHooks
+from kestrel.scheduler.types import (
+    GeneratedPrefix,
+    GenerationRequest,
+    RequestLifecycle,
+    RequestPhase,
+)
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -98,6 +103,29 @@ def test_finalize_sequence_retains_prefix_before_release() -> None:
     assert retain_call["adapter_id"] == "adapter-a"
     assert retain_call["image_hash"] == b"0123456789abcdef"
     assert runtime.released_sequences == [state]
+
+
+def test_cancel_completion_waits_for_inflight_release() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    lifecycle.inflight_refs = 1
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler._completed = deque()
+    scheduler._build_result = lambda seq: seq.finish_reason
+
+    scheduler._finalize_sequence(lifecycle, "cancelled")
+
+    assert scheduler.pop_completed() == []
+    assert runtime.released_sequences == []
+
+    lifecycle.inflight_refs = 0
+    lifecycle.transition(RequestPhase.COMPLETED)
+    scheduler._release_sequence(lifecycle)
+    scheduler._complete_deferred_cancellation(lifecycle)
+
+    assert scheduler.pop_completed() == ["cancelled"]
+    assert runtime.released_sequences == [lifecycle.state]
 
 
 def test_release_sequence_retains_only_decoded_suffix_after_generated_prefix() -> None:

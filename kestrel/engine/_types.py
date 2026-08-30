@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -72,6 +73,8 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         "request_id",
         "_queue",
         "_result_future",
+        "_cancel",
+        "_closed",
         "_final_result",
         "_error",
     )
@@ -81,10 +84,14 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         request_id: int,
         queue: _StreamQueue,
         result_future: asyncio.Future[EngineResult],
+        *,
+        cancel: Optional[Callable[[], None]] = None,
     ) -> None:
         self.request_id = request_id
         self._queue = queue
         self._result_future = result_future
+        self._cancel = cancel
+        self._closed = False
         self._final_result: Optional[EngineResult] = None
         self._error: Optional[BaseException] = None
 
@@ -92,9 +99,14 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         return self
 
     async def __anext__(self) -> StreamUpdate:
+        if self._closed:
+            raise StopAsyncIteration
         while True:
             item = await self._queue.get()
+            if self._closed:
+                raise StopAsyncIteration
             if isinstance(item, _StreamCompletion):
+                self._closed = True
                 if item.error is not None:
                     self._error = item.error
                     raise item.error
@@ -108,9 +120,24 @@ class EngineStream(AsyncIterator[StreamUpdate]):
             return self._final_result
         if self._error is not None:
             raise self._error
-        result = await self._result_future
+        result = await asyncio.shield(self._result_future)
         self._final_result = result
         return result
+
+    async def aclose(self) -> None:
+        """Stop generation and wait for the scheduler to settle the request."""
+
+        if self._closed and self._result_future.done():
+            return
+        self._closed = True
+        if self._cancel is not None:
+            self._cancel()
+        try:
+            self._final_result = await asyncio.shield(self._result_future)
+        finally:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(_StreamCompletion(result=self._final_result))
 
 
 @dataclass(slots=True)
@@ -409,6 +436,7 @@ class _AutoregressiveRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 @dataclass(slots=True)

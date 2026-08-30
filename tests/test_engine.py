@@ -12,13 +12,16 @@ import numpy as np
 import pytest
 
 from kestrel.engine import (
+    EngineMetrics,
+    EngineResult,
+    EngineStream,
     InferenceEngine,
     _AdmissionCoordinator,
     _AutoregressiveRequest,
 )
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.runtime import ExecutionShape
-from kestrel.scheduler import GeneratedPrefix
+from kestrel.scheduler import GeneratedPrefix, StreamUpdate
 from kestrel.skills import (
     DecodeStep,
     PreparedSkillPrompt,
@@ -40,6 +43,37 @@ def test_default_prepared_skill_prompt_preserves_tokens_context_and_budget() -> 
         tokens=(),
         max_new_tokens=7,
     )
+
+
+def test_engine_stream_close_stops_a_waiter_and_settles() -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[EngineResult] = loop.create_future()
+        cancelled = threading.Event()
+        queue = asyncio.Queue()
+        stream = EngineStream(1, queue, future, cancel=cancelled.set)
+        waiting = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        closing = asyncio.create_task(stream.aclose())
+        await asyncio.sleep(0)
+        assert cancelled.is_set()
+        queue.put_nowait(StreamUpdate(1, TextToken(2), "x", 0))
+        result = EngineResult(
+            request_id=1,
+            tokens=[],
+            finish_reason="cancelled",
+            metrics=EngineMetrics(0, 0, 0.0, 0.0, 0.0),
+            output={},
+        )
+        future.set_result(result)
+
+        await closing
+        with pytest.raises(StopAsyncIteration):
+            await waiting
+        assert await stream.result() is result
+
+    asyncio.run(run())
 
 
 def _make_request(
@@ -280,6 +314,34 @@ def test_encoder_input_failure_cancels_concurrent_image_preprocessing() -> None:
 
     assert crop_future.cancelled()
     assert failures == [(req, encoder_input_future.exception())]
+    assert not coordinator.has_pending()
+
+
+def test_admission_close_cancels_pending_preprocessing() -> None:
+    crop_future: Future[object] = Future()
+    encoder_future: Future[object] = Future()
+    coordinator = _AdmissionCoordinator(
+        runtime=_FakeRuntime(
+            prefix_cache=None,
+            prefix_hit=False,
+            image_preprocessor=_FakeImagePreprocessor([crop_future]),
+            encoder_input_preprocessor=_FakeImagePreprocessor([encoder_future]),
+        ),
+        wake_event=threading.Event(),
+        fail_request=lambda *_: None,
+    )
+    req = _make_request(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+        encoder_input=object(),
+    )
+    req.cancel_event = threading.Event()
+
+    assert coordinator.submit(req) is None
+    req.cancel_event.set()
+
+    assert coordinator.pop_cancelled() == [req]
+    assert crop_future.cancelled()
+    assert encoder_future.cancelled()
     assert not coordinator.has_pending()
 
 

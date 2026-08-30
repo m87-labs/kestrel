@@ -29,6 +29,7 @@ from kestrel.models.moondream.lora import AdapterProvider
 
 from kestrel.engine._types import (
     Completion,
+    EngineMetrics,
     EngineResult,
     TickResult,
     _AutoregressiveRequest,
@@ -190,6 +191,20 @@ class _AdmissionCoordinator:
                 prefix_cache_hit=pending.prefix_cache_hit,
             )
 
+    def pop_cancelled(self) -> list[_AutoregressiveRequest]:
+        """Cancel preprocessing owned by streams their callers closed."""
+
+        cancelled: list[_AutoregressiveRequest] = []
+        for request_id, pending in list(self._pending.items()):
+            if not pending.req.cancel_event.is_set():
+                continue
+            self._pending.pop(request_id)
+            for future in (pending.crops_future, pending.encoder_input_future):
+                if future is not None and not future.done():
+                    future.cancel()
+            cancelled.append(pending.req)
+        return cancelled
+
     def fail_all(self, error: Optional[BaseException] = None) -> None:
         exc = error or RuntimeError("Engine shut down")
         for pending in list(self._pending.values()):
@@ -275,12 +290,15 @@ class AutoregressiveExecutor:
             runtime.max_batch_slots,
             runtime.max_batch_size * 4,
         )
-        # Admission-time failures surface as completions the kernel delivers.
-        self._admission_failures: List[Completion] = []
+        # Admission can finish a request before it reaches the scheduler.
+        self._admission_completions: List[Completion] = []
 
     # -- ingress (event-loop thread) ----------------------------------
 
     def submit(self, request: _AutoregressiveRequest) -> None:
+        if request.cancel_event.is_set():
+            self._complete_cancelled(request)
+            return
         if (
             request.max_new_tokens > 0
             and self._runtime.sampling_hooks.sample_greedy is not None
@@ -308,7 +326,7 @@ class AutoregressiveExecutor:
             self._scheduler.has_pending_work()
             or self._admission.has_pending()
             or bool(self._active)
-            or bool(self._admission_failures)
+            or bool(self._admission_completions)
         )
 
     @property
@@ -320,21 +338,24 @@ class AutoregressiveExecutor:
 
     def advance(self) -> TickResult:
         scheduler = self._scheduler
-        progressed = self._promote_ready()
+        cancelled = self._admission.pop_cancelled()
+        for request in cancelled:
+            self._complete_cancelled(request)
+        progressed = bool(cancelled) or self._promote_ready()
 
         if scheduler.has_pending_work():
             progressed = scheduler.advance() or progressed
 
         new = self._collect()
 
-        # Drain the admission-failure buffer LAST. _admission_failures is
-        # the durable home for not-yet-delivered failures; clearing it
+        # Drain admission completions LAST. The list is their durable home;
+        # clearing it
         # only here (after the work above that can raise) means that if
         # scheduler.advance() raises, the buffer stays intact and the
         # kernel's shutdown(exc) path still delivers those callers'
         # completions instead of leaving their futures unresolved.
-        completed = self._admission_failures + new
-        self._admission_failures = []
+        completed = self._admission_completions + new
+        self._admission_completions = []
         progressed = progressed or bool(completed)
 
         return TickResult(
@@ -352,15 +373,15 @@ class AutoregressiveExecutor:
         exc = error or RuntimeError("Engine shut down")
         # Fail in-flight admission first: fail_all() synchronously routes
         # any request still in async preprocessing through
-        # _fail_via_admission, which appends to _admission_failures — so
+        # _fail_via_admission, which appends to _admission_completions — so
         # collect that list *after*, or those requests' futures never get
         # resolved and callers hang.
         self._admission.fail_all(exc)
         for req in self._active.values():
-            self._admission_failures.append(Completion(request=req, error=exc))
+            self._admission_completions.append(Completion(request=req, error=exc))
         self._active.clear()
-        completions = self._admission_failures
-        self._admission_failures = []
+        completions = self._admission_completions
+        self._admission_completions = []
         self._release_active_sequences()
         return tuple(completions)
 
@@ -369,16 +390,39 @@ class AutoregressiveExecutor:
     def _fail_via_admission(
         self, req: _AutoregressiveRequest, error: BaseException
     ) -> None:
-        self._admission_failures.append(Completion(request=req, error=error))
+        self._admission_completions.append(Completion(request=req, error=error))
+
+    def _complete_cancelled(self, req: _AutoregressiveRequest) -> None:
+        self._admission_completions.append(
+            Completion(
+                request=req,
+                result=EngineResult(
+                    request_id=req.request_id,
+                    tokens=[],
+                    finish_reason="cancelled",
+                    metrics=EngineMetrics(
+                        input_tokens=0,
+                        output_tokens=0,
+                        prefill_time_ms=0.0,
+                        decode_time_ms=0.0,
+                        ttft_ms=0.0,
+                    ),
+                    output={},
+                ),
+            )
+        )
 
     def _admit_ready(self, ready: _ReadyAdmission) -> None:
         req = ready.req
+        if req.cancel_event.is_set():
+            self._complete_cancelled(req)
+            return
         try:
             generation_req, skill_state = self._build_generation_request(
                 self._runtime, req, ready.crops, ready.encoder_input
             )
         except Exception as exc:
-            self._admission_failures.append(Completion(request=req, error=exc))
+            self._admission_completions.append(Completion(request=req, error=exc))
             return
         crops_ready = (
             req.image is None
