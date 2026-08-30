@@ -25,6 +25,7 @@ from kestrel.scheduler.types import (
     RequestLifecycle,
     RequestPhase,
 )
+from kestrel.skills import DecodeStep
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -32,6 +33,9 @@ from tests.scheduler._fake_runtime import FakeRuntime
 @dataclass
 class _SkillStateStub:
     tokens: list[object] = field(default_factory=list)
+
+    def consume_step(self, _runtime: object, step: DecodeStep) -> None:
+        self.tokens.append(step.token)
 
     @property
     def token_count(self) -> int:
@@ -418,12 +422,53 @@ def test_prefill_commit_drops_prepared_encoder_input() -> None:
         ),
     )
 
-    tokens, logprobs = scheduler._commit_prefill(step)
+    tokens, logprobs, cancelled = scheduler._commit_prefill(step)
 
     assert tokens == [TextToken(9)]
     assert logprobs is None
+    assert cancelled == (False,)
     assert lifecycle.request.encoder_input is None
     assert lifecycle.request.has_encoder_input is True
     assert runtime.finalized_prepared == [prepared]
     assert released_staging == [staging]
     assert runtime.released_prefill_slots == [slot]
+
+
+def test_prefill_commit_linearizes_cancellation_before_materialization() -> None:
+    runtime = FakeRuntime()
+    lifecycle = _make_lifecycle(runtime)
+    lifecycle.skill_state.tokens.clear()
+    lifecycle.uncommitted_prefill_token = True
+    prepared = SimpleNamespace(state=lifecycle.state)
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = runtime
+    scheduler.running = RunningQueue()
+    scheduler.running.push(lifecycle)
+    scheduler._release_prefill_staging = lambda _staging: None
+    scheduler._mark_finished_if_needed = lambda _seq: False
+
+    def materialize(*_args: object) -> list[TextToken]:
+        assert lifecycle.finalized is False
+        lifecycle.request.cancel_event.set()
+        return [TextToken(9)]
+
+    scheduler._materialize_tokens = materialize
+    slot = runtime.prefill_slots[0]
+    step = PendingCommit(
+        kind="prefill",
+        sequences=[lifecycle],
+        transfer=SimpleNamespace(wait=lambda: (object(), None)),
+        payload=PrefillPendingCommit(
+            staging=object(),
+            slot_id=0,
+            prepared_sequences=[prepared],
+            prefill_slot=slot,
+        ),
+    )
+
+    scheduler.commit_step(step)
+
+    assert lifecycle.request.cancel_event.is_set()
+    assert lifecycle.skill_state.tokens == [TextToken(9)]
+    assert lifecycle.finished is False
+    assert lifecycle in scheduler.running
