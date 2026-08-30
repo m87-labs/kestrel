@@ -14,19 +14,33 @@ from kestrel.runtime.generated_decode import (
 _WEIGHT_LAYER_PREFIX = "model.language_model.layers"
 
 
-def _rope_tables(runtime: Any) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+def _rope_tables(runtime: Any, length: int) -> dict[str, torch.Tensor]:
+    length = int(length)
+    if length < 1 or length > runtime.max_seq_length:
+        raise ValueError(
+            f"Gemma RoPE table length must lie in [1, {runtime.max_seq_length}]"
+        )
     positions = torch.arange(
-        runtime.max_seq_length,
+        length,
         dtype=torch.int64,
         device=runtime.device,
     ).view(1, -1)
     probe = torch.empty((1, 1, 1), dtype=runtime.dtype, device=runtime.device)
     rotary = runtime.model.model.language_model.rotary_emb
-    return {
+    tables = {
         kind: tuple(
-            table[0].float().contiguous() for table in rotary(probe, positions, kind)
+            table[0].float().contiguous()
+            for table in rotary(probe, positions, kind)
         )
         for kind in ("sliding_attention", "full_attention")
+    }
+    local_cos, local_sin = tables["sliding_attention"]
+    global_cos, global_sin = tables["full_attention"]
+    return {
+        "rope_cos_local": local_cos,
+        "rope_sin_local": local_sin,
+        "rope_cos_global": global_cos,
+        "rope_sin_global": global_sin,
     }
 
 
@@ -41,15 +55,10 @@ def create_generated_decode(
     config = runtime.model.model.language_model.config
 
     def rope_inputs(bound_runtime: Any) -> dict[str, torch.Tensor]:
-        ropes = _rope_tables(bound_runtime)
-        local_cos, local_sin = ropes["sliding_attention"]
-        global_cos, global_sin = ropes["full_attention"]
-        return {
-            "rope_cos_local": local_cos,
-            "rope_sin_local": local_sin,
-            "rope_cos_global": global_cos,
-            "rope_sin_global": global_sin,
-        }
+        ropes = bound_runtime._generated_rope_inputs
+        if ropes is None:
+            raise RuntimeError("Gemma generated decode requires prepared RoPE tables")
+        return ropes
 
     bindings = PagedDecodeBindings(
         layers,
@@ -65,7 +74,7 @@ def create_generated_decode(
         weight_root=runtime.model,
         weight_layer_prefix=_WEIGHT_LAYER_PREFIX,
         bindings=bindings,
-        weight_storage=getattr(runtime, "_generated_weight_storage", None),
+        weight_storage=runtime._generated_weight_storage,
     )
     if required:
         return GeneratedDecode.require(

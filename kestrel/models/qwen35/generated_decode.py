@@ -66,7 +66,7 @@ def _generated_decode_spec(runtime: Any) -> GeneratedDecodeSpec:
         weight_root=runtime.model,
         weight_layer_prefix=_WEIGHT_LAYER_PREFIX,
         bindings=bindings,
-        weight_storage=getattr(runtime, "_generated_weight_storage", None),
+        weight_storage=runtime._generated_weight_storage,
         capacity_inputs=state_inputs,
         preparations=(
             DeviceInputPreparation(

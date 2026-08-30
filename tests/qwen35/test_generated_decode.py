@@ -277,6 +277,7 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
     page_table = object()
     runtime = SimpleNamespace(
         max_batch_size=4,
+        _generated_weight_storage=None,
         _decode_rope_deltas=rope_deltas,
         _gather_decode_rope_deltas=lambda *_args: None,
         _prepare_decode_position_ids=lambda *_args: None,
@@ -368,6 +369,7 @@ def test_generated_decode_binds_rope_offsets_without_dropping_old_bundle_prep(
 def test_generated_decode_reports_compiled_slot_capacity(monkeypatch):
     runtime = SimpleNamespace(
         max_batch_size=1,
+        _generated_weight_storage=None,
         _decode_rope_deltas=object(),
         _gather_decode_rope_deltas=lambda *_args: None,
         _prepare_decode_position_ids=lambda *_args: None,
@@ -409,6 +411,7 @@ def test_generated_capacity_inputs_resolve_state_after_cached_field_snapshot(
     pool = _state_pool(config)
     runtime = SimpleNamespace(
         max_batch_size=4,
+        _generated_weight_storage=None,
         _decode_rope_deltas=object(),
         _gather_decode_rope_deltas=lambda *_args: None,
         _prepare_decode_position_ids=lambda *_args: None,

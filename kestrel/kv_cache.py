@@ -1,8 +1,9 @@
 
+import gc
 import threading
 import weakref
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, TypeVar
 
 import numpy as np
 import torch
@@ -99,19 +100,7 @@ class KVMemoryPool:
         per_tensor_bytes = n_pages * n_heads * page_size * head_dim * element_size
         layer_bytes = 2 * per_tensor_bytes
 
-        # Reserve the bytes atomically so concurrent callers can't both
-        # pass the precheck against the same counter value.
-        with self._lock:
-            if (
-                self.budget_bytes is not None
-                and self.allocated_bytes + layer_bytes > self.budget_bytes
-            ):
-                raise MemoryError(
-                    f"KVMemoryPool budget exceeded: requested {layer_bytes} "
-                    f"bytes, already used {self.allocated_bytes} of "
-                    f"{self.budget_bytes}"
-                )
-            self.allocated_bytes += layer_bytes
+        self._reserve_bytes(layer_bytes)
 
         try:
             k = torch.zeros(cache_shape, dtype=dtype, device=self.device)
@@ -135,6 +124,27 @@ class KVMemoryPool:
         with self._lock:
             self.allocated_bytes = max(0, self.allocated_bytes - n)
 
+    def _reserve_bytes(self, n: int) -> None:
+        # Reserve atomically so concurrent callers cannot both pass the budget
+        # check against the same counter value.
+        with self._lock:
+            if (
+                self.budget_bytes is not None
+                and self.allocated_bytes + n > self.budget_bytes
+            ):
+                raise MemoryError(
+                    f"KVMemoryPool budget exceeded: requested {n} bytes, "
+                    f"already used {self.allocated_bytes} of {self.budget_bytes}"
+                )
+            self.allocated_bytes += n
+
+    def budget_available_bytes(self) -> int | None:
+        """Return unallocated bytes from the explicit pool budget."""
+
+        with self._lock:
+            if self.budget_bytes is None:
+                return None
+            return max(0, self.budget_bytes - self.allocated_bytes)
 
 class PagedKVCache(torch.nn.Module):
     def __init__(
@@ -147,15 +157,40 @@ class PagedKVCache(torch.nn.Module):
         *,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        storage: "PagedKVLayerStorage | None" = None,
     ):
         super().__init__()
-        k_cache, v_cache = pool.allocate_layer_kv(
-            n_pages=page_table.n_pages,
-            n_heads=n_heads,
-            page_size=page_table.page_size,
-            head_dim=head_dim,
-            dtype=dtype,
+        expected_shape = (
+            int(page_table.n_pages),
+            int(n_heads),
+            int(page_table.page_size),
+            int(head_dim),
         )
+        if storage is None:
+            k_cache, v_cache = pool.allocate_layer_kv(
+                n_pages=page_table.n_pages,
+                n_heads=n_heads,
+                page_size=page_table.page_size,
+                head_dim=head_dim,
+                dtype=dtype,
+            )
+            k_scale_tensor = None
+            v_scale_tensor = None
+        else:
+            k_cache, v_cache = storage.k_cache, storage.v_cache
+            for name, tensor in (("K", k_cache), ("V", v_cache)):
+                if (
+                    tuple(tensor.shape) != expected_shape
+                    or tensor.dtype is not dtype
+                    or tensor.device != pool.device
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"preallocated {name} cache does not match "
+                        f"{expected_shape}/{dtype}/{pool.device}"
+                    )
+            k_scale_tensor = storage.k_scale_tensor
+            v_scale_tensor = storage.v_scale_tensor
         self.register_buffer("k_cache", k_cache)
         self.register_buffer("v_cache", v_cache)
 
@@ -170,14 +205,25 @@ class PagedKVCache(torch.nn.Module):
         else:
             self.k_scale = 1.0
             self.v_scale = 1.0
-        self.register_buffer(
-            "k_scale_tensor",
-            torch.tensor(self.k_scale, dtype=torch.float32, device=pool.device),
-        )
-        self.register_buffer(
-            "v_scale_tensor",
-            torch.tensor(self.v_scale, dtype=torch.float32, device=pool.device),
-        )
+        if k_scale_tensor is None:
+            k_scale_tensor = torch.tensor(
+                self.k_scale, dtype=torch.float32, device=pool.device
+            )
+        if v_scale_tensor is None:
+            v_scale_tensor = torch.tensor(
+                self.v_scale, dtype=torch.float32, device=pool.device
+            )
+        for name, tensor in (
+            ("k_scale_tensor", k_scale_tensor),
+            ("v_scale_tensor", v_scale_tensor),
+        ):
+            if (
+                tensor.shape != torch.Size([])
+                or tensor.dtype is not torch.float32
+                or tensor.device != pool.device
+            ):
+                raise ValueError(f"preallocated {name} must be a device FP32 scalar")
+            self.register_buffer(name, tensor)
 
     def update(
         self,
@@ -243,14 +289,375 @@ class PagedKVLayerSpec:
     v_scale: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PagedKVLayerStorage:
+    """Views owned by one physical K/V producer layer."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    k_scale_tensor: torch.Tensor
+    v_scale_tensor: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PagedKVStorage:
+    """One allocation-backed set of sparse physical K/V layers."""
+
+    n_pages: int
+    page_size: int
+    dtype: torch.dtype
+    layer_specs: tuple[PagedKVLayerSpec | None, ...]
+    layers: tuple[PagedKVLayerStorage | None, ...]
+    _kv_backing: torch.Tensor
+    _scale_backing: torch.Tensor
+
+
+_KV_TENSOR_ALIGNMENT_BYTES = 256
+_AdditionalStorage = TypeVar("_AdditionalStorage")
+
+
+def paged_kv_bytes_per_page(
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    *,
+    page_size: int,
+    dtype: torch.dtype,
+) -> int:
+    """Return aggregate K+V storage consumed by one physical page."""
+
+    page_size = int(page_size)
+    if page_size < 1:
+        raise ValueError("page_size must be positive")
+    element_size = torch.empty((), dtype=dtype).element_size()
+    total = sum(
+        2 * int(spec.n_heads) * page_size * int(spec.head_dim) * element_size
+        for spec in layer_specs
+        if spec is not None
+    )
+    if total <= 0:
+        raise ValueError("layer_specs must contain at least one physical K/V layer")
+    return total
+
+
+def _paged_kv_layout(
+    n_pages: int,
+    *,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    page_size: int,
+    dtype: torch.dtype,
+) -> tuple[int, tuple[tuple[int, int, tuple[int, ...]] | None, ...]]:
+    """Return one aligned backing layout in dtype elements."""
+
+    n_pages = int(n_pages)
+    page_size = int(page_size)
+    if n_pages < 1 or page_size < 1:
+        raise ValueError("n_pages and page_size must be positive")
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment = max(1, _KV_TENSOR_ALIGNMENT_BYTES // element_size)
+
+    def aligned(value: int) -> int:
+        return ((value + alignment - 1) // alignment) * alignment
+
+    offset = 0
+    layout = []
+    for spec in layer_specs:
+        if spec is None:
+            layout.append(None)
+            continue
+        shape = (
+            n_pages,
+            int(spec.n_heads),
+            page_size,
+            int(spec.head_dim),
+        )
+        elements = int(np.prod(shape))
+        k_start = aligned(offset)
+        v_start = aligned(k_start + elements)
+        offset = v_start + elements
+        layout.append((k_start, v_start, shape))
+    if not layout or all(entry is None for entry in layout):
+        raise ValueError("layer_specs must contain at least one physical K/V layer")
+    return offset, tuple(layout)
+
+
+def paged_kv_storage_bytes(
+    n_pages: int,
+    *,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    page_size: int,
+    dtype: torch.dtype,
+) -> int:
+    """Return exact bytes in the aligned grouped K/V backing allocation."""
+
+    elements, _layout = _paged_kv_layout(
+        n_pages,
+        layer_specs=layer_specs,
+        page_size=page_size,
+        dtype=dtype,
+    )
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_elements = max(1, _KV_TENSOR_ALIGNMENT_BYTES // element_size)
+    return (elements + alignment_elements - 1) * element_size
+
+
+def allocate_paged_kv_storage(
+    n_pages: int,
+    *,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    page_size: int,
+    dtype: torch.dtype,
+    pool: KVMemoryPool,
+) -> PagedKVStorage:
+    """Allocate aligned K/V views with one pool-accounted backing owner."""
+
+    elements, layout = _paged_kv_layout(
+        n_pages,
+        layer_specs=layer_specs,
+        page_size=page_size,
+        dtype=dtype,
+    )
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_elements = max(1, _KV_TENSOR_ALIGNMENT_BYTES // element_size)
+    backing_elements = elements + alignment_elements - 1
+    storage_bytes = backing_elements * element_size
+    pool._reserve_bytes(storage_bytes)
+    try:
+        scale_values = []
+        for spec in layer_specs:
+            if spec is None:
+                continue
+            if dtype == torch.float8_e4m3fn:
+                if spec.k_scale is None or spec.v_scale is None:
+                    raise ValueError("FP8 KV cache requires per-layer k/v scales")
+                scale_values.extend((float(spec.k_scale), float(spec.v_scale)))
+            else:
+                scale_values.extend((1.0, 1.0))
+        scale_backing = torch.tensor(
+            scale_values,
+            dtype=torch.float32,
+            device=pool.device,
+        )
+        kv_backing = torch.empty(backing_elements, dtype=dtype, device=pool.device)
+        prefix_bytes = (-int(kv_backing.data_ptr())) % _KV_TENSOR_ALIGNMENT_BYTES
+        if prefix_bytes % element_size:
+            raise RuntimeError(
+                "K/V backing cannot satisfy dtype-aligned pointer padding"
+            )
+        aligned_backing = kv_backing.narrow(
+            0,
+            prefix_bytes // element_size,
+            elements,
+        )
+
+        layers = []
+        scale_index = 0
+        for entry in layout:
+            if entry is None:
+                layers.append(None)
+                continue
+            k_start, v_start, shape = entry
+            count = int(np.prod(shape))
+            k_cache = aligned_backing.narrow(0, k_start, count).view(shape)
+            v_cache = aligned_backing.narrow(0, v_start, count).view(shape)
+            if (
+                int(k_cache.data_ptr()) % _KV_TENSOR_ALIGNMENT_BYTES
+                or int(v_cache.data_ptr()) % _KV_TENSOR_ALIGNMENT_BYTES
+            ):
+                raise RuntimeError(
+                    "grouped K/V view does not satisfy pointer alignment"
+                )
+            # Page zero is the no-op physical page and may be read by padded rows.
+            # Live pages are written before being mapped, so zeroing the full cache
+            # would add a model-startup memset proportional to context capacity.
+            k_cache[0].zero_()
+            v_cache[0].zero_()
+            layers.append(
+                PagedKVLayerStorage(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k_scale_tensor=scale_backing[scale_index],
+                    v_scale_tensor=scale_backing[scale_index + 1],
+                )
+            )
+            scale_index += 2
+    except Exception:
+        pool._release_bytes(storage_bytes)
+        raise
+
+    # Views retain ``kv_backing``. It is the sole accounting owner; cache views
+    # must never install independent pool finalizers.
+    weakref.finalize(kv_backing, pool._release_bytes, storage_bytes)
+    return PagedKVStorage(
+        n_pages=int(n_pages),
+        page_size=int(page_size),
+        dtype=dtype,
+        layer_specs=tuple(layer_specs),
+        layers=tuple(layers),
+        _kv_backing=kv_backing,
+        _scale_backing=scale_backing,
+    )
+
+
+def _largest_storage_pages(
+    upper: int,
+    available_bytes: int,
+    *,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    page_size: int,
+    dtype: torch.dtype,
+) -> int:
+    """Bound a probe by bytes; successful allocation remains authoritative."""
+
+    low, high = 0, max(0, int(upper))
+    while low < high:
+        middle = (low + high + 1) // 2
+        if paged_kv_storage_bytes(
+            middle,
+            layer_specs=layer_specs,
+            page_size=page_size,
+            dtype=dtype,
+        ) <= int(available_bytes):
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def fit_and_allocate_paged_kv_storage(
+    requested_pages: int,
+    *,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+    page_size: int,
+    dtype: torch.dtype,
+    pool: KVMemoryPool,
+    stream: Any,
+    allocate_additional: Callable[[int], _AdditionalStorage] | None = None,
+) -> tuple[PagedKVStorage, _AdditionalStorage | None]:
+    """Allocate the largest exact fixed K/V cache that the device can retain.
+
+    Page-dependent caller resources are allocated first for each probe. The
+    accepted grouped K/V allocation and those resources are returned without
+    being freed or recreated, so pointer stability does not depend on allocator
+    estimates or cache reuse.
+    """
+
+    requested_pages = int(requested_pages)
+    if requested_pages < 3:
+        raise ValueError(
+            "requested_pages must include reserved, padding, and serving pages"
+        )
+
+    candidate = requested_pages
+    budget_available = pool.budget_available_bytes()
+    if budget_available is not None:
+        candidate = _largest_storage_pages(
+            candidate,
+            budget_available,
+            layer_specs=layer_specs,
+            page_size=page_size,
+            dtype=dtype,
+        )
+    if pool.device.type == "cuda":
+        with torch.cuda.device(pool.device):
+            torch.cuda.empty_cache()
+            driver_free, _driver_total = torch.cuda.mem_get_info(pool.device)
+        candidate = _largest_storage_pages(
+            candidate,
+            int(driver_free),
+            layer_specs=layer_specs,
+            page_size=page_size,
+            dtype=dtype,
+        )
+
+    last_failure: Exception | None = None
+    while candidate >= 3:
+        additional = None
+        try:
+            # Candidate page tables enqueue H2D work, and accepted K/V tensors
+            # are consumed on this same stream. Keeping allocation and retry
+            # cleanup on one stream makes allocator reuse safe and predictable.
+            with stream_context(stream):
+                if allocate_additional is not None:
+                    additional = allocate_additional(candidate)
+
+                # Flush only unowned allocator slack after the exact additional
+                # resources are resident. Driver free is an upper-bound hint;
+                # the retained allocation below is the acceptance criterion.
+                if pool.device.type == "cuda":
+                    with torch.cuda.device(pool.device):
+                        torch.cuda.empty_cache()
+                        driver_free, _driver_total = torch.cuda.mem_get_info(
+                            pool.device
+                        )
+                    bounded = _largest_storage_pages(
+                        candidate,
+                        int(driver_free),
+                        layer_specs=layer_specs,
+                        page_size=page_size,
+                        dtype=dtype,
+                    )
+                    if bounded < candidate:
+                        del additional
+                        gc.collect()
+                        candidate = bounded
+                        continue
+
+                budget_available = pool.budget_available_bytes()
+                if budget_available is not None:
+                    bounded = _largest_storage_pages(
+                        candidate,
+                        budget_available,
+                        layer_specs=layer_specs,
+                        page_size=page_size,
+                        dtype=dtype,
+                    )
+                    if bounded < candidate:
+                        del additional
+                        gc.collect()
+                        candidate = bounded
+                        continue
+
+                storage = allocate_paged_kv_storage(
+                    candidate,
+                    layer_specs=layer_specs,
+                    page_size=page_size,
+                    dtype=dtype,
+                    pool=pool,
+                )
+        except (MemoryError, torch.OutOfMemoryError) as exc:
+            last_failure = exc
+            del additional
+            gc.collect()
+            if pool.device.type == "cuda":
+                with torch.cuda.device(pool.device):
+                    torch.cuda.empty_cache()
+            candidate -= 1
+            continue
+        return storage, additional
+
+    detail = "" if last_failure is None else f": {last_failure}"
+    raise MemoryError(
+        f"insufficient memory for reserved, padding, and serving K/V pages{detail}"
+    )
+
+
 def allocate_paged_kv_layers(
     *,
     layer_specs: Sequence[PagedKVLayerSpec | None],
     page_table: "PageTable",
     pool: KVMemoryPool,
     dtype: torch.dtype,
+    storage: PagedKVStorage | None = None,
 ) -> tuple[PagedKVCache | None, ...]:
     """Allocate the sparse physical K/V layers described by ``layer_specs``."""
+
+    if storage is not None and (
+        storage.n_pages != int(page_table.n_pages)
+        or storage.page_size != int(page_table.page_size)
+        or storage.dtype is not dtype
+        or storage.layer_specs != tuple(layer_specs)
+        or len(storage.layers) != len(layer_specs)
+    ):
+        raise ValueError("preallocated K/V storage does not match the page table")
 
     return tuple(
         None
@@ -263,8 +670,9 @@ def allocate_paged_kv_layers(
             pool=pool,
             k_scale=spec.k_scale,
             v_scale=spec.v_scale,
+            storage=None if storage is None else storage.layers[index],
         )
-        for spec in layer_specs
+        for index, spec in enumerate(layer_specs)
     )
 
 
