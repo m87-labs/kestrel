@@ -40,6 +40,41 @@ def test_empty_cache_cpu_is_noop() -> None:
     empty_cache(CPU)
 
 
+def test_empty_cache_cuda_targets_supplied_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.device as device_module
+
+    target = torch.device("cuda:3")
+    events = []
+    active_devices = []
+
+    @contextmanager
+    def cuda_device(device):
+        events.append(("enter", device))
+        active_devices.append(device)
+        try:
+            yield
+        finally:
+            assert active_devices.pop() == device
+            events.append(("exit", device))
+
+    def cuda_empty_cache() -> None:
+        assert active_devices == [target]
+        events.append(("empty_cache", target))
+
+    monkeypatch.setattr(device_module.torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(device_module.torch.cuda, "empty_cache", cuda_empty_cache)
+
+    empty_cache(target)
+
+    assert events == [
+        ("enter", target),
+        ("empty_cache", target),
+        ("exit", target),
+    ]
+
+
 def test_get_device_capability_cpu_returns_zero_tuple() -> None:
     assert get_device_capability(CPU) == (0, 0)
 

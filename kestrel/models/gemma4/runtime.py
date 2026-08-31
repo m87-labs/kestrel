@@ -80,6 +80,20 @@ class _ImagePrefillProbeResult:
     prepared_sequences: tuple[Any, ...]
 
 
+def _add_exception_note(error: BaseException, note: str) -> None:
+    """Attach cleanup context on every supported Python version."""
+
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        notes = []
+        setattr(error, "__notes__", notes)
+    notes.append(note)
+
+
 def _generated_kv_binding_inputs(
     layer_specs: Sequence[Any],
     layer_kinds: Sequence[str],
@@ -432,7 +446,7 @@ def _run_image_prefill_transient_probe(
             prepared_sequences=tuple(prepared_sequences),
         )
     finally:
-        primary_error = sys.exception()
+        primary_error = sys.exc_info()[1]
         cleanup_failures = []
 
         def clean(label: str, operation: Any) -> None:
@@ -485,7 +499,10 @@ def _run_image_prefill_transient_probe(
             detail = "; ".join(cleanup_failures)
             if primary_error is None:
                 raise RuntimeError(f"Gemma transient probe cleanup failed: {detail}")
-            primary_error.add_note(f"Gemma transient probe cleanup failures: {detail}")
+            _add_exception_note(
+                primary_error,
+                f"Gemma transient probe cleanup failures: {detail}",
+            )
 
     assert result is not None
     return result

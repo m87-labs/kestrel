@@ -52,7 +52,8 @@ def synchronize(device: torch.device) -> None:
 def empty_cache(device: torch.device) -> None:
     """Hint the allocator to release cached blocks; no-op when unsupported."""
     if device.type == "cuda":
-        torch.cuda.empty_cache()
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
     elif device.type == "mps":
         torch.mps.empty_cache()
 

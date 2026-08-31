@@ -12,6 +12,7 @@ from kestrel.models.gemma4.image import GemmaImageInputs
 from kestrel.models.gemma4.runtime import (
     Gemma4Runtime,
     _PagedRuntimeResources,
+    _add_exception_note,
     _allocate_decode_page_tables,
     _copy_image_features_into_embeddings,
     _generated_kv_binding_inputs,
@@ -37,6 +38,16 @@ class _Rotary:
         values = positions.unsqueeze(-1).expand(-1, -1, 3) + offset
         values = values.to(torch.bfloat16)
         return values, values + 1
+
+
+def test_exception_note_compatibility_path_without_add_note() -> None:
+    class LegacyError:
+        pass
+
+    error = LegacyError()
+    _add_exception_note(error, "cleanup detail")
+
+    assert error.__notes__ == ["cleanup detail"]
 
 
 def _runtime(max_seq_length: int = 8):

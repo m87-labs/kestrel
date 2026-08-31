@@ -34,7 +34,7 @@ from dataclasses import replace
 
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
-from kestrel.device import make_stream, set_device, synchronize
+from kestrel.device import empty_cache, make_stream, set_device, synchronize
 from kestrel.runtime import (
     AutoregressiveRuntime,
     CoordToken,
@@ -383,7 +383,7 @@ class InferenceEngine:
         # loops back through ``query()`` → ``_ensure_started``; the
         # ``_init_task is current_task`` check there keeps that
         # recursive call from re-entering this body.
-        await self._warmup_query_pipeline()
+        await self._warmup_and_reclaim_allocator()
         if reporter is not None:
             reporter.start()
             self._photon_reporter = reporter
@@ -490,6 +490,14 @@ class InferenceEngine:
         except Exception:
             _LOGGER.exception("Warmup query pipeline failed")
             raise
+
+    async def _warmup_and_reclaim_allocator(self) -> None:
+        """Finish startup warmup before releasing its inactive device blocks."""
+
+        await self._warmup_query_pipeline()
+        device = self._runtime_cfg.resolved_device()
+        synchronize(device)
+        empty_cache(device)
 
     async def shutdown(self) -> None:
         if self._shutdown:

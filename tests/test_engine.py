@@ -11,6 +11,7 @@ import numpy as np
 
 import pytest
 
+import kestrel.engine.core as engine_core
 from kestrel.engine import (
     InferenceEngine,
     _AdmissionCoordinator,
@@ -407,6 +408,38 @@ def test_transcribe_only_runtime_skips_legacy_query_warmup() -> None:
 
     engine.query = query  # type: ignore[method-assign]
     asyncio.run(engine._warmup_query_pipeline())
+
+
+def test_startup_reclaims_allocator_only_after_warmup_and_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = object.__new__(InferenceEngine)
+    device = object()
+    engine._runtime_cfg = SimpleNamespace(resolved_device=lambda: device)
+    calls: list[object] = []
+
+    async def warmup() -> None:
+        calls.append("warmup")
+
+    engine._warmup_query_pipeline = warmup  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        engine_core,
+        "synchronize",
+        lambda actual: calls.append(("synchronize", actual)),
+    )
+    monkeypatch.setattr(
+        engine_core,
+        "empty_cache",
+        lambda actual: calls.append(("empty_cache", actual)),
+    )
+
+    asyncio.run(engine._warmup_and_reclaim_allocator())
+
+    assert calls == [
+        "warmup",
+        ("synchronize", device),
+        ("empty_cache", device),
+    ]
 
 
 def test_extract_private_logprobs_setting() -> None:
