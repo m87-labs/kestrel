@@ -4,8 +4,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Sequence
+import weakref
 
 import pytest
+import torch
 
 from kestrel.runtime import SequenceState, TextToken, Token
 from kestrel.scheduler.pipeline import (
@@ -17,6 +19,7 @@ from kestrel.scheduler.pipeline import (
 from kestrel.scheduler.queues import RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
+from kestrel.runtime.sampling import SamplingHooks
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -229,6 +232,86 @@ def test_prefill_finalize_failure_retires_adapter_and_slot() -> None:
     assert runtime.released_prefill_slots == [slot]
     assert lifecycle.request.lora_slot == 0
     assert lifecycle.lora_slot_ready is False
+
+
+@pytest.mark.parametrize("hook_mode", ["none", "success", "error"])
+def test_prefill_finalize_releases_last_hidden_after_optional_hook(
+    hook_mode: str,
+) -> None:
+    runtime = FakeRuntime(max_batch_size=2)
+    states = [
+        SequenceState(batch_idx=index, length=2, max_length=4)
+        for index in range(2)
+    ]
+    expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    prompt_storage_refs = []
+    for state, values in zip(states, expected, strict=True):
+        prompt_hidden = torch.cat((torch.zeros(3, 2), values.view(1, 2)))
+        prompt_storage = prompt_hidden.untyped_storage()
+        state.last_hidden = prompt_hidden[-1].detach()
+        prompt_storage_refs.append(weakref.ref(prompt_storage))
+    del prompt_hidden, prompt_storage
+    sequences = [SimpleNamespace(state=state) for state in states]
+    seen = []
+    hook_result = object()
+
+    def post_sample(_slot, *, hidden_last, sequences, **_kwargs):
+        assert all(sequence.state.last_hidden is None for sequence in sequences)
+        seen.append(hidden_last)
+        if hook_mode == "error":
+            raise RuntimeError("synthetic post-sample failure")
+        return hook_result
+
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler._hooks = SamplingHooks(
+        post_sample=None if hook_mode == "none" else post_sample,
+    )
+    scheduler._sample_batch = lambda *_args, **_kwargs: (
+        torch.tensor([10, 11]),
+        torch.zeros(2),
+        torch.ones(2),
+        torch.zeros(2),
+    )
+    scheduler._pending_token_ids = torch.zeros(2, dtype=torch.long)
+    scheduler.running = RunningQueue()
+    prefill_slot = runtime.prefill_slots[0]
+    prefill_slot.batch_idx = torch.tensor([0, 1], dtype=torch.long)
+    staging = SimpleNamespace(
+        sampled_ids=torch.zeros(2, dtype=torch.long),
+        sampled_logprobs=torch.zeros(2),
+        render=SimpleNamespace(transfer=lambda *_args, **_kwargs: object()),
+    )
+    handle = LaunchHandle(
+        kind="prefill",
+        sequences=sequences,
+        payload=PrefillLaunch(
+            staging=staging,
+            slot_id=0,
+            logits=torch.zeros(2, 3),
+            prepared_sequences=[object(), object()],
+            prefill_slot=prefill_slot,
+        ),
+    )
+
+    if hook_mode == "error":
+        with pytest.raises(RuntimeError, match="synthetic post-sample failure"):
+            scheduler._finalize_prefill(handle)
+        pending = None
+    else:
+        pending = scheduler._finalize_prefill(handle)
+
+    assert all(state.last_hidden is None for state in states)
+    assert all(storage() is None for storage in prompt_storage_refs)
+    if hook_mode != "none":
+        assert len(seen) == 1
+        torch.testing.assert_close(seen[0], expected)
+        if hook_mode == "success":
+            assert pending is not None
+            assert pending.payload.runtime_step is hook_result
+    else:
+        assert seen == []
+        assert pending is not None
+        assert pending.payload.runtime_step is None
 
 
 def test_prefill_commit_failure_fences_before_returning_adapter() -> None:

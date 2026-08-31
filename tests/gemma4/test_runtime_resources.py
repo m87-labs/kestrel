@@ -18,8 +18,10 @@ from kestrel.models.gemma4.runtime import (
     _generated_kv_binding_inputs,
     _install_decode_page_tables,
     _materialize_fixed_runtime_resources,
+    _maximum_admitted_image_prefill_prompt,
     _maximum_vision_grid,
     _run_image_prefill_transient_probe,
+    _run_steady_state_image_prefill_probe,
     _vision_probe_inputs,
 )
 from kestrel.kv_cache import (
@@ -535,6 +537,102 @@ def test_image_prefill_probe_restores_accepted_resources_and_runtime() -> None:
     assert torch.count_nonzero(layer.k_cache[0].view(torch.uint8)) == 0
     assert torch.count_nonzero(layer.v_cache[0].view(torch.uint8)) == 0
     assert not runtime.model.model.embed_vision._forward_hooks
+
+
+def test_capacity_probe_uses_maximum_scheduler_admitted_prefill_length() -> None:
+    runtime, _language, _specs, _storage, resources, inputs = (
+        _image_prefill_probe_runtime()
+    )
+
+    prompt = _maximum_admitted_image_prefill_prompt(
+        runtime,
+        resources.page_table,
+        inputs[0],
+    )
+    expected_target = min(
+        runtime.max_seq_length,
+        resources.page_table.pages_available * resources.page_table.page_size,
+    )
+    runtime.page_table = resources.page_table
+    try:
+        prepared = runtime.prepare_sequence(
+            prompt,
+            image_crops=inputs[0],
+            max_new_tokens=1,
+        )
+
+        assert prepared.state.length == expected_target - 1
+        assert prepared.state.length > 286
+        assert prepared.state.max_length == expected_target
+    finally:
+        del runtime.page_table
+
+
+def test_steady_state_probe_releases_first_result_before_second_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.gemma4 import runtime as runtime_module
+
+    runtime = SimpleNamespace(
+        max_seq_length=1024,
+        image_prefix_length=282,
+        max_batch_size=2,
+    )
+    vision_inputs = tuple(
+        SimpleNamespace(num_image_tokens=280) for _row in range(2)
+    )
+    storage = object()
+    resources = SimpleNamespace(
+        page_table=SimpleNamespace(pages_available=512, page_size=1)
+    )
+    layer_specs = (object(),)
+    owner_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    calls = []
+    second = object()
+
+    def run_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        if owner_refs:
+            assert owner_refs[-1]() is None
+        if len(calls) < 3:
+            first_owner = torch.ones(1)
+            owner_refs.append(weakref.ref(first_owner))
+            return SimpleNamespace(owner=first_owner)
+        return second
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_run_image_prefill_transient_probe",
+        run_once,
+    )
+
+    with pytest.raises(ValueError, match="maximum batch"):
+        _run_steady_state_image_prefill_probe(
+            runtime,
+            vision_inputs[:1],
+            storage,
+            resources,
+            layer_specs,
+        )
+
+    result = _run_steady_state_image_prefill_probe(
+        runtime,
+        vision_inputs,
+        storage,
+        resources,
+        layer_specs,
+    )
+
+    assert result is second
+    assert [args for args, _kwargs in calls] == [
+        (runtime, vision_inputs, storage, resources, layer_specs),
+        (runtime, vision_inputs[:1], storage, resources, layer_specs),
+        (runtime, vision_inputs[:1], storage, resources, layer_specs),
+    ]
+    assert calls[0][1] == {}
+    prompt_rows = [kwargs["prompt_tokens"] for _args, kwargs in calls[1:]]
+    assert prompt_rows[0] is prompt_rows[1]
+    assert len(prompt_rows[0]) + runtime.image_prefix_length == 511
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

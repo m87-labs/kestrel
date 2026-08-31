@@ -370,19 +370,50 @@ def _restore_page_table(
     page_table._sync_full_page_table()
 
 
+def _maximum_admitted_image_prefill_prompt(
+    runtime: Any,
+    page_table: PageTable,
+    image_inputs: GemmaImageInputs,
+) -> tuple[TextToken, ...]:
+    """Build the longest image query admitted by the candidate page budget."""
+
+    image_tokens = int(image_inputs.num_image_tokens) + 2
+    if image_tokens != int(runtime.image_prefix_length):
+        raise RuntimeError(
+            "Gemma capacity probe image length does not match runtime admission"
+        )
+    target_length = min(
+        int(runtime.max_seq_length),
+        int(page_table.pages_available) * int(page_table.page_size),
+    )
+    # Engine generation requests reserve at least one token beyond prefill.
+    text_length = target_length - 1 - image_tokens
+    required_prefix = (TURN_ID, USER_ROLE_ID, NEWLINE_ID, NEWLINE_ID)
+    if text_length < len(required_prefix):
+        raise MemoryError(
+            "candidate K/V cache cannot admit the minimum Gemma image query"
+        )
+    filler = (TextToken(token_id=NEWLINE_ID),) * (
+        text_length - len(required_prefix)
+    )
+    return tuple(TextToken(token_id=token_id) for token_id in required_prefix) + filler
+
+
 def _run_image_prefill_transient_probe(
     runtime: Any,
     vision_inputs: Sequence[GemmaImageInputs],
     storage: PagedKVStorage,
     resources: _PagedRuntimeResources | None,
     layer_specs: Sequence[PagedKVLayerSpec | None],
+    *,
+    prompt_tokens: Sequence[TextToken] | None = None,
 ) -> _ImagePrefillProbeResult:
     """Run a production image prefill while candidate K/V resources are live."""
 
     if resources is None:
         raise RuntimeError("Gemma transient probe requires paged resources")
-    if len(vision_inputs) != int(runtime.max_batch_size):
-        raise ValueError("Gemma transient probe must cover the maximum batch")
+    if not 0 < len(vision_inputs) <= int(runtime.max_batch_size):
+        raise ValueError("Gemma transient probe batch is outside runtime capacity")
 
     page_table = resources.page_table
     page_table_snapshot = _snapshot_page_table(page_table)
@@ -414,10 +445,11 @@ def _run_image_prefill_transient_probe(
 
     hook = None
     try:
-        prompt_tokens = tuple(
-            TextToken(token_id=token_id)
-            for token_id in (TURN_ID, USER_ROLE_ID, NEWLINE_ID, NEWLINE_ID)
-        )
+        if prompt_tokens is None:
+            prompt_tokens = tuple(
+                TextToken(token_id=token_id)
+                for token_id in (TURN_ID, USER_ROLE_ID, NEWLINE_ID, NEWLINE_ID)
+            )
         hook = runtime.model.model.embed_vision.register_forward_hook(
             retain_projected_features
         )
@@ -506,6 +538,57 @@ def _run_image_prefill_transient_probe(
 
     assert result is not None
     return result
+
+
+def _run_steady_state_image_prefill_probe(
+    runtime: Any,
+    vision_inputs: Sequence[GemmaImageInputs],
+    storage: PagedKVStorage,
+    resources: _PagedRuntimeResources | None,
+    layer_specs: Sequence[PagedKVLayerSpec | None],
+) -> _ImagePrefillProbeResult:
+    """Validate consecutive maximum-admitted prefills with resources live."""
+
+    if resources is None:
+        raise RuntimeError("Gemma transient probe requires paged resources")
+    if len(vision_inputs) != int(runtime.max_batch_size):
+        raise ValueError("Gemma steady-state probe must cover the maximum batch")
+    probe_inputs = vision_inputs[:1]
+    prompt_tokens = _maximum_admitted_image_prefill_prompt(
+        runtime,
+        resources.page_table,
+        probe_inputs[0],
+    )
+
+    maximum_batch = _run_image_prefill_transient_probe(
+        runtime,
+        vision_inputs,
+        storage,
+        resources,
+        layer_specs,
+    )
+    # The maximum-batch image+language path and the maximum-length language
+    # path are independent serving peaks. Neither result may overlap the next.
+    del maximum_batch
+    warmup = _run_image_prefill_transient_probe(
+        runtime,
+        probe_inputs,
+        storage,
+        resources,
+        layer_specs,
+        prompt_tokens=prompt_tokens,
+    )
+    # Release every first-pass result owner while preserving allocator state.
+    # The second maximum-length pass is the steady-state acceptance criterion.
+    del warmup
+    return _run_image_prefill_transient_probe(
+        runtime,
+        probe_inputs,
+        storage,
+        resources,
+        layer_specs,
+        prompt_tokens=prompt_tokens,
+    )
 
 
 class Gemma4Runtime(UncachedPagedRuntime):
@@ -762,7 +845,7 @@ class Gemma4Runtime(UncachedPagedRuntime):
             ),
             allocate_additional=allocate_paged_resources,
             validate_transient=lambda storage, resources: (
-                _run_image_prefill_transient_probe(
+                _run_steady_state_image_prefill_probe(
                     self,
                     vision_probe_inputs,
                     storage,

@@ -1819,13 +1819,19 @@ class GenerationScheduler:
         # has to run for prefill too. The runtime owns the staging.
         runtime_step = None
         if self._hooks.post_sample is not None:
-            hidden_rows: list[Tensor] = []
-            for seq in sequences:
-                hidden_last = seq.state.last_hidden
-                if hidden_last is None:  # pragma: no cover - defensive
-                    raise RuntimeError("Missing last_hidden after prefill")
-                hidden_rows.append(hidden_last)
-            hidden_last = torch.stack(hidden_rows, dim=0)
+            try:
+                hidden_rows: list[Tensor] = []
+                for seq in sequences:
+                    hidden_row = seq.state.last_hidden
+                    if hidden_row is None:  # pragma: no cover - defensive
+                        raise RuntimeError("Missing last_hidden after prefill")
+                    hidden_rows.append(hidden_row)
+                hidden_last = torch.stack(hidden_rows, dim=0)
+            finally:
+                # A row can be a view into the full prompt activation. The
+                # stack owns the hook values, so release every prompt backing.
+                for seq in sequences:
+                    seq.state.last_hidden = None
             runtime_step = self._hooks.post_sample(
                 prefill_slot,
                 sampled_ids=sampled_ids.view(-1),
@@ -1837,6 +1843,9 @@ class GenerationScheduler:
                 token_logprobs=sampled_logprobs,
                 ready_event=prefill_slot.step_done_event,
             )
+        else:
+            for seq in sequences:
+                seq.state.last_hidden = None
         self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids.view(-1))
         prefill_slot.commit_done_event.record()
         for seq in sequences:
