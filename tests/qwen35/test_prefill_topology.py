@@ -101,7 +101,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     assert observed["max"] == 544
 
 
-def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
+def test_gdn_prefill_forwards_topology_to_combined_prefill() -> None:
     observed: dict[str, object] = {}
     layer = SimpleNamespace(
         conv_states=None,
