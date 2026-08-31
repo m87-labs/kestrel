@@ -894,12 +894,14 @@ class InferenceEngine:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[EngineResult] = loop.create_future()
+        cancel_event = threading.Event()
         req = _SinglePassRequest(
             request_id=next(self._request_ids),
             future=future,
             task=task,
             inputs=inputs,
             submitted_at=time.perf_counter(),
+            cancel_event=cancel_event,
         )
         self._raise_if_scheduler_failed()
         self._single_pass_queue.put((model, req))
@@ -907,7 +909,16 @@ class InferenceEngine:
         if self._scheduler_error is not None:
             self._fail_all_pending(self._scheduler_failed_error())
         del inputs, req
-        return await future
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            self._scheduler_event.set()
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
 
     async def stream(
         self,
