@@ -137,7 +137,7 @@ def test_fitted_paged_kv_storage_respects_consumed_shared_pool_budget() -> None:
     assert pool.allocated_bytes == pool.budget_bytes
 
 
-def test_fitted_paged_kv_storage_retains_first_successful_fragmented_probe(
+def test_fitted_paged_kv_storage_retains_largest_successful_fragmented_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import kestrel.kv_cache as kv_cache
@@ -182,7 +182,7 @@ def test_fitted_paged_kv_storage_retains_first_successful_fragmented_probe(
         allocate_additional=allocate_additional,
     )
 
-    assert attempts == [8, 7, 6, 5]
+    assert attempts == [8, 7, 5, 6, 5]
     assert storage.n_pages == 5
     assert additional is resources[-1]
     assert additional.numel() == 5
@@ -191,6 +191,234 @@ def test_fitted_paged_kv_storage_retains_first_successful_fragmented_probe(
         for _attempt in attempts
         for item in (("enter", compute_stream), ("exit", compute_stream))
     ]
+
+
+def test_fitted_paged_kv_storage_brackets_distant_capacity_logarithmically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cpu")
+    original_allocate = allocate_paged_kv_storage
+    attempts = []
+    backing_refs = []
+    additional_refs = []
+
+    def allocate_storage(n_pages, **kwargs):
+        attempts.append(n_pages)
+        if n_pages > 37:
+            raise torch.OutOfMemoryError("synthetic distant capacity")
+        storage = original_allocate(n_pages, **kwargs)
+        backing_refs.append(weakref.ref(storage._kv_backing))
+        return storage
+
+    def allocate_additional(n_pages):
+        value = torch.empty(n_pages, dtype=torch.int32)
+        additional_refs.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(kv_cache, "allocate_paged_kv_storage", allocate_storage)
+
+    storage, additional = fit_and_allocate_paged_kv_storage(
+        128,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+        allocate_additional=allocate_additional,
+    )
+
+    assert storage.n_pages == 37
+    assert attempts == [
+        128,
+        127,
+        125,
+        121,
+        113,
+        97,
+        65,
+        3,
+        34,
+        49,
+        41,
+        37,
+        39,
+        38,
+        37,
+    ]
+    assert len(attempts) < 20
+    assert all(reference() is None for reference in backing_refs[:-1])
+    assert backing_refs[-1]() is storage._kv_backing
+    assert all(reference() is None for reference in additional_refs[:-1])
+    assert additional_refs[-1]() is additional
+    assert pool.allocated_bytes == paged_kv_storage_bytes(
+        37,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+    )
+
+
+def test_fitted_paged_kv_storage_does_not_rebound_below_known_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cpu", budget_bytes=1 << 20)
+    original_allocate = allocate_paged_kv_storage
+    storage_attempts = []
+    additional_attempts = []
+
+    def largest(upper, _available_bytes, **_kwargs):
+        return 4 if upper == 6 else upper
+
+    def allocate_storage(n_pages, **kwargs):
+        storage_attempts.append(n_pages)
+        if n_pages > 5:
+            raise torch.OutOfMemoryError("synthetic fragmented allocator")
+        return original_allocate(n_pages, **kwargs)
+
+    def allocate_additional(n_pages):
+        additional_attempts.append(n_pages)
+        return torch.empty(n_pages, dtype=torch.int32)
+
+    monkeypatch.setattr(kv_cache, "_largest_storage_pages", largest)
+    monkeypatch.setattr(kv_cache, "allocate_paged_kv_storage", allocate_storage)
+
+    storage, additional = fit_and_allocate_paged_kv_storage(
+        8,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+        allocate_additional=allocate_additional,
+    )
+
+    assert storage.n_pages == 5
+    assert additional is not None and additional.numel() == 5
+    assert storage_attempts == [8, 7, 5, 5]
+    assert additional_attempts == [8, 7, 5, 6, 5]
+
+
+def test_fitted_paged_kv_storage_probes_minimum_after_dynamic_rebound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cpu", budget_bytes=1 << 20)
+    bound_calls = 0
+    additional_attempts = []
+    storage_attempts = []
+    original_allocate = allocate_paged_kv_storage
+
+    def largest(upper, _available_bytes, **_kwargs):
+        nonlocal bound_calls
+        bound_calls += 1
+        if upper == 4 and bound_calls > 1:
+            return 0
+        return upper
+
+    def allocate_additional(n_pages):
+        additional_attempts.append(n_pages)
+        return torch.empty(n_pages, dtype=torch.int32)
+
+    def allocate_storage(n_pages, **kwargs):
+        storage_attempts.append(n_pages)
+        return original_allocate(n_pages, **kwargs)
+
+    monkeypatch.setattr(kv_cache, "_largest_storage_pages", largest)
+    monkeypatch.setattr(kv_cache, "allocate_paged_kv_storage", allocate_storage)
+
+    storage, additional = fit_and_allocate_paged_kv_storage(
+        4,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+        allocate_additional=allocate_additional,
+    )
+
+    assert storage.n_pages == 3
+    assert additional is not None and additional.numel() == 3
+    assert additional_attempts == [4, 3]
+    assert storage_attempts == [3]
+
+
+def test_fitted_paged_kv_storage_recovers_when_final_probe_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    pool = KVMemoryPool(device="cpu")
+    original_allocate = allocate_paged_kv_storage
+    attempts = []
+    page_five_attempts = 0
+
+    def allocate_storage(n_pages, **kwargs):
+        nonlocal page_five_attempts
+        attempts.append(n_pages)
+        if n_pages == 5:
+            page_five_attempts += 1
+        if n_pages > 5 or (n_pages == 5 and page_five_attempts > 1):
+            raise torch.OutOfMemoryError("synthetic changed allocator state")
+        return original_allocate(n_pages, **kwargs)
+
+    monkeypatch.setattr(kv_cache, "allocate_paged_kv_storage", allocate_storage)
+
+    storage, additional = fit_and_allocate_paged_kv_storage(
+        8,
+        layer_specs=specs,
+        page_size=2,
+        dtype=torch.bfloat16,
+        pool=pool,
+        stream=None,
+    )
+
+    assert storage.n_pages == 4
+    assert additional is None
+    assert attempts == [8, 7, 5, 6, 5, 4]
+
+
+def test_fitted_paged_kv_storage_finds_every_monotonic_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.kv_cache as kv_cache
+
+    specs = (PagedKVLayerSpec(n_heads=1, head_dim=8),)
+    original_allocate = allocate_paged_kv_storage
+    monkeypatch.setattr(kv_cache.gc, "collect", lambda: 0)
+
+    for capacity in range(3, 129):
+        pool = KVMemoryPool(device="cpu")
+
+        def allocate_storage(n_pages, **kwargs):
+            if n_pages > capacity:
+                raise torch.OutOfMemoryError("synthetic monotonic capacity")
+            return original_allocate(n_pages, **kwargs)
+
+        monkeypatch.setattr(
+            kv_cache,
+            "allocate_paged_kv_storage",
+            allocate_storage,
+        )
+        storage, additional = fit_and_allocate_paged_kv_storage(
+            128,
+            layer_specs=specs,
+            page_size=2,
+            dtype=torch.bfloat16,
+            pool=pool,
+            stream=None,
+        )
+
+        assert storage.n_pages == capacity
+        assert additional is None
 
 
 def test_fitted_paged_kv_storage_materializes_fixed_resources_before_sizing(

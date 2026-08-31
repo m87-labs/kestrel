@@ -539,7 +539,9 @@ def fit_and_allocate_paged_kv_storage(
     Fixed runtime resources are materialized once before observing available
     memory. Page-dependent caller resources are then allocated first for each
     probe. A caller may then validate its real transient serving path while the
-    candidate K/V allocation is live. The accepted grouped K/V allocation and
+    candidate K/V allocation is live. Page-dependent memory must be monotonic
+    in ``n_pages``; failed probes are exponentially bracketed and binary-searched
+    instead of retrying every page. The accepted grouped K/V allocation and
     page-dependent resources are returned without being freed or recreated, so
     pointer stability does not depend on allocator estimates or cache reuse.
     """
@@ -576,19 +578,32 @@ def fit_and_allocate_paged_kv_storage(
             dtype=dtype,
         )
 
-    last_failure: str | None = None
-    while candidate >= 3:
+    def reclaim_probe() -> None:
+        gc.collect()
+        if pool.device.type == "cuda":
+            with torch.cuda.device(pool.device):
+                torch.cuda.empty_cache()
+
+    def attempt(
+        pages: int,
+    ) -> tuple[
+        PagedKVStorage | None,
+        _AdditionalStorage | None,
+        str | None,
+        int | None,
+    ]:
         additional = None
         storage = None
         transient = None
         retry_failure = None
+        rebound = None
         try:
             # Candidate page tables enqueue H2D work, and accepted K/V tensors
             # are consumed on this same stream. Keeping allocation and retry
             # cleanup on one stream makes allocator reuse safe and predictable.
             with stream_context(stream):
                 if allocate_additional is not None:
-                    additional = allocate_additional(candidate)
+                    additional = allocate_additional(pages)
 
                 # Flush only unowned allocator slack after the exact additional
                 # resources are resident. Driver free is an upper-bound hint;
@@ -600,58 +615,52 @@ def fit_and_allocate_paged_kv_storage(
                             pool.device
                         )
                     bounded = _largest_storage_pages(
-                        candidate,
+                        pages,
                         int(driver_free),
                         layer_specs=layer_specs,
                         page_size=page_size,
                         dtype=dtype,
                     )
-                    if bounded < candidate:
-                        del additional
-                        gc.collect()
-                        candidate = bounded
-                        continue
+                    if bounded < pages:
+                        rebound = bounded
 
                 budget_available = pool.budget_available_bytes()
-                if budget_available is not None:
+                if rebound is None and budget_available is not None:
                     bounded = _largest_storage_pages(
-                        candidate,
+                        pages,
                         budget_available,
                         layer_specs=layer_specs,
                         page_size=page_size,
                         dtype=dtype,
                     )
-                    if bounded < candidate:
-                        del additional
-                        gc.collect()
-                        candidate = bounded
-                        continue
+                    if bounded < pages:
+                        rebound = bounded
 
-                storage = allocate_paged_kv_storage(
-                    candidate,
-                    layer_specs=layer_specs,
-                    page_size=page_size,
-                    dtype=dtype,
-                    pool=pool,
-                )
-                if validate_transient is not None:
-                    with torch.inference_mode():
-                        transient = validate_transient(storage, additional)
-                    # Keep the probe result alive until every operation that
-                    # produced it has completed. This makes the live peak, not
-                    # an allocator estimate, the candidate acceptance gate.
-                    if pool.device.type == "cuda":
-                        if stream is None:
-                            torch.cuda.synchronize(pool.device)
-                        else:
-                            stream.synchronize()
+                if rebound is None:
+                    storage = allocate_paged_kv_storage(
+                        pages,
+                        layer_specs=layer_specs,
+                        page_size=page_size,
+                        dtype=dtype,
+                        pool=pool,
+                    )
+                    if validate_transient is not None:
+                        with torch.inference_mode():
+                            transient = validate_transient(storage, additional)
+                        # Keep the probe result alive until every operation that
+                        # produced it has completed. This makes the live peak,
+                        # not an allocator estimate, the acceptance gate.
+                        if pool.device.type == "cuda":
+                            if stream is None:
+                                torch.cuda.synchronize(pool.device)
+                            else:
+                                stream.synchronize()
         except (MemoryError, torch.OutOfMemoryError) as exc:
             # Do not retain ``exc``: its traceback owns this frame, including
             # the failed storage and any partially-produced probe output.
             retry_failure = f"{type(exc).__name__}: {exc}"
 
-        if retry_failure is not None:
-            last_failure = retry_failure
+        if retry_failure is not None or rebound is not None:
             if pool.device.type == "cuda":
                 if stream is None:
                     torch.cuda.synchronize(pool.device)
@@ -660,15 +669,75 @@ def fit_and_allocate_paged_kv_storage(
             transient = None
             storage = None
             additional = None
-            gc.collect()
-            if pool.device.type == "cuda":
-                with torch.cuda.device(pool.device):
-                    torch.cuda.empty_cache()
-            candidate -= 1
-            continue
+            reclaim_probe()
+            return None, None, retry_failure, rebound
+
         del transient
         assert storage is not None
-        return storage, additional
+        return storage, additional, None, None
+
+    last_failure: str | None = None
+    failed_above: int | None = None
+    passed_below: int | None = None
+    descent = 1
+    while candidate >= 3:
+        storage, additional, retry_failure, rebound = attempt(candidate)
+
+        if rebound is not None:
+            # The exact byte bound proves this candidate cannot fit. Preserve
+            # a tighter failure bound, then probe within the remaining range.
+            failed_above = (
+                candidate if failed_above is None else min(failed_above, candidate)
+            )
+            if passed_below is not None and candidate == passed_below:
+                passed_below = None
+                descent = 1
+            if passed_below is None:
+                if candidate == 3:
+                    break
+                candidate = max(3, int(rebound))
+            elif failed_above - passed_below == 1:
+                candidate = passed_below
+            else:
+                candidate = (passed_below + failed_above) // 2
+            continue
+
+        if retry_failure is not None:
+            last_failure = retry_failure
+            failed_above = (
+                candidate if failed_above is None else min(failed_above, candidate)
+            )
+            if passed_below is not None and candidate == passed_below:
+                # A final re-probe can fail after allocator state changes. Drop
+                # the stale passing observation and search below it.
+                passed_below = None
+                descent = 1
+
+            if passed_below is None:
+                if candidate == 3:
+                    break
+                candidate = max(3, candidate - descent)
+                descent *= 2
+            elif failed_above - passed_below == 1:
+                candidate = passed_below
+            else:
+                candidate = (passed_below + failed_above) // 2
+            continue
+
+        assert storage is not None
+        if failed_above is None or failed_above == candidate + 1:
+            return storage, additional
+
+        passed_below = candidate
+        if pool.device.type == "cuda":
+            if stream is None:
+                torch.cuda.synchronize(pool.device)
+            else:
+                stream.synchronize()
+        storage = None
+        additional = None
+        reclaim_probe()
+        candidate = (passed_below + failed_above) // 2
 
     detail = "" if last_failure is None else f": {last_failure}"
     raise MemoryError(
