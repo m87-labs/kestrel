@@ -4,18 +4,38 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-31
+
+Kestrel 0.7.0 expands Photon with two additional speech model families and
+Gemma 4 26B-A4B. It also reduces startup memory pressure for larger models and
+extends precompiled execution across speech, Qwen, and Gemma workloads.
+
+### More model families
+
 - Added Gemma 4 26B-A4B base and instruction-tuned checkpoint support.
 - Added Qwen3-ASR 0.6B and 1.7B and Parakeet TDT 0.6B v3 transcription for
   files and live PCM, with long-form chunking, progressive results, language
   and prompt controls, forced alignment, and word or character timestamps
   where supported.
-- Added concurrent short-audio batching for Qwen3-ASR without an admission
-  delay. Parakeet decoding uses C1-C8 precompiled decision kernels on H100 and
-  B200, including a no-emission fast path.
-- Added single-pass models as a default-model option, batched single-pass
-  requests, and capability orchestration across execution shapes.
-- Corrected Qwen Gated DeltaNet prefill ownership so allocator-managed rows are
-  not redundantly copied.
+
+### Faster serving
+
+- Updated to `kestrel-kernels` 0.6.0, adding the bundled programs and runtime
+  support required by this release's Qwen, Gemma, and speech workloads.
+- Concurrent short-audio requests are batched immediately for Qwen3-ASR.
+  Parakeet decoding uses C1-C8 precompiled decision kernels on H100 and B200,
+  including a no-emission fast path.
+- Generated model weights are streamed directly into their final runtime
+  layouts, reducing peak host memory during startup for larger Qwen, Gemma,
+  and Moondream 3 checkpoints.
+- Single-pass models can now be selected as the default model, execute batched
+  requests, and share the same capability orchestration as autoregressive
+  models.
+
+### Reliability
+
+- Corrected Qwen Gated DeltaNet prefill topology handling so allocator-managed
+  packed rows remain on the optimized path without redundant copying.
 
 ## 0.6.1 — 2026-08-26
 
