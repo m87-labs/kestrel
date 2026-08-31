@@ -378,6 +378,40 @@ def test_admission_close_cancels_pending_preprocessing() -> None:
     assert not coordinator.has_pending()
 
 
+def test_admission_close_waits_for_running_preprocessing() -> None:
+    crop_future: Future[object] = Future()
+    encoder_future: Future[object] = Future()
+    assert crop_future.set_running_or_notify_cancel()
+    coordinator = _AdmissionCoordinator(
+        runtime=_FakeRuntime(
+            prefix_cache=None,
+            prefix_hit=False,
+            image_preprocessor=_FakeImagePreprocessor([crop_future]),
+            encoder_input_preprocessor=_FakeImagePreprocessor([encoder_future]),
+        ),
+        wake_event=threading.Event(),
+        fail_request=lambda *_: None,
+    )
+    req = _make_request(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+        encoder_input=object(),
+    )
+
+    assert coordinator.submit(req) is None
+    req.cancel_event.set()
+
+    assert coordinator.pop_cancelled() == []
+    assert coordinator.has_pending()
+    assert encoder_future.cancelled()
+    assert coordinator.take_ready() is None
+    assert coordinator.has_pending()
+
+    crop_future.set_result(object())
+
+    assert coordinator.pop_cancelled() == [req]
+    assert not coordinator.has_pending()
+
+
 def test_admission_coordinator_skips_crop_work_on_prefix_hit() -> None:
     image = np.arange(12, dtype=np.uint8).reshape(3, 4)
     preprocessor = _FakeImagePreprocessor()
