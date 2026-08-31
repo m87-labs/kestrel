@@ -206,8 +206,8 @@ def test_binding_reservation_allocates_every_program_slot_pair(
         yield
         stream_contexts.append(("exit", stream))
 
-    def reserve(descriptor, *, weights, runtime_inputs, device):
-        calls.append((descriptor, weights, runtime_inputs))
+    def reserve(descriptor, *, weights, runtime_inputs, device, stream):
+        calls.append((descriptor, weights, runtime_inputs, stream))
         return (
             torch.empty(
                 descriptor["owned_bytes"] + runtime_inputs["slot"],
@@ -241,10 +241,10 @@ def test_binding_reservation_allocates_every_program_slot_pair(
     assert [tensor.dtype for tensor in reservation] == [torch.uint8] * 4
     assert [tensor.numel() for tensor in reservation] == [11, 21, 12, 22]
     assert calls == [
-        (programs[0].descriptor, storage.buffers, first),
-        (programs[1].descriptor, storage.buffers, first),
-        (programs[0].descriptor, storage.buffers, second),
-        (programs[1].descriptor, storage.buffers, second),
+        (programs[0].descriptor, storage.buffers, first, compute_stream),
+        (programs[1].descriptor, storage.buffers, first, compute_stream),
+        (programs[0].descriptor, storage.buffers, second, compute_stream),
+        (programs[1].descriptor, storage.buffers, second, compute_stream),
     ]
     assert stream_contexts == [
         ("enter", compute_stream),
