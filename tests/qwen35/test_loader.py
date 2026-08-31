@@ -12,11 +12,12 @@ from kestrel.models.qwen35.qwen_loader import (
     _dequantize_fp8_weight,
     _interleave_gate_up_weight,
     _load_sharded_safetensors,
-    _materialize_remaining_meta_tensors,
     _restore_rotary_buffers,
 )
 import kestrel.models.qwen35.qwen_loader as loader_module
+from kestrel.models.qwen35.runtime import Qwen35Runtime
 from kestrel.ops.rotary import default_inv_freq
+from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 
 class _FusedExpertHolder(torch.nn.Module):
@@ -299,7 +300,7 @@ def test_remaining_meta_tensors_materialize_without_replacing_bound_storage() ->
         module.register_buffer("pending_buffer", torch.empty(2))
     bound = module.bound
 
-    _materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
+    materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
 
     assert module.bound is bound
     assert module.pending.device.type == "cpu"
@@ -313,11 +314,130 @@ def test_remaining_meta_tensors_reject_uninitialized_derived_buffers() -> None:
         module.register_buffer("derived", torch.empty(2), persistent=False)
 
     try:
-        _materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
+        materialize_remaining_meta_tensors(module, device=torch.device("cpu"))
     except RuntimeError as exc:
         assert "derived buffer" in str(exc)
     else:
         raise AssertionError("uninitialized derived buffer was accepted")
+
+
+def test_load_model_runs_prepare_load_finalize_lifecycle(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self, config) -> None:
+            super().__init__()
+            self.config = config
+            self.weight = torch.nn.Parameter(torch.empty(2))
+
+        def eval(self):
+            events.append("eval")
+            return super().eval()
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(tie_word_embeddings=False)
+    )
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"weight":"model.safetensors"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        loader_module.Qwen3_5Config,
+        "from_dict",
+        lambda _data: config,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "Qwen3_5ForConditionalGeneration",
+        TinyModel,
+    )
+    monkeypatch.setattr(loader_module, "_restore_rotary_buffers", lambda *a, **k: None)
+
+    def load_weights(model, source, shard_names, *, device, revision=None):
+        del source, shard_names, revision
+        events.append("load")
+        assert device == torch.device("cpu")
+        assert model.weight.device.type == "cpu"
+        with torch.no_grad():
+            model.weight.fill_(7)
+        return [], []
+
+    monkeypatch.setattr(loader_module, "_load_sharded_safetensors", load_weights)
+
+    def prepare_model(model: torch.nn.Module) -> None:
+        events.append("prepare")
+        assert model.weight.device.type == "meta"
+
+    def finalize_model(model: torch.nn.Module) -> None:
+        events.append("finalize")
+        assert model.weight.device.type == "cpu"
+        torch.testing.assert_close(model.weight, torch.full((2,), 7.0))
+
+    model = loader_module.load_qwen35_model(
+        tmp_path,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prepare_model=prepare_model,
+        finalize_model=finalize_model,
+    )
+
+    assert events == ["prepare", "load", "finalize", "eval"]
+    assert not model.training
+
+
+def test_runtime_replaces_prepared_storage_with_finalized_storage(
+    monkeypatch,
+) -> None:
+    import kestrel.models.qwen35.qwen_loader as qwen_loader
+    import kestrel.runtime.generated_decode as generated_decode
+
+    events: list[tuple[str, object]] = []
+    prepared_storage = object()
+    finalized_storage = object()
+    model = torch.nn.Module()
+
+    def prepare_storage(runtime, loaded_model, **kwargs):
+        events.append(("prepare", loaded_model))
+        assert kwargs["label"] == "Qwen"
+        assert tuple(kwargs["required_batch_sizes"]) == (1, 2, 3, 4)
+        return prepared_storage
+
+    def finalize_storage(runtime, loaded_model, storage, **kwargs):
+        events.append(("finalize", storage))
+        assert storage is prepared_storage
+        assert kwargs["label"] == "Qwen"
+        assert tuple(kwargs["required_batch_sizes"]) == (1, 2, 3, 4)
+        return finalized_storage
+
+    def load_model(source, **kwargs):
+        assert source == "checkpoint"
+        kwargs["prepare_model"](model)
+        kwargs["finalize_model"](model)
+        return model
+
+    monkeypatch.setattr(
+        generated_decode,
+        "prepare_generated_weight_storage_for_loading",
+        prepare_storage,
+    )
+    monkeypatch.setattr(
+        generated_decode,
+        "finalize_generated_weight_storage_after_loading",
+        finalize_storage,
+    )
+    monkeypatch.setattr(qwen_loader, "load_qwen35_model", load_model)
+
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.device = torch.device("cpu")
+    runtime.dtype = torch.bfloat16
+    runtime.max_batch_size = 4
+    runtime._spec = SimpleNamespace(revision="revision")
+    runtime._generated_weight_storage = None
+
+    assert runtime._load_model("checkpoint") is model
+    assert events == [("prepare", model), ("finalize", prepared_storage)]
+    assert runtime._generated_weight_storage is finalized_storage
 
 
 def test_rotary_buffers_are_recomputed_after_meta_construction() -> None:

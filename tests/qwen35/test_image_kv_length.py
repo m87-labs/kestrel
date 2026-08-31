@@ -64,3 +64,33 @@ def test_qwen_prepare_sequence_reserves_exact_expanded_length() -> None:
     assert prepared["image_length"] == 258
     assert len(prepared["tokens"]) == 259
     assert prepared["target_length"] == 1795
+
+
+@pytest.mark.parametrize(
+    "markers",
+    (
+        (ImageMarker(1), ImageMarker(0)),
+        (ImageMarker(0), ImageMarker(0)),
+    ),
+)
+def test_qwen_prepare_sequence_rejects_out_of_order_image_markers(
+    markers: tuple[ImageMarker, ...],
+) -> None:
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.architecture = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2)
+    )
+    runtime._chat_image_crops = {}
+    runtime._prepare_uncached_sequence = lambda **kwargs: kwargs
+    crops = QwenImageInputs(
+        pixel_values=torch.empty((2, 3)),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        num_image_tokens=2,
+    )
+
+    with pytest.raises(RuntimeError, match="must appear in image input order"):
+        runtime.prepare_sequence(
+            list(markers),
+            image=[object(), object()],
+            image_crops=crops,
+        )

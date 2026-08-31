@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -37,6 +38,73 @@ def test_packed_linear_binding_waits_for_all_streamed_parts() -> None:
     torch.testing.assert_close(state["packed.weight"], torch.cat((q, k)))
 
 
+def test_packed_linear_single_source_reuses_source_tensor() -> None:
+    module = nn.Module()
+    module.packed = PackedLinear(
+        3,
+        (2,),
+        source_names=("q",),
+    )
+    q = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    state = {"q.weight": q}
+
+    bind_declared_packed_projections(module, state)
+
+    assert state == {"packed.weight": q}
+    assert state["packed.weight"] is q
+
+
+def test_packed_linear_repeated_source_packs_each_declared_partition() -> None:
+    module = nn.Module()
+    module.packed = PackedLinear(
+        3,
+        (2, 1, 1),
+        source_names=("q", "k", "k"),
+    )
+    q = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    k = torch.arange(3, dtype=torch.float32).reshape(1, 3) + 10
+    state = {"q.weight": q, "k.weight": k}
+
+    bind_declared_packed_projections(module, state)
+
+    assert set(state) == {"packed.weight"}
+    torch.testing.assert_close(state["packed.weight"], torch.cat((q, k, k)))
+
+
+def test_packed_linear_binding_honors_interleaved_output_layout() -> None:
+    module = nn.Module()
+    module.packed = PackedLinear(
+        3,
+        (16, 16),
+        source_names=("gate", "up"),
+        output_layout="interleaved_i8",
+    )
+    gate = torch.arange(48, dtype=torch.float32).reshape(16, 3)
+    up = torch.arange(48, 96, dtype=torch.float32).reshape(16, 3)
+    state = {"gate.weight": gate, "up.weight": up}
+
+    bind_declared_packed_projections(module, state)
+
+    expected = torch.stack(
+        (gate.reshape(2, 8, 3), up.reshape(2, 8, 3)), dim=1
+    ).reshape(32, 3)
+    torch.testing.assert_close(state["packed.weight"], expected)
+
+
+@pytest.mark.parametrize(
+    "out_features",
+    ((8, 8, 8), (8, 16), (10, 10)),
+)
+def test_packed_linear_rejects_invalid_interleaved_shape(out_features) -> None:
+    with pytest.raises(ValueError, match="two equal output sizes"):
+        PackedLinear(
+            3,
+            out_features,
+            source_names=tuple(f"source_{index}" for index in range(len(out_features))),
+            output_layout="interleaved_i8",
+        )
+
+
 def test_packed_bounded_binding_waits_for_streamed_bounds() -> None:
     module = nn.Module()
     module.packed = PackedBoundedProjections(
@@ -74,6 +142,38 @@ def test_packed_bounded_binding_waits_for_streamed_bounds() -> None:
         "packed.output_max",
         "packed.output_min",
     }
+
+
+def test_packed_bounded_repeated_source_removes_each_bound_once() -> None:
+    module = nn.Module()
+    module.packed = PackedBoundedProjections(
+        2,
+        (1, 1),
+        source_names=("k", "k"),
+        use_bounds=True,
+    )
+    weight = torch.ones((1, 2))
+    state = {
+        "k.linear.weight": weight,
+        "k.input_min": torch.tensor(-1.0),
+        "k.input_max": torch.tensor(1.0),
+        "k.output_min": torch.tensor(-2.0),
+        "k.output_max": torch.tensor(2.0),
+    }
+
+    bind_declared_packed_projections(module, state)
+
+    assert set(state) == {
+        "packed.input_max",
+        "packed.input_min",
+        "packed.linear.weight",
+        "packed.output_max",
+        "packed.output_min",
+    }
+    torch.testing.assert_close(
+        state["packed.linear.weight"],
+        torch.cat((weight, weight)),
+    )
 
 
 def test_packed_binding_skips_already_loaded_target() -> None:

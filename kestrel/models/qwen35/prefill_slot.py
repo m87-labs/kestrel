@@ -32,8 +32,6 @@ class Qwen35PrefillScratch:
     pixel_values: CpuGpuBuffer | None = None
     pixel_capacity: int = 0
     pixel_dim: int = 0
-    image_grid_thw: CpuGpuBuffer | None = None
-    image_grid_capacity: int = 0
     vision_bilinear_indices: CpuGpuBuffer | None = None
     vision_bilinear_weights: CpuGpuBuffer | None = None
     vision_position_ids: CpuGpuBuffer | None = None
@@ -97,7 +95,6 @@ class Qwen35PrefillScratch:
         batch_size: int,
         pixel_rows: int,
         pixel_dim: int,
-        image_grid_rows: int,
         vision_sequence_count: int = 0,
     ) -> "Qwen35PrefillScratch":
         token_capacity = self.token_capacity
@@ -120,7 +117,6 @@ class Qwen35PrefillScratch:
                 batch_size=batch_size,
                 pixel_rows=pixel_rows,
                 pixel_dim=pixel_dim,
-                image_grid_rows=image_grid_rows,
                 vision_sequence_count=vision_sequence_count,
             )
 
@@ -136,16 +132,6 @@ class Qwen35PrefillScratch:
                 device=self.device,
                 pin_memory=self.device.type == "cuda",
                 with_numpy=False,
-            )
-
-        if image_grid_rows > self.image_grid_capacity:
-            self.image_grid_capacity = max(1, image_grid_rows)
-            self.image_grid_thw = CpuGpuBuffer(
-                self.image_grid_capacity,
-                3,
-                dtype=torch.long,
-                device=self.device,
-                pin_memory=self.device.type == "cuda",
             )
 
         if pixel_rows > self.vision_token_capacity:

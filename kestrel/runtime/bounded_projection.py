@@ -115,6 +115,7 @@ class PackedLinear(nn.Linear):
         *,
         source_names: Sequence[str],
         source_weight_leaf: str = "weight",
+        output_layout: str = "contiguous",
     ) -> None:
         packed_out_features = tuple(int(size) for size in out_features)
         source_names = tuple(source_names)
@@ -124,6 +125,19 @@ class PackedLinear(nn.Linear):
             or len(source_names) != len(packed_out_features)
         ):
             raise ValueError("packed linear sources and output sizes must align")
+        if output_layout not in ("contiguous", "interleaved_i8"):
+            raise ValueError(
+                f"unsupported packed linear output layout {output_layout!r}"
+            )
+        if output_layout == "interleaved_i8" and (
+            len(packed_out_features) != 2
+            or packed_out_features[0] != packed_out_features[1]
+            or packed_out_features[0] % 8
+        ):
+            raise ValueError(
+                "interleaved_i8 packed linear requires two equal output sizes "
+                "divisible by 8"
+            )
         super().__init__(
             int(in_features),
             sum(packed_out_features),
@@ -132,6 +146,7 @@ class PackedLinear(nn.Linear):
         self.packed_out_features = packed_out_features
         self.source_names = source_names
         self.source_weight_leaf = source_weight_leaf
+        self.output_layout = output_layout
 
 
 def declared_packed_projection_source_keys(module: nn.Module) -> set[str]:
@@ -305,11 +320,23 @@ def bind_declared_packed_projections(
                     ]
                 )
 
-        packed_weight = torch.cat(weights, dim=0)
+        if isinstance(child, PackedLinear) and child.output_layout == "interleaved_i8":
+            block_rows = child.packed_out_features[0] // 8
+            packed_weight = torch.stack(
+                tuple(
+                    weight.reshape(block_rows, 8, child.in_features)
+                    for weight in weights
+                ),
+                dim=1,
+            ).reshape(sum(child.packed_out_features), child.in_features)
+        elif len(weights) == 1:
+            packed_weight = weights[0]
+        else:
+            packed_weight = torch.cat(weights, dim=0)
         state_dict[target_weight_key] = packed_weight
         for bound_name, value in packed_bounds.items():
             state_dict[target_prefix + bound_name] = value
-        for key in source_weight_keys:
+        for key in dict.fromkeys(source_weight_keys):
             state_dict.pop(key)
-        for key in source_bound_keys:
+        for key in dict.fromkeys(source_bound_keys):
             state_dict.pop(key)

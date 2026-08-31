@@ -12,89 +12,14 @@ from kestrel.runtime.generated_decode import (
 )
 
 
+_WEIGHT_LAYER_PREFIX = "model.language_model.layers"
+
+
 def _state_tensors(state_pool: Any, field: str) -> list[torch.Tensor | None]:
     return [
         None if storage is None else getattr(storage, field)
         for storage in state_pool.layers
     ]
-
-
-def prepare_generated_weight_storage(
-    runtime: Any,
-    model: torch.nn.Module,
-    *,
-    required: bool,
-) -> Any | None:
-    """Bind checkpoint load targets directly into the final generated layout."""
-
-    if runtime.device.type != "cuda" or runtime.dtype is not torch.bfloat16:
-        if required:
-            raise RuntimeError(
-                "generated Qwen decode requires CUDA BF16 model storage"
-            )
-        return None
-    try:
-        from kestrel_kernels import generated_decode as generated_runtime
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"kestrel_kernels", "kestrel_kernels.generated_decode"}:
-            raise
-        if required:
-            raise RuntimeError(
-                "generated Qwen decode requires load-time weight binding support"
-            )
-        return None
-    allocate_weight_storage_for_loading = getattr(
-        generated_runtime, "allocate_weight_storage_for_loading", None
-    )
-    resolve_compatible_programs = getattr(
-        generated_runtime, "resolve_compatible_programs", None
-    )
-    if not callable(allocate_weight_storage_for_loading) or not callable(
-        resolve_compatible_programs
-    ):
-        if required:
-            raise RuntimeError(
-                "generated Qwen decode requires load-time weight binding support"
-            )
-        return None
-
-    properties = torch.cuda.get_device_properties(runtime.device)
-    programs = tuple(resolve_compatible_programs(
-        model,
-        layer_prefix="model.language_model.layers",
-        arch=f"sm{properties.major}{properties.minor}",
-        device_sms=int(properties.multi_processor_count),
-    ))
-    missing_batches = []
-    for batch_size in range(1, runtime.max_batch_size + 1):
-        covered = False
-        for program in programs:
-            static = program.static_extent_bindings.get("active_batch")
-            minimum = int(
-                program.runtime_extent_minimums.get("active_batch", 1)
-            )
-            covered = covered or (
-                (static is None and minimum <= batch_size <= program.capacity)
-                or static == batch_size
-            )
-        if not covered:
-            missing_batches.append(batch_size)
-    if missing_batches:
-        if required:
-            raise RuntimeError(
-                "generated Qwen decode has no load-time artifact coverage for "
-                f"batch sizes {missing_batches}"
-            )
-        return None
-    contracts = {repr(program.descriptor["weights"]) for program in programs}
-    if len(contracts) != 1:
-        raise RuntimeError("generated Qwen artifacts disagree on weight storage")
-    return allocate_weight_storage_for_loading(
-        model,
-        programs[0].descriptor,
-        device=runtime.device,
-        layer_prefix="model.language_model.layers",
-    )
 
 
 def _generated_decode_spec(runtime: Any) -> GeneratedDecodeSpec:
@@ -139,9 +64,9 @@ def _generated_decode_spec(runtime: Any) -> GeneratedDecodeSpec:
     return GeneratedDecodeSpec(
         label="Qwen",
         weight_root=runtime.model,
-        weight_layer_prefix="model.language_model.layers",
+        weight_layer_prefix=_WEIGHT_LAYER_PREFIX,
         bindings=bindings,
-        weight_storage=getattr(runtime, "_generated_weight_storage", None),
+        weight_storage=runtime._generated_weight_storage,
         capacity_inputs=state_inputs,
         preparations=(
             DeviceInputPreparation(
@@ -194,5 +119,4 @@ def create_generated_decode(
 __all__ = [
     "create_generated_decode",
     "generated_decode_slot_capacity",
-    "prepare_generated_weight_storage",
 ]

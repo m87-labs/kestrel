@@ -13,7 +13,8 @@ on ``runtime._use_cuda_graphs`` which evaluates to False on MPS.
 """
 
 import contextlib
-from typing import Optional
+import threading
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -51,7 +52,8 @@ def synchronize(device: torch.device) -> None:
 def empty_cache(device: torch.device) -> None:
     """Hint the allocator to release cached blocks; no-op when unsupported."""
     if device.type == "cuda":
-        torch.cuda.empty_cache()
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
     elif device.type == "mps":
         torch.mps.empty_cache()
 
@@ -89,6 +91,47 @@ def stream_context(stream: Optional[torch.cuda.Stream]):
             yield
 
 
+def materialize_blas_runtime(
+    device: torch.device,
+    stream: Optional[torch.cuda.Stream],
+    operation: Callable[[], Any],
+) -> None:
+    """Materialize the BLAS handle used by a later scheduler thread.
+
+    PyTorch lends CUDA BLAS handles through a thread-local pool window. Running
+    the representative operation on a short-lived thread returns the live
+    handle to the process-wide pool before the scheduler starts and retains its
+    stream workspace, keeping both allocations visible to memory fitting.
+    """
+
+    if device.type != "cuda":
+        with torch.inference_mode():
+            result = operation()
+        del result
+        return
+
+    failures: list[BaseException] = []
+
+    def prime() -> None:
+        try:
+            with torch.cuda.device(device), stream_context(stream):
+                with torch.inference_mode():
+                    result = operation()
+                if stream is None:
+                    torch.cuda.synchronize(device)
+                else:
+                    stream.synchronize()
+                del result
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=prime, name="kestrel-blas-prime")
+    worker.start()
+    worker.join()
+    if failures:
+        raise failures[0]
+
+
 class NoopEvent:
     """Stand-in for ``torch.cuda.Event`` on devices without async events."""
 
@@ -124,6 +167,7 @@ __all__ = [
     "NoopEvent",
     "empty_cache",
     "get_device_capability",
+    "materialize_blas_runtime",
     "make_event",
     "make_stream",
     "set_device",
