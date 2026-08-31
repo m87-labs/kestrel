@@ -70,8 +70,8 @@ class _PackedPrefillBatch:
     paged_kv_seqlens_k: torch.Tensor
     slot_mapping: torch.Tensor
     rope_deltas: torch.Tensor
+    image_token_spans: tuple[tuple[int, int], ...]
     pixel_values: Optional[torch.Tensor] = None
-    image_grid_thw: Optional[torch.Tensor] = None
     vision_bilinear_indices: Optional[torch.Tensor] = None
     vision_bilinear_weights: Optional[torch.Tensor] = None
     vision_position_ids: Optional[torch.Tensor] = None
@@ -597,6 +597,11 @@ class Qwen35Runtime(UncachedPagedRuntime):
                         f"Qwen chat prompt has {len(markers)} image marker(s) "
                         f"but {num_images} image(s) were provided"
                     )
+                marker_indices = [index for _, index in markers]
+                if marker_indices != list(range(num_images)):
+                    raise RuntimeError(
+                        "Qwen image markers must appear in image input order"
+                    )
                 for pos, idx in sorted(markers, reverse=True):
                     block = (
                         [TextToken(token_id=VISION_START_ID)]
@@ -768,7 +773,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         batch_size: int,
         pixel_rows: int,
         pixel_dim: int,
-        image_grid_rows: int,
         vision_sequence_count: int,
     ) -> Qwen35PrefillScratch:
         scratch = getattr(slot, "scratch", None)
@@ -787,7 +791,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             batch_size=batch_size,
             pixel_rows=pixel_rows,
             pixel_dim=pixel_dim,
-            image_grid_rows=image_grid_rows,
             vision_sequence_count=vision_sequence_count,
         )
         if grown is not scratch:
@@ -813,13 +816,14 @@ class Qwen35Runtime(UncachedPagedRuntime):
         end: int,
         mm_token_type_ids: np.ndarray,
         image_grid_thw: np.ndarray,
-    ) -> int:
+    ) -> tuple[int, tuple[tuple[int, int], ...]]:
         spatial_merge_size = int(
             self.architecture.vision_config.spatial_merge_size
         )
         cursor = start
         current_pos = 0
         image_idx = 0
+        image_token_spans: list[tuple[int, int]] = []
         while cursor < end:
             modality_type = int(mm_token_type_ids[cursor - start])
             group_end = cursor + 1
@@ -851,6 +855,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                         "Qwen image token count does not match image grid: "
                         f"tokens={group_end - cursor}, grid={image_len}"
                     )
+                image_token_spans.append((cursor, group_end))
                 offset = current_pos
                 temporal = np.repeat(np.arange(grid_t, dtype=np.int64), grid_h * grid_w)
                 height = np.tile(
@@ -869,7 +874,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
         if image_idx != image_grid_thw.shape[0]:
             raise RuntimeError("Qwen image grid metadata has unused rows")
-        return int(out[:, 0, start:end].max()) + 1 - (end - start)
+        rope_delta = int(out[:, 0, start:end].max()) + 1 - (end - start)
+        return rope_delta, tuple(image_token_spans)
 
     def _fill_vision_metadata(
         self,
@@ -963,7 +969,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
         batch_size: int,
         has_images: bool,
         pixel_rows: int,
-        image_grid_rows: int,
         vision_sequence_count: int,
     ) -> None:
         # One H2D for every text-metadata field (input ids, positions, slot
@@ -976,9 +981,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             if scratch.pixel_values is None:
                 raise RuntimeError("Qwen pixel scratch was not allocated")
             scratch.pixel_values.copy_to_gpu(pixel_rows)
-            if scratch.image_grid_thw is None:
-                raise RuntimeError("Qwen image grid scratch was not allocated")
-            scratch.image_grid_thw.copy_to_gpu(image_grid_rows)
             if (
                 scratch.vision_bilinear_indices is None
                 or scratch.vision_bilinear_weights is None
@@ -1039,9 +1041,9 @@ class Qwen35Runtime(UncachedPagedRuntime):
         total_tokens = 0
         pixel_rows = 0
         pixel_dim = 0
-        image_grid_rows = 0
         vision_sequence_count = 0
         has_images = False
+        image_token_spans: list[tuple[int, int]] = []
 
         for prepared, crops in zip(prepared_sequences, image_crops_list):
             tokens = prepared.tokens_list
@@ -1073,9 +1075,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 if grid_np.ndim != 2 or grid_np.shape[1] != 3:
                     raise ValueError("Qwen image_grid_thw must have shape [N, 3]")
                 crop_grid_rows.append(grid_np)
-                image_grid_rows += int(grid_np.shape[0])
                 vision_sequence_count += int(grid_np[:, 0].sum())
             else:
+                if IMAGE_PAD_ID in token_ids:
+                    raise ValueError(
+                        "Qwen prefill row has image tokens without image inputs"
+                    )
                 crop_grid_rows.append(None)
 
         scratch = self._prefill_scratch_for(
@@ -1084,13 +1089,11 @@ class Qwen35Runtime(UncachedPagedRuntime):
             batch_size=len(prepared_sequences),
             pixel_rows=pixel_rows,
             pixel_dim=pixel_dim,
-            image_grid_rows=image_grid_rows,
             vision_sequence_count=vision_sequence_count,
         )
 
         offset = 0
         pixel_offset = 0
-        grid_offset = 0
         scratch.text_meta.cu_seq_lens_q.np[0] = 0
 
         for row, (token_ids, crops, grid_np, batch_idx) in enumerate(
@@ -1126,17 +1129,15 @@ class Qwen35Runtime(UncachedPagedRuntime):
             else:
                 mm_types[ids_np == IMAGE_PAD_ID] = 1
                 assert grid_np is not None
-                grid_end = grid_offset + grid_np.shape[0]
-                if scratch.image_grid_thw is None:
-                    raise RuntimeError("Qwen image grid scratch was not allocated")
-                scratch.image_grid_thw.np[grid_offset:grid_end] = grid_np
-                scratch.text_meta.rope_deltas.np[row, 0] = self._fill_multimodal_position_ids(
+                rope_delta, row_image_token_spans = self._fill_multimodal_position_ids(
                     scratch.text_meta.position_ids.np,
                     start=offset,
                     end=end,
                     mm_token_type_ids=mm_types,
                     image_grid_thw=grid_np,
                 )
+                scratch.text_meta.rope_deltas.np[row, 0] = rope_delta
+                image_token_spans.extend(row_image_token_spans)
                 pixel_end = pixel_offset + int(crops.pixel_values.shape[0])
                 if scratch.pixel_values is None:
                     raise RuntimeError("Qwen pixel scratch was not allocated")
@@ -1144,7 +1145,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
                     crops.pixel_values
                 )
                 pixel_offset = pixel_end
-                grid_offset = grid_end
             offset += length
 
         if has_images:
@@ -1161,7 +1161,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             batch_size=len(prepared_sequences),
             has_images=has_images,
             pixel_rows=pixel_rows,
-            image_grid_rows=image_grid_rows,
             vision_sequence_count=vision_sequence_count,
         )
         prefill_slot.batch_idx[: len(prepared_sequences)].copy_(
@@ -1192,14 +1191,10 @@ class Qwen35Runtime(UncachedPagedRuntime):
             paged_kv_seqlens_k=scratch.paged_kv_seqlens_k[:batch_size],
             slot_mapping=scratch.text_meta.slot_mapping.gpu[:, :total_tokens],
             rope_deltas=scratch.text_meta.rope_deltas.gpu[:batch_size],
+            image_token_spans=tuple(image_token_spans),
             pixel_values=(
                 scratch.pixel_values.gpu[:pixel_rows]
                 if has_images and scratch.pixel_values is not None
-                else None
-            ),
-            image_grid_thw=(
-                scratch.image_grid_thw.gpu[:image_grid_rows]
-                if has_images and scratch.image_grid_thw is not None
                 else None
             ),
             vision_bilinear_indices=(
@@ -1234,12 +1229,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
             input_ids=packed.input_ids,
             past_key_values=cache,
             pixel_values=packed.pixel_values,
-            image_grid_thw=packed.image_grid_thw,
             position_ids=packed.position_ids,
             vision_bilinear_indices=packed.vision_bilinear_indices,
             vision_bilinear_weights=packed.vision_bilinear_weights,
             vision_position_ids=packed.vision_position_ids,
             vision_cu_seqlens=packed.vision_cu_seqlens,
+            image_token_spans=packed.image_token_spans,
             cache_position_ids=packed.cache_position_ids,
             slot_mapping=packed.slot_mapping,
             page_table=packed.paged_kv_page_table,

@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -65,6 +65,64 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+
+
+def _copy_image_features_into_embeddings(
+    inputs_embeds: torch.Tensor,
+    image_features: torch.Tensor,
+    image_token_spans: Sequence[tuple[int, int]],
+) -> None:
+    """Copy ordered image features into packed embeddings without repacking."""
+
+    if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
+        raise ValueError("prefill embeddings must have shape [1, tokens, hidden]")
+    if not isinstance(image_features, torch.Tensor):
+        raise TypeError("image features must be a tensor")
+    if image_features.ndim != 2:
+        raise ValueError(f"image features must be 2D, got {image_features.ndim}D")
+
+    validated_spans: list[tuple[int, int]] = []
+    previous_end = 0
+    feature_count = 0
+    token_count = int(inputs_embeds.shape[1])
+    hidden_size = int(inputs_embeds.shape[2])
+    for image_index, span in enumerate(image_token_spans):
+        if len(span) != 2:
+            raise ValueError(f"image token span {image_index} must have two bounds")
+        start, end = (int(bound) for bound in span)
+        if start < previous_end or start < 0 or end <= start or end > token_count:
+            raise ValueError(
+                f"image token span {image_index} is invalid or out of order: "
+                f"({start}, {end}) for {token_count} tokens"
+            )
+        feature_count += end - start
+        validated_spans.append((start, end))
+        previous_end = end
+
+    expected_shape = (feature_count, hidden_size)
+    if tuple(image_features.shape) != expected_shape:
+        raise ValueError(
+            f"image features have shape {tuple(image_features.shape)}, "
+            f"expected {expected_shape}"
+        )
+    try:
+        normalized = image_features.to(
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+    except (NotImplementedError, RuntimeError) as exc:
+        raise ValueError(
+            "image features could not be converted to "
+            f"{inputs_embeds.device}/{inputs_embeds.dtype}"
+        ) from exc
+
+    feature_offset = 0
+    for start, end in validated_spans:
+        feature_end = feature_offset + end - start
+        inputs_embeds[0, start:end].copy_(
+            normalized[feature_offset:feature_end]
+        )
+        feature_offset = feature_end
 
 
 @dataclass
@@ -1227,15 +1285,12 @@ class Qwen3_5Model(nn.Module):
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor | None = None,
         *,
         bilinear_indices: torch.Tensor | None = None,
         bilinear_weights: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        if image_grid_thw is None:
-            raise ValueError("image_grid_thw is required with pixel_values")
+    ) -> torch.Tensor:
         if any(
             value is None
             for value in (
@@ -1247,18 +1302,13 @@ class Qwen3_5Model(nn.Module):
         ):
             raise ValueError("Qwen vision metadata must be precomputed by the runtime")
         pixel_values = pixel_values.type(_module_dtype(self.visual))
-        image_embeds = self.visual(
+        return self.visual(
             pixel_values,
             bilinear_indices=bilinear_indices,
             bilinear_weights=bilinear_weights,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
         )
-        split_sizes = (
-            image_grid_thw.prod(-1)
-            // self.config.vision_config.spatial_merge_size**2
-        ).tolist()
-        return torch.split(image_embeds, split_sizes)
 
     def forward(
         self,
@@ -1267,7 +1317,6 @@ class Qwen3_5Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen35InferenceCache | None = None,
         pixel_values: torch.Tensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
         cache_position_ids: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         page_table: torch.Tensor | None = None,
@@ -1281,30 +1330,29 @@ class Qwen3_5Model(nn.Module):
         vision_bilinear_weights: torch.Tensor | None = None,
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
+        image_token_spans: Sequence[tuple[int, int]] | None = None,
     ) -> _TextModelOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
         if pixel_values is not None:
+            if not image_token_spans:
+                raise ValueError(
+                    "packed image-token spans are required with pixel values"
+                )
             image_embeds = self.get_image_features(
                 pixel_values,
-                image_grid_thw,
                 bilinear_indices=vision_bilinear_indices,
                 bilinear_weights=vision_bilinear_weights,
                 position_ids=vision_position_ids,
                 cu_seqlens=vision_cu_seqlens,
             )
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_token_mask = input_ids == self.config.image_token_id
-            image_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
-                inputs_embeds.device
+            _copy_image_features_into_embeddings(
+                inputs_embeds,
+                image_embeds,
+                image_token_spans,
             )
-            if inputs_embeds[image_mask].numel() != image_embeds.numel():
-                raise ValueError(
-                    "Image features and image tokens do not match, "
-                    f"tokens: {image_token_mask.sum()}, "
-                    f"features: {image_embeds.shape[0]}"
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        elif image_token_spans:
+            raise ValueError("packed image-token spans require pixel values")
 
         outputs = self.language_model(
             input_ids=None,
