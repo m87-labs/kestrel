@@ -69,6 +69,9 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     runtime = object.__new__(Qwen35Runtime)
     runtime.model = model
     runtime._new_cache = lambda: cache
+    runtime._linear_state_pool = SimpleNamespace(
+        bind_prefill_state=lambda _cache: None
+    )
 
     marker = object()
     packed = _PackedPrefillBatch(
@@ -86,6 +89,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
         paged_kv_seqlens_k=marker,
         slot_mapping=marker,
         rope_deltas=marker,
+        image_token_spans=(),
     )
 
     hidden, returned_cache = runtime._forward_packed_prefill(packed)
@@ -101,9 +105,8 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
     observed: dict[str, object] = {}
     layer = SimpleNamespace(
         conv_states=None,
-        recurrent_states=None,
+        recurrent_states=torch.empty((1, 1, 1, 1), dtype=torch.bfloat16),
         has_previous_state=False,
-        _reset_replay_rows=lambda state, indices: None,
     )
     cache = SimpleNamespace(
         layers=[layer],
@@ -114,7 +117,7 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         bias=None,
     )
 
-    def recurrent(*args, **kwargs):
+    def packed_prefill(*args, **kwargs):
         observed.update(kwargs)
         return torch.zeros((1, 3, 1)), None
 
@@ -134,14 +137,11 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         in_proj=lambda hidden: torch.zeros((1, 3, 4)),
         supports_packed_gdn=lambda *args: True,
         causal_conv1d_packed=lambda **kwargs: kwargs["x"],
-        packed_prefill_prepare=lambda *args: (
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1, 1)),
-            torch.zeros((1, 3, 1)),
-            torch.zeros((1, 3, 1)),
+        allocate_packed_gdn_prefill_workspace=lambda *args, **kwargs: object(),
+        _prefill_workspace_cache=SimpleNamespace(
+            get=lambda *args, **kwargs: object()
         ),
-        packed_recurrent_prefill=recurrent,
+        packed_gated_delta_rule_prefill=packed_prefill,
         norm=lambda value, gate: value,
         out_proj=lambda value: value,
     )
@@ -154,6 +154,8 @@ def test_gdn_prefill_forwards_host_sequence_lengths_to_recurrence() -> None:
         sequence_lengths=(3,),
         topology_token=fake,
         seq_idx=torch.zeros((1, 3), dtype=torch.int32),
+        gdn_state_indices=torch.tensor([0]),
+        gdn_state_indices_allocator_owned=True,
     )
 
     assert result.shape == (1, 3, 1)
