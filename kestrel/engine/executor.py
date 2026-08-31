@@ -142,6 +142,11 @@ class _AdmissionCoordinator:
             pending = self._pending.get(req_id)
             if pending is None:
                 continue
+            # Cancellation owns terminal delivery once requested. A sibling
+            # future may have been cancelled while another is still running;
+            # leave that admission for ``pop_cancelled`` to settle as a unit.
+            if pending.req.cancel_event.is_set():
+                continue
             futures = (pending.crops_future, pending.encoder_input_future)
             failed: BaseException | None = None
             for future in futures:
@@ -192,16 +197,22 @@ class _AdmissionCoordinator:
             )
 
     def pop_cancelled(self) -> list[_AutoregressiveRequest]:
-        """Cancel preprocessing owned by streams their callers closed."""
+        """Settle preprocessing owned by streams their callers closed."""
 
         cancelled: list[_AutoregressiveRequest] = []
         for request_id, pending in list(self._pending.items()):
             if not pending.req.cancel_event.is_set():
                 continue
-            self._pending.pop(request_id)
-            for future in (pending.crops_future, pending.encoder_input_future):
+            futures = (pending.crops_future, pending.encoder_input_future)
+            for future in futures:
                 if future is not None and not future.done():
                     future.cancel()
+            # ``Future.cancel()`` cannot stop preprocessing that is already
+            # running. Retain ownership until its done callback wakes us again;
+            # only then may EngineStream.aclose() report scheduler settlement.
+            if any(future is not None and not future.done() for future in futures):
+                continue
+            self._pending.pop(request_id)
             cancelled.append(pending.req)
         return cancelled
 
