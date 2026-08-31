@@ -441,6 +441,72 @@ def test_run_resolves_when_event_pending_with_no_other_traffic() -> None:
     asyncio.run(go())
 
 
+def test_run_cancellation_skips_queued_work_and_drains_launched_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.engine.single_pass as sp_mod
+
+    recorded = threading.Event()
+    ready = threading.Event()
+
+    class _ControlledEvent:
+        def record(self, *a: Any, **k: Any) -> None:
+            recorded.set()
+
+        def query(self) -> bool:
+            return ready.is_set()
+
+    monkeypatch.setattr(sp_mod, "make_event", lambda device: _ControlledEvent())
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        sp = _StubSinglePass()
+        engine = _engine_with(ar, sp)
+        engine._loop = asyncio.get_running_loop()
+        engine._initialized = True
+        engine._init_task = None
+        thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+        thread.start()
+        requests: list[asyncio.Task[Any]] = []
+        try:
+            launched = asyncio.create_task(
+                engine.run(sp.model_name, "segment", {"request": "launched"})
+            )
+            requests.append(launched)
+            assert await asyncio.to_thread(recorded.wait, 1.0)
+
+            queued = asyncio.create_task(
+                engine.run(sp.model_name, "segment", {"request": "queued"})
+            )
+            requests.append(queued)
+            await asyncio.sleep(0)
+            launched.cancel()
+            queued.cancel()
+            await asyncio.sleep(0)
+
+            assert not launched.done()
+            assert not queued.done()
+            ready.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*requests, return_exceptions=True), timeout=5.0
+            )
+            assert all(
+                isinstance(outcome, asyncio.CancelledError) for outcome in outcomes
+            )
+            assert sp.calls == [
+                ("segment", ({"request": "launched"},)),
+            ]
+        finally:
+            ready.set()
+            await asyncio.gather(*requests, return_exceptions=True)
+            engine._shutdown = True
+            engine._scheduler_queue.put(None)
+            engine._scheduler_event.set()
+            thread.join(timeout=5.0)
+
+    asyncio.run(go())
+
+
 def test_engine_shutdown_tears_down_single_pass_runtime() -> None:
     """Regression (P2): engine.shutdown() must not AttributeError on a
     single-pass runtime.
