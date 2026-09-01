@@ -985,7 +985,7 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.proj(hidden_states)
+        return _kestrel_linear(hidden_states, self.proj.weight, self.proj.bias)
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):
