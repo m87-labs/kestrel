@@ -4,7 +4,7 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-## 0.7.0 — 2026-08-31
+## 0.7.0 — 2026-09-01
 
 Kestrel 0.7.0 expands Photon with two additional speech model families and
 Gemma 4 26B-A4B. It also reduces startup memory pressure for larger models and
