@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from kestrel_kernels import get_runtime
+
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
 from kestrel.runtime.paged_resources import bound_kv_cache_pages
@@ -62,6 +64,8 @@ class _PackedPrefillBatch:
     cache_position_ids: torch.Tensor
     position_ids: torch.Tensor
     cu_seq_lens_q: Optional[torch.Tensor]
+    sequence_lengths: tuple[int, ...]
+    topology_token: object
     seq_idx: Optional[torch.Tensor]
     batch_indices: torch.Tensor
     max_length: int
@@ -971,8 +975,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
         pixel_rows: int,
         vision_sequence_count: int,
     ) -> None:
-        # One H2D for every text-metadata field (input ids, positions, slot
-        # mapping, seq idx, batch indices, cu-seqlens, rope deltas, …) instead
+        # One H2D for every staged text-metadata field (input ids, positions,
+        # slot mapping, seq idx, batch indices, rope deltas, …) instead
         # of a dozen separate cudaMemcpyAsync launches. Consumers slice each
         # field to its live length, so shipping the whole packed buffer
         # (including unused tails) is safe.
@@ -1094,8 +1098,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
         offset = 0
         pixel_offset = 0
-        scratch.text_meta.cu_seq_lens_q.np[0] = 0
-
         for row, (token_ids, crops, grid_np, batch_idx) in enumerate(
             zip(token_rows, image_crops_list, crop_grid_rows, batch_indices)
         ):
@@ -1110,7 +1112,6 @@ class Qwen35Runtime(UncachedPagedRuntime):
             scratch.text_meta.batch_indices.np[row] = int(batch_idx)
             scratch.text_meta.last_positions.np[row] = length - 1
             scratch.text_meta.last_token_offsets.np[row] = end - 1
-            scratch.text_meta.cu_seq_lens_q.np[row + 1] = end
             self._fill_prefill_slot_mapping(
                 scratch.text_meta.slot_mapping.np,
                 start=offset,
@@ -1172,17 +1173,25 @@ class Qwen35Runtime(UncachedPagedRuntime):
         )
 
         batch_size = len(prepared_sequences)
+        sequence_lengths = tuple(lengths)
+        cu_seq_lens_q, topology_token = (
+            get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=sequence_lengths,
+                device=self.device,
+            )
+        )
 
         return _PackedPrefillBatch(
             input_ids=scratch.text_meta.input_ids.gpu[:, :total_tokens],
             cache_position_ids=scratch.text_meta.cache_position_ids.gpu[:, :total_tokens],
             position_ids=scratch.text_meta.position_ids.gpu[:, :, :total_tokens],
-            # Always pass packed metadata, even for a single sequence: text_meta
-            # is staged to the GPU unconditionally, so cu_seq_lens_q ([0, total])
-            # and seq_idx are valid for batch_size == 1. This lets a single
-            # sequence take the same packed_prefill path as batched prefill
-            # instead of the separate uniform_native_prefill branch.
-            cu_seq_lens_q=scratch.text_meta.cu_seq_lens_q.gpu[: batch_size + 1],
+            # Always pass packed metadata, even for a single sequence. The
+            # topology factory derives cu_seq_lens_q ([0, total]) from the same
+            # ordered host lengths used to pack seq_idx, so a single sequence
+            # takes the same packed-prefill path as a batch.
+            cu_seq_lens_q=cu_seq_lens_q,
+            sequence_lengths=sequence_lengths,
+            topology_token=topology_token,
             seq_idx=scratch.text_meta.seq_idx.gpu[:, :total_tokens],
             batch_indices=scratch.text_meta.batch_indices.gpu[:batch_size],
             max_length=max(lengths),
@@ -1240,6 +1249,8 @@ class Qwen35Runtime(UncachedPagedRuntime):
             page_table=packed.paged_kv_page_table,
             paged_kv_seqlens_k=packed.paged_kv_seqlens_k,
             cu_seq_lens_q=packed.cu_seq_lens_q,
+            sequence_lengths=packed.sequence_lengths,
+            topology_token=packed.topology_token,
             seq_idx=packed.seq_idx,
             gdn_state_indices=packed.batch_indices,
             gdn_state_indices_allocator_owned=True,
