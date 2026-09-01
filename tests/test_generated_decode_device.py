@@ -43,6 +43,17 @@ def _generated_with_programs(*programs):
     return generated
 
 
+def _load_time_weight_runtime(monkeypatch):
+    from kestrel_kernels import generated_decode
+
+    for capability in (
+        "allocate_weight_storage_for_loading",
+        "finalize_weight_storage_after_loading",
+    ):
+        monkeypatch.setattr(generated_decode, capability, Mock(), raising=False)
+    return generated_decode
+
+
 def test_try_create_binds_physical_sm_count_to_program_resolution():
     runtime = SimpleNamespace(
         device=torch.device("cuda", 0),
@@ -182,8 +193,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
     monkeypatch: pytest.MonkeyPatch,
     missing_capability: str,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     runtime = SimpleNamespace(
         device=torch.device("cuda", 0),
         dtype=torch.bfloat16,
@@ -197,7 +207,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
         "resolve_compatible_programs",
         lambda *_args, **_kwargs: (program,),
     )
-    monkeypatch.delattr(generated_runtime, missing_capability)
+    monkeypatch.delattr(generated_runtime, missing_capability, raising=False)
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda _device: properties
     )
@@ -219,8 +229,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
 def test_binding_reservation_allocates_every_program_slot_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     programs = tuple(
         SimpleNamespace(descriptor={"owned_bytes": owned_bytes})
         for owned_bytes in (10, 20)
@@ -287,8 +296,7 @@ def test_binding_reservation_allocates_every_program_slot_pair(
 def test_binding_reservation_fails_soft_only_when_optional(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     monkeypatch.delattr(
         generated_runtime,
         "reserve_binding_storage",
