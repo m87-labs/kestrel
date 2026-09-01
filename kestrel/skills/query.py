@@ -197,6 +197,7 @@ class QuerySkillState(SkillState):
         self._start_ground_id: Optional[int] = None
         self._end_ground_id: Optional[int] = None
         self._streaming = bool(query_request.stream)
+        self._reasoning_stream_offset = 0
         self._answer_stream_offset = 0
         # After reasoning ends (answer_id generated), replay the model's
         # post_reasoning_prefix one token at a time via allowed_token_ids.
@@ -336,6 +337,18 @@ class QuerySkillState(SkillState):
         if not chunk:
             return None
         return chunk
+
+    def pop_reasoning_stream_delta(
+        self, runtime: "AutoregressiveRuntime"
+    ) -> Optional[str]:
+        if not self._streaming or not self._reasoning_tokens:
+            return None
+        text = runtime.tokenizer.decode(self._reasoning_tokens)
+        if len(text) <= self._reasoning_stream_offset:
+            return None
+        chunk = text[self._reasoning_stream_offset :]
+        self._reasoning_stream_offset = len(text)
+        return chunk or None
 
     def finalize(
         self,

@@ -322,6 +322,14 @@ class SkillState:
 
         return None
 
+    def pop_reasoning_stream_delta(
+        self, runtime: "AutoregressiveRuntime"
+    ) -> Optional[str]:
+        """Return newly available reasoning text for streaming clients."""
+
+        return None
+
+
 class SkillRegistry:
     """Maps a model's capability names to their skills.
 

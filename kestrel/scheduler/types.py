@@ -149,14 +149,16 @@ class RequestLifecycle:
             self.logprobs.append(float(logprob))
         callback = self.request.stream_callback
         if callback is not None:
-            delta = self.skill_state.pop_stream_delta(runtime)
-            if delta:
+            text_delta = self.skill_state.pop_stream_delta(runtime)
+            reasoning_delta = self.skill_state.pop_reasoning_stream_delta(runtime)
+            if text_delta or reasoning_delta:
                 callback(
                     StreamUpdate(
                         request_id=self.request.request_id,
                         token=token,
-                        text=delta,
+                        text=text_delta or "",
                         token_index=self.skill_state.token_count - 1,
+                        reasoning=reasoning_delta,
                     )
                 )
 
@@ -282,6 +284,7 @@ class StreamUpdate:
     token: Token
     text: str
     token_index: int
+    reasoning: Optional[str] = None
 
 
 StreamCallback = Callable[[StreamUpdate], None]

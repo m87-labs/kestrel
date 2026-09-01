@@ -202,6 +202,8 @@ def test_reasoning_stop_token_is_not_emitted() -> None:
     state.consume_step(runtime, DecodeStep(TextToken(token_id=88), position=1))
 
     assert state.pop_stream_delta(runtime) is None
+    assert state.pop_reasoning_stream_delta(runtime) == "<42>"
+    assert state.pop_reasoning_stream_delta(runtime) is None
     result = state.finalize(runtime, reason="stop")
     assert result.output == {
         "answer": "",
@@ -417,3 +419,25 @@ def test_reasoning_start_contract_rejects_scalar_and_sequence() -> None:
         match="query template must not set both reasoning start token fields",
     ):
         state.on_prefill(runtime)
+
+
+def test_reasoning_and_answer_streams_remain_separate() -> None:
+    runtime = _Runtime()
+    runtime.prompt_template.answer_id = 7
+    runtime.tokenizer = _VisibleTokenizer()
+    context = QueryRequest(
+        question="hi",
+        image=None,
+        reasoning=True,
+        stream=True,
+    )
+    state = QuerySkill().create_state(runtime, SimpleNamespace(), context)
+
+    state.consume_step(runtime, DecodeStep(TextToken(token_id=41), position=0))
+    assert state.pop_reasoning_stream_delta(runtime) == "<41>"
+    assert state.pop_stream_delta(runtime) is None
+
+    state.consume_step(runtime, DecodeStep(TextToken(token_id=7), position=1))
+    state.consume_step(runtime, DecodeStep(TextToken(token_id=42), position=2))
+    assert state.pop_reasoning_stream_delta(runtime) is None
+    assert state.pop_stream_delta(runtime) == "<42>"
