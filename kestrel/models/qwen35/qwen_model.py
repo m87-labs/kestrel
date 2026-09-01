@@ -1043,7 +1043,9 @@ class Qwen3_5VisionAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
+        attn_output = _kestrel_linear(
+            attn_output, self.proj.weight, self.proj.bias
+        )
         return attn_output
 
 
