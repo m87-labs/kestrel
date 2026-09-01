@@ -43,7 +43,6 @@ _kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
 _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
-_kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
 _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
 _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
@@ -910,12 +909,8 @@ class Qwen3_5VisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.linear_fc1 = nn.Linear(hidden_size, self.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(self.intermediate_size, hidden_size, bias=True)
-        # cuBLASLt fused-MLP GELU epilogue mode that matches ``config.hidden_act``.
-        # The vision encoder uses ``gelu_pytorch_tanh`` (tanh approximation); plain
-        # ``gelu`` maps to the exact (erf) GELU.
+        self.linear_fc1 = nn.Linear(hidden_size, config.intermediate_size, bias=True)
+        self.linear_fc2 = nn.Linear(config.intermediate_size, hidden_size, bias=True)
         if config.hidden_act == "gelu_pytorch_tanh":
             self._gelu_approximate = "tanh"
         elif config.hidden_act == "gelu":
@@ -927,53 +922,21 @@ class Qwen3_5VisionMLP(nn.Module):
             value,
             approximate=self._gelu_approximate or "none",
         )
-    def forward(self, hidden_state, residual=None, hidden_workspace=None):
-        """``linear_fc2(act_fn(linear_fc1(hidden_state)))``, plus ``residual``.
 
-        When ``residual`` is given on CUDA bf16/fp16, fc1+GELU+fc2+bias+residual
-        fuse into a single cuBLASLt call (one kernel instead of the eager
-        fc1/GELU/fc2/add chain), eliminating the per-block GELU launch. Every
-        other case falls back to eager. Called through ``__call__`` so module
-        forward hooks (e.g. the profiler's ``vision.mlp``) still fire.
-        """
-        if (
-            residual is not None
-            and self._gelu_approximate is not None
-            and hidden_state.is_cuda
-            and hidden_state.ndim == 2
-            and hidden_state.dtype in (torch.bfloat16, torch.float16)
-            and self.linear_fc1.weight.dtype == hidden_state.dtype
-            and self.linear_fc2.weight.dtype == hidden_state.dtype
-        ):
-            x = hidden_state.contiguous()
-            residual = residual.contiguous()
-            m = x.shape[0]
-            out = torch.empty_like(residual)
-            if hidden_workspace is not None and hidden_workspace.shape[0] >= m:
-                hidden = hidden_workspace[:m]
-            else:
-                hidden = torch.empty(
-                    (m, self.intermediate_size), device=x.device, dtype=x.dtype
-                )
-            _kestrel_fused_mlp_gelu_bias_residual(
-                out,
-                hidden,
-                x,
-                self.linear_fc1.weight,
-                self.linear_fc1.bias,
-                self.linear_fc2.weight,
-                self.linear_fc2.bias,
-                residual,
-                approximate=self._gelu_approximate,
-            )
-            return out
-        out = self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
-        return out if residual is None else residual + out
+    def forward(self, hidden_state):
+        # Tried the fused FC2+bias+residual epilogue: identical 2,052-row Qwen
+        # images differed by 3.05e-05 at 1 vs 7 images on L4; keeping the
+        # reference operation boundary, which was bit-exact in the same test.
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
 class Qwen3_5VisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
+        self.in_channels = config.in_channels
+        self.temporal_patch_size = config.temporal_patch_size
+        self.patch_size = config.patch_size
+        self.hidden_size = config.hidden_size
         self.proj = nn.Linear(
             config.in_channels
             * config.temporal_patch_size
@@ -984,7 +947,34 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.proj(hidden_states)
+        # Tried the flattened BF16 Linear: identical images differed by 0.03125
+        # at 5 vs 3 images on L4; the checkpoint layout also represents this
+        # reference Conv3D exactly, so preserve that accumulation boundary.
+        weight = self.proj.weight.view(
+            self.hidden_size,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        patches = hidden_states.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        output = F.conv3d(
+            patches,
+            weight,
+            self.proj.bias,
+            stride=(
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            ),
+        )
+        return output.view(-1, self.hidden_size)
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):
@@ -1058,7 +1048,6 @@ class Qwen3_5VisionBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        mlp_workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""
         cu_seqlens (`torch.Tensor`):
@@ -1069,9 +1058,7 @@ class Qwen3_5VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        hidden_states = self.mlp(
-            self.norm2(hidden_states), hidden_states, mlp_workspace
-        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
@@ -1098,24 +1085,6 @@ class Qwen3_5VisionModel(nn.Module):
             ]
         )
         self.merger = Qwen3_5VisionPatchMerger(config)
-        # One shared fused-MLP fc1/gelu workspace for all blocks (the intermediate
-        # is consumed within each block's fused call and the blocks run
-        # sequentially, so a single buffer suffices instead of one per block).
-        self._mlp_hidden_workspace: torch.Tensor | None = None
-
-    def _mlp_workspace(self, num_tokens, dtype, device) -> torch.Tensor:
-        ws = self._mlp_hidden_workspace
-        if (
-            ws is None
-            or ws.shape[0] < num_tokens
-            or ws.dtype != dtype
-            or ws.device != device
-        ):
-            ws = torch.empty(
-                num_tokens, self.config.intermediate_size, dtype=dtype, device=device
-            )
-            self._mlp_hidden_workspace = ws
-        return ws[:num_tokens]
 
     def forward(
         self,
@@ -1137,23 +1106,11 @@ class Qwen3_5VisionModel(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        # Only the fused (CUDA bf16/fp16) MLP path consumes the workspace; skip
-        # the allocation entirely on eager/CPU/MPS fallbacks.
-        if hidden_states.is_cuda and hidden_states.dtype in (
-            torch.bfloat16,
-            torch.float16,
-        ):
-            mlp_workspace = self._mlp_workspace(
-                seq_len, hidden_states.dtype, hidden_states.device
-            )
-        else:
-            mlp_workspace = None
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
-                mlp_workspace=mlp_workspace,
             )
 
         return self.merger(hidden_states)

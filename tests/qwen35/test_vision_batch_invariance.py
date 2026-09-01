@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from kestrel.models.qwen35.qwen_config import Qwen3_5VisionConfig
-from kestrel.models.qwen35.qwen_model import Qwen3_5VisionBlock
+from kestrel.models.qwen35.qwen_model import (
+    Qwen3_5VisionBlock,
+    Qwen3_5VisionPatchEmbed,
+)
 
 
 def _qwen08_vision_config() -> Qwen3_5VisionConfig:
@@ -17,12 +20,42 @@ def _qwen08_vision_config() -> Qwen3_5VisionConfig:
         intermediate_size=3072,
         num_heads=12,
         in_channels=3,
-        patch_size=14,
+        patch_size=16,
         spatial_merge_size=2,
         temporal_patch_size=2,
         out_hidden_size=1024,
         num_position_embeddings=2304,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_l4_vision_patch_embed_is_invariant_to_image_batch_shape() -> None:
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Requires the L4 Qwen vision path")
+
+    torch.manual_seed(79)
+    config = _qwen08_vision_config()
+    sequence_length = 2052
+    patch_width = (
+        config.in_channels
+        * config.temporal_patch_size
+        * config.patch_size
+        * config.patch_size
+    )
+    module = Qwen3_5VisionPatchEmbed(config).cuda().bfloat16().eval()
+    sequence = torch.randn(
+        sequence_length,
+        patch_width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    with torch.inference_mode():
+        five_images = module(sequence.repeat(5, 1))[:sequence_length].clone()
+        three_images = module(sequence.repeat(3, 1))[:sequence_length].clone()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(five_images, three_images, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
