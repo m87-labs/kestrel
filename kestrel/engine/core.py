@@ -1636,6 +1636,22 @@ class InferenceEngine:
             for update in updates:
                 self._deliver_model_stream_update(update)
 
+        def route_single_pass_ingress() -> bool:
+            progressed = False
+            while True:
+                try:
+                    model, req = self._single_pass_queue.get_nowait()
+                except queue.Empty:
+                    return progressed
+                lane = single_pass.get(model)
+                if lane is None:  # pragma: no cover - guarded in run()
+                    self._fail_request(
+                        req, ValueError(f"No single-pass lane for {model!r}")
+                    )
+                else:
+                    lane.submit(req)
+                progressed = True
+
         def any_work() -> bool:
             return (ar_executor is not None and ar_executor.has_work) or any(
                 sp.has_work for sp in single_pass.values()
@@ -1675,6 +1691,10 @@ class InferenceEngine:
                         for item in deferred:
                             self._scheduler_queue.put(item)
 
+                        # Route without launching; ``drain`` below settles only
+                        # cancelled requests and already-completed forwards.
+                        route_single_pass_ingress()
+
                         # Drain in-flight work before pause — callers may
                         # mutate runtime state while paused (e.g. rebuild
                         # CUDA graphs). Only the AR lane has graph state;
@@ -1688,6 +1708,8 @@ class InferenceEngine:
                                 synchronize(runtime.device)
                         else:
                             synchronize(runtime.device)
+                        for lane in single_pass.values():
+                            deliver(lane.drain())
                         paused_event.set()
                         if shutdown_requested:
                             break
@@ -1720,19 +1742,7 @@ class InferenceEngine:
                         ar_executor.submit(item)
                         progressed = True
                     # Single-pass ingress (model-tagged).
-                    while True:
-                        try:
-                            model, req = self._single_pass_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        lane = single_pass.get(model)
-                        if lane is None:  # pragma: no cover - guarded in run()
-                            self._fail_request(
-                                req, ValueError(f"No single-pass lane for {model!r}")
-                            )
-                        else:
-                            lane.submit(req)
-                        progressed = True
+                    progressed |= route_single_pass_ingress()
                     # Streaming session starts (model-tagged).
                     while True:
                         try:

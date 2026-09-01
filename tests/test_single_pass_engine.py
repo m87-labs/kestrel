@@ -20,6 +20,7 @@ import torch
 
 from kestrel.engine import InferenceEngine
 from kestrel.engine._types import _AutoregressiveRequest
+from kestrel.engine.single_pass import _SinglePassRequest
 from kestrel.runtime import ExecutionShape
 
 from tests.scheduler._fake_runtime import FakeRuntime
@@ -107,12 +108,14 @@ def test_run_routes_single_pass_through_kernel_loop() -> None:
 def test_paused_loop_settles_cancelled_ingress_and_shutdown() -> None:
     async def go() -> None:
         ar = FakeRuntime(model_name="ar-default", device="cpu")
-        engine = _engine_with(ar, _StubSinglePass())
+        single_pass = _StubSinglePass()
+        engine = _engine_with(ar, single_pass)
         engine._loop = asyncio.get_running_loop()
         engine._paused_flag.set()
         engine._run_gate.clear()
 
         future = engine._loop.create_future()
+        single_pass_future = engine._loop.create_future()
         cancelled = threading.Event()
         cancelled.set()
         engine._scheduler_queue.put(
@@ -133,10 +136,26 @@ def test_paused_loop_settles_cancelled_ingress_and_shutdown() -> None:
                 cancel_event=cancelled,
             )
         )
+        engine._single_pass_queue.put(
+            (
+                single_pass.model_name,
+                _SinglePassRequest(
+                    request_id=2,
+                    future=single_pass_future,
+                    task="segment",
+                    inputs={},
+                    submitted_at=0.0,
+                    cancel_event=cancelled,
+                ),
+            )
+        )
 
         thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
         thread.start()
         assert (await asyncio.wait_for(future, timeout=5.0)).finish_reason == "cancelled"
+        assert (
+            await asyncio.wait_for(single_pass_future, timeout=5.0)
+        ).finish_reason == "cancelled"
 
         engine._scheduler_queue.put(None)
         engine._scheduler_event.set()
