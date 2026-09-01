@@ -74,12 +74,8 @@ def test_vision_attention_output_uses_runtime_linear_without_changing_semantics(
     attention = Qwen3_5VisionAttention(config).eval()
     inputs = torch.randn(3, config.hidden_size)
     projected_inputs = torch.randn_like(inputs)
-    attention.qkv.forward = lambda hidden_states: torch.zeros(
-        hidden_states.shape[0],
-        3 * config.hidden_size,
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    attention.qkv.weight.data.zero_()
+    attention.qkv.bias.data.zero_()
     monkeypatch.setattr(
         model_module,
         "_kestrel_spatial_rope_apply",
@@ -107,8 +103,11 @@ def test_vision_attention_output_uses_runtime_linear_without_changing_semantics(
         position_embeddings=(torch.empty(0), torch.empty(0)),
     )
 
-    assert len(calls) == 1
-    torch.testing.assert_close(calls[0][0], projected_inputs)
-    assert calls[0][1] is attention.proj.weight
-    assert calls[0][2] is attention.proj.bias
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0][0], inputs)
+    assert calls[0][1] is attention.qkv.weight
+    assert calls[0][2] is attention.qkv.bias
+    torch.testing.assert_close(calls[1][0], projected_inputs)
+    assert calls[1][1] is attention.proj.weight
+    assert calls[1][2] is attention.proj.bias
     torch.testing.assert_close(actual, expected)

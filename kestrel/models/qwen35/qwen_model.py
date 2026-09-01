@@ -1033,9 +1033,12 @@ class Qwen3_5VisionAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        qkv = _kestrel_linear(
+            hidden_states, self.qkv.weight, self.qkv.bias
+        ).view(
+            seq_length, 3, self.num_heads, self.head_dim
         )
+        query_states, key_states, value_states = qkv.unbind(dim=1)
         cos, sin = position_embeddings
         query_states, key_states = _kestrel_spatial_rope_apply(
             query_states, key_states, cos, sin, axis_blocks=1
