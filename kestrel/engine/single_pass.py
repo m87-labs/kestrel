@@ -170,6 +170,28 @@ class SinglePassExecutor:
             has_work=self.has_work,
         )
 
+    def drain(self) -> tuple[Completion, ...]:
+        """Settle terminal work while leaving ordinary queued work paused."""
+
+        completed: List[Completion] = []
+        if self._deferred is not None and self._deferred.cancel_event.is_set():
+            completed.append(_cancelled_completion(self._deferred))
+            self._deferred = None
+        deferred = []
+        for _ in range(self._queue.qsize()):
+            try:
+                request = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if request.cancel_event.is_set():
+                completed.append(_cancelled_completion(request))
+            else:
+                deferred.append(request)
+        for request in deferred:
+            self._queue.put(request)
+        completed.extend(self._collect())
+        return tuple(completed)
+
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")
         completions: List[Completion] = [
