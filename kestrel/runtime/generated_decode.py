@@ -457,6 +457,7 @@ def reserve_generated_binding_storage(
                 weights=weights,
                 runtime_inputs=runtime_inputs,
                 device=device,
+                stream=stream,
             )
         )
 
