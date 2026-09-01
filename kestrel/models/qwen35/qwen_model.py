@@ -44,6 +44,7 @@ _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
 _kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
+_kestrel_linear = _kestrel_runtime.linear.linear
 _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
 _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
@@ -998,8 +999,9 @@ class Qwen3_5VisionPatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x).view(-1, self.hidden_size)
-        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return x
+        x = _kestrel_linear(x, self.linear_fc1.weight, self.linear_fc1.bias)
+        x = self.act_fn(x)
+        return _kestrel_linear(x, self.linear_fc2.weight, self.linear_fc2.bias)
 
 
 class Qwen3_5VisionAttention(nn.Module):
