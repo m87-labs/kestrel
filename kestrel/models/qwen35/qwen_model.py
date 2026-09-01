@@ -377,7 +377,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=torch.long,
         ).view(-1).contiguous()
 
-        in_proj = self.in_proj(hidden_states)
+        in_proj = _kestrel_linear(
+            hidden_states, self.in_proj.weight, self.in_proj.bias
+        )
         mixed_qkv, z, b, a = torch.split(
             in_proj,
             [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads],
@@ -464,7 +466,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        output = self.out_proj(core_attn_out)
+        output = _kestrel_linear(
+            core_attn_out, self.out_proj.weight, self.out_proj.bias
+        )
         return output
 
 
@@ -509,7 +513,9 @@ class Qwen3_5Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        q_gate, key_states, value_states = self.qkv_proj(hidden_states).split(
+        q_gate, key_states, value_states = _kestrel_linear(
+            hidden_states, self.qkv_proj.weight, self.qkv_proj.bias
+        ).split(
             [self.q_gate_size, self.kv_size, self.kv_size],
             dim=-1,
         )
@@ -575,7 +581,9 @@ class Qwen3_5Attention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = _kestrel_linear(
+            attn_output, self.o_proj.weight, self.o_proj.bias
+        )
         return attn_output, attn_weights
 
 
@@ -600,7 +608,9 @@ class Qwen3_5MLP(nn.Module):
         )
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
+        gate_up = _kestrel_linear(
+            x, self.gate_up_proj.weight, self.gate_up_proj.bias
+        )
         hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
@@ -608,7 +618,9 @@ class Qwen3_5MLP(nn.Module):
             activation="silu",
             layout=_KESTREL_MOE_GATE_UP_LAYOUT,
         )
-        return self.down_proj(hidden)
+        return _kestrel_linear(
+            hidden, self.down_proj.weight, self.down_proj.bias
+        )
 
 
 class Qwen3_5Experts(nn.Module):
