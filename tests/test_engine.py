@@ -17,6 +17,7 @@ from kestrel.engine import (
     _AutoregressiveRequest,
 )
 from kestrel.models.moondream.runtime import TextToken
+from kestrel.runtime import ExecutionShape
 from kestrel.scheduler import GeneratedPrefix
 from kestrel.skills import (
     DecodeStep,
@@ -400,6 +401,10 @@ def test_admission_coordinator_skips_failed_crop_and_keeps_promoting() -> None:
 
 def test_transcribe_only_runtime_skips_legacy_query_warmup() -> None:
     engine = object.__new__(InferenceEngine)
+    engine._default_model = "fake"
+    engine._runtimes = {
+        "fake": SimpleNamespace(execution_shape=ExecutionShape.AUTOREGRESSIVE),
+    }
     engine._skills_override = SkillRegistry([SkillSpec("transcribe")])
 
     async def query(**_kwargs: object) -> None:
@@ -471,7 +476,10 @@ def test_validate_generated_prefix_rejects_unsupported_requests() -> None:
     engine = object.__new__(InferenceEngine)
     engine._default_model = "fake"
     engine._runtimes = {
-        "fake": SimpleNamespace(eos_token_ids=(2, 3)),
+        "fake": SimpleNamespace(
+            eos_token_ids=(2, 3),
+            execution_shape=ExecutionShape.AUTOREGRESSIVE,
+        ),
     }
 
     prefix = GeneratedPrefix(tokens=(TextToken(10),))

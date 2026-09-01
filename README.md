@@ -34,7 +34,8 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 pip install kestrel
 ```
 
-For Jetson Orin (JetPack 6) or Jetson Thor (JetPack 7), see the [Jetson setup guide](docs/jetson.md).
+For Jetson Orin (JetPack 6) or Jetson Thor (JetPack 7), see the
+[Jetson setup guide](https://github.com/m87-labs/kestrel/blob/main/docs/jetson.md).
 
 ## Model Access
 
@@ -132,7 +133,8 @@ asyncio.run(main())
 
 Kestrel accepts encoded paths, bytes, bounded binary streams, raw mono PCM,
 and asynchronous PCM iterators. Long paths are decoded incrementally. See
-[Speech-to-text models](docs/asr.md) for the shared interface and model
+[Speech-to-text models](https://github.com/m87-labs/kestrel/blob/main/docs/asr.md)
+for the shared interface and model
 capability matrix, model-specific options, formats, and resource limits.
 
 ## Tasks
@@ -331,11 +333,16 @@ architecture and checkpoint format.
 
 ## Triton Inference Server
 
-Kestrel can be deployed as a [Triton Inference Server](https://github.com/triton-inference-server/server) backend. See the [Triton setup guide](triton_server/README.md).
+Kestrel can be deployed as a
+[Triton Inference Server](https://github.com/triton-inference-server/server)
+backend. See the
+[Triton setup guide](https://github.com/m87-labs/kestrel/blob/main/triton_server/README.md).
 
 ## Benchmarks
 
-Throughput and latency for the `query` skill are tracked in [PERFORMANCE.md](./PERFORMANCE.md), with results broken out by GPU.
+Throughput and latency for the `query` skill are tracked in
+[PERFORMANCE.md](https://github.com/m87-labs/kestrel/blob/main/PERFORMANCE.md),
+with results broken out by GPU.
 
 ## Telemetry
 
