@@ -43,7 +43,7 @@ def _make_module(runtime: _FakeMoeRuntime) -> MoEModule:
     return module
 
 
-def test_prefill_moe_handles_reuse_power_of_two_capacity_bucket() -> None:
+def test_prefill_moe_handle_passes_exact_capacity_to_runtime() -> None:
     runtime = _FakeMoeRuntime()
     module = _make_module(runtime)
 
@@ -60,8 +60,8 @@ def test_prefill_moe_handles_reuse_power_of_two_capacity_bucket() -> None:
         mode="prefill",
     )
 
-    assert first is second
-    assert [capacity.max_tokens for capacity in runtime.capacities] == [256]
+    assert first is not second
+    assert [capacity.max_tokens for capacity in runtime.capacities] == [129, 200]
 
 
 def test_decode_moe_handles_remain_exact_capacity_for_cuda_graph_buckets() -> None:
