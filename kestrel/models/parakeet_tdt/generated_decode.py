@@ -74,6 +74,10 @@ class _TdtDecodeBindings:
 class _TdtBatchGeneratedDecoder:
     """Run one complete TDT decision per generated kernel launch."""
 
+    # Tried an outer CUDA graph around the generated step plus device recurrence:
+    # it returned an empty L4 transcript. The graph-free tensor recurrence was
+    # correct but slowed C1 from 75.4 ms to 127.2 ms; keeping host recurrence.
+
     minimum_batch = 1
 
     @classmethod
