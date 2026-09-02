@@ -8,7 +8,7 @@ import pytest
 
 from kestrel.models.moondream.runtime import PrefillClassification, TextToken
 from kestrel.runtime import SequenceState
-from kestrel.scheduler.pipeline import PipelineState
+from kestrel.scheduler.pipeline import DecodeLaunch, LaunchHandle, PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
 from kestrel.scheduler.types import (
@@ -307,3 +307,73 @@ def test_advance_rejects_only_request_that_cannot_fit_kv_cache() -> None:
     assert completed[0].output == {
         "error": ("Insufficient KV cache capacity for request 42 (needs 9 tokens).")
     }
+
+
+def test_advance_finalizes_decode_without_reentering_compute_stream() -> None:
+    handle = LaunchHandle(
+        kind="decode",
+        sequences=(),
+        payload=DecodeLaunch(slot_id=0),
+    )
+    mask_plan = object()
+    pending = object()
+    committed = []
+    pipeline = SimpleNamespace(
+        has_launch_in_flight=lambda: True,
+        queue_depth=lambda: 0,
+        pop_oldest=lambda: None,
+        launch_handle=handle,
+        on_pending_commit=committed.append,
+        can_launch=lambda: False,
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace(
+        spec=None,
+        decode_slots=(SimpleNamespace(compute_stream=None),),
+    )
+    scheduler._compute_stream = None
+    scheduler._pipeline = pipeline
+    scheduler.waiting = []
+    scheduler.running = []
+    scheduler._build_mask = lambda sequences, slot: mask_plan
+    scheduler._finalize_sampling_on_stream = (
+        lambda actual_handle, actual_plan: pending
+    )
+    scheduler.finalize_sampling = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("decode hot path must not reenter its compute stream")
+    )
+
+    assert GenerationScheduler.advance(scheduler) is True
+    assert committed == [pending]
+
+
+def test_advance_launches_decode_without_reentering_compute_stream() -> None:
+    plan = object()
+    handle = object()
+    launched = []
+    pipeline = SimpleNamespace(
+        has_launch_in_flight=lambda: False,
+        queue_depth=lambda: 0,
+        pop_oldest=lambda: None,
+        launch_handle=None,
+        can_launch=lambda: True,
+        free_slot_id=lambda: 0,
+        on_launch=launched.append,
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace(spec=None)
+    scheduler._compute_stream = None
+    scheduler._pipeline = pipeline
+    scheduler.waiting = []
+    scheduler.running = [object()]
+    scheduler._launch_prefill_step = lambda actual_pipeline: False
+    scheduler.schedule_decode_step = lambda: plan
+    scheduler._launch_forward_on_stream = (
+        lambda actual_plan, slot_id: handle
+    )
+    scheduler.launch_forward_async = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("decode hot path must not reenter its compute stream"))
+
+    assert GenerationScheduler.advance(scheduler) is True
+    assert launched == [handle]

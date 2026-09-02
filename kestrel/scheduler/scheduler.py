@@ -540,7 +540,11 @@ class GenerationScheduler:
                     if handle.kind == "decode":
                         slot = self.runtime.decode_slots[handle.slot_id]
                         plan = self._build_mask(handle.sequences, slot)
-                    step = self.finalize_sampling(handle, plan)
+                        step = self._finalize_sampling_on_stream(handle, plan)
+                    else:
+                        # Prefill finalization is off the steady-state decode
+                        # path and keeps the wrapper's failure cleanup.
+                        step = self.finalize_sampling(handle, plan)
                     pipeline.on_pending_commit(step)
                     progressed = True
 
@@ -559,7 +563,7 @@ class GenerationScheduler:
                                 raise AssertionError(
                                     "Pipeline reported can_launch but no free slot_id"
                                 )
-                            handle = self.launch_forward_async(plan, slot_id)
+                            handle = self._launch_forward_on_stream(plan, slot_id)
                             pipeline.on_launch(handle)
                             progressed = True
 
