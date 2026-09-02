@@ -30,9 +30,11 @@ def _logical_weight_sources(text: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _engine_weight_buffers(text: torch.nn.Module) -> dict[str, torch.Tensor]:
+    names = ("moe_up_w_slab", "moe_up_scale_slab")
     return {
-        "moe_up_w_slab": text.moe_up_w_slab,
-        "moe_up_scale_slab": text.moe_up_scale_slab,
+        name: buffer
+        for name in names
+        if (buffer := getattr(text, name, None)) is not None
     }
 
 

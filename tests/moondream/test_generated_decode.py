@@ -61,6 +61,10 @@ def test_moondream_exposes_logical_moe_sources_and_engine_slabs() -> None:
     assert buffers["moe_up_scale_slab"] is text.moe_up_scale_slab
 
 
+def test_dense_moondream_has_no_generated_engine_slabs() -> None:
+    assert _engine_weight_buffers(torch.nn.Module()) == {}
+
+
 def test_moondream_bindings_expose_compiler_runtime_resources() -> None:
     first = _cache(1)
     second = _cache(2)
