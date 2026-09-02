@@ -29,6 +29,9 @@ class _Invocation:
     def prepare_launch(self, **extents):
         return lambda: self.launch(**extents)
 
+    def prepare_repeated_launch(self, **extents):
+        return lambda: self.launch(**extents)
+
 
 @dataclass(frozen=True)
 class _Program:
