@@ -322,6 +322,12 @@ class GenerationScheduler:
         if not isinstance(hooks, SamplingHooks):
             raise TypeError("runtime.sampling_hooks must be SamplingHooks")
         self._hooks = hooks
+        self._greedy_tail_hooks_eligible = bool(
+            hooks.process_logits is None
+            and hooks.adjust_sampling_params is None
+            and hooks.sample_greedy is None
+            and hooks.score_sampled_tokens is None
+        )
         if (
             self._hooks.process_logits is not None
             or self._hooks.adjust_sampling_params is not None
@@ -2402,7 +2408,6 @@ class GenerationScheduler:
 
         # Read forward outputs from slot's buffers
         logits = slot.logits[:batch_size]
-        hidden_last = slot.hidden_last[:batch_size]
 
         # Reuse batch indices already copied in launch_forward_async
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]
@@ -2449,7 +2454,7 @@ class GenerationScheduler:
             runtime_step = self._hooks.post_sample(
                 slot,
                 sampled_ids=sampled_ids,
-                hidden_last=hidden_last,
+                hidden_last=slot.hidden_last[:batch_size],
                 sequences=sequences,
                 batch_idx=batch_idx,
                 temperatures=temps,
@@ -2496,10 +2501,7 @@ class GenerationScheduler:
             and plan.disallow is None
             and plan.event is None
             and not plan.suppress_rows
-            and self._hooks.process_logits is None
-            and self._hooks.adjust_sampling_params is None
-            and self._hooks.sample_greedy is None
-            and self._hooks.score_sampled_tokens is None
+            and self._greedy_tail_hooks_eligible
         )
 
     def commit_step(self, step: PendingCommit) -> None:
