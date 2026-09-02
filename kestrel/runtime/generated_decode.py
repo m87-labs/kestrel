@@ -258,6 +258,15 @@ def _selectable_programs(
     )
 
 
+def _program_lookup(
+    programs: Sequence[Any], max_batch_size: int
+) -> tuple[tuple[int, Any] | None, ...]:
+    return tuple(
+        _select_program(programs, batch_size)
+        for batch_size in range(1, int(max_batch_size) + 1)
+    )
+
+
 def _generated_weight_runtime(*, label: str, required: bool) -> Any | None:
     try:
         from kestrel_kernels import generated_decode as generated_runtime
@@ -612,7 +621,7 @@ class GeneratedDecode:
             missing = [
                 int(batch_size)
                 for batch_size in required_batch_sizes
-                if not self.supports(int(batch_size))
+                if _select_program(available_programs, int(batch_size)) is None
             ]
             if missing:
                 raise RuntimeError(
@@ -625,6 +634,9 @@ class GeneratedDecode:
         )
         if not self._programs:
             raise ValueError("generated decode has no selectable batch artifact")
+        self._program_by_batch = _program_lookup(
+            self._programs, runtime.max_batch_size
+        )
 
         from kestrel_kernels.generated_decode import (
             assemble_bindings,
@@ -778,7 +790,10 @@ class GeneratedDecode:
             )
 
     def _program_for(self, batch_size: int) -> tuple[int, Any] | None:
-        return _select_program(self._programs, batch_size)
+        batch_size = int(batch_size)
+        if batch_size < 1 or batch_size > len(self._program_by_batch):
+            return None
+        return self._program_by_batch[batch_size - 1]
 
     def supports(self, batch_size: int) -> bool:
         return self._program_for(batch_size) is not None
