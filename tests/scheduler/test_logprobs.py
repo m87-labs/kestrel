@@ -87,6 +87,7 @@ def _scheduler(batch: int = 1) -> GenerationScheduler:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = SimpleNamespace()
     scheduler._hooks = SamplingHooks()
+    scheduler._greedy_tail_hooks_eligible = True
     scheduler._sampling_rng = torch.Generator()
     scheduler._sampling_temps = torch.empty((batch,), dtype=torch.float32)
     scheduler._sampling_top_ps = torch.empty((batch,), dtype=torch.float32)
@@ -1060,6 +1061,10 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
         def index_copy_(self, *_args) -> None:
             raise AssertionError("fused greedy tail must skip pending index_copy")
 
+    class HiddenLastStub:
+        def __getitem__(self, _key):
+            raise AssertionError("hidden state read without a post-sample hook")
+
     batch_indices = torch.tensor([1, 4], dtype=torch.long)
     sampled_ids = torch.empty((2,), dtype=torch.long)
     step_done = EventStub()
@@ -1068,7 +1073,7 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     slot = SimpleNamespace(
         compute_stream=object(),
         logits=torch.tensor([[1.0, 4.0], [5.0, 2.0]]),
-        hidden_last=torch.empty((2, 1)),
+        hidden_last=HiddenLastStub(),
         sampled_ids=sampled_ids,
         sampled_logprobs=torch.empty((2,), dtype=torch.float32),
         meta=SimpleNamespace(batch_idx=SimpleNamespace(gpu=batch_indices)),
@@ -1081,6 +1086,7 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     assert other_slot.compute_stream is not slot.compute_stream
     scheduler.runtime = SimpleNamespace(decode_slots=(other_slot, slot))
     scheduler._hooks = SamplingHooks()
+    scheduler._greedy_tail_hooks_eligible = True
     scheduler._pending_token_ids = PendingStub()
     scheduler._greedy_tail_workspaces = (object(), object())
     scheduler._sample_batch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -1187,6 +1193,12 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
 def test_greedy_tail_eligibility_rejects_modified_sampling(plan, hooks) -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler._hooks = hooks
+    scheduler._greedy_tail_hooks_eligible = bool(
+        hooks.process_logits is None
+        and hooks.adjust_sampling_params is None
+        and hooks.sample_greedy is None
+        and hooks.score_sampled_tokens is None
+    )
 
     assert not scheduler._can_publish_greedy_tail(plan)
 
