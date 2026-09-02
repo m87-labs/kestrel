@@ -821,7 +821,7 @@ class GeneratedDecode:
             raise RuntimeError(
                 f"generated {self._spec.label} launch misses {sorted(missing)}"
             )
-        return bound.invocation.prepare_launch(
+        return bound.invocation.prepare_repeated_launch(
             **{
                 name: value
                 for name, value in extents.items()
