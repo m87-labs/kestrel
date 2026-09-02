@@ -146,9 +146,14 @@ class Qwen3AsrTranscribeState(SkillState):
         self._clip_start_seconds = audio.clip_start_seconds
         self._alignment_audio = audio if self.timestamps == "word" else None
         self._token_ids: list[int] = []
-        self._stream_decoder = DecodeStream(skip_special_tokens=False)
-        self._stream_raw = ""
-        self._stream_text = ""
+        self._stream_decoder = (
+            DecodeStream(skip_special_tokens=False)
+            if request.stream_callback is not None
+            else None
+        )
+        if self._stream_decoder is not None:
+            self._stream_raw = ""
+            self._stream_text = ""
 
     def consume_step(self, runtime: Any, step: DecodeStep) -> None:
         del runtime
@@ -157,12 +162,10 @@ class Qwen3AsrTranscribeState(SkillState):
         self.append_token(step.token)
         token_id = int(step.token.token_id)
         self._token_ids.append(token_id)
-        piece = self._stream_decoder.step(self.tokenizer.backend, token_id)
-        if piece:
-            self._stream_raw += piece
-
-    def stop_token_ids(self, runtime: Any) -> Sequence[int]:
-        return tuple(int(token_id) for token_id in runtime.eos_token_ids)
+        if self._stream_decoder is not None:
+            piece = self._stream_decoder.step(self.tokenizer.backend, token_id)
+            if piece:
+                self._stream_raw += piece
 
     def _decoded(self) -> tuple[str, str | None]:
         return self.tokenizer.decode_result(
@@ -172,6 +175,8 @@ class Qwen3AsrTranscribeState(SkillState):
 
     def pop_stream_delta(self, runtime: Any) -> str | None:
         del runtime
+        if self._stream_decoder is None:
+            return None
         raw = self._stream_raw
         if self.language is None:
             marker = "<asr_text>"
