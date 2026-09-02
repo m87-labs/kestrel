@@ -2516,10 +2516,9 @@ class MoondreamRuntime:
                 hidden = self._native_decode_hidden(slot, batch_size, embeds)
         else:
             hidden = self._native_decode_hidden(slot, batch_size, embeds)
-        logits = lm_head(hidden, self.model.text)
+        lm_head(hidden, self.model.text, out=slot.logits[:batch_size])
 
         # Write to slot output buffers (stable addresses for graph capture)
-        slot.logits[:batch_size].copy_(logits)
         slot.hidden_last[:batch_size].copy_(hidden[:, 0, :])
 
     def _megakernel_decode_hidden(
