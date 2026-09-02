@@ -1,6 +1,6 @@
 import contextlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -31,6 +31,9 @@ class _Invocation:
 
     def prepare_repeated_launch(self, **extents):
         return lambda: self.launch(**extents)
+
+    def prepare_repeated_dynamic_launch(self):
+        return self.launch
 
 
 @dataclass(frozen=True)
@@ -222,6 +225,33 @@ def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypa
         ("b8", {"active_batch": 7}),
         ("b8_exact", {}),
     ]
+
+
+def test_generated_decode_repeated_dynamic_launch_keeps_step_preparations(
+    monkeypatch,
+):
+    generated, launches = _build(
+        monkeypatch,
+        _programs("b1"),
+        max_batch_size=1,
+    )
+    prepared = []
+    generated._input_preparation_plan = (
+        runtime_decode.DeviceInputPreparation("prepare", ()),
+    )
+    generated._spec = dataclass_replace(
+        generated._spec,
+        preparation_callbacks={
+            "prepare": lambda slot, batch: prepared.append((slot.slot_id, batch))
+        },
+    )
+    slot = SimpleNamespace(slot_id=0)
+
+    generated.run(slot, 1)
+    generated.run(slot, 1)
+
+    assert prepared == [(0, 1), (0, 1)]
+    assert launches == [("b1", {}), ("b1", {})]
 
 
 def test_static_launcher_resolves_capacity_once(monkeypatch):
