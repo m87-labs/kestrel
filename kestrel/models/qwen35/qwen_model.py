@@ -49,7 +49,6 @@ _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
 _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
-_KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 
@@ -164,18 +163,6 @@ def _module_dtype(module: nn.Module) -> torch.dtype:
         return next(module.parameters()).dtype
     except StopIteration:
         return torch.get_default_dtype()
-
-
-def _kestrel_moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
-    tokens = int(tokens)
-    if tokens <= 0:
-        raise ValueError("tokens must be positive")
-    if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS:
-        return tokens, "decode"
-    return (
-        max(_KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
-        "prefill",
-    )
 
 
 class Qwen3_5VisionRotaryEmbedding(nn.Module):
@@ -693,7 +680,6 @@ class Qwen3_5Experts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         tokens = int(hidden_states.shape[0])
-        capacity_tokens, capacity_mode = _kestrel_moe_capacity_for_tokens(tokens)
         if top_k_index.dtype != torch.int32:
             top_k_index = top_k_index.to(torch.int32)
         spec = _MOE_API.MoeSpec(
@@ -709,8 +695,12 @@ class Qwen3_5Experts(nn.Module):
         handle = _kestrel_moe_runtime.prepare(
             spec,
             _MOE_API.MoeCapacity(
-                max_tokens=capacity_tokens,
-                mode=capacity_mode,
+                max_tokens=tokens,
+                mode=(
+                    "decode"
+                    if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS
+                    else "prefill"
+                ),
             ),
             device=hidden_states.device,
         )

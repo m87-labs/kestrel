@@ -59,5 +59,6 @@ def test_bf16_experts_use_device_selected_moe_backend(monkeypatch) -> None:
     spec = calls["spec"]
     assert spec.backend == "auto"
     assert spec.weight_format == "bf16"
+    assert calls["capacity"].max_tokens == hidden.shape[0]
     assert calls["forward"]["topk_ids"].dtype == torch.int32
     torch.testing.assert_close(output, hidden + 1)

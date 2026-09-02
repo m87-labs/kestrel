@@ -155,6 +155,7 @@ def test_experts_use_shared_contiguous_geglu_runtime(monkeypatch) -> None:
     assert spec.activation == "geglu"
     assert spec.backend == "auto"
     assert spec.intermediate_size == config.moe_intermediate_size
+    assert calls["capacity"].max_tokens == indices.shape[0]
     assert forward["weights"].weight_scale_layout == "block128"
     assert forward["topk_ids"].dtype == torch.int32
     torch.testing.assert_close(output, hidden + 1)
