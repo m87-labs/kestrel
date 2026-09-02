@@ -151,16 +151,15 @@ class RequestLifecycle:
         if callback is not None:
             text_delta = self.skill_state.pop_stream_delta(runtime)
             reasoning_delta = self.skill_state.pop_reasoning_stream_delta(runtime)
-            if text_delta or reasoning_delta:
-                callback(
-                    StreamUpdate(
-                        request_id=self.request.request_id,
-                        token=token,
-                        text=text_delta or "",
-                        token_index=self.skill_state.token_count - 1,
-                        reasoning=reasoning_delta,
-                    )
+            callback(
+                StreamUpdate(
+                    request_id=self.request.request_id,
+                    token=token,
+                    text=text_delta or "",
+                    token_index=self.skill_state.token_count - 1,
+                    reasoning=reasoning_delta,
                 )
+            )
 
     @property
     def total_length(self) -> int:
@@ -278,7 +277,7 @@ class SchedulerResult:
 
 @dataclass
 class StreamUpdate:
-    """Incremental token update emitted while a request is decoding."""
+    """Incremental update emitted for every committed decode token."""
 
     request_id: int
     token: Token
