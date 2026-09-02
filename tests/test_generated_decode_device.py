@@ -7,6 +7,7 @@ import torch
 
 from kestrel.runtime.generated_decode import (
     GeneratedDecode,
+    _program_lookup,
     prepare_generated_weight_storage_for_loading,
     reserve_generated_binding_storage,
 )
@@ -21,6 +22,15 @@ def _program(capacity, *, active_batch=None, minimum_batch=1):
             {} if minimum_batch == 1 else {"active_batch": minimum_batch}
         ),
     )
+
+
+def _generated_with_programs(*programs):
+    generated = GeneratedDecode.__new__(GeneratedDecode)
+    generated._programs = programs
+    generated._program_by_batch = _program_lookup(
+        programs, max(program.capacity for program in programs)
+    )
+    return generated
 
 
 def test_try_create_binds_physical_sm_count_to_program_resolution():
@@ -53,13 +63,12 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
 
 
 def test_program_selection_preserves_legacy_static_preference():
-    generated = GeneratedDecode.__new__(GeneratedDecode)
     dynamic_b2 = _program(2)
     dynamic_b4 = _program(4)
     exact_b4 = _program(4, active_batch=4)
     dynamic_b8 = _program(8)
     exact_b8 = _program(8, active_batch=8)
-    generated._programs = (
+    generated = _generated_with_programs(
         dynamic_b2,
         dynamic_b4,
         exact_b4,
@@ -77,12 +86,11 @@ def test_program_selection_preserves_legacy_static_preference():
 
 
 def test_program_selection_partitions_dynamic_runtime_intervals():
-    generated = GeneratedDecode.__new__(GeneratedDecode)
     b1 = _program(1, active_batch=1)
     b2 = _program(2, minimum_batch=2)
     b4 = _program(4, minimum_batch=3)
     b8 = _program(8, minimum_batch=5)
-    generated._programs = (b1, b2, b4, b8)
+    generated = _generated_with_programs(b1, b2, b4, b8)
 
     assert [generated._program_for(batch_size)[1] for batch_size in range(1, 9)] == [
         b1,
@@ -97,11 +105,20 @@ def test_program_selection_partitions_dynamic_runtime_intervals():
 
 
 def test_program_selection_rejects_invalid_runtime_interval():
-    generated = GeneratedDecode.__new__(GeneratedDecode)
-    generated._programs = (_program(4, minimum_batch=5),)
-
     with pytest.raises(RuntimeError, match="invalid active-batch interval"):
-        generated._program_for(4)
+        _generated_with_programs(_program(4, minimum_batch=5))
+
+
+def test_program_selection_does_not_rescan_after_construction(monkeypatch):
+    generated = _generated_with_programs(_program(2), _program(4))
+    monkeypatch.setattr(
+        "kestrel.runtime.generated_decode._select_program",
+        lambda *_args, **_kwargs: pytest.fail("program selection rescanned"),
+    )
+
+    assert generated.supports(3)
+    assert generated._program_for(3)[1].capacity == 4
+    assert generated._program_for(5) is None
 
 
 def test_slot_capacity_uses_selected_program_physical_capacity(monkeypatch):
