@@ -14,6 +14,19 @@ from kestrel.models.registry import get_spec
 import kestrel.models.gemma4.model as model_module
 
 
+def test_moe_capacity_matches_generated_decode_buckets() -> None:
+    assert [
+        model_module._moe_capacity_for_tokens(tokens)
+        for tokens in (1, 3, 8, 9, 16)
+    ] == [
+        (1, "decode"),
+        (4, "decode"),
+        (8, "decode"),
+        (64, "prefill"),
+        (64, "prefill"),
+    ]
+
+
 def _text_config(*, moe: bool = True) -> Gemma4TextConfig:
     return Gemma4TextConfig(
         vocab_size=32,

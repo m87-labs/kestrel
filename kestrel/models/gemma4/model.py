@@ -33,7 +33,7 @@ _moe_runtime = get_runtime().moe
 _kestrel_gated_activation_into = _dense_runtime.gated_activation_into
 _prepare_neox_rotary = _rotary_runtime.prepare_neox
 _apply_neox_rotary = _rotary_runtime.apply_neox
-_MOE_DECODE_MAX_TOKENS = 16
+_MOE_DECODE_MAX_TOKENS = 8
 _MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 
 
@@ -42,7 +42,7 @@ def _moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
     if tokens <= 0:
         raise ValueError("tokens must be positive")
     if tokens <= _MOE_DECODE_MAX_TOKENS:
-        return tokens, "decode"
+        return 1 << (tokens - 1).bit_length(), "decode"
     return (
         max(_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
         "prefill",

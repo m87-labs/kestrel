@@ -7,6 +7,19 @@ from kestrel.models.qwen35.qwen_model import Qwen3_5Experts
 import kestrel.models.qwen35.qwen_model as model_module
 
 
+def test_moe_capacity_matches_generated_decode_buckets() -> None:
+    assert [
+        model_module._kestrel_moe_capacity_for_tokens(tokens)
+        for tokens in (1, 3, 8, 9, 16)
+    ] == [
+        (1, "decode"),
+        (4, "decode"),
+        (8, "decode"),
+        (64, "prefill"),
+        (64, "prefill"),
+    ]
+
+
 def _moe_config() -> Qwen3_5TextConfig:
     return Qwen3_5TextConfig(
         vocab_size=32,

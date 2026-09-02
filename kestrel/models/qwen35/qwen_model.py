@@ -48,7 +48,7 @@ _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
 _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
 _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
-_KESTREL_MOE_DECODE_MAX_TOKENS = 16
+_KESTREL_MOE_DECODE_MAX_TOKENS = 8
 _KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
 _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
@@ -171,7 +171,7 @@ def _kestrel_moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
     if tokens <= 0:
         raise ValueError("tokens must be positive")
     if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS:
-        return tokens, "decode"
+        return 1 << (tokens - 1).bit_length(), "decode"
     return (
         max(_KESTREL_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
         "prefill",
