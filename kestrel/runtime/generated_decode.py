@@ -118,6 +118,7 @@ class GeneratedDecodeSpec:
     preparation_callbacks: Mapping[str, Callable[[Any, int], None]] = field(
         default_factory=dict
     )
+    program_names: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -522,6 +523,8 @@ class GeneratedDecode:
 
         properties = torch.cuda.get_device_properties(runtime.device)
         resolution_options = {}
+        if spec.program_names is not None:
+            resolution_options["program_names"] = spec.program_names
         weight_sources = getattr(spec, "weight_sources", None)
         if weight_sources is not None:
             resolution_options["weight_sources"] = weight_sources
@@ -675,19 +678,28 @@ class GeneratedDecode:
                     **materialization_options,
                 )
             else:
-                expected_contract = repr(self._programs[0].descriptor["weights"])
-                actual_contract = getattr(
-                    spec.weight_storage, "weight_contract", None
-                )
-                if actual_contract != expected_contract:
-                    raise RuntimeError(
-                        "preloaded generated weights do not match the selected program"
-                    )
                 if getattr(spec.weight_storage, "finalized", None) is not True:
                     raise RuntimeError(
                         "preloaded generated weights were not finalized after loading"
                     )
-                self.weight_storage = spec.weight_storage
+                expected_contract = repr(self._programs[0].descriptor["weights"])
+                actual_contract = getattr(
+                    spec.weight_storage, "weight_contract", None
+                )
+                if actual_contract == expected_contract:
+                    self.weight_storage = spec.weight_storage
+                else:
+                    from kestrel_kernels.generated_decode import (
+                        extend_weight_storage,
+                    )
+
+                    self.weight_storage = extend_weight_storage(
+                        spec.weight_storage,
+                        spec.weight_root,
+                        self._programs[0].descriptor,
+                        layer_prefix=spec.weight_layer_prefix,
+                        **materialization_options,
+                    )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
         ambient_stream.wait_event(weights_ready)

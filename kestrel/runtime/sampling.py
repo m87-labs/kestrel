@@ -142,5 +142,10 @@ class SamplingHooks:
     # Default: no-op. Runtime gathers any aux decode inputs into slot.
     prepare_decode_inputs: Callable[..., None] | None = None
 
+    # Require ordinary temperature/top-p sampling to resolve both CUDA
+    # operations from the packed kernel bundle. Production generated runtimes
+    # use this to prevent silent JIT or torch fallbacks.
+    require_packed_sampling: bool = False
+
 
 __all__ = ["SamplingHooks"]

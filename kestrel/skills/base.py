@@ -329,6 +329,26 @@ class SkillState:
 
         return None
 
+    def pop_stream_output(
+        self,
+        runtime: "AutoregressiveRuntime",
+    ) -> Optional[Mapping[str, object]]:
+        """Return one append-only streaming update.
+
+        Text skills inherit the existing ``pop_stream_delta`` behavior. A
+        capability that streams another payload, such as synthesized PCM, can
+        override this hook without teaching the scheduler about that modality.
+        """
+
+        text = self.pop_stream_delta(runtime)
+        reasoning = self.pop_reasoning_stream_delta(runtime)
+        output = {}
+        if text:
+            output["text"] = text
+        if reasoning:
+            output["reasoning"] = reasoning
+        return output or None
+
 
 class SkillRegistry:
     """Maps a model's capability names to their skills.
