@@ -237,7 +237,14 @@ class AutoregressiveRuntime(Runtime, Protocol):
 
     def release_sequence(self, state: SequenceState) -> None: ...
 
-    def decode_with_slot(self, slot: Any, batch_size: int) -> None: ...
+    def decode_with_slot(self, slot: Any, batch_size: int) -> None:
+        """Enqueue one decode forward on the caller's current compute stream.
+
+        The scheduler owns stream selection and calls this only while already
+        inside ``slot.compute_stream``. Implementations must not re-enter that
+        same stream context on every token.
+        """
+        ...
 
 
 class SinglePassRuntime(Runtime, Protocol):

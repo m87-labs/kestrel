@@ -542,8 +542,7 @@ class Qwen3AsrRuntime(UncachedPagedRuntime):
             or self.decode_slots[slot_id] is not slot
         ):
             raise ValueError("Qwen3AsrRuntime received a foreign decode slot")
-        with stream_context(self._compute_stream):
-            self.generated_decode.run(slot, batch_size)
+        self.generated_decode.run(slot, batch_size)
 
     def align_words(
         self,

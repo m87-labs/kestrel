@@ -6,7 +6,6 @@ import os
 import threading
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -737,11 +736,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                 "selected generated Qwen decode does not cover "
                 f"active batch size {batch_size}"
             )
-        stream = getattr(slot, "compute_stream", None)
-        stream_context = (
-            torch.cuda.stream(stream) if stream is not None else nullcontext())
-        with stream_context:
-            megakernel.run(slot, batch_size)
+        megakernel.run(slot, batch_size)
 
     def _gather_decode_rope_deltas(
         self,
