@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -188,6 +188,17 @@ class _TdtBatchGeneratedDecoder:
             for slot_id in range(2)
         )
         self._generated: GeneratedDecode
+        self._launchers: dict[int, tuple[Callable[[], None], ...]] = {}
+
+    def _launchers_for(self, batch: int) -> tuple[Callable[[], None], ...]:
+        launchers = self._launchers.get(batch)
+        if launchers is None:
+            launchers = tuple(
+                self._generated.static_launcher(slot, batch)
+                for slot in self.decode_slots
+            )
+            self._launchers[batch] = launchers
+        return launchers
 
     def generate(
         self,
@@ -231,10 +242,7 @@ class _TdtBatchGeneratedDecoder:
             ):
                 current.copy_(initial)
 
-            launchers = tuple(
-                self._generated.static_launcher(slot, batch)
-                for slot in self.decode_slots
-            )
+            launchers = self._launchers_for(batch)
             pending: deque[_TdtDecodeSlot] = deque()
 
             def enqueue(slot: _TdtDecodeSlot) -> None:
