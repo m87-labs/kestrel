@@ -372,7 +372,9 @@ class _TdtBatchDecodeState:
         self,
         decisions: list[list[int]],
         active: list[bool],
-    ) -> None:
+    ) -> list[int]:
+        """Commit decisions and return rows stopped by host-only budgets."""
+        newly_policy_stopped: list[int] = []
         for index, ((token_id, duration_index), is_active) in enumerate(
             zip(decisions, active, strict=True)
         ):
@@ -391,20 +393,16 @@ class _TdtBatchDecodeState:
                 and remaining_tokens is not None
             ):
                 self.tokens_remaining[index] = remaining_tokens - 1
-
-    def policy_stopped_rows(self) -> tuple[int, ...]:
-        return tuple(
-            index
-            for index, (frame, valid_length, steps, tokens) in enumerate(zip(
-                self.frames,
-                self.valid_lengths,
-                self.steps_remaining,
-                self.tokens_remaining,
-                strict=True,
-            ))
-            if frame < valid_length
-            and (steps <= 0 or (tokens is not None and tokens <= 0))
-        )
+            tokens = self.tokens_remaining[index]
+            if (
+                self.frames[index] < self.valid_lengths[index]
+                and (
+                    self.steps_remaining[index] <= 0
+                    or (tokens is not None and tokens <= 0)
+                )
+            ):
+                newly_policy_stopped.append(index)
+        return newly_policy_stopped
 
     def output(self, device: torch.device) -> TdtOutput:
         length_values = [len(sequence) for sequence in self.sequences]

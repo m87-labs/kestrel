@@ -253,29 +253,23 @@ class _TdtBatchGeneratedDecoder:
 
             enqueue(self.decode_slots[0])
             enqueue(self.decode_slots[1])
-            policy_stopped: set[int] = set()
             while pending:
                 slot = pending.popleft()
                 slot.read_done.synchronize()
-                active = state.active()
                 decisions = (
                     slot.decisions.cpu.view(2, self.max_batch_size)
                     [:, :batch]
                     .T.tolist()
                 )
-                state.commit(decisions, active)
-                next_active = state.active()
-                if not any(next_active):
+                newly_policy_stopped = state.commit(decisions, active)
+                active = state.active()
+                if not any(active):
                     break
 
-                newly_stopped = (
-                    set(state.policy_stopped_rows()) - policy_stopped
-                )
-                for row in sorted(newly_stopped):
+                for row in newly_policy_stopped:
                     first_slot.active[row : row + 1].copy_(
                         self._inactive, non_blocking=True
                     )
-                policy_stopped.update(newly_stopped)
                 enqueue(slot)
 
             return state.output(self.device)
