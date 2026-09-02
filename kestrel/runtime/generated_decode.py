@@ -123,6 +123,7 @@ class GeneratedDecodeSpec:
 @dataclass(frozen=True)
 class _BoundInvocation:
     invocation: Any
+    repeated_dynamic_launch: Callable[..., Any]
     scalar_names: frozenset[str]
     required_launch_extents: frozenset[str]
 
@@ -770,8 +771,10 @@ class GeneratedDecode:
                         f"generated {spec.label} has unknown launch extents "
                         f"{sorted(unknown)}"
                     )
+                invocation = program.bind(bindings)
                 self._slots[(int(slot.slot_id), program_index)] = _BoundInvocation(
-                    program.bind(bindings),
+                    invocation,
+                    invocation.prepare_repeated_dynamic_launch(),
                     scalar_names,
                     frozenset(launch_extents),
                 )
@@ -859,7 +862,7 @@ class GeneratedDecode:
             raise RuntimeError(
                 f"generated {self._spec.label} launch misses {sorted(missing)}"
             )
-        bound.invocation.launch(
+        bound.repeated_dynamic_launch(
             **{
                 name: value
                 for name, value in extents.items()
