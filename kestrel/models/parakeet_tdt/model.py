@@ -324,56 +324,38 @@ class TdtOutput:
     encoder_frame_seconds: float = 0.08
 
 
-@dataclass(slots=True)
-class _TdtBatchState:
-    config: ParakeetTdtConfig
-    valid_lengths: list[int]
-    frames: list[int]
-    steps_remaining: list[int]
-    tokens_remaining: list[int | None]
-    sequences: list[list[int]]
-    durations: list[list[int]]
+def _decode_batch(
+    config: ParakeetTdtConfig,
+    valid_lengths: list[int],
+    max_tokens: int | None,
+    device: torch.device,
+    step: Callable[[list[int], list[bool]], list[list[int]]],
+) -> TdtOutput:
+    batch = len(valid_lengths)
+    frames = [0] * batch
+    steps_remaining = [
+        config.max_symbols_per_step * length for length in valid_lengths
+    ]
+    tokens_remaining = [max_tokens] * batch
+    sequences = [[config.blank_token_id] for _ in range(batch)]
+    durations = [[0] for _ in range(batch)]
 
-    @classmethod
-    def create(
-        cls,
-        config: ParakeetTdtConfig,
-        valid_lengths: list[int],
-        max_tokens: int | None,
-    ) -> "_TdtBatchState":
-        batch = len(valid_lengths)
-        return cls(
-            config=config,
-            valid_lengths=valid_lengths,
-            frames=[0] * batch,
-            steps_remaining=[
-                config.max_symbols_per_step * length for length in valid_lengths
-            ],
-            tokens_remaining=[max_tokens] * batch,
-            sequences=[[config.blank_token_id] for _ in range(batch)],
-            durations=[[0] for _ in range(batch)],
-        )
-
-    def active(self) -> list[bool]:
-        return [
+    while True:
+        active = [
             frame < valid_length
             and steps > 0
             and (tokens is None or tokens > 0)
             for frame, valid_length, steps, tokens in zip(
-                self.frames,
-                self.valid_lengths,
-                self.steps_remaining,
-                self.tokens_remaining,
+                frames,
+                valid_lengths,
+                steps_remaining,
+                tokens_remaining,
                 strict=True,
             )
         ]
-
-    def commit(
-        self,
-        decisions: list[list[int]],
-        active: list[bool],
-    ) -> None:
-        config = self.config
+        if not any(active):
+            break
+        decisions = step(frames, active)
         for index, ((token_id, duration_index), is_active) in enumerate(
             zip(decisions, active, strict=True)
         ):
@@ -382,51 +364,28 @@ class _TdtBatchState:
             duration = config.durations[duration_index]
             if token_id == config.blank_token_id and duration == 0:
                 duration = 1
-            self.sequences[index].append(token_id)
-            self.durations[index].append(duration)
-            self.frames[index] += duration
-            self.steps_remaining[index] -= 1
-            remaining_tokens = self.tokens_remaining[index]
+            sequences[index].append(token_id)
+            durations[index].append(duration)
+            frames[index] += duration
+            steps_remaining[index] -= 1
+            remaining_tokens = tokens_remaining[index]
             if token_id != config.blank_token_id and remaining_tokens is not None:
-                self.tokens_remaining[index] = remaining_tokens - 1
+                tokens_remaining[index] = remaining_tokens - 1
 
-    def output(self, device: torch.device) -> TdtOutput:
-        config = self.config
-        lengths = torch.tensor(
-            [len(sequence) for sequence in self.sequences], device=device
-        )
-        width = int(lengths.max())
-        sequence_tensor = torch.tensor(
-            [
-                sequence + [config.blank_token_id] * (width - len(sequence))
-                for sequence in self.sequences
-            ],
-            device=device,
-        )
-        duration_tensor = torch.tensor(
-            [
-                duration + [0] * (width - len(duration))
-                for duration in self.durations
-            ],
-            device=device,
-        )
-        return TdtOutput(sequence_tensor, duration_tensor, lengths)
-
-
-def _decode_batch(
-    config: ParakeetTdtConfig,
-    valid_lengths: list[int],
-    max_tokens: int | None,
-    device: torch.device,
-    step: Callable[[list[int], list[bool]], list[list[int]]],
-) -> TdtOutput:
-    state = _TdtBatchState.create(config, valid_lengths, max_tokens)
-    while True:
-        active = state.active()
-        if not any(active):
-            break
-        state.commit(step(state.frames, active), active)
-    return state.output(device)
+    lengths = torch.tensor([len(sequence) for sequence in sequences], device=device)
+    width = int(lengths.max())
+    sequence_tensor = torch.tensor(
+        [
+            sequence + [config.blank_token_id] * (width - len(sequence))
+            for sequence in sequences
+        ],
+        device=device,
+    )
+    duration_tensor = torch.tensor(
+        [duration + [0] * (width - len(duration)) for duration in durations],
+        device=device,
+    )
+    return TdtOutput(sequence_tensor, duration_tensor, lengths)
 
 
 class ParakeetTdt(nn.Module):
