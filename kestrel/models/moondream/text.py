@@ -281,7 +281,11 @@ def text_decoder(
 
 
 def lm_head(
-    hidden: torch.Tensor, module: nn.Module, indices: Optional[torch.Tensor] = None
+    hidden: torch.Tensor,
+    module: nn.Module,
+    indices: Optional[torch.Tensor] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
 ):
     hidden_last = hidden[:, -1, :]
     post_ln = LayerNormWeights(weight=module.post_ln.weight, bias=module.post_ln.bias)
@@ -289,9 +293,14 @@ def lm_head(
     if indices is not None:
         weights = module.lm_head.weight[indices]
         bias = module.lm_head.bias[indices]
-        logits = _kestrel_linear(hidden_norm, weights, bias)
+        logits = _kestrel_linear(hidden_norm, weights, bias, out=out)
     else:
-        logits = _kestrel_linear(hidden_norm, module.lm_head.weight, module.lm_head.bias)
+        logits = _kestrel_linear(
+            hidden_norm,
+            module.lm_head.weight,
+            module.lm_head.bias,
+            out=out,
+        )
     return logits
 
 

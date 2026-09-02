@@ -22,7 +22,11 @@ def _forward_runtime(monkeypatch: pytest.MonkeyPatch):
         enabled=True,
     )
     runtime._megakernel_buckets = frozenset({1})
-    monkeypatch.setattr(runtime_mod, "lm_head", lambda hidden, text: torch.ones(1, 3))
+    monkeypatch.setattr(
+        runtime_mod,
+        "lm_head",
+        lambda hidden, text, *, out: out.fill_(1),
+    )
     return runtime, slot
 
 
@@ -57,6 +61,40 @@ def test_graphs_on_genuine_megakernel_failure_remains_fatal(
 
     with pytest.raises(RuntimeError, match="kernel failed"):
         runtime._run_decode_forward(slot, 1)
+
+
+def test_decode_lm_head_writes_exact_active_logits_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, slot = _forward_runtime(monkeypatch)
+    capacity = 3
+    batch_size = 2
+    slot.decode_token_ids = torch.zeros(capacity, dtype=torch.int64)
+    slot.decode_coord_values = torch.zeros(capacity, 1)
+    slot.decode_size_values = torch.zeros(capacity, 2)
+    slot.logits = torch.full((capacity, 3), -1.0)
+    slot.hidden_last = torch.zeros(capacity, 2)
+    runtime._megakernel_buckets = frozenset({batch_size})
+    runtime._megakernel_decode_hidden = lambda *args: torch.ones(
+        batch_size, 1, 2
+    )
+    captured = {}
+
+    def fake_lm_head(hidden, text, *, out):
+        captured["out"] = out
+        out.fill_(7)
+        return torch.full_like(out, 99)
+
+    monkeypatch.setattr(runtime_mod, "lm_head", fake_lm_head)
+
+    runtime._run_decode_forward(slot, batch_size)
+
+    active_logits = slot.logits[:batch_size]
+    assert captured["out"].data_ptr() == active_logits.data_ptr()
+    assert captured["out"].shape == active_logits.shape
+    assert captured["out"].stride() == active_logits.stride()
+    assert torch.equal(active_logits, torch.full_like(active_logits, 7))
+    assert torch.equal(slot.logits[batch_size:], torch.full((1, 3), -1.0))
 
 
 def test_padding_clears_host_and_device_megakernel_metadata() -> None:
