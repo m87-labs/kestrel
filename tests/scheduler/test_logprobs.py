@@ -199,12 +199,31 @@ def test_stage_token_emits_reasoning_without_answer_text() -> None:
     seq.stage_token(SimpleNamespace(), TextToken(10))
     seq.stage_token(SimpleNamespace(), TextToken(11))
 
-    assert len(updates) == 1
+    assert len(updates) == 2
     assert updates[0].request_id == 7
     assert updates[0].token == TextToken(10)
     assert updates[0].token_index == 0
     assert updates[0].text == ""
     assert updates[0].reasoning == "think"
+    assert updates[1].token == TextToken(11)
+    assert updates[1].token_index == 1
+    assert updates[1].text == ""
+    assert updates[1].reasoning is None
+
+
+def test_stage_token_emits_update_without_text_or_reasoning_delta() -> None:
+    updates = []
+    seq = _make_lifecycle(return_logprobs=None)
+    seq.request.stream_callback = updates.append
+
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+
+    assert len(updates) == 1
+    assert updates[0].request_id == 7
+    assert updates[0].token == TextToken(10)
+    assert updates[0].token_index == 0
+    assert updates[0].text == ""
+    assert updates[0].reasoning is None
 
 
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
