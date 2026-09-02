@@ -1207,12 +1207,11 @@ class Gemma4Runtime(UncachedPagedRuntime):
                 "required generated Gemma decode does not cover "
                 f"active batch size {batch_size}"
             )
-        with torch.cuda.stream(slot.compute_stream):
-            if use_generated:
-                assert self.generated_decode is not None
-                self.generated_decode.run(slot, batch_size)
-            else:
-                self._run_native_decode(slot, batch_size)
+        if use_generated:
+            assert self.generated_decode is not None
+            self.generated_decode.run(slot, batch_size)
+        else:
+            self._run_native_decode(slot, batch_size)
 
     def _run_native_decode(self, slot: Any, batch_size: int) -> None:
         batch_idx = slot.meta.batch_idx.gpu[:batch_size]

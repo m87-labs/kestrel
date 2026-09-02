@@ -1261,18 +1261,18 @@ class WhisperRuntime(UncachedPagedRuntime):
         )
         # Generated programs are compiled for B1/B2/B4/B8. Tail lanes address
         # the globally reserved no-op row/page and are ignored by the scheduler.
-        # Staging and launch share the captured compute stream, so no host sync
-        # or device-value read is introduced for non-power-of-two batches.
-        with stream_context(self._compute_stream):
-            if launch_capacity != batch_size:
-                slot.decode_token_ids[batch_size:launch_capacity].zero_()
-                slot.meta.input_pos.gpu[batch_size:launch_capacity].zero_()
-                slot.meta.batch_idx.gpu[batch_size:launch_capacity].fill_(
-                    self._padding_batch_idx
-                )
-            # Resident slot tensors were bound at session construction. The
-            # generated launch reads token_ids/input_pos/batch_idx and writes logits.
-            self._decode_session.run(slot, launch_capacity)
+        # Staging and launch share the caller-selected compute stream, so no
+        # host sync or device-value read is introduced for non-power-of-two
+        # batches.
+        if launch_capacity != batch_size:
+            slot.decode_token_ids[batch_size:launch_capacity].zero_()
+            slot.meta.input_pos.gpu[batch_size:launch_capacity].zero_()
+            slot.meta.batch_idx.gpu[batch_size:launch_capacity].fill_(
+                self._padding_batch_idx
+            )
+        # Resident slot tensors were bound at session construction. The
+        # generated launch reads token_ids/input_pos/batch_idx and writes logits.
+        self._decode_session.run(slot, launch_capacity)
 
     def _warmup_decode(self) -> None:
         slot = self._decode_slots[0]

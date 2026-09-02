@@ -6,6 +6,8 @@ from kestrel.models.gemma4.runtime import Gemma4Runtime
 from kestrel.models.moondream.runtime import MoondreamRuntime
 from kestrel.models.qwen35 import generated_decode as qwen_generated
 from kestrel.models.qwen35.runtime import Qwen35Runtime
+from kestrel.models.qwen3_asr.runtime import Qwen3AsrRuntime
+from kestrel.models.whisper.runtime import WhisperRuntime
 from kestrel.runtime.generated_decode import GeneratedDecode
 
 
@@ -166,13 +168,21 @@ def test_generated_requirement_covers_complete_batch_domain(
         GeneratedDecode,
         "_resolve_programs",
         classmethod(
-            lambda _cls, _runtime, _spec: (SimpleNamespace(capacity=4),)
+            lambda _cls, _runtime, _spec: (
+                SimpleNamespace(
+                    capacity=1,
+                    static_extent_bindings={"active_batch": 1},
+                ),
+                SimpleNamespace(
+                    capacity=2,
+                    static_extent_bindings={"active_batch": 2},
+                ),
+                SimpleNamespace(
+                    capacity=4,
+                    static_extent_bindings={"active_batch": 4},
+                ),
+            )
         ),
-    )
-    monkeypatch.setattr(
-        GeneratedDecode,
-        "supports",
-        lambda _self, batch_size: batch_size != 3,
     )
 
     with pytest.raises(
@@ -212,6 +222,48 @@ def test_qwen_selected_generated_failure_never_falls_back_to_native() -> None:
         runtime.decode_with_slot(object(), 2)
 
 
+def test_qwen_decode_uses_caller_selected_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.qwen35 import runtime as qwen_runtime
+
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.decode_path = "generated"
+    runtime.generated_decode = _Generated(supported=True)
+    slot = SimpleNamespace(compute_stream=object())
+    monkeypatch.setattr(
+        qwen_runtime.torch.cuda,
+        "stream",
+        lambda _stream: pytest.fail("runtime must not re-enter the caller stream"),
+    )
+
+    runtime.decode_with_slot(slot, 2)
+
+    assert runtime.generated_decode.runs == [2]
+
+
+def test_qwen_asr_decode_uses_caller_selected_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.qwen3_asr import runtime as qwen_asr_runtime
+
+    runtime = object.__new__(Qwen3AsrRuntime)
+    runtime.max_batch_size = 4
+    runtime.generated_decode = _Generated(supported=True)
+    runtime._compute_stream = object()
+    slot = SimpleNamespace(slot_id=0)
+    runtime.decode_slots = (slot,)
+    monkeypatch.setattr(
+        qwen_asr_runtime,
+        "stream_context",
+        lambda _stream: pytest.fail("runtime must not re-enter the caller stream"),
+    )
+
+    runtime.decode_with_slot(slot, 2)
+
+    assert runtime.generated_decode.runs == [2]
+
+
 def test_gemma_required_generated_never_falls_back_to_native(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,6 +288,60 @@ def test_gemma_required_generated_never_falls_back_to_native(
         match="required generated Gemma decode does not cover active batch size 2",
     ):
         runtime.decode_with_slot(SimpleNamespace(compute_stream=object()), 2)
+
+
+def test_gemma_decode_uses_caller_selected_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.gemma4 import runtime as gemma_runtime
+
+    runtime = object.__new__(Gemma4Runtime)
+    runtime.decode_path = "generated"
+    runtime.generated_decode = _Generated(supported=True)
+    slot = SimpleNamespace(compute_stream=object())
+    monkeypatch.setattr(
+        gemma_runtime.torch.cuda,
+        "stream",
+        lambda _stream: pytest.fail("runtime must not re-enter the caller stream"),
+    )
+
+    runtime.decode_with_slot(slot, 2)
+
+    assert runtime.generated_decode.runs == [2]
+
+
+def test_whisper_decode_uses_caller_selected_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel.models.whisper import runtime as whisper_runtime
+
+    launches = []
+    runtime = object.__new__(WhisperRuntime)
+    runtime.max_batch_size = 4
+    runtime._decode_batch_capacities = (1, 2, 4)
+    runtime._padding_batch_idx = 0
+    runtime._compute_stream = object()
+    runtime._decode_session = SimpleNamespace(
+        run=lambda slot, capacity: launches.append((slot, capacity))
+    )
+    slot = SimpleNamespace(
+        slot_id=0,
+        decode_token_ids=torch.ones(4, dtype=torch.long),
+        meta=SimpleNamespace(
+            input_pos=SimpleNamespace(gpu=torch.ones(4, dtype=torch.int32)),
+            batch_idx=SimpleNamespace(gpu=torch.ones(4, dtype=torch.long)),
+        ),
+    )
+    runtime._decode_slots = (slot,)
+    monkeypatch.setattr(
+        whisper_runtime,
+        "stream_context",
+        lambda _stream: pytest.fail("runtime must not re-enter the caller stream"),
+    )
+
+    runtime.decode_with_slot(slot, 3)
+
+    assert launches == [(slot, 4)]
 
 
 def test_moondream_explicit_decode_path_refuses_before_runtime_work() -> None:
