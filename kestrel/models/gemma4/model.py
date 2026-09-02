@@ -34,19 +34,6 @@ _kestrel_gated_activation_into = _dense_runtime.gated_activation_into
 _prepare_neox_rotary = _rotary_runtime.prepare_neox
 _apply_neox_rotary = _rotary_runtime.apply_neox
 _MOE_DECODE_MAX_TOKENS = 16
-_MOE_MIN_PREFILL_BUCKET_TOKENS = 64
-
-
-def _moe_capacity_for_tokens(tokens: int) -> tuple[int, str]:
-    tokens = int(tokens)
-    if tokens <= 0:
-        raise ValueError("tokens must be positive")
-    if tokens <= _MOE_DECODE_MAX_TOKENS:
-        return tokens, "decode"
-    return (
-        max(_MOE_MIN_PREFILL_BUCKET_TOKENS, 1 << (tokens - 1).bit_length()),
-        "prefill",
-    )
 
 
 def _rmsnorm_state(
@@ -342,7 +329,6 @@ class Gemma4TextExperts(nn.Module):
         input_shape = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, self.hidden_size)
         tokens = int(flat_hidden.shape[0])
-        capacity_tokens, capacity_mode = _moe_capacity_for_tokens(tokens)
         if top_k_index.dtype != torch.int32:
             top_k_index = top_k_index.to(torch.int32)
         weight_formats = {
@@ -369,8 +355,8 @@ class Gemma4TextExperts(nn.Module):
         handle = _moe_runtime.prepare(
             spec,
             _MOE_API.MoeCapacity(
-                max_tokens=capacity_tokens,
-                mode=capacity_mode,
+                max_tokens=tokens,
+                mode="decode" if tokens <= _MOE_DECODE_MAX_TOKENS else "prefill",
             ),
             device=flat_hidden.device,
         )
