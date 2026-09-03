@@ -2471,10 +2471,13 @@ class GenerationScheduler:
             # The fused greedy tail has already published these rows.
             self._pending_token_ids.index_copy_(0, batch_idx, sampled_ids)
 
-        # Record a second event after pending writes so we can safely release/reuse
-        # batch indices (e.g. finalize a sequence and admit a new one into the same
-        # batch slot) without racing the `_pending_*` updates.
-        slot.commit_done_event.record()
+        pending_write_covered_by_transfer = bool(
+            pending_published and self._hooks.post_sample is None
+        )
+        if not pending_write_covered_by_transfer:
+            # Generic pending writes and model-owned post-sample work happen
+            # after step_done_event. Fence those before batch-index reuse.
+            slot.commit_done_event.record()
         for seq in sequences:
             seq.packed_pending_ready = True
 
@@ -2493,6 +2496,9 @@ class GenerationScheduler:
             transfer=transfer,
             payload=DecodePendingCommit(
                 slot_id=handle.slot_id,
+                pending_write_covered_by_transfer=(
+                    pending_write_covered_by_transfer
+                ),
                 runtime_step=runtime_step,
             ),
         )
@@ -2546,15 +2552,16 @@ class GenerationScheduler:
         # Wait for D2H transfer
         token_ids_cpu, logprobs_cpu = step.transfer.wait()
 
-        # Ensure `_pending_token_ids` writes for this step have completed before
-        # we release or reuse any batch indices (these writes intentionally do
-        # not gate the D2H above).
+        payload: DecodePendingCommit = step.payload
+        # The fused plain-greedy kernel publishes pending tokens before the
+        # transfer's ready event, so transfer completion already supplies this
+        # fence. Other paths still need the later commit event.
         slot = self.runtime.decode_slots[step.slot_id]
-        slot.commit_done_event.synchronize()
+        if not payload.pending_write_covered_by_transfer:
+            slot.commit_done_event.synchronize()
 
         # Materialise typed tokens. Runtime threads its own per-step state via
         # ``runtime_step`` (e.g. CPU-side aux values, if it owns them).
-        payload: DecodePendingCommit = step.payload
         batch_idx_cpu = slot.meta.batch_idx.cpu[: len(step.sequences)]
         tokens = self._materialize_tokens(
             token_ids_cpu,

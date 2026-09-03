@@ -164,6 +164,10 @@ class DecodePendingCommit:
     # if no hook was registered). Threaded back into the runtime's
     # materialize_tokens hook on commit.
     runtime_step: object = None
+    # The sampled-id transfer waits on step_done_event.  When the same fused
+    # kernel published pending tokens before that event, completing the transfer
+    # also proves the pending writes are safe for batch-index reuse.
+    pending_write_covered_by_transfer: bool = False
 
 
 @dataclass(slots=True)

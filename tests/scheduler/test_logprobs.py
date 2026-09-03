@@ -9,7 +9,12 @@ import torch
 from kestrel.models.moondream.region import SpatialDecodeTables
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.runtime.sampling import SamplingHooks
-from kestrel.scheduler.pipeline import DecodeLaunch, LaunchHandle
+from kestrel.scheduler.pipeline import (
+    DecodeLaunch,
+    DecodePendingCommit,
+    LaunchHandle,
+    PendingCommit,
+)
 from kestrel.scheduler.scheduler import GenerationScheduler, _MaskPlan
 from kestrel.scheduler.spatial import compute_spatial_values
 from kestrel.scheduler.types import GeneratedPrefix, GenerationRequest, RequestLifecycle
@@ -1064,8 +1069,27 @@ def test_sample_batch_plan_waits_through_event_abstraction(
     assert sampled.tolist() == [1]
 
 
-def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy(
+@pytest.mark.parametrize(
+    (
+        "all_greedy",
+        "with_post_sample",
+        "expected_pending_copies",
+        "expected_commit_records",
+        "expected_transfer_fence",
+    ),
+    [
+        (True, False, 0, 0, True),
+        (True, True, 0, 1, False),
+        (False, False, 1, 1, False),
+    ],
+)
+def test_finalize_only_reuses_transfer_fence_for_plain_fused_greedy(
     monkeypatch: pytest.MonkeyPatch,
+    all_greedy: bool,
+    with_post_sample: bool,
+    expected_pending_copies: int,
+    expected_commit_records: int,
+    expected_transfer_fence: bool,
 ) -> None:
     class EventStub:
         def __init__(self) -> None:
@@ -1075,14 +1099,12 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
             self.records += 1
 
     class PendingStub:
-        shape = (8,)
+        def __init__(self) -> None:
+            self.shape = (8,)
+            self.index_copies = 0
 
         def index_copy_(self, *_args) -> None:
-            raise AssertionError("fused greedy tail must skip pending index_copy")
-
-    class HiddenLastStub:
-        def __getitem__(self, _key):
-            raise AssertionError("hidden state read without a post-sample hook")
+            self.index_copies += 1
 
     batch_indices = torch.tensor([1, 4], dtype=torch.long)
     sampled_ids = torch.empty((2,), dtype=torch.long)
@@ -1092,7 +1114,7 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     slot = SimpleNamespace(
         compute_stream=object(),
         logits=torch.tensor([[1.0, 4.0], [5.0, 2.0]]),
-        hidden_last=HiddenLastStub(),
+        hidden_last=torch.empty((2, 1)),
         sampled_ids=sampled_ids,
         sampled_logprobs=torch.empty((2,), dtype=torch.float32),
         meta=SimpleNamespace(batch_idx=SimpleNamespace(gpu=batch_indices)),
@@ -1104,13 +1126,29 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
     other_slot = SimpleNamespace(compute_stream=object())
     assert other_slot.compute_stream is not slot.compute_stream
     scheduler.runtime = SimpleNamespace(decode_slots=(other_slot, slot))
-    scheduler._hooks = SamplingHooks()
-    scheduler._greedy_tail_hooks_eligible = True
-    scheduler._pending_token_ids = PendingStub()
-    scheduler._greedy_tail_workspaces = (object(), object())
-    scheduler._sample_batch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("eligible greedy tail must not call generic sampling")
+    runtime_step = object()
+    post_sample_calls = []
+
+    def post_sample(*args, **kwargs):
+        post_sample_calls.append((args, kwargs))
+        return runtime_step
+
+    scheduler._hooks = SamplingHooks(
+        post_sample=post_sample if with_post_sample else None
     )
+    scheduler._greedy_tail_hooks_eligible = True
+    pending = PendingStub()
+    scheduler._pending_token_ids = pending
+    scheduler._greedy_tail_workspaces = (object(), object())
+    generic_calls = []
+
+    def sample_batch(*args, **kwargs):
+        generic_calls.append((args, kwargs))
+        out = args[2]
+        out.copy_(torch.tensor([1, 0]))
+        return out, None, None, None
+
+    scheduler._sample_batch = sample_batch
     calls = []
 
     def fused(
@@ -1149,26 +1187,72 @@ def test_finalize_uses_slot_local_fused_greedy_tail_and_skips_pending_index_copy
         disallow=None,
         event=None,
         suppress_rows=[],
-        all_greedy=True,
+        all_greedy=all_greedy,
         any_return_logprobs=False,
     )
 
     result = scheduler._finalize_sampling_on_stream(handle, plan)
 
-    assert len(calls) == 1
-    assert calls[0][1].data_ptr() == batch_indices.data_ptr()
-    assert torch.equal(calls[0][1], batch_indices)
-    assert calls[0][2] is scheduler._pending_token_ids
-    assert calls[0][3] is scheduler._greedy_tail_workspaces[1]
-    assert calls[0][4] is sampled_ids
-    assert calls[0][5] is True
-    assert torch.all(calls[0][1] >= 0)
-    assert torch.all(calls[0][1] < scheduler._pending_token_ids.shape[0])
+    assert len(calls) == int(all_greedy)
+    assert len(generic_calls) == int(not all_greedy)
+    if all_greedy:
+        assert calls[0][1].data_ptr() == batch_indices.data_ptr()
+        assert torch.equal(calls[0][1], batch_indices)
+        assert calls[0][2] is scheduler._pending_token_ids
+        assert calls[0][3] is scheduler._greedy_tail_workspaces[1]
+        assert calls[0][4] is sampled_ids
+        assert calls[0][5] is True
+        assert torch.all(calls[0][1] >= 0)
+        assert torch.all(calls[0][1] < scheduler._pending_token_ids.shape[0])
     assert sampled_ids.tolist() == [1, 0]
     assert step_done.records == 1
-    assert commit_done.records == 1
+    assert pending.index_copies == expected_pending_copies
+    assert commit_done.records == expected_commit_records
+    assert len(post_sample_calls) == int(with_post_sample)
     assert all(sequence.packed_pending_ready for sequence in sequences)
     assert result.transfer is transfer
+    assert (
+        result.payload.pending_write_covered_by_transfer is expected_transfer_fence
+    )
+    assert result.payload.runtime_step is (
+        runtime_step if with_post_sample else None
+    )
+
+
+@pytest.mark.parametrize("transfer_fences_pending", [False, True])
+def test_decode_commit_uses_the_required_pending_write_fence(
+    transfer_fences_pending: bool,
+) -> None:
+    class CommitEventStub:
+        def __init__(self) -> None:
+            self.synchronizes = 0
+
+        def synchronize(self) -> None:
+            self.synchronizes += 1
+
+    commit_done = CommitEventStub()
+    slot = SimpleNamespace(
+        commit_done_event=commit_done,
+        meta=SimpleNamespace(batch_idx=SimpleNamespace(cpu=torch.empty((0,)))),
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace(decode_slots=(slot,))
+    scheduler._hooks = SamplingHooks()
+    step = PendingCommit(
+        kind="decode",
+        sequences=[],
+        transfer=SimpleNamespace(
+            wait=lambda: (torch.empty((0,), dtype=torch.long), None)
+        ),
+        payload=DecodePendingCommit(
+            slot_id=0,
+            pending_write_covered_by_transfer=transfer_fences_pending,
+        ),
+    )
+
+    scheduler.commit_step(step)
+
+    assert commit_done.synchronizes == int(not transfer_fences_pending)
 
 
 @pytest.mark.parametrize(
