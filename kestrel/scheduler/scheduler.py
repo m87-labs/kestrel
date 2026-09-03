@@ -2304,10 +2304,15 @@ class GenerationScheduler:
             idx_np = slot.meta.batch_idx.np
             pos_np = slot.meta.input_pos.np
             lora_np = slot.meta.lora_slot_ids.np
+            max_input_pos = 0
             for i, seq in enumerate(sequences):
                 idx_np[i] = seq.state.batch_idx
-                pos_np[i] = seq.state.length
+                input_pos = seq.state.length
+                pos_np[i] = input_pos
                 lora_np[i] = seq.state.lora_slot
+                if input_pos > max_input_pos:
+                    max_input_pos = input_pos
+            slot.meta.max_input_pos = max_input_pos
 
             # One H2D copy stages batch_idx/input_pos/lora_slot_ids together
             # (they share a packed buffer) instead of three separate launches.

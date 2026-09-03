@@ -1,9 +1,14 @@
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import torch
 
 from kestrel.runtime import SequenceState, TextToken
+from kestrel.runtime.decode_slot import DecodeMetaBuffers
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.scheduler.queues import RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler
-from kestrel.scheduler.types import GenerationRequest, RequestLifecycle
+from kestrel.scheduler.types import GenerationRequest, RequestLifecycle, StepPlan
 
 from tests.scheduler._fake_runtime import FakeRuntime
 
@@ -66,3 +71,29 @@ def test_resident_tail_does_not_replace_temporarily_blocked_cohort_member() -> N
     plan = scheduler.schedule_decode_step()
 
     assert plan.sequences == [sequences[1]]
+
+
+def test_decode_launch_retains_maximum_staged_position() -> None:
+    scheduler = object.__new__(GenerationScheduler)
+    runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    slot = SimpleNamespace(
+        slot_id=0,
+        meta=DecodeMetaBuffers(
+            max_batch_slots=4,
+            device=torch.device("cpu"),
+            pin_memory=False,
+        ),
+        decode_token_ids=torch.empty(4, dtype=torch.long),
+    )
+    runtime.decode_slots[0] = slot
+    scheduler.runtime = runtime
+    scheduler._pending_token_ids = torch.arange(4, dtype=torch.long)
+    scheduler._hooks = SamplingHooks()
+    sequences = [_make_lifecycle(request_id) for request_id in (1, 2)]
+    sequences[0].state.length = 7
+    sequences[1].state.length = 3
+
+    scheduler._launch_forward_on_stream(StepPlan(sequences), slot_id=0)
+
+    assert slot.meta.input_pos.cpu[:2].tolist() == [7, 3]
+    assert slot.meta.max_input_pos == 7

@@ -130,6 +130,7 @@ def test_moondream_slot_bindings_use_stable_hidden_and_metadata_buffers() -> Non
     slot = SimpleNamespace(
         hidden_last=torch.zeros(8, 16),
         meta=SimpleNamespace(
+            max_input_pos=6,
             batch_idx=SimpleNamespace(gpu=torch.arange(8)),
             input_pos=SimpleNamespace(
                 gpu=torch.arange(8, dtype=torch.int32),

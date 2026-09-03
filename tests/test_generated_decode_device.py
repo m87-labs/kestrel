@@ -7,10 +7,20 @@ import torch
 
 from kestrel.runtime.generated_decode import (
     GeneratedDecode,
+    PagedDecodeBindings,
     _program_lookup,
     prepare_generated_weight_storage_for_loading,
     reserve_generated_binding_storage,
 )
+
+
+def test_paged_launch_extents_use_scheduler_position_scalar() -> None:
+    slot = SimpleNamespace(meta=SimpleNamespace(max_input_pos=37))
+
+    assert PagedDecodeBindings(layers=()).launch_extents(slot, 3) == {
+        "active_batch": 3,
+        "kv_len": 38,
+    }
 
 
 def _program(capacity, *, active_batch=None, minimum_batch=1):
