@@ -31,6 +31,9 @@ class DecodeMetaBuffers:
         self.batch_idx = self.inputs.batch_idx
         self.input_pos = self.inputs.input_pos
         self.lora_slot_ids = self.inputs.lora_slot_ids
+        # Scheduler-owned scalar companion to the staged positions.  This removes
+        # a per-launch host tensor reduction; end-to-end impact is not yet validated.
+        self.max_input_pos = 0
 
 
 @dataclass

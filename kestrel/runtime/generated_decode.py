@@ -97,7 +97,7 @@ class PagedDecodeBindings:
     def launch_extents(slot: Any, batch_size: int) -> Mapping[str, int]:
         return {
             "active_batch": int(batch_size),
-            "kv_len": int(slot.meta.input_pos.cpu[:batch_size].max()) + 1,
+            "kv_len": int(slot.meta.max_input_pos) + 1,
         }
 
 

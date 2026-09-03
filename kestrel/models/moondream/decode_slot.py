@@ -54,6 +54,9 @@ class DecodeMetaBuffers:
             device=device,
             pin_memory=True,
         )
+        # Scheduler-owned scalar companion to the staged positions.  This removes
+        # a per-launch host tensor reduction; end-to-end impact is not yet validated.
+        self.max_input_pos = 0
         # token-major MoE LoRA ids
         self.active_token_ids = CpuGpuBuffer(
             max_batch_slots, dtype=torch.int32, device=device, pin_memory=True
