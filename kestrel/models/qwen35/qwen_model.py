@@ -44,6 +44,7 @@ _kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
 _kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
 _kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
 _kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
+_kestrel_linear = _kestrel_runtime.linear.linear
 _kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
 _kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
 _kestrel_moe_runtime = _kestrel_runtime.moe
@@ -363,7 +364,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=torch.long,
         ).view(-1).contiguous()
 
-        in_proj = self.in_proj(hidden_states)
+        in_proj = _kestrel_linear(
+            hidden_states, self.in_proj.weight, self.in_proj.bias
+        )
         mixed_qkv, z, b, a = torch.split(
             in_proj,
             [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads],
@@ -450,7 +453,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        output = self.out_proj(core_attn_out)
+        output = _kestrel_linear(
+            core_attn_out, self.out_proj.weight, self.out_proj.bias
+        )
         return output
 
 
@@ -495,7 +500,9 @@ class Qwen3_5Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        q_gate, key_states, value_states = self.qkv_proj(hidden_states).split(
+        q_gate, key_states, value_states = _kestrel_linear(
+            hidden_states, self.qkv_proj.weight, self.qkv_proj.bias
+        ).split(
             [self.q_gate_size, self.kv_size, self.kv_size],
             dim=-1,
         )
@@ -561,7 +568,9 @@ class Qwen3_5Attention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = _kestrel_linear(
+            attn_output, self.o_proj.weight, self.o_proj.bias
+        )
         return attn_output, attn_weights
 
 
@@ -586,7 +595,9 @@ class Qwen3_5MLP(nn.Module):
         )
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
+        gate_up = _kestrel_linear(
+            x, self.gate_up_proj.weight, self.gate_up_proj.bias
+        )
         hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
             hidden,
@@ -594,7 +605,9 @@ class Qwen3_5MLP(nn.Module):
             activation="silu",
             layout=_KESTREL_MOE_GATE_UP_LAYOUT,
         )
-        return self.down_proj(hidden)
+        return _kestrel_linear(
+            hidden, self.down_proj.weight, self.down_proj.bias
+        )
 
 
 class Qwen3_5Experts(nn.Module):
@@ -974,7 +987,7 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.proj(hidden_states)
+        return _kestrel_linear(hidden_states, self.proj.weight, self.proj.bias)
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):
@@ -988,8 +1001,9 @@ class Qwen3_5VisionPatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x).view(-1, self.hidden_size)
-        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return x
+        x = _kestrel_linear(x, self.linear_fc1.weight, self.linear_fc1.bias)
+        x = self.act_fn(x)
+        return _kestrel_linear(x, self.linear_fc2.weight, self.linear_fc2.bias)
 
 
 class Qwen3_5VisionAttention(nn.Module):
@@ -1009,9 +1023,12 @@ class Qwen3_5VisionAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        qkv = _kestrel_linear(
+            hidden_states, self.qkv.weight, self.qkv.bias
+        ).view(
+            seq_length, 3, self.num_heads, self.head_dim
         )
+        query_states, key_states, value_states = qkv.unbind(dim=1)
         cos, sin = position_embeddings
         query_states, key_states = _kestrel_spatial_rope_apply(
             query_states, key_states, cos, sin, axis_blocks=1
@@ -1031,7 +1048,9 @@ class Qwen3_5VisionAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
+        attn_output = _kestrel_linear(
+            attn_output, self.proj.weight, self.proj.bias
+        )
         return attn_output
 
 

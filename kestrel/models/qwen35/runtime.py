@@ -48,6 +48,7 @@ from .qwen_image import preprocess_image
 
 
 _PREFILL_SCRATCH_TOKENS = 1024
+_kestrel_linear = get_runtime().linear.linear
 
 
 @dataclass
@@ -716,7 +717,11 @@ class Qwen35Runtime(UncachedPagedRuntime):
             for row, prepared in enumerate(prepared_sequences):
                 prepared.state.last_hidden = hidden_rows[row].detach()
 
-            return self.model.lm_head(hidden_rows)
+            return _kestrel_linear(
+                hidden_rows,
+                self.model.lm_head.weight,
+                self.model.lm_head.bias,
+            )
         finally:
             self._record_prefill_slot_done(prefill_slot)
 
