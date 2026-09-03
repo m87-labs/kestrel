@@ -131,7 +131,8 @@ class AutoregressiveRuntime(Runtime, Protocol):
     graph_capture_lock: Any  # context manager serializing CUDA-graph capture
     kv_pool: Any  # Engine-owned KV memory pool shared with co-hosted AR runtimes
 
-    # Shared cache state used by the scheduler.
+    # Shared cache state used by the scheduler for capacity accounting. The
+    # runtime owns page mappings and their device visibility.
     page_table: Any
 
     # Capacity queries
@@ -242,7 +243,9 @@ class AutoregressiveRuntime(Runtime, Protocol):
 
         The scheduler owns stream selection and calls this only while already
         inside ``slot.compute_stream``. Implementations must not re-enter that
-        same stream context on every token.
+        same stream context on every token. If an implementation changes page
+        mappings after prefill, it must make them device-visible before the
+        decode reads them; the scheduler does not commit runtime-owned mappings.
         """
         ...
 

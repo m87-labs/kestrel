@@ -111,6 +111,7 @@ def test_launch_prepared_batch_omits_paged_kv_q_lengths_for_uniform_q_lengths() 
     )
 
     assert logits.shape == (2, 8)
+    assert runtime.page_table.committed == [1, 2]
     assert captured["position_ids_contiguous"]
     assert captured["batch_idx_contiguous"]
     assert captured["paged_kv_seqlens_q"] is None

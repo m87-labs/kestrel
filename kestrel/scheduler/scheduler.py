@@ -2327,10 +2327,6 @@ class GenerationScheduler:
             if self._hooks.prepare_decode_inputs is not None:
                 self._hooks.prepare_decode_inputs(slot, batch_idx, batch_size)
 
-            # Commit page table for all batch indices before forward pass (deferred H2D sync)
-            batch_indices_list = [seq.state.batch_idx for seq in sequences]
-            self.runtime.page_table.commit_block_table(batch_indices_list)
-
             # Run forward pass - writes to slot.logits and slot.hidden_last.
             # ``inference_mode`` is applied centrally here (not left to each
             # runtime) so eager model paths can't accidentally retain

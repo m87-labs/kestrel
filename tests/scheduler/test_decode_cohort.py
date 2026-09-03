@@ -97,3 +97,4 @@ def test_decode_launch_retains_maximum_staged_position() -> None:
 
     assert slot.meta.input_pos.cpu[:2].tolist() == [7, 3]
     assert slot.meta.max_input_pos == 7
+    assert runtime.page_table.commit_block_table_calls == []
