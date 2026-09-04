@@ -12,7 +12,7 @@ from torch import Tensor
 from kestrel.runtime.generated_decode import GeneratedDecode, GeneratedDecodeSpec
 from kestrel.utils import CpuGpuBuffer
 
-from .model import ParakeetTdt, TdtOutput, _TdtBatchDecodeState
+from .model import ParakeetTdt, TdtOutput, TdtState, _TdtBatchDecodeState
 
 
 @dataclass(slots=True)
@@ -73,9 +73,7 @@ class _TdtDecodeBindings:
         }
 
     @staticmethod
-    def launch_extents(
-        _slot: _TdtDecodeSlot, batch_size: int
-    ) -> Mapping[str, int]:
+    def launch_extents(_slot: _TdtDecodeSlot, batch_size: int) -> Mapping[str, int]:
         return {"active_batch": int(batch_size)}
 
 
@@ -151,19 +149,16 @@ class _TdtBatchGeneratedDecoder:
             device=self.device,
             dtype=self.dtype,
         )
-        valid_lengths = torch.zeros(
-            max_batch, dtype=torch.long, device=self.device
-        )
-        frame_indices = torch.zeros(
-            max_batch, dtype=torch.long, device=self.device
-        )
+        valid_lengths = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        frame_indices = torch.zeros(max_batch, dtype=torch.long, device=self.device)
         active = torch.zeros(max_batch, dtype=torch.bool, device=self.device)
         decoder_hidden = torch.empty_like(self._initial_decoder_hidden)
         hidden = tuple(torch.empty_like(value) for value in self._initial_hidden)
         cell = tuple(torch.empty_like(value) for value in self._initial_cell)
-        self._initial_frame_indices = torch.arange(
-            max_batch, dtype=torch.long, device=self.device
-        ) * config.encoder.max_position_embeddings
+        self._initial_frame_indices = (
+            torch.arange(max_batch, dtype=torch.long, device=self.device)
+            * config.encoder.max_position_embeddings
+        )
         self._inactive = torch.zeros(1, dtype=torch.bool, pin_memory=True)
         self.decode_slots: Sequence[_TdtDecodeSlot] = tuple(
             _TdtDecodeSlot(
@@ -212,35 +207,153 @@ class _TdtBatchGeneratedDecoder:
             raise ValueError("TDT generated decode requires a supported batch")
         first_slot = self.decode_slots[0]
         if width > first_slot.encoded.shape[1]:
-            return self.model._generate_batch(
-                encoded, valid, max_tokens=max_tokens
+            return self.model._generate_batch(encoded, valid, max_tokens=max_tokens)
+
+        state = self._run(encoded, valid, max_tokens=max_tokens)
+        return state.output(self.device)
+
+    def generate_windows(
+        self,
+        encoded: Tensor,
+        valid: Tensor,
+        *,
+        max_tokens: int | None,
+        start_frames: Sequence[int],
+        frame_counts: Sequence[int | None],
+        states: Sequence[TdtState | None],
+    ) -> tuple[TdtOutput, ...]:
+        """Decode a cohort of windows, retaining recurrent state on the GPU."""
+        batch = encoded.shape[0]
+        if not (len(start_frames) == len(frame_counts) == len(states) == batch):
+            raise ValueError("TDT windows must match the encoded batch")
+        if encoded.shape[1] > self.decode_slots[0].encoded.shape[1]:
+            return tuple(
+                self.model.generate_encoded(
+                    encoded[row : row + 1],
+                    valid[row : row + 1],
+                    max_tokens=max_tokens,
+                    start_frame=start_frames[row],
+                    frame_count=frame_counts[row],
+                    state=states[row],
+                )
+                for row in range(batch)
             )
+        with torch.cuda.stream(self.compute_stream):
+            state = self._run(
+                encoded,
+                valid,
+                max_tokens=max_tokens,
+                start_frames=start_frames,
+                frame_counts=frame_counts,
+                previous_states=states,
+            )
+            slot = self.decode_slots[0]
+            # Returned rows retain immutable cohort snapshots, independent of
+            # launch storage. Copy each state tensor once, not once per row.
+            decoder_hidden = slot.decoder_hidden[:batch].clone()
+            hidden = torch.stack([value[:batch] for value in slot.hidden], dim=0)
+            cell = torch.stack([value[:batch] for value in slot.cell], dim=0)
+            return tuple(
+                TdtOutput(
+                    sequences=torch.tensor([state.sequences[row]], device=self.device),
+                    durations=torch.tensor([state.durations[row]], device=self.device),
+                    lengths=torch.tensor(
+                        [len(state.sequences[row])], device=self.device
+                    ),
+                    state=TdtState(
+                        decoder_hidden[row : row + 1, None],
+                        hidden[:, row : row + 1],
+                        cell[:, row : row + 1],
+                        max(0, state.frames[row] - state.valid_lengths[row]),
+                    ),
+                )
+                for row in range(batch)
+            )
+
+    def _run(
+        self,
+        encoded: Tensor,
+        valid: Tensor,
+        *,
+        max_tokens: int | None,
+        start_frames: Sequence[int] | None = None,
+        frame_counts: Sequence[int | None] | None = None,
+        previous_states: Sequence[TdtState | None] | None = None,
+    ) -> _TdtBatchDecodeState:
+        batch, width, _ = encoded.shape
+        if not self.minimum_batch <= batch <= self.max_batch_size:
+            raise ValueError("TDT generated decode requires a supported batch")
+        first_slot = self.decode_slots[0]
 
         with torch.cuda.stream(self.compute_stream):
             valid_device = valid.sum(-1).to(dtype=torch.long)
             valid_lengths = valid_device.tolist()
-            state = _TdtBatchDecodeState.create(
-                self.model.config, valid_lengths, max_tokens
+            starts = [0] * batch if start_frames is None else list(start_frames)
+            counts = [None] * batch if frame_counts is None else list(frame_counts)
+            previous = (
+                [None] * batch if previous_states is None else list(previous_states)
             )
+            ends = [
+                length if count is None else min(length, start + count)
+                for length, start, count in zip(
+                    valid_lengths, starts, counts, strict=True
+                )
+            ]
+            if any(
+                not 0 <= start <= end for start, end in zip(starts, ends, strict=True)
+            ):
+                raise ValueError("TDT decode frames are outside the encoded audio")
+            state = _TdtBatchDecodeState.create(self.model.config, ends, max_tokens)
+            for row, (start, end, prior) in enumerate(
+                zip(starts, ends, previous, strict=True)
+            ):
+                carry = 0 if prior is None else prior.carry
+                state.frames[row] = start + carry
+                state.durations[row][0] = min(carry, end - start)
+                state.steps_remaining[row] = self.model.config.max_symbols_per_step * (
+                    end - start
+                )
             active = state.active()
-            if not any(active):
-                return state.output(self.device)
 
             first_slot.encoded[:batch, :width].copy_(encoded)
-            first_slot.valid_lengths[:batch].copy_(valid_device)
+            first_slot.valid_lengths[:batch].copy_(
+                torch.tensor(ends, device=self.device)
+            )
             first_slot.frame_indices[:batch].copy_(
                 self._initial_frame_indices[:batch]
+                + torch.tensor(state.frames, device=self.device).clamp_max(
+                    first_slot.encoded.shape[1] - 1
+                )
             )
-            first_slot.active[:batch].copy_(
-                torch.tensor(active, device=self.device)
+            first_slot.active[:batch].copy_(torch.tensor(active, device=self.device))
+            torch.cat(
+                [
+                    self._initial_decoder_hidden[row : row + 1]
+                    if prior is None
+                    else prior.decoder_hidden[:, 0]
+                    for row, prior in enumerate(previous)
+                ],
+                out=first_slot.decoder_hidden[:batch],
             )
-            first_slot.decoder_hidden.copy_(self._initial_decoder_hidden)
-            for current, initial in zip(
-                (*first_slot.hidden, *first_slot.cell),
-                (*self._initial_hidden, *self._initial_cell),
-                strict=True,
+            for layer, (hidden, cell) in enumerate(
+                zip(first_slot.hidden, first_slot.cell, strict=True)
             ):
-                current.copy_(initial)
+                for destination, initial, field in (
+                    (hidden, self._initial_hidden[layer], "hidden"),
+                    (cell, self._initial_cell[layer], "cell"),
+                ):
+                    torch.cat(
+                        [
+                            initial[row : row + 1]
+                            if prior is None
+                            else getattr(prior, field)[layer]
+                            for row, prior in enumerate(previous)
+                        ],
+                        out=destination[:batch],
+                    )
+
+            if not any(active):
+                return state
 
             launchers = self._launchers_for(batch)
             pending: deque[_TdtDecodeSlot] = deque()
@@ -251,16 +364,33 @@ class _TdtBatchGeneratedDecoder:
                 slot.read_done.record(self.compute_stream)
                 pending.append(slot)
 
-            enqueue(self.decode_slots[0])
-            enqueue(self.decode_slots[1])
+            def fill_pipeline() -> None:
+                # A pending decision can spend at most one token/step. Near a
+                # host policy limit, don't enqueue a decision whose state might
+                # later have to be rolled back at a streaming boundary.
+                budget = min(
+                    min(steps, tokens if tokens is not None else steps)
+                    for steps, tokens, enabled in zip(
+                        state.steps_remaining,
+                        state.tokens_remaining,
+                        active,
+                        strict=True,
+                    )
+                    if enabled
+                )
+                for candidate in self.decode_slots:
+                    if len(pending) >= min(2, budget):
+                        break
+                    if not any(item is candidate for item in pending):
+                        enqueue(candidate)
+
+            fill_pipeline()
             while pending:
                 slot = pending.popleft()
                 slot.read_done.synchronize()
-                decisions = (
-                    slot.decisions.cpu.view(2, self.max_batch_size)
-                    [:, :batch]
-                    .T.tolist()
-                )
+                decisions = slot.decisions.cpu.view(2, self.max_batch_size)[
+                    :, :batch
+                ].T.tolist()
                 newly_policy_stopped = state.commit(decisions, active)
                 active = state.active()
                 if not any(active):
@@ -270,9 +400,9 @@ class _TdtBatchGeneratedDecoder:
                     first_slot.active[row : row + 1].copy_(
                         self._inactive, non_blocking=True
                     )
-                enqueue(slot)
+                fill_pipeline()
 
-            return state.output(self.device)
+            return state
 
 
 __all__ = ["_TdtBatchGeneratedDecoder"]
