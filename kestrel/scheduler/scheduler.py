@@ -4,7 +4,6 @@ import logging
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from itertools import islice
 from typing import Deque, List, Optional, Sequence
 
 import torch
@@ -768,9 +767,8 @@ class GenerationScheduler:
         # Admit real (>=1 token) requests into free spec rows, capping the live
         # spec batch to the runtime's captured-graph batch size.
         #
-        # The decoder's pool can expose MORE free rows than ``max_batch_size``
-        # (it is sized from ``max_batch_slots == max_batch_size + 2`` to keep
-        # headroom for transient prefill, see ``runtime.max_batch_slots``), so
+        # The decoder's pool can expose more free rows than ``max_batch_size``
+        # to keep headroom for transient prefill, so
         # admitting ``while decoder.free_slots > 0`` alone would queue up to
         # ``max_batch_slots`` running rows. ``_spec_decode_step`` then snapshots
         # EVERY running row into ``active`` and hands the whole set to one
@@ -2321,15 +2319,27 @@ class GenerationScheduler:
         if not len(self.running):
             return None
 
-        # Keep decode membership stable until a cohort member retires. Prefill
-        # may leave one additional request resident in ``running`` to preserve
-        # prefill headroom, but that tail request waits for a cohort slot instead
-        # of rotating into alternate token steps. Select the cohort BEFORE
-        # checking temporary dispatchability: otherwise a pipelined member with
-        # two in-flight references would let the resident tail slip into one
-        # launch, reintroducing composition churn and irregular inter-token
-        # latency.
-        cohort = list(islice(self.running, self.runtime.max_batch_size))
+        running = list(self.running)
+        deadlines = [
+            sequence.skill_state.next_output_deadline(self.runtime)
+            for sequence in running
+        ]
+        if any(deadline is not None for deadline in deadlines):
+            cohort = [
+                sequence
+                for sequence, _deadline in sorted(
+                    zip(running, deadlines, strict=True),
+                    key=lambda item: (
+                        item[1] is None,
+                        item[1] if item[1] is not None else 0.0,
+                    ),
+                )
+            ]
+        else:
+            # Keep ordinary decode membership stable until a cohort member
+            # retires. A resident tail waits for a cohort slot instead of
+            # rotating into alternate token steps.
+            cohort = running[: self.runtime.max_batch_size]
 
         active: list[RequestLifecycle] = []
         for seq in cohort:
@@ -2338,6 +2348,8 @@ class GenerationScheduler:
             if not self._can_dispatch(seq):
                 continue
             active.append(seq)
+            if len(active) == self.runtime.max_batch_size:
+                break
 
         if not active:
             return None
