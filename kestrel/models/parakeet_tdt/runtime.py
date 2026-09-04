@@ -270,23 +270,40 @@ class ParakeetTdtRuntime:
         encoded, valid = self.model.encode(features, mask)
         values = []
         factor = self.model.config.encoder.subsampling_factor
-        for row, window, request, row_encoded, row_valid in zip(
-            rows, windows, requests, encoded, valid, strict=True
+        starts = [
+            _encoder_frames(window.start_sample, factor) for window in windows
+        ]
+        counts = [
+            None
+            if window.sample_count is None
+            else _encoder_frames(window.sample_count, factor)
+            for window in windows
+        ]
+        states = [
+            None if window.state is None else window.state.decoder
+            for window in windows
+        ]
+        if isinstance(self._batch_decoder, _TdtBatchGeneratedDecoder):
+            outputs = self._batch_decoder.generate_windows(
+                encoded, valid, max_tokens=max_tokens,
+                start_frames=starts, frame_counts=counts, states=states,
+            )
+        else:
+            outputs = tuple(
+                self.model.generate_encoded(
+                    encoded[index : index + 1], valid[index : index + 1],
+                    max_tokens=max_tokens, start_frame=start,
+                    frame_count=count, state=state,
+                )
+                for index, (start, count, state) in enumerate(
+                    zip(starts, counts, states, strict=True)
+                )
+            )
+        for row, window, request, generated in zip(
+            rows, windows, requests, outputs, strict=True
         ):
             _index, audio = row
             previous = window.state
-            generated = self.model.generate_encoded(
-                row_encoded[None],
-                row_valid[None],
-                max_tokens=max_tokens,
-                start_frame=_encoder_frames(window.start_sample, factor),
-                frame_count=(
-                    None
-                    if window.sample_count is None
-                    else _encoder_frames(window.sample_count, factor)
-                ),
-                state=None if previous is None else previous.decoder,
-            )
             length = int(generated.lengths[0])
             token_ids = generated.sequences[0, 1:length].tolist()
             durations = generated.durations[0, 1:length].tolist()
