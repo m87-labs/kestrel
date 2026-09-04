@@ -396,7 +396,9 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
     scheduler._compute_stream = None
     scheduler._pipeline = pipeline
     scheduler.waiting = []
-    scheduler.running = [object()]
+    scheduler.running = [
+        SimpleNamespace(request=SimpleNamespace(cancel_event=threading.Event()))
+    ]
     scheduler._launch_prefill_step = lambda actual_pipeline: False
     scheduler.schedule_decode_step = lambda: plan
     scheduler._launch_forward_on_stream = (
