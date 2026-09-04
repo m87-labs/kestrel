@@ -368,16 +368,19 @@ class _TdtBatchGeneratedDecoder:
                 # A pending decision can spend at most one token/step. Near a
                 # host policy limit, don't enqueue a decision whose state might
                 # later have to be rolled back at a streaming boundary.
-                budget = min(
-                    min(steps, tokens if tokens is not None else steps)
-                    for steps, tokens, enabled in zip(
-                        state.steps_remaining,
-                        state.tokens_remaining,
-                        active,
-                        strict=True,
+                # Terminal requests discard the state and retain full lookahead.
+                budget = 2
+                if previous_states is not None:
+                    budget = min(
+                        min(steps, tokens if tokens is not None else steps)
+                        for steps, tokens, enabled in zip(
+                            state.steps_remaining,
+                            state.tokens_remaining,
+                            active,
+                            strict=True,
+                        )
+                        if enabled
                     )
-                    if enabled
-                )
                 for candidate in self.decode_slots:
                     if len(pending) >= min(2, budget):
                         break
