@@ -1,10 +1,12 @@
 """Typed containers used by the scheduler."""
 
-import numpy as np
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
+
+import numpy as np
 
 from kestrel.runtime import AutoregressiveRuntime, SequenceState, Token
 from kestrel.skills import SkillSpec, SkillState, DecodeStep
@@ -149,15 +151,17 @@ class RequestLifecycle:
             self.logprobs.append(float(logprob))
         callback = self.request.stream_callback
         if callback is not None:
-            text_delta = self.skill_state.pop_stream_delta(runtime)
-            reasoning_delta = self.skill_state.pop_reasoning_stream_delta(runtime)
+            output = self.skill_state.pop_stream_output(runtime) or {}
+            text = output.get("text", "")
+            reasoning = output.get("reasoning")
             callback(
                 StreamUpdate(
                     request_id=self.request.request_id,
                     token=token,
-                    text=text_delta or "",
+                    text=text if isinstance(text, str) else "",
                     token_index=self.skill_state.token_count - 1,
-                    reasoning=reasoning_delta,
+                    reasoning=reasoning if isinstance(reasoning, str) else None,
+                    output=output,
                 )
             )
 
@@ -210,6 +214,7 @@ class GenerationRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     prompt_length: int = field(init=False)
 
@@ -277,13 +282,19 @@ class SchedulerResult:
 
 @dataclass
 class StreamUpdate:
-    """Incremental update emitted for every committed decode token."""
+    """One append-only update emitted for every committed decode token.
+
+    ``text`` remains the convenient text-delta surface. ``output`` carries the
+    capability-defined payload for non-text streams and mirrors text deltas as
+    ``{"text": text}``.
+    """
 
     request_id: int
     token: Token
     text: str
     token_index: int
     reasoning: Optional[str] = None
+    output: Mapping[str, object] = field(default_factory=dict)
 
 
 StreamCallback = Callable[[StreamUpdate], None]

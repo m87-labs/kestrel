@@ -104,6 +104,7 @@ def _build(
     weight_sources=None,
     weight_storage=None,
     materialize_calls=None,
+    extension_helper=True,
 ):
     launches = programs[0].launches
     kernels = ModuleType("kestrel_kernels")
@@ -112,6 +113,9 @@ def _build(
     generated.derive_runtime_extents = lambda _descriptor, _inputs, *, active_batch: {
         "active_batch": int(active_batch)
     }
+    generated.weight_storage_contract = lambda descriptor: repr(
+        descriptor["weights"]
+    )
 
     def materialize_weights(*_args, **kwargs):
         if materialize_calls is not None:
@@ -119,6 +123,12 @@ def _build(
         return SimpleNamespace(buffers={})
 
     generated.materialize_weights = materialize_weights
+    if extension_helper:
+        generated.extend_weight_storage = (
+            lambda storage, _module, descriptor, **kwargs: SimpleNamespace(
+                buffers={}, base=storage, descriptor=descriptor, options=kwargs
+            )
+        )
     monkeypatch.setitem(sys.modules, "kestrel_kernels", kernels)
     monkeypatch.setitem(sys.modules, "kestrel_kernels.generated_decode", generated)
     monkeypatch.setattr(
@@ -174,24 +184,27 @@ def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
         max_batch_size=1,
         weight_storage=storage,
         materialize_calls=calls,
+        extension_helper=False,
     )
 
     assert generated.weight_storage is storage
     assert calls == []
 
 
-def test_generated_decode_rejects_mismatched_preloaded_weight_storage(monkeypatch):
+def test_generated_decode_extends_partial_preloaded_weight_storage(monkeypatch):
     storage = SimpleNamespace(
-        buffers={}, weight_contract="different", finalized=True
+        buffers={}, weight_contract="partial", finalized=True
     )
 
-    with pytest.raises(RuntimeError, match="preloaded generated weights"):
-        _build(
-            monkeypatch,
-            _programs("b1"),
-            max_batch_size=1,
-            weight_storage=storage,
-        )
+    generated, _launches = _build(
+        monkeypatch,
+        _programs("b1"),
+        max_batch_size=1,
+        weight_storage=storage,
+    )
+
+    assert generated.weight_storage.base is storage
+    assert generated.weight_storage.options == {"layer_prefix": "layers"}
 
 
 def test_generated_decode_rejects_unfinalized_preloaded_weight_storage(monkeypatch):

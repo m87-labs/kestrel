@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -97,6 +98,36 @@ def _make_scheduler(
         _make_candidate(request)
     ]
     return scheduler
+
+
+def test_cancelled_prefill_waits_for_commit_before_finalizing() -> None:
+    request = _make_request()
+    request.cancel_event = threading.Event()
+    request.cancel_event.set()
+    sequence = request.lifecycle
+    sequence.sequence_state = SequenceState(
+        batch_idx=1,
+        length=1,
+        max_length=9,
+        prompt_length=1,
+    )
+    sequence.uncommitted_prefill_token = True
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = FakeRuntime()
+    scheduler.waiting = RequestQueue()
+    scheduler.running = RunningQueue()
+    scheduler.running.push(sequence)
+    finalized: list[tuple[RequestLifecycle, str]] = []
+    scheduler._finalize_sequence = lambda seq, reason: finalized.append((seq, reason))
+    scheduler._commit_prefill = lambda _step: ([TextToken(7)], None, (True,))
+    step = SimpleNamespace(kind="prefill", sequences=[sequence])
+
+    assert scheduler._cancel_requests() is False
+    scheduler.commit_step(step)
+
+    assert finalized == [(sequence, "cancelled")]
+    assert sequence.skill_state.tokens == []
+    assert len(scheduler.running) == 0
 
 
 def test_scheduler_requires_uniform_sampling_hooks() -> None:
@@ -365,7 +396,9 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
     scheduler._compute_stream = None
     scheduler._pipeline = pipeline
     scheduler.waiting = []
-    scheduler.running = [object()]
+    scheduler.running = [
+        SimpleNamespace(request=SimpleNamespace(cancel_event=threading.Event()))
+    ]
     scheduler._launch_prefill_step = lambda actual_pipeline: False
     scheduler.schedule_decode_step = lambda: plan
     scheduler._launch_forward_on_stream = (

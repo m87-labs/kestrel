@@ -4,7 +4,6 @@ import logging
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from itertools import islice
 from typing import Deque, List, Optional, Sequence
 
 import torch
@@ -508,6 +507,7 @@ class GenerationScheduler:
         progressed = False
         pipeline = self._pipeline
         with stream_context(self._compute_stream):
+            progressed |= self._cancel_requests()
             has_launch = pipeline.has_launch_in_flight()
             has_queued = pipeline.queue_depth() > 0
 
@@ -588,6 +588,31 @@ class GenerationScheduler:
                 progressed = True
         return progressed
 
+    def _cancel_requests(self) -> bool:
+        """Finish closed streams through the scheduler's existing release paths."""
+
+        progressed = False
+        for request in list(self.waiting):
+            if not request.cancel_event.is_set():
+                continue
+            self.waiting.remove(request)
+            self._finish_request_early(request, reason="cancelled")
+            progressed = True
+
+        for seq in list(self.running):
+            if (
+                not seq.request.cancel_event.is_set()
+                # The row is not safe to release until prefill commits it.
+                or seq.uncommitted_prefill_token
+            ):
+                continue
+            self.running.remove(seq)
+            self._finalize_sequence(seq, "cancelled")
+            if self.runtime.spec is not None and seq.inflight_refs == 0:
+                self._retire_spec_row(seq.state)
+            progressed = True
+        return progressed
+
     def _drain_pipeline(self) -> None:
         """Drain in-flight work before prefill / before an engine pause.
 
@@ -630,6 +655,11 @@ class GenerationScheduler:
                 self.commit_step(step)
                 pipeline.on_step_completed()
 
+        # Pause forbids new launches, but closing an already-owned request
+        # must still release its scheduler resources while the engine is idle.
+        with stream_context(self._compute_stream):
+            self._cancel_requests()
+
     # ------------------------------------------------------------------
     # Speculative decode path
     #
@@ -649,6 +679,7 @@ class GenerationScheduler:
     def _advance_spec(self) -> bool:
         progressed = False
         with stream_context(self._compute_stream):
+            progressed |= self._cancel_requests()
             progressed |= self._spec_admit()
             progressed |= self._spec_decode_step()
         return progressed
@@ -736,9 +767,8 @@ class GenerationScheduler:
         # Admit real (>=1 token) requests into free spec rows, capping the live
         # spec batch to the runtime's captured-graph batch size.
         #
-        # The decoder's pool can expose MORE free rows than ``max_batch_size``
-        # (it is sized from ``max_batch_slots == max_batch_size + 2`` to keep
-        # headroom for transient prefill, see ``runtime.max_batch_slots``), so
+        # The decoder's pool can expose more free rows than ``max_batch_size``
+        # to keep headroom for transient prefill, so
         # admitting ``while decoder.free_slots > 0`` alone would queue up to
         # ``max_batch_slots`` running rows. ``_spec_decode_step`` then snapshots
         # EVERY running row into ``active`` and hands the whole set to one
@@ -1235,7 +1265,11 @@ class GenerationScheduler:
         active = [
             seq
             for seq in self.running
-            if not seq.finished and seq.sequence_state is not None
+            if (
+                not seq.finished
+                and seq.sequence_state is not None
+                and not seq.request.cancel_event.is_set()
+            )
         ]
         # Reserve this launch's ref before the commit (see docstring): protects
         # continuing sequences from a premature retire when the commit drops
@@ -1284,6 +1318,7 @@ class GenerationScheduler:
                     seq.inflight_refs -= 1
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
+                        self._complete_deferred_cancellation(seq)
                         self._retire_spec_row(seq.state)
                 else:
                     launchable.append(seq)
@@ -1548,6 +1583,13 @@ class GenerationScheduler:
                 # stuck in FINALIZING forever after its row is retired.
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
+                    self._complete_deferred_cancellation(seq)
+                    self._retire_spec_row(seq.state)
+                continue
+            if seq.request.cancel_event.is_set():
+                self.running.remove(seq)
+                self._finalize_sequence(seq, "cancelled")
+                if seq.inflight_refs == 0:
                     self._retire_spec_row(seq.state)
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
@@ -1601,6 +1643,21 @@ class GenerationScheduler:
             exc,
             exc_info=exc,
         )
+        self._finish_request_early(
+            request,
+            reason="error",
+            error=exc,
+        )
+
+    def _finish_request_early(
+        self,
+        request: GenerationRequest,
+        *,
+        reason: str,
+        error: Exception | None = None,
+    ) -> None:
+        """Finish a request that has not installed a runtime sequence."""
+
         lifecycle = request.lifecycle
         if lifecycle.lora_slot_ready and request.lora_slot:
             # A request can carry a scheduler-owned adapter reference from an
@@ -1614,8 +1671,8 @@ class GenerationScheduler:
             finally:
                 request.lora_slot = 0
                 lifecycle.lora_slot_ready = False
-        lifecycle.finish_reason = "error"
-        lifecycle.error = exc
+        lifecycle.finish_reason = reason
+        lifecycle.error = error
         lifecycle.finished = True
         lifecycle.finalized = True
         # Terminal requests no longer need their prepared host-side encoder
@@ -1626,13 +1683,15 @@ class GenerationScheduler:
         result = SchedulerResult(
             request_id=request.request_id,
             tokens=[],
-            finish_reason="error",
+            finish_reason=reason,
             metrics=metrics,
-            output={"error": str(exc)},
+            output={"error": str(error)} if error is not None else {},
         )
         self._completed.append(result)
 
     def _is_launchable_request(self, request: GenerationRequest) -> bool:
+        if request.cancel_event.is_set():
+            return False
         lifecycle = request.lifecycle
         if lifecycle.phase not in (
             RequestPhase.WAITING_RESOURCES,
@@ -1883,8 +1942,11 @@ class GenerationScheduler:
             ),
         )
 
-    def _commit_prefill(self, step: PendingCommit) -> tuple[list[Token], Tensor | None]:
-        """Commit a prefill PendingCommit and return first tokens/logprobs."""
+    def _commit_prefill(
+        self,
+        step: PendingCommit,
+    ) -> tuple[list[Token], Tensor | None, tuple[bool, ...]]:
+        """Commit prefill and return tokens, logprobs, and cancellation snapshot."""
         if step.kind != "prefill":
             raise AssertionError("prefill commit requires a prefill pending commit")
         payload = step.payload
@@ -1906,6 +1968,16 @@ class GenerationScheduler:
             # host ownership, so the original host payload can now be dropped.
             for sequence in step.sequences:
                 sequence.request.encoder_input = None
+            cancelled = tuple(
+                not sequence.finalized
+                and sequence.request.cancel_event.is_set()
+                for sequence in step.sequences
+            )
+            for sequence, is_cancelled in zip(
+                step.sequences, cancelled, strict=True
+            ):
+                if is_cancelled:
+                    sequence.finalized = True
             tokens = self._materialize_tokens(
                 token_ids_cpu,
                 step.sequences,
@@ -1923,7 +1995,7 @@ class GenerationScheduler:
                 )
             self._release_prefill_staging(staging)
             self.runtime.release_prefill_slot(prefill_slot)
-        return tokens, logprobs_cpu
+        return tokens, logprobs_cpu, cancelled
 
     def _launch_prefill_step(self, pipeline: PipelineState) -> bool:
         """Launch a prefill forward and enqueue it into the shared pipeline.
@@ -2213,6 +2285,8 @@ class GenerationScheduler:
         """
         if seq.finalized:
             return False
+        if seq.request.cancel_event.is_set():
+            return False
         if seq.inflight_refs >= 2:
             return False
         # Absolute max length (includes prompt)
@@ -2245,15 +2319,27 @@ class GenerationScheduler:
         if not len(self.running):
             return None
 
-        # Keep decode membership stable until a cohort member retires. Prefill
-        # may leave one additional request resident in ``running`` to preserve
-        # prefill headroom, but that tail request waits for a cohort slot instead
-        # of rotating into alternate token steps. Select the cohort BEFORE
-        # checking temporary dispatchability: otherwise a pipelined member with
-        # two in-flight references would let the resident tail slip into one
-        # launch, reintroducing composition churn and irregular inter-token
-        # latency.
-        cohort = list(islice(self.running, self.runtime.max_batch_size))
+        running = list(self.running)
+        deadlines = [
+            sequence.skill_state.next_output_deadline(self.runtime)
+            for sequence in running
+        ]
+        if any(deadline is not None for deadline in deadlines):
+            cohort = [
+                sequence
+                for sequence, _deadline in sorted(
+                    zip(running, deadlines, strict=True),
+                    key=lambda item: (
+                        item[1] is None,
+                        item[1] if item[1] is not None else 0.0,
+                    ),
+                )
+            ]
+        else:
+            # Keep ordinary decode membership stable until a cohort member
+            # retires. A resident tail waits for a cohort slot instead of
+            # rotating into alternate token steps.
+            cohort = running[: self.runtime.max_batch_size]
 
         active: list[RequestLifecycle] = []
         for seq in cohort:
@@ -2262,6 +2348,8 @@ class GenerationScheduler:
             if not self._can_dispatch(seq):
                 continue
             active.append(seq)
+            if len(active) == self.runtime.max_batch_size:
+                break
 
         if not active:
             return None
@@ -2527,16 +2615,22 @@ class GenerationScheduler:
         at commit time and released when their last step completes.
         """
         if step.kind == "prefill":
-            tokens, logprobs_cpu = self._commit_prefill(step)
+            tokens, logprobs_cpu, cancelled = self._commit_prefill(step)
             if len(tokens) != len(step.sequences):
                 raise RuntimeError(
                     "Prefill token count mismatch: "
                     f"{len(tokens)} token(s) for {len(step.sequences)} sequence(s)"
                 )
             logprobs = self._logprobs_for_sequences(step.sequences, logprobs_cpu)
-            for seq, token, logprob in zip(step.sequences, tokens, logprobs):
-                seq.stage_token(self.runtime, token, logprob=logprob)
+            for seq, token, logprob, is_cancelled in zip(
+                step.sequences, tokens, logprobs, cancelled, strict=True
+            ):
                 seq.uncommitted_prefill_token = False
+                if is_cancelled:
+                    self.running.remove(seq)
+                    self._finalize_sequence(seq, "cancelled")
+                    continue
+                seq.stage_token(self.runtime, token, logprob=logprob)
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     # Prefill sequences are enqueued into `running` immediately
@@ -2564,6 +2658,14 @@ class GenerationScheduler:
         # Materialise typed tokens. Runtime threads its own per-step state via
         # ``runtime_step`` (e.g. CPU-side aux values, if it owns them).
         batch_idx_cpu = slot.meta.batch_idx.cpu[: len(step.sequences)]
+        cancelled = tuple(
+            not seq.finalized and seq.request.cancel_event.is_set()
+            for seq in step.sequences
+        )
+        for seq, is_cancelled in zip(step.sequences, cancelled, strict=True):
+            if is_cancelled:
+                self.running.remove(seq)
+                self._finalize_sequence(seq, "cancelled")
         tokens = self._materialize_tokens(
             token_ids_cpu,
             step.sequences,
@@ -2581,6 +2683,7 @@ class GenerationScheduler:
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
+                    self._complete_deferred_cancellation(seq)
                 continue
 
             # Stage token (calls consume_step, emits streaming)
@@ -3060,6 +3163,8 @@ class GenerationScheduler:
         }
         if logprobs is not None:
             sample_kwargs["logprobs_out"] = logprobs
+        if self._hooks.require_packed_sampling:
+            sample_kwargs["require_packed"] = True
         sampled_raw = sample_step_from_logits(
             logits,
             temps,
@@ -3182,7 +3287,12 @@ class GenerationScheduler:
         else:
             seq.transition(RequestPhase.FINALIZING)
 
-        self._completed.append(self._build_result(seq))
+        if reason != "cancelled" or seq.inflight_refs == 0:
+            self._completed.append(self._build_result(seq))
+
+    def _complete_deferred_cancellation(self, seq: RequestLifecycle) -> None:
+        if seq.finish_reason == "cancelled":
+            self._completed.append(self._build_result(seq))
 
     def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"

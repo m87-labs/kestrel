@@ -16,10 +16,15 @@ from tests.scheduler._fake_runtime import FakeRuntime
 @dataclass
 class _SkillStateStub:
     tokens: list[object] = field(default_factory=list)
+    deadline: float | None = None
 
     @property
     def token_count(self) -> int:
         return len(self.tokens)
+
+    def next_output_deadline(self, runtime: object) -> float | None:
+        del runtime
+        return self.deadline
 
 
 def _make_lifecycle(request_id: int) -> RequestLifecycle:
@@ -71,6 +76,21 @@ def test_resident_tail_does_not_replace_temporarily_blocked_cohort_member() -> N
     plan = scheduler.schedule_decode_step()
 
     assert plan.sequences == [sequences[1]]
+
+
+def test_stream_deadline_can_promote_a_resident_tail() -> None:
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    scheduler.running = RunningQueue()
+    sequences = [_make_lifecycle(request_id) for request_id in (1, 2, 3)]
+    scheduler.running.extend(sequences)
+    sequences[0].skill_state.deadline = 10.0
+    sequences[1].skill_state.deadline = 20.0
+    sequences[2].skill_state.deadline = 1.0
+
+    plan = scheduler.schedule_decode_step()
+
+    assert plan.sequences == [sequences[2], sequences[0]]
 
 
 def test_decode_launch_retains_maximum_staged_position() -> None:
