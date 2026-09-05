@@ -365,7 +365,10 @@ def generated_weight_programs_for_loading(
                 f"generated {label} decode has no selectable load-time artifact"
             )
         return ()
-    contracts = {repr(program.descriptor["weights"]) for program in selected}
+    contracts = {
+        generated_runtime.weight_storage_contract(program.descriptor)
+        for program in selected
+    }
     if len(contracts) != 1:
         raise RuntimeError(
             f"generated {label} artifacts disagree on weight storage"
@@ -720,9 +723,13 @@ class GeneratedDecode:
             assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
+            weight_storage_contract,
         )
 
-        contracts = {repr(program.descriptor["weights"]) for program in self._programs}
+        contracts = {
+            weight_storage_contract(program.descriptor)
+            for program in self._programs
+        }
         if len(contracts) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on weight storage"
