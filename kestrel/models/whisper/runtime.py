@@ -644,9 +644,9 @@ class WhisperRuntime(UncachedPagedRuntime):
 
         if components.session_factory is None:
             capability = torch.cuda.get_device_capability(self.device)
-            if capability[0] not in (9, 10):
+            if capability != (8, 9) and capability[0] not in (9, 10):
                 raise RuntimeError(
-                    "Optimized Whisper serving currently supports Hopper and "
+                    "Optimized Whisper serving currently supports Ada, Hopper, and "
                     f"Blackwell, got compute capability {capability[0]}."
                     f"{capability[1]}"
                 )
