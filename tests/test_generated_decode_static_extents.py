@@ -113,6 +113,9 @@ def _build(
     generated.derive_runtime_extents = lambda _descriptor, _inputs, *, active_batch: {
         "active_batch": int(active_batch)
     }
+    generated.weight_storage_contract = lambda descriptor: repr(
+        descriptor["weights"]
+    )
 
     def materialize_weights(*_args, **kwargs):
         if materialize_calls is not None:
