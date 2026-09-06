@@ -82,7 +82,8 @@ def test_native_whisper_ops_use_the_uniform_kernel_runtime_surface() -> None:
         ((8, 9), 128, False),  # Larger consumer Ada.
         ((8, 9), 142, False),  # L40/L40S must not inherit L4 admission.
         ((8, 0), 108, False),
-        ((8, 6), 82, False),
+        ((8, 6), 82, True),  # RTX 3090: exact shipped Ampere target.
+        ((8, 6), 68, False),  # Other consumer Ampere target.
         ((12, 0), 96, False),
         ((9, 0), 132, True),
         ((10, 0), 148, True),
@@ -101,7 +102,7 @@ def test_unsupported_native_target_fails_before_asset_loading(
     import kestrel.models.whisper.runtime as runtime_module
 
     monkeypatch.setattr(runtime_module, "get_device_capability", lambda _device: (8, 6))
-    monkeypatch.setattr(runtime_module, "get_device_sm_count", lambda _device: 82)
+    monkeypatch.setattr(runtime_module, "get_device_sm_count", lambda _device: 68)
     monkeypatch.setattr(
         runtime_module,
         "_load_production_components",
@@ -114,7 +115,7 @@ def test_unsupported_native_target_fails_before_asset_loading(
         SimpleNamespace(session_factory=None) if injected_native_components else None
     )
 
-    with pytest.raises(RuntimeError, match="got SM86 with 82 SMs"):
+    with pytest.raises(RuntimeError, match="got SM86 with 68 SMs"):
         WhisperRuntime(cfg, kv_pool=object(), _components=components)
 
 
