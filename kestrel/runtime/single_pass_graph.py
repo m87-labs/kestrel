@@ -46,15 +46,18 @@ class FixedShapeSinglePassGraph:
             raise ValueError("single-pass graph max_entries must be positive")
         self.enabled = bool(enabled)
         self.device = resolve_device(device)
-        if self.enabled:
-            if self.device.type != "cuda":
-                raise ValueError("single-pass graph replay requires a CUDA device")
+        if self.enabled and self.device.type != "cuda":
+            raise ValueError("single-pass graph replay requires a CUDA device")
+        if self.enabled and stream is None:
             with torch.cuda.device(self.device):
-                if stream is None:
-                    stream = torch.cuda.Stream(device=self.device)
-                elif stream.device != self.device:
+                stream = torch.cuda.Stream(device=self.device)
+        if stream is not None:
+            if self.device.type != "cuda":
+                raise ValueError("single-pass graph stream requires a CUDA device")
+            with torch.cuda.device(self.device):
+                if stream.device != self.device:
                     raise ValueError("single-pass graph stream must share its device")
-                if stream == torch.cuda.default_stream(self.device):
+                if self.enabled and stream == torch.cuda.default_stream(self.device):
                     raise ValueError(
                         "single-pass graph replay requires a non-default stream"
                     )
@@ -115,6 +118,24 @@ class FixedShapeSinglePassGraph:
         return _GraphEntry(static_inputs, outputs, graph)
 
     @contextmanager
+    def _ordered_stream(self) -> Iterator[None]:
+        """Order the ambient CUDA stream before the configured session stream."""
+        stream = self._stream
+        if stream is None:
+            yield
+            return
+        with torch.cuda.device(self.device):
+            source_stream = torch.cuda.current_stream(self.device)
+            ready = None
+            if source_stream != stream:
+                ready = torch.cuda.Event()
+                ready.record(source_stream)
+                stream.wait_event(ready)
+            with stream_context(stream):
+                yield
+            del ready
+
+    @contextmanager
     def launch(self, *inputs: Tensor) -> Iterator[tuple[Tensor, ...]]:
         """Stage one exact-shape call and lease its outputs to the caller.
 
@@ -130,24 +151,17 @@ class FixedShapeSinglePassGraph:
                 raise RuntimeError("single-pass graph leases cannot be nested")
             self._active_lease_thread = thread_id
             try:
-                if not self.enabled:
-                    yield self._outputs(self._run_forward(*values))
-                    return
-
-                stream = self._stream
-                if stream is None:
-                    raise RuntimeError("single-pass graph launch has no CUDA stream")
-                with torch.cuda.device(self.device):
-                    source_stream = torch.cuda.current_stream(self.device)
-                    ready = None
-                    if source_stream != stream:
-                        ready = torch.cuda.Event()
-                        ready.record(source_stream)
-                        stream.wait_event(ready)
-                    # Keep the caller in the owned stream context for the entire
-                    # lease, so consumers are ordered after replay before stable
-                    # outputs can be staged again by another caller.
-                    with stream_context(stream):
+                # Keep the caller in the configured stream context for the entire
+                # lease, so eager and replay consumers share identical ordering.
+                with self._ordered_stream():
+                    if not self.enabled:
+                        yield self._outputs(self._run_forward(*values))
+                    else:
+                        stream = self._stream
+                        if stream is None:
+                            raise RuntimeError(
+                                "single-pass graph launch has no CUDA stream"
+                            )
                         key = self._key(values)
                         entry = self._entries.get(key)
                         if entry is None:
@@ -164,12 +178,11 @@ class FixedShapeSinglePassGraph:
                                 destination.copy_(source)
                             entry.graph.replay()
                         yield entry.outputs
-                    del ready
             finally:
                 self._active_lease_thread = None
 
     def shutdown(self) -> None:
-        """Synchronize the owned stream and release graph pools and buffers."""
+        """Synchronize the configured stream and release retained state."""
         with self._lock:
             if self._closed:
                 return
@@ -179,12 +192,8 @@ class FixedShapeSinglePassGraph:
                 )
             self._closed = True
             try:
-                if self.enabled:
-                    stream = self._stream
-                    if stream is None:
-                        raise RuntimeError(
-                            "single-pass graph shutdown has no CUDA stream"
-                        )
+                stream = self._stream
+                if stream is not None:
                     stream.synchronize()
             finally:
                 self._entries.clear()

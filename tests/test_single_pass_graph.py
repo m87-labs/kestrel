@@ -91,6 +91,36 @@ def test_cuda_session_owns_nondefault_stream_and_waits_for_producer() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_disabled_session_keeps_eager_forward_and_consumers_ordered() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    target = torch.cuda.Stream(device=device)
+    producer = torch.cuda.Stream(device=device)
+    observed_streams = []
+
+    def forward(value: torch.Tensor) -> tuple[torch.Tensor]:
+        observed_streams.append(torch.cuda.current_stream(device))
+        return (value.square() + 1,)
+
+    session = FixedShapeSinglePassGraph(
+        enabled=False,
+        device=device,
+        stream=target,
+        run_forward=forward,
+    )
+    value = torch.zeros(4096, device=device)
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(5_000_000)
+        value.fill_(3)
+        with session.launch(value) as (output,):
+            assert torch.cuda.current_stream(device) == target
+            consumed = output + 2
+            target.synchronize()
+            torch.testing.assert_close(consumed, value.square() + 3)
+    assert observed_streams == [target]
+    session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_session_retains_four_shapes_and_evicts_the_fifth() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
