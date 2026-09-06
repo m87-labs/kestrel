@@ -11,6 +11,7 @@ from kestrel.device import (
     NoopEvent,
     empty_cache,
     get_device_capability,
+    get_device_sm_count,
     make_event,
     make_stream,
     materialize_blas_runtime,
@@ -77,6 +78,10 @@ def test_empty_cache_cuda_targets_supplied_device(
 
 def test_get_device_capability_cpu_returns_zero_tuple() -> None:
     assert get_device_capability(CPU) == (0, 0)
+
+
+def test_get_device_sm_count_cpu_returns_zero() -> None:
+    assert get_device_sm_count(CPU) == 0
 
 
 def test_make_stream_cpu_returns_none() -> None:
@@ -210,6 +215,14 @@ def test_make_event_cuda_returns_real_event() -> None:
 @pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
 def test_get_device_capability_cuda_matches_torch() -> None:
     assert get_device_capability(CUDA) == torch.cuda.get_device_capability()
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+def test_get_device_sm_count_cuda_matches_torch() -> None:
+    assert (
+        get_device_sm_count(CUDA)
+        == torch.cuda.get_device_properties(CUDA).multi_processor_count
+    )
 
 
 # --- MPS path: stream is None, event is NoopEvent, sync uses torch.mps.* ---

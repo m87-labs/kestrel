@@ -69,6 +69,13 @@ def get_device_capability(device: torch.device) -> tuple[int, int]:
     return (0, 0)
 
 
+def get_device_sm_count(device: torch.device) -> int:
+    """Return the physical CUDA SM count; non-CUDA devices return zero."""
+    if device.type == "cuda":
+        return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return 0
+
+
 def make_stream(device: torch.device) -> Optional[torch.cuda.Stream]:
     """Create a CUDA stream for explicit pipelining.
 
@@ -167,6 +174,7 @@ __all__ = [
     "NoopEvent",
     "empty_cache",
     "get_device_capability",
+    "get_device_sm_count",
     "materialize_blas_runtime",
     "make_event",
     "make_stream",
