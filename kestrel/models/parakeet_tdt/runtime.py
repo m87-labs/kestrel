@@ -178,9 +178,9 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
             run_forward=self.model.encode,
-            # One graph bounds persistent pool memory; a shape transition
-            # recaptures instead of accumulating graph pools.
-            max_entries=1,
+            # Three exact B1/B4/B8 shapes retained 372 MiB on L4 and avoided
+            # 107-146 ms recaptures; cap at four independent graph pools.
+            max_entries=4,
         )
 
     @property
