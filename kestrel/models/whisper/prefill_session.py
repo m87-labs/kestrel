@@ -13,6 +13,7 @@ from .prefill_decoder_prefix import (
     WhisperDecoderPrefixWorkspace,
     prepare_whisper_decoder_weights,
     whisper_decoder_prefix,
+    whisper_no_speech_probabilities_from_logits,
 )
 from .prefill_encoder import (
     PreparedWhisperEncoderWeights,
@@ -60,7 +61,7 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
         self._workspaces: dict[
             int, tuple[WhisperEncoderWorkspace, WhisperDecoderPrefixWorkspace]
         ] = {}
-        self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._graphs: dict[tuple[int, int, bool], torch.cuda.CUDAGraph] = {}
         self._require_packed = bool(require_packed)
         self._artifact_receipts: tuple[dict[str, object], ...] = ()
         self._lock = threading.Lock()
@@ -79,7 +80,13 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
             self._workspaces[batch_size] = workspace
         return workspace
 
-    def _run(self, slot: WhisperPrefillBuffers, batch_size: int) -> None:
+    def _run(
+        self,
+        slot: WhisperPrefillBuffers,
+        batch_size: int,
+        *,
+        separate_sot_projection: bool,
+    ) -> None:
         weights = self._weights
         cross_kv = self._cross_kv
         self_kv = self._self_kv
@@ -102,6 +109,7 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
         whisper_decoder_prefix(
             slot.control_token_ids[:batch_size],
             slot.prefix_lengths[:batch_size],
+            slot.sot_positions[:batch_size],
             slot.slot_mapping[:batch_size],
             encoder_workspace.compact_cross_keys,
             encoder_workspace.compact_cross_values,
@@ -109,13 +117,37 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
             decoder_workspace,
             self_kv,
             logits_out=slot.logits_out[:batch_size],
+            separate_sot_projection=separate_sot_projection,
             require_packed=self._require_packed,
+        )
+
+    def _score_no_speech(
+        self,
+        slot: WhisperPrefillBuffers,
+        batch_size: int,
+        *,
+        separate_sot_projection: bool,
+    ) -> None:
+        if self._weights is None:
+            raise RuntimeError("Whisper prefill session is shut down")
+        _, decoder_workspace = self._workspace(batch_size)
+        logits = (
+            decoder_workspace.projection_logits[batch_size:]
+            if separate_sot_projection
+            else slot.logits_out[:batch_size]
+        )
+        whisper_no_speech_probabilities_from_logits(
+            logits,
+            scores=decoder_workspace.no_speech_scores,
+            normalizer=decoder_workspace.no_speech_normalizer,
+            probabilities_out=slot.no_speech_probs_out[:batch_size],
         )
 
     def _stage_warmup(self, slot: WhisperPrefillBuffers, batch_size: int) -> None:
         slot.input_features[:batch_size].zero_()
         slot.control_token_ids[:batch_size].fill_(50258)
         slot.prefix_lengths[:batch_size].fill_(1)
+        slot.sot_positions[:batch_size].zero_()
         slot.slot_mapping[:batch_size].zero_()
         slot.batch_idx[:batch_size].copy_(
             torch.arange(
@@ -143,18 +175,35 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
                 with torch.cuda.stream(self._stream):
                     for batch_size in range(1, self._max_batch_size + 1):
                         self._stage_warmup(warmup_slot, batch_size)
-                        self._run(warmup_slot, batch_size)
+                        for separate_sot_projection in (False, True):
+                            self._run(
+                                warmup_slot,
+                                batch_size,
+                                separate_sot_projection=separate_sot_projection,
+                            )
+                            self._score_no_speech(
+                                warmup_slot,
+                                batch_size,
+                                separate_sot_projection=separate_sot_projection,
+                            )
                 self._stream.synchronize()
 
                 for batch_size in range(1, self._max_batch_size + 1):
                     for slot_id, slot in self._buffers.items():
-                        with torch.cuda.stream(self._stream):
-                            self._stage_warmup(slot, batch_size)
-                        self._stream.synchronize()
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph, stream=self._stream):
-                            self._run(slot, batch_size)
-                        self._graphs[(slot_id, batch_size)] = graph
+                        for separate_sot_projection in (False, True):
+                            with torch.cuda.stream(self._stream):
+                                self._stage_warmup(slot, batch_size)
+                            self._stream.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph, stream=self._stream):
+                                self._run(
+                                    slot,
+                                    batch_size,
+                                    separate_sot_projection=separate_sot_projection,
+                                )
+                            self._graphs[
+                                (slot_id, batch_size, separate_sot_projection)
+                            ] = graph
                 self._stream.synchronize()
             receipts = receipt_capture.receipts
             if self._require_packed and not receipts:
@@ -165,14 +214,28 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
             self._warmed = True
 
     @torch.inference_mode()
-    def launch(self, slot_id: int, batch_size: int) -> None:
+    def launch(
+        self,
+        slot_id: int,
+        batch_size: int,
+        *,
+        separate_sot_projection: bool,
+        retain_sot_score: bool,
+    ) -> None:
         if self._closed:
             raise RuntimeError("Whisper prefill session is shut down")
         if not self._warmed:
             raise RuntimeError("Whisper prefill session must be warmed before launch")
         if not 0 < int(batch_size) <= self._max_batch_size:
             raise ValueError("Whisper prefill batch is outside session capacity")
-        key = (int(slot_id), int(batch_size))
+        if (
+            type(separate_sot_projection) is not bool
+            or type(retain_sot_score) is not bool
+        ):
+            raise TypeError("Whisper SOT projection and retention modes must be bool")
+        if separate_sot_projection and not retain_sot_score:
+            raise ValueError("separate Whisper SOT projection requires score retention")
+        key = (int(slot_id), int(batch_size), separate_sot_projection)
         try:
             graph = self._graphs[key]
         except KeyError as exc:
@@ -180,6 +243,12 @@ class NativeWhisperPrefillSession(WhisperPrefillSession):
                 f"No captured Whisper prefill graph for slot/batch {key}"
             ) from exc
         graph.replay()
+        if retain_sot_score:
+            self._score_no_speech(
+                self._buffers[int(slot_id)],
+                int(batch_size),
+                separate_sot_projection=separate_sot_projection,
+            )
 
     def shutdown(self) -> None:
         with self._lock:

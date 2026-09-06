@@ -51,12 +51,12 @@ from .alignment import (
     TranscriptAnalysis,
     TranscriptScores,
     align_transcript_words,
-    no_speech_probability,
 )
 from .assets import CHECKPOINT_REVISION, MODEL_NAME, REPO_ID, WhisperAssets
 from .audio import AudioSource, PreparedAudio, prepare_audio
 from .config import WhisperPreprocessorConfig, WhisperTurboConfig
 from .generated_decode import create_generated_decode
+from .prefill_decoder_prefix import whisper_no_speech_probabilities_from_logits
 from .prefill_session import NativeWhisperPrefillSession
 from .runtime_abi import (
     WhisperExecutionBindings,
@@ -285,6 +285,7 @@ class WhisperPrefillSlot:
     features: CpuGpuBuffer
     metadata: PackedBuffer
     logits: Tensor
+    no_speech_probs: Tensor
 
     def execution_buffers(self) -> WhisperPrefillBuffers:
         return WhisperPrefillBuffers(
@@ -292,9 +293,11 @@ class WhisperPrefillSlot:
             input_features=self.features.gpu,
             control_token_ids=self.metadata.control_token_ids.gpu,
             prefix_lengths=self.metadata.prefix_lengths.gpu,
+            sot_positions=self.metadata.sot_positions.gpu,
             batch_idx=self.batch_idx,
             slot_mapping=self.metadata.slot_mapping.gpu,
             logits_out=self.logits,
+            no_speech_probs_out=self.no_speech_probs,
         )
 
 
@@ -530,6 +533,7 @@ class WhisperRuntime(UncachedPagedRuntime):
             process_logits=self._process_logits,
             adjust_sampling_params=self._adjust_sampling_params,
             score_sampled_tokens=self._score_sampled_tokens,
+            prepare_decode_inputs=self._prepare_decode_inputs,
             require_packed_greedy_logprobs=self._require_native,
         )
 
@@ -547,6 +551,11 @@ class WhisperRuntime(UncachedPagedRuntime):
         self._sampling_artifact_receipts: tuple[dict[str, object], ...] = ()
         self._prepared_audio: dict[int, PreparedAudio] = {}
         self._owned_cross_rows: set[int] = set()
+        self._no_speech_score_rows: set[int] = set()
+        self._pending_no_speech_score_rows: set[int] = set()
+        self._no_speech_probs = torch.empty(
+            (self.max_batch_slots,), dtype=torch.float32, device=self.device
+        )
         self.active_sequences: dict[int, Any] = {}
 
         if kv_pool is None:
@@ -629,12 +638,44 @@ class WhisperRuntime(UncachedPagedRuntime):
                 vocab_size=self.vocab_size,
                 hidden_dim=self._config.d_model,
                 position_shape=(decode_rows, 1),
+                scratch_specs={
+                    "whisper_no_speech_logits": (
+                        (self.max_batch_size, self.vocab_size),
+                        self.dtype,
+                    ),
+                    "whisper_no_speech_scores": (
+                        (self.max_batch_size, self.vocab_size),
+                        torch.float32,
+                    ),
+                    "whisper_no_speech_normalizer": (
+                        (self.max_batch_size,),
+                        torch.float32,
+                    ),
+                    "whisper_no_speech_probs": (
+                        (self.max_batch_size,),
+                        torch.float32,
+                    ),
+                },
                 compute_stream=self._compute_stream,
                 copy_stream=self._copy_stream,
             )
             for slot_id in range(_DECODE_SLOT_COUNT)
         )
         self.decode_slots: Sequence[DecodeSlot] = self._decode_slots
+        self._no_speech_decode_indices = tuple(
+            PackedBuffer(
+                [
+                    ("compact_rows", (self.max_batch_size,), torch.int64),
+                    ("batch_rows", (self.max_batch_size,), torch.int64),
+                ],
+                device=self.device,
+                pin_memory=self.device.type == "cuda",
+            )
+            for _slot in self._decode_slots
+        )
+        self._no_speech_decode_bindings: list[tuple[int, ...]] = [
+            () for _slot in self._decode_slots
+        ]
 
         # Sampling can overlap two resident pipeline slots. Each slot therefore
         # owns its own pinned constraint source and GPU destination: mutating a
@@ -779,14 +820,13 @@ class WhisperRuntime(UncachedPagedRuntime):
             max(1, int(math.ceil(duration_seconds * 50.0))),
         )
         with stream_context(self._compute_stream):
-            no_speech_prob = no_speech_probability(
-                decoder=decoder,
-                tokenizer=self.tokenizer,
-                prefix_token_ids=prefix_token_ids,
-                cross_keys=self.cross_kv.keys[:, batch_idx : batch_idx + 1],
-                cross_values=self.cross_kv.values[:, batch_idx : batch_idx + 1],
-                config=self._config,
-            )
+            if batch_idx not in self._no_speech_score_rows:
+                raise RuntimeError(
+                    "Whisper decoder analysis is missing its native SOT score"
+                )
+            no_speech_prob = float(self._no_speech_probs[batch_idx].item())
+            if not math.isfinite(no_speech_prob) or not 0.0 <= no_speech_prob <= 1.0:
+                raise RuntimeError("Whisper native SOT score is invalid")
             words = (
                 align_transcript_words(
                     decoder=decoder,
@@ -830,6 +870,7 @@ class WhisperRuntime(UncachedPagedRuntime):
                     torch.int64,
                 ),
                 ("prefix_lengths", (self.max_batch_size,), torch.int32),
+                ("sot_positions", (self.max_batch_size,), torch.int64),
                 ("batch_idx", (self.max_batch_size,), torch.int64),
                 (
                     "slot_mapping",
@@ -854,6 +895,11 @@ class WhisperRuntime(UncachedPagedRuntime):
             logits=torch.empty(
                 (self.max_batch_size, self.vocab_size),
                 dtype=self.dtype,
+                device=self.device,
+            ),
+            no_speech_probs=torch.empty(
+                (self.max_batch_size,),
+                dtype=torch.float32,
                 device=self.device,
             ),
         )
@@ -947,6 +993,62 @@ class WhisperRuntime(UncachedPagedRuntime):
             constraints,
             require_packed=self._require_native,
         )
+        # A forced-tail SOT is known on the host even while its sampled token
+        # remains device-resident. Remember that its *next* decode forward
+        # owns the upstream no-speech distribution; decode captures those raw
+        # logits before the scheduler can apply any masks in place.
+        for sequence in sequences:
+            state = sequence.skill_state
+            forced = state.allowed_token_ids(self)
+            if forced != (state.controls.decoder_start_id,):
+                continue
+            sequence_state = getattr(sequence, "state", None)
+            if sequence_state is None:
+                raise TypeError("Whisper forced SOT requires sequence state ownership")
+            row = int(sequence_state.batch_idx)
+            if row not in self._no_speech_score_rows:
+                self._pending_no_speech_score_rows.add(row)
+
+    def _prepare_decode_inputs(
+        self,
+        slot: DecodeSlot,
+        batch_idx: Tensor,
+        batch_size: int,
+    ) -> None:
+        """Bind pending forced-tail SOT rows to this decode slot's compact order."""
+
+        slot_id = int(slot.slot_id)
+        if (
+            slot_id not in range(len(self._decode_slots))
+            or self._decode_slots[slot_id] is not slot
+            or batch_idx.data_ptr() != slot.meta.batch_idx.gpu.data_ptr()
+            or not 0 < int(batch_size) <= self.max_batch_size
+        ):
+            raise ValueError("Whisper no-speech decode binding received a foreign slot")
+        if self._no_speech_decode_bindings[slot_id]:
+            raise RuntimeError("Whisper no-speech decode binding was not consumed")
+        host_rows = tuple(
+            int(value) for value in slot.meta.batch_idx.cpu[: int(batch_size)]
+        )
+        bound = tuple(
+            (compact_row, row)
+            for compact_row, row in enumerate(host_rows)
+            if row in self._pending_no_speech_score_rows
+        )
+        if not bound:
+            return
+        rows = tuple(row for _compact_row, row in bound)
+        if len(set(rows)) != len(rows):
+            raise RuntimeError(
+                "Whisper no-speech decode binding contains duplicate rows"
+            )
+        indices = self._no_speech_decode_indices[slot_id]
+        indices.compact_rows.cpu[: len(bound)] = torch.tensor(
+            [compact_row for compact_row, _row in bound], dtype=torch.int64
+        )
+        indices.batch_rows.cpu[: len(bound)] = torch.tensor(rows, dtype=torch.int64)
+        indices.copy_to_gpu()
+        self._no_speech_decode_bindings[slot_id] = rows
 
     def _score_sampled_tokens(
         self,
@@ -1155,7 +1257,12 @@ class WhisperRuntime(UncachedPagedRuntime):
         )
         row = int(prepared.state.batch_idx)
         try:
-            if row in self._owned_cross_rows or row in self._prepared_audio:
+            if (
+                row in self._owned_cross_rows
+                or row in self._prepared_audio
+                or row in self._no_speech_score_rows
+                or row in self._pending_no_speech_score_rows
+            ):
                 raise RuntimeError(f"Whisper state row {row} is already owned")
             self._owned_cross_rows.add(row)
             self._prepared_audio[row] = encoder_input
@@ -1182,18 +1289,22 @@ class WhisperRuntime(UncachedPagedRuntime):
         slot: WhisperPrefillSlot,
         prepared_sequences: Sequence[PreparedSequence],
         encoder_inputs: Sequence[object | None],
-    ) -> None:
+    ) -> tuple[tuple[int, ...], bool]:
         batch_size = len(prepared_sequences)
         controls_cpu = slot.metadata.control_token_ids.cpu
         lengths_cpu = slot.metadata.prefix_lengths.cpu
+        sot_positions_cpu = slot.metadata.sot_positions.cpu
         batch_idx_cpu = slot.metadata.batch_idx.cpu
         mapping_cpu = slot.metadata.slot_mapping.cpu
         controls_cpu.zero_()
         lengths_cpu.zero_()
+        sot_positions_cpu.zero_()
         batch_idx_cpu.zero_()
         mapping_cpu.zero_()
 
         rows: list[int] = []
+        scored_rows: list[int] = []
+        separate_sot_projection = False
         for compact_row, (prepared, supplied_audio) in enumerate(
             zip(prepared_sequences, encoder_inputs)
         ):
@@ -1220,6 +1331,17 @@ class WhisperRuntime(UncachedPagedRuntime):
                 token_ids, dtype=torch.int64
             )
             lengths_cpu[compact_row] = len(token_ids)
+            sot_positions = tuple(
+                index
+                for index, token_id in enumerate(token_ids)
+                if token_id == self.tokenizer.controls.decoder_start_id
+            )
+            if sot_positions:
+                # Match the legacy/upstream contract: the final decoder-start
+                # token in the prefix owns the no-speech distribution.
+                sot_positions_cpu[compact_row] = sot_positions[-1]
+                scored_rows.append(row)
+                separate_sot_projection |= sot_positions[-1] != len(token_ids) - 1
             batch_idx_cpu[compact_row] = row
             # page_size=1, so each physical page index is also the flat slot.
             mapping_cpu[compact_row, : len(token_ids)] = torch.tensor(
@@ -1229,6 +1351,7 @@ class WhisperRuntime(UncachedPagedRuntime):
         self.page_table.commit_block_table(rows)
         slot.features.copy_to_gpu(batch_size)
         slot.metadata.copy_to_gpu()
+        return tuple(scored_rows), separate_sot_projection
 
     @torch.inference_mode()
     def launch_prepared_batch(
@@ -1264,14 +1387,25 @@ class WhisperRuntime(UncachedPagedRuntime):
             raise RuntimeError("Whisper prefill slot must be acquired before launch")
 
         with stream_context(self._compute_stream):
-            self._stage_prefill(
+            scored_rows, separate_sot_projection = self._stage_prefill(
                 prefill_slot,
                 prepared_sequences,
                 encoder_inputs,
             )
             # Contract: this call enqueues every decoder-visible write, including
             # cross-K/V and prefix self-KV, before it returns.
-            self._prefill_session.launch(slot_id, batch_size)
+            self._prefill_session.launch(
+                slot_id,
+                batch_size,
+                separate_sot_projection=separate_sot_projection,
+                retain_sot_score=bool(scored_rows),
+            )
+            self._no_speech_probs.index_copy_(
+                0,
+                prefill_slot.batch_idx[:batch_size],
+                prefill_slot.no_speech_probs[:batch_size],
+            )
+            self._no_speech_score_rows.update(scored_rows)
         return prefill_slot.logits[:batch_size]
 
     def finalize_prepared_sequence_after_prefill(
@@ -1289,6 +1423,8 @@ class WhisperRuntime(UncachedPagedRuntime):
     def _release_runtime_state(self, batch_idx: int) -> None:
         self._prepared_audio.pop(batch_idx, None)
         self._owned_cross_rows.discard(batch_idx)
+        self._no_speech_score_rows.discard(batch_idx)
+        self._pending_no_speech_score_rows.discard(batch_idx)
 
     @torch.inference_mode()
     def decode_with_slot(self, slot: DecodeSlot, batch_size: int) -> None:
@@ -1320,7 +1456,38 @@ class WhisperRuntime(UncachedPagedRuntime):
             )
         # Resident slot tensors were bound at session construction. The
         # generated launch reads token_ids/input_pos/batch_idx and writes logits.
-        self._decode_session.run(slot, launch_capacity)
+        bound_rows = self._no_speech_decode_bindings[slot_id]
+        try:
+            self._decode_session.run(slot, launch_capacity)
+            if bound_rows:
+                count = len(bound_rows)
+                indices = self._no_speech_decode_indices[slot_id]
+                compact_rows = indices.compact_rows.gpu[:count]
+                raw_logits = slot.scratch["whisper_no_speech_logits"][:count]
+                torch.index_select(
+                    slot.logits[:batch_size],
+                    0,
+                    compact_rows,
+                    out=raw_logits,
+                )
+                probabilities = slot.scratch["whisper_no_speech_probs"][:count]
+                whisper_no_speech_probabilities_from_logits(
+                    raw_logits,
+                    scores=slot.scratch["whisper_no_speech_scores"][:count],
+                    normalizer=slot.scratch[
+                        "whisper_no_speech_normalizer"
+                    ][:count],
+                    probabilities_out=probabilities,
+                )
+                self._no_speech_probs.index_copy_(
+                    0,
+                    indices.batch_rows.gpu[:count],
+                    probabilities,
+                )
+                self._pending_no_speech_score_rows.difference_update(bound_rows)
+                self._no_speech_score_rows.update(bound_rows)
+        finally:
+            self._no_speech_decode_bindings[slot_id] = ()
 
     def _warmup_decode(self) -> None:
         slot = self._decode_slots[0]
@@ -1447,6 +1614,11 @@ class WhisperRuntime(UncachedPagedRuntime):
         self.active_sequences.clear()
         self._prepared_audio.clear()
         self._owned_cross_rows.clear()
+        self._no_speech_score_rows.clear()
+        self._pending_no_speech_score_rows.clear()
+        self._no_speech_decode_bindings[:] = [
+            () for _slot in self._no_speech_decode_bindings
+        ]
         if errors:
             raise errors[0]
 

@@ -14,6 +14,7 @@ from kestrel.models.whisper.prefill_decoder_prefix import (
     WhisperDecoderPrefixWorkspace,
     prepare_whisper_decoder_weights,
     whisper_decoder_prefix,
+    whisper_no_speech_probabilities,
 )
 from kestrel.models.whisper.config import WhisperTurboConfig
 from kestrel.models.whisper.runtime_abi import WhisperSelfKVArenas
@@ -128,13 +129,15 @@ def _paged_state(config, *, state_rows):
 
 def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
     config, eager, weights = _eager_and_kernel_weights()
-    batch = 3
-    lengths = torch.tensor([1, 3, 4], device="cuda", dtype=torch.int32)
+    batch = 4
+    lengths = torch.tensor([1, 3, 4, 4], device="cuda", dtype=torch.int32)
+    sot_positions = torch.tensor([0, 0, 2, 0], device="cuda", dtype=torch.int64)
     token_ids = torch.tensor(
         [
             [50258, 50257, 50257, 50257],
             [50258, 50259, 50360, 50257],
-            [50258, 50259, 50360, 50364],
+            [50362, 10, 50258, 50259],
+            [50362, 10, 11, 12],
         ],
         device="cuda",
         dtype=torch.int64,
@@ -151,7 +154,7 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
     )
     compact_values = _random(compact_keys.shape, scale=0.02)
     expected = []
-    for row, length in enumerate((1, 3, 4)):
+    for row, length in enumerate((1, 3, 4, 4)):
         row_cross = CrossAttentionKV(
             compact_keys[:, row : row + 1].contiguous(),
             compact_values[:, row : row + 1].contiguous(),
@@ -163,19 +166,21 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
         )
 
     state_rows = 5
-    batch_idx = torch.tensor([4, 1, 3], device="cuda", dtype=torch.int64)
+    batch_idx = torch.tensor([4, 1, 3, 2], device="cuda", dtype=torch.int64)
     self_kv, page_table = _paged_state(config, state_rows=state_rows)
     slot_mapping = page_table.index_select(0, batch_idx)[:, :4].long().contiguous()
     positions = torch.arange(4, device="cuda").view(1, 4)
     slot_mapping.masked_fill_(positions >= lengths.view(-1, 1), 0)
     workspace = WhisperDecoderPrefixWorkspace.allocate(batch, device="cuda")
     logits = torch.empty((batch, VOCAB_SIZE), device="cuda", dtype=torch.bfloat16)
+    no_speech_probs = torch.empty((batch,), device="cuda", dtype=torch.float32)
     key_pool_ptrs = tuple(pool.data_ptr() for pool in self_kv.keys)
     value_pool_ptrs = tuple(pool.data_ptr() for pool in self_kv.values)
 
     actual = whisper_decoder_prefix(
         token_ids,
         lengths,
+        sot_positions,
         slot_mapping,
         compact_keys,
         compact_values,
@@ -184,7 +189,11 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
         self_kv,
         logits_out=logits,
     )
-    for row, length in enumerate((1, 3, 4)):
+    scored_no_speech = whisper_no_speech_probabilities(
+        workspace,
+        probabilities_out=no_speech_probs,
+    )
+    for row, length in enumerate((1, 3, 4, 4)):
         _assert_close(
             actual.last_hidden_state[row],
             expected[row].hidden_states[0, length - 1],
@@ -192,6 +201,20 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
         _assert_close(
             actual.logits[row], expected[row].logits[0, length - 1], atol=0.12
         )
+        if row < 3:
+            retained_sot_logits = workspace.projection_logits[batch + row]
+            _assert_close(
+                retained_sot_logits,
+                expected[row].logits[0, int(sot_positions[row])],
+                atol=0.12,
+            )
+            expected_no_speech = retained_sot_logits.float().softmax(dim=-1)[50361]
+            torch.testing.assert_close(
+                scored_no_speech[row],
+                expected_no_speech,
+                rtol=1e-5,
+                atol=1e-8,
+            )
         for layer in range(DECODER_LAYERS):
             for position in range(length):
                 page = int(slot_mapping[row, position])
@@ -216,12 +239,37 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
     assert tuple(pool.data_ptr() for pool in self_kv.values) == value_pool_ptrs
     assert actual.logits.data_ptr() == logits.data_ptr()
     assert actual.last_hidden_state.data_ptr() == workspace.last_hidden.data_ptr()
+    assert workspace.last_hidden.data_ptr() == workspace.projection_hidden.data_ptr()
+
+    # Automatic-language batches stage SOT as every row's last token. Their
+    # score comes from the ordinary B-row logits, and the 2B projection buffers
+    # must remain untouched.
+    workspace.projection_logits.fill_(float("nan"))
+    direct = whisper_decoder_prefix(
+        token_ids,
+        lengths,
+        sot_positions,
+        slot_mapping,
+        compact_keys,
+        compact_values,
+        weights,
+        workspace,
+        self_kv,
+        logits_out=logits,
+        separate_sot_projection=False,
+    )
+    assert torch.isnan(workspace.projection_logits).all()
+    for row, length in enumerate((1, 3, 4, 4)):
+        _assert_close(
+            direct.logits[row], expected[row].logits[0, length - 1], atol=0.12
+        )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = whisper_decoder_prefix(
             token_ids,
             lengths,
+            sot_positions,
             slot_mapping,
             compact_keys,
             compact_values,
@@ -231,10 +279,14 @@ def test_mixed_prefix_matches_eager_oracle_paged_layout_and_graph() -> None:
             logits_out=logits,
         )
     graph.replay()
+    whisper_no_speech_probabilities(
+        workspace,
+        probabilities_out=no_speech_probs,
+    )
     torch.cuda.synchronize()
     assert captured.logits.data_ptr() == logits.data_ptr()
     assert captured.last_hidden_state.data_ptr() == workspace.last_hidden.data_ptr()
-    for row, length in enumerate((1, 3, 4)):
+    for row, length in enumerate((1, 3, 4, 4)):
         _assert_close(
             captured.logits[row], expected[row].logits[0, length - 1], atol=0.12
         )

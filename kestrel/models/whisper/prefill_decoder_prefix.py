@@ -41,6 +41,7 @@ _VISION = _KERNELS.vision
 CONTROL_PREFIX_CAPACITY = 4
 MAX_TARGET_POSITIONS = 448
 VOCAB_SIZE = 51866
+NO_SPEECH_TOKEN_ID = 50361
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,10 @@ class WhisperDecoderPrefixWorkspace:
     mlp_hidden: torch.Tensor
     final_hidden: torch.Tensor
     last_hidden: torch.Tensor
+    projection_hidden: torch.Tensor
+    projection_logits: torch.Tensor
+    no_speech_scores: torch.Tensor
+    no_speech_normalizer: torch.Tensor
     last_indices: torch.Tensor
     kv_scale: torch.Tensor
 
@@ -104,6 +109,9 @@ class WhisperDecoderPrefixWorkspace:
             raise ValueError("Whisper decoder-prefix workspace requires a CUDA device")
         dtype = torch.bfloat16
         shape = (batch_size, CONTROL_PREFIX_CAPACITY, HIDDEN_SIZE)
+        projection_hidden = torch.empty(
+            (2 * batch_size, HIDDEN_SIZE), device=resolved_device, dtype=dtype
+        )
         return cls(
             batch_size=batch_size,
             hidden=torch.empty(shape, device=resolved_device, dtype=dtype),
@@ -134,8 +142,21 @@ class WhisperDecoderPrefixWorkspace:
                 dtype=dtype,
             ),
             final_hidden=torch.empty(shape, device=resolved_device, dtype=dtype),
-            last_hidden=torch.empty(
-                (batch_size, HIDDEN_SIZE), device=resolved_device, dtype=dtype
+            # The first projection block is also the public last-hidden view.
+            # Keeping one pointer-stable backing removes a device copy from
+            # every captured prefix graph.
+            last_hidden=projection_hidden[:batch_size],
+            projection_hidden=projection_hidden,
+            projection_logits=torch.empty(
+                (2 * batch_size, VOCAB_SIZE), device=resolved_device, dtype=dtype
+            ),
+            no_speech_scores=torch.empty(
+                (batch_size, VOCAB_SIZE),
+                device=resolved_device,
+                dtype=torch.float32,
+            ),
+            no_speech_normalizer=torch.empty(
+                (batch_size,), device=resolved_device, dtype=torch.float32
             ),
             last_indices=torch.empty(
                 (batch_size,), device=resolved_device, dtype=torch.int64
@@ -251,6 +272,7 @@ def prepare_whisper_decoder_weights(
 def _validate_prefix_inputs(
     control_token_ids: torch.Tensor,
     prefix_lengths: torch.Tensor,
+    sot_positions: torch.Tensor,
     slot_mapping: torch.Tensor,
     compact_cross_keys: torch.Tensor,
     compact_cross_values: torch.Tensor,
@@ -279,6 +301,13 @@ def _validate_prefix_inputs(
         raise ValueError(
             "prefix_lengths must be contiguous CUDA INT32 [batch] with values 1, 3, or 4"
         )
+    if (
+        tuple(sot_positions.shape) != (batch,)
+        or sot_positions.dtype != torch.int64
+        or sot_positions.device != device
+        or not sot_positions.is_contiguous()
+    ):
+        raise ValueError("sot_positions must be contiguous CUDA INT64 [batch]")
     if (
         tuple(slot_mapping.shape) != (batch, CONTROL_PREFIX_CAPACITY)
         or slot_mapping.dtype != torch.int64
@@ -472,6 +501,7 @@ def _run_decoder_layer(
 def whisper_decoder_prefix(
     control_token_ids: torch.Tensor,
     prefix_lengths: torch.Tensor,
+    sot_positions: torch.Tensor,
     slot_mapping: torch.Tensor,
     compact_cross_keys: torch.Tensor,
     compact_cross_values: torch.Tensor,
@@ -480,6 +510,7 @@ def whisper_decoder_prefix(
     self_kv: WhisperSelfKVArenas,
     *,
     logits_out: torch.Tensor,
+    separate_sot_projection: bool = True,
     require_packed: bool = False,
 ) -> WhisperDecoderPrefixOutput:
     """Prefill mixed 1/3/4-token control prefixes and seed decode logits.
@@ -492,6 +523,8 @@ def whisper_decoder_prefix(
     automatic-language and explicit-language requests.
     """
 
+    if type(separate_sot_projection) is not bool:
+        raise TypeError("separate_sot_projection must be bool")
     # Tried one native paged-decode-style step per control token: at B1/B4/B8
     # it cost 0.99-1.06x this batched graph for length 1, while this graph was
     # 3.30-3.60x faster for length 4 on H100/B200.  Keeping one Bx4 graph so
@@ -499,6 +532,7 @@ def whisper_decoder_prefix(
     _validate_prefix_inputs(
         control_token_ids,
         prefix_lengths,
+        sot_positions,
         slot_mapping,
         compact_cross_keys,
         compact_cross_values,
@@ -542,25 +576,130 @@ def whisper_decoder_prefix(
         last_indices,
         out=workspace.last_hidden.view(workspace.batch_size, 1, HIDDEN_SIZE),
     )
+    if not separate_sot_projection:
+        # The overwhelmingly common automatic-language prefix is SOT alone,
+        # so its last-token logits already are the upstream SOT distribution.
+        # Keep that graph on the original B-row projection instead of paying
+        # for the packed 2B projection used by earlier-SOT prefixes.
+        _LINEAR.linear(
+            workspace.last_hidden,
+            weights.token_embedding,
+            None,
+            out=logits_out,
+        )
+        return WhisperDecoderPrefixOutput(
+            logits=logits_out,
+            last_hidden_state=workspace.last_hidden,
+        )
+    # Project the last valid prefix row and the staged SOT row together.
+    # ``sot_positions`` is host-derived from the exact prefix. Rows whose SOT
+    # lies in the forced tail carry the safe dummy index zero here and are not
+    # marked scored by the runtime; their actual raw logits are retained from
+    # the decode step that consumes SOT.
+    sot_indices = sot_positions.view(-1, 1, 1).expand(-1, 1, HIDDEN_SIZE)
+    torch.gather(
+        workspace.final_hidden,
+        1,
+        sot_indices,
+        out=workspace.projection_hidden[workspace.batch_size :].view(
+            workspace.batch_size, 1, HIDDEN_SIZE
+        ),
+    )
     _LINEAR.linear(
-        workspace.last_hidden,
+        workspace.projection_hidden,
         weights.token_embedding,
         None,
-        out=logits_out,
+        out=workspace.projection_logits,
     )
+    logits_out.copy_(workspace.projection_logits[: workspace.batch_size])
     return WhisperDecoderPrefixOutput(
         logits=logits_out,
         last_hidden_state=workspace.last_hidden,
     )
 
 
+@torch.inference_mode()
+def whisper_no_speech_probabilities(
+    workspace: WhisperDecoderPrefixWorkspace,
+    *,
+    probabilities_out: torch.Tensor,
+) -> torch.Tensor:
+    """Retain Whisper's unfiltered SOT probability from a completed prefill."""
+
+    batch = workspace.batch_size
+    if (
+        tuple(probabilities_out.shape) != (batch,)
+        or probabilities_out.device != workspace.device
+        or probabilities_out.dtype != torch.float32
+        or not probabilities_out.is_contiguous()
+    ):
+        raise ValueError("probabilities_out must be contiguous CUDA FP32 [batch]")
+    return whisper_no_speech_probabilities_from_logits(
+        workspace.projection_logits[batch:],
+        scores=workspace.no_speech_scores,
+        normalizer=workspace.no_speech_normalizer,
+        probabilities_out=probabilities_out,
+    )
+
+
+@torch.inference_mode()
+def whisper_no_speech_probabilities_from_logits(
+    logits: torch.Tensor,
+    *,
+    scores: torch.Tensor,
+    normalizer: torch.Tensor,
+    probabilities_out: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce unfiltered BF16 decoder logits into the fixed SOT probability."""
+
+    if logits.ndim != 2:
+        raise ValueError("no-speech logits must be contiguous BF16 [batch, vocab]")
+    batch, vocab = logits.shape
+    if (
+        vocab != VOCAB_SIZE
+        or logits.dtype != torch.bfloat16
+        or not logits.is_contiguous()
+        or tuple(scores.shape) != (batch, vocab)
+        or scores.device != logits.device
+        or scores.dtype != torch.float32
+        or not scores.is_contiguous()
+        or tuple(normalizer.shape) != (batch,)
+        or normalizer.device != logits.device
+        or normalizer.dtype != torch.float32
+        or not normalizer.is_contiguous()
+        or tuple(probabilities_out.shape) != (batch,)
+        or probabilities_out.device != logits.device
+        or probabilities_out.dtype != torch.float32
+        or not probabilities_out.is_contiguous()
+    ):
+        raise ValueError(
+            "no-speech reduction requires contiguous colocated logits/scratch"
+        )
+    scores.copy_(logits)
+    torch.logsumexp(
+        scores,
+        dim=1,
+        out=normalizer,
+    )
+    torch.sub(
+        scores[:, NO_SPEECH_TOKEN_ID],
+        normalizer,
+        out=probabilities_out,
+    )
+    torch.exp(probabilities_out, out=probabilities_out)
+    return probabilities_out
+
+
 __all__ = [
     "CONTROL_PREFIX_CAPACITY",
     "MAX_TARGET_POSITIONS",
+    "NO_SPEECH_TOKEN_ID",
     "VOCAB_SIZE",
     "PreparedWhisperDecoderWeights",
     "WhisperDecoderPrefixOutput",
     "WhisperDecoderPrefixWorkspace",
     "prepare_whisper_decoder_weights",
     "whisper_decoder_prefix",
+    "whisper_no_speech_probabilities",
+    "whisper_no_speech_probabilities_from_logits",
 ]
