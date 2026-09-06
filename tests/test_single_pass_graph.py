@@ -31,7 +31,7 @@ def test_disabled_session_runs_eager_and_refuses_after_shutdown() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_session_replays_stable_outputs_and_bounds_shapes() -> None:
+def test_cuda_session_retains_four_shapes_and_evicts_the_fifth() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     calls = 0
@@ -46,7 +46,7 @@ def test_cuda_session_replays_stable_outputs_and_bounds_shapes() -> None:
         device=device,
         stream=stream,
         run_forward=forward,
-        max_entries=1,
+        max_entries=4,
     )
     first = torch.arange(4, device=device, dtype=torch.float32)
     with session.launch(first) as (output,):
@@ -61,13 +61,32 @@ def test_cuda_session_replays_stable_outputs_and_bounds_shapes() -> None:
         torch.testing.assert_close(output, (first + 1).square() + 1)
     assert calls == 2
 
-    with session.launch(torch.arange(5, device=device)) as (output,):
-        stream.synchronize()
-        torch.testing.assert_close(output, torch.arange(5, device=device).square() + 1)
-    assert calls == 4
+    pointers = {4: pointer}
+    for size in (1, 2, 8):
+        value = torch.arange(size, device=device, dtype=torch.float32)
+        with session.launch(value) as (output,):
+            stream.synchronize()
+            pointers[size] = output.data_ptr()
+            torch.testing.assert_close(output, value.square() + 1)
+    assert calls == 8
 
+    for size in (4, 1, 2, 8):
+        value = torch.arange(size, device=device, dtype=torch.float32) + 2
+        with session.launch(value) as (output,):
+            stream.synchronize()
+            assert output.data_ptr() == pointers[size]
+            torch.testing.assert_close(output, value.square() + 1)
+    assert calls == 8
+
+    fifth = torch.arange(6, device=device, dtype=torch.float32)
+    with session.launch(fifth) as (output,):
+        stream.synchronize()
+        torch.testing.assert_close(output, fifth.square() + 1)
+    assert calls == 10
+
+    # Shape four was the least recently used after the replay sequence above.
     with session.launch(first) as (output,):
         stream.synchronize()
         torch.testing.assert_close(output, first.square() + 1)
-    assert calls == 6
+    assert calls == 12
     session.shutdown()
