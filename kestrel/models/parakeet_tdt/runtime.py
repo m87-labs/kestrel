@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.device import empty_cache, resolve_device
+from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
 from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
@@ -122,11 +122,7 @@ class ParakeetTdtRuntime:
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
-            else (
-                torch.cuda.current_stream(self.device)
-                if self.device.type == "cuda" and torch.cuda.is_available()
-                else None
-            )
+            else make_stream(self.device)
         )
         if model is None or tokenizer is None:
             checkpoint = getattr(cfg, "model_path", None) or self._model_name

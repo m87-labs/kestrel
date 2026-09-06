@@ -22,12 +22,72 @@ def test_disabled_session_runs_eager_and_refuses_after_shutdown() -> None:
     )
     with session.launch(torch.tensor([2])) as (output,):
         assert output.tolist() == [3]
+        with pytest.raises(RuntimeError, match="cannot be nested"):
+            with session.launch(torch.tensor([4])):
+                pass
+        with pytest.raises(RuntimeError, match="during an active lease"):
+            session.shutdown()
     assert len(calls) == 1
     session.shutdown()
     session.shutdown()
     with pytest.raises(RuntimeError, match="shut down"):
         with session.launch(torch.tensor([2])):
             pass
+
+
+def test_shutdown_releases_state_when_stream_synchronize_fails() -> None:
+    session = FixedShapeSinglePassGraph(
+        enabled=False,
+        device=torch.device("cpu"),
+        stream=None,
+        run_forward=lambda value: (value,),
+    )
+
+    class _FailingStream:
+        def synchronize(self) -> None:
+            raise RuntimeError("sync failed")
+
+    session.enabled = True
+    session._stream = _FailingStream()  # type: ignore[assignment]
+    session._entries[()] = object()  # type: ignore[index,assignment]
+    with pytest.raises(RuntimeError, match="sync failed"):
+        session.shutdown()
+    assert not session._entries
+    assert session._stream is None
+    assert session._run_forward(torch.tensor([1])) == ()
+    session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_session_owns_nondefault_stream_and_waits_for_producer() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    session = FixedShapeSinglePassGraph(
+        enabled=True,
+        device=device,
+        stream=None,
+        run_forward=lambda value: (value.square() + 1,),
+    )
+    assert session._stream is not None
+    assert session._stream != torch.cuda.default_stream(device)
+
+    value = torch.zeros(4096, device=device)
+    producer = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(5_000_000)
+        value.fill_(3)
+        with session.launch(value) as (output,):
+            assert session._stream is not None
+            session._stream.synchronize()
+            torch.testing.assert_close(output, value.square() + 1)
+    session.shutdown()
+
+    with pytest.raises(ValueError, match="non-default stream"):
+        FixedShapeSinglePassGraph(
+            enabled=True,
+            device=device,
+            stream=torch.cuda.default_stream(device),
+            run_forward=lambda item: (item,),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
