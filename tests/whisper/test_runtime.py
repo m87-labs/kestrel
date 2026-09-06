@@ -140,6 +140,7 @@ class _FakeSession:
     warmup_failures: int = 0
     warmup_calls: int = 0
     launches: list[tuple[int, int]] = field(default_factory=list)
+    launch_modes: list[tuple[bool, bool]] = field(default_factory=list)
     shutdown_calls: int = 0
     artifact_identities: tuple[dict[str, object], ...] = ()
     artifact_receipts: tuple[dict[str, object], ...] = ()
@@ -150,10 +151,20 @@ class _FakeSession:
             self.warmup_failures -= 1
             raise RuntimeError(f"{self.kind} warmup failed")
 
-    def launch(self, slot_id: int, batch_size: int) -> None:
+    def launch(
+        self,
+        slot_id: int,
+        batch_size: int,
+        *,
+        separate_sot_projection: bool,
+        retain_sot_score: bool,
+    ) -> None:
         self.launches.append((slot_id, batch_size))
         slot = self.buffers[slot_id]
         slot.logits_out[:batch_size].fill_(7.0)
+        if retain_sot_score:
+            slot.no_speech_probs_out[:batch_size].fill_(0.25)
+        self.launch_modes.append((separate_sot_projection, retain_sot_score))
 
     def run(self, slot: Any, batch_size: int) -> None:
         self.warmup_calls += 1
@@ -392,6 +403,7 @@ def test_prepared_audio_cross_row_and_prefix_slot_lifecycle(
     )
     assert factory.prefill is not None
     assert factory.prefill.launches == [(slot.slot_id, 1)]
+    assert factory.prefill.launch_modes == [(True, True)]
     assert torch.all(logits == 7)
     assert slot.metadata.control_token_ids.gpu[0].tolist() == [
         50258,
@@ -400,6 +412,7 @@ def test_prepared_audio_cross_row_and_prefix_slot_lifecycle(
         0,
     ]
     assert slot.metadata.prefix_lengths.gpu[0].item() == 3
+    assert slot.metadata.sot_positions.gpu[0].item() == 0
     assert slot.batch_idx[0].item() == row
     assert (
         slot.metadata.slot_mapping.gpu[0, :3].tolist()
@@ -411,12 +424,175 @@ def test_prepared_audio_cross_row_and_prefix_slot_lifecycle(
     assert row in runtime.active_sequences
     assert row not in runtime._prepared_audio
     assert row in runtime._owned_cross_rows
+    analysis = runtime.analyze_transcript(
+        batch_idx=row,
+        language="en",
+        task="transcribe",
+        prefix_token_ids=(50258, 50259, 50360),
+        text_token_ids=(10,),
+        avg_logprob=-0.5,
+        duration_seconds=0.1,
+        include_words=False,
+    )
+    assert analysis.words == ()
+    assert analysis.scores.no_speech_prob == pytest.approx(0.25)
 
     runtime.release_sequence(prepared.state)
     assert row not in runtime.active_sequences
     assert row not in runtime._owned_cross_rows
+    assert row not in runtime._no_speech_score_rows
     assert row in runtime.page_table.free_batch_idx
     runtime.release_prefill_slot(slot)
+    runtime.shutdown()
+
+
+def test_prefill_stages_actual_sot_position_and_marks_only_present_rows(
+    runtime_model_config,
+    runtime_weights,
+    prepared_audio,
+) -> None:
+    factory = _FakeSessionFactory()
+    runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
+    with_sot = runtime.prepare_sequence(
+        [TextToken(token_id=value) for value in (50362, 10, 50258, 50259)],
+        encoder_input=prepared_audio,
+        max_new_tokens=4,
+    )
+    forced_tail = runtime.prepare_sequence(
+        [TextToken(token_id=value) for value in (50362, 10, 11, 12)],
+        encoder_input=prepared_audio,
+        max_new_tokens=4,
+    )
+    slot = runtime.acquire_prefill_slot()
+    runtime.launch_prepared_batch(
+        [forced_tail, with_sot],
+        slot,
+        images=[None, None],
+        image_crops_list=[None, None],
+        encoder_inputs=[prepared_audio, prepared_audio],
+    )
+
+    assert slot.metadata.sot_positions.gpu[:2].tolist() == [0, 2]
+    assert factory.prefill is not None
+    assert factory.prefill.launch_modes == [(True, True)]
+    assert forced_tail.state.batch_idx not in runtime._no_speech_score_rows
+    assert with_sot.state.batch_idx in runtime._no_speech_score_rows
+
+    runtime.abort_prepared_sequence(forced_tail)
+    runtime.abort_prepared_sequence(with_sot)
+    runtime.release_prefill_slot(slot)
+    runtime.shutdown()
+
+
+def test_sot_only_prefill_reuses_last_logits_projection(
+    runtime_model_config,
+    runtime_weights,
+    prepared_audio,
+) -> None:
+    factory = _FakeSessionFactory()
+    runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
+    prepared = runtime.prepare_sequence(
+        [TextToken(token_id=50258)],
+        encoder_input=prepared_audio,
+        max_new_tokens=4,
+    )
+    row = int(prepared.state.batch_idx)
+    slot = runtime.acquire_prefill_slot()
+    runtime.launch_prepared_batch(
+        [prepared],
+        slot,
+        images=[None],
+        image_crops_list=[None],
+        encoder_inputs=[prepared_audio],
+    )
+
+    assert factory.prefill is not None
+    assert factory.prefill.launch_modes == [(False, True)]
+    assert row in runtime._no_speech_score_rows
+    assert runtime._no_speech_probs[row].item() == pytest.approx(0.25)
+
+    runtime.abort_prepared_sequence(prepared)
+    runtime.release_prefill_slot(slot)
+    runtime.shutdown()
+
+
+def test_forced_tail_sot_captures_raw_decode_logits_by_global_row(
+    runtime_model_config,
+    runtime_weights,
+    prepared_audio,
+) -> None:
+    factory = _FakeSessionFactory()
+    runtime = _make_runtime(runtime_model_config, runtime_weights, factory)
+    prepared = runtime.prepare_sequence(
+        [TextToken(token_id=value) for value in (50362, 10, 11, 12)],
+        encoder_input=prepared_audio,
+        max_new_tokens=4,
+    )
+    row = int(prepared.state.batch_idx)
+    prefill_slot = runtime.acquire_prefill_slot()
+    runtime.launch_prepared_batch(
+        [prepared],
+        prefill_slot,
+        images=[None],
+        image_crops_list=[None],
+        encoder_inputs=[prepared_audio],
+    )
+    assert row not in runtime._no_speech_score_rows
+    assert factory.prefill is not None
+    assert factory.prefill.launch_modes == [(False, False)]
+
+    state = WhisperTranscribeState(
+        WhisperTranscribeSkill(),
+        SimpleNamespace(),
+        WhisperDecodeContext(
+            language="en",
+            timestamps="none",
+            max_transcript_tokens=1,
+            temperature=0.0,
+            forced_prefix_tail=(50258, 50259, 50360),
+        ),
+        runtime.tokenizer,
+        prepared_audio,
+    )
+    sequence = SimpleNamespace(skill_state=state, state=prepared.state)
+    process_logits = runtime.sampling_hooks.process_logits
+    assert process_logits is not None
+    process_logits(
+        prefill_slot.logits[:1],
+        sequences=[sequence],
+        batch_idx=prefill_slot.batch_idx[:1],
+    )
+    assert row in runtime._pending_no_speech_score_rows
+
+    decode_slot = runtime.decode_slots[1]
+    decode_slot.meta.batch_idx.cpu[0] = row
+    decode_slot.meta.input_pos.cpu[0] = prepared.state.length
+    decode_slot.meta.inputs.copy_to_gpu()
+    decode_slot.decode_token_ids[0] = 50258
+    prepare_decode = runtime.sampling_hooks.prepare_decode_inputs
+    assert prepare_decode is not None
+    prepare_decode(decode_slot, decode_slot.meta.batch_idx.gpu[:1], 1)
+    runtime.decode_with_slot(decode_slot, 1)
+
+    assert row not in runtime._pending_no_speech_score_rows
+    assert row in runtime._no_speech_score_rows
+    assert runtime._no_speech_probs[row].item() == pytest.approx(
+        1.0 / runtime.vocab_size,
+        rel=1e-5,
+    )
+    # Sampling owns and mutates the decode-slot logits after forward. The
+    # retained global score must already be independent of that storage.
+    decode_slot.logits[0].fill_(-float("inf"))
+    decode_slot.logits[0, 42] = 0
+    assert runtime._no_speech_probs[row].item() == pytest.approx(
+        1.0 / runtime.vocab_size,
+        rel=1e-5,
+    )
+
+    runtime.abort_prepared_sequence(prepared)
+    assert row not in runtime._no_speech_score_rows
+    assert row not in runtime._pending_no_speech_score_rows
+    runtime.release_prefill_slot(prefill_slot)
     runtime.shutdown()
 
 

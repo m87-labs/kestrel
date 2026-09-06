@@ -119,9 +119,11 @@ class WhisperPrefillBuffers:
     input_features: Tensor
     control_token_ids: Tensor
     prefix_lengths: Tensor
+    sot_positions: Tensor
     batch_idx: Tensor
     slot_mapping: Tensor
     logits_out: Tensor
+    no_speech_probs_out: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +164,14 @@ class WhisperPrefillSession(Protocol):
 
     def warmup(self) -> None: ...
 
-    def launch(self, slot_id: int, batch_size: int) -> None: ...
+    def launch(
+        self,
+        slot_id: int,
+        batch_size: int,
+        *,
+        separate_sot_projection: bool,
+        retain_sot_score: bool,
+    ) -> None: ...
 
     def shutdown(self) -> None: ...
 
@@ -199,6 +208,11 @@ def validate_resident_buffers(
                 (max_batch_size,),
                 torch.int32,
             ),
+            "sot_positions": (
+                slot.sot_positions,
+                (max_batch_size,),
+                torch.int64,
+            ),
             "batch_idx": (
                 slot.batch_idx,
                 (max_batch_size,),
@@ -213,6 +227,11 @@ def validate_resident_buffers(
                 slot.logits_out,
                 (max_batch_size, config.vocab_size),
                 dtype,
+            ),
+            "no_speech_probs_out": (
+                slot.no_speech_probs_out,
+                (max_batch_size,),
+                torch.float32,
             ),
         }
         for name, (tensor, shape, expected_dtype) in expected.items():
