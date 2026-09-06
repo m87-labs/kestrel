@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.device import empty_cache, resolve_device
+from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
+from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
 from kestrel.models.asr.contract import (
@@ -118,7 +119,11 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
-        self.compute_stream = compute_stream
+        self.compute_stream = (
+            compute_stream
+            if compute_stream is not None
+            else make_stream(self.device)
+        )
         if model is None or tokenizer is None:
             checkpoint = getattr(cfg, "model_path", None) or self._model_name
             loaded = load_parakeet_tdt(checkpoint, device=self.device, dtype=self.dtype)
@@ -139,7 +144,8 @@ class ParakeetTdtRuntime:
                 "Parakeet generated decode requires CUDA with BF16 weights"
             )
         if self.decode_path != "native" and generated_supported:
-            stream = compute_stream or torch.cuda.current_stream(self.device)
+            stream = self.compute_stream
+            assert stream is not None
             self._batch_decoder = _TdtBatchGeneratedDecoder.create(
                 self.model,
                 max_batch=self.batch_capacity,
@@ -152,12 +158,26 @@ class ParakeetTdtRuntime:
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         ):
-            stream = compute_stream or torch.cuda.current_stream(self.device)
+            stream = self.compute_stream
+            assert stream is not None
             self._batch_decoder = _TdtBatchGraphDecoder(
                 self.model,
                 max_batch=self.batch_capacity,
                 compute_stream=stream,
             )
+        self._encoder_graph = FixedShapeSinglePassGraph(
+            enabled=(
+                bool(getattr(cfg, "enable_cuda_graphs", True))
+                and self.device.type == "cuda"
+                and torch.cuda.is_available()
+            ),
+            device=self.device,
+            stream=self.compute_stream,
+            run_forward=self.model.encode,
+            # Three exact B1/B4/B8 shapes retained 372 MiB on L4 and avoided
+            # 107-146 ms recaptures; cap at four independent graph pools.
+            max_entries=4,
+        )
 
     @property
     def model_name(self) -> str:
@@ -267,65 +287,65 @@ class ParakeetTdtRuntime:
         *,
         max_tokens: int,
     ) -> tuple[dict[str, object], ...]:
-        encoded, valid = self.model.encode(features, mask)
         values = []
         factor = self.model.config.encoder.subsampling_factor
-        for row, window, request, row_encoded, row_valid in zip(
-            rows, windows, requests, encoded, valid, strict=True
-        ):
-            _index, audio = row
-            previous = window.state
-            generated = self.model.generate_encoded(
-                row_encoded[None],
-                row_valid[None],
-                max_tokens=max_tokens,
-                start_frame=_encoder_frames(window.start_sample, factor),
-                frame_count=(
-                    None
-                    if window.sample_count is None
-                    else _encoder_frames(window.sample_count, factor)
-                ),
-                state=None if previous is None else previous.decoder,
-            )
-            length = int(generated.lengths[0])
-            token_ids = generated.sequences[0, 1:length].tolist()
-            durations = generated.durations[0, 1:length].tolist()
-            if previous is None:
-                all_token_ids = (self.tokenizer.blank_token_id, *token_ids)
-                all_durations = (0, *durations)
-            else:
-                all_token_ids = (*previous.token_ids, *token_ids)
-                all_durations = (*previous.durations, *durations)
-            if generated.state is None:
-                raise RuntimeError("stateful TDT decoding returned no state")
-            state = _StreamState(generated.state, all_token_ids, all_durations)
-            text_parts: list[str] = []
-            segments: list[Segment] = []
-            logical_audio = DecodedAudio(
-                audio.waveform,
-                window.duration_seconds,
-                window.duration_seconds,
-                0.0,
-            )
-            self._append_chunk_result(
-                request,
-                logical_audio,
-                list(all_token_ids),
-                list(all_durations),
-                text_parts,
-                segments,
-                frame_seconds=generated.encoder_frame_seconds,
-            )
-            value = TranscriptionResult(
-                text=" ".join(text_parts),
-                language=None,
-                duration_seconds=window.duration_seconds,
-                source_duration_seconds=window.duration_seconds,
-                clip_start_seconds=0.0,
-                segments=tuple(segments),
-            ).as_dict()
-            value["_stream_state"] = state
-            values.append(value)
+        with self._encoder_graph.launch(features, mask) as (encoded, valid):
+            for row, window, request, row_encoded, row_valid in zip(
+                rows, windows, requests, encoded, valid, strict=True
+            ):
+                _index, audio = row
+                previous = window.state
+                generated = self.model.generate_encoded(
+                    row_encoded[None],
+                    row_valid[None],
+                    max_tokens=max_tokens,
+                    start_frame=_encoder_frames(window.start_sample, factor),
+                    frame_count=(
+                        None
+                        if window.sample_count is None
+                        else _encoder_frames(window.sample_count, factor)
+                    ),
+                    state=None if previous is None else previous.decoder,
+                )
+                length = int(generated.lengths[0])
+                token_ids = generated.sequences[0, 1:length].tolist()
+                durations = generated.durations[0, 1:length].tolist()
+                if previous is None:
+                    all_token_ids = (self.tokenizer.blank_token_id, *token_ids)
+                    all_durations = (0, *durations)
+                else:
+                    all_token_ids = (*previous.token_ids, *token_ids)
+                    all_durations = (*previous.durations, *durations)
+                if generated.state is None:
+                    raise RuntimeError("stateful TDT decoding returned no state")
+                state = _StreamState(generated.state, all_token_ids, all_durations)
+                text_parts: list[str] = []
+                segments: list[Segment] = []
+                logical_audio = DecodedAudio(
+                    audio.waveform,
+                    window.duration_seconds,
+                    window.duration_seconds,
+                    0.0,
+                )
+                self._append_chunk_result(
+                    request,
+                    logical_audio,
+                    list(all_token_ids),
+                    list(all_durations),
+                    text_parts,
+                    segments,
+                    frame_seconds=generated.encoder_frame_seconds,
+                )
+                value = TranscriptionResult(
+                    text=" ".join(text_parts),
+                    language=None,
+                    duration_seconds=window.duration_seconds,
+                    source_duration_seconds=window.duration_seconds,
+                    clip_start_seconds=0.0,
+                    segments=tuple(segments),
+                ).as_dict()
+                value["_stream_state"] = state
+                values.append(value)
         return tuple(values)
 
     @torch.inference_mode()
@@ -437,30 +457,38 @@ class ParakeetTdtRuntime:
                         ):
                             results[index] = value
                         continue
-                    if (
-                        self._batch_decoder is None
-                        or features.shape[0] < self._batch_decoder.minimum_batch
-                    ):
-                        output = self.model.generate(
-                            features,
-                            mask,
-                            max_tokens=max_tokens,
-                        )
-                    else:
-                        encoded, valid = self.model.encode(features, mask)
-                        output = self._batch_decoder.generate(
-                            encoded,
-                            valid,
-                            max_tokens=max_tokens,
-                        )
-                    packed = torch.cat(
-                        (
-                            output.lengths[:, None],
-                            output.sequences,
-                            output.durations,
-                        ),
-                        dim=1,
-                    ).tolist()
+                    use_encoded_decode = (
+                        self._batch_decoder is not None
+                        and features.shape[0] >= self._batch_decoder.minimum_batch
+                    )
+                    encoder_lease = (
+                        self._encoder_graph.launch(features, mask)
+                        if use_encoded_decode
+                        else nullcontext(None)
+                    )
+                    with encoder_lease as encoded_result:
+                        if encoded_result is None:
+                            output = self.model.generate(
+                                features,
+                                mask,
+                                max_tokens=max_tokens,
+                            )
+                        else:
+                            assert self._batch_decoder is not None
+                            encoded, valid = encoded_result
+                            output = self._batch_decoder.generate(
+                                encoded,
+                                valid,
+                                max_tokens=max_tokens,
+                            )
+                        packed = torch.cat(
+                            (
+                                output.lengths[:, None],
+                                output.sequences,
+                                output.durations,
+                            ),
+                            dim=1,
+                        ).tolist()
                     for (index, audio), row in zip(valid_group, packed, strict=True):
                         length = row[0]
                         token_ids = row[1 : 1 + length]
@@ -494,6 +522,7 @@ class ParakeetTdtRuntime:
         return tuple(finalized)
 
     def shutdown(self) -> None:
+        self._encoder_graph.shutdown()
         empty_cache(self.device)
 
 
