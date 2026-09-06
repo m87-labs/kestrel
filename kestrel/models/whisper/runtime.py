@@ -21,7 +21,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from kestrel.device import make_event, make_stream, stream_context
+from kestrel.device import (
+    get_device_capability,
+    get_device_sm_count,
+    make_event,
+    make_stream,
+    stream_context,
+)
 from kestrel.kv_cache import (
     KVMemoryPool,
     PageTable,
@@ -76,6 +82,48 @@ _DECODE_SLOT_COUNT = 2
 _CONTROL_TOKEN_CAPACITY = 4
 _DEFAULT_TRANSCRIPT_TOKENS = 444
 _CONSTRAINT_PLAN_WIDTH = 8
+
+
+def _supports_whisper_native_target(
+    capability: tuple[int, int], device_sms: int
+) -> bool:
+    """Whether one CUDA target is in Whisper's native serving domain.
+
+    Hopper SM9x and data-center Blackwell SM10x preserve the existing
+    architecture-level admission; their exact packed-program coverage remains
+    fail-closed in the generated runtime. Ada is narrower: only an exact
+    packaging-owned generated-decode target is admitted, so adding L4 support
+    cannot silently admit every SM89 product.
+    """
+    if (
+        not isinstance(device_sms, int)
+        or isinstance(device_sms, bool)
+        or device_sms <= 0
+    ):
+        return False
+    major, minor = capability
+    if major in (9, 10):
+        return True
+    if (major, minor) != (8, 9):
+        return False
+
+    from kestrel_kernels.deploy_targets import GENERATED_DECODE, deploy_targets_for
+
+    return any(
+        target.arch_num == 89 and target.num_sms == device_sms
+        for target in deploy_targets_for(GENERATED_DECODE)
+    )
+
+
+def _require_whisper_native_target(device: torch.device) -> None:
+    capability = get_device_capability(device)
+    device_sms = get_device_sm_count(device)
+    if not _supports_whisper_native_target(capability, device_sms):
+        raise RuntimeError(
+            "Optimized Whisper serving supports shipped Ada generated-decode "
+            "targets, Hopper SM9x, and data-center Blackwell SM10x; got "
+            f"SM{capability[0]}{capability[1]} with {device_sms} SMs"
+        )
 
 
 def _validated_packed_receipts(
@@ -403,6 +451,14 @@ class WhisperRuntime(UncachedPagedRuntime):
         self.dtype = _resolved_dtype(cfg)
         if not isinstance(self.dtype, torch.dtype):
             raise TypeError("Whisper runtime dtype must be a torch.dtype")
+        production = _components is None
+        uses_native_sessions = production or _components.session_factory is None
+        if uses_native_sessions:
+            if self.device.type != "cuda":
+                raise ValueError("The optimized Whisper runtime requires a CUDA device")
+            if self.dtype is not torch.bfloat16:
+                raise ValueError("The optimized Whisper runtime requires bfloat16")
+            _require_whisper_native_target(self.device)
         self.max_batch_size = _positive_int(
             "max_batch_size", getattr(cfg, "max_batch_size", 1)
         )
@@ -433,7 +489,6 @@ class WhisperRuntime(UncachedPagedRuntime):
                 stacklevel=2,
             )
 
-        production = _components is None
         if production and not bool(getattr(cfg, "enable_cuda_graphs", True)):
             raise ValueError(
                 "Optimized Whisper serving requires CUDA graphs for custom prefill"
@@ -643,13 +698,6 @@ class WhisperRuntime(UncachedPagedRuntime):
         )
 
         if components.session_factory is None:
-            capability = torch.cuda.get_device_capability(self.device)
-            if capability[0] not in (9, 10):
-                raise RuntimeError(
-                    "Optimized Whisper serving currently supports Hopper and "
-                    f"Blackwell, got compute capability {capability[0]}."
-                    f"{capability[1]}"
-                )
             self._prefill_session = NativeWhisperPrefillSession(
                 bindings,
                 components.weights,
