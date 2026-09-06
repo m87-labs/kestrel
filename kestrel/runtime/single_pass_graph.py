@@ -49,7 +49,6 @@ class FixedShapeSinglePassGraph:
         self._stream = stream
         self._run_forward = run_forward
         self._max_entries = int(max_entries)
-        self._pool = None
         self._entries: OrderedDict[_InputKey, _GraphEntry] = OrderedDict()
         self._lock = threading.RLock()
         self._closed = False
@@ -99,14 +98,8 @@ class FixedShapeSinglePassGraph:
             self._outputs(self._run_forward(*static_inputs))
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(
-                graph,
-                stream=stream,
-                pool=self._pool,
-            ):
+            with torch.cuda.graph(graph, stream=stream):
                 outputs = self._outputs(self._run_forward(*static_inputs))
-            if self._pool is None:
-                self._pool = graph.pool()
             graph.replay()
         return _GraphEntry(static_inputs, outputs, graph)
 
