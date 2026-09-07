@@ -91,9 +91,9 @@ def _supports_whisper_native_target(
 
     Hopper SM9x and data-center Blackwell SM10x preserve the existing
     architecture-level admission; their exact packed-program coverage remains
-    fail-closed in the generated runtime. Ampere and Ada are narrower: only an
-    exact packaging-owned generated-decode target is admitted, so support for
-    one device cannot silently admit every SM8x product.
+    fail-closed in the generated runtime. Other architectures require an exact
+    packaging-owned generated-decode target, so adding a target admits only
+    the architecture and SM count whose artifacts are shipped.
     """
     if (
         not isinstance(device_sms, int)
@@ -104,9 +104,6 @@ def _supports_whisper_native_target(
     major, minor = capability
     if major in (9, 10):
         return True
-    if major != 8:
-        return False
-
     from kestrel_kernels.deploy_targets import GENERATED_DECODE, deploy_targets_for
 
     return any(
@@ -120,7 +117,7 @@ def _require_whisper_native_target(device: torch.device) -> None:
     device_sms = get_device_sm_count(device)
     if not _supports_whisper_native_target(capability, device_sms):
         raise RuntimeError(
-            "Optimized Whisper serving supports shipped Ampere/Ada "
+            "Optimized Whisper serving supports shipped "
             "generated-decode targets, Hopper SM9x, and data-center "
             "Blackwell SM10x; got "
             f"SM{capability[0]}{capability[1]} with {device_sms} SMs"
