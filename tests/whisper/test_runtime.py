@@ -96,6 +96,18 @@ def test_whisper_native_target_support_is_explicit(
     assert _supports_whisper_native_target(capability, device_sms) is expected
 
 
+def test_whisper_admits_exact_packaging_target_on_a_new_architecture(monkeypatch):
+    import kestrel_kernels.deploy_targets as targets
+
+    monkeypatch.setattr(
+        targets, "deploy_targets_for",
+        lambda family: (SimpleNamespace(arch_num=120, num_sms=188),),
+    )
+    assert _supports_whisper_native_target((12, 0), 188)
+    assert not _supports_whisper_native_target((12, 0), 170)
+    assert not _supports_whisper_native_target((12, 1), 188)
+
+
 @pytest.mark.parametrize("injected_native_components", (False, True))
 def test_unsupported_native_target_fails_before_asset_loading(
     monkeypatch, injected_native_components: bool
