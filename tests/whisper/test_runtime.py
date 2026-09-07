@@ -81,7 +81,8 @@ def test_native_whisper_ops_use_the_uniform_kernel_runtime_surface() -> None:
         ((8, 9), 24, False),  # Smaller consumer Ada.
         ((8, 9), 128, False),  # Larger consumer Ada.
         ((8, 9), 142, False),  # L40/L40S must not inherit L4 admission.
-        ((8, 0), 108, False),
+        ((8, 0), 108, True),  # A100 SXM: exact shipped Ampere target.
+        ((8, 0), 80, False),  # Other SM80 target.
         ((8, 6), 82, True),  # RTX 3090: exact shipped Ampere target.
         ((8, 6), 68, False),  # Other consumer Ampere target.
         ((12, 0), 96, False),

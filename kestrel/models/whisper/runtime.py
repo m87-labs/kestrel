@@ -104,7 +104,7 @@ def _supports_whisper_native_target(
     major, minor = capability
     if major in (9, 10):
         return True
-    if major != 8 or minor not in (6, 9):
+    if major != 8:
         return False
 
     from kestrel_kernels.deploy_targets import GENERATED_DECODE, deploy_targets_for
