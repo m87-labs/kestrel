@@ -22,10 +22,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from kestrel.ops.attention import dense_attention, paged_attention
+from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.ops.rotary import default_inv_freq
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
+
+
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
@@ -51,6 +54,19 @@ _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
+
+
+def _text_linear(
+    config: Qwen3_5TextConfig, in_features: int, out_features: int, *,
+    quantized_rows: int | None = None, interleaved_parts: int = 1,
+) -> nn.Module:
+    if config.dense_weight_format == "fp8_e4m3":
+        return BlockScaledLinear(
+            in_features, out_features, quantized_rows=quantized_rows,
+            interleaved_parts=interleaved_parts,
+        )
+    return nn.Linear(in_features, out_features, bias=False)
+
 
 
 def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
@@ -297,7 +313,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = _text_linear(config, self.value_dim, self.hidden_size)
 
         self.causal_conv1d_packed = _kestrel_causal_conv1d_packed
         self.allocate_packed_gdn_prefill_workspace = (
@@ -309,10 +325,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.supports_packed_gdn = _kestrel_supports_packed_gdn
         self._prefill_workspace_cache = _PackedGatedDeltaPrefillWorkspaceCache()
 
-        self.in_proj = nn.Linear(
-            self.hidden_size,
+        self.in_proj = _text_linear(
+            config, self.hidden_size,
             self.conv_dim + self.value_dim + 2 * self.num_v_heads,
-            bias=False,
+            quantized_rows=self.conv_dim + self.value_dim,
         )
 
     def forward(
@@ -464,15 +480,11 @@ class Qwen3_5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.q_gate_size = config.num_attention_heads * self.head_dim * 2
         self.kv_size = config.num_key_value_heads * self.head_dim
-        self.qkv_proj = nn.Linear(
-            config.hidden_size,
-            self.q_gate_size + 2 * self.kv_size,
-            bias=False,
+        self.qkv_proj = _text_linear(
+            config, config.hidden_size, self.q_gate_size + 2 * self.kv_size,
         )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
+        self.o_proj = _text_linear(
+            config, config.num_attention_heads * self.head_dim, config.hidden_size,
         )
         # Unlike OLMo, these normalize only the head dimension.
         self.q_norm = _rmsnorm_state(self.head_dim, config.rms_norm_eps)
@@ -574,15 +586,12 @@ class Qwen3_5MLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
-        self.gate_up_proj = nn.Linear(
-            self.hidden_size,
-            2 * self.intermediate_size,
-            bias=False,
+        self.gate_up_proj = _text_linear(
+            config, self.hidden_size, 2 * self.intermediate_size,
+            interleaved_parts=2,
         )
-        self.down_proj = nn.Linear(
-            self.intermediate_size,
-            self.hidden_size,
-            bias=False,
+        self.down_proj = _text_linear(
+            config, self.intermediate_size, self.hidden_size,
         )
 
     def forward(self, x):

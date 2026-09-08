@@ -12,6 +12,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
 from kestrel.ops.rotary import default_inv_freq
+from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 from .qwen_config import Qwen3_5Config
@@ -258,27 +259,30 @@ def _dequantize_fp8_weight(
     return output
 
 
-def _load_fp8_expert_weight_and_scale(
+def _load_fp8_block_weight_and_scale(
     value: torch.Tensor,
     scale_inv: torch.Tensor | None,
     expected_shape: torch.Size,
     *,
     key: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _is_float8_tensor(value):
-        raise ValueError(f"Qwen FP8 expert weight {key!r} has dtype {value.dtype}")
+    if value.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"Qwen FP8 block weight {key!r} has dtype {value.dtype}")
     if scale_inv is None:
-        raise ValueError(f"Qwen FP8 expert weight {key!r} is missing weight_scale_inv")
+        raise ValueError(f"Qwen FP8 block weight {key!r} is missing weight_scale_inv")
     if value.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
-            "Qwen FP8 expert loading expects 2D weight/scale tensors, "
+            "Qwen FP8 block loading expects 2D weight/scale tensors, "
             f"got weight={tuple(value.shape)} scale={tuple(scale_inv.shape)}"
         )
     if value.shape != expected_shape:
         raise ValueError(
-            f"Qwen FP8 expert weight {key!r} has shape {tuple(value.shape)}, "
+            f"Qwen FP8 block weight {key!r} has shape {tuple(value.shape)}, "
             f"expected {tuple(expected_shape)}"
         )
+    expected_scale_shape = tuple((extent + 127) // 128 for extent in expected_shape)
+    if tuple(scale_inv.shape) != expected_scale_shape or not scale_inv.is_floating_point():
+        raise ValueError(f"Qwen FP8 block scale {key!r} must have shape {expected_scale_shape} and floating-point values")
     return value.view(torch.uint8).contiguous(), scale_inv.to(torch.float32).contiguous()
 
 
@@ -380,6 +384,62 @@ def _copy_fused_projection_part(
     seen.add(part)
     if seen == set(parts):
         loaded_keys.add(fused_key)
+
+
+def _copy_block_scaled_projection_part(
+    module: BlockScaledLinear,
+    tensor_shapes: dict[str, torch.Size],
+    *, checkpoint_key: str, target_key: str, part: str,
+    parts: tuple[str, ...], value: torch.Tensor,
+    scale: torch.Tensor | None, loaded_parts: dict[str, set[str]],
+    loaded_keys: set[str],
+) -> None:
+    prefix = checkpoint_key[:-len(part)]
+    shapes = [tensor_shapes[prefix + item] for item in parts]
+    if any(len(shape) != 2 or shape[1] != module.in_features for shape in shapes):
+        raise ValueError(f"invalid block-scaled projection parts for {target_key!r}")
+    if sum(shape[0] for shape in shapes) != module.out_features:
+        raise ValueError(f"block-scaled projection rows disagree for {target_key!r}")
+    if value.shape != tensor_shapes[checkpoint_key]:
+        raise ValueError(f"checkpoint tensor {checkpoint_key!r} changed shape")
+    seen = loaded_parts.setdefault(target_key, set())
+    if part in seen:
+        raise ValueError(f"duplicate block-scaled projection part {checkpoint_key!r}")
+    slot = parts.index(part)
+    offset = sum(shape[0] for shape in shapes[:slot])
+    rows = int(value.shape[0])
+    with torch.no_grad():
+        if module.interleaved_parts == 2:
+            if len(parts) != 2 or shapes[0] != shapes[1]:
+                raise ValueError("interleaved FP8 projections need two equal row parts")
+            weight, scales = _load_fp8_block_weight_and_scale(
+                value, scale, value.shape, key=checkpoint_key)
+            module.weight.reshape(-1, 2, 8, module.in_features)[:, slot].copy_(
+                weight.reshape(-1, 8, module.in_features))
+            module.weight_scale_inv[slot].copy_(scales)
+        elif offset < module.quantized_rows:
+            if offset % 128 or offset + rows > module.quantized_rows:
+                raise ValueError("FP8 projection parts must preserve scale-block boundaries")
+            if rows % 128 and offset + rows != module.quantized_rows:
+                raise ValueError("only the final FP8 projection part may have partial blocks")
+            weight, scales = _load_fp8_block_weight_and_scale(
+                value, scale, value.shape, key=checkpoint_key)
+            module.weight.narrow(0, offset, rows).copy_(weight)
+            module.weight_scale_inv[0].narrow(0, offset // 128, scales.shape[0]).copy_(scales)
+        else:
+            if module.weight_tail is None or value.dtype not in (
+                torch.bfloat16, torch.float16, torch.float32,
+            ) or scale is not None:
+                raise ValueError("unquantized projection tails require floating-point weights without scales")
+            module.weight_tail.narrow(0, offset - module.quantized_rows, rows).copy_(value)
+            module.weight.narrow(0, offset, rows).zero_()
+    seen.add(part)
+    if seen == set(parts):
+        loaded_keys.add(target_key)
+        module_key = target_key.removesuffix(".weight")
+        loaded_keys.add(module_key + ".weight_scale_inv")
+        if module.weight_tail is not None:
+            loaded_keys.add(module_key + ".weight_tail")
 
 
 def _copy_bf16_expert_part(
@@ -582,6 +642,16 @@ def _load_sharded_safetensors(
                 value = handle.get_tensor(key)
             if key in expected_keys:
                 scale_key = _scale_inv_key(key)
+                if key.endswith(".weight"):
+                    module = model.get_submodule(key.removesuffix(".weight"))
+                    if isinstance(module, BlockScaledLinear):
+                        _copy_block_scaled_projection_part(
+                            module, tensor_shapes, checkpoint_key=key,
+                            target_key=key, part="weight", parts=("weight",),
+                            value=value, scale=scale_inv_by_key.get(scale_key),
+                            loaded_parts=loaded_fused_parts, loaded_keys=loaded_keys,
+                        )
+                        continue
                 loaded = _loadable_tensor(
                     key,
                     value,
@@ -604,6 +674,17 @@ def _load_sharded_safetensors(
             fused_handled = False
             for fused_key, part, parts in fused_parts:
                 if fused_key in expected_keys:
+                    module = model.get_submodule(fused_key.rsplit(".", 1)[0])
+                    if isinstance(module, BlockScaledLinear) and fused_key.endswith(".weight"):
+                        _copy_block_scaled_projection_part(
+                            module, tensor_shapes, checkpoint_key=key,
+                            target_key=fused_key, part=part, parts=parts,
+                            value=value,
+                            scale=scale_inv_by_key.get(_scale_inv_key(key)),
+                            loaded_parts=loaded_fused_parts, loaded_keys=loaded_keys,
+                        )
+                        fused_handled = True
+                        break
                     loaded = _loadable_tensor(
                         key,
                         value,
@@ -641,7 +722,7 @@ def _load_sharded_safetensors(
                             expected_part_shape = torch.Size(
                                 (target_shape[1], target_shape[2])
                             )
-                        weight, scale = _load_fp8_expert_weight_and_scale(
+                        weight, scale = _load_fp8_block_weight_and_scale(
                             value,
                             scale_inv_by_key.get(_scale_inv_key(key)),
                             expected_part_shape,

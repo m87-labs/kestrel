@@ -34,6 +34,7 @@ class Qwen3_5TextConfig:
     num_experts_per_tok: int | None = None
     num_experts: int | None = None
     expert_weight_format: str = "bf16"
+    dense_weight_format: str = "bf16"
 
     def __post_init__(self) -> None:
         layer_types = tuple(str(kind) for kind in self.layer_types)
@@ -56,6 +57,8 @@ class Qwen3_5TextConfig:
             raise ValueError(
                 f"unsupported Qwen expert weight format {self.expert_weight_format!r}"
             )
+        if self.dense_weight_format not in {"bf16", "fp8_e4m3"}:
+            raise ValueError(f"unsupported Qwen dense weight format {self.dense_weight_format!r}")
         moe_fields = (
             self.moe_intermediate_size,
             self.shared_expert_intermediate_size,
@@ -81,6 +84,7 @@ class Qwen3_5TextConfig:
         is_moe: bool,
         tie_word_embeddings: bool,
         expert_weight_format: str,
+        dense_weight_format: str = "bf16",
     ) -> "Qwen3_5TextConfig":
         if required_config(data, "hidden_act", "Qwen text") != "silu":
             raise ValueError("Qwen text inference requires hidden_act='silu'")
@@ -141,6 +145,7 @@ class Qwen3_5TextConfig:
             ),
             layer_types=layer_types,
             expert_weight_format=expert_weight_format,
+            dense_weight_format=dense_weight_format,
         )
         if is_moe:
             for name in (
@@ -205,6 +210,8 @@ class Qwen3_5Config:
             and quantization.get("fmt") == "e4m3"
             else "bf16"
         )
+        if expert_weight_format == "fp8_e4m3" and quantization.get("weight_block_size", [128, 128]) != [128, 128]:
+            raise ValueError("Qwen FP8 requires 128 by 128 weight scale blocks")
         text = Qwen3_5TextConfig.from_dict(
             text_data,
             is_moe=model_type == "qwen3_5_moe"
@@ -213,6 +220,7 @@ class Qwen3_5Config:
                 required_config(data, "tie_word_embeddings", "Qwen")
             ),
             expert_weight_format=expert_weight_format,
+            dense_weight_format=expert_weight_format,
         )
         return cls(
             text_config=text,

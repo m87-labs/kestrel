@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
+import pytest
 from safetensors.torch import save_file
 
 from kestrel.models.qwen35.qwen_loader import (
@@ -17,6 +18,7 @@ from kestrel.models.qwen35.qwen_loader import (
 import kestrel.models.qwen35.qwen_loader as loader_module
 from kestrel.models.qwen35.runtime import Qwen35Runtime
 from kestrel.ops.rotary import default_inv_freq
+from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.runtime.generated_decode import materialize_remaining_meta_tensors
 
 
@@ -33,6 +35,48 @@ class _FusedExpertHolder(torch.nn.Module):
             torch.empty((2, 32, 3), dtype=torch.bfloat16),
             requires_grad=False,
         )
+
+
+@pytest.mark.parametrize("kind", ["direct", "gdn", "gated"])
+def test_sharded_loader_keeps_native_fp8_and_bf16_tail(tmp_path, kind):
+    torch.manual_seed(128)
+    model = torch.nn.Module()
+    if kind == "direct":
+        name, parts, row_counts = "out_proj", ("out_proj",), (144,)
+    elif kind == "gdn":
+        name = "in_proj"
+        parts, row_counts = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"), (128, 128, 8, 8)
+    else:
+        name, parts, row_counts = "gate_up_proj", ("gate_proj", "up_proj"), (144, 144)
+    module = BlockScaledLinear(
+        136, sum(row_counts), quantized_rows=256 if kind == "gdn" else None,
+        interleaved_parts=2 if kind == "gated" else 1,
+    )
+    model.layer = torch.nn.Module()
+    setattr(model.layer, name, module)
+    checkpoint, expected = {}, []
+    for index, (part, rows) in enumerate(zip(parts, row_counts, strict=True)):
+        key = f"layer.{part}.weight"
+        if kind == "gdn" and index >= 2:
+            weight = torch.full((rows, 136), 1.0078125, dtype=torch.bfloat16)
+            checkpoint[key] = weight
+            expected.append(weight)
+        else:
+            weight = torch.randn(rows, 136).to(torch.float8_e4m3fn)
+            scale = torch.rand((rows + 127) // 128, 2) + 0.25
+            checkpoint[key] = weight
+            checkpoint[key + "_scale_inv"] = scale
+            expected.append(_dequantize_fp8_weight(weight, scale, weight.shape, key=key))
+    save_file(checkpoint, tmp_path / "model.safetensors")
+    assert _load_sharded_safetensors(
+        model, tmp_path, ["model.safetensors"], device=torch.device("cpu"),
+    ) == ([], [])
+    expected_weight = (
+        _interleave_gate_up_weight(*expected) if kind == "gated"
+        else torch.cat(expected)
+    )
+    torch.testing.assert_close(module.dequantized_weight(torch.bfloat16), expected_weight, rtol=0, atol=0)
+    assert module.weight.dtype == torch.uint8
 
 
 def test_fp8_dequantization_chunks_without_changing_bf16_result() -> None:
