@@ -29,9 +29,10 @@ def test_speech_onset_trimmer_preserves_audio_without_detected_speech() -> None:
 
 def test_speech_onset_trimmer_discards_a_startup_click_before_speech() -> None:
     block = 240
-    waveform = np.zeros(7 * block, dtype=np.float32)
-    waveform[block - 15 : block + 15] = 0.1
-    speech_start = 3 * block
+    waveform = np.zeros(8 * block, dtype=np.float32)
+    click = np.tile(np.array((-0.1, 0.1), dtype=np.float32), 121)
+    waveform[block - 1 : 2 * block + 1] = click
+    speech_start = 4 * block
     waveform[speech_start:] = np.tile(
         np.array((-0.1, 0.1), dtype=np.float32), 2 * block
     )
@@ -39,3 +40,14 @@ def test_speech_onset_trimmer_discards_a_startup_click_before_speech() -> None:
 
     np.testing.assert_array_equal(trimmer.push(waveform), waveform[speech_start:])
     assert trimmer.finish().size == 0
+
+
+def test_speech_onset_trimmer_rejects_sparse_same_polarity_spikes() -> None:
+    block = 240
+    waveform = np.zeros(3 * block, dtype=np.float32)
+    for start in range(0, waveform.size, block):
+        waveform[start : start + 2] = 1.0
+    trimmer = SpeechOnsetTrimmer(24_000)
+
+    assert trimmer.push(waveform).size == 0
+    np.testing.assert_array_equal(trimmer.finish(), waveform)

@@ -31,12 +31,16 @@ class SpeechOnsetTrimmer:
             window = self._pending[self._scan : self._scan + self._frame]
             centered = window - np.mean(window)
             rms = float(np.sqrt(np.mean(centered * centered)))
-            if rms >= self._threshold:
+            occupied = (
+                np.count_nonzero(np.abs(window) >= self._threshold) * 2
+                >= self._frame
+            )
+            if rms >= self._threshold and occupied:
                 if self._run_length == 0:
                     self._run_start = self._scan
                 self._run_length += 1
-                # A click crossing a block boundary can activate two blocks;
-                # three requires 30 ms of sustained audio.
+                # Requiring three half-occupied blocks rejects sparse startup
+                # clicks without retaining a model-specific silence duration.
                 if self._run_length == 3:
                     assert self._run_start is not None
                     audible = self._pending[self._run_start :]
