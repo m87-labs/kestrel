@@ -118,12 +118,12 @@ def _loadable_tensor(
     scale_inv: torch.Tensor | None = None,
     *,
     convert_fp8_to_bf16: bool = False,
-    exact_fp32_weight_keys: set[str] | None = None,
+    fp32_storage_weight_keys: set[str] | None = None,
 ) -> torch.Tensor:
-    if exact_fp32_weight_keys is not None and key in exact_fp32_weight_keys:
-        if value.dtype != torch.float32:
+    if fp32_storage_weight_keys is not None and key in fp32_storage_weight_keys:
+        if value.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise ValueError(
-                f"Qwen GDN norm weight {key!r} requires an FP32 checkpoint tensor, "
+                f"Qwen GDN norm weight {key!r} requires an unquantized floating-point checkpoint tensor, "
                 f"got {value.dtype}"
             )
         if value.shape != expected_shape:
@@ -131,7 +131,9 @@ def _loadable_tensor(
                 f"Qwen GDN norm weight {key!r} has shape {tuple(value.shape)}, "
                 f"expected {tuple(expected_shape)}"
             )
-        return value
+        # Qwen 3.6 checkpoints may store this norm in BF16. Widen exactly;
+        # FP32 checkpoints must never round through the model activation dtype.
+        return value.to(torch.float32)
     if _is_float8_tensor(value):
         if not convert_fp8_to_bf16:
             raise ValueError(
@@ -659,7 +661,7 @@ def _load_sharded_safetensors(
                     expected_state[key].shape,
                     scale_inv_by_key.get(scale_key),
                     convert_fp8_to_bf16=_stores_checkpoint_fp8_as_bf16(key),
-                    exact_fp32_weight_keys=qwen_gdn_norm_weight_keys,
+                    fp32_storage_weight_keys=qwen_gdn_norm_weight_keys,
                 )
                 with torch.no_grad():
                     _copy_direct_checkpoint_tensor(
