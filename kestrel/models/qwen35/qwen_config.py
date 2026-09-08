@@ -210,7 +210,10 @@ class Qwen3_5Config:
             and quantization.get("fmt") == "e4m3"
             else "bf16"
         )
-        if expert_weight_format == "fp8_e4m3" and quantization.get("weight_block_size", [128, 128]) != [128, 128]:
+        if (
+            expert_weight_format == "fp8_e4m3"
+            and quantization.get("weight_block_size", [128, 128]) != [128, 128]
+        ):
             raise ValueError("Qwen FP8 requires 128 by 128 weight scale blocks")
         text = Qwen3_5TextConfig.from_dict(
             text_data,

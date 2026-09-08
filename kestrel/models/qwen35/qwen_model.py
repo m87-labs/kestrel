@@ -28,8 +28,6 @@ from kestrel.ops.rotary import default_inv_freq
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
 
-
-
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
 
@@ -66,7 +64,6 @@ def _text_linear(
             interleaved_parts=interleaved_parts,
         )
     return nn.Linear(in_features, out_features, bias=False)
-
 
 
 def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
