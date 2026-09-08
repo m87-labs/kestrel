@@ -57,35 +57,37 @@ class MoondreamDecodeBindings:
             runtime._lora_workspace is None
             and runtime.page_size == 1
             and len(self.layers) == len(runtime.model.text.blocks)
-            and all(layer.cache.quantized for layer in self.layers)
+            and bool(self.layers)
+            and (
+                all(layer.cache.quantized for layer in self.layers)
+                or all(
+                    not layer.cache.quantized
+                    and layer.cache.k_cache.dtype == torch.bfloat16
+                    and layer.cache.v_cache.dtype == torch.bfloat16
+                    for layer in self.layers
+                )
+            )
             and all(
                 int(layer.cache.k_cache.shape[2])
                 == int(layer.cache.v_cache.shape[2])
                 == 1
                 for layer in self.layers
             )
-            and all(
-                hasattr(block.attn, "_tau_pos_table")
-                for block in runtime.model.text.blocks
+            and (
+                not self.layers[0].cache.quantized
+                or all(
+                    hasattr(block.attn, "_tau_pos_table")
+                    for block in runtime.model.text.blocks
+                )
             )
         )
 
     def runtime_inputs(self, runtime: Any) -> Mapping[str, Any]:
         rope_cos, rope_sin = _rope_tables(runtime.model.text)
         caches = [layer.cache for layer in self.layers]
-        return {
-            "tau_pos": torch.stack([
-                block.attn._tau_pos_table.detach().float()
-                for block in runtime.model.text.blocks
-            ]).contiguous(),
+        inputs = {
             "rope_cos": rope_cos,
             "rope_sin": rope_sin,
-            "mK_dequant_scale": torch.stack([
-                cache.k_scale_tensor for cache in caches
-            ]).contiguous(),
-            "mV_dequant_scale": torch.stack([
-                cache.v_scale_tensor for cache in caches
-            ]).contiguous(),
             "mK": [cache.k_cache[:, :, 0, :] for cache in caches],
             "mV": [cache.v_cache[:, :, 0, :] for cache in caches],
             "page_table": runtime.page_table.page_table,
@@ -93,6 +95,20 @@ class MoondreamDecodeBindings:
             # ``launch_extents`` supplies the live maximum position for every run.
             "kv_len": 1,
         }
+        if caches[0].quantized:
+            inputs.update({
+                "tau_pos": torch.stack([
+                    block.attn._tau_pos_table.detach().float()
+                    for block in runtime.model.text.blocks
+                ]).contiguous(),
+                "mK_dequant_scale": torch.stack([
+                    cache.k_scale_tensor for cache in caches
+                ]).contiguous(),
+                "mV_dequant_scale": torch.stack([
+                    cache.v_scale_tensor for cache in caches
+                ]).contiguous(),
+            })
+        return inputs
 
     def slot_inputs(self, slot: Any, capacity: int) -> Mapping[str, Any]:
         return {

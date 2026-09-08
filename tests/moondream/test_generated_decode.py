@@ -182,3 +182,27 @@ def test_moondream_allocates_selected_generated_program_abi_capacity(
     assert plan.slot_capacity == 8
     assert storage_capacity == 8
     assert runtime.max_batch_slots == 3
+
+
+def test_dense_moondream_binds_bf16_pool_without_tau_or_scales():
+    cache = SimpleNamespace(
+        quantized=False,
+        k_cache=torch.zeros(3, 1, 1, 2, dtype=torch.bfloat16),
+        v_cache=torch.zeros(3, 1, 1, 2, dtype=torch.bfloat16),
+    )
+    runtime = SimpleNamespace(
+        _lora_workspace=None, page_size=1,
+        model=SimpleNamespace(text=SimpleNamespace(
+            blocks=[SimpleNamespace(attn=SimpleNamespace())],
+            cos_sin_cache=torch.ones(5, 4),
+        )),
+        page_table=SimpleNamespace(page_table=torch.zeros(1, 5, dtype=torch.int32)),
+    )
+    bindings = MoondreamDecodeBindings([SimpleNamespace(cache=cache)])
+    assert bindings.is_eligible(runtime)
+    inputs = bindings.runtime_inputs(runtime)
+    assert set(inputs) == {"mK", "mV", "rope_cos", "rope_sin", "page_table", "kv_len"}
+    assert inputs["mK"][0].data_ptr() == cache.k_cache.data_ptr()
+    assert inputs["mV"][0].data_ptr() == cache.v_cache.data_ptr()
+    cache.k_cache = cache.k_cache.float()
+    assert not bindings.is_eligible(runtime)
