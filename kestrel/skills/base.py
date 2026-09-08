@@ -349,6 +349,19 @@ class SkillState:
             output["reasoning"] = reasoning
         return output or None
 
+    def next_output_deadline(
+        self,
+        runtime: "AutoregressiveRuntime",
+    ) -> Optional[float]:
+        """Return the monotonic deadline for the next streaming update.
+
+        Skills with playback or other real-time output can opt into
+        deadline-ordered decode. ``None`` retains the scheduler's stable FIFO
+        cohort policy.
+        """
+
+        return None
+
 
 class SkillRegistry:
     """Maps a model's capability names to their skills.
