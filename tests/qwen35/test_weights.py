@@ -53,21 +53,28 @@ def test_gdn_norm_preserves_exact_fp32_checkpoint_weight_under_bf16_default(
     torch.testing.assert_close(model.norm.weight, checkpoint, rtol=0, atol=0)
 
 
-def test_gdn_norm_rejects_rounded_checkpoint_weight(tmp_path) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gdn_norm_widens_checkpoint_without_changing_values(tmp_path, dtype) -> None:
+    model = _gdn_norm_holder(4)
+    checkpoint = torch.tensor([0.9929, 1.0009, 1.0071, -0.125], dtype=dtype)
+    shard = tmp_path / "model.safetensors"
+    save_file({"norm.weight": checkpoint}, shard)
+    missing, unexpected = _load_sharded_safetensors(
+        model, tmp_path, [shard.name], device=torch.device("cpu"),
+    )
+    assert missing == []
+    assert unexpected == []
+    assert model.norm.weight.dtype == torch.float32
+    torch.testing.assert_close(model.norm.weight, checkpoint.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.float8_e4m3fn])
+def test_gdn_norm_rejects_quantized_checkpoint_weight(tmp_path, dtype) -> None:
     model = _gdn_norm_holder(4)
     shard = tmp_path / "model.safetensors"
-    save_file({"norm.weight": torch.full((4,), 0.5, dtype=torch.bfloat16)}, shard)
-
-    with pytest.raises(ValueError, match="requires an FP32 checkpoint tensor"):
+    save_file({"norm.weight": torch.ones(4).to(dtype)}, shard)
+    with pytest.raises(ValueError, match="requires an unquantized floating-point"):
         _load_sharded_safetensors(
-            model,
-            tmp_path,
-            [shard.name],
-            device=torch.device("cpu"),
+            model, tmp_path, [shard.name], device=torch.device("cpu"),
         )
-    torch.testing.assert_close(
-        model.norm.weight,
-        torch.ones(4, dtype=torch.float32),
-        rtol=0,
-        atol=0,
-    )
+    torch.testing.assert_close(model.norm.weight, torch.ones(4), rtol=0, atol=0)
