@@ -4,6 +4,17 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.7.1 — 2026-09-09
+
+- Updated to `kestrel-kernels` 0.6.1 and matching CUDA bundle companions.
+- Expanded Whisper device admission to the deployed generated-decode targets,
+  including L4 and RTX 3090.
+- Reduced speech inference overhead with fused Parakeet encoder projections,
+  bounded encoder graph reuse, pipelined decoder readback, and shared Qwen ASR
+  prefill normalization.
+- Improved generated decode integration for Moondream and packed Qwen weights,
+  and reduced decode scheduling and sampled-token transfer overhead.
+
 ## 0.7.0 — 2026-09-01
 
 Kestrel 0.7.0 expands Photon with two additional speech model families and
