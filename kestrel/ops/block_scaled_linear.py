@@ -2,7 +2,11 @@
 
 import torch
 from torch import nn
-from torch.nn import functional as F
+
+from kestrel_kernels import get_runtime
+
+
+_block_scaled_linear = get_runtime().linear.block_scaled_linear
 
 
 class BlockScaledLinear(nn.Module):
@@ -10,8 +14,8 @@ class BlockScaledLinear(nn.Module):
 
     Scales are stored as [parts, row blocks, column blocks]. With two parts,
     eight-row blocks alternate between the parts, as in a fused gated MLP.
-    The ordinary forward materializes a temporary activation-dtype weight;
-    generated decode binds the packed storage directly.
+    Eager inference dispatches the packed projection through the active runtime;
+    generated decode binds the same packed storage directly.
     """
 
     block_size = 128
@@ -94,5 +98,12 @@ class BlockScaledLinear(nn.Module):
         return torch.cat((prefix, self.weight_tail.to(dtype)), dim=0)
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
-        bias = None if self.bias is None else self.bias.to(activation.dtype)
-        return F.linear(activation, self.dequantized_weight(activation.dtype), bias)
+        return _block_scaled_linear(
+            activation,
+            self.weight,
+            self.weight_scale_inv,
+            quantized_rows=self.quantized_rows,
+            interleaved_parts=self.interleaved_parts,
+            weight_tail=self.weight_tail,
+            bias=self.bias,
+        )
