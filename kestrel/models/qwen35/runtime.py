@@ -44,7 +44,7 @@ from .prompt_template import (
     _NEWLINE_ID,
     _USER_ID,
 )
-from .qwen_image import preprocess_image
+from .qwen_image import image_token_count, preprocess_image
 
 
 _PREFILL_SCRATCH_TOKENS = 1024
@@ -446,26 +446,29 @@ class Qwen35Runtime(UncachedPagedRuntime):
         image: Any,
         image_crops: Any,
     ) -> int:
-        """Return the exact Qwen vision expansion after preprocessing."""
+        """Return the exact Qwen vision expansion, including before chat preprocessing."""
         if image is None:
             return 0
-        if not isinstance(image_crops, QwenImageInputs):
-            return super().image_kv_length(prompt_tokens, image, image_crops)
 
         from kestrel.runtime.tokens import ImageMarker
 
-        num_images = int(image_crops.image_grid_thw.shape[0])
-        grid_tokens = int(image_crops.image_grid_thw.prod(-1).sum().item()) // 4
-        if grid_tokens != int(image_crops.num_image_tokens):
-            raise ValueError(
-                "Qwen preprocessed image token count does not match its grid"
-            )
+        if isinstance(image_crops, QwenImageInputs):
+            num_images = int(image_crops.image_grid_thw.shape[0])
+            num_image_tokens = int(image_crops.image_grid_thw.prod(-1).sum().item()) // 4
+            if num_image_tokens != int(image_crops.num_image_tokens):
+                raise ValueError(
+                    "Qwen preprocessed image token count does not match its grid"
+                )
+        else:
+            images = image if isinstance(image, (list, tuple)) else [image]
+            num_images = len(images)
+            num_image_tokens = sum(image_token_count(one) for one in images)
         marker_count = sum(isinstance(token, ImageMarker) for token in prompt_tokens)
         if marker_count not in (0, num_images):
             raise ValueError(
                 "Qwen image marker count must be zero or match preprocessed images"
             )
-        inserted_tokens = int(image_crops.num_image_tokens) + 2 * num_images
+        inserted_tokens = num_image_tokens + 2 * num_images
         return inserted_tokens - marker_count
 
     def _load_model(self, source: str | Path) -> nn.Module:

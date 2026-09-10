@@ -42,6 +42,13 @@ def _smart_resize(height: int, width: int) -> tuple[int, int]:
     return h_bar, w_bar
 
 
+def image_token_count(image: Any) -> int:
+    """Count merged image patches without resizing or materializing them."""
+    rgb = image if isinstance(image, np.ndarray) else decode_to_srgb(image)
+    height, width = _smart_resize(*rgb.shape[:2])
+    return (height // _RESIZE_FACTOR) * (width // _RESIZE_FACTOR)
+
+
 def preprocess_image(image: Any) -> tuple[torch.Tensor, torch.Tensor]:
     rgb = np.ascontiguousarray(decode_to_srgb(image))
     height, width = rgb.shape[:2]
@@ -86,4 +93,4 @@ def preprocess_image(image: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return pixel_values, image_grid_thw
 
 
-__all__ = ["preprocess_image"]
+__all__ = ["image_token_count", "preprocess_image"]

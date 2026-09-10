@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from kestrel.models.qwen35.qwen_image import preprocess_image
 from kestrel.models.qwen35.runtime import Qwen35Runtime, QwenImageInputs
 from kestrel.runtime import ImageMarker, TextToken
 
@@ -26,7 +28,6 @@ def test_qwen_image_kv_length_uses_preprocessed_expansion() -> None:
 
     assert runtime.image_kv_length([TextToken(1)], object(), crops) == 258
     assert runtime.image_kv_length([ImageMarker(0)], object(), crops) == 257
-    assert runtime.image_kv_length([TextToken(1)], object(), None) == 4096
 
     multi = _image_inputs(images=2, tokens=600)
     assert runtime.image_kv_length(
@@ -39,6 +40,33 @@ def test_qwen_image_kv_length_uses_preprocessed_expansion() -> None:
     inconsistent.num_image_tokens = 255
     with pytest.raises(ValueError, match="does not match its grid"):
         runtime.image_kv_length([TextToken(1)], object(), inconsistent)
+
+
+@pytest.mark.parametrize("shapes", [((64, 64),), ((333, 517),), ((64, 64), (333, 517))])
+def test_chat_image_length_matches_expanded_prompt(shapes) -> None:
+    runtime = object.__new__(Qwen35Runtime)
+    runtime.image_prefix_length = 4096
+    runtime.architecture = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2)
+    )
+    runtime._chat_image_crops = {}
+    runtime._prepare_uncached_sequence = lambda **kwargs: kwargs
+    images = tuple(np.zeros((*shape, 3), dtype=np.uint8) for shape in shapes)
+    processed = [preprocess_image(image) for image in images]
+    grid = torch.cat([item[1] for item in processed])
+    crops = QwenImageInputs(
+        pixel_values=torch.cat([item[0] for item in processed]),
+        image_grid_thw=grid,
+        num_image_tokens=int(grid.prod(-1).sum().item()) // 4,
+    )
+    tokens = [TextToken(1), *(ImageMarker(i) for i in range(len(images)))]
+    image_length = runtime.image_kv_length(tokens, images, None)
+    prepared = runtime.prepare_sequence(
+        tokens, image=images, image_crops=crops, max_new_tokens=128,
+    )
+
+    assert image_length == len(prepared["tokens"]) - len(tokens)
+    assert len(tokens) + image_length + 128 == prepared["target_length"]
 
 
 def test_qwen_prepare_sequence_reserves_exact_expanded_length() -> None:
