@@ -44,6 +44,14 @@ class _Program:
     launches: list[tuple[str, dict]]
 
     @property
+    def runtime_extent_minimums(self):
+        return {}
+
+    @property
+    def num_ctas(self):
+        return 1
+
+    @property
     def descriptor(self):
         scalar_arguments = (
             []
@@ -119,12 +127,33 @@ def _build(
         return SimpleNamespace(buffers={})
 
     generated.materialize_weights = materialize_weights
+    generated.select_compatible_program = lambda programs, requested, **_kwargs: min(
+        (
+            program for program in programs
+            if program.capacity >= requested["active_batch"]
+            and all(
+                requested.get(name) == value
+                for name, value in program.static_extent_bindings.items()
+            )
+        ),
+        key=lambda program: (
+            program.capacity,
+            -len(program.static_extent_bindings),
+            program.name,
+        ),
+        default=None,
+    )
     monkeypatch.setitem(sys.modules, "kestrel_kernels", kernels)
     monkeypatch.setitem(sys.modules, "kestrel_kernels.generated_decode", generated)
     monkeypatch.setattr(
         runtime_decode.torch.cuda, "current_stream", lambda _device: _Stream()
     )
     monkeypatch.setattr(runtime_decode.torch.cuda, "Event", _Event)
+    monkeypatch.setattr(
+        runtime_decode.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=1),
+    )
     monkeypatch.setattr(
         runtime_decode.torch.cuda, "stream", lambda _stream: contextlib.nullcontext()
     )
@@ -332,8 +361,16 @@ def test_generated_decode_plan_reports_selected_physical_slot_capacity(monkeypat
         "_resolve_programs",
         classmethod(lambda _cls, _runtime, _spec: programs),
     )
-    runtime = SimpleNamespace(max_batch_size=1)
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        device="cuda",
+    )
     spec = object()
+    monkeypatch.setattr(
+        runtime_decode.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=132),
+    )
 
     plan = runtime_decode.GeneratedDecode.plan(runtime, spec)
 
@@ -345,7 +382,10 @@ def test_generated_decode_plan_reports_selected_physical_slot_capacity(monkeypat
 
 def test_generated_decode_plan_reuses_exact_resolution_when_binding(monkeypatch):
     programs = _programs("b1")
-    runtime = SimpleNamespace(max_batch_size=1)
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        device="cuda",
+    )
     spec = object()
     plan = runtime_decode._GeneratedDecodePlan(
         runtime=runtime,
@@ -362,6 +402,11 @@ def test_generated_decode_plan_reuses_exact_resolution_when_binding(monkeypatch)
                 "binding must reuse the pre-allocation resolution"
             )
         ),
+    )
+    monkeypatch.setattr(
+        runtime_decode.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=132),
     )
     constructions = []
     monkeypatch.setattr(
@@ -406,7 +451,15 @@ def test_optional_generated_decode_falls_back_when_all_artifacts_are_unreachable
         "_resolve_programs",
         classmethod(lambda _cls, _runtime, _spec: programs),
     )
-    runtime = SimpleNamespace(max_batch_size=4)
+    runtime = SimpleNamespace(
+        max_batch_size=4,
+        device=SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(
+        runtime_decode.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=1),
+    )
 
     assert runtime_decode.GeneratedDecode.try_create(runtime, object()) is None
 
@@ -418,7 +471,15 @@ def test_required_generated_decode_rejects_all_unreachable_artifacts(monkeypatch
         "_resolve_programs",
         classmethod(lambda _cls, _runtime, _spec: programs),
     )
-    runtime = SimpleNamespace(max_batch_size=4)
+    runtime = SimpleNamespace(
+        max_batch_size=4,
+        device=SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(
+        runtime_decode.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=1),
+    )
     spec = SimpleNamespace(label="test")
 
     with pytest.raises(
