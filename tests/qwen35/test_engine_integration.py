@@ -1,4 +1,4 @@
-"""End-to-end engine query through Qwen35Runtime."""
+"""End-to-end engine query and chat through Qwen35Runtime."""
 
 from __future__ import annotations
 
@@ -64,6 +64,43 @@ def test_engine_image_query_returns_text() -> None:
     assert "red" in answer.lower(), f"expected an answer about red; got {answer!r}"
     assert result.metrics.output_tokens < 64
     print(f"\n[qwen35 engine image answer] {answer!r}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_engine_image_chat_generates_multiple_tokens() -> None:
+    import asyncio
+    import base64
+    import io
+
+    Image = pytest.importorskip("PIL.Image")
+
+    image = io.BytesIO()
+    Image.new("RGB", (64, 64), "red").save(image, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode()
+
+    async def run() -> EngineResult:
+        engine = await InferenceEngine.create(RuntimeConfig(
+            device="cuda", model="Qwen/Qwen3.5-0.8B", max_batch_size=1,
+        ))
+        try:
+            stream = await engine.chat(
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": "Describe the image in one sentence."},
+                ]}],
+                reasoning=False,
+                stream=True,
+                settings={"max_tokens": 128, "temperature": 0},
+            )
+            async for _ in stream:
+                pass
+            return await stream.result()
+        finally:
+            await engine.shutdown()
+
+    result = asyncio.run(run())
+    assert result.finish_reason == "stop"
+    assert result.metrics.output_tokens > 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
