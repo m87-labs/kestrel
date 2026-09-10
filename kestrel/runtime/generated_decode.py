@@ -249,42 +249,95 @@ def _state_requirements(descriptor: Mapping[str, Any]):
     )
 
 
-def _select_program(programs: Sequence[Any], batch_size: int) -> tuple[int, Any] | None:
-    batch_size = int(batch_size)
+def _select_program(
+    programs: Sequence[Any],
+    batch_size: int,
+    runtime_extents: Mapping[str, int] | None = None,
+    *,
+    device_sms: int,
+) -> tuple[int, Any] | None:
+    requested = {"active_batch": batch_size}
+    if runtime_extents is not None:
+        supplied = dict(runtime_extents)
+        supplied_batch = supplied.get("active_batch", batch_size)
+        if supplied_batch != batch_size:
+            raise RuntimeError(
+                "generated decode launch active_batch disagrees with the "
+                f"requested batch size: {supplied_batch} != {batch_size}"
+            )
+        requested.update(supplied)
     candidates = []
     for index, program in enumerate(programs):
+        _active_batch_interval(program)
         static_extents = program.static_extent_bindings
-        if static_extents.keys() - {"active_batch"}:
+        minimums = getattr(program, "runtime_extent_minimums", {})
+        if runtime_extents is None and (
+            static_extents.keys() - {"active_batch"}
+            or minimums.keys() - {"active_batch"}
+        ):
             continue
-        minimum_batch, maximum_batch = _active_batch_interval(program)
-        if not minimum_batch <= batch_size <= maximum_batch:
-            continue
-        static_batch = program.static_extent_bindings.get("active_batch")
-        candidates.append((static_batch is None, int(program.capacity), index, program))
+        candidates.append((index, program))
     if not candidates:
         return None
-    _dynamic, _capacity, index, program = min(candidates, key=lambda item: item[:3])
-    return index, program
+    from kestrel_kernels.generated_decode import select_compatible_program
+
+    selected = select_compatible_program(
+        tuple(program for _index, program in candidates),
+        requested,
+        device_sms=int(device_sms),
+    )
+    if selected is None:
+        return None
+    return next(
+        (index, program)
+        for index, program in candidates
+        if program is selected
+    )
 
 
 def _selectable_programs(
-    programs: Sequence[Any], max_batch_size: int
+    programs: Sequence[Any],
+    max_batch_size: int,
+    *,
+    device_sms: int,
 ) -> tuple[Any, ...]:
-    selected_indexes = set()
-    for batch_size in range(1, int(max_batch_size) + 1):
-        selected = _select_program(programs, batch_size)
-        if selected is not None:
-            selected_indexes.add(selected[0])
+    selected_indexes = {
+        selected[0]
+        for batch_size in range(1, int(max_batch_size) + 1)
+        if (
+            selected := _select_program(
+                programs,
+                batch_size,
+                device_sms=device_sms,
+            )
+        ) is not None
+    }
+    # Selection-only runtime minima can make an otherwise-shadowed program
+    # live at launch. Retain those variants without retaining ordinary wider
+    # fallbacks that can never win within this runtime's batch domain.
+    selected_indexes.update(
+        index
+        for index, program in enumerate(programs)
+        if _active_batch_interval(program)[0] <= int(max_batch_size)
+        and not program.static_extent_bindings.keys() - {"active_batch"}
+        and getattr(program, "runtime_extent_minimums", {}).keys()
+        - {"active_batch"}
+        and int(program.num_ctas) <= int(device_sms)
+    )
     return tuple(
-        program for index, program in enumerate(programs) if index in selected_indexes
+        program for index, program in enumerate(programs)
+        if index in selected_indexes
     )
 
 
 def _program_lookup(
-    programs: Sequence[Any], max_batch_size: int
+    programs: Sequence[Any],
+    max_batch_size: int,
+    *,
+    device_sms: int,
 ) -> tuple[tuple[int, Any] | None, ...]:
     return tuple(
-        _select_program(programs, batch_size)
+        _select_program(programs, batch_size, device_sms=device_sms)
         for batch_size in range(1, int(max_batch_size) + 1)
     )
 
@@ -348,7 +401,11 @@ def generated_weight_programs_for_loading(
     missing = [
         int(batch_size)
         for batch_size in required_batch_sizes
-        if _select_program(programs, int(batch_size)) is None
+        if _select_program(
+            programs,
+            int(batch_size),
+            device_sms=int(properties.multi_processor_count),
+        ) is None
     ]
     if missing:
         if required:
@@ -357,7 +414,11 @@ def generated_weight_programs_for_loading(
                 f"for batch sizes {missing}"
             )
         return ()
-    selected = _selectable_programs(programs, runtime.max_batch_size)
+    selected = _selectable_programs(
+        programs,
+        runtime.max_batch_size,
+        device_sms=int(properties.multi_processor_count),
+    )
     if not selected:
         if required:
             raise RuntimeError(
@@ -577,12 +638,21 @@ class GeneratedDecode:
         """Return the physical row capacity required by selectable programs."""
 
         programs = cls._resolve_programs(runtime, spec)
+        properties = torch.cuda.get_device_properties(runtime.device)
         if any(
-            _select_program(programs, int(batch_size)) is None
+            _select_program(
+                programs,
+                int(batch_size),
+                device_sms=int(properties.multi_processor_count),
+            ) is None
             for batch_size in required_batch_sizes
         ):
             return None
-        selected = _selectable_programs(programs, runtime.max_batch_size)
+        selected = _selectable_programs(
+            programs,
+            runtime.max_batch_size,
+            device_sms=int(properties.multi_processor_count),
+        )
         if not selected:
             return None
         return max(int(program.capacity) for program in selected)
@@ -603,7 +673,13 @@ class GeneratedDecode:
             max_batch_size=max_batch_size,
             compatible_programs=compatible_programs,
             selectable_programs=_selectable_programs(
-                compatible_programs, max_batch_size
+                compatible_programs,
+                max_batch_size,
+                device_sms=int(
+                    torch.cuda.get_device_properties(
+                        runtime.device
+                    ).multi_processor_count
+                ),
             ),
         )
 
@@ -662,13 +738,22 @@ class GeneratedDecode:
         else:
             cls._validate_plan(runtime, spec, plan)
             compatible_programs = plan.compatible_programs
+        properties = torch.cuda.get_device_properties(runtime.device)
         if not compatible_programs or any(
-            _select_program(compatible_programs, int(batch_size)) is None
+            _select_program(
+                compatible_programs,
+                int(batch_size),
+                device_sms=int(properties.multi_processor_count),
+            ) is None
             for batch_size in required_batch_sizes
         ):
             return None
         programs = (
-            _selectable_programs(compatible_programs, runtime.max_batch_size)
+            _selectable_programs(
+                compatible_programs,
+                runtime.max_batch_size,
+                device_sms=int(properties.multi_processor_count),
+            )
             if plan is None
             else plan.selectable_programs
         )
@@ -692,11 +777,17 @@ class GeneratedDecode:
         available_programs = tuple(programs)
         self._programs = available_programs
         self._spec = spec
+        self._device_sms = int(
+            torch.cuda.get_device_properties(runtime.device).multi_processor_count)
         if required_batch_sizes:
             missing = [
                 int(batch_size)
                 for batch_size in required_batch_sizes
-                if _select_program(available_programs, int(batch_size)) is None
+                if _select_program(
+                    available_programs,
+                    int(batch_size),
+                    device_sms=self._device_sms,
+                ) is None
             ]
             if missing:
                 raise RuntimeError(
@@ -705,12 +796,16 @@ class GeneratedDecode:
                 )
 
         self._programs = _selectable_programs(
-            available_programs, runtime.max_batch_size
+            available_programs,
+            runtime.max_batch_size,
+            device_sms=self._device_sms,
         )
         if not self._programs:
             raise ValueError("generated decode has no selectable batch artifact")
         self._program_by_batch = _program_lookup(
-            self._programs, runtime.max_batch_size
+            self._programs,
+            runtime.max_batch_size,
+            device_sms=self._device_sms,
         )
 
         from kestrel_kernels.generated_decode import (
@@ -826,6 +921,8 @@ class GeneratedDecode:
                         f"with static artifact bindings {mismatched}"
                     )
                 extents.update(launch_extents)
+                for name, minimum in program.runtime_extent_minimums.items():
+                    extents[name] = max(int(extents.get(name, minimum)), int(minimum))
                 bindings = assemble_bindings(
                     program.descriptor,
                     weights=self.weight_storage.buffers,
@@ -868,9 +965,24 @@ class GeneratedDecode:
                 f"{sorted(missing)}"
             )
 
-    def _program_for(self, batch_size: int) -> tuple[int, Any] | None:
-        batch_size = int(batch_size)
-        if batch_size < 1 or batch_size > len(self._program_by_batch):
+    def _program_for(
+        self,
+        batch_size: int,
+        runtime_extents: Mapping[str, int] | None = None,
+    ) -> tuple[int, Any] | None:
+        if type(batch_size) is not int or batch_size <= 0:
+            raise RuntimeError(
+                "generated decode selection requires positive exact integer "
+                "active_batch"
+            )
+        if runtime_extents is not None:
+            return _select_program(
+                self._programs,
+                batch_size,
+                runtime_extents,
+                device_sms=self._device_sms,
+            )
+        if batch_size > len(self._program_by_batch):
             return None
         return self._program_by_batch[batch_size - 1]
 
@@ -904,12 +1016,12 @@ class GeneratedDecode:
             raise ValueError(
                 "static generated decode cannot run per-step input preparations"
             )
-        selected = self._program_for(batch_size)
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
+        selected = self._program_for(batch_size, extents)
         if selected is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
         program_index, _program = selected
         bound = self._slots[(int(slot.slot_id), program_index)]
-        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         missing = bound.required_launch_extents - extents.keys()
         if missing:
             raise RuntimeError(
@@ -925,14 +1037,14 @@ class GeneratedDecode:
 
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
-        selected = self._program_for(batch_size)
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
+        selected = self._program_for(batch_size, extents)
         if selected is None:
             raise ValueError(f"no generated decode capacity covers {batch_size}")
         program_index, _program = selected
         for step in self._input_preparation_plan:
             self._spec.preparation_callbacks[step.name](slot, int(batch_size))
         bound = self._slots[(int(slot.slot_id), program_index)]
-        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         missing = bound.required_launch_extents - extents.keys()
         if missing:
             raise RuntimeError(

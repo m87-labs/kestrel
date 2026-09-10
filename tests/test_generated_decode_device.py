@@ -9,6 +9,7 @@ from kestrel.runtime.generated_decode import (
     GeneratedDecode,
     PagedDecodeBindings,
     _program_lookup,
+    _selectable_programs,
     prepare_generated_weight_storage_for_loading,
     reserve_generated_binding_storage,
 )
@@ -23,22 +24,37 @@ def test_paged_launch_extents_use_scheduler_position_scalar() -> None:
     }
 
 
-def _program(capacity, *, active_batch=None, minimum_batch=1):
+def _program(
+    capacity,
+    *,
+    active_batch=None,
+    minimum_batch=1,
+    minimums=None,
+    name=None,
+    num_ctas=132,
+):
     static = {} if active_batch is None else {"active_batch": active_batch}
+    runtime_minimums = (
+        {} if minimum_batch == 1 else {"active_batch": minimum_batch}
+    )
+    runtime_minimums.update(minimums or {})
     return SimpleNamespace(
         capacity=capacity,
         static_extent_bindings=static,
-        runtime_extent_minimums=(
-            {} if minimum_batch == 1 else {"active_batch": minimum_batch}
-        ),
+        runtime_extent_minimums=runtime_minimums,
+        name=name,
+        num_ctas=num_ctas,
     )
 
 
 def _generated_with_programs(*programs):
     generated = GeneratedDecode.__new__(GeneratedDecode)
+    generated._device_sms = 132
     generated._programs = programs
     generated._program_by_batch = _program_lookup(
-        programs, max(program.capacity for program in programs)
+        programs,
+        max(program.capacity for program in programs),
+        device_sms=generated._device_sms,
     )
     return generated
 
@@ -117,6 +133,48 @@ def test_program_selection_partitions_dynamic_runtime_intervals():
     ]
 
 
+def test_program_selection_reselects_by_live_runtime_extent():
+    u2 = _program(8, minimum_batch=5, name="u2")
+    u4 = _program(
+        8,
+        minimum_batch=5,
+        minimums={"kv_len": 3201},
+        name="u4",
+    )
+    generated = _generated_with_programs(u2, u4)
+
+    assert generated._program_for(8)[1] is u2
+    assert generated._program_for(
+        8, {"active_batch": 8, "kv_len": 3200}
+    )[1] is u2
+    assert generated._program_for(
+        8, {"active_batch": 8, "kv_len": 3201}
+    )[1] is u4
+
+    with pytest.raises(RuntimeError, match="active_batch disagrees"):
+        generated._program_for(8, {"active_batch": 7, "kv_len": 3201})
+    with pytest.raises(RuntimeError, match="positive exact integer"):
+        generated._program_for(
+            8, {"active_batch": 8, "kv_len": "3201"}
+        )
+    with pytest.raises(RuntimeError, match="positive exact integer"):
+        generated._program_for(
+            8, {"active_batch": 8, "kv_len": True}
+        )
+    with pytest.raises(RuntimeError, match="positive exact integer"):
+        generated._program_for(True)
+
+
+def test_selectable_programs_ignore_unrelated_static_runtime_extent():
+    fallback = _program(8, minimum_batch=5, name="dynamic")
+    static_kv = _program(8, minimum_batch=5, name="static-kv")
+    static_kv.static_extent_bindings = {"kv_len": 4096}
+
+    assert _selectable_programs(
+        (fallback, static_kv), 8, device_sms=132,
+    ) == (fallback,)
+
+
 def test_program_selection_rejects_invalid_runtime_interval():
     with pytest.raises(RuntimeError, match="invalid active-batch interval"):
         _generated_with_programs(_program(4, minimum_batch=5))
@@ -135,12 +193,20 @@ def test_program_selection_does_not_rescan_after_construction(monkeypatch):
 
 
 def test_slot_capacity_uses_selected_program_physical_capacity(monkeypatch):
-    runtime = SimpleNamespace(max_batch_size=1)
+    runtime = SimpleNamespace(
+        max_batch_size=1,
+        device=torch.device("cuda", 0),
+    )
     b8 = _program(8)
     monkeypatch.setattr(
         GeneratedDecode,
         "_resolve_programs",
         classmethod(lambda _cls, _runtime, _spec: (b8,)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=132),
     )
 
     assert GeneratedDecode.resolve_slot_capacity(
@@ -151,7 +217,10 @@ def test_slot_capacity_uses_selected_program_physical_capacity(monkeypatch):
 
 
 def test_slot_capacity_refuses_incomplete_required_domain(monkeypatch):
-    runtime = SimpleNamespace(max_batch_size=4)
+    runtime = SimpleNamespace(
+        max_batch_size=4,
+        device=torch.device("cuda", 0),
+    )
     programs = tuple(
         _program(batch_size, active_batch=batch_size)
         for batch_size in (1, 2, 4)
@@ -160,6 +229,11 @@ def test_slot_capacity_refuses_incomplete_required_domain(monkeypatch):
         GeneratedDecode,
         "_resolve_programs",
         classmethod(lambda _cls, _runtime, _spec: programs),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=132),
     )
 
     assert GeneratedDecode.resolve_slot_capacity(
