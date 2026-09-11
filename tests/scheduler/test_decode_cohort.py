@@ -54,6 +54,7 @@ def _make_lifecycle(request_id: int) -> RequestLifecycle:
 def test_decode_cohort_stays_stable_until_a_member_retires() -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    scheduler._hooks = SamplingHooks()
     scheduler.running = RunningQueue()
     sequences = [_make_lifecycle(request_id) for request_id in (1, 2, 3)]
     scheduler.running.extend(sequences)
@@ -68,6 +69,7 @@ def test_decode_cohort_stays_stable_until_a_member_retires() -> None:
 def test_resident_tail_does_not_replace_temporarily_blocked_cohort_member() -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    scheduler._hooks = SamplingHooks()
     scheduler.running = RunningQueue()
     sequences = [_make_lifecycle(request_id) for request_id in (1, 2, 3)]
     scheduler.running.extend(sequences)
@@ -78,9 +80,28 @@ def test_resident_tail_does_not_replace_temporarily_blocked_cohort_member() -> N
     assert plan.sequences == [sequences[1]]
 
 
+def test_runtime_backpressure_accounts_for_inflight_steps() -> None:
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    seen = []
+    scheduler._hooks = SamplingHooks(
+        can_dispatch=lambda state, *, inflight_steps: (
+            seen.append((state, inflight_steps)) or inflight_steps == 0
+        )
+    )
+    scheduler.running = RunningQueue()
+    blocked, ready = (_make_lifecycle(request_id) for request_id in (1, 2))
+    blocked.inflight_refs = 1
+    scheduler.running.extend((blocked, ready))
+
+    assert scheduler.schedule_decode_step().sequences == [ready]
+    assert seen == [(blocked.skill_state, 1), (ready.skill_state, 0)]
+
+
 def test_stream_deadline_can_promote_a_resident_tail() -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    scheduler._hooks = SamplingHooks()
     scheduler.running = RunningQueue()
     sequences = [_make_lifecycle(request_id) for request_id in (1, 2, 3)]
     scheduler.running.extend(sequences)
@@ -96,6 +117,7 @@ def test_stream_deadline_can_promote_a_resident_tail() -> None:
 def test_stream_deadline_reserves_one_dispatchable_ordinary_slot() -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
+    scheduler._hooks = SamplingHooks()
     scheduler.running = RunningQueue()
     deadline_late, ordinary, deadline_early = (
         _make_lifecycle(request_id) for request_id in (1, 2, 3)

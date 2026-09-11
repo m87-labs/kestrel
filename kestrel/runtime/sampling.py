@@ -49,6 +49,10 @@ class SamplingHooks:
     10. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
+    11. Between forwards, ``advance_auxiliary(force=...)`` may enqueue one
+        non-overlapping runtime-owned stage. ``can_dispatch(skill_state,
+        inflight_steps=...)`` keeps a producer out of decode while that stage
+        owns its bounded intermediate storage.
     """
 
     # process_logits(logits, *, sequences, batch_idx) -> None
@@ -146,6 +150,19 @@ class SamplingHooks:
     # operations from the packed kernel bundle. Production generated runtimes
     # use this to prevent silent JIT or torch fallbacks.
     require_packed_sampling: bool = False
+
+    # can_dispatch(skill_state, *, inflight_steps) -> bool
+    # Optional runtime-owned backpressure. Returning false temporarily keeps
+    # the sequence out of a decode batch; an accompanying auxiliary hook must
+    # eventually make it dispatchable again.
+    can_dispatch: Callable[..., bool] | None = None
+
+    # advance_auxiliary(*, force) -> bool
+    # May enqueue one runtime-owned stage on the scheduler's compute stream.
+    # ``force`` is true when no ordinary forward can launch, so a runtime that
+    # applied backpressure must make progress. Returning true prevents a model
+    # forward from being launched in the same tick.
+    advance_auxiliary: Callable[..., bool] | None = None
 
 
 __all__ = ["SamplingHooks"]

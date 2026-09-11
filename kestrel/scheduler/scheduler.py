@@ -552,12 +552,22 @@ class GenerationScheduler:
                 # it overlaps the next tick's commit+finalize instead of paying
                 # the launch on the critical path between forwards.
                 if pipeline.can_launch():
-                    launched_forward = False
-                    progressed |= self._launch_prefill_step(pipeline)
-                    launched_forward = pipeline.has_launch_in_flight()
-                    if not launched_forward:
+                    ran_auxiliary = (
+                        self._hooks.advance_auxiliary is not None
+                        and self._hooks.advance_auxiliary(force=False)
+                    )
+                    if ran_auxiliary:
+                        progressed = True
+                    else:
+                        progressed |= self._launch_prefill_step(pipeline)
+                    if not ran_auxiliary and not pipeline.has_launch_in_flight():
                         plan = self.schedule_decode_step()
-                        if plan is not None:
+                        if plan is None and (
+                            self._hooks.advance_auxiliary is not None
+                            and self._hooks.advance_auxiliary(force=True)
+                        ):
+                            progressed = True
+                        elif plan is not None:
                             slot_id = pipeline.free_slot_id()
                             if slot_id is None:  # pragma: no cover - defensive
                                 raise AssertionError(
@@ -2291,6 +2301,13 @@ class GenerationScheduler:
             return False
         # Absolute max length (includes prompt)
         if seq.state.length >= seq.state.max_length:
+            return False
+        if (
+            self._hooks.can_dispatch is not None
+            and not self._hooks.can_dispatch(
+                seq.skill_state, inflight_steps=seq.inflight_refs
+            )
+        ):
             return False
         # Max new tokens budget - account for in-flight steps
         if seq.request.max_new_tokens is not None:

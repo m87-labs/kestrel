@@ -9,6 +9,7 @@ import pytest
 
 from kestrel.models.moondream.runtime import PrefillClassification, TextToken
 from kestrel.runtime import SequenceState
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.scheduler.pipeline import DecodeLaunch, LaunchHandle, PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
@@ -90,6 +91,7 @@ def _make_scheduler(
 ) -> GenerationScheduler:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = runtime
+    scheduler._hooks = SamplingHooks()
     scheduler.waiting = RequestQueue()
     scheduler.waiting.push(request)
     scheduler.running = RunningQueue()
@@ -393,6 +395,7 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
     )
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = SimpleNamespace(spec=None)
+    scheduler._hooks = SamplingHooks()
     scheduler._compute_stream = None
     scheduler._pipeline = pipeline
     scheduler.waiting = []
@@ -410,3 +413,35 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
 
     assert GenerationScheduler.advance(scheduler) is True
     assert launched == [handle]
+
+
+def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
+    forced = []
+    pipeline = SimpleNamespace(
+        has_launch_in_flight=lambda: False,
+        queue_depth=lambda: 0,
+        pop_oldest=lambda: None,
+        launch_handle=None,
+        can_launch=lambda: True,
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace(spec=None)
+    scheduler._hooks = SamplingHooks(
+        advance_auxiliary=lambda *, force: forced.append(force) or True
+    )
+    scheduler._compute_stream = None
+    scheduler._pipeline = pipeline
+    scheduler.waiting = []
+    scheduler.running = [
+        SimpleNamespace(request=SimpleNamespace(cancel_event=threading.Event()))
+    ]
+    scheduler._launch_prefill_step = lambda actual_pipeline: (_ for _ in ()).throw(
+        AssertionError("urgent auxiliary work must precede prefill")
+    )
+    scheduler.schedule_decode_step = lambda: object()
+    scheduler._launch_forward_on_stream = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("decode must not overlap auxiliary work")
+    )
+
+    assert GenerationScheduler.advance(scheduler) is True
+    assert forced == [False]
