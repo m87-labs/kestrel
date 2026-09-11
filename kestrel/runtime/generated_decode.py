@@ -157,21 +157,26 @@ def _active_batch_interval(program: Any) -> tuple[int, int]:
     minimum = int(
         getattr(program, "runtime_extent_minimums", {}).get("active_batch", 1)
     )
-    if not 1 <= minimum <= capacity:
+    maximum = int(
+        getattr(program, "runtime_extent_maximums", {}).get(
+            "active_batch", capacity
+        )
+    )
+    if not 1 <= minimum <= maximum <= capacity:
         raise RuntimeError(
             "generated decode program has invalid active-batch interval "
-            f"[{minimum}, {capacity}]"
+            f"[{minimum}, {maximum}] within capacity {capacity}"
         )
     static = program.static_extent_bindings.get("active_batch")
     if static is not None:
         static = int(static)
-        if not minimum <= static <= capacity:
+        if not minimum <= static <= maximum:
             raise RuntimeError(
                 "generated decode program has invalid static active batch "
-                f"{static} outside [{minimum}, {capacity}]"
+                f"{static} outside [{minimum}, {maximum}]"
             )
         return static, static
-    return minimum, capacity
+    return minimum, maximum
 
 
 def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, Any]:
@@ -272,9 +277,11 @@ def _select_program(
         _active_batch_interval(program)
         static_extents = program.static_extent_bindings
         minimums = getattr(program, "runtime_extent_minimums", {})
+        maximums = getattr(program, "runtime_extent_maximums", {})
         if runtime_extents is None and (
             static_extents.keys() - {"active_batch"}
             or minimums.keys() - {"active_batch"}
+            or maximums.keys() - {"active_batch"}
         ):
             continue
         candidates.append((index, program))

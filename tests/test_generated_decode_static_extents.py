@@ -1,6 +1,6 @@
 import contextlib
 import sys
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass, field, replace as dataclass_replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -42,6 +42,7 @@ class _Program:
     capacity: int
     static_extent_bindings: dict[str, int]
     launches: list[tuple[str, dict]]
+    runtime_extent_maximums: dict[str, int] = field(default_factory=dict)
 
     @property
     def runtime_extent_minimums(self):
@@ -136,12 +137,23 @@ def _build(
             program for program in programs
             if program.capacity >= requested["active_batch"]
             and all(
+                requested.get(name, 0) >= value
+                for name, value in program.runtime_extent_minimums.items()
+            )
+            and all(
+                requested.get(name, value + 1) <= value
+                for name, value in program.runtime_extent_maximums.items()
+            )
+            and all(
                 requested.get(name) == value
                 for name, value in program.static_extent_bindings.items()
             )
         ),
         key=lambda program: (
             program.capacity,
+            program.runtime_extent_maximums.get(
+                "active_batch", program.capacity
+            ),
             -len(program.static_extent_bindings),
             program.name,
         ),
@@ -267,6 +279,43 @@ def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypa
         ("b8", {"active_batch": 7}),
         ("b8_exact", {}),
     ]
+
+
+def test_generated_decode_selects_admission_band_then_capacity_fallback(monkeypatch):
+    programs = _programs("b1", "b2", "b4", "b8")
+    launches = programs[0].launches
+    full_c32 = _Program("full_c32", 32, {}, launches)
+    band_c32 = _Program(
+        "band_c32",
+        32,
+        {},
+        launches,
+        {"active_batch": 24},
+    )
+    generated, _launches = _build(
+        monkeypatch,
+        (*programs, full_c32, band_c32),
+        max_batch_size=32,
+    )
+
+    assert generated._program_for(24)[1] is band_c32
+    assert generated._program_for(25)[1] is full_c32
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum"),
+    ((1, 0), (17, 16), (1, 33)),
+)
+def test_generated_decode_rejects_malformed_admission_maximum(minimum, maximum):
+    program = SimpleNamespace(
+        capacity=32,
+        runtime_extent_minimums={"active_batch": minimum},
+        runtime_extent_maximums={"active_batch": maximum},
+        static_extent_bindings={},
+    )
+
+    with pytest.raises(RuntimeError, match="invalid active-batch interval"):
+        runtime_decode._active_batch_interval(program)
 
 
 def test_generated_decode_repeated_dynamic_launch_keeps_step_preparations(
