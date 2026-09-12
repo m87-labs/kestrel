@@ -417,6 +417,22 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
 
 def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
     forced = []
+    published = []
+    request = SimpleNamespace(cancel_event=threading.Event())
+    skill_state = SimpleNamespace(request=request)
+    sequence = SimpleNamespace(
+        request=request,
+        skill_state=skill_state,
+        finalized=False,
+        publish_stream_output=lambda runtime: published.append(runtime) or True,
+    )
+    request.lifecycle = sequence
+
+    def advance_auxiliary(*, force, stream_output_ready):
+        forced.append(force)
+        assert stream_output_ready(skill_state) is True
+        return True
+
     pipeline = SimpleNamespace(
         has_launch_in_flight=lambda: False,
         queue_depth=lambda: 0,
@@ -427,14 +443,12 @@ def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = SimpleNamespace(spec=None)
     scheduler._hooks = SamplingHooks(
-        advance_auxiliary=lambda *, force: forced.append(force) or True
+        advance_auxiliary=advance_auxiliary
     )
     scheduler._compute_stream = None
     scheduler._pipeline = pipeline
     scheduler.waiting = []
-    scheduler.running = [
-        SimpleNamespace(request=SimpleNamespace(cancel_event=threading.Event()))
-    ]
+    scheduler.running = [sequence]
     scheduler._launch_prefill_step = lambda actual_pipeline: (_ for _ in ()).throw(
         AssertionError("urgent auxiliary work must precede prefill")
     )
@@ -445,3 +459,4 @@ def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
 
     assert GenerationScheduler.advance(scheduler) is True
     assert forced == [False]
+    assert published == [scheduler.runtime]

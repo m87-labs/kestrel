@@ -62,11 +62,16 @@ class _ReasoningStreamSkillState(_SkillStateStub):
 
 
 class _AudioStreamState(_SkillStateStub):
-    def pop_stream_output(self, runtime: object) -> dict[str, object] | None:
-        return {
+    def __init__(self, request: GenerationRequest) -> None:
+        super().__init__(request)
+        self.output: dict[str, object] | None = {
             "audio": [0.25, -0.25],
             "sample_rate": 24_000,
         }
+
+    def pop_stream_output(self, runtime: object) -> dict[str, object] | None:
+        output, self.output = self.output, None
+        return output
 
 
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
@@ -253,6 +258,30 @@ def test_stream_update_preserves_capability_defined_output() -> None:
         "audio": [0.25, -0.25],
         "sample_rate": 24_000,
     }
+
+
+def test_completed_output_publishes_without_a_second_token_commit() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(
+        _AudioStreamState,
+        return_logprobs=None,
+    )
+    seq.request.stream_callback = updates.append
+
+    state = seq.skill_state
+    assert isinstance(state, _AudioStreamState)
+    state.output = None
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+    state.output = {"audio": [0.25], "sample_rate": 24_000}
+
+    assert seq.publish_stream_output(SimpleNamespace()) is True
+    assert seq.publish_stream_output(SimpleNamespace()) is False
+    assert len(updates) == 2
+    assert updates[0].token == TextToken(10)
+    assert updates[0].token_index == 0
+    assert updates[1].token is None
+    assert updates[1].token_index is None
+    assert updates[1].output == {"audio": [0.25], "sample_rate": 24_000}
 
 
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:

@@ -554,7 +554,10 @@ class GenerationScheduler:
                 if pipeline.can_launch():
                     ran_auxiliary = (
                         self._hooks.advance_auxiliary is not None
-                        and self._hooks.advance_auxiliary(force=False)
+                        and self._hooks.advance_auxiliary(
+                            force=False,
+                            stream_output_ready=self._publish_stream_output,
+                        )
                     )
                     if ran_auxiliary:
                         progressed = True
@@ -564,7 +567,10 @@ class GenerationScheduler:
                         plan = self.schedule_decode_step()
                         if plan is None and (
                             self._hooks.advance_auxiliary is not None
-                            and self._hooks.advance_auxiliary(force=True)
+                            and self._hooks.advance_auxiliary(
+                                force=True,
+                                stream_output_ready=self._publish_stream_output,
+                            )
                         ):
                             progressed = True
                         elif plan is not None:
@@ -597,6 +603,14 @@ class GenerationScheduler:
                 self._fail_request_early(stalled, error)
                 progressed = True
         return progressed
+
+    def _publish_stream_output(self, skill_state: SkillState) -> bool:
+        """Publish an active state's output without coupling it to a token."""
+
+        sequence = skill_state.request.lifecycle
+        if sequence.skill_state is not skill_state or sequence.finalized:
+            return False
+        return sequence.publish_stream_output(self.runtime)
 
     def _cancel_requests(self) -> bool:
         """Finish closed streams through the scheduler's existing release paths."""
