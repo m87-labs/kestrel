@@ -149,21 +149,41 @@ class RequestLifecycle:
         if self.request.return_logprobs is True:
             assert logprob is not None
             self.logprobs.append(float(logprob))
+        self._emit_stream_output(runtime, token=token)
+
+    def publish_stream_output(self, runtime: AutoregressiveRuntime) -> bool:
+        """Publish output that became ready independently of token commit."""
+
+        return self._emit_stream_output(runtime, token=None)
+
+    def _emit_stream_output(
+        self,
+        runtime: AutoregressiveRuntime,
+        *,
+        token: Token | None,
+    ) -> bool:
         callback = self.request.stream_callback
-        if callback is not None:
-            output = self.skill_state.pop_stream_output(runtime) or {}
-            text = output.get("text", "")
-            reasoning = output.get("reasoning")
-            callback(
-                StreamUpdate(
-                    request_id=self.request.request_id,
-                    token=token,
-                    text=text if isinstance(text, str) else "",
-                    token_index=self.skill_state.token_count - 1,
-                    reasoning=reasoning if isinstance(reasoning, str) else None,
-                    output=output,
-                )
+        if callback is None:
+            return False
+        output = self.skill_state.pop_stream_output(runtime)
+        if output is None and token is None:
+            return False
+        payload = output or {}
+        text = payload.get("text", "")
+        reasoning = payload.get("reasoning")
+        callback(
+            StreamUpdate(
+                request_id=self.request.request_id,
+                token=token,
+                text=text if isinstance(text, str) else "",
+                token_index=(
+                    self.skill_state.token_count - 1 if token is not None else None
+                ),
+                reasoning=reasoning if isinstance(reasoning, str) else None,
+                output=payload,
             )
+        )
+        return True
 
     @property
     def total_length(self) -> int:
@@ -282,17 +302,18 @@ class SchedulerResult:
 
 @dataclass
 class StreamUpdate:
-    """One append-only update emitted for every committed decode token.
+    """One append-only token or capability-output update.
 
     ``text`` remains the convenient text-delta surface. ``output`` carries the
     capability-defined payload for non-text streams and mirrors text deltas as
-    ``{"text": text}``.
+    ``{"text": text}``. A token commit sets ``token`` and ``token_index``;
+    output that completes between token commits leaves both as ``None``.
     """
 
     request_id: int
-    token: Token
+    token: Optional[Token]
     text: str
-    token_index: int
+    token_index: Optional[int]
     reasoning: Optional[str] = None
     output: Mapping[str, object] = field(default_factory=dict)
 
