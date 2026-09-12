@@ -415,7 +415,8 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
     assert launched == [handle]
 
 
-def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
+@pytest.mark.parametrize("needs_force", [False, True])
+def test_advance_runs_auxiliary_instead_of_overlapping_decode(needs_force) -> None:
     forced = []
     published = []
     request = SimpleNamespace(cancel_event=threading.Event())
@@ -430,6 +431,8 @@ def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
 
     def advance_auxiliary(*, force, stream_output_ready):
         forced.append(force)
+        if needs_force and not force:
+            return False
         assert stream_output_ready(skill_state) is True
         return True
 
@@ -452,11 +455,16 @@ def test_advance_runs_auxiliary_instead_of_overlapping_decode() -> None:
     scheduler._launch_prefill_step = lambda actual_pipeline: (_ for _ in ()).throw(
         AssertionError("urgent auxiliary work must precede prefill")
     )
-    scheduler.schedule_decode_step = lambda: object()
+    if needs_force:
+        scheduler._launch_prefill_step = lambda actual_pipeline: False
+    scheduler.schedule_decode_step = lambda: None if needs_force else object()
     scheduler._launch_forward_on_stream = lambda *_args: (_ for _ in ()).throw(
         AssertionError("decode must not overlap auxiliary work")
     )
 
     assert GenerationScheduler.advance(scheduler) is True
-    assert forced == [False]
+    assert forced == ([False, True] if needs_force else [False])
+    assert published == [scheduler.runtime]
+    sequence.finalized = True
+    assert scheduler._publish_stream_output(skill_state) is False
     assert published == [scheduler.runtime]
