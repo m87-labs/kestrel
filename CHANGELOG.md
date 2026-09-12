@@ -4,6 +4,8 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+- Resolved compiler-declared runtime resources when fusion changes generated
+  output argument names.
 - Added the model-bound `synthesize` capability and append-only streaming
   payloads for generated media such as PCM audio, including lossless compound
   capability streams, immediate publication of completed output, explicit

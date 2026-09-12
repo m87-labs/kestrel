@@ -194,6 +194,23 @@ def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, An
     return merged
 
 
+def _bind_runtime_resources(descriptor, inputs, **owners) -> None:
+    """Bind fused outputs without changing input preparation or readiness."""
+    outputs = {
+        operand["logical_name"]
+        for operand in descriptor["device_program"]["physical_abi"]["operands"]
+        if operand["kind"] == "output"
+    }
+    for recipe in descriptor.get("runtime", {}).get("tensors", ()):
+        argument = recipe["argument"]
+        if argument not in outputs or argument in inputs or recipe.get("key"):
+            continue
+        resources = owners.get(recipe["owner"], {})
+        resource = recipe.get("resource")
+        if resource in resources:
+            inputs[argument] = resources[resource]
+
+
 def _required_engine_inputs(descriptor: Mapping[str, Any]) -> tuple[str, ...]:
     arguments = {
         item["name"]
@@ -916,11 +933,15 @@ class GeneratedDecode:
                     if spec.capacity_inputs
                     else {}
                 )
+                slot_inputs = dict(spec.bindings.slot_inputs(slot, capacity))
                 inputs = _merge_disjoint(
                     spec.label,
                     shared=shared_inputs,
                     capacity=capacity_inputs,
-                    slot=dict(spec.bindings.slot_inputs(slot, capacity)),
+                    slot=slot_inputs,
+                )
+                _bind_runtime_resources(
+                    program.descriptor, inputs, runtime=shared_inputs, slot=slot_inputs,
                 )
                 plan = _preparation_plan(
                     program.descriptor,

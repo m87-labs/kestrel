@@ -8,6 +8,34 @@ import pytest
 from kestrel.runtime import generated_decode as runtime_decode
 
 
+def test_compiler_output_resource_binds_fused_abi_name():
+    pcm = object()
+    inputs = {"pcm": pcm}
+    descriptor = {"device_program": {"physical_abi": {"operands": [
+        {"logical_name": "pcm.projection", "kind": "output"},
+    ]}}, "runtime": {"tensors": [
+        {"argument": "pcm.projection", "owner": "slot", "resource": "pcm"},
+    ]}}
+    runtime_decode._bind_runtime_resources(descriptor, inputs, slot={"pcm": pcm})
+    assert inputs["pcm.projection"] is pcm
+
+
+def test_resource_binding_preserves_explicit_inputs_and_owner_namespace():
+    explicit, resource = object(), object()
+    inputs = {"bound": explicit}
+    descriptor = {"device_program": {"physical_abi": {"operands": [
+        {"logical_name": name, "kind": "output"}
+        for name in ("bound", "missing", "keyed")
+    ] + [{"logical_name": "unprepared_input", "kind": "runtime"}]}}, "runtime": {"tensors": [
+        {"argument": "bound", "owner": "slot", "resource": "buffer"},
+        {"argument": "missing", "owner": "runtime", "resource": "buffer"},
+        {"argument": "keyed", "owner": "slot", "resource": "buffer", "key": ["field"]},
+        {"argument": "unprepared_input", "owner": "slot", "resource": "buffer"},
+    ]}}
+    runtime_decode._bind_runtime_resources(descriptor, inputs, slot={"buffer": resource})
+    assert inputs == {"bound": explicit}
+
+
 class _Stream:
     def wait_event(self, _event) -> None:
         pass
@@ -43,6 +71,10 @@ class _Program:
     static_extent_bindings: dict[str, int]
     launches: list[tuple[str, dict]]
     runtime_extent_maximums: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def identity(self):
+        return self.name
 
     @property
     def runtime_extent_minimums(self):
@@ -118,7 +150,7 @@ def _build(
     launches = programs[0].launches
     kernels = ModuleType("kestrel_kernels")
     generated = ModuleType("kestrel_kernels.generated_decode")
-    generated.assemble_bindings = lambda _descriptor, **_kwargs: {}
+    generated.assemble_bindings = lambda _descriptor, **kwargs: kwargs["runtime_inputs"]
     generated.derive_runtime_extents = lambda _descriptor, _inputs, *, active_batch: {
         "active_batch": int(active_batch)
     }
@@ -196,6 +228,39 @@ def _build(
     return runtime_decode.GeneratedDecode(
         runtime, spec=spec, programs=programs
     ), launches
+
+
+def test_generated_decode_launch_binds_fused_output(monkeypatch):
+    pcm = object()
+
+    class Program(_Program):
+        @property
+        def descriptor(self):
+            result = super().descriptor
+            result["device_program"]["argument_plan"]["arguments"].append(
+                {"name": "pcm_out", "source": "external", "transport": "tensor"}
+            )
+            result["device_program"]["physical_abi"]["operands"] = [
+                {"logical_name": "pcm.projection", "abi_name": "pcm_out",
+                 "kind": "output", "owner": "slot"}
+            ]
+            result["runtime"] = {"tensors": [
+                {"argument": "pcm.projection", "owner": "slot", "resource": "pcm"}
+            ]}
+            return result
+
+        def bind(self, bindings):
+            assert bindings["pcm.projection"] is pcm
+            return super().bind(bindings)
+
+    class Bindings(_Bindings):
+        def slot_inputs(self, slot, capacity):
+            return {"pcm": pcm}
+
+    program = Program("vocoder", 4, {"active_batch": 4}, [])
+    generated, launches = _build(monkeypatch, (program,), bindings=Bindings())
+    generated.run(SimpleNamespace(slot_id=0), 4)
+    assert launches == [("vocoder", {})]
 
 
 def test_generated_decode_materializes_explicit_weight_sources(monkeypatch):
