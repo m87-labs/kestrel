@@ -119,6 +119,7 @@ class GeneratedDecodeSpec:
     preparation_callbacks: Mapping[str, Callable[[Any, int], None]] = field(
         default_factory=dict
     )
+    program_names: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,21 +157,26 @@ def _active_batch_interval(program: Any) -> tuple[int, int]:
     minimum = int(
         getattr(program, "runtime_extent_minimums", {}).get("active_batch", 1)
     )
-    if not 1 <= minimum <= capacity:
+    maximum = int(
+        getattr(program, "runtime_extent_maximums", {}).get(
+            "active_batch", capacity
+        )
+    )
+    if not 1 <= minimum <= maximum <= capacity:
         raise RuntimeError(
             "generated decode program has invalid active-batch interval "
-            f"[{minimum}, {capacity}]"
+            f"[{minimum}, {maximum}] within capacity {capacity}"
         )
     static = program.static_extent_bindings.get("active_batch")
     if static is not None:
         static = int(static)
-        if not minimum <= static <= capacity:
+        if not minimum <= static <= maximum:
             raise RuntimeError(
                 "generated decode program has invalid static active batch "
-                f"{static} outside [{minimum}, {capacity}]"
+                f"{static} outside [{minimum}, {maximum}]"
             )
         return static, static
-    return minimum, capacity
+    return minimum, maximum
 
 
 def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, Any]:
@@ -186,6 +192,23 @@ def _merge_disjoint(label: str, **namespaces: Mapping[str, Any]) -> dict[str, An
             merged[name] = value
             owners[name] = namespace
     return merged
+
+
+def _bind_runtime_resources(descriptor, inputs, **owners) -> None:
+    """Bind fused outputs without changing input preparation or readiness."""
+    outputs = {
+        operand["logical_name"]
+        for operand in descriptor["device_program"]["physical_abi"]["operands"]
+        if operand["kind"] == "output"
+    }
+    for recipe in descriptor.get("runtime", {}).get("tensors", ()):
+        argument = recipe["argument"]
+        if argument not in outputs or argument in inputs or recipe.get("key"):
+            continue
+        resources = owners.get(recipe["owner"], {})
+        resource = recipe.get("resource")
+        if resource in resources:
+            inputs[argument] = resources[resource]
 
 
 def _required_engine_inputs(descriptor: Mapping[str, Any]) -> tuple[str, ...]:
@@ -271,9 +294,11 @@ def _select_program(
         _active_batch_interval(program)
         static_extents = program.static_extent_bindings
         minimums = getattr(program, "runtime_extent_minimums", {})
+        maximums = getattr(program, "runtime_extent_maximums", {})
         if runtime_extents is None and (
             static_extents.keys() - {"active_batch"}
             or minimums.keys() - {"active_batch"}
+            or maximums.keys() - {"active_batch"}
         ):
             continue
         candidates.append((index, program))
@@ -425,7 +450,10 @@ def generated_weight_programs_for_loading(
                 f"generated {label} decode has no selectable load-time artifact"
             )
         return ()
-    contracts = {repr(program.descriptor["weights"]) for program in selected}
+    contracts = {
+        generated_runtime.weight_storage_contract(program.descriptor)
+        for program in selected
+    }
     if len(contracts) != 1:
         raise RuntimeError(
             f"generated {label} artifacts disagree on weight storage"
@@ -614,6 +642,8 @@ class GeneratedDecode:
 
         properties = torch.cuda.get_device_properties(runtime.device)
         resolution_options = {}
+        if spec.program_names is not None:
+            resolution_options["program_names"] = spec.program_names
         weight_sources = getattr(spec, "weight_sources", None)
         if weight_sources is not None:
             resolution_options["weight_sources"] = weight_sources
@@ -812,9 +842,13 @@ class GeneratedDecode:
             assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
+            weight_storage_contract,
         )
 
-        contracts = {repr(program.descriptor["weights"]) for program in self._programs}
+        contracts = {
+            weight_storage_contract(program.descriptor)
+            for program in self._programs
+        }
         if len(contracts) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on weight storage"
@@ -859,19 +893,28 @@ class GeneratedDecode:
                     **materialization_options,
                 )
             else:
-                expected_contract = repr(self._programs[0].descriptor["weights"])
-                actual_contract = getattr(
-                    spec.weight_storage, "weight_contract", None
-                )
-                if actual_contract != expected_contract:
-                    raise RuntimeError(
-                        "preloaded generated weights do not match the selected program"
-                    )
                 if getattr(spec.weight_storage, "finalized", None) is not True:
                     raise RuntimeError(
                         "preloaded generated weights were not finalized after loading"
                     )
-                self.weight_storage = spec.weight_storage
+                expected_contract = repr(self._programs[0].descriptor["weights"])
+                actual_contract = getattr(
+                    spec.weight_storage, "weight_contract", None
+                )
+                if actual_contract == expected_contract:
+                    self.weight_storage = spec.weight_storage
+                else:
+                    from kestrel_kernels.generated_decode import (
+                        extend_weight_storage,
+                    )
+
+                    self.weight_storage = extend_weight_storage(
+                        spec.weight_storage,
+                        spec.weight_root,
+                        self._programs[0].descriptor,
+                        layer_prefix=spec.weight_layer_prefix,
+                        **materialization_options,
+                    )
             shared_inputs = dict(spec.bindings.runtime_inputs(runtime))
             weights_ready.record(runtime.compute_stream)
         ambient_stream.wait_event(weights_ready)
@@ -890,11 +933,15 @@ class GeneratedDecode:
                     if spec.capacity_inputs
                     else {}
                 )
+                slot_inputs = dict(spec.bindings.slot_inputs(slot, capacity))
                 inputs = _merge_disjoint(
                     spec.label,
                     shared=shared_inputs,
                     capacity=capacity_inputs,
-                    slot=dict(spec.bindings.slot_inputs(slot, capacity)),
+                    slot=slot_inputs,
+                )
+                _bind_runtime_resources(
+                    program.descriptor, inputs, runtime=shared_inputs, slot=slot_inputs,
                 )
                 plan = _preparation_plan(
                     program.descriptor,

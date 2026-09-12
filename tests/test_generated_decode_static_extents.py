@@ -1,11 +1,39 @@
 import contextlib
 import sys
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass, field, replace as dataclass_replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from kestrel.runtime import generated_decode as runtime_decode
+
+
+def test_compiler_output_resource_binds_fused_abi_name():
+    pcm = object()
+    inputs = {"pcm": pcm}
+    descriptor = {"device_program": {"physical_abi": {"operands": [
+        {"logical_name": "pcm.projection", "kind": "output"},
+    ]}}, "runtime": {"tensors": [
+        {"argument": "pcm.projection", "owner": "slot", "resource": "pcm"},
+    ]}}
+    runtime_decode._bind_runtime_resources(descriptor, inputs, slot={"pcm": pcm})
+    assert inputs["pcm.projection"] is pcm
+
+
+def test_resource_binding_preserves_explicit_inputs_and_owner_namespace():
+    explicit, resource = object(), object()
+    inputs = {"bound": explicit}
+    descriptor = {"device_program": {"physical_abi": {"operands": [
+        {"logical_name": name, "kind": "output"}
+        for name in ("bound", "missing", "keyed")
+    ] + [{"logical_name": "unprepared_input", "kind": "runtime"}]}}, "runtime": {"tensors": [
+        {"argument": "bound", "owner": "slot", "resource": "buffer"},
+        {"argument": "missing", "owner": "runtime", "resource": "buffer"},
+        {"argument": "keyed", "owner": "slot", "resource": "buffer", "key": ["field"]},
+        {"argument": "unprepared_input", "owner": "slot", "resource": "buffer"},
+    ]}}
+    runtime_decode._bind_runtime_resources(descriptor, inputs, slot={"buffer": resource})
+    assert inputs == {"bound": explicit}
 
 
 class _Stream:
@@ -42,6 +70,11 @@ class _Program:
     capacity: int
     static_extent_bindings: dict[str, int]
     launches: list[tuple[str, dict]]
+    runtime_extent_maximums: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def identity(self):
+        return self.name
 
     @property
     def runtime_extent_minimums(self):
@@ -112,14 +145,18 @@ def _build(
     weight_sources=None,
     weight_storage=None,
     materialize_calls=None,
+    extension_helper=True,
 ):
     launches = programs[0].launches
     kernels = ModuleType("kestrel_kernels")
     generated = ModuleType("kestrel_kernels.generated_decode")
-    generated.assemble_bindings = lambda _descriptor, **_kwargs: {}
+    generated.assemble_bindings = lambda _descriptor, **kwargs: kwargs["runtime_inputs"]
     generated.derive_runtime_extents = lambda _descriptor, _inputs, *, active_batch: {
         "active_batch": int(active_batch)
     }
+    generated.weight_storage_contract = lambda descriptor: repr(
+        descriptor["weights"]
+    )
 
     def materialize_weights(*_args, **kwargs):
         if materialize_calls is not None:
@@ -132,17 +169,34 @@ def _build(
             program for program in programs
             if program.capacity >= requested["active_batch"]
             and all(
+                requested.get(name, 0) >= value
+                for name, value in program.runtime_extent_minimums.items()
+            )
+            and all(
+                requested.get(name, value + 1) <= value
+                for name, value in program.runtime_extent_maximums.items()
+            )
+            and all(
                 requested.get(name) == value
                 for name, value in program.static_extent_bindings.items()
             )
         ),
         key=lambda program: (
             program.capacity,
+            program.runtime_extent_maximums.get(
+                "active_batch", program.capacity
+            ),
             -len(program.static_extent_bindings),
             program.name,
         ),
         default=None,
     )
+    if extension_helper:
+        generated.extend_weight_storage = (
+            lambda storage, _module, descriptor, **kwargs: SimpleNamespace(
+                buffers={}, base=storage, descriptor=descriptor, options=kwargs
+            )
+        )
     monkeypatch.setitem(sys.modules, "kestrel_kernels", kernels)
     monkeypatch.setitem(sys.modules, "kestrel_kernels.generated_decode", generated)
     monkeypatch.setattr(
@@ -176,6 +230,39 @@ def _build(
     ), launches
 
 
+def test_generated_decode_launch_binds_fused_output(monkeypatch):
+    pcm = object()
+
+    class Program(_Program):
+        @property
+        def descriptor(self):
+            result = super().descriptor
+            result["device_program"]["argument_plan"]["arguments"].append(
+                {"name": "pcm_out", "source": "external", "transport": "tensor"}
+            )
+            result["device_program"]["physical_abi"]["operands"] = [
+                {"logical_name": "pcm.projection", "abi_name": "pcm_out",
+                 "kind": "output", "owner": "slot"}
+            ]
+            result["runtime"] = {"tensors": [
+                {"argument": "pcm.projection", "owner": "slot", "resource": "pcm"}
+            ]}
+            return result
+
+        def bind(self, bindings):
+            assert bindings["pcm.projection"] is pcm
+            return super().bind(bindings)
+
+    class Bindings(_Bindings):
+        def slot_inputs(self, slot, capacity):
+            return {"pcm": pcm}
+
+    program = Program("vocoder", 4, {"active_batch": 4}, [])
+    generated, launches = _build(monkeypatch, (program,), bindings=Bindings())
+    generated.run(SimpleNamespace(slot_id=0), 4)
+    assert launches == [("vocoder", {})]
+
+
 def test_generated_decode_materializes_explicit_weight_sources(monkeypatch):
     sources = {"model.layers.0.weight": object()}
     calls = []
@@ -203,24 +290,27 @@ def test_generated_decode_reuses_matching_preloaded_weight_storage(monkeypatch):
         max_batch_size=1,
         weight_storage=storage,
         materialize_calls=calls,
+        extension_helper=False,
     )
 
     assert generated.weight_storage is storage
     assert calls == []
 
 
-def test_generated_decode_rejects_mismatched_preloaded_weight_storage(monkeypatch):
+def test_generated_decode_extends_partial_preloaded_weight_storage(monkeypatch):
     storage = SimpleNamespace(
-        buffers={}, weight_contract="different", finalized=True
+        buffers={}, weight_contract="partial", finalized=True
     )
 
-    with pytest.raises(RuntimeError, match="preloaded generated weights"):
-        _build(
-            monkeypatch,
-            _programs("b1"),
-            max_batch_size=1,
-            weight_storage=storage,
-        )
+    generated, _launches = _build(
+        monkeypatch,
+        _programs("b1"),
+        max_batch_size=1,
+        weight_storage=storage,
+    )
+
+    assert generated.weight_storage.base is storage
+    assert generated.weight_storage.options == {"layer_prefix": "layers"}
 
 
 def test_generated_decode_rejects_unfinalized_preloaded_weight_storage(monkeypatch):
@@ -254,6 +344,43 @@ def test_generated_decode_constructs_and_selects_dynamic_exact_siblings(monkeypa
         ("b8", {"active_batch": 7}),
         ("b8_exact", {}),
     ]
+
+
+def test_generated_decode_selects_admission_band_then_capacity_fallback(monkeypatch):
+    programs = _programs("b1", "b2", "b4", "b8")
+    launches = programs[0].launches
+    full_c32 = _Program("full_c32", 32, {}, launches)
+    band_c32 = _Program(
+        "band_c32",
+        32,
+        {},
+        launches,
+        {"active_batch": 24},
+    )
+    generated, _launches = _build(
+        monkeypatch,
+        (*programs, full_c32, band_c32),
+        max_batch_size=32,
+    )
+
+    assert generated._program_for(24)[1] is band_c32
+    assert generated._program_for(25)[1] is full_c32
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum"),
+    ((1, 0), (17, 16), (1, 33)),
+)
+def test_generated_decode_rejects_malformed_admission_maximum(minimum, maximum):
+    program = SimpleNamespace(
+        capacity=32,
+        runtime_extent_minimums={"active_batch": minimum},
+        runtime_extent_maximums={"active_batch": maximum},
+        static_extent_bindings={},
+    )
+
+    with pytest.raises(RuntimeError, match="invalid active-batch interval"):
+        runtime_decode._active_batch_interval(program)
 
 
 def test_generated_decode_repeated_dynamic_launch_keeps_step_preparations(

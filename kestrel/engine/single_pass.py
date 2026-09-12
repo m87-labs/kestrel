@@ -18,7 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
 
 from kestrel.device import make_event, stream_context
@@ -54,9 +55,12 @@ class _SinglePassRequest:
     submitted_at: float
     adapter: Optional[str] = None
     stream_queue: "Optional[_StreamQueue]" = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
-def _single_pass_result(request_id: int, output: Any) -> EngineResult:
+def _single_pass_result(
+    request_id: int, output: Any, finish_reason: str = "stop"
+) -> EngineResult:
     """Wrap a driver forward's output as an EngineResult.
 
     Single-pass tasks produce structured output (e.g. masks + scores),
@@ -75,7 +79,7 @@ def _single_pass_result(request_id: int, output: Any) -> EngineResult:
     return EngineResult(
         request_id=request_id,
         tokens=[],
-        finish_reason="stop",
+        finish_reason=finish_reason,
         metrics=EngineMetrics(
             input_tokens=0,
             output_tokens=0,
@@ -84,6 +88,13 @@ def _single_pass_result(request_id: int, output: Any) -> EngineResult:
             ttft_ms=0.0,
         ),
         output=output if isinstance(output, dict) else {"result": output},
+    )
+
+
+def _cancelled_completion(request: _SinglePassRequest) -> Completion:
+    return Completion(
+        request=request,
+        result=_single_pass_result(request.request_id, {}, "cancelled"),
     )
 
 
@@ -150,14 +161,36 @@ class SinglePassExecutor:
         return bool(self._in_flight)
 
     def advance(self) -> TickResult:
-        progressed = self._launch()
-        completed = self._collect()
+        progressed, completed = self._launch()
+        completed.extend(self._collect())
         progressed = progressed or bool(completed)
         return TickResult(
             progressed=progressed,
             completed=tuple(completed),
             has_work=self.has_work,
         )
+
+    def drain(self) -> tuple[Completion, ...]:
+        """Settle terminal work while leaving ordinary queued work paused."""
+
+        completed: List[Completion] = []
+        if self._deferred is not None and self._deferred.cancel_event.is_set():
+            completed.append(_cancelled_completion(self._deferred))
+            self._deferred = None
+        deferred = []
+        for _ in range(self._queue.qsize()):
+            try:
+                request = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if request.cancel_event.is_set():
+                completed.append(_cancelled_completion(request))
+            else:
+                deferred.append(request)
+        for request in deferred:
+            self._queue.put(request)
+        completed.extend(self._collect())
+        return tuple(completed)
 
     def shutdown(self, error: Optional[BaseException] = None) -> tuple[Completion, ...]:
         exc = error or RuntimeError("Engine shut down")
@@ -180,16 +213,25 @@ class SinglePassExecutor:
 
     # -- internals ----------------------------------------------------
 
-    def _launch(self) -> bool:
+    def _launch(self) -> tuple[bool, List[Completion]]:
         """Start forwards until the in-flight pool is full or the queue drains."""
-        launched = False
+        progressed = False
+        completed: List[Completion] = []
         while len(self._in_flight) < self._max_in_flight:
             try:
                 requests = self._take_batch()
             except queue.Empty:
                 break
-            launched = self._launch_batch(requests) or launched
-        return launched
+            pending = []
+            for request in requests:
+                if request.cancel_event.is_set():
+                    completed.append(_cancelled_completion(request))
+                    progressed = True
+                else:
+                    pending.append(request)
+            if pending:
+                progressed = self._launch_batch(pending) or progressed
+        return progressed, completed
 
     def _take_batch(self) -> tuple[_SinglePassRequest, ...]:
         if self._deferred is None:
@@ -258,7 +300,9 @@ class SinglePassExecutor:
             elif f.done_event.query():
                 completed.extend(
                     (
-                        Completion(request=request, error=output)
+                        _cancelled_completion(request)
+                        if request.cancel_event.is_set()
+                        else Completion(request=request, error=output)
                         if isinstance(output, BaseException)
                         else Completion(
                             request=request,

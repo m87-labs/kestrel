@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -58,6 +59,19 @@ class _ReasoningStreamSkillState(_SkillStateStub):
             return None
         self._reasoning_pending = False
         return "think"
+
+
+class _AudioStreamState(_SkillStateStub):
+    def __init__(self, request: GenerationRequest) -> None:
+        super().__init__(request)
+        self.output: dict[str, object] | None = {
+            "audio": [0.25, -0.25],
+            "sample_rate": 24_000,
+        }
+
+    def pop_stream_output(self, runtime: object) -> dict[str, object] | None:
+        output, self.output = self.output, None
+        return output
 
 
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
@@ -231,6 +245,45 @@ def test_stage_token_emits_update_without_text_or_reasoning_delta() -> None:
     assert updates[0].reasoning is None
 
 
+def test_stream_update_preserves_capability_defined_output() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(_AudioStreamState, return_logprobs=None)
+    seq.request.stream_callback = updates.append
+
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+
+    assert len(updates) == 1
+    assert updates[0].text == ""
+    assert updates[0].output == {
+        "audio": [0.25, -0.25],
+        "sample_rate": 24_000,
+    }
+
+
+def test_completed_output_publishes_without_a_second_token_commit() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(
+        _AudioStreamState,
+        return_logprobs=None,
+    )
+    seq.request.stream_callback = updates.append
+
+    state = seq.skill_state
+    assert isinstance(state, _AudioStreamState)
+    state.output = None
+    seq.stage_token(SimpleNamespace(), TextToken(10))
+    state.output = {"audio": [0.25], "sample_rate": 24_000}
+
+    assert seq.publish_stream_output(SimpleNamespace()) is True
+    assert seq.publish_stream_output(SimpleNamespace()) is False
+    assert len(updates) == 2
+    assert updates[0].token == TextToken(10)
+    assert updates[0].token_index == 0
+    assert updates[1].token is None
+    assert updates[1].token_index is None
+    assert updates[1].output == {"audio": [0.25], "sample_rate": 24_000}
+
+
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:
     request = GenerationRequest(
         request_id=7,
@@ -390,6 +443,28 @@ def test_sample_batch_omits_logprob_keyword_without_opt_in(
 
     assert sampled.tolist() == [3]
     assert logprobs is None
+
+
+def test_sample_batch_requests_packed_sampling_when_runtime_requires_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    scheduler._hooks = SamplingHooks(require_packed_sampling=True)
+    sample = Mock(return_value=torch.tensor([3]))
+    monkeypatch.setattr(
+        "kestrel.scheduler.scheduler.sample_step_from_logits",
+        sample,
+    )
+
+    GenerationScheduler._sample_batch(
+        scheduler,
+        torch.zeros((1, 8), dtype=torch.float32),
+        [_sequence(temperature=0.7, return_logprobs=None)],  # type: ignore[list-item]
+        torch.empty((1,), dtype=torch.long),
+        batch_idx=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert sample.call_args.kwargs["require_packed"] is True
 
 
 def test_scheduler_rejects_custom_greedy_with_speculative_decode() -> None:

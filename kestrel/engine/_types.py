@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from concurrent.futures import Future
+import threading
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -29,7 +29,7 @@ import numpy as np
 
 from kestrel.runtime import Token
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
-from kestrel.skills import SkillSpec, SkillState
+from kestrel.skills import SkillSpec
 
 
 @dataclass(slots=True)
@@ -73,6 +73,8 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         "request_id",
         "_queue",
         "_result_future",
+        "_cancel",
+        "_closed",
         "_final_result",
         "_error",
     )
@@ -82,10 +84,14 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         request_id: int,
         queue: _StreamQueue,
         result_future: asyncio.Future[EngineResult],
+        *,
+        cancel: Optional[Callable[[], None]] = None,
     ) -> None:
         self.request_id = request_id
         self._queue = queue
         self._result_future = result_future
+        self._cancel = cancel
+        self._closed = False
         self._final_result: Optional[EngineResult] = None
         self._error: Optional[BaseException] = None
 
@@ -93,9 +99,14 @@ class EngineStream(AsyncIterator[StreamUpdate]):
         return self
 
     async def __anext__(self) -> StreamUpdate:
+        if self._closed:
+            raise StopAsyncIteration
         while True:
             item = await self._queue.get()
+            if self._closed:
+                raise StopAsyncIteration
             if isinstance(item, _StreamCompletion):
+                self._closed = True
                 if item.error is not None:
                     self._error = item.error
                     raise item.error
@@ -109,14 +120,29 @@ class EngineStream(AsyncIterator[StreamUpdate]):
             return self._final_result
         if self._error is not None:
             raise self._error
-        result = await self._result_future
+        result = await asyncio.shield(self._result_future)
         self._final_result = result
         return result
+
+    async def aclose(self) -> None:
+        """Stop generation and wait for the scheduler to settle the request."""
+
+        if self._closed and self._result_future.done():
+            return
+        self._closed = True
+        if self._cancel is not None:
+            self._cancel()
+        try:
+            self._final_result = await asyncio.shield(self._result_future)
+        finally:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(_StreamCompletion(result=self._final_result))
 
 
 @dataclass(slots=True)
 class CapabilityUpdate:
-    """One coalescible progress snapshot from compound capability work."""
+    """One model-defined update from compound capability work."""
 
     task: str
     index: int
@@ -135,21 +161,27 @@ _CapabilityProducer = Callable[[_EmitCapabilityUpdate], Awaitable[EngineResult]]
 
 
 class CapabilityStream(AsyncIterator[CapabilityUpdate]):
-    """Bounded progress stream for a multi-request capability operation.
+    """Progress or output stream for a compound capability operation.
 
-    Updates are snapshots rather than an append-only event log. If a consumer
-    is slower than the producer, the pending snapshot is replaced by the most
-    recent one. This keeps memory bounded while ``result()`` remains usable by
-    callers that do not iterate progress.
+    By default, updates are replaceable snapshots: if a consumer is slower
+    than the producer, only the latest pending snapshot is retained. Pass
+    ``coalesce=False`` for lossless, append-only payloads such as PCM chunks.
+    That mode has the same queueing semantics as autoregressive streams.
     """
 
     __slots__ = ("task", "_queue", "_producer", "_index", "_closed")
 
-    def __init__(self, task: str, producer: _CapabilityProducer) -> None:
+    def __init__(
+        self,
+        task: str,
+        producer: _CapabilityProducer,
+        *,
+        coalesce: bool = True,
+    ) -> None:
         if not isinstance(task, str) or not task:
             raise ValueError("CapabilityStream task must be a non-empty string")
         self.task = task
-        self._queue: asyncio.Queue[CapabilityUpdate] = asyncio.Queue(maxsize=1)
+        self._queue: asyncio.Queue[CapabilityUpdate | None] = asyncio.Queue()
         self._index = 0
         self._closed = False
 
@@ -164,72 +196,64 @@ class CapabilityStream(AsyncIterator[CapabilityUpdate]):
                 output=dict(output),
             )
             self._index += 1
-            if self._queue.full():
+            if coalesce and not self._queue.empty():
                 self._queue.get_nowait()
             self._queue.put_nowait(update)
 
-        self._producer = asyncio.create_task(producer(emit))
+        async def produce() -> EngineResult:
+            try:
+                return await producer(emit)
+            finally:
+                self._queue.put_nowait(None)
+
+        self._producer = asyncio.create_task(produce())
 
     def __aiter__(self) -> "CapabilityStream":
         return self
 
     async def __anext__(self) -> CapabilityUpdate:
-        if not self._queue.empty():
-            return self._queue.get_nowait()
-        if self._producer.done():
+        if self._closed:
+            raise StopAsyncIteration
+        item = await self._queue.get()
+        if item is None:
+            if self._closed:
+                raise StopAsyncIteration
+            self._closed = True
             await self._producer
             raise StopAsyncIteration
-        next_update = asyncio.create_task(self._queue.get())
-        try:
-            done, _ = await asyncio.wait(
-                (next_update, self._producer),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            if next_update.cancel():
-                try:
-                    await next_update
-                except asyncio.CancelledError:
-                    pass
-            elif not self._queue.full():
-                # Cancellation may arrive after queue.get() has consumed the
-                # snapshot but before asyncio.wait() returns it. Restore that
-                # snapshot unless the producer has already published a newer
-                # one, which supersedes it under the coalescing contract.
-                self._queue.put_nowait(next_update.result())
-            raise
-        if next_update in done:
-            return next_update.result()
-        next_update.cancel()
-        try:
-            await next_update
-        except asyncio.CancelledError:
-            pass
-        await self._producer
-        raise StopAsyncIteration
+        return item
 
     async def result(self) -> EngineResult:
         return await self._producer
 
     async def aclose(self) -> None:
-        if self._closed:
+        if self._closed and self._producer.done():
             return
         self._closed = True
         if not self._producer.done():
             self._producer.cancel()
         try:
-            await self._producer
-        except asyncio.CancelledError:
-            pass
+            outcome, = await asyncio.gather(
+                self._producer, return_exceptions=True
+            )
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                raise outcome
+        finally:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
 
     async def __aenter__(self) -> "CapabilityStream":
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if exc_type is not None:
+        try:
+            if exc_type is None:
+                await self.result()
+        finally:
             await self.aclose()
-        else:
-            await self.result()
 
 
 @dataclass(slots=True)
@@ -412,6 +436,7 @@ class _AutoregressiveRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 @dataclass(slots=True)

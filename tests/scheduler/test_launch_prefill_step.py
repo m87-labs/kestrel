@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 
 from kestrel.models.moondream.runtime import PrefillClassification, TextToken
 from kestrel.runtime import SequenceState
+from kestrel.runtime.sampling import SamplingHooks
 from kestrel.scheduler.pipeline import DecodeLaunch, LaunchHandle, PipelineState
 from kestrel.scheduler.queues import RequestQueue, RunningQueue
 from kestrel.scheduler.scheduler import GenerationScheduler, _PrefillCandidate
@@ -89,6 +91,7 @@ def _make_scheduler(
 ) -> GenerationScheduler:
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = runtime
+    scheduler._hooks = SamplingHooks()
     scheduler.waiting = RequestQueue()
     scheduler.waiting.push(request)
     scheduler.running = RunningQueue()
@@ -97,6 +100,36 @@ def _make_scheduler(
         _make_candidate(request)
     ]
     return scheduler
+
+
+def test_cancelled_prefill_waits_for_commit_before_finalizing() -> None:
+    request = _make_request()
+    request.cancel_event = threading.Event()
+    request.cancel_event.set()
+    sequence = request.lifecycle
+    sequence.sequence_state = SequenceState(
+        batch_idx=1,
+        length=1,
+        max_length=9,
+        prompt_length=1,
+    )
+    sequence.uncommitted_prefill_token = True
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = FakeRuntime()
+    scheduler.waiting = RequestQueue()
+    scheduler.running = RunningQueue()
+    scheduler.running.push(sequence)
+    finalized: list[tuple[RequestLifecycle, str]] = []
+    scheduler._finalize_sequence = lambda seq, reason: finalized.append((seq, reason))
+    scheduler._commit_prefill = lambda _step: ([TextToken(7)], None, (True,))
+    step = SimpleNamespace(kind="prefill", sequences=[sequence])
+
+    assert scheduler._cancel_requests() is False
+    scheduler.commit_step(step)
+
+    assert finalized == [(sequence, "cancelled")]
+    assert sequence.skill_state.tokens == []
+    assert len(scheduler.running) == 0
 
 
 def test_scheduler_requires_uniform_sampling_hooks() -> None:
@@ -362,10 +395,13 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
     )
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = SimpleNamespace(spec=None)
+    scheduler._hooks = SamplingHooks()
     scheduler._compute_stream = None
     scheduler._pipeline = pipeline
     scheduler.waiting = []
-    scheduler.running = [object()]
+    scheduler.running = [
+        SimpleNamespace(request=SimpleNamespace(cancel_event=threading.Event()))
+    ]
     scheduler._launch_prefill_step = lambda actual_pipeline: False
     scheduler.schedule_decode_step = lambda: plan
     scheduler._launch_forward_on_stream = (
@@ -377,3 +413,58 @@ def test_advance_launches_decode_without_reentering_compute_stream() -> None:
 
     assert GenerationScheduler.advance(scheduler) is True
     assert launched == [handle]
+
+
+@pytest.mark.parametrize("needs_force", [False, True])
+def test_advance_runs_auxiliary_instead_of_overlapping_decode(needs_force) -> None:
+    forced = []
+    published = []
+    request = SimpleNamespace(cancel_event=threading.Event())
+    skill_state = SimpleNamespace(request=request)
+    sequence = SimpleNamespace(
+        request=request,
+        skill_state=skill_state,
+        finalized=False,
+        publish_stream_output=lambda runtime: published.append(runtime) or True,
+    )
+    request.lifecycle = sequence
+
+    def advance_auxiliary(*, force, stream_output_ready):
+        forced.append(force)
+        if needs_force and not force:
+            return False
+        assert stream_output_ready(skill_state) is True
+        return True
+
+    pipeline = SimpleNamespace(
+        has_launch_in_flight=lambda: False,
+        queue_depth=lambda: 0,
+        pop_oldest=lambda: None,
+        launch_handle=None,
+        can_launch=lambda: True,
+    )
+    scheduler = object.__new__(GenerationScheduler)
+    scheduler.runtime = SimpleNamespace(spec=None)
+    scheduler._hooks = SamplingHooks(
+        advance_auxiliary=advance_auxiliary
+    )
+    scheduler._compute_stream = None
+    scheduler._pipeline = pipeline
+    scheduler.waiting = []
+    scheduler.running = [sequence]
+    scheduler._launch_prefill_step = lambda actual_pipeline: (_ for _ in ()).throw(
+        AssertionError("urgent auxiliary work must precede prefill")
+    )
+    if needs_force:
+        scheduler._launch_prefill_step = lambda actual_pipeline: False
+    scheduler.schedule_decode_step = lambda: None if needs_force else object()
+    scheduler._launch_forward_on_stream = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("decode must not overlap auxiliary work")
+    )
+
+    assert GenerationScheduler.advance(scheduler) is True
+    assert forced == ([False, True] if needs_force else [False])
+    assert published == [scheduler.runtime]
+    sequence.finalized = True
+    assert scheduler._publish_stream_output(skill_state) is False
+    assert published == [scheduler.runtime]
