@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
-from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
 from kestrel.models.asr.contract import (
@@ -26,6 +25,7 @@ from kestrel.models.asr.contract import (
 
 from .contract import parse_request
 from .decode_graph import _TdtBatchGraphDecoder
+from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
@@ -165,7 +165,8 @@ class ParakeetTdtRuntime:
                 max_batch=self.batch_capacity,
                 compute_stream=stream,
             )
-        self._encoder_graph = FixedShapeSinglePassGraph(
+        self._encoder_graph = ParakeetEncoderGraph(
+            self.model,
             enabled=(
                 bool(getattr(cfg, "enable_cuda_graphs", True))
                 and self.device.type == "cuda"
@@ -173,10 +174,6 @@ class ParakeetTdtRuntime:
             ),
             device=self.device,
             stream=self.compute_stream,
-            run_forward=self.model.encode,
-            # Three exact B1/B4/B8 shapes retained 372 MiB on L4 and avoided
-            # 107-146 ms recaptures; cap at four independent graph pools.
-            max_entries=4,
         )
 
     @property

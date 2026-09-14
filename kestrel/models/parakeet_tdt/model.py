@@ -251,6 +251,9 @@ class Encoder(nn.Module):
 
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden, valid = self.subsampling(features, mask)
+        return self.forward_subsampled(hidden, valid)
+
+    def forward_subsampled(self, hidden: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
         length = hidden.shape[1]
         relative_positions = torch.arange(length - 1, -length, -1, device=hidden.device)
         phase = torch.outer(relative_positions.float(), self.inverse_frequency)
@@ -498,6 +501,10 @@ class ParakeetTdt(nn.Module):
 
     def encode(self, features: Tensor, attention_mask: Tensor) -> tuple[Tensor, Tensor]:
         encoded, valid = self.encoder(features, attention_mask)
+        return self.encoder_projector(encoded), valid
+
+    def encode_subsampled(self, hidden: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+        encoded, valid = self.encoder.forward_subsampled(hidden, valid)
         return self.encoder_projector(encoded), valid
 
     def generate(
