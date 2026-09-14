@@ -4,6 +4,15 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.7.2 — 2026-09-13
+
+- Updated to `kestrel-kernels` 0.6.2 and matching CUDA bundle companions.
+- Expanded fast generated decode for Qwen 3.5 and Qwen 3.6 35B-A3B across
+  NVIDIA Ampere, Hopper, and Blackwell GPUs, including live batch extents.
+- Kept block-scaled Qwen prefill projections on the packed GPU path.
+- Corrected multimodal Qwen chat token accounting when image inputs are
+  combined with conversation history.
+
 ## 0.7.1 — 2026-09-09
 
 - Updated to `kestrel-kernels` 0.6.1 and matching CUDA bundle companions.
