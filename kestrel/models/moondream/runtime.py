@@ -808,11 +808,6 @@ class MoondreamRuntime:
             device=self.device,
             dtype=self.dtype,
         )
-        self._encode_vision_crops = (
-            self._vision_backend.encode_crops
-            if self._vision_backend is not None
-            else self._encode_native_vision_crops
-        )
         self.seg_refiner = (
             SegmentRefiner(self.model.vision, self.config.vision, self.device)
             if self._vision_backend is None and _HAS_SEG_DEPS
@@ -1484,8 +1479,15 @@ class MoondreamRuntime:
         overlap: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
         with torch.inference_mode():
+            crop_dtype = (
+                self._vision_backend.crop_dtype
+                if self._vision_backend is not None
+                else self.dtype
+            )
+            normalize_crops = self._vision_backend is None
             if overlap is not None:
-                crops, tiling = prepare_crops_from_overlap(overlap, self.device, self.dtype)
+                crops, tiling = prepare_crops_from_overlap(
+                    overlap, self.device, crop_dtype, normalize=normalize_crops)
             else:
                 if image is None:
                     raise ValueError("image must be provided when overlap is not supplied")
@@ -1497,9 +1499,17 @@ class MoondreamRuntime:
                 from kestrel.utils.image import decode_to_srgb
 
                 image = decode_to_srgb(image)
-                crops, tiling = prepare_crops(image, self.config.vision, self.device, self.dtype)
+                crops, tiling = prepare_crops(
+                    image,
+                    self.config.vision,
+                    self.device,
+                    crop_dtype,
+                    normalize=normalize_crops,
+                )
 
-            outputs = self._encode_vision_crops(crops)
+            if self._vision_backend is not None:
+                return self._vision_backend.encode_crops(crops, tiling)
+            outputs = self._encode_native_vision_crops(crops)
 
             # Rest unchanged: projection, reconstruction
             global_features = outputs[0]

@@ -1,6 +1,4 @@
-"""Optional full-encoder SigLIP backend selection."""
-
-from importlib.metadata import entry_points
+"""Select the shipped Hopper SigLIP encoder when its contract matches."""
 from typing import Any, Protocol
 
 import torch
@@ -8,18 +6,20 @@ import torch
 from kestrel.device import get_device_capability
 
 
-_BACKEND_GROUP = "kestrel_kernels.siglip_backends"
-_HOPPER_BACKEND = "hopper"
-_CROP_COUNTS = tuple(range(1, 14))
+_CROP_COUNTS = tuple(range(2, 14))
 _SIGLIP_GEOMETRY = (27, 1152, 4304, 16, 14, 378, 12, 3)
+_create_hopper_encoder = None
 
 
 class SiglipEncoderBackend(Protocol):
     """Runtime contract implemented by a complete vision encoder backend."""
 
     crop_counts: tuple[int, ...]
+    crop_dtype: torch.dtype
 
-    def encode_crops(self, crops: torch.Tensor) -> torch.Tensor: ...
+    def encode_crops(
+        self, crops: torch.Tensor, tiling: tuple[int, int],
+    ) -> torch.Tensor: ...
 
     def close(self) -> None: ...
 
@@ -60,17 +60,12 @@ def create_siglip_backend(
     if not _is_hopper_siglip(vision, config, device, dtype):
         return None
 
-    candidates = tuple(
-        point
-        for point in entry_points(group=_BACKEND_GROUP)
-        if point.name == _HOPPER_BACKEND
-    )
-    if len(candidates) != 1:
-        raise RuntimeError(
-            "Hopper SigLIP requires exactly one installed full-encoder backend; "
-            f"found {len(candidates)}"
-        )
-    backend = candidates[0].load()(
+    factory = _create_hopper_encoder
+    if factory is None:
+        from kestrel_kernels.megakernel.siglip import create_encoder
+
+        factory = create_encoder
+    backend = factory(
         model_name=model_name,
         vision=vision,
         config=config,
@@ -81,7 +76,12 @@ def create_siglip_backend(
         close = getattr(backend, "close", None)
         if callable(close):
             close()
-        raise RuntimeError("Hopper SigLIP backend does not cover every crop count 1..13")
+        raise RuntimeError("Hopper SigLIP backend does not cover every image crop count 2..13")
+    if getattr(backend, "crop_dtype", None) is not torch.uint8:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+        raise RuntimeError("Hopper SigLIP backend must consume raw uint8 crops")
     if not callable(getattr(backend, "encode_crops", None)) or not callable(
         getattr(backend, "close", None)
     ):

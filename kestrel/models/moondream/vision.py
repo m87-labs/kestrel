@@ -25,15 +25,19 @@ def prepare_crops(
     config: VisionConfig,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    normalize: bool = True,
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
     overlap = compute_overlap_crops(image, config)
-    return prepare_crops_from_overlap(overlap, device, dtype)
+    return prepare_crops_from_overlap(overlap, device, dtype, normalize=normalize)
 
 
 def prepare_crops_from_overlap(
     overlap: OverlapCropOutput,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    normalize: bool = True,
 ) -> Tuple[torch.Tensor, Tuple[int, int]]:
     crops_cpu = torch.from_numpy(overlap["crops"])
     crops_cpu = crops_cpu.permute(0, 3, 1, 2).contiguous()
@@ -51,8 +55,11 @@ def prepare_crops_from_overlap(
         dtype=dtype,
         non_blocking=True,
     )
-    crops = crops.div_(255.0)
-    crops = crops.sub_(0.5).div_(0.5)
+    if normalize:
+        crops = crops.div_(255.0)
+        crops = crops.sub_(0.5).div_(0.5)
+    elif dtype is not torch.uint8:
+        raise ValueError("unnormalized crops require uint8 output")
     return crops, overlap["tiling"]
 
 

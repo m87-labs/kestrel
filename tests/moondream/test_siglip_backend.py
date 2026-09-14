@@ -1,11 +1,13 @@
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from kestrel.models.moondream import siglip_backend
 from kestrel.models.moondream.runtime import MoondreamRuntime
+from kestrel.models.moondream.vision import prepare_crops_from_overlap
 
 
 def _config():
@@ -25,21 +27,11 @@ def _vision():
     return SimpleNamespace(blocks=[object()] * 27)
 
 
-class _Point:
-    name = "hopper"
-
-    def __init__(self, factory):
-        self._factory = factory
-
-    def load(self):
-        return self._factory
-
-
-def test_non_hopper_keeps_native_without_loading_plugins(monkeypatch):
+def test_non_hopper_keeps_native_without_loading_hopper_backend(monkeypatch):
     monkeypatch.setattr(
         siglip_backend,
-        "entry_points",
-        lambda **_kwargs: pytest.fail("non-Hopper must not discover Hopper plugins"),
+        "_create_hopper_encoder",
+        lambda **_kwargs: pytest.fail("non-Hopper must not construct the Hopper backend"),
     )
 
     backend = siglip_backend.create_siglip_backend(
@@ -53,25 +45,12 @@ def test_non_hopper_keeps_native_without_loading_plugins(monkeypatch):
     assert backend is None
 
 
-def test_hopper_requires_one_complete_all_count_backend(monkeypatch):
-    monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr(siglip_backend, "entry_points", lambda **_kwargs: ())
-
-    with pytest.raises(RuntimeError, match="exactly one installed"):
-        siglip_backend.create_siglip_backend(
-            model_name="moondream3-preview",
-            vision=_vision(),
-            config=_config(),
-            device=torch.device("cuda:0"),
-            dtype=torch.bfloat16,
-        )
-
-
 def test_hopper_selects_once_by_vision_contract(monkeypatch):
     calls = []
     backend = SimpleNamespace(
-        crop_counts=tuple(range(1, 14)),
-        encode_crops=lambda crops: crops,
+        crop_counts=tuple(range(2, 14)),
+        crop_dtype=torch.uint8,
+        encode_crops=lambda crops, tiling: crops,
         close=lambda: None,
     )
 
@@ -80,11 +59,7 @@ def test_hopper_selects_once_by_vision_contract(monkeypatch):
         return backend
 
     monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr(
-        siglip_backend,
-        "entry_points",
-        lambda **_kwargs: (_Point(factory),),
-    )
+    monkeypatch.setattr(siglip_backend, "_create_hopper_encoder", factory)
 
     selected = siglip_backend.create_siglip_backend(
         model_name="any-model-with-this-siglip-contract",
@@ -102,18 +77,40 @@ def test_hopper_selects_once_by_vision_contract(monkeypatch):
 def test_incomplete_hopper_family_is_closed_and_rejected(monkeypatch):
     closed = []
     backend = SimpleNamespace(
-        crop_counts=tuple(range(1, 13)),
-        encode_crops=lambda crops: crops,
+        crop_counts=tuple(range(2, 13)),
+        crop_dtype=torch.uint8,
+        encode_crops=lambda crops, tiling: crops,
         close=lambda: closed.append(True),
     )
     monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
     monkeypatch.setattr(
-        siglip_backend,
-        "entry_points",
-        lambda **_kwargs: (_Point(lambda **_kwargs: backend),),
-    )
+        siglip_backend, "_create_hopper_encoder", lambda **_kwargs: backend)
 
-    with pytest.raises(RuntimeError, match="every crop count 1..13"):
+    with pytest.raises(RuntimeError, match="every image crop count 2..13"):
+        siglip_backend.create_siglip_backend(
+            model_name="moondream3-preview",
+            vision=_vision(),
+            config=_config(),
+            device=torch.device("cuda:0"),
+            dtype=torch.bfloat16,
+        )
+
+    assert closed == [True]
+
+
+def test_hopper_requires_raw_uint8_backend(monkeypatch):
+    closed = []
+    backend = SimpleNamespace(
+        crop_counts=tuple(range(2, 14)),
+        crop_dtype=torch.bfloat16,
+        encode_crops=lambda crops, tiling: crops,
+        close=lambda: closed.append(True),
+    )
+    monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
+    monkeypatch.setattr(
+        siglip_backend, "_create_hopper_encoder", lambda **_kwargs: backend)
+
+    with pytest.raises(RuntimeError, match="raw uint8"):
         siglip_backend.create_siglip_backend(
             model_name="moondream3-preview",
             vision=_vision(),
@@ -150,3 +147,43 @@ def test_hopper_lifecycle_does_not_recapture_native_vision():
         ("backend", True),
         ("pool", True),
     ]
+
+
+def test_hopper_backend_owns_reconstruction_and_projection():
+    calls = []
+    expected = torch.randn(729, 2048, dtype=torch.bfloat16)
+    backend = SimpleNamespace(
+        crop_dtype=torch.uint8,
+        encode_crops=lambda crops, tiling: calls.append((crops.shape, crops.dtype, tiling))
+        or expected,
+    )
+    runtime = MoondreamRuntime.__new__(MoondreamRuntime)
+    runtime.device = torch.device("cpu")
+    runtime.dtype = torch.bfloat16
+    runtime._vision_backend = backend
+    runtime.config = SimpleNamespace(vision=_config())
+    overlap = {
+        "crops": np.zeros((2, 378, 378, 3), dtype=np.uint8),
+        "tiling": (1, 1),
+    }
+
+    actual = runtime.encode_image(None, overlap=overlap)
+
+    assert actual is expected
+    assert calls == [(torch.Size((2, 3, 378, 378)), torch.uint8, (1, 1))]
+
+
+def test_unnormalized_crop_staging_preserves_raw_uint8():
+    overlap = {
+        "crops": np.full((2, 378, 378, 3), 127, dtype=np.uint8),
+        "tiling": (1, 1),
+    }
+
+    crops, tiling = prepare_crops_from_overlap(
+        overlap, torch.device("cpu"), torch.uint8, normalize=False)
+
+    assert crops.shape == (2, 3, 378, 378)
+    assert crops.dtype is torch.uint8
+    assert crops.is_contiguous()
+    assert crops.unique().tolist() == [127]
+    assert tiling == (1, 1)
