@@ -74,6 +74,19 @@ class _AudioStreamState(_SkillStateStub):
         return output
 
 
+class _FinalizeAudioStreamState(_SkillStateStub):
+    def __init__(self, request: GenerationRequest) -> None:
+        super().__init__(request)
+        self.outputs: list[dict[str, object]] = []
+
+    def finalize(self, runtime: object, *, reason: str) -> SkillFinalizeResult:
+        self.outputs.extend(({"audio": [0.25]}, {"audio": [-0.25]}))
+        return super().finalize(runtime, reason=reason)
+
+    def pop_stream_output(self, runtime: object) -> dict[str, object] | None:
+        return self.outputs.pop(0) if self.outputs else None
+
+
 def _make_lifecycle(*, return_logprobs: bool | None) -> RequestLifecycle:
     request = GenerationRequest(
         request_id=7,
@@ -282,6 +295,22 @@ def test_completed_output_publishes_without_a_second_token_commit() -> None:
     assert updates[1].token is None
     assert updates[1].token_index is None
     assert updates[1].output == {"audio": [0.25], "sample_rate": 24_000}
+
+
+def test_finalize_drains_remaining_stream_output() -> None:
+    updates = []
+    seq = _make_lifecycle_with_state(
+        _FinalizeAudioStreamState,
+        return_logprobs=None,
+    )
+    seq.request.stream_callback = updates.append
+
+    GenerationScheduler._build_result(_scheduler(), seq)
+
+    assert [update.output for update in updates] == [
+        {"audio": [0.25]},
+        {"audio": [-0.25]},
+    ]
 
 
 def test_scheduler_result_keeps_generated_prefix_logprobs_aligned() -> None:

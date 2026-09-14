@@ -3355,6 +3355,8 @@ class GenerationScheduler:
             finalize = seq.skill_state.finalize(self.runtime, reason=finish_reason)
             tokens = finalize.tokens
             output = finalize.output
+            while seq.publish_stream_output(self.runtime):
+                pass
             finalization_failed = False
         except Exception as exc:  # pragma: no cover - defensive
             _LOGGER.exception("Failed to finalize sequence %s", seq.request.request_id)
