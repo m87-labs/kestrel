@@ -477,6 +477,7 @@ def test_runtime_replaces_prepared_storage_with_finalized_storage(
     runtime.dtype = torch.bfloat16
     runtime.max_batch_size = 4
     runtime._spec = SimpleNamespace(revision="revision")
+    runtime._generated_decode_team_member = None
     runtime._generated_weight_storage = None
 
     assert runtime._load_model("checkpoint") is model
