@@ -30,7 +30,7 @@ def _vision():
 def test_non_hopper_keeps_native_without_loading_hopper_backend(monkeypatch):
     monkeypatch.setattr(
         siglip_backend,
-        "_create_hopper_encoder",
+        "_load_hopper_encoder",
         lambda **_kwargs: pytest.fail("non-Hopper must not construct the Hopper backend"),
     )
 
@@ -43,6 +43,24 @@ def test_non_hopper_keeps_native_without_loading_hopper_backend(monkeypatch):
     )
 
     assert backend is None
+
+
+def test_missing_hopper_runtime_is_an_available_native_fallback(monkeypatch):
+    missing = ModuleNotFoundError(
+        "missing shipped backend", name="kestrel_kernels.megakernel.siglip")
+    monkeypatch.setattr(
+        siglip_backend, "import_module", lambda _name: (_ for _ in ()).throw(missing))
+
+    assert siglip_backend._load_hopper_encoder() is None
+
+
+def test_broken_hopper_runtime_is_not_hidden_as_unavailable(monkeypatch):
+    broken = ModuleNotFoundError("missing backend dependency", name="backend_dependency")
+    monkeypatch.setattr(
+        siglip_backend, "import_module", lambda _name: (_ for _ in ()).throw(broken))
+
+    with pytest.raises(ModuleNotFoundError, match="missing backend dependency"):
+        siglip_backend._load_hopper_encoder()
 
 
 def test_hopper_selects_once_by_vision_contract(monkeypatch):
@@ -59,7 +77,7 @@ def test_hopper_selects_once_by_vision_contract(monkeypatch):
         return backend
 
     monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr(siglip_backend, "_create_hopper_encoder", factory)
+    monkeypatch.setattr(siglip_backend, "_load_hopper_encoder", lambda: factory)
 
     selected = siglip_backend.create_siglip_backend(
         model_name="any-model-with-this-siglip-contract",
@@ -74,6 +92,21 @@ def test_hopper_selects_once_by_vision_contract(monkeypatch):
     assert calls[0]["model_name"] == "any-model-with-this-siglip-contract"
 
 
+def test_hopper_keeps_native_until_backend_package_is_available(monkeypatch):
+    monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
+    monkeypatch.setattr(siglip_backend, "_load_hopper_encoder", lambda: None)
+
+    backend = siglip_backend.create_siglip_backend(
+        model_name="moondream3-preview",
+        vision=_vision(),
+        config=_config(),
+        device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+    )
+
+    assert backend is None
+
+
 def test_incomplete_hopper_family_is_closed_and_rejected(monkeypatch):
     closed = []
     backend = SimpleNamespace(
@@ -84,7 +117,7 @@ def test_incomplete_hopper_family_is_closed_and_rejected(monkeypatch):
     )
     monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
     monkeypatch.setattr(
-        siglip_backend, "_create_hopper_encoder", lambda **_kwargs: backend)
+        siglip_backend, "_load_hopper_encoder", lambda: lambda **_kwargs: backend)
 
     with pytest.raises(RuntimeError, match="every image crop count 2..13"):
         siglip_backend.create_siglip_backend(
@@ -108,7 +141,7 @@ def test_hopper_requires_raw_uint8_backend(monkeypatch):
     )
     monkeypatch.setattr(siglip_backend, "get_device_capability", lambda _device: (9, 0))
     monkeypatch.setattr(
-        siglip_backend, "_create_hopper_encoder", lambda **_kwargs: backend)
+        siglip_backend, "_load_hopper_encoder", lambda: lambda **_kwargs: backend)
 
     with pytest.raises(RuntimeError, match="raw uint8"):
         siglip_backend.create_siglip_backend(

@@ -1,4 +1,5 @@
 """Select the shipped Hopper SigLIP encoder when its contract matches."""
+from importlib import import_module
 from typing import Any, Protocol
 
 import torch
@@ -8,7 +9,16 @@ from kestrel.device import get_device_capability
 
 _CROP_COUNTS = tuple(range(2, 14))
 _SIGLIP_GEOMETRY = (27, 1152, 4304, 16, 14, 378, 12, 3)
-_create_hopper_encoder = None
+
+
+def _load_hopper_encoder():
+    try:
+        module = import_module("kestrel_kernels.megakernel.siglip")
+    except ModuleNotFoundError as exc:
+        if exc.name == "kestrel_kernels.megakernel.siglip":
+            return None
+        raise
+    return module.create_encoder
 
 
 class SiglipEncoderBackend(Protocol):
@@ -56,15 +66,13 @@ def create_siglip_backend(
     device: torch.device,
     dtype: torch.dtype,
 ) -> SiglipEncoderBackend | None:
-    """Create the required Hopper backend, or select the native tower elsewhere."""
+    """Create an installed Hopper backend when eligible, or retain the native tower."""
     if not _is_hopper_siglip(vision, config, device, dtype):
         return None
 
-    factory = _create_hopper_encoder
+    factory = _load_hopper_encoder()
     if factory is None:
-        from kestrel_kernels.megakernel.siglip import create_encoder
-
-        factory = create_encoder
+        return None
     backend = factory(
         model_name=model_name,
         vision=vision,
