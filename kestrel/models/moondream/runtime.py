@@ -59,6 +59,7 @@ from kestrel.models.registry import get_spec
 from .config import MoondreamConfig
 from .image_preprocessor import ImagePreprocessor
 from .model import MoondreamModel
+from .siglip_backend import SiglipEncoderBackend, create_siglip_backend
 from .weights import load_moondream_weights
 from .text import (
     lm_head,
@@ -800,9 +801,17 @@ class MoondreamRuntime:
         ]
         self._prefill_slot_free: list[PrefillSlot] = list(reversed(self._prefill_slots))
 
+        self._vision_backend: SiglipEncoderBackend | None = create_siglip_backend(
+            model_name=self.model_name,
+            vision=self.model.vision,
+            config=self.config.vision,
+            device=self.device,
+            dtype=self.dtype,
+        )
         self.seg_refiner = (
             SegmentRefiner(self.model.vision, self.config.vision, self.device)
-            if _HAS_SEG_DEPS else None
+            if self._vision_backend is None and _HAS_SEG_DEPS
+            else None
         )
 
         # Multi-slot LoRA workspace and slot manager.
@@ -925,16 +934,16 @@ class MoondreamRuntime:
             device=self.device,
         )
 
-        # Pre-allocate workspaces unconditionally (needed for both graph and non-graph paths)
-        self._preallocate_workspaces()
+        if self._vision_backend is None:
+            self._preallocate_workspaces()
 
         if self._use_cuda_graphs:
             self._maybe_release_cuda_allocator_cache()
             self._ensure_cuda_graphs_ready()
 
-        # Allocate vision encoder buffers (always, for consistency)
-        self._allocate_vision_buffers()
-        self._capture_vision_graphs()
+        if self._vision_backend is None:
+            self._allocate_vision_buffers()
+            self._capture_vision_graphs()
 
     def _initialize_generated_decode(self, plan=None) -> None:
         """Apply the runtime-wide decode policy before graph capture."""
@@ -1327,7 +1336,11 @@ class MoondreamRuntime:
         The engine calls this once per runtime on shutdown; for Moondream
         that means tearing down the image-preprocessor thread pool.
         """
-        self._image_preprocessor.shutdown(wait=True)
+        try:
+            if self._vision_backend is not None:
+                self._vision_backend.close()
+        finally:
+            self._image_preprocessor.shutdown(wait=True)
 
     def acquire_prefill_slot(self, slot_id: int | None = None) -> PrefillSlot:
         if slot_id is None:
@@ -1466,8 +1479,15 @@ class MoondreamRuntime:
         overlap: Optional[OverlapCropOutput] = None,
     ) -> Tensor:
         with torch.inference_mode():
+            crop_dtype = (
+                self._vision_backend.crop_dtype
+                if self._vision_backend is not None
+                else self.dtype
+            )
+            normalize_crops = self._vision_backend is None
             if overlap is not None:
-                crops, tiling = prepare_crops_from_overlap(overlap, self.device, self.dtype)
+                crops, tiling = prepare_crops_from_overlap(
+                    overlap, self.device, crop_dtype, normalize=normalize_crops)
             else:
                 if image is None:
                     raise ValueError("image must be provided when overlap is not supplied")
@@ -1479,25 +1499,17 @@ class MoondreamRuntime:
                 from kestrel.utils.image import decode_to_srgb
 
                 image = decode_to_srgb(image)
-                crops, tiling = prepare_crops(image, self.config.vision, self.device, self.dtype)
-
-            batch_size = crops.shape[0]
-
-            # Always use stable buffers for consistency
-            self._vision_input[:batch_size].copy_(crops)
-
-            # Use CUDA graph if available, otherwise eager
-            if batch_size in self._vision_graphs:
-                self._vision_graphs[batch_size].replay()
-            else:
-                out = vision_encoder(
-                    self._vision_input[:batch_size],
-                    self.model.vision,
+                crops, tiling = prepare_crops(
+                    image,
                     self.config.vision,
+                    self.device,
+                    crop_dtype,
+                    normalize=normalize_crops,
                 )
-                self._vision_output[:batch_size].copy_(out)
 
-            outputs = self._vision_output[:batch_size]
+            if self._vision_backend is not None:
+                return self._vision_backend.encode_crops(crops, tiling)
+            outputs = self._encode_native_vision_crops(crops)
 
             # Rest unchanged: projection, reconstruction
             global_features = outputs[0]
@@ -2758,13 +2770,14 @@ class MoondreamRuntime:
             if torch.cuda.is_available() and self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
 
-            # Clear vision graphs
-            self._vision_graphs = {}
+            if self._vision_backend is None:
+                self._vision_graphs = {}
 
             self._decode_graphs.clear()
 
             self._ensure_cuda_graphs_ready()
-            self._capture_vision_graphs()
+            if self._vision_backend is None:
+                self._capture_vision_graphs()
 
     def _ensure_cuda_graphs_ready(self) -> None:
         """Capture CUDA graphs for all slots using slot buffers directly."""
@@ -2811,6 +2824,21 @@ class MoondreamRuntime:
             (max_batch, patches, config.enc_dim),
             dtype=self.dtype, device=self.device
         )
+
+    def _encode_native_vision_crops(self, crops: Tensor) -> Tensor:
+        """Run the retained non-Hopper tower selected during initialization."""
+        batch_size = crops.shape[0]
+        self._vision_input[:batch_size].copy_(crops)
+        if batch_size in self._vision_graphs:
+            self._vision_graphs[batch_size].replay()
+        else:
+            out = vision_encoder(
+                self._vision_input[:batch_size],
+                self.model.vision,
+                self.config.vision,
+            )
+            self._vision_output[:batch_size].copy_(out)
+        return self._vision_output[:batch_size]
 
     def _capture_vision_graphs(self) -> None:
         """Capture CUDA graphs for vision encoder at all crop counts."""
