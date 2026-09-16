@@ -34,6 +34,7 @@ class ParakeetEncoderGraph:
         model: ParakeetTdt,
         *,
         enabled: bool,
+        max_batch: int,
         device: torch.device,
         stream: torch.cuda.Stream | None,
         buckets: tuple[int, ...] = _ENCODER_GRAPH_BUCKETS,
@@ -42,12 +43,15 @@ class ParakeetEncoderGraph:
         self._model = model
         if stream is None:
             stream = make_stream(device)
+        # Retain every batch/bucket graph until shutdown: evicting one can free
+        # cuBLAS workspace still used by other graphs on the same stream.
+        # https://github.com/pytorch/pytorch/issues/193402
         self._graphs = FixedShapeSinglePassGraph(
             enabled=enabled and bool(self.buckets),
             device=device,
             stream=stream,
             run_forward=model.encode_subsampled,
-            max_entries=max(1, len(self.buckets)),
+            max_entries=max(1, max_batch * len(self.buckets)),
         )
         # The outer session keeps stream ordering and the output lease through
         # the caller's decoding; the inner cache reuses its output buffers.
