@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
-
-from kestrel.device import stream_context
 
 from .generated_decode import GeneratedDecodeTeamMember
 
@@ -91,7 +88,7 @@ def _collective_pairs(descriptor: dict[str, Any]) -> tuple[tuple[dict, dict], ..
 
 
 class GeneratedDecodeRankTeam:
-    """Bind and launch one BS1 decode program on a local CUDA device team."""
+    """Bind one BS1 slot and queue rank launches on a local CUDA team."""
 
     def __init__(self, runtimes: Sequence[Any]) -> None:
         runtimes = tuple(runtimes)
@@ -149,7 +146,10 @@ class GeneratedDecodeRankTeam:
         self._allocations = []
         self._bound_runtimes = []
         self._closed = False
-        self._launch_pool = None
+        self._bound_team = None
+        self._bound_members = ()
+        self._bound_slots = ()
+        self._step = 0
         rank_inputs = [dict() for _ in runtimes]
         try:
             for local, multicast in _collective_pairs(programs[0].descriptor):
@@ -163,45 +163,76 @@ class GeneratedDecodeRankTeam:
             for runtime, inputs in zip(runtimes, rank_inputs):
                 runtime.generated_decode.bind_team(inputs)
                 self._bound_runtimes.append(runtime)
-            self._launch_pool = ThreadPoolExecutor(max_workers=len(runtimes))
+            from kestrel_kernels.generated_decode import BoundGeneratedDecodeRankTeam
+
+            slots = tuple(runtime.decode_slots[0] for runtime in runtimes)
+            members = tuple(
+                runtime.generated_decode.team_slot_launch(slot, 1)[0]
+                for runtime, slot in zip(runtimes, slots)
+            )
+
+            def stage(rank: int, _step: int) -> None:
+                runtimes[rank].generated_decode.prepare_team_inputs(slots[rank], 1)
+
+            self._bound_team = BoundGeneratedDecodeRankTeam(
+                self.devices, members, stage_step=stage,
+            )
+            self._bound_members = members
+            self._bound_slots = slots
         except BaseException:
             self.close()
             raise
 
-    def run_one(self, *, slot_id: int = 0) -> Any:
-        """Launch prepared slots on every rank and return rank zero's slot."""
+    @torch.inference_mode()
+    def queue_one(self, *, slot_id: int = 0) -> Any:
+        """Queue slot0 on every rank; call wait before reading its outputs."""
 
         if self._closed:
             raise RuntimeError("generated decode rank team is closed")
-        if type(slot_id) is not int or slot_id < 0:
-            raise ValueError("generated decode rank team needs a valid slot ID")
-        slots = tuple(runtime.decode_slots[slot_id] for runtime in self.runtimes)
-
-        def launch(runtime, slot):
-            with torch.cuda.device(runtime.device):
-                with stream_context(slot.compute_stream):
-                    runtime.decode_with_slot(slot, 1)
-
-        futures = tuple(
-            self._launch_pool.submit(launch, runtime, slot)
+        if type(slot_id) is not int or slot_id != 0:
+            raise ValueError("generated decode rank team is bound to slot0")
+        slots = tuple(runtime.decode_slots[0] for runtime in self.runtimes)
+        if any(
+            slot is not bound_slot
+            for slot, bound_slot in zip(
+                slots, self._bound_slots, strict=True,
+            )
+        ):
+            raise RuntimeError("generated decode team slot object changed after binding")
+        launches = tuple(
+            runtime.generated_decode.team_slot_launch(slot, 1)
             for runtime, slot in zip(self.runtimes, slots)
         )
-        for future in futures:
-            future.result()
-        for device in self.devices:
-            torch.cuda.synchronize(device)
+        if (
+            any(
+                bound is not member
+                for (bound, _), member in zip(
+                    launches, self._bound_members, strict=True,
+                )
+            )
+            or any(scalars != launches[0][1] for _, scalars in launches[1:])
+        ):
+            raise RuntimeError("generated decode ranks changed slot program or extents")
+        self._bound_team.launch_step(self._step, **launches[0][1])
+        self._step += 1
         return slots[0]
+
+    def wait(self) -> None:
+        if self._closed:
+            raise RuntimeError("generated decode rank team is closed")
+        self._bound_team.wait()
 
     def close(self) -> None:
         if self._closed:
             return
-        if self._launch_pool is not None:
-            self._launch_pool.shutdown(wait=True)
-        for device in self.devices:
-            torch.cuda.synchronize(device)
+        if self._bound_team is not None:
+            self._bound_team.close()
         for runtime in reversed(self._bound_runtimes):
             runtime.generated_decode.unbind_team()
         self._bound_runtimes.clear()
+        self._bound_members = ()
+        self._bound_slots = ()
+        self._bound_team = None
         first_error = None
         for allocation in reversed(self._allocations):
             try:

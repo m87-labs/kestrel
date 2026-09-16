@@ -1091,6 +1091,58 @@ class GeneratedDecode:
             raise RuntimeError(f"generated decode team has no batch={batch_size} program")
         return selected[1]
 
+    def team_slot_launch(
+        self, slot: Any, batch_size: int = 1,
+    ) -> tuple[Any, dict[str, int]]:
+        """Return the owned slot invocation and its current launch scalars."""
+
+        if self._spec.team_member is None or not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
+        selected = self._program_for(batch_size, extents)
+        if selected is None:
+            raise RuntimeError(
+                f"generated decode team has no batch={batch_size} program"
+            )
+        program_index, _program = selected
+        bound = self._slots[(int(slot.slot_id), program_index)]
+        bound_stream = bound.invocation.stream
+        slot_stream = slot.compute_stream
+        if bound_stream is not slot_stream:
+            bound_address = getattr(bound_stream, "cuda_stream", bound_stream)
+            slot_address = getattr(slot_stream, "cuda_stream", slot_stream)
+            bound_device = getattr(bound_stream, "device", None)
+            slot_device = getattr(slot_stream, "device", None)
+            if (
+                type(bound_address) is not int
+                or type(slot_address) is not int
+                or bound_address != slot_address
+                or bound_device is None
+                or slot_device is None
+                or torch.device(bound_device) != torch.device(slot_device)
+            ):
+                raise RuntimeError(
+                    "generated decode team slot and bound launch use different streams"
+                )
+        missing = bound.required_launch_extents - extents.keys()
+        if missing:
+            raise RuntimeError(
+                f"generated {self._spec.label} launch misses {sorted(missing)}"
+            )
+        return bound.invocation, {
+            name: value for name, value in extents.items()
+            if name in bound.scalar_names
+        }
+
+    @torch.inference_mode()
+    def prepare_team_inputs(self, slot: Any, batch_size: int = 1) -> None:
+        """Run model input preparations on the selected rank compute stream."""
+
+        if self._spec.team_member is None or not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
+        for step in self._input_preparation_plan:
+            self._spec.preparation_callbacks[step.name](slot, int(batch_size))
+
     def _program_for(
         self,
         batch_size: int,
@@ -1138,6 +1190,8 @@ class GeneratedDecode:
     def static_launcher(self, slot: Any, batch_size: int) -> Callable[[], None]:
         """Bind a repeated launch whose inputs and extents stay fixed."""
 
+        if self._spec.team_member is not None:
+            raise RuntimeError("distributed generated decode requires a rank team")
         if not self._team_bound:
             raise RuntimeError("generated decode team is not bound")
         if self._input_preparation_plan:
@@ -1165,6 +1219,8 @@ class GeneratedDecode:
 
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
+        if self._spec.team_member is not None:
+            raise RuntimeError("distributed generated decode requires a rank team")
         if not self._team_bound:
             raise RuntimeError("generated decode team is not bound")
         extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
