@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 
 import pytest
@@ -52,7 +53,7 @@ def _features(valid_frames, *, batch=1, device="cpu", dtype=torch.float32):
 def test_encoder_rejects_invalid_buckets(buckets) -> None:
     with pytest.raises(ValueError, match="encoder graph buckets"):
         ParakeetEncoderGraph(
-            _model(), enabled=False, device=torch.device("cpu"), stream=None,
+            _model(), enabled=False, max_batch=8, device=torch.device("cpu"), stream=None,
             buckets=buckets,
         )
 
@@ -77,7 +78,8 @@ def test_padding_after_subsampling_preserves_boundary_outputs() -> None:
 def test_disabled_encoder_keeps_original_shapes(enabled, buckets) -> None:
     model = _model()
     session = ParakeetEncoderGraph(
-        model, enabled=enabled, device=torch.device("cpu"), stream=None, buckets=buckets
+        model, enabled=enabled, max_batch=8, device=torch.device("cpu"), stream=None,
+        buckets=buckets,
     )
     features, mask = _features(129)
     with session.launch(features, mask) as (actual, valid):
@@ -105,6 +107,7 @@ def test_bucket_routing_preserves_lengths_and_bypasses_outliers(
     session = ParakeetEncoderGraph(
         model,
         enabled=False,
+        max_batch=8,
         device=torch.device("cpu"),
         stream=None,
         **({} if buckets is None else {"buckets": buckets}),
@@ -149,14 +152,14 @@ def test_cuda_buckets_replay_without_capturing_outliers(buckets) -> None:
 
     model.encode_subsampled = counted
     session = ParakeetEncoderGraph(
-        model, enabled=True, device=device, stream=stream,
+        model, enabled=True, max_batch=8, device=device, stream=stream,
         **({} if buckets is None else {"buckets": buckets}),
     )
     buckets = session.buckets
     try:
         lengths = [size * 8 - 1 for size in buckets]
         lengths += [129, 137, 383, 384, 639, 640, 1023, 1024, 1791, 1792, 2000]
-        for batch in (1, 8, 1):
+        for batch in (*range(1, 9), 1):
             for length in lengths:
                 features, mask = _features(
                     length, batch=batch, device=device, dtype=torch.bfloat16
@@ -169,10 +172,9 @@ def test_cuda_buckets_replay_without_capturing_outliers(buckets) -> None:
                     torch.testing.assert_close(
                         actual[valid], expected[valid], atol=0.02, rtol=0.02
                     )
-                assert len(session._graphs._entries) <= len(buckets)
-        assert len(session._graphs._entries) == len(buckets)
-        assert len(calls) == 6 * len(buckets)
-        assert {shape[1] for shape in calls} == set(buckets)
+        assert Counter(shape[:2] for shape in calls) == {
+            (batch, bucket): 2 for batch in range(1, 9) for bucket in buckets
+        }
     finally:
         session.shutdown()
 
@@ -190,6 +192,7 @@ def test_cuda_bucket_waits_for_producer_and_leases_outputs_to_consumers(
     session = ParakeetEncoderGraph(
         model,
         enabled=True,
+        max_batch=8,
         device=device,
         stream=stream if provide_stream else None,
         buckets=(48, 80),

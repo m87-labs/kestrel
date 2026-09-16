@@ -167,6 +167,7 @@ class ParakeetTdtRuntime:
             )
         self._encoder_graph = ParakeetEncoderGraph(
             self.model,
+            max_batch=self.batch_capacity,
             enabled=(
                 bool(getattr(cfg, "enable_cuda_graphs", True))
                 and self.device.type == "cuda"
