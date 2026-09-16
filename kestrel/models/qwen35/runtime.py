@@ -18,6 +18,7 @@ from kestrel_kernels import get_runtime
 
 from kestrel.kv_cache import KVMemoryPool, PageTable, allocate_paged_kv_layers
 from kestrel.runtime.decode_slot import DecodeSlot, create_decode_slot
+from kestrel.runtime.generated_decode import GeneratedDecodeTeamMember
 from kestrel.runtime.paged_resources import bound_kv_cache_pages
 from kestrel.runtime.tokenizer import load_tokenizer
 from kestrel.runtime.preprocessing import (
@@ -244,10 +245,12 @@ class Qwen35Runtime(UncachedPagedRuntime):
         max_lora_rank: Optional[int] = None,
         kv_pool: KVMemoryPool,
         compute_stream: torch.cuda.Stream | None = None,
+        generated_decode_team_member: GeneratedDecodeTeamMember | None = None,
     ) -> None:
         from kestrel.runtime import ExecutionShape
 
         self._cfg = cfg
+        self._generated_decode_team_member = generated_decode_team_member
         self.execution_shape = ExecutionShape.AUTOREGRESSIVE
         # The runtime protocol requires an explicit speculative capability.
         self.spec = None
@@ -489,6 +492,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                     layer_prefix=_WEIGHT_LAYER_PREFIX,
                     required_batch_sizes=range(1, self.max_batch_size + 1),
                     required=True,
+                    team_member=self._generated_decode_team_member,
                 )
             )
 
@@ -504,6 +508,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
                         required_batch_sizes=range(
                             1, self.max_batch_size + 1
                         ),
+                        team_member=self._generated_decode_team_member,
                     )
                 )
 

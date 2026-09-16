@@ -82,6 +82,7 @@ def _generated_decode_spec(runtime: Any) -> GeneratedDecodeSpec:
             "gather_rope_deltas": runtime._gather_decode_rope_deltas,
             "prepare_position_ids": runtime._prepare_decode_position_ids,
         },
+        team_member=runtime._generated_decode_team_member,
     )
 
 

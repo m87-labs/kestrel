@@ -119,6 +119,29 @@ class GeneratedDecodeSpec:
     preparation_callbacks: Mapping[str, Callable[[Any, int], None]] = field(
         default_factory=dict
     )
+    team_member: "GeneratedDecodeTeamMember | None" = None
+
+
+@dataclass(frozen=True)
+class GeneratedDecodeTeamMember:
+    """One local CUDA rank and the compiler topology it must bind."""
+
+    devices: tuple[int, ...]
+    rank: int
+    topology: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "devices", tuple(self.devices))
+        if (
+            len(self.devices) <= 1
+            or len(set(self.devices)) != len(self.devices)
+            or any(type(device) is not int or device < 0 for device in self.devices)
+            or type(self.rank) is not int
+            or not 0 <= self.rank < len(self.devices)
+            or type(self.topology) is not str
+            or not self.topology
+        ):
+            raise ValueError("generated decode team member is malformed")
 
 
 @dataclass(frozen=True)
@@ -145,6 +168,16 @@ class _GeneratedDecodePlan:
 class _BoundInvocation:
     invocation: Any
     repeated_dynamic_launch: Callable[..., Any]
+    scalar_names: frozenset[str]
+    required_launch_extents: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _PendingSlotBinding:
+    program: Any
+    inputs: Mapping[str, Any]
+    extents: Mapping[str, int]
+    stream: Any
     scalar_names: frozenset[str]
     required_launch_extents: frozenset[str]
 
@@ -378,6 +411,7 @@ def generated_weight_programs_for_loading(
     layer_prefix: str,
     required_batch_sizes: Sequence[int],
     required: bool,
+    team_member: GeneratedDecodeTeamMember | None = None,
 ) -> tuple[Any, ...]:
     """Resolve the exact load-time program set or fail soft when optional."""
 
@@ -392,12 +426,15 @@ def generated_weight_programs_for_loading(
         return ()
 
     properties = torch.cuda.get_device_properties(runtime.device)
-    programs = tuple(generated_runtime.resolve_compatible_programs(
-        model,
-        layer_prefix=layer_prefix,
-        arch=f"sm{properties.major}{properties.minor}",
-        device_sms=int(properties.multi_processor_count),
-    ))
+    programs = tuple(
+        program for program in generated_runtime.resolve_compatible_programs(
+            model,
+            layer_prefix=layer_prefix,
+            arch=f"sm{properties.major}{properties.minor}",
+            device_sms=int(properties.multi_processor_count),
+        )
+        if _program_matches_team(program, team_member)
+    )
     missing = [
         int(batch_size)
         for batch_size in required_batch_sizes
@@ -441,6 +478,7 @@ def prepare_generated_weight_storage_for_loading(
     layer_prefix: str,
     required_batch_sizes: Sequence[int],
     required: bool,
+    team_member: GeneratedDecodeTeamMember | None = None,
 ) -> Any | None:
     """Bind checkpoint targets into the selected generated program's final slabs."""
 
@@ -451,6 +489,7 @@ def prepare_generated_weight_storage_for_loading(
         layer_prefix=layer_prefix,
         required_batch_sizes=required_batch_sizes,
         required=required,
+        team_member=team_member,
     )
     if not selected:
         return None
@@ -473,6 +512,7 @@ def finalize_generated_weight_storage_after_loading(
     label: str,
     layer_prefix: str,
     required_batch_sizes: Sequence[int],
+    team_member: GeneratedDecodeTeamMember | None = None,
 ) -> Any:
     """Finalize retained recipes against the exact selected weight contract."""
 
@@ -483,6 +523,7 @@ def finalize_generated_weight_storage_after_loading(
         layer_prefix=layer_prefix,
         required_batch_sizes=required_batch_sizes,
         required=True,
+        team_member=team_member,
     )
     generated_runtime = _generated_weight_runtime(label=label, required=True)
     assert generated_runtime is not None
@@ -590,6 +631,22 @@ def materialize_remaining_meta_tensors(
             module._buffers[name] = replacement
 
 
+def _program_matches_team(
+    program: Any, member: GeneratedDecodeTeamMember | None,
+) -> bool:
+    plan = program.descriptor["device_program"].get("distribution_plan", {})
+    world_size = plan.get("world_size", 1)
+    if type(world_size) is not int or world_size <= 0:
+        raise RuntimeError("generated decode program has malformed world size")
+    if member is None:
+        return world_size == 1
+    return (
+        world_size == len(member.devices)
+        and plan.get("strategy") == "tensor_parallel"
+        and plan.get("routed_expert_topology") == member.topology
+    )
+
+
 class GeneratedDecode:
     """Select bundled capacities and bind them to one serving runtime."""
 
@@ -617,14 +674,20 @@ class GeneratedDecode:
         weight_sources = getattr(spec, "weight_sources", None)
         if weight_sources is not None:
             resolution_options["weight_sources"] = weight_sources
+        member = spec.team_member
+        if member is not None and runtime.device != torch.device(
+            "cuda", member.devices[member.rank]
+        ):
+            raise ValueError("generated decode team rank and runtime device disagree")
         return tuple(
-            resolve_compatible_programs(
+            program for program in resolve_compatible_programs(
                 spec.weight_root,
                 layer_prefix=spec.weight_layer_prefix,
                 arch=f"sm{properties.major}{properties.minor}",
                 device_sms=int(properties.multi_processor_count),
                 **resolution_options,
             )
+            if _program_matches_team(program, member)
         )
 
     @classmethod
@@ -809,7 +872,6 @@ class GeneratedDecode:
         )
 
         from kestrel_kernels.generated_decode import (
-            assemble_bindings,
             derive_runtime_extents,
             materialize_weights,
         )
@@ -877,6 +939,9 @@ class GeneratedDecode:
         ambient_stream.wait_event(weights_ready)
 
         self._slots = {}
+        self._pending_slots = {}
+        self._team_bound = spec.team_member is None
+        self._runtime_device = runtime.device
         plans = {}
         for slot in runtime.decode_slots:
             for program_index, program in enumerate(self._programs):
@@ -923,14 +988,6 @@ class GeneratedDecode:
                 extents.update(launch_extents)
                 for name, minimum in program.runtime_extent_minimums.items():
                     extents[name] = max(int(extents.get(name, minimum)), int(minimum))
-                bindings = assemble_bindings(
-                    program.descriptor,
-                    weights=self.weight_storage.buffers,
-                    runtime_inputs=inputs,
-                    runtime_extents=extents,
-                    stream=slot.compute_stream,
-                    device=runtime.device,
-                )
                 scalar_names = frozenset(
                     item["name"]
                     for item in program.descriptor["device_program"]["argument_plan"][
@@ -944,13 +1001,16 @@ class GeneratedDecode:
                         f"generated {spec.label} has unknown launch extents "
                         f"{sorted(unknown)}"
                     )
-                invocation = program.bind(bindings)
-                self._slots[(int(slot.slot_id), program_index)] = _BoundInvocation(
-                    invocation,
-                    invocation.prepare_repeated_dynamic_launch(),
+                pending = _PendingSlotBinding(
+                    program, inputs, extents, slot.compute_stream,
                     scalar_names,
                     frozenset(launch_extents),
                 )
+                key = (int(slot.slot_id), program_index)
+                if spec.team_member is None:
+                    self._slots[key] = self._bind_slot(pending)
+                else:
+                    self._pending_slots[key] = pending
         if len(plans) != 1:
             raise RuntimeError(
                 f"generated {spec.label} capacities disagree on input preparation"
@@ -964,6 +1024,124 @@ class GeneratedDecode:
                 f"generated {spec.label} has no preparation callbacks for "
                 f"{sorted(missing)}"
             )
+
+    def _bind_slot(
+        self,
+        pending: _PendingSlotBinding,
+        collective_inputs: Mapping[str, Any] | None = None,
+    ) -> _BoundInvocation:
+        from kestrel_kernels.generated_decode import assemble_bindings
+
+        options = {}
+        member = self._spec.team_member
+        if member is not None:
+            if collective_inputs is None:
+                raise RuntimeError("generated decode team has no collective buffers")
+            options = {
+                "device_rank": member.rank,
+                "collective_inputs": collective_inputs,
+            }
+        bindings = assemble_bindings(
+            pending.program.descriptor,
+            weights=self.weight_storage.buffers,
+            runtime_inputs=pending.inputs,
+            runtime_extents=pending.extents,
+            stream=pending.stream,
+            device=self._runtime_device,
+            **options,
+        )
+        invocation = pending.program.bind(bindings)
+        return _BoundInvocation(
+            invocation,
+            invocation.prepare_repeated_dynamic_launch(),
+            pending.scalar_names,
+            pending.required_launch_extents,
+        )
+
+    def bind_team(self, collective_inputs: Mapping[str, Any]) -> None:
+        """Complete the deferred bindings after the team owns collective memory."""
+
+        if (
+            self._spec.team_member is None
+            or not self._pending_slots
+            or self._team_bound
+            or self._slots
+        ):
+            raise RuntimeError("generated decode has no pending team bindings")
+        bound = {
+            key: self._bind_slot(pending, collective_inputs)
+            for key, pending in self._pending_slots.items()
+        }
+        self._slots = bound
+        self._team_bound = True
+
+    def unbind_team(self) -> None:
+        """Drop every invocation before its collective allocations are freed."""
+
+        if self._spec.team_member is None:
+            raise RuntimeError("generated decode is not a team member")
+        self._slots.clear()
+        self._team_bound = False
+
+    def team_program(self, batch_size: int = 1) -> Any:
+        if self._spec.team_member is None:
+            raise RuntimeError("generated decode is not a team member")
+        selected = self._program_for(batch_size)
+        if selected is None:
+            raise RuntimeError(f"generated decode team has no batch={batch_size} program")
+        return selected[1]
+
+    def team_slot_launch(
+        self, slot: Any, batch_size: int = 1,
+    ) -> tuple[Any, dict[str, int]]:
+        """Return the owned slot invocation and its current launch scalars."""
+
+        if self._spec.team_member is None or not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
+        extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
+        selected = self._program_for(batch_size, extents)
+        if selected is None:
+            raise RuntimeError(
+                f"generated decode team has no batch={batch_size} program"
+            )
+        program_index, _program = selected
+        bound = self._slots[(int(slot.slot_id), program_index)]
+        bound_stream = bound.invocation.stream
+        slot_stream = slot.compute_stream
+        if bound_stream is not slot_stream:
+            bound_address = getattr(bound_stream, "cuda_stream", bound_stream)
+            slot_address = getattr(slot_stream, "cuda_stream", slot_stream)
+            bound_device = getattr(bound_stream, "device", None)
+            slot_device = getattr(slot_stream, "device", None)
+            if (
+                type(bound_address) is not int
+                or type(slot_address) is not int
+                or bound_address != slot_address
+                or bound_device is None
+                or slot_device is None
+                or torch.device(bound_device) != torch.device(slot_device)
+            ):
+                raise RuntimeError(
+                    "generated decode team slot and bound launch use different streams"
+                )
+        missing = bound.required_launch_extents - extents.keys()
+        if missing:
+            raise RuntimeError(
+                f"generated {self._spec.label} launch misses {sorted(missing)}"
+            )
+        return bound.invocation, {
+            name: value for name, value in extents.items()
+            if name in bound.scalar_names
+        }
+
+    @torch.inference_mode()
+    def prepare_team_inputs(self, slot: Any, batch_size: int = 1) -> None:
+        """Run model input preparations on the selected rank compute stream."""
+
+        if self._spec.team_member is None or not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
+        for step in self._input_preparation_plan:
+            self._spec.preparation_callbacks[step.name](slot, int(batch_size))
 
     def _program_for(
         self,
@@ -1012,6 +1190,10 @@ class GeneratedDecode:
     def static_launcher(self, slot: Any, batch_size: int) -> Callable[[], None]:
         """Bind a repeated launch whose inputs and extents stay fixed."""
 
+        if self._spec.team_member is not None:
+            raise RuntimeError("distributed generated decode requires a rank team")
+        if not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
         if self._input_preparation_plan:
             raise ValueError(
                 "static generated decode cannot run per-step input preparations"
@@ -1037,6 +1219,10 @@ class GeneratedDecode:
 
     @torch.inference_mode()
     def run(self, slot: Any, batch_size: int = 1) -> None:
+        if self._spec.team_member is not None:
+            raise RuntimeError("distributed generated decode requires a rank team")
+        if not self._team_bound:
+            raise RuntimeError("generated decode team is not bound")
         extents = dict(self._spec.bindings.launch_extents(slot, int(batch_size)))
         selected = self._program_for(batch_size, extents)
         if selected is None:
@@ -1064,6 +1250,7 @@ __all__ = [
     "GeneratedDecode",
     "GeneratedDecodeBindings",
     "GeneratedDecodeSpec",
+    "GeneratedDecodeTeamMember",
     "PagedDecodeBindings",
     "finalize_generated_weight_storage_after_loading",
     "generated_weight_programs_for_loading",
