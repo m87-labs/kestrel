@@ -30,6 +30,10 @@ def captured():
         qkv = torch.zeros(1, 16, 8)
         fail = False
 
+        @property
+        def replay_geometry(self):
+            return (id(self),)
+
         def replay_into(self, layer, length, cu, topology):
             layer.recurrent_states.fill_(length)
             if self.fail:
@@ -126,13 +130,13 @@ def test_captured_indices_survive_caller_metadata_reuse():
             0, kwargs["final_state_indices"], kwargs["initial_state"])
 
     module = SimpleNamespace(
-        head_k_dim=4, conv_kernel_size=4, A_log=None, dt_bias=None,
+        head_k_dim=4, head_v_dim=4, conv_kernel_size=4, A_log=None, dt_bias=None,
         allocate_packed_gdn_prefill_workspace=None,
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         packed_gated_delta_rule_prefill=native)
     for index in range(2):
         branch._prefix_records[index] = _RecurrentPrefixRecord(
-            module, torch.zeros(1, 16, 8), torch.zeros(1, 16, 2),
+            module, torch.zeros(1, 16, 8 + index * 8), torch.zeros(1, 16, 2),
             torch.zeros(1, 16, 2), torch.zeros(1, 8, 19),
             torch.full((1, 2, 4, 4), 7., dtype=torch.bfloat16), indices)
     indices.zero_()
@@ -141,3 +145,63 @@ def test_captured_indices_survive_caller_metadata_reuse():
         assert torch.all(old.recurrent_states == 1)
         assert torch.all(layer.recurrent_states[0] == 1)
         assert torch.all(layer.recurrent_states[1] == 7)
+
+
+@pytest.mark.parametrize("value_dim", [4, 6])
+def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value_dim):
+    import kestrel_kernels
+    from kestrel.models.qwen35.qwen_model import _RecurrentPrefixRecord
+
+    source, branch = captured()
+    for cache in (source, branch):
+        for layer in cache.layers:
+            layer.recurrent_states = torch.ones(2, 2, value_dim, 4, dtype=torch.bfloat16)
+    prepared, recurrences = [], []
+    fail = True
+
+    def prepare(qkv, a, b, A_log, dt_bias, **buffers):
+        prepared.append((A_log, dt_bias))
+        for value in buffers.values():
+            value.fill_(A_log)
+
+    def recurrence(q, k, v, g, beta, cu, **kwargs):
+        recurrences.append(kwargs["sequence_lengths"])
+        assert kwargs["sequence_lengths"] == (3, 3)
+        assert torch.all(q[:, :3] == 2) and torch.all(q[:, 3:] == 5)
+        assert beta.dtype == torch.float32
+        assert v.shape == (1, 6, 2, value_dim)
+        kwargs["final_state"].copy_(kwargs["initial_state"])
+        if fail:
+            raise RuntimeError("injected grouped recurrence failure")
+
+    def topology(**kwargs):
+        lengths = kwargs["sequence_lengths"]
+        return torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]), object()
+
+    monkeypatch.setattr(kestrel_kernels, "get_runtime", lambda: SimpleNamespace(
+        gated_delta=SimpleNamespace(bind_packed_prefill_topology=topology,
+            packed_prefill_prepare=prepare,
+            packed_recurrent_gated_delta_rule_prefill=recurrence)))
+    indices = torch.tensor([1])
+    for index, parameter in enumerate((2, 5)):
+        module = SimpleNamespace(head_k_dim=4, head_v_dim=value_dim, conv_kernel_size=4,
+                                 A_log=parameter, dt_bias=parameter + 1)
+        branch._prefix_records[index] = _RecurrentPrefixRecord(
+            module, torch.zeros(1, 16, 8 + 2 * value_dim), torch.zeros(1, 16, 2),
+            torch.zeros(1, 16, 2), torch.full((1, 8, 19), parameter),
+            torch.full((1, 2, value_dim, 4), parameter, dtype=torch.bfloat16), indices)
+    indices.zero_()
+    with pytest.raises(RuntimeError, match="grouped recurrence failure"):
+        branch.commit_recurrent_prefix(3)
+    assert branch._prefix_source is source and len(branch._prefix_records) == 2
+    assert all(torch.all(layer.recurrent_states == 1) for layer in source.layers)
+    fail = False
+    prepared.clear()
+    recurrences.clear()
+    result = branch.commit_recurrent_prefix(3)
+    assert prepared == [(2, 3), (5, 6)] and recurrences == [(3, 3)]
+    for old, layer, parameter in zip(source.layers, result.layers, (2, 5)):
+        assert torch.all(old.recurrent_states == 1)
+        assert torch.all(layer.recurrent_states[0] == 1)
+        assert torch.all(layer.recurrent_states[1] == parameter)
+        assert torch.all(layer.conv_states == parameter)

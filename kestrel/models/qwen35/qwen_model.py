@@ -70,6 +70,62 @@ class _RecurrentPrefixRecord:
         # Scheduler metadata may be reused before the accepted prefix commits.
         object.__setattr__(self, "state_indices", self.state_indices.clone())
 
+    @property
+    def replay_geometry(self) -> tuple:
+        return (self.qkv.device, self.qkv.dtype, self.qkv.shape[-1],
+                self.a.shape[-1], self.initial_state.dtype,
+                tuple(self.initial_state.shape[1:]), self.module.head_k_dim,
+                self.module.head_v_dim)
+
+    @staticmethod
+    def replay_group(records: list[tuple[_RecurrentPrefixRecord, LinearAttentionState]],
+                     length: int) -> None:
+        """Batch independent recurrences after layer-specific gate preparation."""
+        from kestrel_kernels import get_runtime
+
+        runtime = get_runtime().gated_delta
+        first = records[0][0]
+        count = len(records)
+        if any(record.replay_geometry != first.replay_geometry for record, _ in records):
+            raise ValueError("recurrent replay group has incompatible geometry")
+        dim = first.module.head_k_dim
+        value_dim = first.module.head_v_dim
+        nv = first.initial_state.shape[1]
+        if tuple(first.initial_state.shape[2:]) != (value_dim, dim):
+            raise ValueError("recurrent replay state head geometry does not match module")
+        qk_width = first.qkv.shape[-1] - nv * value_dim
+        if qk_width <= 0 or qk_width % (2 * dim):
+            raise ValueError("recurrent replay mixed projection width is invalid")
+        nk = qk_width // (2 * dim)
+        device = first.qkv.device
+        q = torch.empty((1, count * length, nk, dim), device=device, dtype=first.qkv.dtype)
+        k = torch.empty_like(q)
+        v = torch.empty((1, count * length, nv, value_dim), device=device, dtype=first.qkv.dtype)
+        g = torch.empty((1, count * length, nv), device=device, dtype=torch.float32)
+        beta = torch.empty_like(g)
+        for index, (record, _) in enumerate(records):
+            active = slice(index * length, (index + 1) * length)
+            runtime.packed_prefill_prepare(
+                record.qkv[:, :length].contiguous(), record.a[:, :length].contiguous(),
+                record.b[:, :length].contiguous(), record.module.A_log, record.module.dt_bias,
+                query=q[:, active], key=k[:, active], value=v[:, active],
+                g=g[:, active], beta=beta[:, active])
+        initial = torch.cat([record.initial_state for record, _ in records], dim=0)
+        final = torch.empty_like(initial)
+        indices = torch.arange(count, device=device, dtype=torch.int64)
+        lengths = (length,) * count
+        cu, topology = runtime.bind_packed_prefill_topology(
+            sequence_lengths=lengths, device=device)
+        runtime.packed_recurrent_gated_delta_rule_prefill(
+            q, k, v, g, beta, cu, initial_state=initial, final_state=final,
+            final_state_indices=indices, final_state_indices_allocator_owned=True,
+            sequence_lengths=lengths, topology_token=topology)
+        for index, (record, layer) in enumerate(records):
+            layer.recurrent_states.index_copy_(0, record.state_indices, final[index:index+1])
+            layer.conv_states.copy_(record.conv_input[
+                ..., length-1:length-1+record.module.conv_kernel_size])
+            layer.has_previous_state = True
+
     def replay_into(self, layer: LinearAttentionState, length: int,
                     cu: torch.Tensor, topology: object) -> None:
         module = self.module

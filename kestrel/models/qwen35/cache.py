@@ -140,11 +140,17 @@ class Qwen35InferenceCache:
             from kestrel_kernels import get_runtime
 
             result = source.fork_recurrent_state()
-            record = next(iter(self._prefix_records.values()))
-            cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
-                sequence_lengths=(length,), device=record.qkv.device)
+            groups = {}
             for index, record in self._prefix_records.items():
-                record.replay_into(result.layers[index], length, cu, topology)
+                groups.setdefault(record.replay_geometry, []).append((record, result.layers[index]))
+            for group in groups.values():
+                if len(group) == 1:
+                    record, layer = group[0]
+                    cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+                        sequence_lengths=(length,), device=record.qkv.device)
+                    record.replay_into(layer, length, cu, topology)
+                else:
+                    group[0][0].replay_group(group, length)
             result.advance_to(self._prefix_start + length)
         self._prefix_records = {}
         self._prefix_source = None
