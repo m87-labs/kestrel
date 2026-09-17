@@ -17,6 +17,7 @@ _VARIANTS = [
     "Qwen/Qwen3.5-9B",
     "Qwen/Qwen3.5-9B-Base",
     "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-27B-FP8",
     "Qwen/Qwen3.5-35B-A3B",
     "Qwen/Qwen3.5-35B-A3B-Base",
     "Qwen/Qwen3.6-27B",
