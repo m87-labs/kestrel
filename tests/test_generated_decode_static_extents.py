@@ -102,6 +102,7 @@ class _Program:
             "weights": [],
             "carried_state": [],
             "device_program": {
+                "shape_env": {"active_batch": self.capacity},
                 "argument_plan": {"arguments": scalar_arguments},
                 "physical_abi": {"operands": []},
             },
@@ -479,6 +480,32 @@ def test_generated_decode_skips_artifacts_above_runtime_batch_limit(monkeypatch)
         "b4",
         "b4_exact",
     ]
+
+
+def test_static_served_rows_bind_the_padded_physical_tile(monkeypatch):
+    class PaddedProgram(_Program):
+        @property
+        def descriptor(self):
+            descriptor = super().descriptor
+            descriptor["device_program"]["shape_env"]["active_batch"] = 16
+            return descriptor
+
+    capacities = []
+
+    class Bindings(_Bindings):
+        def slot_inputs(self, slot, capacity):
+            capacities.append(capacity)
+            return {}
+
+    program = PaddedProgram("ten_rows", 10, {"active_batch": 10}, [])
+    generated, launches = _build(
+        monkeypatch, (program,), bindings=Bindings(), max_batch_size=10)
+    generated.run(SimpleNamespace(slot_id=0), 10)
+    assert capacities == [16]
+    assert launches == [("ten_rows", {})]
+    plan = runtime_decode._GeneratedDecodePlan(
+        None, None, 10, (program,), (program,))
+    assert plan.slot_capacity == 16
 
 
 def test_generated_decode_plan_reports_selected_physical_slot_capacity(monkeypatch):

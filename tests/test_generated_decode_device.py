@@ -44,7 +44,8 @@ def _program(
         runtime_extent_minimums=runtime_minimums,
         runtime_extent_maximums={},
         identity=repr((capacity, static, runtime_minimums, name, num_ctas)),
-        descriptor={"program": name or f"b{capacity}"},
+        descriptor={"program": name or f"b{capacity}",
+                    "device_program": {"shape_env": {"active_batch": capacity}}},
         name=name,
         num_ctas=num_ctas,
     )

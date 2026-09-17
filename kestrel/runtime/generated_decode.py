@@ -137,7 +137,7 @@ class _GeneratedDecodePlan:
         """Physical rows required by every program this runtime can select."""
 
         return max(
-            (int(program.capacity) for program in self.selectable_programs),
+            (_physical_capacity(program) for program in self.selectable_programs),
             default=0,
         )
 
@@ -148,6 +148,10 @@ class _BoundInvocation:
     repeated_dynamic_launch: Callable[..., Any]
     scalar_names: frozenset[str]
     required_launch_extents: frozenset[str]
+
+
+def _physical_capacity(program: Any) -> int:
+    return int(program.descriptor["device_program"]["shape_env"]["active_batch"])
 
 
 def _active_batch_interval(program: Any) -> tuple[int, int]:
@@ -685,7 +689,7 @@ class GeneratedDecode:
         )
         if not selected:
             return None
-        return max(int(program.capacity) for program in selected)
+        return max(_physical_capacity(program) for program in selected)
 
     @classmethod
     def plan(
@@ -923,11 +927,11 @@ class GeneratedDecode:
         plans = {}
         for slot in runtime.decode_slots:
             for program_index, program in enumerate(self._programs):
-                capacity = program.capacity
+                capacity = _physical_capacity(program)
                 minimum_batch, maximum_batch = _active_batch_interval(program)
                 if minimum_batch > int(runtime.max_batch_size):
                     continue
-                requirements = self.state_requirements_by_capacity[capacity]
+                requirements = self.state_requirements_by_capacity[program.capacity]
                 capacity_inputs = (
                     dict(spec.capacity_inputs(capacity, requirements))
                     if spec.capacity_inputs
