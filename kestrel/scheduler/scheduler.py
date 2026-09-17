@@ -2360,7 +2360,10 @@ class GenerationScheduler:
             due = {
                 id(sequence)
                 for sequence, deadline in zip(running, deadlines, strict=True)
-                if deadline is not None and deadline <= now and sequence.needs_decode()
+                if deadline is not None
+                and deadline <= now
+                and sequence.needs_decode()
+                and (sequence.inflight_refs > 0 or self._can_dispatch(sequence))
             }
             ranked = [
                 sequence

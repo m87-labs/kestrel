@@ -355,11 +355,12 @@ class SkillState:
         self,
         runtime: "AutoregressiveRuntime",
     ) -> Optional[float]:
-        """Return the monotonic deadline for the next streaming update.
+        """Return the next streaming update's deadline on ``time.perf_counter``.
 
         Skills with playback or other real-time output can opt into
-        deadline-ordered decode. ``None`` retains the scheduler's stable FIFO
-        cohort policy.
+        deadline-ordered decode. Runnable or in-flight output already due takes
+        precedence over future deadlines. ``None`` retains the scheduler's
+        stable FIFO cohort policy.
         """
 
         return None

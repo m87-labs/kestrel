@@ -103,7 +103,9 @@ def test_runtime_backpressure_accounts_for_inflight_steps() -> None:
     assert scheduler.schedule_decode_step() is None
     blocked.inflight_refs = 0
     assert scheduler.schedule_decode_step().sequences == [blocked]
-    scheduler.running.remove(blocked)
+    scheduler._hooks = SamplingHooks(
+        can_dispatch=lambda state, *, inflight_steps: state is ready.skill_state
+    )
     assert scheduler.schedule_decode_step().sequences == [ready]
 
 
