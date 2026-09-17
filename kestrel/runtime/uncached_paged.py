@@ -89,7 +89,8 @@ class UncachedPagedRuntime:
         raise NotImplementedError("LoRA adapters are not supported")
 
     def release_adapter_slot(self, slot: int) -> None:
-        raise NotImplementedError("LoRA adapters are not supported")
+        if slot != 0:
+            raise NotImplementedError("LoRA adapters are not supported")
 
     def classify_prefill(
         self,
