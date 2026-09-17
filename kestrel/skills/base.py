@@ -338,6 +338,8 @@ class SkillState:
         Text skills inherit the existing ``pop_stream_delta`` behavior. A
         capability that streams another payload, such as synthesized PCM, can
         override this hook without teaching the scheduler about that modality.
+        Return ``None`` when no update is ready, or an empty mapping to retain
+        a token-only update. The default preserves text skills' per-token stream.
         """
 
         text = self.pop_stream_delta(runtime)
@@ -347,7 +349,7 @@ class SkillState:
             output["text"] = text
         if reasoning:
             output["reasoning"] = reasoning
-        return output or None
+        return output
 
     def next_output_deadline(
         self,

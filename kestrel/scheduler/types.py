@@ -166,9 +166,9 @@ class RequestLifecycle:
         if callback is None:
             return False
         output = self.skill_state.pop_stream_output(runtime)
-        if output is None and token is None:
+        if output is None or (token is None and not output):
             return False
-        payload = output or {}
+        payload = output
         text = payload.get("text", "")
         reasoning = payload.get("reasoning")
         callback(

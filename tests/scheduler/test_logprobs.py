@@ -285,16 +285,15 @@ def test_completed_output_publishes_without_a_second_token_commit() -> None:
     assert isinstance(state, _AudioStreamState)
     state.output = None
     seq.stage_token(SimpleNamespace(), TextToken(10))
+    assert updates == []
     state.output = {"audio": [0.25], "sample_rate": 24_000}
 
     assert seq.publish_stream_output(SimpleNamespace()) is True
     assert seq.publish_stream_output(SimpleNamespace()) is False
-    assert len(updates) == 2
-    assert updates[0].token == TextToken(10)
-    assert updates[0].token_index == 0
-    assert updates[1].token is None
-    assert updates[1].token_index is None
-    assert updates[1].output == {"audio": [0.25], "sample_rate": 24_000}
+    assert len(updates) == 1
+    assert updates[0].token is None
+    assert updates[0].token_index is None
+    assert updates[0].output == {"audio": [0.25], "sample_rate": 24_000}
 
 
 def test_finalize_drains_remaining_stream_output() -> None:

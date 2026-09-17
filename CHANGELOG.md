@@ -9,7 +9,7 @@ All notable changes since `v0.1.2` are documented in this file.
 - Added the model-bound `synthesize` capability and append-only streaming
   payloads for generated media such as PCM audio, including lossless compound
   capability streams, immediate publication of completed output, explicit
-  cancellation, and shared speech-onset trimming.
+  cancellation, payload-only media updates, and shared speech-onset trimming.
 
 ## 0.7.2 — 2026-09-13
 
