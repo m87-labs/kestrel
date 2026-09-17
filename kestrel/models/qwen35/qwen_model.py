@@ -77,6 +77,7 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+    layer_hidden_states: tuple[torch.Tensor, ...] = ()
 
 
 def _copy_image_features_into_embeddings(
@@ -1192,7 +1193,12 @@ class Qwen3_5TextModel(nn.Module):
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
         gdn_state_indices_allocator_owned: bool = False,
+        capture_layers: tuple[int, ...] = (),
     ) -> _TextModelOutput:
+        if (any(type(index) is not int or not 0 <= index < self.config.num_hidden_layers
+                for index in capture_layers)
+                or tuple(sorted(set(capture_layers))) != capture_layers):
+            raise ValueError("capture_layers must be increasing zero-based layer indices")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1219,6 +1225,7 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         decoder_layers = self.layers[: self.config.num_hidden_layers]
+        captured = []
 
         if decoder_layers:
             state = decoder_layers[0].input_layernorm
@@ -1253,6 +1260,10 @@ class Qwen3_5TextModel(nn.Module):
                 gdn_state_indices=gdn_state_indices,
                 gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
             )
+            if i in capture_layers:
+                # Capture the residual after this layer, before its successor's
+                # normalization; later layers may reuse the residual storage.
+                captured.append(hidden_states.clone())
 
         hidden_states = (
             normalized_hidden_states
@@ -1264,6 +1275,7 @@ class Qwen3_5TextModel(nn.Module):
         return _TextModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            layer_hidden_states=tuple(captured),
         )
 
     def _update_linear_attn_mask(self, attention_mask, past_key_values):
@@ -1341,6 +1353,7 @@ class Qwen3_5Model(nn.Module):
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
         image_token_spans: Sequence[tuple[int, int]] | None = None,
+        capture_layers: tuple[int, ...] = (),
     ) -> _TextModelOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -1381,11 +1394,13 @@ class Qwen3_5Model(nn.Module):
             seq_idx=seq_idx,
             gdn_state_indices=gdn_state_indices,
             gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
+            capture_layers=capture_layers,
         )
 
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            layer_hidden_states=outputs.layer_hidden_states,
         )
 
 
