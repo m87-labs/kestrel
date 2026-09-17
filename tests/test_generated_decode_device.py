@@ -43,6 +43,8 @@ def _program(
         static_extent_bindings=static,
         runtime_extent_minimums=runtime_minimums,
         runtime_extent_maximums={},
+        identity=repr((capacity, static, runtime_minimums, name, num_ctas)),
+        descriptor={"program": name or f"b{capacity}"},
         name=name,
         num_ctas=num_ctas,
     )
@@ -148,7 +150,9 @@ def test_program_selection_partitions_dynamic_runtime_intervals():
 
 
 def test_program_selection_reselects_by_live_runtime_extent():
-    u2 = _program(8, minimum_batch=5, name="u2")
+    # The shared selector rejects equal-priority overlapping artifacts. Use a
+    # wider fallback so the smaller eligible specialization has clear priority.
+    u2 = _program(16, minimum_batch=5, name="u2")
     u4 = _program(
         8,
         minimum_batch=5,
