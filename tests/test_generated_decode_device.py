@@ -42,6 +42,7 @@ def _program(
         capacity=capacity,
         static_extent_bindings=static,
         runtime_extent_minimums=runtime_minimums,
+        runtime_extent_maximums={},
         name=name,
         num_ctas=num_ctas,
     )
