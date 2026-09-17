@@ -717,6 +717,11 @@ class Qwen3_5MLP(nn.Module):
         )
 
     def forward(self, x):
+        if (isinstance(self.gate_up_proj, BlockScaledLinear)
+                and self.gate_up_proj.interleaved_parts == 2
+                and self.gate_up_proj.weight_tail is None
+                and self.gate_up_proj.bias is None):
+            return self.down_proj(self.gate_up_proj(x, gated_activation="silu"))
         gate_up = self.gate_up_proj(x)
         hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
