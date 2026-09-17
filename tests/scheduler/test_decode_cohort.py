@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -96,6 +97,14 @@ def test_runtime_backpressure_accounts_for_inflight_steps() -> None:
 
     assert scheduler.schedule_decode_step().sequences == [ready]
     assert seen == [(blocked.skill_state, 1), (ready.skill_state, 0)]
+
+    blocked.skill_state.deadline = time.perf_counter() - 1
+    ready.skill_state.deadline = time.perf_counter() + 60
+    assert scheduler.schedule_decode_step() is None
+    blocked.inflight_refs = 0
+    assert scheduler.schedule_decode_step().sequences == [blocked]
+    scheduler.running.remove(blocked)
+    assert scheduler.schedule_decode_step().sequences == [ready]
 
 
 def test_stream_deadline_can_promote_a_resident_tail() -> None:

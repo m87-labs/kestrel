@@ -2356,6 +2356,12 @@ class GenerationScheduler:
             for sequence in running
         ]
         if any(deadline is not None for deadline in deadlines):
+            now = time.perf_counter()
+            due = {
+                id(sequence)
+                for sequence, deadline in zip(running, deadlines, strict=True)
+                if deadline is not None and deadline <= now and sequence.needs_decode()
+            }
             ranked = [
                 sequence
                 for sequence, _deadline in sorted(
@@ -2365,7 +2371,10 @@ class GenerationScheduler:
                         item[1] if item[1] is not None else 0.0,
                     ),
                 )
+                if not due or id(sequence) in due
             ]
+            # Do not run future-deadline work ahead of output already due,
+            # including when its producer is awaiting a pending commit.
             reserved = None
             if self.runtime.max_batch_size >= 2:
                 reserved = next(
