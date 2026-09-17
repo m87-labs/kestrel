@@ -27,6 +27,7 @@ from kestrel.ops.rotary import default_inv_freq
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
+from .gdn_state import LinearAttentionState
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
@@ -52,6 +53,39 @@ _kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
+
+
+@dataclass(frozen=True)
+class _RecurrentPrefixRecord:
+    """One verification's immutable projection outputs, never shared workspace."""
+    module: Qwen3_5GatedDeltaNet
+    qkv: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+    conv_input: torch.Tensor
+    initial_state: torch.Tensor
+    state_indices: torch.Tensor
+
+    def __post_init__(self) -> None:
+        # Scheduler metadata may be reused before the accepted prefix commits.
+        object.__setattr__(self, "state_indices", self.state_indices.clone())
+
+    def replay_into(self, layer: LinearAttentionState, length: int,
+                    cu: torch.Tensor, topology: object) -> None:
+        module = self.module
+        qkv, a, b = (value[:, :length].contiguous() for value in (self.qkv, self.a, self.b))
+        workspace = module._prefill_workspace_cache.get(
+            qkv, a, head_dim=module.head_k_dim,
+            allocate=module.allocate_packed_gdn_prefill_workspace)
+        module.packed_gated_delta_rule_prefill(
+            qkv, a, b, module.A_log, module.dt_bias, cu,
+            workspace=workspace, initial_state=self.initial_state,
+            output_final_state=True, sequence_lengths=(length,), topology_token=topology,
+            final_state=layer.recurrent_states, final_state_indices=self.state_indices,
+            final_state_indices_allocator_owned=True)
+        layer.conv_states.copy_(
+            self.conv_input[..., length-1:length-1+module.conv_kernel_size])
+        layer.has_previous_state = True
 
 
 def _text_linear(
@@ -348,6 +382,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             raise RuntimeError("Qwen GDN requires inference cache state")
         batch_size, seq_len, _ = hidden_states.shape
         has_initial_state = cache_params.has_previous_state(self.layer_idx)
+        capture_prefix = cache_params._prefix_source is not None
+        if capture_prefix:
+            if (batch_size != 1 or sequence_lengths is None
+                    or tuple(sequence_lengths) != (seq_len,) or not has_initial_state
+                    or not gdn_state_indices_allocator_owned):
+                raise ValueError("prefix capture requires one committed sequence and owned state indices")
+            if (cache_params.seq_length != cache_params._prefix_start
+                    or self.layer_idx in cache_params._prefix_records):
+                raise RuntimeError("prefix capture permits only one verification forward")
         cu_seqlens_q = cu_seq_lens_q
         supports_packed_gdn = (
             self.supports_packed_gdn(
@@ -440,6 +483,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.
+        conv_input = mixed_qkv
         mixed_qkv = self.causal_conv1d_packed(
             x=mixed_qkv,
             weight=self.conv1d.weight.squeeze(1),
@@ -482,6 +526,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output = self.out_proj(core_attn_out)
         layer.has_previous_state = True
+        if capture_prefix:
+            # Projection/conv outputs own their storage; initial_state is the
+            # compact index_select copy made before writing the speculative pool.
+            cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord(
+                self, mixed_qkv, a, b, conv_input, initial_state, state_indices)
         return output
 
 

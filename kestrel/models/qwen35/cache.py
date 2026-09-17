@@ -13,6 +13,7 @@ from .gdn_state import LinearAttentionState
 
 if TYPE_CHECKING:
     from kestrel.runtime.carried_state import StatePhysicalForm
+    from .qwen_model import _RecurrentPrefixRecord
 
 
 def qwen_paged_kv_specs(
@@ -60,6 +61,9 @@ class Qwen35InferenceCache:
             layers.append(layer)
         self.layers = tuple(layers)
         self.seq_length = 0
+        self._prefix_source: Qwen35InferenceCache | None = None
+        self._prefix_start = 0
+        self._prefix_records: dict[int, _RecurrentPrefixRecord] = {}
 
     def has_previous_state(self, layer_idx: int | None = None) -> bool:
         if layer_idx is None:
@@ -82,7 +86,7 @@ class Qwen35InferenceCache:
     def advance_to(self, seq_length: int) -> None:
         self.seq_length = max(self.seq_length, int(seq_length))
 
-    def fork_recurrent_state(self) -> Qwen35InferenceCache:
+    def fork_recurrent_state(self, *, capture_prefix: bool = False) -> Qwen35InferenceCache:
         """Copy recurrent state while sharing append-only paged K/V storage.
 
         The caller must restrict attention to the branch's sequence length;
@@ -91,6 +95,11 @@ class Qwen35InferenceCache:
         writes the shared suffix; this is not concurrent branch storage.
         """
         branch = copy(self)
+        if capture_prefix and (self._prefix_source is not None or self.seq_length <= 0):
+            raise ValueError("prefix capture requires a committed nonempty cache")
+        branch._prefix_source = self if capture_prefix else None
+        branch._prefix_start = self.seq_length if capture_prefix else 0
+        branch._prefix_records = {}
         layers = []
         for layer in self.layers:
             if isinstance(layer, LinearAttentionState):
@@ -102,6 +111,45 @@ class Qwen35InferenceCache:
             layers.append(layer)
         branch.layers = tuple(layers)
         return branch
+
+    def commit_recurrent_prefix(self, length: int) -> Qwen35InferenceCache:
+        """Commit one verified prefix without repeating its dense projections.
+
+        Records belong to a single serial verification fork. K/V suffix storage
+        is shared, as for ordinary forks; callers retain only committed features
+        and never expose attention positions beyond the returned sequence length.
+        """
+        source = self._prefix_source
+        if source is None:
+            raise RuntimeError("cache has no captured verification prefix")
+        if source.seq_length != self._prefix_start:
+            raise RuntimeError("captured prefix source has advanced")
+        expected = {i for i, layer in enumerate(self.layers)
+                    if isinstance(layer, LinearAttentionState)}
+        if not expected or set(self._prefix_records) != expected:
+            raise RuntimeError("captured prefix is missing recurrent layers")
+        lengths = {record.qkv.shape[1] for record in self._prefix_records.values()}
+        if len(lengths) != 1 or self.seq_length != self._prefix_start + next(iter(lengths)):
+            raise RuntimeError("captured prefix does not match verified sequence length")
+        total = next(iter(lengths))
+        if type(length) is not int or not 1 <= length <= total:
+            raise ValueError("prefix length must be within the verified token range")
+        if length == total:
+            result = self
+        else:
+            from kestrel_kernels import get_runtime
+
+            result = source.fork_recurrent_state()
+            record = next(iter(self._prefix_records.values()))
+            cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=(length,), device=record.qkv.device)
+            for index, record in self._prefix_records.items():
+                record.replay_into(result.layers[index], length, cu, topology)
+            result.advance_to(self._prefix_start + length)
+        self._prefix_records = {}
+        self._prefix_source = None
+        self._prefix_start = 0
+        return result
 
 
 class Qwen35LinearStatePool:
