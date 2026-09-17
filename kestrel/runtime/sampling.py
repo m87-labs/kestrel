@@ -49,6 +49,12 @@ class SamplingHooks:
     10. On commit, scheduler reads CPU-side token ids + logprobs and
        calls ``materialize_tokens(token_ids_cpu, sequences, batch_idx,
        step_handle)`` to build the typed Token list it hands to skills.
+    11. Between forwards, ``advance_auxiliary(force=...,
+        stream_output_ready=...)`` may enqueue one non-overlapping runtime-owned
+        stage. It calls ``stream_output_ready(skill_state)`` when completed work
+        makes an output available independently of token commit.
+        ``can_dispatch(skill_state, inflight_steps=...)`` keeps a producer out
+        of decode while that stage owns its bounded intermediate storage.
     """
 
     # process_logits(logits, *, sequences, batch_idx) -> None
@@ -141,6 +147,26 @@ class SamplingHooks:
     # prepare_decode_inputs(slot, batch_idx, batch_size) -> None
     # Default: no-op. Runtime gathers any aux decode inputs into slot.
     prepare_decode_inputs: Callable[..., None] | None = None
+
+    # Require ordinary temperature/top-p sampling to resolve both CUDA
+    # operations from the packed kernel bundle. Production generated runtimes
+    # use this to prevent silent JIT or torch fallbacks.
+    require_packed_sampling: bool = False
+
+    # can_dispatch(skill_state, *, inflight_steps) -> bool
+    # Optional runtime-owned backpressure. Returning false temporarily keeps
+    # the sequence out of a decode batch; an accompanying auxiliary hook must
+    # eventually make it dispatchable again.
+    can_dispatch: Callable[..., bool] | None = None
+
+    # advance_auxiliary(*, force, stream_output_ready) -> bool
+    # May enqueue one runtime-owned stage on the scheduler's compute stream.
+    # ``force`` is true when no ordinary forward can launch, so a runtime that
+    # applied backpressure must make progress. Returning true prevents a model
+    # forward from being launched in the same tick. Call ``stream_output_ready``
+    # once for each skill state whose completed auxiliary work made an output
+    # available; the scheduler publishes it without fabricating a token commit.
+    advance_auxiliary: Callable[..., bool] | None = None
 
 
 __all__ = ["SamplingHooks"]
