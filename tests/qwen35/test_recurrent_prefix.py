@@ -159,10 +159,15 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
     prepared, recurrences = [], []
     fail = True
 
-    def prepare(qkv, a, b, A_log, dt_bias, **buffers):
-        prepared.append((A_log, dt_bias))
+    def prepare(qkv, a, b, A_log, dt_bias, *, cu_seqlens,
+                sequence_lengths, topology_token, **buffers):
+        prepared.append((A_log.tolist(), dt_bias.tolist()))
+        assert sequence_lengths == (3, 3) and cu_seqlens.tolist() == [0, 3, 6]
+        assert qkv.shape == (1, 6, 8 + 2 * value_dim)
+        assert torch.all(qkv[:, :3] == 2) and torch.all(qkv[:, 3:] == 5)
         for value in buffers.values():
-            value.fill_(A_log)
+            value[:, :3].fill_(A_log[0, 0])
+            value[:, 3:].fill_(A_log[1, 0])
 
     def recurrence(q, k, v, g, beta, cu, **kwargs):
         recurrences.append(kwargs["sequence_lengths"])
@@ -185,10 +190,12 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
     indices = torch.tensor([1])
     for index, parameter in enumerate((2, 5)):
         module = SimpleNamespace(head_k_dim=4, head_v_dim=value_dim, conv_kernel_size=4,
-                                 A_log=parameter, dt_bias=parameter + 1)
+                                 A_log=torch.full((2,), parameter, dtype=torch.float32),
+                                 dt_bias=torch.full((2,), parameter + 1, dtype=torch.float32))
         branch._prefix_records[index] = _RecurrentPrefixRecord(
-            module, torch.zeros(1, 16, 8 + 2 * value_dim), torch.zeros(1, 16, 2),
-            torch.zeros(1, 16, 2), torch.full((1, 8, 19), parameter),
+            module, torch.full((1, 16, 8 + 2 * value_dim), parameter, dtype=torch.bfloat16),
+            torch.zeros(1, 16, 2, dtype=torch.bfloat16),
+            torch.zeros(1, 16, 2, dtype=torch.bfloat16), torch.full((1, 8, 19), parameter),
             torch.full((1, 2, value_dim, 4), parameter, dtype=torch.bfloat16), indices)
     indices.zero_()
     with pytest.raises(RuntimeError, match="grouped recurrence failure"):
@@ -199,7 +206,8 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
     prepared.clear()
     recurrences.clear()
     result = branch.commit_recurrent_prefix(3)
-    assert prepared == [(2, 3), (5, 6)] and recurrences == [(3, 3)]
+    assert prepared == [([[2, 2], [5, 5]], [[3, 3], [6, 6]])]
+    assert recurrences == [(3, 3)]
     for old, layer, parameter in zip(source.layers, result.layers, (2, 5)):
         assert torch.all(old.recurrent_states == 1)
         assert torch.all(layer.recurrent_states[0] == 1)
