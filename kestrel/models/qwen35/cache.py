@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
@@ -80,6 +81,27 @@ class Qwen35InferenceCache:
 
     def advance_to(self, seq_length: int) -> None:
         self.seq_length = max(self.seq_length, int(seq_length))
+
+    def fork_recurrent_state(self) -> Qwen35InferenceCache:
+        """Copy recurrent state while sharing append-only paged K/V storage.
+
+        The caller must restrict attention to the branch's sequence length;
+        rejected K/V suffixes remain allocated but are not committed context.
+        Siblings must be explored serially and discarded before another sibling
+        writes the shared suffix; this is not concurrent branch storage.
+        """
+        branch = copy(self)
+        layers = []
+        for layer in self.layers:
+            if isinstance(layer, LinearAttentionState):
+                layer = copy(layer)
+                if layer.conv_states is not None:
+                    layer.conv_states = layer.conv_states.clone()
+                if layer.recurrent_states is not None:
+                    layer.recurrent_states = layer.recurrent_states.clone()
+            layers.append(layer)
+        branch.layers = tuple(layers)
+        return branch
 
 
 class Qwen35LinearStatePool:

@@ -4,6 +4,31 @@ import torch
 from kestrel.models.qwen35.dflash import DFlashConfig, _Attention
 
 
+def test_speculative_recurrent_branch_does_not_mutate_committed_state():
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+
+    paged = object()
+    cache = Qwen35InferenceCache(
+        config=SimpleNamespace(layer_types=("linear_attention", "full_attention")),
+        paged_kv=(None, paged))
+    layer = cache.layers[0]
+    layer.conv_states = torch.ones(1, 8, 4, dtype=torch.bfloat16)
+    layer.recurrent_states = torch.ones(2, 2, 4, 4, dtype=torch.bfloat16)
+    layer.has_previous_state = True
+    cache.advance_to(31)
+    branch = cache.fork_recurrent_state()
+    branch.layers[0].conv_states.fill_(2)
+    branch.layers[0].recurrent_states.fill_(3)
+    branch.advance_to(47)
+    assert torch.all(layer.conv_states == 1)
+    assert torch.all(layer.recurrent_states == 1)
+    assert branch.layers[0].has_previous_state
+    assert branch.layers[1] is paged
+    assert cache.get_seq_length() == 31
+    assert branch.get_seq_length() == 47
+
+
 def _tap_model(monkeypatch):
     from types import SimpleNamespace
     from kestrel.models.qwen35 import qwen_model

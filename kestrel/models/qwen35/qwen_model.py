@@ -347,12 +347,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if cache_params is None:
             raise RuntimeError("Qwen GDN requires inference cache state")
         batch_size, seq_len, _ = hidden_states.shape
-        is_decode = cache_params.has_previous_state(self.layer_idx)
+        has_initial_state = cache_params.has_previous_state(self.layer_idx)
         cu_seqlens_q = cu_seq_lens_q
-        if is_decode:
-            raise RuntimeError(
-                "Qwen cached decode must run through the generated program"
-            )
         supports_packed_gdn = (
             self.supports_packed_gdn(
                 hidden_states.device,
@@ -390,6 +386,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         num_sequences = int(cu_seqlens_q.numel() - 1)
         layer = cache_params.layers[self.layer_idx]
         conv_shape = (num_sequences, self.conv_dim, self.conv_kernel_size)
+        if has_initial_state:
+            if num_sequences != 1:
+                raise ValueError("Qwen recurrent continuation currently requires one sequence")
+            if (layer.conv_states is None
+                    or tuple(layer.conv_states.shape) != conv_shape
+                    or layer.conv_states.dtype != mixed_qkv.dtype
+                    or layer.conv_states.device != mixed_qkv.device):
+                raise ValueError("Qwen recurrent continuation requires committed convolution history")
         if layer.conv_states is None or tuple(layer.conv_states.shape) != conv_shape:
             layer.conv_states = torch.empty(
                 conv_shape,
@@ -416,7 +420,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 "Qwen prefill requires one recurrent-state index per packed sequence"
             )
         packed_recurrent_state = layer.recurrent_states
-        layer.has_previous_state = True
+        initial_state = (
+            packed_recurrent_state.index_select(0, state_indices)
+            if has_initial_state else None
+        )
         if seq_idx is None:
             seq_idx = _packed_seq_idx_from_cu_seqlens(
                 cu_seqlens_q,
@@ -424,6 +431,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv.device,
             )
         recurrence_cu_seqlens = cu_seqlens_q
+        conv_prefix = self.conv_kernel_size - 1 if has_initial_state else 0
+        if conv_prefix:
+            mixed_qkv = torch.cat(
+                (packed_conv_state[..., -conv_prefix:], mixed_qkv), dim=-1)
+            seq_idx = torch.zeros(
+                (1, mixed_qkv.shape[-1]), device=mixed_qkv.device, dtype=torch.int32)
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.
@@ -435,6 +448,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             activation=self.activation,
             final_state=packed_conv_state,
         )
+        if conv_prefix:
+            mixed_qkv = mixed_qkv[..., conv_prefix:].contiguous()
         mixed_qkv = mixed_qkv.transpose(1, 2)
         workspace = self._prefill_workspace_cache.get(
             mixed_qkv,
@@ -450,6 +465,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.dt_bias,
             recurrence_cu_seqlens,
             workspace=workspace,
+            initial_state=initial_state,
             output_final_state=True,
             sequence_lengths=sequence_lengths,
             topology_token=topology_token,
@@ -465,6 +481,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
+        layer.has_previous_state = True
         return output
 
 
