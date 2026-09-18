@@ -83,13 +83,10 @@ def _write_tokenizer(path: Path, vocab_size: int, *, blank: int, pad: int) -> No
     """A word-level tokenizer with Parakeet's two special tokens."""
     tokenizers = pytest.importorskip("tokenizers")
 
-    vocab = {f"▁t{index}": index for index in range(vocab_size)}
-    vocab["<pad>"] = pad
-    vocab["<blank>"] = blank
-    vocab["▁t2"] = 0  # freed by <pad>; keep the map a bijection
-    vocab["▁t31"] = 1
-    vocab["▁t0"] = 3
-    vocab["▁t1"] = 4
+    vocab = {"<pad>": pad, "<blank>": blank}
+    for index in range(vocab_size):
+        if index not in (pad, blank):
+            vocab[f"▁t{index}"] = index
     tokenizer = tokenizers.Tokenizer(
         tokenizers.models.WordLevel(vocab=vocab, unk_token="<pad>")
     )
