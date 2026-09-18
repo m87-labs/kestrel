@@ -180,6 +180,13 @@ against 12.6x at 6 and 12.2x at 16. Weight modes whose GEMM owns a native
 thread pool cap the default at 4 instead, so torch's workers stay out of its
 way. `OMP_NUM_THREADS` overrides the default when it is set.
 
+`ternary_mode` picks how the 2-bit weights are kept: `dense` dequantizes them
+once (2 bytes per weight, and the only mode accelerators run today), `gemm8`
+keeps them packed and runs an int8-activation GEMM on the CPU (1 GB less
+resident, and faster on x86 with AVX-512 VNNI or on NEON). `auto`, the default,
+leaves the choice to kestrel-kernels. Transcripts are identical in either
+mode.
+
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding
 use Kestrel's bundled generated-decode programs. Installed runtimes do not

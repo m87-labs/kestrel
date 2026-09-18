@@ -51,11 +51,13 @@ jobs:
         run: |
           python -c "import torch; print('torch', torch.__version__)"
           python -c "import kestrel_kernels; print('kernels', kestrel_kernels.__file__)"
-          # The ternary layers arrive with a kestrel-kernels release that
-          # ships kestrel_kernels/ternary.py; until then the engine tests in
-          # tests/asr/test_parakeet_ternary_cpu.py skip rather than fail.
+          # The ternary layers and the conformer ops arrive with a
+          # kestrel-kernels release that ships kestrel_kernels/ternary.py and
+          # kestrel_kernels/conformer_ops.py; until then the tests that need
+          # them skip rather than fail.
           python -c "import importlib.util as u; print('ternary layers:', u.find_spec('kestrel_kernels.ternary') is not None)"
-          python -c "from kestrel.config import default_cpu_threads, physical_cpu_count; print('cores', physical_cpu_count(), 'threads', default_cpu_threads())"
+          python -c "import importlib.util as u; print('conformer ops:', u.find_spec('kestrel_kernels.conformer_ops') is not None)"
+          python -c "from kestrel.config import default_cpu_threads; print('threads', default_cpu_threads())"
 
       - name: Run the CPU test subset
         # Everything that runs without a GPU. The remaining suites
