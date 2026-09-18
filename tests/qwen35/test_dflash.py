@@ -125,7 +125,7 @@ def test_invalid_attention_metadata_rejected(field, value):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("layer", [0, 5])
-@pytest.mark.filterwarnings("error:.*[Ff]allback.*:RuntimeWarning")
+@pytest.mark.filterwarnings("error::RuntimeWarning")
 def test_draft_native_attention_matches_bottom_right_mask(layer):
     torch.manual_seed(2715)
     config = DFlashConfig.from_dict(_metadata())
@@ -155,7 +155,7 @@ def test_draft_native_attention_matches_bottom_right_mask(layer):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.filterwarnings("error:.*[Ff]allback.*:RuntimeWarning")
+@pytest.mark.filterwarnings("error::RuntimeWarning")
 @pytest.mark.parametrize("position_base", [0, 1000])
 def test_draft_context_cache_excludes_queries_and_appends_verified_context(monkeypatch, position_base):
     from kestrel.models.qwen35.dflash import DFlashContextCache, DFlashDraftModel
@@ -215,3 +215,35 @@ def test_draft_context_cache_rejects_invalid_capacity(capacity):
 
     with pytest.raises(ValueError, match="positive integer"):
         DFlashContextCache(capacity)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_packed_draft_preserves_independent_contexts():
+    from kestrel.models.qwen35.dflash import DFlashDraftModel, DFlashContextCache
+
+    torch.manual_seed(629)
+    model = DFlashDraftModel(DFlashConfig.from_dict(_metadata())).cuda().bfloat16().eval()
+    serial = [DFlashContextCache(32), DFlashContextCache(32)]
+    packed = [DFlashContextCache(32), DFlashContextCache(32)]
+    with torch.inference_mode():
+        for added in ((5, 7), (2, 0), (1, 3)):
+            noises = [torch.randn(1, rows, 128, device="cuda", dtype=torch.bfloat16)
+                      for rows in (3, 5)]
+            targets = [torch.randn(1, length, 1024, device="cuda", dtype=torch.bfloat16)
+                       for length in added]
+            positions = [torch.arange(cache.length, cache.length + length + noise.shape[1],
+                                      device="cuda")[None]
+                         for cache, length, noise in zip(serial, added, noises)]
+            expected = [model(noise, target, pos, context_cache=cache)
+                        for noise, target, pos, cache in zip(noises, targets, positions, serial)]
+            actual = model.forward_many(noises, targets, positions, context_caches=packed)
+            for result, reference, left, right in zip(actual, expected, serial, packed):
+                torch.testing.assert_close(result, reference, rtol=.02, atol=.02)
+                assert left.length == right.length
+                for a, b in zip(left.layers, right.layers):
+                    torch.testing.assert_close(a.keys[:, :left.length], b.keys[:, :right.length],
+                                               rtol=.02, atol=.02)
+                    torch.testing.assert_close(a.values[:, :left.length], b.values[:, :right.length],
+                                               rtol=.02, atol=.02)
+            assert packed[0].layers[0].keys.data_ptr() != packed[1].layers[0].keys.data_ptr()

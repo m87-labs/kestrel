@@ -112,6 +112,49 @@ class Qwen35InferenceCache:
         branch.layers = tuple(layers)
         return branch
 
+    @staticmethod
+    def fork_packed_recurrent_state(caches):
+        """Copy independent committed rows once into packed verification storage."""
+        if not caches or len({id(cache) for cache in caches}) != len(caches):
+            raise ValueError("packed verification requires distinct caches")
+        if any(cache._prefix_source is not None or cache.seq_length <= 0 for cache in caches):
+            raise ValueError("prefix capture requires committed nonempty caches")
+        if len({len(cache.layers) for cache in caches}) != 1:
+            raise ValueError("packed verification layer counts must match")
+        branches = []
+        for source in caches:
+            branch = copy(source)
+            branch._prefix_source = source
+            branch._prefix_start = source.seq_length
+            branch._prefix_records = {}
+            branch.layers = list(source.layers)
+            branches.append(branch)
+        packed = copy(branches[0])
+        packed._prefix_records = {}
+        packed_layers = list(packed.layers)
+        for index, first in enumerate(caches[0].layers):
+            owners = [cache.layers[index] for cache in caches]
+            if any(type(layer) is not type(first) for layer in owners):
+                raise ValueError("packed verification layer kinds must match")
+            if not isinstance(first, LinearAttentionState):
+                continue
+            layer = copy(first)
+            for name in ("conv_states", "recurrent_states"):
+                tensors = [getattr(owner, name) for owner in owners]
+                if any(tensor is None or tensor.shape[0] != 1 for tensor in tensors):
+                    raise ValueError("packed verification requires initialized single-row state")
+                setattr(layer, name, torch.cat(tensors, dim=0))
+            packed_layers[index] = layer
+            for row, branch in enumerate(branches):
+                owned = copy(owners[row])
+                owned.conv_states = layer.conv_states[row:row + 1]
+                owned.recurrent_states = layer.recurrent_states[row:row + 1]
+                branch.layers[index] = owned
+        packed.layers = tuple(packed_layers)
+        for branch in branches:
+            branch.layers = tuple(branch.layers)
+        return packed, branches
+
     def commit_recurrent_prefix(self, length: int) -> Qwen35InferenceCache:
         """Commit one verified prefix without repeating its dense projections.
 

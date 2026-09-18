@@ -19,6 +19,8 @@ def decoder():
     obj.num_speculative_tokens = 3
     obj._sessions = {1: _Session(state, SimpleNamespace(seq_length=10), None, None, 7)}
     obj.propose = lambda ctx: DraftResult(torch.tensor([[8, 9, 10]]))
+    obj._propose_many = lambda sessions: [
+        [session.bonus, *obj.propose(session).token_ids[0].tolist()] for session in sessions]
     commits = []
 
     class Verified:
@@ -286,6 +288,25 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         assert branch.layers[0].recurrent_states[0].item() == slot + 100
         assert session.cache.layers[0].recurrent_states[0].item() == slot
         assert torch.all(session.cache.layers[0].conv_states == session.cache.seq_length)
+    first_branch = results[0][2].layers[0]
+    second_branch = results[1][2].layers[0]
+    first_branch.recurrent_states.zero_()
+    assert second_branch.recurrent_states.item() == 101
+    assert sessions[0].cache.layers[0].recurrent_states.item() == 3
+    assert sessions[1].cache.layers[0].recurrent_states.item() == 1
+
+
+def test_packed_fork_rejects_shared_owner_and_noncompact_state():
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+    cache = Qwen35InferenceCache(
+        config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
+    cache.seq_length = 3
+    cache.layers[0].conv_states = torch.zeros(2, 2, 3)
+    cache.layers[0].recurrent_states = torch.zeros(2, 1, 1, 1)
+    with pytest.raises(ValueError, match="distinct caches"):
+        Qwen35InferenceCache.fork_packed_recurrent_state([cache, cache])
+    with pytest.raises(ValueError, match="single-row state"):
+        Qwen35InferenceCache.fork_packed_recurrent_state([cache])
 
 
 def test_admission_forks_only_owned_recurrent_row():

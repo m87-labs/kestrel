@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import json
+from itertools import accumulate
 from pathlib import Path
 
 import torch
@@ -18,6 +19,21 @@ from kestrel_kernels import get_runtime
 class _LayerContextBuffer:
     keys: torch.Tensor | None = None
     values: torch.Tensor | None = None
+
+    def append(self, keys, values, start, capacity):
+        end = start + keys.shape[2]
+        if end > capacity:
+            raise ValueError("DFlash context capacity exceeded")
+        shape = (keys.shape[0], capacity, keys.shape[1], keys.shape[3])
+        if self.keys is None:
+            self.keys, self.values = keys.new_empty(shape), values.new_empty(shape)
+        if (self.values is None or self.keys.shape != shape or self.values.shape != shape
+                or self.keys.dtype != keys.dtype or self.values.dtype != values.dtype
+                or self.keys.device != keys.device or self.values.device != values.device):
+            raise ValueError("DFlash context buffer does not match this session")
+        self.keys[:, start:end].copy_(keys.transpose(1, 2))
+        self.values[:, start:end].copy_(values.transpose(1, 2))
+        return self.keys[:, :end].transpose(1, 2), self.values[:, :end].transpose(1, 2)
 
 
 @dataclass
@@ -132,28 +148,43 @@ class _Attention(nn.Module):
         q = apply_rotary(q, cos[:, -rows:], sin[:, -rows:])
         k = apply_rotary(k, cos, sin)
         if cache is not None:
-            end = past_context + joined.shape[1]
-            if end > cache_capacity:
-                raise ValueError("DFlash context capacity exceeded")
-            shape = (batch, cache_capacity, k.shape[1], self.head_dim)
-            if cache.keys is None:
-                keys, values = k.new_empty(shape), v.new_empty(shape)
-                cache.keys, cache.values = keys, values
-            if (cache.values is None
-                    or cache.keys.shape != shape or cache.values.shape != shape
-                    or cache.keys.dtype != k.dtype or cache.values.dtype != v.dtype
-                    or cache.keys.device != k.device or cache.values.device != v.device):
-                raise ValueError("DFlash context buffer does not match this session")
-            cache.keys[:, past_context:end].copy_(k.transpose(1, 2))
-            cache.values[:, past_context:end].copy_(v.transpose(1, 2))
-            k = cache.keys[:, :end].transpose(1, 2)
-            v = cache.values[:, :end].transpose(1, 2)
+            k, v = cache.append(k, v, past_context, cache_capacity)
         output = dense_attention(
             q, k, v, scaling=self.head_dim ** -0.5, causal=self.causal,
             window_size_left=None if self.window is None else self.window - 1,
             window_size_right=None if self.window is None or not self.causal else 0,
         )
         return self.o_proj(output.reshape(batch, rows, -1))
+
+    def forward_packed(self, hidden, contexts, cos, sin, caches, layer_index,
+                       query_lengths, cu_q, cu_k):
+        query_pieces = hidden.split(query_lengths, dim=1)
+        joined_lengths = tuple(context.shape[1] + query.shape[1]
+                               for context, query in zip(contexts, query_pieces))
+        joined = torch.cat([torch.cat((context, query), dim=1)
+                            for context, query in zip(contexts, query_pieces)], dim=1)
+        q = self.q_norm(self.q_proj(hidden).reshape(1, hidden.shape[1], -1, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(joined).reshape(1, joined.shape[1], -1, self.head_dim)).transpose(1, 2)
+        v = self.v_proj(joined).reshape(1, joined.shape[1], -1, self.head_dim).transpose(1, 2)
+        q_cos = torch.cat([part[:, -length:] for part, length in
+                           zip(cos.split(joined_lengths, dim=1), query_lengths)], dim=1)
+        q_sin = torch.cat([part[:, -length:] for part, length in
+                           zip(sin.split(joined_lengths, dim=1), query_lengths)], dim=1)
+        q = apply_rotary(q, q_cos, q_sin)
+        k = apply_rotary(k, cos, sin)
+        keys, values = [], []
+        for key, value, cache in zip(k.split(joined_lengths, dim=2),
+                                     v.split(joined_lengths, dim=2), caches):
+            key, value = cache.layers[layer_index].append(key, value, cache.length, cache.capacity)
+            keys.append(key)
+            values.append(value)
+        output = dense_attention(
+            q, torch.cat(keys, dim=2), torch.cat(values, dim=2),
+            scaling=self.head_dim ** -0.5, causal=self.causal,
+            window_size_left=None if self.window is None else self.window - 1,
+            window_size_right=None if self.window is None or not self.causal else 0,
+            cu_seqlens=cu_q, cu_seqlens_k=cu_k)
+        return self.o_proj(output.reshape(1, hidden.shape[1], -1))
 
 
 class _MLP(nn.Module):
@@ -225,6 +256,49 @@ class DFlashDraftModel(nn.Module):
         if context_cache is not None:
             # Failed evaluation may overwrite only the uncommitted suffix.
             context_cache.length += target_hidden.shape[1]
+        return result
+
+    def forward_many(self, noise_embeddings, target_hiddens, position_ids, *, context_caches):
+        """Evaluate independent draft blocks with separate committed KV owners."""
+        count = len(noise_embeddings)
+        if (not count or len(target_hiddens) != count or len(position_ids) != count
+                or len(context_caches) != count or len({id(c) for c in context_caches}) != count):
+            raise ValueError("packed DFlash requires distinct caches and matching sequence inputs")
+        query_lengths = tuple(value.shape[1] for value in noise_embeddings)
+        context_lengths = tuple(value.shape[1] for value in target_hiddens)
+        key_lengths = []
+        for noise, target, positions, cache in zip(
+                noise_embeddings, target_hiddens, position_ids, context_caches):
+            if (noise.shape[0] != 1 or target.shape[0] != 1 or noise.shape[1] < 1
+                    or positions.shape != (1, target.shape[1] + noise.shape[1])):
+                raise ValueError("packed DFlash inputs must each describe one nonempty query sequence")
+            end = cache.length + positions.shape[1]
+            if end > cache.capacity:
+                raise ValueError("DFlash context capacity exceeded")
+            if cache.layers and len(cache.layers) != len(self.layers):
+                raise ValueError("DFlash context cache has the wrong layer count")
+            key_lengths.append(end)
+        for cache in context_caches:
+            if not cache.layers:
+                cache.layers = [_LayerContextBuffer() for _ in self.layers]
+        noise = torch.cat(noise_embeddings, dim=1)
+        targets = torch.cat(target_hiddens, dim=1)
+        context = (self.hidden_norm(self.fc(targets)) if targets.shape[1]
+                   else noise.new_empty((1, 0, self.config.hidden_size)))
+        contexts = context.split(context_lengths, dim=1)
+        positions = torch.cat(position_ids, dim=1)
+        cos, sin = self.rotary_emb(noise, positions[..., None])
+        cu_q = torch.tensor([0, *accumulate(query_lengths)], device=noise.device, dtype=torch.int32)
+        cu_k = torch.tensor([0, *accumulate(key_lengths)], device=noise.device, dtype=torch.int32)
+        hidden = noise
+        for index, layer in enumerate(self.layers):
+            hidden = hidden + layer.self_attn.forward_packed(
+                layer.input_layernorm(hidden), contexts, cos, sin, context_caches,
+                index, query_lengths, cu_q, cu_k)
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        result = self.norm(hidden).split(query_lengths, dim=1)
+        for cache, length in zip(context_caches, context_lengths):
+            cache.length += length
         return result
 
 

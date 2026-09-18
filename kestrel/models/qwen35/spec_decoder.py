@@ -1,6 +1,5 @@
 """Independent greedy DFlash sessions with native sequence verification."""
 
-from copy import copy
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -133,21 +132,29 @@ class Qwen35DFlashDecoder:
         ids = self.runtime.model.lm_head(hidden[:, 1:]).argmax(-1).to(torch.int32)
         return DraftResult(token_ids=ids)
 
+    def _propose_many(self, sessions):
+        config = self.draft.config
+        noise = torch.full((len(sessions), config.block_size), config.mask_token_id,
+                           device=self.runtime.device, dtype=torch.long)
+        noise[:, 0] = torch.tensor([session.bonus for session in sessions],
+                                   device=self.runtime.device)
+        positions = [torch.arange(session.draft_cache.length,
+                                  session.cache.seq_length + config.block_size,
+                                  device=self.runtime.device)[None]
+                     for session in sessions]
+        hidden = self.draft.forward_many(
+            self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
+            positions, context_caches=[session.draft_cache for session in sessions])
+        logits = self.runtime.model.lm_head(torch.cat([value[:, 1:] for value in hidden], dim=1))
+        ids = logits.argmax(-1).reshape(len(sessions), config.block_size - 1).tolist()
+        return [[session.bonus, *row] for session, row in zip(sessions, ids)]
+
     def _target_many(self, candidates, sessions):
         """Verify independent sequences together, retaining separate commit owners."""
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
-        branches = [session.cache.fork_recurrent_state(capture_prefix=True) for session in sessions]
-        packed = copy(branches[0])
-        packed._prefix_records = {}
-        layers = []
-        for index, layer in enumerate(packed.layers):
-            if isinstance(layer, LinearAttentionState):
-                layer = copy(layer)
-                layer.conv_states = torch.cat([branch.layers[index].conv_states for branch in branches])
-                layer.recurrent_states = torch.cat([branch.layers[index].recurrent_states for branch in branches])
-            layers.append(layer)
-        packed.layers = tuple(layers)
+        packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
+            [session.cache for session in sessions])
         ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
         positions = torch.cat([
             torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
@@ -178,9 +185,6 @@ class Qwen35DFlashDecoder:
         for index, record in packed._prefix_records.items():
             records = record.split_sequences(lengths)
             for row, branch in enumerate(branches):
-                branch.layers[index].conv_states.copy_(packed.layers[index].conv_states[row:row + 1])
-                branch.layers[index].recurrent_states.copy_(
-                    packed.layers[index].recurrent_states[row:row + 1])
                 branch._prefix_records[index] = replace(records[row], state_indices=local_state_indices[row:row + 1])
         for branch, session, length in zip(branches, sessions, lengths):
             branch.advance_to(session.cache.seq_length + length)
@@ -218,12 +222,12 @@ class Qwen35DFlashDecoder:
             sessions.append((session, cap))
         pending = []
         try:
-            candidates = [[session.bonus, *self.propose(session).token_ids[0].tolist()]
-                          for session, _ in sessions]
             if len(sessions) == 1:
                 session = sessions[0][0]
+                candidates = [[session.bonus, *self.propose(session).token_ids[0].tolist()]]
                 results = [self._target(candidates[0], session.cache, session.state.batch_idx, capture=True)]
             else:
+                candidates = self._propose_many([session for session, _ in sessions])
                 results = self._target_many(candidates, [session for session, _ in sessions])
             for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0
