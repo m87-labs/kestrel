@@ -237,6 +237,13 @@ def _write_vision_grid_metadata(
 class Qwen35Runtime(UncachedPagedRuntime):
     """Runtime wrapping upstream Qwen 3.5 modeling for Kestrel."""
 
+    def shutdown(self) -> None:
+        try:
+            if self.spec is not None:
+                self.spec.decoder.shutdown()
+        finally:
+            super().shutdown()
+
     def __init__(
         self,
         cfg: Any,

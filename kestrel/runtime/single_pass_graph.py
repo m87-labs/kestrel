@@ -110,10 +110,14 @@ class FixedShapeSinglePassGraph:
                 destination.copy_(source)
             # Materialize library handles and algorithm selection outside capture.
             self._outputs(self._run_forward(*static_inputs))
+            for destination, source in zip(static_inputs, inputs, strict=True):
+                destination.copy_(source)
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 outputs = self._outputs(self._run_forward(*static_inputs))
+            for destination, source in zip(static_inputs, inputs, strict=True):
+                destination.copy_(source)
             graph.replay()
         return _GraphEntry(static_inputs, outputs, graph)
 

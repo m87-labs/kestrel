@@ -6,6 +6,23 @@ import torch
 from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_mutating_forward_restores_capture_inputs():
+    def forward(value):
+        value.add_(1)
+        return (value,)
+    session = FixedShapeSinglePassGraph(enabled=True, device=torch.device('cuda'),
+        stream=None, run_forward=forward)
+    try:
+        for initial in (2, 7, -3):
+            value = torch.full((16,), initial, device='cuda')
+            with session.launch(value) as (output,):
+                torch.testing.assert_close(output, torch.full_like(output, initial + 1))
+                torch.testing.assert_close(value, torch.full_like(value, initial))
+    finally:
+        session.shutdown()
+
+
 def test_disabled_session_runs_eager_and_refuses_after_shutdown() -> None:
     calls = []
 

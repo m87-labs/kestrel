@@ -1,6 +1,7 @@
 """Independent greedy DFlash sessions with native sequence verification."""
 
 from dataclasses import dataclass, replace
+from contextlib import ExitStack
 from typing import Any
 
 import torch
@@ -43,6 +44,23 @@ class Qwen35DFlashDecoder:
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
+        self._target_graph = None
+        self._graph_failed = False
+        self._closed = False
+        if runtime._cfg.enable_cuda_graphs:
+            from .spec_target_graph import Qwen35TargetGraph
+            self._target_graph = Qwen35TargetGraph(runtime, self.text,
+                config.target_layer_ids, config.block_size)
+
+    def _verify(self, leases, **kwargs):
+        if leases is None or self._target_graph is None:
+            return self.text(**kwargs)
+        return leases.enter_context(self._target_graph.launch(**kwargs))
+
+    def shutdown(self):
+        self._closed = True
+        if self._target_graph is not None:
+            self._target_graph.shutdown()
 
     @property
     def free_slots(self):
@@ -57,6 +75,8 @@ class Qwen35DFlashDecoder:
     def admit(self, state, prompt_tokens, *, image=None, image_crops=None,
               allowed_token_ids=None, suppressed_token_ids=None,
               suppress_next_token_ids=None, temperature=0.0, top_p=1.0):
+        if self._closed or self._graph_failed:
+            raise RuntimeError('speculative decoder is shut down or its verification graph failed')
         self._unconstrained(allowed_token_ids, suppressed_token_ids)
         if (image is not None or image_crops is not None or suppress_next_token_ids
                 or temperature != 0.0 or not 0.0 < top_p <= 1.0
@@ -95,7 +115,7 @@ class Qwen35DFlashDecoder:
             state.batch_idx = -1
             raise
 
-    def _target(self, tokens, committed, slot, *, capture):
+    def _target(self, tokens, committed, slot, *, capture, leases=None):
         cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
@@ -106,7 +126,7 @@ class Qwen35DFlashDecoder:
         slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
-        output = self.text(
+        output = self._verify(leases,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
@@ -149,7 +169,7 @@ class Qwen35DFlashDecoder:
         ids = logits.argmax(-1).reshape(len(sessions), config.block_size - 1).tolist()
         return [[session.bonus, *row] for session, row in zip(sessions, ids)]
 
-    def _target_many(self, candidates, sessions):
+    def _target_many(self, candidates, sessions, *, leases=None):
         """Verify independent sequences together, retaining separate commit owners."""
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
@@ -169,7 +189,7 @@ class Qwen35DFlashDecoder:
             for row, position in enumerate(position_rows)])[None]
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=lengths, device=device)
-        output = self.text(
+        output = self._verify(leases,
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
             paged_kv_seqlens_k=torch.tensor([
@@ -199,6 +219,13 @@ class Qwen35DFlashDecoder:
         session.bonus = expected[count-1]
 
     def step(self, states, *, allowed_token_ids=None, suppressed_token_ids=None, commit_caps=None):
+        if self._closed or self._graph_failed:
+            raise RuntimeError('speculative decoder is shut down or its verification graph failed')
+        with ExitStack() as leases:
+            return self._step(states, allowed_token_ids=allowed_token_ids,
+                suppressed_token_ids=suppressed_token_ids, commit_caps=commit_caps, leases=leases)
+
+    def _step(self, states, *, allowed_token_ids, suppressed_token_ids, commit_caps, leases):
         if not states:
             raise ValueError("Qwen DFlash requires admitted sequences")
         for values in (allowed_token_ids, suppressed_token_ids, commit_caps):
@@ -225,10 +252,10 @@ class Qwen35DFlashDecoder:
             if len(sessions) == 1:
                 session = sessions[0][0]
                 candidates = [[session.bonus, *self.propose(session).token_ids[0].tolist()]]
-                results = [self._target(candidates[0], session.cache, session.state.batch_idx, capture=True)]
+                results = [self._target(candidates[0], session.cache, session.state.batch_idx, capture=True, leases=leases)]
             else:
                 candidates = self._propose_many([session for session, _ in sessions])
-                results = self._target_many(candidates, [session for session, _ in sessions])
+                results = self._target_many(candidates, [session for session, _ in sessions], leases=leases)
             for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0
                 for proposed, wanted in zip(candidate[1:], expected):
@@ -240,6 +267,8 @@ class Qwen35DFlashDecoder:
             for ctx in pending:
                 self.commit_accept(ctx)
         except Exception:
+            if self._target_graph is not None:
+                self._graph_failed = True
             # Draft caches and shared KV suffixes may already have advanced.
             # Keep slots owned until scheduler retirement; retry is not safe.
             for session, _ in sessions:

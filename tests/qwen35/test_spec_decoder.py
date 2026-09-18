@@ -10,6 +10,8 @@ from kestrel.runtime.tokens import TextToken
 
 def decoder():
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj._target_graph = None
+    obj._graph_failed = obj._closed = False
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(
@@ -28,8 +30,8 @@ def decoder():
             commits.append(count)
             return SimpleNamespace(seq_length=10+count)
 
-    obj._target = lambda tokens, cache, slot, capture: ([8, 9, 99, 100], torch.ones(1, 4, 2), Verified())
-    obj._target_many = lambda candidates, sessions: [
+    obj._target = lambda tokens, cache, slot, capture, leases=None: ([8, 9, 99, 100], torch.ones(1, 4, 2), Verified())
+    obj._target_many = lambda candidates, sessions, leases=None: [
         obj._target(tokens, session.cache, session.state.batch_idx, capture=True)
         for tokens, session in zip(candidates, sessions)]
     return obj, state, commits, erased
@@ -53,6 +55,43 @@ def test_retire_releases_slot_and_capture_once():
     obj.retire(state)
     assert erased == [1]
     assert obj.free_slots == 1 and not obj._sessions
+
+
+def test_target_graph_lease_outlives_commit_and_poison_rejects_retry():
+    from contextlib import contextmanager
+    obj, state, _, _ = decoder()
+    active = []
+    original = obj._target
+    @contextmanager
+    def lease():
+        active.append(True)
+        try:
+            yield
+        finally:
+            active.pop()
+    def target(tokens, cache, slot, capture, leases=None):
+        leases.enter_context(lease())
+        return original(tokens, cache, slot, capture)
+    obj._target = target
+    commit = obj.commit_accept
+    def checked_commit(ctx):
+        assert active == [True]
+        commit(ctx)
+    obj.commit_accept = checked_commit
+    obj.step([state])
+    assert not active
+    obj._target_graph = SimpleNamespace(shutdown=lambda: None)
+    def fail(ctx):
+        assert active
+        raise RuntimeError('commit failed')
+    obj.commit_accept = fail
+    with pytest.raises(RuntimeError, match='commit failed'):
+        obj.step([state])
+    assert not active and obj._graph_failed
+    with pytest.raises(RuntimeError, match='graph failed'):
+        obj.step([state])
+    obj.shutdown()
+    assert obj._closed
 
 
 def test_base_adapter_slot_retirement_is_valid_without_lora_support():
@@ -324,7 +363,7 @@ def test_admission_forks_only_owned_recurrent_row():
 
     obj.runtime._linear_state_pool = SimpleNamespace(bind_prefill_state=bind)
 
-    def target(tokens, cache, slot, capture):
+    def target(tokens, cache, slot, capture, leases=None):
         assert slot == 2 and not capture
         assert cache.layers[0].recurrent_states.shape == (1, 1, 1, 1)
         assert cache.layers[0].recurrent_states.item() == 2
