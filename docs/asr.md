@@ -185,7 +185,9 @@ once (2 bytes per weight, and the only mode the accelerators run today), while
 `gemm8` keeps them packed and runs an int8-activation GEMM on the CPU — 0.78 GB
 resident and 62-68x real time on an EPYC 9575F, against 45x for dense bf16 at
 the same thread count. `auto`, the default, leaves the choice to
-kestrel-kernels. Transcripts are identical either way.
+kestrel-kernels. `dense` keeps the activations exact; `gemm8` quantizes them to
+int8 per 128-element group, so its arithmetic is not bit-exact — on the
+50-utterance dev-clean set it moved one hypothesis by a trailing period.
 
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding
