@@ -19,11 +19,13 @@ from .tokenizer import ParakeetTokenizer
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
 _FILES = ("config.json", "tokenizer.json", "model.safetensors")
-# The ternary (2-bit) student distilled from MODEL_ID (thrush). Its checkpoint directory holds the packed
+# The ternary (2-bit) student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID. A checkpoint holds the packed
 # ``model.safetensors`` + ``ternary.json`` (thrush ``scripts/export_ternary.py --names hf``), plus config.json and
 # tokenizer.json; ``load_parakeet_tdt`` recognises the manifest and builds the ternary variant.
-TERNARY_MODEL_ID = "m87-labs/parakeet-tdt-0.6b-v3-ternary"
+TERNARY_MODEL_ID = "moondream/parakeet-ternary"
+TERNARY_REVISION = "47b5112255e8c726308fae6952187f81c13eccca"  # rl6 export, private, for runtime testing
 TERNARY_MANIFEST = "ternary.json"
+_TERNARY_FILES = _FILES + (TERNARY_MANIFEST,)
 # The ternary student ships for CPU and Apple silicon only for now: a CUDA request runs it on MPS when available,
 # else on the CPU (its GEMMs are dense bf16/fp16/fp32 through torch there; the 2-bit kernels are CPU/ARM code).
 TERNARY_DEVICE_TYPES = frozenset({"cpu", "mps"})
@@ -44,10 +46,11 @@ def load_parakeet_tdt(
     local_files_only: bool = False,
     ternary_mode: str = "auto",
 ) -> LoadedParakeetTdt:
+    ternary_repo = str(checkpoint) == TERNARY_MODEL_ID
     root = resolve_checkpoint(
         checkpoint,
-        revision=revision,
-        filenames=_FILES,
+        revision=TERNARY_REVISION if ternary_repo and revision == REVISION else revision,
+        filenames=_TERNARY_FILES if ternary_repo else _FILES,
         local_files_only=local_files_only,
     )
     manifest_path = root / TERNARY_MANIFEST
@@ -217,6 +220,7 @@ __all__ = [
     "REVISION",
     "TERNARY_DEVICE_TYPES",
     "TERNARY_MODEL_ID",
+    "TERNARY_REVISION",
     "TernaryManifest",
     "is_ternary_checkpoint",
     "load_parakeet_tdt",

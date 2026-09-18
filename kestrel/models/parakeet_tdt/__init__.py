@@ -3,7 +3,7 @@
 from kestrel.models.registry import ModelSpec, register
 
 from .runtime import ParakeetTdtRuntime
-from .weights import MODEL_ID, REVISION, TERNARY_MODEL_ID, load_parakeet_tdt
+from .weights import MODEL_ID, REVISION, TERNARY_MODEL_ID, TERNARY_REVISION, load_parakeet_tdt
 
 
 def _build_orchestrators():
@@ -22,12 +22,13 @@ register(
     )
 )
 
-# The 2-bit (ternary) student: same runtime, same contract; ``RuntimeConfig(model=TERNARY_MODEL_ID,
-# model_path=<export dir>)`` until the packed weights are published under ``repo_id``.
+# The 2-bit (ternary) student: same runtime, same contract, weights at ``repo_id`` (private for now);
+# ``RuntimeConfig(model=TERNARY_MODEL_ID)`` downloads them, ``model_path=<export dir>`` loads a local export.
 register(
     ModelSpec(
         name=TERNARY_MODEL_ID,
         repo_id=TERNARY_MODEL_ID,
+        revision=TERNARY_REVISION,
         runtime=ParakeetTdtRuntime,
         orchestrators=_build_orchestrators,
     )
