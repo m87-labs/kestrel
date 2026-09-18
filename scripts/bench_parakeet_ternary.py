@@ -57,7 +57,7 @@ def main() -> None:
     ap.add_argument("--checkpoint", default=None, help="fp checkpoint (default: the pinned nvidia/parakeet-tdt-0.6b-v3)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="auto", choices=[*DTYPES, "auto"])
-    ap.add_argument("--mode", default="auto", choices=["int8", "dense", "packed", "jit", "auto"])
+    ap.add_argument("--mode", default="auto", choices=["int8", "dense", "packed", "jit", "vnni", "auto"])
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--legacy-conv", action="store_true", help="keep nn.Conv1d for the depthwise conv on CPU/MPS (A/B)")
     ap.add_argument("--bench-dir", required=True)
