@@ -25,6 +25,7 @@ TERNARY_MODEL_ID = "moondream/parakeet-redux"
 TERNARY_REVISION = "70828b0628e071b8f58c36911f418d6c8096bc6f"  # rl6 export, private, for runtime testing
 _MANIFEST = "ternary.json"
 _QKV = ("q_proj", "k_proj", "v_proj")
+_REL = "relative_k_proj"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,8 @@ def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
     Every quantized module is a linear: the encoder applies its 1x1 convolutions in the linear layout too. The
     export keeps the attention projections separate, so a block's q/k/v triple becomes the model's one fused
     ``qkv_proj`` — ``RelativeAttention._load_from_state_dict`` concatenates their rows as it does for fp weights.
+    The blocks' relative-position projections fuse the same way, but across blocks rather than within one:
+    they do not depend on the activations, so the encoder holds a single layer for all of them.
     """
     from kestrel_kernels.ternary import TernaryLinear
 
@@ -62,9 +65,12 @@ def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
         )
 
     fused: dict[str, dict[str, dict]] = {}
+    relative: list[dict] = []
     for entry in quantized:
         parent, _, attr = entry["name"].rpartition(".")
-        if attr in _QKV and hasattr(model.get_submodule(parent), "qkv_proj"):
+        if attr == _REL and hasattr(model.encoder, _REL):
+            relative.append(entry)
+        elif attr in _QKV and hasattr(model.get_submodule(parent), "qkv_proj"):
             fused.setdefault(parent, {})[attr] = entry
         else:
             model.set_submodule(entry["name"], layer(entry))
@@ -73,6 +79,16 @@ def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
             raise ValueError(f"{parent}: the export quantizes {sorted(parts)}, not all of q/k/v")
         out_features = sum(parts[attr]["out_features"] for attr in _QKV)
         model.set_submodule(f"{parent}.qkv_proj", layer(parts["q_proj"], out_features))
+    if relative:
+        if len(relative) != len(model.encoder.layers):
+            raise ValueError(
+                f"the export quantizes {len(relative)} relative-position projections, not one per encoder "
+                f"block ({len(model.encoder.layers)})"
+            )
+        model.set_submodule(
+            f"encoder.{_REL}",
+            layer(relative[0], sum(entry["out_features"] for entry in relative)),
+        )
 
 
 def load_parakeet_tdt(

@@ -7,6 +7,8 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -71,13 +73,41 @@ def _timed_segments(
     return tuple(segments)
 
 
-def _has_native_gemm_weights(model: torch.nn.Module) -> bool:
-    """Whether any layer runs its GEMM on the kernels' own thread pool: the ternary ``gemm8`` weight mode
-    (int8 activations, packed weight panels). Dense and fp weights go through torch's GEMM instead."""
-    return any(
-        getattr(getattr(module, "weight", None), "mode", None) == "gemm8"
-        for module in model.modules()
-    )
+def _set_kernel_worker_threads(threads: int | None) -> None:
+    """Hand the kernels their pool size, or ``None`` to leave them their cache-domain policy."""
+    try:
+        from kestrel_kernels.ternary import set_worker_threads
+    except ImportError:
+        return
+    set_worker_threads(threads)
+
+
+def confine_to_cache_domain() -> None:
+    """Pin this process to the cores the kernels chose, when the caller has not already pinned it.
+
+    The kernels pin their own workers; a library may not move a caller's other threads, but the model
+    runtime may, and it has to: the thread that submits a parallel region works in it, so a submitter
+    roaming a 256-CPU box undoes the locality the workers were placed for. Measured on an unpinned process
+    on an EPYC 9575F, 50 utterances: 49.7x real time with only the workers pinned, 113x with the process
+    confined as well.
+
+    A no-op where the topology cannot be read (macOS has no affinity interface), and where the current mask
+    is already inside the chosen group.
+    """
+    try:
+        from kestrel_kernels import _cpu
+    except ImportError:
+        return
+    cpus = set(getattr(_cpu, "pool_cpus", tuple)())
+    if not cpus or not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        current = os.sched_getaffinity(0)
+        if current <= cpus:
+            return
+        os.sched_setaffinity(0, cpus)
+    except OSError:  # a container that forbids it; the workers are still placed
+        pass
 
 
 def _encoder_frames(samples: int, factor: int) -> int:
@@ -195,21 +225,46 @@ class ParakeetTdtRuntime:
         )
 
     def _set_cpu_threads(self, cfg: Any) -> int:
-        """Apply torch's intra-op thread count for this model's weight mode; returns the count in force.
+        """Apply torch's intra-op thread count; returns the count in force.
 
-        Dense weights go through torch's own GEMM and want every physical core; the ternary ``gemm8`` mode
-        runs its int8 GEMM on a separate native pool, and torch's spinning OpenMP workers only steal cores
-        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`. The mode is a property of the
-        loaded weights, so this runs after the model is built. ``torch.set_num_threads`` is process-global:
-        the last runtime to ask wins.
+        On the CPU this model's weights have exactly one resident form — packed codes with int8
+        activations — and that matrix multiply runs on the kernels' own pool, as do the fused encoder ops
+        beside it. torch is left with the subsampling convolutions, the decoder and the joint, and its
+        spinning OpenMP workers otherwise only steal cores from the pool, so the default is
+        :data:`NATIVE_GEMM_THREAD_CAP` whenever the model is on the CPU. ``torch.set_num_threads`` is
+        process-global: the last runtime to ask wins.
+
+        How many cores the model uses is not a number to pick either. Every kernel region here is short —
+        a 4.6 s utterance issues a few hundred — so a hand-off that crosses a last-level cache costs more
+        than the extra cores pay back, which is why sixteen cores spanning two CCDs of an EPYC 9575F is
+        *slower* than eight on one (86x against 113x real time). So the kernels size their pool to the
+        largest group of physical cores inside this process's affinity mask that share a cache, capped at
+        eight, and pin their workers there; :func:`confine_to_cache_domain` then confines this process to
+        the same group, because the thread that submits a region takes part in it and a submitter on
+        another CCD costs what the workers saved. For throughput on a many-core socket, run one process per
+        cache domain, each of them pinned, rather than one process across the socket.
+
+        ``cpu_threads`` in the config is the explicit override: it sizes the kernels' pool as well as
+        torch's, and suppresses the confinement, because an operator who names a count is managing placement
+        themselves. There is no environment variable for any of it.
+
+        A CPU deployment should also set ``OMP_WAIT_POLICY=passive`` in the environment before torch is
+        imported: measured on that machine at 4 / 8 / 16 pinned cores, the 50-utterance benchmark runs at
+        34 / 94 / 84x real time with torch's workers spinning and 90 / 113 / 86x with them parked. It
+        cannot be set from here — libgomp reads it when it loads.
         """
         threads = getattr(cfg, "cpu_threads", None)
+        if self.device.type != "cpu":
+            torch.set_num_threads(int(threads or default_cpu_threads()))
+            return torch.get_num_threads()
         if threads is None:
-            threads = (
-                default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
-                if _has_native_gemm_weights(self.model)
-                else default_cpu_threads()
-            )
+            confine_to_cache_domain()
+            _set_kernel_worker_threads(None)
+            threads = default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
+        else:
+            # A named count sizes the kernels' pool as well, and suppresses the confinement: an operator who
+            # picks a number is managing placement themselves.
+            _set_kernel_worker_threads(int(threads))
         torch.set_num_threads(int(threads))
         return torch.get_num_threads()
 

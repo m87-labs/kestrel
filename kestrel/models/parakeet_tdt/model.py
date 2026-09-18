@@ -16,6 +16,11 @@ from kestrel_kernels import get_runtime
 from .config import ParakeetEncoderConfig, ParakeetTdtConfig
 
 
+def _norm_args(norm: nn.LayerNorm) -> tuple[Tensor, Tensor, float]:
+    """A LayerNorm module as the ``conformer`` domain takes it."""
+    return norm.weight, norm.bias, norm.eps
+
+
 class FeedForward(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
@@ -27,7 +32,9 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
-        return self.linear2(F.silu(self.linear1(hidden)))
+        # The activation is a runtime op so a backend can do it in one pass over the [B, T, 4C] projection
+        # instead of the read-write-read torch needs; the reference is F.silu.
+        return self.linear2(get_runtime().conformer.silu(self.linear1(hidden)))
 
 
 class Convolution(nn.Module):
@@ -75,7 +82,7 @@ class Convolution(nn.Module):
         )
 
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
-        hidden = F.glu(self.pointwise_conv1(hidden), dim=-1)
+        hidden = get_runtime().conformer.glu(self.pointwise_conv1(hidden))
         norm = self.norm
         # The depthwise convolution, the eval-mode BatchNorm and the SiLU are one runtime op: it masks the
         # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
@@ -102,9 +109,8 @@ class RelativeAttention(nn.Module):
             config.hidden_size, 3 * config.hidden_size, bias=False
         )
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.relative_k_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=False
-        )
+        # ``relative_k_proj`` is not here: it does not depend on the activations, so the encoder runs all
+        # 24 layers' copies as one projection and hands each block its slice (see ``Encoder``).
         self.bias_u = nn.Parameter(torch.zeros(self.num_heads, self.head_dim))
         self.bias_v = nn.Parameter(torch.zeros(self.num_heads, self.head_dim))
 
@@ -142,13 +148,13 @@ class RelativeAttention(nn.Module):
             error_msgs,
         )
 
-    def forward(self, hidden: Tensor, positions: Tensor, mask: Tensor | None) -> Tensor:
+    def forward(self, hidden: Tensor, rel_k: Tensor, mask: Tensor | None) -> Tensor:
         # Everything between the projections and o_proj is one runtime op: the relative shift, the two score
         # products, the mask and the softmax. It takes the projections fused, which is what lets a backend
         # read q, k and v in place instead of materializing the chunk/view/transpose chain.
         attended = get_runtime().conformer.rel_attention(
             self.qkv_proj(hidden),
-            self.relative_k_proj(positions),
+            rel_k,
             self.bias_u,
             self.bias_v,
             mask,
@@ -173,17 +179,33 @@ class EncoderBlock(nn.Module):
     def forward(
         self,
         hidden: Tensor,
-        positions: Tensor,
+        rel_k: Tensor,
         pair_mask: Tensor | None,
         valid: Tensor | None,
     ) -> Tensor:
-        hidden = hidden + 0.5 * self.feed_forward1(self.norm_feed_forward1(hidden))
-        hidden = hidden + self.self_attn(
-            self.norm_self_att(hidden), positions, pair_mask
+        # Every residual add feeds straight into the next LayerNorm, so the two go through the runtime as one
+        # op returning both: the sum the next residual needs and the normalized input the next sublayer takes.
+        # A backend that fuses them reads the activation once instead of three times; the reference is the
+        # ``hidden + alpha * y`` then ``LayerNorm`` this replaces, and alpha is a power of two, so the bits
+        # are the ones the model had.
+        conformer = get_runtime().conformer
+        normed = conformer.layer_norm(hidden, *_norm_args(self.norm_feed_forward1))
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden, self.feed_forward1(normed), 0.5, *_norm_args(self.norm_self_att)
         )
-        hidden = hidden + self.conv(self.norm_conv(hidden), valid)
-        hidden = hidden + 0.5 * self.feed_forward2(self.norm_feed_forward2(hidden))
-        return self.norm_out(hidden)
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden,
+            self.self_attn(normed, rel_k, pair_mask),
+            1.0,
+            *_norm_args(self.norm_conv),
+        )
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden, self.conv(normed, valid), 1.0, *_norm_args(self.norm_feed_forward2)
+        )
+        _, out = conformer.add_scaled_layer_norm(
+            hidden, self.feed_forward2(normed), 0.5, *_norm_args(self.norm_out)
+        )
+        return out
 
 
 class Subsampling(nn.Module):
@@ -223,8 +245,17 @@ class Subsampling(nn.Module):
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden = features.unsqueeze(1)
         lengths = mask.sum(-1)
+        conformer = get_runtime().conformer
         for layer in self.layers:
-            hidden = layer(hidden)
+            if isinstance(layer, nn.Conv2d) and layer.groups == layer.in_channels > 1:
+                # The two depthwise convolutions go through the runtime: the reference is this same
+                # ``F.conv2d``, and a backend whose torch has no depthwise 2-D kernel (Apple silicon runs it
+                # one channel at a time -- 14 of the front end's 22 ms per utterance) replaces it.
+                hidden = conformer.depthwise_conv2d(
+                    hidden, layer.weight[:, 0], layer.bias, layer.stride[0], layer.padding[0]
+                )
+            else:
+                hidden = layer(hidden)
             if isinstance(layer, nn.Conv2d) and layer.stride != (1, 1):
                 lengths = (
                     lengths + 2 * layer.padding[0] - layer.kernel_size[0]
@@ -249,6 +280,13 @@ class Encoder(nn.Module):
         self.layers = nn.ModuleList(
             EncoderBlock(config) for _ in range(config.num_hidden_layers)
         )
+        # Every block projects the same relative-position table with its own weight, and the table does not
+        # depend on the activations -- so all 24 projections are one [2L-1, C] x [24C, C] matrix multiply
+        # instead of 24 narrow ones. Same arithmetic, 8.6 % of the encoder's projection work at 24x the
+        # output width, and one activation quantization on the packed CPU path rather than 24.
+        self.relative_k_proj = nn.Linear(
+            config.hidden_size, config.num_hidden_layers * config.hidden_size, bias=False
+        )
         inverse = 1 / (
             10_000
             ** (
@@ -257,6 +295,39 @@ class Encoder(nn.Module):
             )
         )
         self.register_buffer("inverse_frequency", inverse, persistent=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # The checkpoint keeps one relative-position projection per block; they concatenate by row into the
+        # encoder's single one, exactly as a block's q/k/v triple does. Ternary rows are independent, so the
+        # packed codes and their scales concatenate the same way.
+        for suffix in ("weight", "qweight", "scales"):
+            fused_key = f"{prefix}relative_k_proj.{suffix}"
+            source_keys = tuple(
+                f"{prefix}layers.{index}.self_attn.relative_k_proj.{suffix}"
+                for index in range(len(self.layers))
+            )
+            if fused_key not in state_dict and all(key in state_dict for key in source_keys):
+                state_dict[fused_key] = torch.cat(
+                    tuple(state_dict.pop(key) for key in source_keys)
+                ).contiguous()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def reset_nonpersistent_buffers(self) -> None:
         config = self.config
@@ -281,9 +352,14 @@ class Encoder(nn.Module):
         phase = torch.outer(relative_positions.float(), self.inverse_frequency)
         positions = torch.stack((phase.sin(), phase.cos()), dim=-1).flatten(-2)
         positions = positions[None].expand(hidden.shape[0], -1, -1).to(hidden.dtype)
+        # One projection for all the blocks, then a contiguous slice each: the layer axis moves to the front
+        # so a block's slice is the ordinary ``[B, 2L-1, C]`` the attention op takes on any backend.
+        relative = self.relative_k_proj(positions)
+        relative = relative.view(*relative.shape[:2], len(self.layers), -1)
+        relative = relative.permute(2, 0, 1, 3).contiguous()
         pair_mask = valid[:, :, None] & valid[:, None, :]
-        for layer in self.layers:
-            hidden = layer(hidden, positions, pair_mask, valid)
+        for layer, rel_k in zip(self.layers, relative):
+            hidden = layer(hidden, rel_k, pair_mask, valid)
         return hidden, valid
 
 
