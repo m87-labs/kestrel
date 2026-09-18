@@ -29,8 +29,11 @@ from kestrel.models.parakeet_tdt.model import ParakeetTdt
 from kestrel.models.parakeet_tdt.weights import ternarize
 
 
-GROUP_SIZE = 32
-_HIDDEN = 64
+# The real export's group size. The native dequant/GEMM ops constrain it
+# (a multiple of 64 that divides K, and 128 for the VNNI path), so the tiny
+# model keeps 128 and sizes its layers around it rather than shrinking it.
+GROUP_SIZE = 128
+_HIDDEN = 128
 _QUANTIZED = (
     "feed_forward1.linear1",
     "feed_forward1.linear2",

@@ -288,21 +288,28 @@ def _linux_physical_cores() -> int | None:
     return len(cores) or None
 
 
+def _affinity_count() -> int | None:
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return None
+
+
 def physical_cpu_count() -> int | None:
     """Physical cores available for compute, or ``None`` when undetectable.
 
     Apple silicon reports performance cores only; elsewhere SMT siblings are
-    collapsed so an 8-core/16-thread laptop answers 8.
+    collapsed so an 8-core/16-thread laptop answers 8. A process pinned to a
+    subset of the machine (``taskset``, a cgroup's cpuset) never counts more
+    cores than it is allowed to run on.
     """
     if platform.system() == "Darwin":
         return _apple_performance_cores()
     count = _linux_physical_cores()
-    if count is not None:
-        return count
-    try:
-        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except (AttributeError, OSError):
-        return os.cpu_count()
+    affinity = _affinity_count()
+    if count is None:
+        return affinity if affinity is not None else os.cpu_count()
+    return count if affinity is None else min(count, affinity)
 
 
 def default_cpu_threads(cap: int | None = None) -> int:
