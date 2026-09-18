@@ -96,6 +96,7 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         observed["seq_idx"] = kwargs["seq_idx"].clone()
         return kwargs["x"]
     def recurrence(qkv, *args, **kwargs):
+        assert qkv.is_contiguous()
         observed["qkv"] = qkv.clone()
         observed["initial"] = kwargs["initial_state"]
         return torch.zeros(1, 5, 1), None

@@ -621,12 +621,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             activation=self.activation,
             final_state=packed_conv_state,
         )
-        if conv_prefix and num_sequences == 1:
-            mixed_qkv = mixed_qkv[..., conv_prefix:].contiguous()
-        elif conv_prefix:
-            chunks = mixed_qkv.split(tuple(length + conv_prefix for length in sequence_lengths), dim=-1)
-            mixed_qkv = torch.cat([chunk[..., conv_prefix:] for chunk in chunks], dim=-1).contiguous()
         mixed_qkv = mixed_qkv.transpose(1, 2)
+        if conv_prefix and num_sequences == 1:
+            mixed_qkv = mixed_qkv[:, conv_prefix:].contiguous()
+        elif conv_prefix:
+            chunks = mixed_qkv.split(tuple(length + conv_prefix for length in sequence_lengths), dim=1)
+            mixed_qkv = torch.cat([chunk[:, conv_prefix:] for chunk in chunks], dim=1)
         workspace = self._prefill_workspace_cache.get(
             mixed_qkv,
             a,
@@ -660,7 +660,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         layer.has_previous_state = True
         if capture_prefix:
             # Projection/conv outputs own their storage; initial_state is the
-            # compact index_select copy made before writing the speculative pool.
+            # independent copy made before writing the speculative pool.
             cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord.capture(
                 self, mixed_qkv, a, b, conv_input, initial_state, state_indices)
         return output
