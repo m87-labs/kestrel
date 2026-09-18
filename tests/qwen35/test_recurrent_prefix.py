@@ -76,11 +76,12 @@ def test_packed_prefix_records_split_independent_histories():
         record.split_sequences((1, 3))
 
 
-def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch):
+@pytest.mark.parametrize("state_indices", [(1, 0), (1, 1)])
+def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, state_indices):
     observed = {}
     layer = SimpleNamespace(
         conv_states=torch.tensor([[[10., 11., 12.]], [[20., 21., 22.]]]),
-        recurrent_states=torch.zeros(2, 1, 1, 1, dtype=torch.bfloat16),
+        recurrent_states=torch.tensor([10., 20.], dtype=torch.bfloat16).view(2, 1, 1, 1),
         has_previous_state=True)
     cache = Qwen35InferenceCache(
         config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
@@ -91,6 +92,7 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch):
     cache._prefix_records = {}
     def conv(**kwargs):
         observed["conv"] = kwargs["x"].clone()
+        observed["conv_stride"] = kwargs["x"].stride()
         observed["seq_idx"] = kwargs["seq_idx"].clone()
         return kwargs["x"]
     def recurrence(qkv, *args, **kwargs):
@@ -117,20 +119,24 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch):
     output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
         cache_params=cache, cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
         sequence_lengths=(2, 3), topology_token=object(),
-        gdn_state_indices=torch.tensor([1, 0]), gdn_state_indices_allocator_owned=True)
+        gdn_state_indices=torch.tensor(state_indices), gdn_state_indices_allocator_owned=True)
     assert output.shape == (1, 5, 1)
     assert concatenations[0] == 4  # Prefix/token pairs need no intermediate copies.
+    assert observed["conv_stride"][1] == 1
     assert observed["conv"].flatten().tolist() == [11, 12, 1, 2, 21, 22, 3, 4, 5]
     assert observed["seq_idx"].flatten().tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 1]
     assert observed["qkv"].flatten().tolist() == [1, 2, 3, 4, 5]
     assert observed["initial"].shape == (2, 1, 1, 1)
+    assert observed["initial"].flatten().tolist() == [10. + 10. * index for index in state_indices]
+    layer.recurrent_states.fill_(-1)
+    assert observed["initial"].flatten().tolist() == [10. + 10. * index for index in state_indices]
     records = cache._prefix_records[0].split_sequences((2, 3))
-    assert records[0].state_indices.tolist() == [1]
-    assert records[1].state_indices.tolist() == [0]
+    assert records[0].state_indices.tolist() == [state_indices[0]]
+    assert records[1].state_indices.tolist() == [state_indices[1]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("lengths", [(16, 16), (5, 13)])
+@pytest.mark.parametrize("lengths", [(16, 16), (5, 13), (1, 3), (17, 65)])
 def test_native_packed_continuation_matches_independent_sequences(monkeypatch, lengths):
     import kestrel_kernels
     from kestrel_kernels.runtime import get_runtime
@@ -146,6 +152,17 @@ def test_native_packed_continuation_matches_independent_sequences(monkeypatch, l
     module.norm.weight.data = module.norm.weight.data.float()
     module.in_proj = torch.nn.Identity()
     module.out_proj = torch.nn.Identity()
+    native_conv = module.causal_conv1d_packed
+    def checked_conv(**kwargs):
+        assert kwargs["x"].stride(1) == 1
+        output = native_conv(**kwargs)
+        reference_state = torch.full_like(kwargs["final_state"], float("nan"))
+        reference = native_conv(**{**kwargs, "x": kwargs["x"].contiguous(),
+                                   "final_state": reference_state})
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["final_state"], reference_state, rtol=0, atol=0)
+        return output
+    module.causal_conv1d_packed = checked_conv
     width = module.conv_dim + module.value_dim + 2 * module.num_v_heads
     x = torch.randn(1, sum(lengths), width, device="cuda", dtype=torch.bfloat16) * .1
     conv = torch.randn(2, module.conv_dim, 4, device="cuda", dtype=torch.bfloat16) * .1

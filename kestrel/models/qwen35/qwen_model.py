@@ -580,7 +580,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         packed_recurrent_state = layer.recurrent_states
         initial_state = (
-            packed_recurrent_state.index_select(0, state_indices)
+            packed_recurrent_state.gather(
+                0, state_indices[:, None, None, None].expand(
+                    -1, *packed_recurrent_state.shape[1:]))
             if has_initial_state else None
         )
         if seq_idx is None:
@@ -591,18 +593,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         recurrence_cu_seqlens = cu_seqlens_q
         conv_prefix = self.conv_kernel_size - 1 if has_initial_state else 0
+        # Preserve channel-contiguous projection storage through history concatenation.
         if conv_prefix and num_sequences == 1:
             mixed_qkv = torch.cat(
-                (packed_conv_state[..., -conv_prefix:], mixed_qkv), dim=-1)
+                (packed_conv_state[..., -conv_prefix:].transpose(1, 2),
+                 mixed_qkv.transpose(1, 2)), dim=1).transpose(1, 2)
             seq_idx = cache_params.conv_sequence_indices(
                 (mixed_qkv.shape[-1] - conv_prefix,), conv_prefix, mixed_qkv.device)
         elif conv_prefix:
             chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
             mixed_qkv = torch.cat([
-                part
+                part.transpose(1, 2)
                 for index, chunk in enumerate(chunks)
                 for part in (packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk)
-            ], dim=-1)
+            ], dim=1).transpose(1, 2)
             seq_idx = cache_params.conv_sequence_indices(
                 sequence_lengths, conv_prefix, mixed_qkv.device)
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
