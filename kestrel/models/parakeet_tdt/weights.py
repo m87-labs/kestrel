@@ -24,6 +24,9 @@ _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # tokenizer.json; ``load_parakeet_tdt`` recognises the manifest and builds the ternary variant.
 TERNARY_MODEL_ID = "m87-labs/parakeet-tdt-0.6b-v3-ternary"
 TERNARY_MANIFEST = "ternary.json"
+# The ternary student ships for CPU and Apple silicon only for now: a CUDA request runs it on MPS when available,
+# else on the CPU (its GEMMs are dense bf16/fp16/fp32 through torch there; the 2-bit kernels are CPU/ARM code).
+TERNARY_DEVICE_TYPES = frozenset({"cpu", "mps"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +94,26 @@ class TernaryManifest:
             float(m["size_mb"]),
             m["source"],
         )
+
+
+def is_ternary_checkpoint(checkpoint: str | Path | None, model_name: str | None = None) -> bool:
+    """Whether ``checkpoint`` (a local directory) or ``model_name`` designates the ternary student."""
+    if model_name == TERNARY_MODEL_ID:
+        return True
+    if checkpoint is None:
+        return False
+    path = Path(checkpoint)
+    return path.is_dir() and (path / TERNARY_MANIFEST).exists()
+
+
+def ternary_runtime_device(device: torch.device) -> torch.device:
+    """The device the ternary student actually runs on: ``device`` when it is CPU or MPS, otherwise MPS if this
+    torch has it, else CPU (see ``TERNARY_DEVICE_TYPES``)."""
+    if device.type in TERNARY_DEVICE_TYPES:
+        return device
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def _set_submodule(root: nn.Module, name: str, module: nn.Module) -> None:
@@ -192,9 +215,12 @@ __all__ = [
     "LoadedParakeetTdt",
     "MODEL_ID",
     "REVISION",
+    "TERNARY_DEVICE_TYPES",
     "TERNARY_MODEL_ID",
     "TernaryManifest",
+    "is_ternary_checkpoint",
     "load_parakeet_tdt",
     "load_parakeet_tdt_ternary",
     "ternarize",
+    "ternary_runtime_device",
 ]

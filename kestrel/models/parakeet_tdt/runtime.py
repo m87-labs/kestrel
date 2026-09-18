@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from kestrel.config import cpu_default_dtype
 from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
 
@@ -30,7 +32,9 @@ from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
 from .tokenizer import ParakeetTokenizer
-from .weights import MODEL_ID, load_parakeet_tdt
+from .weights import MODEL_ID, is_ternary_checkpoint, load_parakeet_tdt, ternary_runtime_device
+
+logger = logging.getLogger(__name__)
 
 
 def _timed_segments(
@@ -119,13 +123,23 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
+        checkpoint = getattr(cfg, "model_path", None) or self._model_name
+        if model is None and is_ternary_checkpoint(checkpoint, self._model_name):
+            target = ternary_runtime_device(self.device)
+            if target != self.device:
+                logger.warning(
+                    "%s runs on CPU/MPS only for now; using %s instead of %s",
+                    self._model_name, target, self.device,
+                )
+                self.device = target
+                if getattr(cfg, "dtype", torch.bfloat16) == torch.bfloat16:
+                    self.dtype = torch.float16 if target.type == "mps" else cpu_default_dtype()
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
             else make_stream(self.device)
         )
         if model is None or tokenizer is None:
-            checkpoint = getattr(cfg, "model_path", None) or self._model_name
             loaded = load_parakeet_tdt(
                 checkpoint,
                 device=self.device,
