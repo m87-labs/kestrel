@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -11,17 +10,8 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.config import (
-    NATIVE_GEMM_THREAD_CAP,
-    cpu_default_dtype,
-    default_cpu_threads,
-)
-from kestrel.device import (
-    configure_cpu_threads,
-    empty_cache,
-    make_stream,
-    resolve_device,
-)
+from kestrel.config import NATIVE_GEMM_THREAD_CAP, default_cpu_threads
+from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
@@ -41,9 +31,7 @@ from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
 from .tokenizer import ParakeetTokenizer
-from .weights import MODEL_ID, is_ternary_checkpoint, load_parakeet_tdt, ternary_runtime_device
-
-logger = logging.getLogger(__name__)
+from .weights import MODEL_ID, load_parakeet_tdt
 
 
 def _timed_segments(
@@ -83,15 +71,13 @@ def _timed_segments(
     return tuple(segments)
 
 
-def _weight_modes(model: torch.nn.Module) -> frozenset[str]:
-    """Weight-cache modes present in ``model`` (``dense``/``vnni``/... for
-    ternary layers; empty for an ordinary fp checkpoint)."""
-    modes = set()
-    for module in model.modules():
-        mode = getattr(getattr(module, "weight", None), "mode", None)
-        if isinstance(mode, str):
-            modes.add(mode)
-    return frozenset(modes)
+def _has_native_gemm_weights(model: torch.nn.Module) -> bool:
+    """Whether any layer runs its GEMM on the kernels' own thread pool: the ternary ``gemm8`` weight mode
+    (int8 activations, packed weight panels). Dense and fp weights go through torch's GEMM instead."""
+    return any(
+        getattr(getattr(module, "weight", None), "mode", None) == "gemm8"
+        for module in model.modules()
+    )
 
 
 def _encoder_frames(samples: int, factor: int) -> int:
@@ -146,17 +132,6 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
-        checkpoint = getattr(cfg, "model_path", None) or self._model_name
-        if model is None and is_ternary_checkpoint(checkpoint, self._model_name):
-            target = ternary_runtime_device(self.device)
-            if target != self.device:
-                logger.warning(
-                    "%s runs on CPU/MPS only for now; using %s instead of %s",
-                    self._model_name, target, self.device,
-                )
-                self.device = target
-                if getattr(cfg, "dtype", torch.bfloat16) == torch.bfloat16:
-                    self.dtype = torch.float16 if target.type == "mps" else cpu_default_dtype()
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
@@ -164,7 +139,7 @@ class ParakeetTdtRuntime:
         )
         if model is None or tokenizer is None:
             loaded = load_parakeet_tdt(
-                checkpoint,
+                getattr(cfg, "model_path", None) or self._model_name,
                 device=self.device,
                 dtype=self.dtype,
                 ternary_mode=getattr(cfg, "ternary_mode", "auto"),
@@ -172,9 +147,7 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
-        self.cpu_threads = (
-            self._configure_cpu_threads(cfg) if self.device.type == "cpu" else None
-        )
+        self.cpu_threads = self._set_cpu_threads(cfg) if self.device.type == "cpu" else None
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -222,24 +195,24 @@ class ParakeetTdtRuntime:
             stream=self.compute_stream,
         )
 
-    def _configure_cpu_threads(self, cfg: Any) -> int:
-        """Apply the CPU intra-op thread count for this model's weight mode.
+    def _set_cpu_threads(self, cfg: Any) -> int:
+        """Apply torch's intra-op thread count for this model's weight mode; returns the count in force.
 
-        Dense weights go through torch's own GEMM and want every physical
-        core; the ternary ``vnni`` mode runs its int8 GEMM on a separate
-        native pool, and torch's spinning OpenMP workers only steal cores
-        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`.
-        The mode is a property of the loaded weights, so this runs after the
-        model is built (and after weight materialization, which is itself
-        happier with every core).
+        Dense weights go through torch's own GEMM and want every physical core; the ternary ``gemm8`` mode
+        runs its int8 GEMM on a separate native pool, and torch's spinning OpenMP workers only steal cores
+        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`. The mode is a property of the
+        loaded weights, so this runs after the model is built. ``torch.set_num_threads`` is process-global:
+        the last runtime to ask wins.
         """
-        cap = NATIVE_GEMM_THREAD_CAP if "vnni" in _weight_modes(self.model) else None
-        threads = (
-            cfg.resolved_cpu_threads(cap=cap)
-            if hasattr(cfg, "resolved_cpu_threads")
-            else getattr(cfg, "cpu_threads", None) or default_cpu_threads(cap)
-        )
-        return configure_cpu_threads(int(threads))
+        threads = getattr(cfg, "cpu_threads", None)
+        if threads is None:
+            threads = (
+                default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
+                if _has_native_gemm_weights(self.model)
+                else default_cpu_threads()
+            )
+        torch.set_num_threads(int(threads))
+        return torch.get_num_threads()
 
     @property
     def model_name(self) -> str:

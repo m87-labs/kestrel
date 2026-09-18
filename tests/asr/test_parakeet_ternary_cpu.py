@@ -17,20 +17,15 @@ import numpy as np
 import pytest
 import torch
 
-from kestrel.config import (
-    NATIVE_GEMM_THREAD_CAP,
-    RuntimeConfig,
-    default_cpu_threads,
-    physical_cpu_count,
-)
+from kestrel.config import NATIVE_GEMM_THREAD_CAP, RuntimeConfig, default_cpu_threads
 from kestrel.models.parakeet_tdt import TERNARY_MODEL_ID
 from kestrel.models.parakeet_tdt.config import ParakeetTdtConfig
 from kestrel.models.parakeet_tdt.model import ParakeetTdt
-from kestrel.models.parakeet_tdt.weights import ternarize
+from kestrel.models.parakeet_tdt.weights import _quantized_modules, ternarize
 
 
-# The real export's group size. The native dequant/GEMM ops constrain it
-# (a multiple of 64 that divides K, and 128 for the VNNI path), so the tiny
+# The real export's group size. The native GEMM constrains it (a multiple of 64
+# that divides K, and 128 for the int8-activation ``gemm8`` mode), so the tiny
 # model keeps 128 and sizes its layers around it rather than shrinking it.
 GROUP_SIZE = 128
 _HIDDEN = 128
@@ -238,21 +233,12 @@ def test_unrestricted_models_keep_the_cuda_default() -> None:
 
 def test_cpu_thread_policy(monkeypatch) -> None:
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
-    physical = physical_cpu_count()
-    assert physical is None or physical >= 1
     assert 1 <= default_cpu_threads() <= 8
     assert 1 <= default_cpu_threads(NATIVE_GEMM_THREAD_CAP) <= NATIVE_GEMM_THREAD_CAP
     # An explicit environment knob is a deliberate choice, cap or no cap.
     monkeypatch.setenv("OMP_NUM_THREADS", "11")
     assert default_cpu_threads() == 11
     assert default_cpu_threads(NATIVE_GEMM_THREAD_CAP) == 11
-    monkeypatch.delenv("OMP_NUM_THREADS")
-    cfg = RuntimeConfig(
-        model=TERNARY_MODEL_ID, model_path="/nonexistent", device="cpu", cpu_threads=3
-    )
-    assert cfg.resolved_cpu_threads() == 3
-    # An explicit count is the caller's decision; a runtime cap cannot lower it.
-    assert cfg.resolved_cpu_threads(cap=1) == 3
     with pytest.raises(ValueError):
         RuntimeConfig(
             model=TERNARY_MODEL_ID,
@@ -371,13 +357,11 @@ def test_ternarize_fuses_the_exports_separate_qkv(tmp_path) -> None:
     pytest.importorskip("kestrel_kernels.ternary")
     from kestrel_kernels.ternary import TernaryLinear
 
-    from kestrel.models.parakeet_tdt.weights import TernaryManifest
-
     root = build_tiny_ternary_export(tmp_path / "export")
     config = ParakeetTdtConfig.from_json_file(root / "config.json")
-    manifest = TernaryManifest.load(root / "ternary.json")
     with torch.device("meta"):
-        model = ternarize(ParakeetTdt(config), manifest)
+        model = ParakeetTdt(config)
+        ternarize(model, _quantized_modules(root / "ternary.json"))
     attention = model.get_submodule("encoder.layers.0.self_attn")
     assert isinstance(attention.qkv_proj, TernaryLinear)
     assert attention.qkv_proj.out_features == 3 * config.encoder.hidden_size
