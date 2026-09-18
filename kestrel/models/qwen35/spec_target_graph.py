@@ -98,13 +98,16 @@ class Qwen35TargetGraph:
         with self._graphs.launch(*inputs) as values:
             hidden, taps = values[0], values[1:1 + len(self._capture_layers)]
             remaining = iter(values[1 + len(self._capture_layers):])
+            destinations, sources = [], []
             for index in self._linear:
                 layer = cache.layers[index]
-                layer.conv_states.copy_(next(remaining))
-                layer.recurrent_states.copy_(next(remaining))
+                destinations.extend((layer.conv_states, layer.recurrent_states))
+                sources.extend((next(remaining), next(remaining)))
                 record = _RecurrentPrefixRecord(self._text.layers[index].linear_attn,
                     *(next(remaining) for _ in _RECORDS))
                 cache._prefix_records[index] = record
+            if destinations:
+                torch._foreach_copy_(destinations, sources)
             yield _TextModelOutput(hidden, cache, tuple(taps))
 
     def shutdown(self):
