@@ -197,6 +197,7 @@ def _replay_recurrent_prefix(mixed, a, b, A_log, dt_bias, initial, cu, topology)
     indices = torch.arange(count, device=mixed.device, dtype=torch.int64)
     runtime.packed_recurrent_gated_delta_rule_prefill(
         q, k, v, g, beta, cu, initial_state=initial, final_state=final,
+        output_sequence=False,
         final_state_indices=indices, final_state_indices_allocator_owned=True,
         sequence_lengths=lengths, topology_token=topology)
     return final

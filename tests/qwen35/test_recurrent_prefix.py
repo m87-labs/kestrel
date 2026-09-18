@@ -391,6 +391,7 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
 
     def recurrence(q, k, v, g, beta, cu, **kwargs):
         recurrences.append(kwargs["sequence_lengths"])
+        assert kwargs["output_sequence"] is False
         assert kwargs["sequence_lengths"] == (3, 3)
         assert torch.all(q[:, :3] == 2) and torch.all(q[:, 3:] == 5)
         assert beta.dtype == torch.float32
