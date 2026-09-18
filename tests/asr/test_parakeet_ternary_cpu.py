@@ -29,20 +29,6 @@ from kestrel.models.parakeet_tdt.weights import _quantized_modules, ternarize
 # model keeps 128 and sizes its layers around it rather than shrinking it.
 GROUP_SIZE = 128
 _HIDDEN = 128
-_QUANTIZED = (
-    "feed_forward1.linear1",
-    "feed_forward1.linear2",
-    "self_attn.q_proj",
-    "self_attn.k_proj",
-    "self_attn.v_proj",
-    "self_attn.o_proj",
-    "self_attn.relative_k_proj",
-    "conv.pointwise_conv1",
-    "conv.pointwise_conv2",
-    "feed_forward2.linear1",
-    "feed_forward2.linear2",
-)
-
 _CONFIG: dict[str, Any] = {
     "architectures": ["ParakeetForTDT"],
     "blank_token_id": 31,
@@ -123,76 +109,51 @@ def build_tiny_ternary_export(root: Path, *, seed: int = 0) -> Path:
     config = ParakeetTdtConfig.from_json_file(root / "config.json")
     with torch.device("meta"):
         reference = ParakeetTdt(config)
-    shapes = {
-        name: (module.weight.shape[0], module.weight.shape[1])
-        for name, module in reference.named_modules()
-        if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d))
-    }
 
-    # The export keeps q/k/v separate (HF naming); ``ternarize`` fuses them.
-    quantized = []
-    for layer in range(config.encoder.num_hidden_layers):
-        for suffix in _QUANTIZED:
-            name = f"encoder.layers.{layer}.{suffix}"
-            if suffix.startswith("self_attn.") and suffix.endswith(
-                ("q_proj", "k_proj", "v_proj")
-            ):
-                out_features = in_features = config.encoder.hidden_size
-            else:
-                out_features, in_features = shapes[name]
-            quantized.append(
-                {
-                    "name": name,
-                    "out_features": int(out_features),
-                    "in_features": int(in_features),
-                    "group_size": GROUP_SIZE,
-                    "as_conv1d": False,
-                    "has_bias": False,
-                    "zero_fraction": 0.33,
-                }
-            )
+    # Every encoder linear is quantized. The export keeps the attention projections separate under their HF
+    # names, the way thrush writes them; ``ternarize`` fuses them back into the model's qkv_proj.
+    hidden = config.encoder.hidden_size
+    quantized: list[dict[str, Any]] = []
+    fused: set[str] = set()
+    for name, module in reference.named_modules():
+        if not name.startswith("encoder.layers.") or not isinstance(module, torch.nn.Linear):
+            continue
+        if name.endswith("qkv_proj"):
+            fused.add(name)
+            shapes = [(f"{name[: -len('qkv_proj')]}{attr}", hidden, hidden) for attr in ("q_proj", "k_proj", "v_proj")]
+        else:
+            shapes = [(name, module.out_features, module.in_features)]
+        quantized += [
+            {"name": n, "out_features": out, "in_features": inp, "group_size": GROUP_SIZE, "has_bias": False}
+            for n, out, inp in shapes
+        ]
     (root / "ternary.json").write_text(
         json.dumps(
             {
                 "format": "thrush-ternary-v1",
                 "names": "hf",
-                "packing": {"bits": 2, "code_offset": 1, "elements_per_byte": 4},
                 "quant": {"mode": "ternary", "group_size": GROUP_SIZE},
-                "source": {"checkpoint": "tests/tiny", "step": 0},
                 "quantized_modules": quantized,
-                "n_quantized_params": 0,
-                "n_dense_params": 0,
-                "size_mb": 0.1,
             }
         )
     )
 
     generator = torch.Generator().manual_seed(seed)
-    quantized_names = {entry["name"] for entry in quantized}
+    skip = fused | {entry["name"] for entry in quantized}
     state: dict[str, torch.Tensor] = {}
     for name, tensor in reference.state_dict().items():
-        module_name = name.rsplit(".", 1)[0]
-        if module_name in quantized_names or (
-            module_name.endswith("qkv_proj")
-            and f"{module_name[: -len('qkv_proj')]}q_proj" in quantized_names
-        ):
+        if name.rsplit(".", 1)[0] in skip:
             continue
-        if tensor.dtype.is_floating_point:
-            state[name] = torch.randn(
-                tensor.shape, generator=generator, dtype=torch.float32
-            ) * 0.05
-        else:
+        if not tensor.dtype.is_floating_point:
             state[name] = torch.zeros(tensor.shape, dtype=tensor.dtype)
-    # BatchNorm must not divide by a random (possibly negative) variance.
-    for name in list(state):
-        if name.endswith("norm.running_var"):
-            state[name] = torch.ones_like(state[name])
+        elif name.endswith("norm.running_var"):
+            state[name] = torch.ones(tensor.shape)  # BatchNorm must not divide by a random variance
         elif name.endswith("norm.running_mean"):
-            state[name] = torch.zeros_like(state[name])
+            state[name] = torch.zeros(tensor.shape)
+        else:
+            state[name] = 0.05 * torch.randn(tensor.shape, generator=generator, dtype=torch.float32)
     for entry in quantized:
-        packed, scales = _pack_ternary(
-            entry["out_features"], entry["in_features"], generator
-        )
+        packed, scales = _pack_ternary(entry["out_features"], entry["in_features"], generator)
         state[f"{entry['name']}.qweight"] = packed
         state[f"{entry['name']}.scales"] = scales
     save_file(state, str(root / "model.safetensors"))
@@ -254,10 +215,8 @@ def test_cpu_thread_policy(monkeypatch) -> None:
 @pytest.fixture
 def offline_engine(monkeypatch):
     """``InferenceEngine`` with its two network side-effects stubbed out."""
-    pytest.importorskip(
-        "kestrel_kernels.ternary",
-        reason="the ternary layers ship with kestrel-kernels",
-    )
+    for module in ("kestrel_kernels.ternary", "kestrel_kernels.conformer_ops"):
+        pytest.importorskip(module, reason="the ternary layers and conformer ops ship with kestrel-kernels")
     import kestrel.engine.core as core
     import kestrel.model_download as model_download
     from kestrel.photon import PhotonReporter
