@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from kestrel_kernels import get_runtime
+
 from .config import ParakeetEncoderConfig, ParakeetTdtConfig
 
 
@@ -28,29 +30,11 @@ class FeedForward(nn.Module):
         return self.linear2(F.silu(self.linear1(hidden)))
 
 
-def _pointwise(conv: nn.Module, hidden: Tensor) -> Tensor:
-    """A 1x1 ``Conv1d`` applied in the linear layout ``[B, T, C]``. Kernel-runtime layers that replace the conv
-    (the ternary student) take that layout through their own forward."""
-    weight = conv.weight
-    if isinstance(weight, Tensor):
-        return F.linear(hidden, weight[..., 0], conv.bias)
-    return conv(hidden)
-
-
-# Devices whose depthwise Conv1d runs as shifted multiply-adds in the [B, T, C] layout (see ``Convolution``).
-# CUDA keeps cuDNN's depthwise kernel (fast, and the validated reference numerics). On CPU the swap only pays
-# where torch has no oneDNN: with oneDNN (x86) the Conv1d path measured equal in fp32 and 8 % faster in bf16
-# on an EPYC 9575F; without it (macOS arm64) torch runs the conv one channel at a time, 53-67 % of the encoder's time.
-DEPTHWISE_LINEAR_LAYOUT_DEVICES: frozenset[str] = frozenset(
-    {"mps"} | (set() if torch.backends.mkldnn.is_available() else {"cpu"})
-)
-
-
 class Convolution(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
         channels = config.hidden_size
-        self.pointwise_conv1 = nn.Conv1d(channels, 2 * channels, 1, bias=False)
+        self.pointwise_conv1 = nn.Linear(channels, 2 * channels, bias=False)
         self.depthwise_conv = nn.Conv1d(
             channels,
             channels,
@@ -60,42 +44,59 @@ class Convolution(nn.Module):
             bias=False,
         )
         self.norm = nn.BatchNorm1d(channels)
-        self.pointwise_conv2 = nn.Conv1d(channels, channels, 1, bias=False)
+        self.pointwise_conv2 = nn.Linear(channels, channels, bias=False)
+        # ``norm`` folded to a per-channel affine by ``reset_nonpersistent_buffers`` once the running stats
+        # are loaded: the depthwise op takes the affine, never the running stats.
+        self.register_buffer("bn_scale", torch.ones(channels), persistent=False)
+        self.register_buffer("bn_shift", torch.zeros(channels), persistent=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # The checkpoint stores the 1x1 convolutions as ``Conv1d`` weights ``[C_out, C_in, 1]``. Running them
+        # as linears measured 42.87 ms vs 45.37 ms encoder wall on L4 at batch 1, and it is the layout the
+        # ternary export already packs, so the trailing kernel axis is dropped on the way in.
+        for name in ("pointwise_conv1", "pointwise_conv2"):
+            key = f"{prefix}{name}.weight"
+            weight = state_dict.get(key)
+            if weight is not None and weight.dim() == 3:
+                state_dict[key] = weight[..., 0]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def reset_nonpersistent_buffers(self) -> None:
+        # Deferred: ``kestrel_kernels.conformer_ops`` ships with the kernels release this model needs, and
+        # importing it at module scope would break the runtimes that never build a conformer.
+        from kestrel_kernels.conformer_ops import fold_batchnorm
+
+        self.bn_scale, self.bn_shift = fold_batchnorm(self.norm)
 
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
-        # Treating both 1x1 convolutions as linears measured 42.87 ms vs
-        # 45.37 ms encoder wall on L4 at batch 1; keep the depthwise Conv1d.
-        hidden = F.glu(_pointwise(self.pointwise_conv1, hidden), dim=-1)
-        if valid is not None:
-            hidden = hidden.masked_fill(~valid[..., None], 0)
-        if hidden.device.type in DEPTHWISE_LINEAR_LAYOUT_DEVICES and not self.norm.training:
-            hidden = F.silu(self._depthwise_norm_linear_layout(hidden))
-        else:
-            hidden = self.depthwise_conv(hidden.transpose(1, 2))
-            hidden = F.silu(self.norm(hidden)).transpose(1, 2)
-        return _pointwise(self.pointwise_conv2, hidden)
-
-    def _depthwise_norm_linear_layout(self, hidden: Tensor) -> Tensor:
-        """Depthwise conv + eval-mode BatchNorm on ``[B, T, C]`` as ``k`` shifted multiply-adds.
-
-        torch's CPU depthwise Conv1d on macOS falls to ``_slow_conv2d_forward`` one channel at a time (251k calls
-        and 53-67 % of the encoder's time on an M2), and the transposed layout costs two copies per layer on every
-        backend. The taps accumulate in fp32 so the result rounds once, like the fused kernels do.
-        """
-        weight = self.depthwise_conv.weight[:, 0, :]  # [C, k]
-        taps = weight.shape[-1]
-        pad = (taps - 1) // 2
-        length = hidden.shape[1]
-        x = F.pad(hidden, (0, 0, pad, pad)).float()
-        out = x[:, :length] * weight[:, 0].float()
-        for j in range(1, taps):
-            out = torch.addcmul(out, x[:, j : j + length], weight[:, j].float())
-        if self.depthwise_conv.bias is not None:
-            out = out + self.depthwise_conv.bias.float()
-        norm = self.norm
-        scale = norm.weight.float() * torch.rsqrt(norm.running_var.float() + norm.eps)
-        shift = norm.bias.float() - norm.running_mean.float() * scale
-        return torch.addcmul(shift, out, scale).to(hidden.dtype)
+        hidden = F.glu(self.pointwise_conv1(hidden), dim=-1)
+        # The depthwise convolution, the folded BatchNorm and the SiLU are one runtime op: it masks the
+        # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
+        hidden = get_runtime().conformer.depthwise_conv_bn_silu(
+            hidden,
+            self.depthwise_conv.weight[:, 0, :],  # the op takes the depthwise weight as [C, k]
+            self.bn_scale,
+            self.bn_shift,
+            valid,
+        )
+        return self.pointwise_conv2(hidden)
 
 
 class RelativeAttention(nn.Module):
@@ -127,14 +128,17 @@ class RelativeAttention(nn.Module):
         # One QKV GEMM measured 43.35 ms vs 45.37 ms encoder wall on L4 at
         # batch 1. Fuse the checkpoint's separate tensors without retaining a
         # duplicate 144 MiB BF16 copy across the 24 encoder layers.
-        fused_key = f"{prefix}qkv_proj.weight"
-        source_keys = tuple(f"{prefix}{name}_proj.weight" for name in "qkv")
-        if fused_key not in state_dict and all(
-            key in state_dict for key in source_keys
-        ):
-            state_dict[fused_key] = torch.cat(
-                tuple(state_dict.pop(key) for key in source_keys)
-            ).contiguous()
+        # A ternary checkpoint carries packed codes and scales instead of a weight; ternary rows are
+        # independent, so those concatenate by row just as the dense weight does.
+        for suffix in ("weight", "qweight", "scales"):
+            fused_key = f"{prefix}qkv_proj.{suffix}"
+            source_keys = tuple(f"{prefix}{name}_proj.{suffix}" for name in "qkv")
+            if fused_key not in state_dict and all(
+                key in state_dict for key in source_keys
+            ):
+                state_dict[fused_key] = torch.cat(
+                    tuple(state_dict.pop(key) for key in source_keys)
+                ).contiguous()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -289,6 +293,8 @@ class Encoder(nn.Module):
                 )
             )
         ).to(self.subsampling.linear.weight.device)
+        for layer in self.layers:
+            layer.conv.reset_nonpersistent_buffers()
 
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden, valid = self.subsampling(features, mask)
