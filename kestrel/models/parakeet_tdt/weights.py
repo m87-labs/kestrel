@@ -158,10 +158,11 @@ def load_parakeet_tdt_ternary(
     mode: str = "auto",
 ) -> LoadedParakeetTdt:
     """Build the fp architecture, swap in the ternary layers, load the packed export with ``strict=True``, then
-    materialize the weight cache: ``jit`` (2-bit weights resident, each layer expanded into a shared scratch buffer
-    by the native op right before its GEMM; the CPU default), ``dense`` (dequantized once, 2 bytes/weight in
-    bf16/fp16; the accelerator default), ``int8`` (1 byte/weight, one scaling pass per call) or ``packed``
-    (0.25 byte/weight, bit-unpack in torch per call). ``auto`` picks jit on CPU and dense elsewhere. Activations
+    materialize the weight cache: ``dense`` (dequantized once, 2 bytes/weight in bf16/fp16; the default until the
+    packed-code GEMM kernels ship), ``jit`` (2-bit weights resident, each layer expanded into a shared scratch
+    buffer by the native op right before its GEMM; opt-in, 0.6-0.8x of dense), ``int8`` (1 byte/weight, one scaling
+    pass per call) or ``packed`` (0.25 byte/weight, bit-unpack in torch per call). ``auto`` = the runtime's default
+    (dense). Activations
     stay in ``dtype``; nothing is quantized at run time. ``root`` needs config.json and tokenizer.json next to the
     export (the pinned fp checkpoint's files are used when they are absent)."""
     from kestrel_kernels.ternary import materialize_ternary
