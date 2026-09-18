@@ -126,7 +126,12 @@ class ParakeetTdtRuntime:
         )
         if model is None or tokenizer is None:
             checkpoint = getattr(cfg, "model_path", None) or self._model_name
-            loaded = load_parakeet_tdt(checkpoint, device=self.device, dtype=self.dtype)
+            loaded = load_parakeet_tdt(
+                checkpoint,
+                device=self.device,
+                dtype=self.dtype,
+                ternary_mode=getattr(cfg, "ternary_mode", "dense"),
+            )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer

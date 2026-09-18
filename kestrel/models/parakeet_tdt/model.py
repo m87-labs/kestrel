@@ -28,6 +28,15 @@ class FeedForward(nn.Module):
         return self.linear2(F.silu(self.linear1(hidden)))
 
 
+def _pointwise(conv: nn.Module, hidden: Tensor) -> Tensor:
+    """A 1x1 ``Conv1d`` applied in the linear layout ``[B, T, C]``. Kernel-runtime layers that replace the conv
+    (the ternary student) take that layout through their own forward."""
+    weight = conv.weight
+    if isinstance(weight, Tensor):
+        return F.linear(hidden, weight[..., 0], conv.bias)
+    return conv(hidden)
+
+
 class Convolution(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
@@ -47,14 +56,12 @@ class Convolution(nn.Module):
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
         # Treating both 1x1 convolutions as linears measured 42.87 ms vs
         # 45.37 ms encoder wall on L4 at batch 1; keep the depthwise Conv1d.
-        hidden = F.glu(
-            F.linear(hidden, self.pointwise_conv1.weight[..., 0]), dim=-1
-        )
+        hidden = F.glu(_pointwise(self.pointwise_conv1, hidden), dim=-1)
         if valid is not None:
             hidden = hidden.masked_fill(~valid[..., None], 0)
         hidden = self.depthwise_conv(hidden.transpose(1, 2))
         hidden = F.silu(self.norm(hidden)).transpose(1, 2)
-        return F.linear(hidden, self.pointwise_conv2.weight[..., 0])
+        return _pointwise(self.pointwise_conv2, hidden)
 
 
 class RelativeAttention(nn.Module):
