@@ -235,7 +235,7 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         cache.seq_length = start
         cache.layers[0].has_previous_state = True
         cache.layers[0].conv_states = torch.full((1, 2, 3), float(start))
-        cache.layers[0].recurrent_states = torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1)
+        cache.layers[0].recurrent_states = torch.full((1, 1, 1, 1), float(session.state.batch_idx))
         session.cache = cache
     page_table = torch.arange(32).reshape(4, 8)
     obj.runtime.device = torch.device("cpu")
@@ -281,10 +281,41 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         assert branch._prefix_source is session.cache
         assert branch._prefix_start == session.cache.seq_length
         assert branch.seq_length == session.cache.seq_length + count
-        assert branch._prefix_records[0].state_indices.tolist() == [slot]
-        assert branch.layers[0].recurrent_states[slot].item() == slot + 100
-        assert session.cache.layers[0].recurrent_states[slot].item() == slot
+        assert branch._prefix_records[0].state_indices.tolist() == [0]
+        assert branch.layers[0].recurrent_states.shape[0] == 1
+        assert branch.layers[0].recurrent_states[0].item() == slot + 100
+        assert session.cache.layers[0].recurrent_states[0].item() == slot
         assert torch.all(session.cache.layers[0].conv_states == session.cache.seq_length)
+
+
+def test_admission_forks_only_owned_recurrent_row():
+    obj, first, _, erased = decoder()
+    state = SimpleNamespace(batch_idx=-1, max_length=100)
+    obj.runtime.page_table.allocate = lambda: 2
+    obj.runtime.page_table.reserve = lambda *args: True
+    obj.runtime.page_table.commit_block_table = lambda *args: None
+    obj.runtime._paged_kv = (None,)
+    obj.text = SimpleNamespace(config=SimpleNamespace(layer_types=("linear_attention",)))
+    pool = torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1)
+
+    def bind(cache):
+        cache.layers[0].recurrent_states = pool
+
+    obj.runtime._linear_state_pool = SimpleNamespace(bind_prefill_state=bind)
+
+    def target(tokens, cache, slot, capture):
+        assert slot == 2 and not capture
+        assert cache.layers[0].recurrent_states.shape == (1, 1, 1, 1)
+        assert cache.layers[0].recurrent_states.item() == 2
+        branch = cache.fork_recurrent_state()
+        branch.layers[0].recurrent_states.add_(100)
+        return [3], torch.zeros(1, 1, 1), branch
+
+    obj._target = target
+    obj.admit(state, [TextToken(token_id=1)])
+    assert pool.flatten().tolist() == [0, 1, 2, 3]
+    assert obj._sessions[2].cache.layers[0].recurrent_states.item() == 102
+    assert obj._sessions[1].state is first and erased == []
 
 
 def test_unsupported_runtime_rejects_draft_config_before_loading():

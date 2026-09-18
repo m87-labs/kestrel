@@ -83,6 +83,11 @@ class Qwen35DFlashDecoder:
             pages.commit_block_table([slot])
             cache = Qwen35InferenceCache(config=self.text.config, paged_kv=self.runtime._paged_kv)
             self.runtime._linear_state_pool.bind_prefill_state(cache)
+            # KV retains the global allocator slot; this private recurrent
+            # cache owns only its row, which the first target fork clones.
+            for layer in cache.layers:
+                if isinstance(layer, LinearAttentionState):
+                    layer.recurrent_states = layer.recurrent_states[slot:slot + 1]
             expected, features, cache = self._target(tokens, cache, slot, capture=False)
             self._sessions[slot] = _Session(state, cache, DFlashContextCache(capacity), features, expected[-1])
             return expected[-1], None
@@ -108,7 +113,7 @@ class Qwen35DFlashDecoder:
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
             cu_seq_lens_q=cu, sequence_lengths=(length,), topology_token=topology,
             seq_idx=torch.zeros((1, length), device=device, dtype=torch.int32),
-            gdn_state_indices=torch.tensor([slot], device=device, dtype=torch.long),
+            gdn_state_indices=torch.zeros(1, device=device, dtype=torch.long),
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         cache.advance_to(start+length)
         features = torch.cat(output.layer_hidden_states, dim=-1)
@@ -140,9 +145,7 @@ class Qwen35DFlashDecoder:
             if isinstance(layer, LinearAttentionState):
                 layer = copy(layer)
                 layer.conv_states = torch.cat([branch.layers[index].conv_states for branch in branches])
-                layer.recurrent_states = torch.cat([
-                    branch.layers[index].recurrent_states[session.state.batch_idx:session.state.batch_idx + 1]
-                    for branch, session in zip(branches, sessions)])
+                layer.recurrent_states = torch.cat([branch.layers[index].recurrent_states for branch in branches])
             layers.append(layer)
         packed.layers = tuple(layers)
         ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
@@ -150,6 +153,7 @@ class Qwen35DFlashDecoder:
             torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
             for session, length in zip(sessions, lengths)])[None]
         slot_ids = torch.tensor([session.state.batch_idx for session in sessions], device=device, dtype=torch.long)
+        local_state_indices = torch.zeros_like(slot_ids)
         page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
         page_size = self.runtime.page_size
         position_rows = positions[0].split(lengths)
@@ -173,12 +177,11 @@ class Qwen35DFlashDecoder:
         expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].split(lengths)
         for index, record in packed._prefix_records.items():
             records = record.split_sequences(lengths)
-            for row, (branch, session) in enumerate(zip(branches, sessions)):
-                slot = session.state.batch_idx
+            for row, branch in enumerate(branches):
                 branch.layers[index].conv_states.copy_(packed.layers[index].conv_states[row:row + 1])
-                branch.layers[index].recurrent_states[slot:slot + 1].copy_(
+                branch.layers[index].recurrent_states.copy_(
                     packed.layers[index].recurrent_states[row:row + 1])
-                branch._prefix_records[index] = replace(records[row], state_indices=slot_ids[row:row + 1])
+                branch._prefix_records[index] = replace(records[row], state_indices=local_state_indices[row:row + 1])
         for branch, session, length in zip(branches, sessions, lengths):
             branch.advance_to(session.cache.seq_length + length)
         return [(tokens.tolist(), feature, branch)
