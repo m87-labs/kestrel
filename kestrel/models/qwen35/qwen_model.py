@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Any, Sequence
 
 import torch
@@ -103,13 +104,11 @@ class _RecurrentPrefixRecord:
 
     @staticmethod
     def replay_group(records: list[tuple[_RecurrentPrefixRecord, LinearAttentionState]],
-                     length: int) -> None:
+                     length: int, graph=None) -> None:
         """Batch independent recurrences after layer-specific gate preparation."""
         from kestrel_kernels import get_runtime
 
-        runtime = get_runtime().gated_delta
         first = records[0][0]
-        count = len(records)
         if any(record.replay_geometry != first.replay_geometry for record, _ in records):
             raise ValueError("recurrent replay group has incompatible geometry")
         dim = first.module.head_k_dim
@@ -120,32 +119,24 @@ class _RecurrentPrefixRecord:
         qk_width = first.qkv.shape[-1] - nv * value_dim
         if qk_width <= 0 or qk_width % (2 * dim):
             raise ValueError("recurrent replay mixed projection width is invalid")
-        nk = qk_width // (2 * dim)
-        device = first.qkv.device
-        q = torch.empty((1, count * length, nk, dim), device=device, dtype=first.qkv.dtype)
-        k = torch.empty_like(q)
-        v = torch.empty((1, count * length, nv, value_dim), device=device, dtype=first.qkv.dtype)
-        g = torch.empty((1, count * length, nv), device=device, dtype=torch.float32)
-        beta = torch.empty_like(g)
-        lengths = (length,) * count
-        cu, topology = runtime.bind_packed_prefill_topology(
-            sequence_lengths=lengths, device=device)
         mixed = torch.cat([record.qkv[:, :length] for record, _ in records], dim=1)
         a = torch.cat([record.a[:, :length] for record, _ in records], dim=1)
         b = torch.cat([record.b[:, :length] for record, _ in records], dim=1)
         A_log = torch.stack([record.module.A_log for record, _ in records])
         dt_bias = torch.stack([record.module.dt_bias for record, _ in records])
-        runtime.packed_prefill_prepare(
-            mixed, a, b, A_log, dt_bias, cu_seqlens=cu,
-            sequence_lengths=lengths, topology_token=topology,
-            query=q, key=k, value=v, g=g, beta=beta)
         initial = torch.cat([record.initial_state for record, _ in records], dim=0)
-        final = torch.empty_like(initial)
-        indices = torch.arange(count, device=device, dtype=torch.int64)
-        runtime.packed_recurrent_gated_delta_rule_prefill(
-            q, k, v, g, beta, cu, initial_state=initial, final_state=final,
-            final_state_indices=indices, final_state_indices_allocator_owned=True,
-            sequence_lengths=lengths, topology_token=topology)
+        inputs = (mixed, a, b, A_log, dt_bias, initial)
+        if graph is None:
+            cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=(length,) * len(records), device=first.qkv.device)
+            lease = nullcontext((_replay_recurrent_prefix(*inputs, cu, topology),))
+        else:
+            lease = graph.launch(*inputs)
+        with lease as (final,):
+            _RecurrentPrefixRecord.copy_replay_state(records, length, final)
+
+    @staticmethod
+    def copy_replay_state(records, length, final):
         state_destinations, state_sources = [], []
         conv_destinations, conv_sources = [], []
         for index, (record, layer) in enumerate(records):
@@ -179,6 +170,34 @@ class _RecurrentPrefixRecord:
         layer.conv_states.copy_(
             self.conv_input[..., length-1:length-1+module.conv_kernel_size])
         layer.has_previous_state = True
+
+
+def _replay_recurrent_prefix(mixed, a, b, A_log, dt_bias, initial, cu, topology):
+    from kestrel_kernels import get_runtime
+
+    runtime = get_runtime().gated_delta
+    count, nv, value_dim, dim = initial.shape
+    total = mixed.shape[1]
+    if total % count:
+        raise ValueError("recurrent replay requires equal sequence lengths")
+    lengths = (total // count,) * count
+    nk = (mixed.shape[-1] - nv * value_dim) // (2 * dim)
+    q = torch.empty((1, total, nk, dim), device=mixed.device, dtype=mixed.dtype)
+    k = torch.empty_like(q)
+    v = torch.empty((1, total, nv, value_dim), device=mixed.device, dtype=mixed.dtype)
+    g = torch.empty((1, total, nv), device=mixed.device, dtype=torch.float32)
+    beta = torch.empty_like(g)
+    runtime.packed_prefill_prepare(
+        mixed, a, b, A_log, dt_bias, cu_seqlens=cu,
+        sequence_lengths=lengths, topology_token=topology,
+        query=q, key=k, value=v, g=g, beta=beta)
+    final = torch.empty_like(initial)
+    indices = torch.arange(count, device=mixed.device, dtype=torch.int64)
+    runtime.packed_recurrent_gated_delta_rule_prefill(
+        q, k, v, g, beta, cu, initial_state=initial, final_state=final,
+        final_state_indices=indices, final_state_indices_allocator_owned=True,
+        sequence_lengths=lengths, topology_token=topology)
+    return final
 
 
 def _text_linear(

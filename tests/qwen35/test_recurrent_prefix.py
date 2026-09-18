@@ -297,7 +297,8 @@ def test_captured_indices_survive_caller_metadata_reuse():
 
 @pytest.mark.parametrize("value_dim", [4, 6])
 @pytest.mark.parametrize("pool_rows", [1, 2])
-def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value_dim, pool_rows):
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value_dim, pool_rows, use_graph):
     import kestrel_kernels
     from kestrel.models.qwen35.qwen_model import _RecurrentPrefixRecord
 
@@ -336,6 +337,17 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
         gated_delta=SimpleNamespace(bind_packed_prefill_topology=topology,
             packed_prefill_prepare=prepare,
             packed_recurrent_gated_delta_rule_prefill=recurrence)))
+    from contextlib import contextmanager
+    from kestrel.models.qwen35.qwen_model import _replay_recurrent_prefix
+    class Graph:
+        @contextmanager
+        def launch(self, *inputs):
+            cu, token = topology(sequence_lengths=(3, 3))
+            final = _replay_recurrent_prefix(*inputs, cu, token)
+            yield (final,)
+            # Reuse immediately after the lease: committed caches must own data.
+            final.zero_()
+    graph = Graph() if use_graph else None
     indices = torch.tensor([pool_rows - 1])
     for index, parameter in enumerate((2, 5)):
         module = SimpleNamespace(head_k_dim=4, head_v_dim=value_dim, conv_kernel_size=4,
@@ -348,13 +360,13 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
             torch.full((1, 2, value_dim, 4), parameter, dtype=torch.bfloat16), indices)
     indices.zero_()
     with pytest.raises(RuntimeError, match="grouped recurrence failure"):
-        branch.commit_recurrent_prefix(3)
+        branch.commit_recurrent_prefix(3, replay_graph=graph)
     assert branch._prefix_source is source and len(branch._prefix_records) == 2
     assert all(torch.all(layer.recurrent_states == 1) for layer in source.layers)
     fail = False
     prepared.clear()
     recurrences.clear()
-    result = branch.commit_recurrent_prefix(3)
+    result = branch.commit_recurrent_prefix(3, replay_graph=graph)
     assert prepared == [([[2, 2], [5, 5]], [[3, 3], [6, 6]])]
     assert recurrences == [(3, 3)]
     for old, layer, parameter in zip(source.layers, result.layers, (2, 5)):

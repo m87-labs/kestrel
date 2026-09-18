@@ -11,6 +11,7 @@ from kestrel.runtime.tokens import TextToken
 def decoder():
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
     obj._target_graph = None
+    obj._replay_graph = None
     obj._graph_failed = obj._closed = False
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
@@ -26,7 +27,7 @@ def decoder():
     commits = []
 
     class Verified:
-        def commit_recurrent_prefix(self, count):
+        def commit_recurrent_prefix(self, count, *, replay_graph=None):
             commits.append(count)
             return SimpleNamespace(seq_length=10+count)
 
@@ -55,6 +56,19 @@ def test_retire_releases_slot_and_capture_once():
     obj.retire(state)
     assert erased == [1]
     assert obj.free_slots == 1 and not obj._sessions
+
+
+def test_shutdown_releases_replay_graph_after_target_shutdown_error():
+    obj, _, _, _ = decoder()
+    closed = []
+    def target_shutdown():
+        closed.append("target")
+        raise RuntimeError("injected shutdown failure")
+    obj._target_graph = SimpleNamespace(shutdown=target_shutdown)
+    obj._replay_graph = SimpleNamespace(shutdown=lambda: closed.append("replay"))
+    with pytest.raises(RuntimeError, match="injected shutdown failure"):
+        obj.shutdown()
+    assert obj._closed and closed == ["target", "replay"]
 
 
 def test_target_graph_lease_outlives_commit_and_poison_rejects_retry():

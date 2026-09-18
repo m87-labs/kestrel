@@ -169,7 +169,7 @@ class Qwen35InferenceCache:
             branch.layers = tuple(branch.layers)
         return packed, branches
 
-    def commit_recurrent_prefix(self, length: int) -> Qwen35InferenceCache:
+    def commit_recurrent_prefix(self, length: int, *, replay_graph=None) -> Qwen35InferenceCache:
         """Commit one verified prefix without repeating its dense projections.
 
         Records belong to a single serial verification fork. K/V suffix storage
@@ -209,7 +209,7 @@ class Qwen35InferenceCache:
                         sequence_lengths=(length,), device=record.qkv.device)
                     record.replay_into(layer, length, cu, topology)
                 else:
-                    group[0][0].replay_group(group, length)
+                    group[0][0].replay_group(group, length, graph=replay_graph)
             result.advance_to(self._prefix_start + length)
         self._prefix_records = {}
         self._prefix_source = None

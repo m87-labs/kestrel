@@ -45,12 +45,16 @@ class Qwen35DFlashDecoder:
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
         self._target_graph = None
+        self._replay_graph = None
         self._graph_failed = False
         self._closed = False
         if runtime._cfg.enable_cuda_graphs:
             from .spec_target_graph import Qwen35TargetGraph
+            from .spec_replay_graph import Qwen35ReplayGraph
             self._target_graph = Qwen35TargetGraph(runtime, self.text,
                 config.target_layer_ids, config.block_size)
+            self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
+                target.num_hidden_layers)
 
     def _verify(self, leases, **kwargs):
         if leases is None or self._target_graph is None:
@@ -59,8 +63,12 @@ class Qwen35DFlashDecoder:
 
     def shutdown(self):
         self._closed = True
-        if self._target_graph is not None:
-            self._target_graph.shutdown()
+        try:
+            if self._target_graph is not None:
+                self._target_graph.shutdown()
+        finally:
+            if self._replay_graph is not None:
+                self._replay_graph.shutdown()
 
     @property
     def free_slots(self):
@@ -213,7 +221,7 @@ class Qwen35DFlashDecoder:
 
     def commit_accept(self, ctx):
         session, verified, features, expected, count = ctx
-        cache = verified.commit_recurrent_prefix(count)
+        cache = verified.commit_recurrent_prefix(count, replay_graph=self._replay_graph)
         session.cache = cache
         session.features = features[:, :count]
         session.bonus = expected[count-1]
