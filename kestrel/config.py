@@ -356,8 +356,11 @@ class RuntimeConfig:
     # Ignored off CPU.
     cpu_threads: int | None = None
     # How a ternary (2-bit) checkpoint keeps its weights: ``dense`` (dequantized
-    # once) or ``gemm8`` (packed, with int8 activations), or ``auto`` to leave
-    # the choice to kestrel-kernels. Ignored by models that are not ternary.
+    # once), ``gemm8`` (CPU, packed with int8 activations), ``metal`` (MPS,
+    # packed and decoded inside the Metal GEMM), or ``auto`` to leave the choice
+    # to kestrel-kernels -- which is ``metal`` on MPS, where keeping the codes
+    # packed is 2.5 GB of device memory against 220 MB, and ``dense`` elsewhere.
+    # Ignored by models that are not ternary.
     ternary_mode: str = "auto"
 
     def __post_init__(self):
