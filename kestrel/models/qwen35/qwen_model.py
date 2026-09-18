@@ -573,18 +573,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if conv_prefix and num_sequences == 1:
             mixed_qkv = torch.cat(
                 (packed_conv_state[..., -conv_prefix:], mixed_qkv), dim=-1)
-            seq_idx = torch.zeros(
-                (1, mixed_qkv.shape[-1]), device=mixed_qkv.device, dtype=torch.int32)
+            seq_idx = cache_params.conv_sequence_indices(
+                (mixed_qkv.shape[-1] - conv_prefix,), conv_prefix, mixed_qkv.device)
         elif conv_prefix:
             chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
             mixed_qkv = torch.cat([
                 torch.cat((packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk), dim=-1)
                 for index, chunk in enumerate(chunks)
             ], dim=-1)
-            seq_idx = torch.cat([
-                torch.full((1, length + conv_prefix), index, device=mixed_qkv.device, dtype=torch.int32)
-                for index, length in enumerate(sequence_lengths)
-            ], dim=-1)
+            seq_idx = cache_params.conv_sequence_indices(
+                sequence_lengths, conv_prefix, mixed_qkv.device)
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.

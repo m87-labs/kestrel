@@ -37,8 +37,13 @@ def test_packed_continuation_keeps_convolution_histories_separate():
         conv_states=torch.tensor([[[10., 11., 12.]], [[20., 21., 22.]]]),
         recurrent_states=torch.zeros(2, 1, 1, 1, dtype=torch.bfloat16),
         has_previous_state=True)
-    cache = SimpleNamespace(layers=[layer], has_previous_state=lambda _: True,
-        _prefix_source=object(), seq_length=9, _prefix_start=9, _prefix_records={})
+    cache = Qwen35InferenceCache(
+        config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
+    cache.layers = (layer,)
+    cache.advance_to(9)
+    cache._prefix_source = object()
+    cache._prefix_start = 9
+    cache._prefix_records = {}
     def conv(**kwargs):
         observed["conv"] = kwargs["x"].clone()
         observed["seq_idx"] = kwargs["seq_idx"].clone()
@@ -179,6 +184,33 @@ def test_full_commit_returns_verified_branch_and_releases_source():
     _, branch = captured()
     assert branch.commit_recurrent_prefix(16) is branch
     assert branch._prefix_source is None and not branch._prefix_records
+
+
+def test_convolution_layout_reuses_only_matching_geometry():
+    source, _ = captured()
+    first = source.conv_sequence_indices((2, 3), 3, torch.device("cpu"))
+    assert first.tolist() == [[0] * 5 + [1] * 6]
+    assert source.conv_sequence_indices([2, 3], 3, torch.device("cpu")) is first
+    branch = source.fork_recurrent_state()
+    assert branch.conv_sequence_indices((2, 3), 3, torch.device("cpu")) is first
+    changed = branch.conv_sequence_indices((3, 2), 3, torch.device("cpu"))
+    assert changed.tolist() == [[0] * 6 + [1] * 5]
+    assert changed is not first
+    assert source.conv_sequence_indices((2, 3), 3, torch.device("cpu")) is first
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_convolution_layout_does_not_cross_streams():
+    source, _ = captured()
+    device = torch.device("cuda", torch.cuda.current_device())
+    first = source.conv_sequence_indices((2, 3), 3, device)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        second = source.conv_sequence_indices((2, 3), 3, device)
+        assert source.conv_sequence_indices((2, 3), 3, device) is second
+    stream.synchronize()
+    assert second is not first
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
 
 
 def test_failed_commit_can_retry_without_modifying_source():

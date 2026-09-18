@@ -64,6 +64,20 @@ class Qwen35InferenceCache:
         self._prefix_source: Qwen35InferenceCache | None = None
         self._prefix_start = 0
         self._prefix_records: dict[int, _RecurrentPrefixRecord] = {}
+        self._conv_sequence_layout = None
+
+    def conv_sequence_indices(self, lengths: Sequence[int], prefix: int, device: torch.device) -> torch.Tensor:
+        """Reuse one immutable convolution layout across compatible layers."""
+        lengths = tuple(lengths)
+        stream = torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else None
+        key = (lengths, prefix, device, stream)
+        if self._conv_sequence_layout is None or self._conv_sequence_layout[0] != key:
+            indices = torch.cat([
+                torch.full((1, length + prefix), index, device=device, dtype=torch.int32)
+                for index, length in enumerate(lengths)
+            ], dim=-1)
+            self._conv_sequence_layout = (key, indices)
+        return self._conv_sequence_layout[1]
 
     def has_previous_state(self, layer_idx: int | None = None) -> bool:
         if layer_idx is None:
