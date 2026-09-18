@@ -45,10 +45,6 @@ class Convolution(nn.Module):
         )
         self.norm = nn.BatchNorm1d(channels)
         self.pointwise_conv2 = nn.Linear(channels, channels, bias=False)
-        # ``norm`` folded to a per-channel affine by ``reset_nonpersistent_buffers`` once the running stats
-        # are loaded: the depthwise op takes the affine, never the running stats.
-        self.register_buffer("bn_scale", torch.ones(channels), persistent=False)
-        self.register_buffer("bn_shift", torch.zeros(channels), persistent=False)
 
     def _load_from_state_dict(
         self,
@@ -78,22 +74,19 @@ class Convolution(nn.Module):
             error_msgs,
         )
 
-    def reset_nonpersistent_buffers(self) -> None:
-        # Deferred: ``kestrel_kernels.conformer_ops`` ships with the kernels release this model needs, and
-        # importing it at module scope would break the runtimes that never build a conformer.
-        from kestrel_kernels.conformer_ops import fold_batchnorm
-
-        self.bn_scale, self.bn_shift = fold_batchnorm(self.norm)
-
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
         hidden = F.glu(self.pointwise_conv1(hidden), dim=-1)
-        # The depthwise convolution, the folded BatchNorm and the SiLU are one runtime op: it masks the
+        norm = self.norm
+        # The depthwise convolution, the eval-mode BatchNorm and the SiLU are one runtime op: it masks the
         # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
         hidden = get_runtime().conformer.depthwise_conv_bn_silu(
             hidden,
             self.depthwise_conv.weight[:, 0, :],  # the op takes the depthwise weight as [C, k]
-            self.bn_scale,
-            self.bn_shift,
+            norm.running_mean,
+            norm.running_var,
+            norm.weight,
+            norm.bias,
+            norm.eps,
             valid,
         )
         return self.pointwise_conv2(hidden)
@@ -293,8 +286,6 @@ class Encoder(nn.Module):
                 )
             )
         ).to(self.subsampling.linear.weight.device)
-        for layer in self.layers:
-            layer.conv.reset_nonpersistent_buffers()
 
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden, valid = self.subsampling(features, mask)

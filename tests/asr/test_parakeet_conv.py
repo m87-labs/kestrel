@@ -45,7 +45,6 @@ def conv(request, monkeypatch) -> Convolution:
         module.norm.bias.normal_()
         module.norm.running_mean.normal_()
         module.norm.running_var.uniform_(0.5, 2.0)
-    module.reset_nonpersistent_buffers()
     return module
 
 
