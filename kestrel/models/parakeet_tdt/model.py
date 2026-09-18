@@ -346,12 +346,17 @@ class Decoder(nn.Module):
                 getattr(self, f"_cell_weight_{layer}"),
                 getattr(self, f"_cell_bias_{layer}"),
             )
-            input_gate, forget_gate, candidate, output_gate = gates.chunk(4, dim=-1)
+            # One sigmoid over the whole gate row rather than three over its quarters: elementwise, so the
+            # bits are the same, and a single-row decode step costs what it dispatches. Fusing the rest into
+            # a Metal kernel was tried and is not shippable -- see kestrel_kernels.tdt_ops.
+            gated = gates.sigmoid()
+            width = old_cell.shape[-1]
+            candidate = gates[..., 2 * width : 3 * width].tanh()
             cell = (
-                forget_gate.sigmoid() * old_cell[layer]
-                + input_gate.sigmoid() * candidate.tanh()
+                gated[..., width : 2 * width] * old_cell[layer]
+                + gated[..., :width] * candidate
             )
-            value = output_gate.sigmoid() * cell.tanh()
+            value = gated[..., 3 * width :] * cell.tanh()
             new_hidden.append(value)
             new_cell.append(cell)
         state = torch.stack(new_hidden), torch.stack(new_cell)
@@ -576,16 +581,17 @@ class ParakeetTdt(nn.Module):
         durations = [min(carry, end_frame - start_frame)]
         steps_remaining = self.config.max_symbols_per_step * (end_frame - start_frame)
         tokens_remaining = max_tokens
+        greedy_step = get_runtime().tdt.greedy_step
         while (
             frame < end_frame
             and steps_remaining > 0
             and (tokens_remaining is None or tokens_remaining > 0)
         ):
             logits = self.joint(encoded[:, frame : frame + 1], decoder_hidden)
-            # Tried stacking both argmax results into one host read: 90.4 ms
-            # vs 78.2 ms end-to-end on H100; keeping the separate reads.
-            token_id = int(logits[..., : self.config.vocab_size].argmax())
-            duration_index = int(logits[..., self.config.vocab_size :].argmax())
+            # Both argmaxes are one runtime op, because how many times the host waits for the GPU here is a
+            # backend question: separate reads measured faster on an H100 (78.2 ms against 90.4 ms end to
+            # end), one fused read is faster on MPS.
+            token_id, duration_index = greedy_step(logits, self.config.vocab_size)
             duration = self.config.durations[duration_index]
             if token_id == self.config.blank_token_id and duration == 0:
                 duration = 1

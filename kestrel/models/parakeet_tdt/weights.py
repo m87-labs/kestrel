@@ -82,14 +82,12 @@ def load_parakeet_tdt(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
     local_files_only: bool = False,
-    ternary_mode: str = "auto",
 ) -> LoadedParakeetTdt:
     """Load the pinned fp checkpoint, or the ternary student when the checkpoint carries a ``ternary.json``.
 
-    The ternary variant loads the packed export with ``strict=True`` and then materializes the weight form
-    ``ternary_mode`` selects: ``dense`` dequantizes the codes once (2 bytes/weight), ``gemm8`` keeps them
-    packed as GEMM panels and quantizes the activations to int8, and ``auto`` leaves the choice to
-    kestrel-kernels. Activations stay in ``dtype`` otherwise; nothing else is quantized at run time.
+    The ternary variant loads the packed export with ``strict=True`` and then materializes the resident
+    weight form for the device it is on -- packed on both shipped targets, and there is nothing to select;
+    see ``kestrel_kernels.ternary``. Activations stay in ``dtype``; nothing else is quantized at run time.
     """
     from safetensors.torch import load_file
 
@@ -121,7 +119,7 @@ def load_parakeet_tdt(
         # Between the two casts: the cache dequantizes the packed codes on the target device and keeps its
         # scales in fp32, so it must exist before the module cast reaches the dequantized weights.
         model.to(device=device)
-        materialize_ternary(model, ternary_mode, dtype)
+        materialize_ternary(model, dtype)
         model.to(dtype=dtype)
     else:
         model.to(device=device, dtype=dtype)

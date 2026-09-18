@@ -142,7 +142,6 @@ class ParakeetTdtRuntime:
                 getattr(cfg, "model_path", None) or self._model_name,
                 device=self.device,
                 dtype=self.dtype,
-                ternary_mode=getattr(cfg, "ternary_mode", "auto"),
             )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
