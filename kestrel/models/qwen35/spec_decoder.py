@@ -1,7 +1,7 @@
 """Independent greedy DFlash sessions with native sequence verification."""
 
 from dataclasses import dataclass, replace
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import torch
@@ -46,6 +46,8 @@ class Qwen35DFlashDecoder:
         self._sessions = {}
         self._target_graph = None
         self._replay_graph = None
+        self._draft_graph = None
+        self._draft_graph_enabled = runtime._cfg.enable_cuda_graphs
         self._graph_failed = False
         self._closed = False
         if runtime._cfg.enable_cuda_graphs:
@@ -67,8 +69,12 @@ class Qwen35DFlashDecoder:
             if self._target_graph is not None:
                 self._target_graph.shutdown()
         finally:
-            if self._replay_graph is not None:
-                self._replay_graph.shutdown()
+            try:
+                if self._replay_graph is not None:
+                    self._replay_graph.shutdown()
+            finally:
+                if self._draft_graph is not None:
+                    self._draft_graph.shutdown()
 
     @property
     def free_slots(self):
@@ -147,6 +153,31 @@ class Qwen35DFlashDecoder:
         expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].tolist()
         return expected, features, cache
 
+    @contextmanager
+    def _draft_hidden(self, noise, features, positions, caches):
+        eligible = (self._draft_graph_enabled
+                    and all(cache.layers for cache in caches)
+                    and all(value.shape[1] <= self.draft.config.block_size for value in features))
+        if not eligible:
+            if len(caches) == 1:
+                yield self.draft(noise[0], features[0], positions[0], context_cache=caches[0])
+            else:
+                yield torch.cat(self.draft.forward_many(
+                    noise, features, positions, context_caches=caches), dim=0)
+            return
+        from .draft_workspace import DFlashDraftGraphSession
+        if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
+                or tuple(cache.capacity for cache in self._draft_graph.caches)
+                != tuple(cache.capacity for cache in caches)):
+            if self._draft_graph is not None:
+                self._draft_graph.shutdown()
+            self._draft_graph = DFlashDraftGraphSession(self.draft, caches)
+        elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
+              or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
+            self._draft_graph.rebind(caches)
+        with self._draft_graph.launch(noise, features, positions) as hidden:
+            yield hidden
+
     def propose(self, ctx):
         config = self.draft.config
         start = ctx.cache.seq_length
@@ -155,9 +186,13 @@ class Qwen35DFlashDecoder:
         noise[0, 0] = ctx.bonus
         positions = torch.arange(ctx.draft_cache.length, start+config.block_size,
                                  device=self.runtime.device)[None]
-        hidden = self.draft(self.text.embed_tokens(noise), ctx.features, positions,
-                            context_cache=ctx.draft_cache)
-        ids = self.runtime.model.lm_head(hidden[:, 1:]).argmax(-1).to(torch.int32)
+        consumer_stream = torch.cuda.current_stream(self.runtime.device)
+        with self._draft_hidden([self.text.embed_tokens(noise)], [ctx.features],
+                                [positions], [ctx.draft_cache]) as hidden:
+            ids = self.runtime.model.lm_head(hidden[:, 1:]).argmax(-1).to(torch.int32)
+            producer_stream = torch.cuda.current_stream(self.runtime.device)
+        if producer_stream != consumer_stream:
+            ids.record_stream(consumer_stream)
         return DraftResult(token_ids=ids)
 
     def _propose_many(self, sessions):
@@ -170,11 +205,11 @@ class Qwen35DFlashDecoder:
                                   session.cache.seq_length + config.block_size,
                                   device=self.runtime.device)[None]
                      for session in sessions]
-        hidden = self.draft.forward_many(
-            self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
-            positions, context_caches=[session.draft_cache for session in sessions])
-        logits = self.runtime.model.lm_head(torch.cat([value[:, 1:] for value in hidden], dim=1))
-        ids = logits.argmax(-1).reshape(len(sessions), config.block_size - 1).tolist()
+        with self._draft_hidden(
+                self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
+                positions, [session.draft_cache for session in sessions]) as hidden:
+            logits = self.runtime.model.lm_head(hidden[:, 1:].reshape(1, -1, hidden.shape[-1]))
+            ids = logits.argmax(-1).reshape(len(sessions), config.block_size - 1).tolist()
         return [[session.bonus, *row] for session, row in zip(sessions, ids)]
 
     def _target_many(self, candidates, sessions, *, leases=None):

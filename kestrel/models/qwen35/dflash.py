@@ -186,6 +186,35 @@ class _Attention(nn.Module):
             cu_seqlens=cu_q, cu_seqlens_k=cu_k)
         return self.o_proj(output.reshape(1, hidden.shape[1], -1))
 
+    def forward_stable(self, hidden, context, cos, sin, workspace,
+                       slot_mapping, used_keys):
+        """Fixed-shape layer primitive with session-owned committed KV lengths.
+
+        Context padding is projected but its KV writes land in private guard
+        storage. Query positions follow the live context, not its padded size.
+        Callers retain the workspace and lease outputs until consumed.
+        """
+        batch, rows, _ = hidden.shape
+        if (hidden.device.type != "cuda" or batch != workspace.slots
+                or rows != workspace.query_rows
+                or context.shape[:2] != (batch, workspace.context_rows)):
+            raise ValueError("stable draft attention requires matching CUDA workspace inputs")
+        joined = torch.cat((context, hidden), dim=1)
+        q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)).transpose(1, 2)
+        v = self.v_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)
+        q = apply_rotary(q, cos[:, -rows:], sin[:, -rows:])
+        k = apply_rotary(k, cos, sin).transpose(1, 2)
+        keys, values = workspace.write(k.reshape(-1, k.shape[2], self.head_dim),
+                                       v.reshape(-1, v.shape[2], self.head_dim), slot_mapping)
+        output, _ = get_runtime().attention.flash_attn_fwd(
+            q.transpose(1, 2), keys, values, seqused_k=used_keys,
+            softmax_scale=self.head_dim ** -0.5, causal=self.causal,
+            window_size_left=None if self.window is None else self.window - 1,
+            window_size_right=None if self.window is None or not self.causal else 0,
+            require_native=True, pack_gqa=False)
+        return self.o_proj(output.reshape(batch, rows, -1))
+
 
 class _MLP(nn.Module):
     def __init__(self, config):

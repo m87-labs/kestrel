@@ -12,6 +12,8 @@ def decoder():
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
     obj._target_graph = None
     obj._replay_graph = None
+    obj._draft_graph = None
+    obj._draft_graph_enabled = False
     obj._graph_failed = obj._closed = False
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
@@ -69,6 +71,36 @@ def test_shutdown_releases_replay_graph_after_target_shutdown_error():
     with pytest.raises(RuntimeError, match="injected shutdown failure"):
         obj.shutdown()
     assert obj._closed and closed == ["target", "replay"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_single_draft_device_ids_are_ordered_after_stream_lease():
+    from contextlib import contextmanager
+    obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj.draft = SimpleNamespace(config=SimpleNamespace(block_size=4, mask_token_id=0))
+    obj.runtime = SimpleNamespace(device=torch.device("cuda:0"), model=SimpleNamespace(
+        lm_head=lambda hidden: torch.cat((hidden, hidden + 1), dim=-1)))
+    obj.text = SimpleNamespace(embed_tokens=lambda ids: torch.zeros((*ids.shape, 1), device="cuda"))
+    stream = torch.cuda.Stream()
+    @contextmanager
+    def hidden(*args):
+        caller = torch.cuda.current_stream()
+        stream.wait_stream(caller)
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1000000)
+            yield torch.zeros(1, 4, 1, device="cuda")
+        caller.wait_stream(stream)
+    obj._draft_hidden = hidden
+    ctx = SimpleNamespace(cache=SimpleNamespace(seq_length=8),
+                          draft_cache=SimpleNamespace(length=6), bonus=1,
+                          features=torch.zeros(1, 2, 1, device="cuda"))
+    consumer = torch.cuda.Stream()
+    consumer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(consumer):
+        result = obj.propose(ctx)
+        assert result.token_ids.device.type == "cuda"
+        assert result.token_ids.dtype == torch.int32
+        assert result.token_ids.tolist() == [[1, 1, 1]]
 
 
 def test_target_graph_lease_outlives_commit_and_poison_rejects_retry():
