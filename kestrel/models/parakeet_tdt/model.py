@@ -16,6 +16,11 @@ from kestrel_kernels import get_runtime
 from .config import ParakeetEncoderConfig, ParakeetTdtConfig
 
 
+def _norm_args(norm: nn.LayerNorm) -> tuple[Tensor, Tensor, float]:
+    """A LayerNorm module as the ``conformer`` domain takes it."""
+    return norm.weight, norm.bias, norm.eps
+
+
 class FeedForward(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
@@ -27,7 +32,9 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
-        return self.linear2(F.silu(self.linear1(hidden)))
+        # The activation is a runtime op so a backend can do it in one pass over the [B, T, 4C] projection
+        # instead of the read-write-read torch needs; the reference is F.silu.
+        return self.linear2(get_runtime().conformer.silu(self.linear1(hidden)))
 
 
 class Convolution(nn.Module):
@@ -75,7 +82,7 @@ class Convolution(nn.Module):
         )
 
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
-        hidden = F.glu(self.pointwise_conv1(hidden), dim=-1)
+        hidden = get_runtime().conformer.glu(self.pointwise_conv1(hidden))
         norm = self.norm
         # The depthwise convolution, the eval-mode BatchNorm and the SiLU are one runtime op: it masks the
         # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
@@ -177,13 +184,29 @@ class EncoderBlock(nn.Module):
         pair_mask: Tensor | None,
         valid: Tensor | None,
     ) -> Tensor:
-        hidden = hidden + 0.5 * self.feed_forward1(self.norm_feed_forward1(hidden))
-        hidden = hidden + self.self_attn(
-            self.norm_self_att(hidden), positions, pair_mask
+        # Every residual add feeds straight into the next LayerNorm, so the two go through the runtime as one
+        # op returning both: the sum the next residual needs and the normalized input the next sublayer takes.
+        # A backend that fuses them reads the activation once instead of three times; the reference is the
+        # ``hidden + alpha * y`` then ``LayerNorm`` this replaces, and alpha is a power of two, so the bits
+        # are the ones the model had.
+        conformer = get_runtime().conformer
+        normed = conformer.layer_norm(hidden, *_norm_args(self.norm_feed_forward1))
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden, self.feed_forward1(normed), 0.5, *_norm_args(self.norm_self_att)
         )
-        hidden = hidden + self.conv(self.norm_conv(hidden), valid)
-        hidden = hidden + 0.5 * self.feed_forward2(self.norm_feed_forward2(hidden))
-        return self.norm_out(hidden)
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden,
+            self.self_attn(normed, positions, pair_mask),
+            1.0,
+            *_norm_args(self.norm_conv),
+        )
+        hidden, normed = conformer.add_scaled_layer_norm(
+            hidden, self.conv(normed, valid), 1.0, *_norm_args(self.norm_feed_forward2)
+        )
+        _, out = conformer.add_scaled_layer_norm(
+            hidden, self.feed_forward2(normed), 0.5, *_norm_args(self.norm_out)
+        )
+        return out
 
 
 class Subsampling(nn.Module):
@@ -223,8 +246,17 @@ class Subsampling(nn.Module):
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden = features.unsqueeze(1)
         lengths = mask.sum(-1)
+        conformer = get_runtime().conformer
         for layer in self.layers:
-            hidden = layer(hidden)
+            if isinstance(layer, nn.Conv2d) and layer.groups == layer.in_channels > 1:
+                # The two depthwise convolutions go through the runtime: the reference is this same
+                # ``F.conv2d``, and a backend whose torch has no depthwise 2-D kernel (Apple silicon runs it
+                # one channel at a time -- 14 of the front end's 22 ms per utterance) replaces it.
+                hidden = conformer.depthwise_conv2d(
+                    hidden, layer.weight[:, 0], layer.bias, layer.stride[0], layer.padding[0]
+                )
+            else:
+                hidden = layer(hidden)
             if isinstance(layer, nn.Conv2d) and layer.stride != (1, 1):
                 lengths = (
                     lengths + 2 * layer.padding[0] - layer.kernel_size[0]
