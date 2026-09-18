@@ -6,19 +6,98 @@ import torch
 from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 
+def test_graph_input_copies_group_dtypes_and_preserve_views(monkeypatch):
+    from kestrel.runtime.single_pass_graph import _GraphInputCopies
+
+    sources = (
+        torch.arange(12.0).reshape(3, 4).t(),
+        torch.arange(5),
+        torch.arange(6.0).reshape(2, 3),
+        torch.empty(0),
+    )
+    destinations = tuple(
+        torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+        for value in sources
+    )
+    calls = []
+    original = torch._foreach_copy_
+
+    def copy(dst, src):
+        calls.append(tuple(value.dtype for value in dst))
+        return original(dst, src)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", copy)
+    _GraphInputCopies(destinations).copy(sources)
+    for destination, source in zip(destinations, sources, strict=True):
+        torch.testing.assert_close(destination, source, atol=0, rtol=0)
+    # Empty storage aliases conservatively retain sequential copying.
+    assert not calls
+    plan = _GraphInputCopies(destinations[:-1])
+    plan.copy(sources[:-1])
+    assert calls == [(torch.float32, torch.float32), (torch.int64,)]
+    assert all(
+        all(a is b for a, b in zip(dst, src, strict=True))
+        for _, dst, src in plan.groups
+    )
+
+
+def test_graph_input_aliases_keep_sequential_copy_semantics(monkeypatch):
+    from kestrel.runtime.single_pass_graph import _GraphInputCopies
+
+    first, second = torch.tensor([1.0, 3.0]), torch.tensor([2.0])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("aliased input copies must remain ordered")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", forbidden)
+    _GraphInputCopies((first, second)).copy((second.expand_as(first), first[1:]))
+    assert first.tolist() == [2.0, 2.0]
+    assert second.item() == 2.0
+
+
+def test_graph_input_copy_failure_releases_caller_sources(monkeypatch):
+    import gc
+    import weakref
+    from kestrel.runtime.single_pass_graph import _GraphInputCopies
+
+    plan = _GraphInputCopies((torch.empty(3), torch.empty(4)))
+    sources = (torch.ones(3), torch.ones(4))
+    references = tuple(weakref.ref(value) for value in sources)
+
+    def fail(*args):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", fail)
+    with pytest.raises(RuntimeError, match="copy failed"):
+        plan.copy(sources)
+    assert all(
+        all(a is b for a, b in zip(dst, src, strict=True))
+        for _, dst, src in plan.groups
+    )
+    del sources
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_mutating_forward_restores_capture_inputs():
     from kestrel_kernels.cubin_runtime import _GRAPH_EXECUTION
+
     phases = []
+
     def forward(value):
-        phases.append((_GRAPH_EXECUTION.get(), torch.cuda.is_current_stream_capturing()))
+        phases.append(
+            (_GRAPH_EXECUTION.get(), torch.cuda.is_current_stream_capturing())
+        )
         value.add_(1)
         return (value,)
-    session = FixedShapeSinglePassGraph(enabled=True, device=torch.device('cuda'),
-        stream=None, run_forward=forward)
+
+    session = FixedShapeSinglePassGraph(
+        enabled=True, device=torch.device("cuda"), stream=None, run_forward=forward
+    )
     try:
         for initial in (2, 7, -3):
-            value = torch.full((16,), initial, device='cuda')
+            value = torch.full((16,), initial, device="cuda")
             with session.launch(value) as (output,):
                 torch.testing.assert_close(output, torch.full_like(output, initial + 1))
                 torch.testing.assert_close(value, torch.full_like(value, initial))

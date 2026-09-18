@@ -17,11 +17,53 @@ from kestrel.device import resolve_device, stream_context
 _InputKey = tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...]
 
 
+class _GraphInputCopies:
+    """Reuse staging metadata while preserving cross-input alias ordering."""
+
+    def __init__(self, destinations: tuple[Tensor, ...]):
+        self.destinations = destinations
+        self.storage = {
+            value.data_ptr() - value.storage_offset() * value.element_size()
+            for value in destinations
+        }
+        groups: dict[torch.dtype, tuple[list[int], list[Tensor]]] = {}
+        for index, destination in enumerate(destinations):
+            indices, dst = groups.setdefault(destination.dtype, ([], []))
+            indices.append(index)
+            dst.append(destination)
+        self.groups = tuple(
+            (indices, dst, list(dst)) for indices, dst in groups.values()
+        )
+
+    def copy(self, sources: tuple[Tensor, ...]) -> None:
+        if len(sources) != len(self.destinations):
+            raise ValueError("graph input count changed")
+        # untyped_storage() attaches a GC-tracked Python wrapper to each source.
+        if len(sources) < 2 or any(
+            value.data_ptr() - value.storage_offset() * value.element_size()
+            in self.storage
+            for value in sources
+        ):
+            for destination, source in zip(self.destinations, sources, strict=True):
+                destination.copy_(source)
+            return
+        for indices, dst, src in self.groups:
+            try:
+                for offset, index in enumerate(indices):
+                    src[offset] = sources[index]
+                torch._foreach_copy_(dst, src)
+            finally:
+                # Never retain a caller's state after staging has been enqueued.
+                for offset in range(len(src)):
+                    src[offset] = dst[offset]
+
+
 @dataclass(slots=True)
 class _GraphEntry:
     inputs: tuple[Tensor, ...]
     outputs: tuple[Tensor, ...]
     graph: torch.cuda.CUDAGraph
+    copies: _GraphInputCopies
 
 
 class FixedShapeSinglePassGraph:
@@ -103,26 +145,24 @@ class FixedShapeSinglePassGraph:
             )
             for value in inputs
         )
+        copies = _GraphInputCopies(static_inputs)
         with (
             torch.cuda.device(self.device),
             stream_context(stream),
             torch.inference_mode(),
             graph_execution_scope(),
         ):
-            for destination, source in zip(static_inputs, inputs, strict=True):
-                destination.copy_(source)
+            copies.copy(inputs)
             # Materialize library handles and algorithm selection outside capture.
             self._outputs(self._run_forward(*static_inputs))
-            for destination, source in zip(static_inputs, inputs, strict=True):
-                destination.copy_(source)
+            copies.copy(inputs)
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 outputs = self._outputs(self._run_forward(*static_inputs))
-            for destination, source in zip(static_inputs, inputs, strict=True):
-                destination.copy_(source)
+            copies.copy(inputs)
             graph.replay()
-        return _GraphEntry(static_inputs, outputs, graph)
+        return _GraphEntry(static_inputs, outputs, graph, copies)
 
     @contextmanager
     def _ordered_stream(self) -> Iterator[None]:
@@ -179,10 +219,7 @@ class FixedShapeSinglePassGraph:
                             self._entries[key] = entry
                         else:
                             self._entries.move_to_end(key)
-                            for destination, source in zip(
-                                entry.inputs, values, strict=True
-                            ):
-                                destination.copy_(source)
+                            entry.copies.copy(values)
                             entry.graph.replay()
                         yield entry.outputs
             finally:
