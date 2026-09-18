@@ -291,10 +291,23 @@ Adapters are automatically downloaded and cached on first use.
 ```python
 RuntimeConfig(
     model="moondream3-preview",  # or "moondream2" / "moondream3.1-9B-A2B"
+    device=None,                 # None picks the device; "cuda"/"mps"/"cpu" to force one
     max_batch_size=4,            # Max concurrent requests
+    cpu_threads=None,            # Intra-op threads when running on the CPU
     decode_path="auto",          # "auto", "native", or fail-closed "generated"
 )
 ```
+
+`device=None` selects CUDA, which is what every GPU-first model wants. A model
+that declares the device types it supports — the 2-bit Parakeet student runs on
+CPU and Apple silicon only — instead gets the best device it supports on this
+machine: MPS when available, else CPU. Asking such a model for a device it
+cannot run on logs a warning and uses that same fallback rather than failing.
+
+`cpu_threads` sets torch's intra-op thread count for CPU inference. The default
+is the physical core count (performance cores on Apple silicon) capped at 8, or
+4 for weight modes whose GEMM runs on its own thread pool. `OMP_NUM_THREADS`
+overrides the default when it is set.
 
 `decode_path="native"` disables generated decode construction on runtimes that
 provide a native decode path. Qwen 3.5/3.6 requires compatible bundled generated

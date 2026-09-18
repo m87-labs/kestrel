@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from kestrel_kernels import get_runtime
+
 from .config import ParakeetEncoderConfig, ParakeetTdtConfig
 
 
@@ -32,7 +34,7 @@ class Convolution(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
         channels = config.hidden_size
-        self.pointwise_conv1 = nn.Conv1d(channels, 2 * channels, 1, bias=False)
+        self.pointwise_conv1 = nn.Linear(channels, 2 * channels, bias=False)
         self.depthwise_conv = nn.Conv1d(
             channels,
             channels,
@@ -42,19 +44,52 @@ class Convolution(nn.Module):
             bias=False,
         )
         self.norm = nn.BatchNorm1d(channels)
-        self.pointwise_conv2 = nn.Conv1d(channels, channels, 1, bias=False)
+        self.pointwise_conv2 = nn.Linear(channels, channels, bias=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # The checkpoint stores the 1x1 convolutions as ``Conv1d`` weights ``[C_out, C_in, 1]``. Running them
+        # as linears measured 42.87 ms vs 45.37 ms encoder wall on L4 at batch 1, and it is the layout the
+        # ternary export already packs, so the trailing kernel axis is dropped on the way in.
+        for name in ("pointwise_conv1", "pointwise_conv2"):
+            key = f"{prefix}{name}.weight"
+            weight = state_dict.get(key)
+            if weight is not None and weight.dim() == 3:
+                state_dict[key] = weight[..., 0]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
-        # Treating both 1x1 convolutions as linears measured 42.87 ms vs
-        # 45.37 ms encoder wall on L4 at batch 1; keep the depthwise Conv1d.
-        hidden = F.glu(
-            F.linear(hidden, self.pointwise_conv1.weight[..., 0]), dim=-1
+        hidden = F.glu(self.pointwise_conv1(hidden), dim=-1)
+        norm = self.norm
+        # The depthwise convolution, the eval-mode BatchNorm and the SiLU are one runtime op: it masks the
+        # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
+        hidden = get_runtime().conformer.depthwise_conv_bn_silu(
+            hidden,
+            self.depthwise_conv.weight[:, 0, :],  # the op takes the depthwise weight as [C, k]
+            norm.running_mean,
+            norm.running_var,
+            norm.weight,
+            norm.bias,
+            norm.eps,
+            valid,
         )
-        if valid is not None:
-            hidden = hidden.masked_fill(~valid[..., None], 0)
-        hidden = self.depthwise_conv(hidden.transpose(1, 2))
-        hidden = F.silu(self.norm(hidden)).transpose(1, 2)
-        return F.linear(hidden, self.pointwise_conv2.weight[..., 0])
+        return self.pointwise_conv2(hidden)
 
 
 class RelativeAttention(nn.Module):
@@ -86,14 +121,17 @@ class RelativeAttention(nn.Module):
         # One QKV GEMM measured 43.35 ms vs 45.37 ms encoder wall on L4 at
         # batch 1. Fuse the checkpoint's separate tensors without retaining a
         # duplicate 144 MiB BF16 copy across the 24 encoder layers.
-        fused_key = f"{prefix}qkv_proj.weight"
-        source_keys = tuple(f"{prefix}{name}_proj.weight" for name in "qkv")
-        if fused_key not in state_dict and all(
-            key in state_dict for key in source_keys
-        ):
-            state_dict[fused_key] = torch.cat(
-                tuple(state_dict.pop(key) for key in source_keys)
-            ).contiguous()
+        # A ternary checkpoint carries packed codes and scales instead of a weight; ternary rows are
+        # independent, so those concatenate by row just as the dense weight does.
+        for suffix in ("weight", "qweight", "scales"):
+            fused_key = f"{prefix}qkv_proj.{suffix}"
+            source_keys = tuple(f"{prefix}{name}_proj.{suffix}" for name in "qkv")
+            if fused_key not in state_dict and all(
+                key in state_dict for key in source_keys
+            ):
+                state_dict[fused_key] = torch.cat(
+                    tuple(state_dict.pop(key) for key in source_keys)
+                ).contiguous()
         super()._load_from_state_dict(
             state_dict,
             prefix,
