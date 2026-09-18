@@ -435,10 +435,9 @@ class InferenceEngine:
         spec = get_spec(model_id)
         kwargs: dict[str, Any] = {"compute_stream": self._compute_stream}
         # A runtime that stores no KV cache (single-pass ASR encoders, for
-        # instance) opts out with ``needs_kv_pool = False``. Building the pool
-        # imports ``kestrel.kv_cache``, which binds paged-attention kernels at
-        # import time — work with no purpose here, and not something every
-        # CPU/MPS kernel build has to offer.
+        # instance) opts out with ``needs_kv_pool = False``: the engine then
+        # holds no pool at all rather than budgeting paged attention storage
+        # on a device whose only model never pages anything.
         if getattr(spec.runtime, "needs_kv_pool", True):
             kwargs["kv_pool"] = self._shared_kv_pool()
         if model_id == self._default_model:
