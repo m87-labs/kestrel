@@ -22,8 +22,8 @@ _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # The ternary (2-bit) student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID. A checkpoint holds the packed
 # ``model.safetensors`` + ``ternary.json`` (thrush ``scripts/export_ternary.py --names hf``), plus config.json and
 # tokenizer.json; ``load_parakeet_tdt`` recognises the manifest and builds the ternary variant.
-TERNARY_MODEL_ID = "moondream/parakeet-ternary"
-TERNARY_REVISION = "47b5112255e8c726308fae6952187f81c13eccca"  # rl6 export, private, for runtime testing
+TERNARY_MODEL_ID = "moondream/parakeet-redux"
+TERNARY_REVISION = "70828b0628e071b8f58c36911f418d6c8096bc6f"  # rl6 export, private, for runtime testing
 TERNARY_MANIFEST = "ternary.json"
 _TERNARY_FILES = _FILES + (TERNARY_MANIFEST,)
 # The ternary student ships for CPU and Apple silicon only for now: a CUDA request runs it on MPS when available,
