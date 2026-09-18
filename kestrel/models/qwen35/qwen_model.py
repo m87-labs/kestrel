@@ -152,6 +152,8 @@ class _RecurrentPrefixRecord:
             layer.has_previous_state = True
         if state_destinations:
             torch._foreach_copy_(state_destinations, state_sources)
+        # Tried stack+foreach histories: C8 1.85s vs 1.67s with extra GC;
+        # keeping direct copies despite the faster isolated copy kernel.
         torch._foreach_copy_(conv_destinations, conv_sources)
 
     def replay_into(self, layer: LinearAttentionState, length: int,
@@ -597,8 +599,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         elif conv_prefix:
             chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
             mixed_qkv = torch.cat([
-                torch.cat((packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk), dim=-1)
+                part
                 for index, chunk in enumerate(chunks)
+                for part in (packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk)
             ], dim=-1)
             seq_idx = cache_params.conv_sequence_indices(
                 sequence_lengths, conv_prefix, mixed_qkv.device)

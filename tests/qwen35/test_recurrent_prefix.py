@@ -76,7 +76,7 @@ def test_packed_prefix_records_split_independent_histories():
         record.split_sequences((1, 3))
 
 
-def test_packed_continuation_keeps_convolution_histories_separate():
+def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch):
     observed = {}
     layer = SimpleNamespace(
         conv_states=torch.tensor([[[10., 11., 12.]], [[20., 21., 22.]]]),
@@ -108,11 +108,18 @@ def test_packed_continuation_keeps_convolution_histories_separate():
         allocate_packed_gdn_prefill_workspace=lambda *args, **kwargs: object(),
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         norm=lambda value, gate: value, out_proj=lambda value: value)
+    concatenations = []
+    original_cat = torch.cat
+    def concatenate(values, *args, **kwargs):
+        concatenations.append(len(values))
+        return original_cat(values, *args, **kwargs)
+    monkeypatch.setattr(torch, "cat", concatenate)
     output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
         cache_params=cache, cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
         sequence_lengths=(2, 3), topology_token=object(),
         gdn_state_indices=torch.tensor([1, 0]), gdn_state_indices_allocator_owned=True)
     assert output.shape == (1, 5, 1)
+    assert concatenations[0] == 4  # Prefix/token pairs need no intermediate copies.
     assert observed["conv"].flatten().tolist() == [11, 12, 1, 2, 21, 22, 3, 4, 5]
     assert observed["seq_idx"].flatten().tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 1]
     assert observed["qkv"].flatten().tolist() == [1, 2, 3, 4, 5]
