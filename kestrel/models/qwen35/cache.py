@@ -115,14 +115,20 @@ class Qwen35InferenceCache:
         branch._prefix_start = self.seq_length if capture_prefix else 0
         branch._prefix_records = {}
         layers = []
+        sources, destinations = [], []
         for layer in self.layers:
             if isinstance(layer, LinearAttentionState):
                 layer = copy(layer)
-                if layer.conv_states is not None:
-                    layer.conv_states = layer.conv_states.clone()
-                if layer.recurrent_states is not None:
-                    layer.recurrent_states = layer.recurrent_states.clone()
+                for name in ("conv_states", "recurrent_states"):
+                    source = getattr(layer, name)
+                    if source is not None:
+                        destination = torch.empty_like(source)
+                        sources.append(source)
+                        destinations.append(destination)
+                        setattr(layer, name, destination)
             layers.append(layer)
+        if sources:
+            torch._foreach_copy_(destinations, sources)
         branch.layers = tuple(layers)
         return branch
 

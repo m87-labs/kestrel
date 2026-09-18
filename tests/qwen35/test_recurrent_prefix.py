@@ -7,6 +7,51 @@ from kestrel.models.qwen35.cache import Qwen35InferenceCache
 from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
 
 
+@pytest.mark.parametrize("mixed_device", [False, True])
+def test_fork_batches_owned_copies_with_mixed_storage(monkeypatch, mixed_device):
+    if mixed_device and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cache = Qwen35InferenceCache(config=SimpleNamespace(
+        layer_types=("linear_attention", "linear_attention", "linear_attention")),
+        paged_kv=(None, None, None))
+    cache.layers[0].conv_states = torch.arange(48, dtype=torch.float32).reshape(2, 4, 6)[..., ::2]
+    cache.layers[0].recurrent_states = torch.ones(2, 2, 4, 4, dtype=torch.bfloat16)
+    device = "cuda" if mixed_device else "cpu"
+    cache.layers[1].recurrent_states = torch.full((1, 2, 4, 4), 3., dtype=torch.float16, device=device)
+    cache.advance_to(7)
+    calls = []
+    original = torch._foreach_copy_
+    def copy_many(destinations, sources):
+        calls.append(len(sources))
+        return original(destinations, sources)
+    monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
+    branch = cache.fork_recurrent_state(capture_prefix=True)
+    assert calls == [3]
+    assert branch._prefix_source is cache
+    for source, copied in zip(cache.layers, branch.layers):
+        assert source is not copied
+        for name in ("conv_states", "recurrent_states"):
+            a, b = getattr(source, name), getattr(copied, name)
+            if a is None:
+                assert b is None
+            else:
+                assert torch.equal(a, b)
+                assert a.dtype == b.dtype and a.device == b.device
+                assert a.data_ptr() != b.data_ptr()
+                b.zero_()
+                assert a.count_nonzero() > 0
+
+
+def test_fork_empty_state_does_not_submit_copy(monkeypatch):
+    cache = Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)),
+                                 paged_kv=(None,))
+    monkeypatch.setattr(torch, "_foreach_copy_", lambda *args: pytest.fail("empty copy"))
+    branch = cache.fork_recurrent_state()
+    assert branch.layers[0] is not cache.layers[0]
+    assert branch.layers[0].conv_states is None
+    assert branch.layers[0].recurrent_states is None
+
+
 def test_packed_prefix_records_split_independent_histories():
     from kestrel.models.qwen35.qwen_model import _RecurrentPrefixRecord
     module = SimpleNamespace(conv_kernel_size=4)
