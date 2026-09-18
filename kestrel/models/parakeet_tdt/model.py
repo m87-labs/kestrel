@@ -142,34 +142,18 @@ class RelativeAttention(nn.Module):
             error_msgs,
         )
 
-    @staticmethod
-    def _relative_shift(scores: Tensor) -> Tensor:
-        batch, heads, query, positions = scores.shape
-        scores = F.pad(scores, (1, 0)).view(batch, heads, -1, query)
-        return scores[:, :, 1:].view(batch, heads, query, positions)
-
     def forward(self, hidden: Tensor, positions: Tensor, mask: Tensor | None) -> Tensor:
-        batch, length, _ = hidden.shape
-        shape = (batch, length, self.num_heads, self.head_dim)
-        q, k, v = (
-            value.view(shape).transpose(1, 2)
-            for value in self.qkv_proj(hidden).chunk(3, dim=-1)
+        # Everything between the projections and o_proj is one runtime op: the relative shift, the two score
+        # products, the mask and the softmax. It takes the projections fused, which is what lets a backend
+        # read q, k and v in place instead of materializing the chunk/view/transpose chain.
+        attended = get_runtime().conformer.rel_attention(
+            self.qkv_proj(hidden),
+            self.relative_k_proj(positions),
+            self.bias_u,
+            self.bias_v,
+            mask,
+            self.scale,
         )
-        if mask is not None:
-            key_valid = mask[:, :1, :].transpose(1, 2)
-            k = k.masked_fill(~key_valid[:, None], 0)
-            v = v.masked_fill(~key_valid[:, None], 0)
-        relative_k = self.relative_k_proj(positions).view(
-            batch, -1, self.num_heads, self.head_dim
-        )
-        relative = (q + self.bias_v[None, :, None]) @ relative_k.permute(0, 2, 3, 1)
-        relative = self._relative_shift(relative)[..., :length] * self.scale
-        content = (q + self.bias_u[None, :, None]) @ k.transpose(-1, -2) * self.scale
-        scores = content + relative
-        if mask is not None:
-            scores = scores.masked_fill(~mask[:, None, :, :], float("-inf"))
-        probabilities = scores.softmax(-1, dtype=torch.float32).to(q.dtype)
-        attended = (probabilities @ v).transpose(1, 2).reshape(batch, length, -1)
         return self.o_proj(attended)
 
 
