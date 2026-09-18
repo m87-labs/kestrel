@@ -8,7 +8,10 @@ from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_mutating_forward_restores_capture_inputs():
+    from kestrel_kernels.cubin_runtime import _GRAPH_EXECUTION
+    phases = []
     def forward(value):
+        phases.append((_GRAPH_EXECUTION.get(), torch.cuda.is_current_stream_capturing()))
         value.add_(1)
         return (value,)
     session = FixedShapeSinglePassGraph(enabled=True, device=torch.device('cuda'),
@@ -21,6 +24,8 @@ def test_cuda_mutating_forward_restores_capture_inputs():
                 torch.testing.assert_close(value, torch.full_like(value, initial))
     finally:
         session.shutdown()
+    assert phases == [(True, False), (True, True)]
+    assert not _GRAPH_EXECUTION.get()
 
 
 def test_disabled_session_runs_eager_and_refuses_after_shutdown() -> None:

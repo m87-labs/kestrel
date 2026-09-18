@@ -89,6 +89,8 @@ class FixedShapeSinglePassGraph:
         )
 
     def _capture(self, inputs: tuple[Tensor, ...]) -> _GraphEntry:
+        from kestrel_kernels.cubin_runtime import graph_execution_scope
+
         stream = self._stream
         if stream is None:
             raise RuntimeError("single-pass graph capture has no CUDA stream")
@@ -105,6 +107,7 @@ class FixedShapeSinglePassGraph:
             torch.cuda.device(self.device),
             stream_context(stream),
             torch.inference_mode(),
+            graph_execution_scope(),
         ):
             for destination, source in zip(static_inputs, inputs, strict=True):
                 destination.copy_(source)
