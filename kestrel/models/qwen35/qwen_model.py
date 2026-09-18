@@ -66,9 +66,11 @@ class _RecurrentPrefixRecord:
     initial_state: torch.Tensor
     state_indices: torch.Tensor
 
-    def __post_init__(self) -> None:
+    @classmethod
+    def capture(cls, module, qkv, a, b, conv_input, initial_state, state_indices):
         # Scheduler metadata may be reused before the accepted prefix commits.
-        object.__setattr__(self, "state_indices", self.state_indices.clone())
+        # Derived records share this owned snapshot rather than copying it again.
+        return cls(module, qkv, a, b, conv_input, initial_state, state_indices.clone())
 
     @property
     def replay_geometry(self) -> tuple:
@@ -624,7 +626,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if capture_prefix:
             # Projection/conv outputs own their storage; initial_state is the
             # compact index_select copy made before writing the speculative pool.
-            cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord(
+            cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord.capture(
                 self, mixed_qkv, a, b, conv_input, initial_state, state_indices)
         return output
 

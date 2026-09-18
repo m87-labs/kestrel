@@ -14,7 +14,8 @@ def test_packed_prefix_records_split_independent_histories():
     conv = torch.arange(44).reshape(1, 4, 11)
     state = torch.arange(8).reshape(2, 1, 2, 2)
     indices = torch.tensor([3, 1])
-    record = _RecurrentPrefixRecord(module, qkv, qkv, qkv, conv, state, indices)
+    record = _RecurrentPrefixRecord.capture(module, qkv, qkv, qkv, conv, state, indices)
+    indices.zero_()
     first, second = record.split_sequences((2, 3))
     assert torch.equal(first.qkv, qkv[:, :2])
     assert torch.equal(second.qkv, qkv[:, 2:])
@@ -24,6 +25,8 @@ def test_packed_prefix_records_split_independent_histories():
     assert torch.equal(second.initial_state, state[1:])
     assert first.state_indices.tolist() == [3]
     assert second.state_indices.tolist() == [1]
+    assert first.state_indices.data_ptr() == record.state_indices.data_ptr()
+    assert second.state_indices.data_ptr() == record.state_indices[1:].data_ptr()
     with pytest.raises(ValueError, match="do not match"):
         record.split_sequences((1, 3))
 
@@ -248,7 +251,7 @@ def test_captured_indices_survive_caller_metadata_reuse():
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         packed_gated_delta_rule_prefill=native)
     for index in range(2):
-        branch._prefix_records[index] = _RecurrentPrefixRecord(
+        branch._prefix_records[index] = _RecurrentPrefixRecord.capture(
             module, torch.zeros(1, 16, 8 + index * 8), torch.zeros(1, 16, 2),
             torch.zeros(1, 16, 2), torch.zeros(1, 8, 19),
             torch.full((1, 2, 4, 4), 7., dtype=torch.bfloat16), indices)
@@ -305,7 +308,7 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
         module = SimpleNamespace(head_k_dim=4, head_v_dim=value_dim, conv_kernel_size=4,
                                  A_log=torch.full((2,), parameter, dtype=torch.float32),
                                  dt_bias=torch.full((2,), parameter + 1, dtype=torch.float32))
-        branch._prefix_records[index] = _RecurrentPrefixRecord(
+        branch._prefix_records[index] = _RecurrentPrefixRecord.capture(
             module, torch.full((1, 16, 8 + 2 * value_dim), parameter, dtype=torch.bfloat16),
             torch.zeros(1, 16, 2, dtype=torch.bfloat16),
             torch.zeros(1, 16, 2, dtype=torch.bfloat16), torch.full((1, 8, 19), parameter),
