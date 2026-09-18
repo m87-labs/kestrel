@@ -44,9 +44,22 @@ def main() -> None:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="auto", choices=[*DTYPES, "auto"])
     ap.add_argument("--threads", type=int, default=0, help="0 applies the shipped CPU thread policy")
+    ap.add_argument(
+        "--isa",
+        default=None,
+        help="run the CPU kernels on a named instruction-set path instead of the widest this machine has "
+        "(the output is identical at every one); pass 'name,conformer-name' to pick both",
+    )
     ap.add_argument("--bench-dir", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.isa:
+        from kestrel_kernels.cpu import conformer as cpu_conformer
+        from kestrel_kernels.ternary import set_gemm_isa
+
+        gemm_isa, _, conformer_isa = args.isa.partition(",")
+        set_gemm_isa(gemm_isa or None)
+        cpu_conformer.set_isa(conformer_isa or None)
     device = torch.device(args.device)
     if args.threads:
         torch.set_num_threads(args.threads)

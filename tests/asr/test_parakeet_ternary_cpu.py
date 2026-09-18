@@ -202,14 +202,12 @@ def test_unrestricted_models_keep_the_cuda_default() -> None:
     assert resolve_model_device("an-unregistered-model", None) == "cuda"
 
 
-def test_cpu_thread_policy(monkeypatch) -> None:
-    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+def test_cpu_thread_policy() -> None:
+    """The counts come from the machine and the caps, and from nowhere else -- there is no environment
+    variable that changes them; ``RuntimeConfig.cpu_threads`` is the way to name one."""
     assert 1 <= default_cpu_threads() <= 8
     assert 1 <= default_cpu_threads(NATIVE_GEMM_THREAD_CAP) <= NATIVE_GEMM_THREAD_CAP
-    # An explicit environment knob is a deliberate choice, cap or no cap.
-    monkeypatch.setenv("OMP_NUM_THREADS", "11")
-    assert default_cpu_threads() == 11
-    assert default_cpu_threads(NATIVE_GEMM_THREAD_CAP) == 11
+    assert default_cpu_threads(1) == 1
     with pytest.raises(ValueError):
         RuntimeConfig(
             model=TERNARY_MODEL_ID,

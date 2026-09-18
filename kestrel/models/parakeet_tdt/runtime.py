@@ -73,6 +73,15 @@ def _timed_segments(
     return tuple(segments)
 
 
+def _set_kernel_worker_threads(threads: int | None) -> None:
+    """Hand the kernels their pool size, or ``None`` to leave them their cache-domain policy."""
+    try:
+        from kestrel_kernels.ternary import set_worker_threads
+    except ImportError:
+        return
+    set_worker_threads(threads)
+
+
 def confine_to_cache_domain() -> None:
     """Pin this process to the cores the kernels chose, when the caller has not already pinned it.
 
@@ -235,8 +244,9 @@ class ParakeetTdtRuntime:
         another CCD costs what the workers saved. For throughput on a many-core socket, run one process per
         cache domain, each of them pinned, rather than one process across the socket.
 
-        ``cpu_threads`` in the config is the explicit override, and it suppresses the confinement too: an
-        operator who names a thread count is managing placement themselves.
+        ``cpu_threads`` in the config is the explicit override: it sizes the kernels' pool as well as
+        torch's, and suppresses the confinement, because an operator who names a count is managing placement
+        themselves. There is no environment variable for any of it.
 
         A CPU deployment should also set ``OMP_WAIT_POLICY=passive`` in the environment before torch is
         imported: measured on that machine at 4 / 8 / 16 pinned cores, the 50-utterance benchmark runs at
@@ -244,14 +254,17 @@ class ParakeetTdtRuntime:
         cannot be set from here — libgomp reads it when it loads.
         """
         threads = getattr(cfg, "cpu_threads", None)
+        if self.device.type != "cpu":
+            torch.set_num_threads(int(threads or default_cpu_threads()))
+            return torch.get_num_threads()
         if threads is None:
-            threads = (
-                default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
-                if self.device.type == "cpu"
-                else default_cpu_threads()
-            )
-            if self.device.type == "cpu":
-                confine_to_cache_domain()
+            confine_to_cache_domain()
+            _set_kernel_worker_threads(None)
+            threads = default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
+        else:
+            # A named count sizes the kernels' pool as well, and suppresses the confinement: an operator who
+            # picks a number is managing placement themselves.
+            _set_kernel_worker_threads(int(threads))
         torch.set_num_threads(int(threads))
         return torch.get_num_threads()
 
