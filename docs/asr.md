@@ -156,6 +156,30 @@ four seconds of initial context. Completed 180-second blocks and the final
 result use the same full-context path as file transcription, so previews may be
 revised without changing committed transcription quality.
 
+### Running on the CPU or on Apple silicon
+
+Transcription runtimes need no paged KV cache, so they start without one and
+run wherever the caller points them. Leave `device` unset and Kestrel picks:
+CUDA for a model that can use it, and for a model restricted to CPU and Apple
+silicon — the 2-bit Parakeet student — MPS when the machine has it, else the
+CPU. Asking such a model for CUDA logs a warning and falls back the same way
+instead of raising.
+
+```python
+from kestrel.models.parakeet_tdt import TERNARY_MODEL_ID
+
+engine = await InferenceEngine.create(
+    RuntimeConfig(model=TERNARY_MODEL_ID, model_path="/models/parakeet-ternary")
+)
+```
+
+On the CPU, `cpu_threads` sets torch's intra-op thread count; the default is
+the physical core count (performance cores on Apple silicon) capped at 8, which
+measured fastest on an 8-core Ryzen 9 7940HS — 14.4x real time at 8 threads
+against 12.6x at 6 and 12.2x at 16. Weight modes whose GEMM owns a native
+thread pool cap the default at 4 instead, so torch's workers stay out of its
+way. `OMP_NUM_THREADS` overrides the default when it is set.
+
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding
 use Kestrel's bundled generated-decode programs. Installed runtimes do not
