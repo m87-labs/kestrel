@@ -39,7 +39,7 @@ def load_parakeet_tdt(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
     local_files_only: bool = False,
-    ternary_mode: str = "dense",
+    ternary_mode: str = "auto",
 ) -> LoadedParakeetTdt:
     root = resolve_checkpoint(
         checkpoint,
@@ -155,11 +155,13 @@ def load_parakeet_tdt_ternary(
     *,
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
-    mode: str = "dense",
+    mode: str = "auto",
 ) -> LoadedParakeetTdt:
     """Build the fp architecture, swap in the ternary layers, load the packed export with ``strict=True``, then
-    materialize the weight cache: ``dense`` (dequantized once, fp speed, 2 bytes/weight in bf16/fp16), ``int8``
-    (1 byte/weight, one scaling pass per call) or ``packed`` (0.25 byte/weight, bit-unpack per call). Activations
+    materialize the weight cache: ``jit`` (2-bit weights resident, each layer expanded into a shared scratch buffer
+    by the native op right before its GEMM; the CPU default), ``dense`` (dequantized once, 2 bytes/weight in
+    bf16/fp16; the accelerator default), ``int8`` (1 byte/weight, one scaling pass per call) or ``packed``
+    (0.25 byte/weight, bit-unpack in torch per call). ``auto`` picks jit on CPU and dense elsewhere. Activations
     stay in ``dtype``; nothing is quantized at run time. ``root`` needs config.json and tokenizer.json next to the
     export (the pinned fp checkpoint's files are used when they are absent)."""
     from kestrel_kernels.ternary import materialize_ternary

@@ -130,7 +130,7 @@ class ParakeetTdtRuntime:
                 checkpoint,
                 device=self.device,
                 dtype=self.dtype,
-                ternary_mode=getattr(cfg, "ternary_mode", "dense"),
+                ternary_mode=getattr(cfg, "ternary_mode", "auto"),
             )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
