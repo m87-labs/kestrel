@@ -183,6 +183,8 @@ class Qwen35InferenceCache:
             from kestrel_kernels import get_runtime
 
             result = source.fork_recurrent_state()
+            # Tried cross-request grouping: C8 requests 2.28-2.46s vs 2.13-2.30s,
+            # including GC; keeping per-request groups.
             groups = {}
             for index, record in self._prefix_records.items():
                 groups.setdefault(record.replay_geometry, []).append((record, result.layers[index]))

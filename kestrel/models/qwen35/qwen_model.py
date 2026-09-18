@@ -146,11 +146,22 @@ class _RecurrentPrefixRecord:
             q, k, v, g, beta, cu, initial_state=initial, final_state=final,
             final_state_indices=indices, final_state_indices_allocator_owned=True,
             sequence_lengths=lengths, topology_token=topology)
+        state_destinations, state_sources = [], []
+        conv_destinations, conv_sources = [], []
         for index, (record, layer) in enumerate(records):
-            layer.recurrent_states.index_copy_(0, record.state_indices, final[index:index+1])
-            layer.conv_states.copy_(record.conv_input[
+            if layer.recurrent_states.shape[0] == 1 and record.state_indices.numel() == 1:
+                # Capture validated index0; the destination fork has the same pool extent.
+                state_destinations.append(layer.recurrent_states)
+                state_sources.append(final[index:index+1])
+            else:
+                layer.recurrent_states.index_copy_(0, record.state_indices, final[index:index+1])
+            conv_destinations.append(layer.conv_states)
+            conv_sources.append(record.conv_input[
                 ..., length-1:length-1+record.module.conv_kernel_size])
             layer.has_previous_state = True
+        if state_destinations:
+            torch._foreach_copy_(state_destinations, state_sources)
+        torch._foreach_copy_(conv_destinations, conv_sources)
 
     def replay_into(self, layer: LinearAttentionState, length: int,
                     cu: torch.Tensor, topology: object) -> None:

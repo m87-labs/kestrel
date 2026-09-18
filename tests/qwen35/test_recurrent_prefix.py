@@ -264,14 +264,15 @@ def test_captured_indices_survive_caller_metadata_reuse():
 
 
 @pytest.mark.parametrize("value_dim", [4, 6])
-def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value_dim):
+@pytest.mark.parametrize("pool_rows", [1, 2])
+def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value_dim, pool_rows):
     import kestrel_kernels
     from kestrel.models.qwen35.qwen_model import _RecurrentPrefixRecord
 
     source, branch = captured()
     for cache in (source, branch):
         for layer in cache.layers:
-            layer.recurrent_states = torch.ones(2, 2, value_dim, 4, dtype=torch.bfloat16)
+            layer.recurrent_states = torch.ones(pool_rows, 2, value_dim, 4, dtype=torch.bfloat16)
     prepared, recurrences = [], []
     fail = True
 
@@ -303,7 +304,7 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
         gated_delta=SimpleNamespace(bind_packed_prefill_topology=topology,
             packed_prefill_prepare=prepare,
             packed_recurrent_gated_delta_rule_prefill=recurrence)))
-    indices = torch.tensor([1])
+    indices = torch.tensor([pool_rows - 1])
     for index, parameter in enumerate((2, 5)):
         module = SimpleNamespace(head_k_dim=4, head_v_dim=value_dim, conv_kernel_size=4,
                                  A_log=torch.full((2,), parameter, dtype=torch.float32),
@@ -326,6 +327,7 @@ def test_grouped_replay_keeps_layer_parameters_and_state_rows(monkeypatch, value
     assert recurrences == [(3, 3)]
     for old, layer, parameter in zip(source.layers, result.layers, (2, 5)):
         assert torch.all(old.recurrent_states == 1)
-        assert torch.all(layer.recurrent_states[0] == 1)
-        assert torch.all(layer.recurrent_states[1] == parameter)
+        if pool_rows > 1:
+            assert torch.all(layer.recurrent_states[0] == 1)
+        assert torch.all(layer.recurrent_states[pool_rows - 1] == parameter)
         assert torch.all(layer.conv_states == parameter)
