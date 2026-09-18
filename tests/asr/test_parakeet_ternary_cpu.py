@@ -111,14 +111,24 @@ def build_tiny_ternary_export(root: Path, *, seed: int = 0) -> Path:
         reference = ParakeetTdt(config)
 
     # Every encoder linear is quantized. The export keeps the attention projections separate under their HF
-    # names, the way thrush writes them; ``ternarize`` fuses them back into the model's qkv_proj.
+    # names, the way thrush writes them; ``ternarize`` fuses them back into the model's qkv_proj, and the
+    # blocks' relative-position projections into the encoder's single one.
     hidden = config.encoder.hidden_size
+    layers = config.encoder.num_hidden_layers
     quantized: list[dict[str, Any]] = []
     fused: set[str] = set()
     for name, module in reference.named_modules():
-        if not name.startswith("encoder.layers.") or not isinstance(module, torch.nn.Linear):
+        if not isinstance(module, torch.nn.Linear):
             continue
-        if name.endswith("qkv_proj"):
+        if name == "encoder.relative_k_proj":
+            fused.add(name)
+            shapes = [
+                (f"encoder.layers.{index}.self_attn.relative_k_proj", hidden, hidden)
+                for index in range(layers)
+            ]
+        elif not name.startswith("encoder.layers."):
+            continue
+        elif name.endswith("qkv_proj"):
             fused.add(name)
             shapes = [(f"{name[: -len('qkv_proj')]}{attr}", hidden, hidden) for attr in ("q_proj", "k_proj", "v_proj")]
         else:
@@ -325,3 +335,23 @@ def test_ternarize_fuses_the_exports_separate_qkv(tmp_path) -> None:
     assert isinstance(attention.qkv_proj, TernaryLinear)
     assert attention.qkv_proj.out_features == 3 * config.encoder.hidden_size
     assert isinstance(attention.o_proj, TernaryLinear)
+
+
+def test_ternarize_fuses_the_blocks_relative_position_projections(tmp_path) -> None:
+    """They do not depend on the activations, so all of them are one layer on the encoder -- the export
+    still writes one per block, under the HF names."""
+    pytest.importorskip("kestrel_kernels.ternary")
+    from kestrel_kernels.ternary import TernaryLinear
+
+    root = build_tiny_ternary_export(tmp_path / "export")
+    config = ParakeetTdtConfig.from_json_file(root / "config.json")
+    names = {entry["name"] for entry in _quantized_modules(root / "ternary.json")}
+    assert "encoder.layers.0.self_attn.relative_k_proj" in names
+    assert "encoder.relative_k_proj" not in names
+    with torch.device("meta"):
+        model = ParakeetTdt(config)
+        ternarize(model, _quantized_modules(root / "ternary.json"))
+    projection = model.encoder.relative_k_proj
+    assert isinstance(projection, TernaryLinear)
+    assert projection.out_features == config.encoder.num_hidden_layers * config.encoder.hidden_size
+    assert not hasattr(model.encoder.layers[0].self_attn, "relative_k_proj")

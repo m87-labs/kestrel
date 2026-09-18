@@ -71,15 +71,6 @@ def _timed_segments(
     return tuple(segments)
 
 
-def _has_native_gemm_weights(model: torch.nn.Module) -> bool:
-    """Whether any layer runs its GEMM on the kernels' own thread pool: the ternary ``gemm8`` weight mode
-    (int8 activations, packed weight panels). Dense and fp weights go through torch's GEMM instead."""
-    return any(
-        getattr(getattr(module, "weight", None), "mode", None) == "gemm8"
-        for module in model.modules()
-    )
-
-
 def _encoder_frames(samples: int, factor: int) -> int:
     frames = samples // 160
     while factor > 1:
@@ -195,19 +186,25 @@ class ParakeetTdtRuntime:
         )
 
     def _set_cpu_threads(self, cfg: Any) -> int:
-        """Apply torch's intra-op thread count for this model's weight mode; returns the count in force.
+        """Apply torch's intra-op thread count; returns the count in force.
 
-        Dense weights go through torch's own GEMM and want every physical core; the ternary ``gemm8`` mode
-        runs its int8 GEMM on a separate native pool, and torch's spinning OpenMP workers only steal cores
-        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`. The mode is a property of the
-        loaded weights, so this runs after the model is built. ``torch.set_num_threads`` is process-global:
-        the last runtime to ask wins.
+        On the CPU this model's weights have exactly one resident form — packed codes with int8
+        activations — and that GEMM runs on the kernels' own pool, as do the fused encoder ops beside it.
+        torch is left with the subsampling convolutions, the decoder and the joint, and its spinning OpenMP
+        workers otherwise only steal cores from the pool, so the default is
+        :data:`NATIVE_GEMM_THREAD_CAP` whenever the model is on the CPU. ``torch.set_num_threads`` is
+        process-global: the last runtime to ask wins.
+
+        The same contention is why a CPU deployment should also set ``OMP_WAIT_POLICY=passive`` in the
+        environment before torch is imported: measured on an EPYC 9575F pinned to 4 / 8 / 16 physical cores,
+        the 50-utterance benchmark runs at 34 / 94 / 84x real time with torch's workers spinning and
+        90 / 113 / 78x with them parked. It cannot be set from here — libgomp reads it when it loads.
         """
         threads = getattr(cfg, "cpu_threads", None)
         if threads is None:
             threads = (
                 default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
-                if _has_native_gemm_weights(self.model)
+                if self.device.type == "cpu"
                 else default_cpu_threads()
             )
         torch.set_num_threads(int(threads))

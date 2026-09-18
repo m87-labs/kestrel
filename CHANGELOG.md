@@ -4,6 +4,24 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+- Speech: the Parakeet encoder hands the work between its matrix multiplies to the
+  `conformer` kernel domain rather than running it a tensor op at a time — each residual
+  add together with the normalization that follows it, the feed-forward and gate
+  activations, and the subsampling front end's depthwise convolutions. The references are
+  the ops they replace, so a backend without kernels for them is exactly where it was.
+- Speech: the encoder projects the relative-position table for all 24 blocks in one matrix
+  multiply instead of one per block. It does not depend on the activations, and it is 8.6 %
+  of the encoder's projection work at a 24x wider output.
+- Speech: on the CPU the model's intra-op thread count no longer depends on the weight
+  form, because there is only one — the packed codes, whose matrix multiply and fused
+  encoder ops run on the kernels' own pool. Set `OMP_WAIT_POLICY=passive` in a CPU
+  deployment's environment: with the encoder's work off the tensor library, its idle
+  OpenMP workers otherwise spin on cores that pool wants, which is worth 2.6x at four
+  pinned cores on an EPYC 9575F.
+- Speech: taken together, the 50-utterance dev-clean benchmark on the CPU int8 path runs at
+  90 / 113 / 86x real time on 4 / 8 / 16 pinned cores of an EPYC 9575F (was 78 / 79 / 65x)
+  and at 37.2x on an M2 MacBook Air (was 28.5x), transcripts unchanged.
+
 ## 0.7.2 — 2026-09-13
 
 - Updated to `kestrel-kernels` 0.6.2 and matching CUDA bundle companions.
