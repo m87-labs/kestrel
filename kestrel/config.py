@@ -115,9 +115,7 @@ def _mps_total_memory_bytes() -> int | None:
     a coarse tier when sysctl is unavailable).
     """
     try:
-        out = subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"], timeout=2, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=2)
         return int(out.strip())
     except Exception:
         pass
@@ -170,7 +168,7 @@ _DEFAULT_DEVICE = "cuda"
 # thread per core for a workload that does not use them.
 _CPU_THREAD_CAP = 8
 # Cap for a model whose GEMMs run on their own native thread pool (the ternary
-# ``vnni`` weight mode). Torch's OpenMP workers spin-wait between ops and fight
+# ``gemm8`` weight mode). Torch's OpenMP workers spin-wait between ops and fight
 # that pool for cores: on a 16-core EPYC 9575F, torch at 4 intra-op threads ran
 # the 50-utterance set at 64x real time against 40x with torch at 16.
 NATIVE_GEMM_THREAD_CAP = 4
@@ -213,10 +211,7 @@ def _preferred_device(supported: frozenset[str]) -> str:
             return device_type
     # Nothing in the set is usable here; name one anyway so the caller gets the
     # model's own error rather than a silently wrong device.
-    for device_type in _DEVICE_PREFERENCE:
-        if device_type in supported:
-            return device_type
-    return _DEFAULT_DEVICE
+    return sorted(supported)[0]
 
 
 def resolve_model_device(model: str | None, device: str | None) -> str:
@@ -246,108 +241,66 @@ def resolve_model_device(model: str | None, device: str | None) -> str:
     return target
 
 
-def _apple_performance_cores() -> int | None:
-    """P-core count on Apple silicon (``hw.perflevel0.physicalcpu``).
+def _physical_cpu_count() -> int:
+    """Physical cores available to this process.
 
-    The efficiency cores drag a latency-bound GEMM down rather than help it,
-    so the thread default counts performance cores only.
+    Apple silicon counts performance cores only (the efficiency cores drag a
+    latency-bound GEMM down rather than help it); elsewhere SMT siblings are
+    collapsed, so an 8-core/16-thread laptop answers 8, and a process pinned to
+    a subset of the machine (``taskset``, a cgroup's cpuset) never counts more
+    cores than it may run on.
     """
-    for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
-        try:
-            out = subprocess.check_output(
-                ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
-            )
-            count = int(out.strip())
-        except Exception:  # noqa: BLE001 — probe, never fatal
-            continue
-        if count > 0:
-            return count
-    return None
-
-
-def _linux_physical_cores() -> int | None:
-    """Physical core count from ``/proc/cpuinfo`` (SMT siblings collapsed)."""
+    if platform.system() == "Darwin":
+        for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+            try:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
+                )
+                return int(out.strip())
+            except Exception:  # noqa: BLE001 — probe, never fatal
+                continue
+        return os.cpu_count() or 1
+    try:
+        usable = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        usable = os.cpu_count() or 1
+    cores: set[tuple[str, str]] = set()
+    package = core = None
     try:
         text = Path("/proc/cpuinfo").read_text()
     except OSError:
-        return None
-    cores: set[tuple[str, str]] = set()
-    package = core = None
+        text = ""
     for line in text.splitlines():
         key, _, value = line.partition(":")
-        key = key.strip()
-        value = value.strip()
+        key, value = key.strip(), value.strip()
         if key == "physical id":
             package = value
         elif key == "core id":
             core = value
-        elif not line.strip():
-            package = core = None
         if package is not None and core is not None:
             cores.add((package, core))
-    return len(cores) or None
+            package = core = None
+    return min(len(cores), usable) if cores else usable
 
 
-def _affinity_count() -> int | None:
-    try:
-        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except (AttributeError, OSError):
-        return None
-
-
-def physical_cpu_count() -> int | None:
-    """Physical cores available for compute, or ``None`` when undetectable.
-
-    Apple silicon reports performance cores only; elsewhere SMT siblings are
-    collapsed so an 8-core/16-thread laptop answers 8. A process pinned to a
-    subset of the machine (``taskset``, a cgroup's cpuset) never counts more
-    cores than it is allowed to run on.
-    """
-    if platform.system() == "Darwin":
-        return _apple_performance_cores()
-    count = _linux_physical_cores()
-    affinity = _affinity_count()
-    if count is None:
-        return affinity if affinity is not None else os.cpu_count()
-    return count if affinity is None else min(count, affinity)
-
-
-def default_cpu_threads(cap: int | None = None) -> int:
+def default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
     """The intra-op thread count Kestrel uses for CPU inference.
 
-    Physical cores (P-cores on Apple silicon), capped at ``cap`` (default
-    :data:`_CPU_THREAD_CAP`). A runtime whose GEMMs own a separate native
-    thread pool passes :data:`NATIVE_GEMM_THREAD_CAP` instead, so torch's
-    workers stay out of the GEMM's way. ``OMP_NUM_THREADS`` wins when the
-    caller set it: an explicit environment knob is a deliberate choice, not a
-    default to override.
+    Physical cores (P-cores on Apple silicon), capped at ``cap``: a runtime
+    whose GEMMs own a separate native thread pool passes
+    :data:`NATIVE_GEMM_THREAD_CAP` so torch's workers stay out of the GEMM's
+    way. ``OMP_NUM_THREADS`` wins when the caller set it: an explicit
+    environment knob is a deliberate choice, not a default to override.
     """
     env = os.environ.get("OMP_NUM_THREADS", "").strip()
-    if env:
-        try:
-            requested = int(env)
-        except ValueError:
-            requested = 0
-        if requested > 0:
-            return requested
-    count = physical_cpu_count() or os.cpu_count() or 1
-    return max(1, min(int(count), _CPU_THREAD_CAP if cap is None else int(cap)))
-
-
-def cpu_has_native_bf16() -> bool:
-    """Whether this CPU multiplies bf16 matrices natively (AVX-512 BF16 or Intel AMX)."""
-    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
-        fn = getattr(torch.cpu, probe, None)
-        try:
-            if fn is not None and fn():
-                return True
-        except Exception:  # noqa: BLE001 — probes are private torch API
-            continue
-    return False
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    return max(1, min(_physical_cpu_count(), cap))
 
 
 def cpu_default_dtype() -> torch.dtype:
-    """The dtype the ``bfloat16`` default resolves to on CPU.
+    """The dtype the ``bfloat16`` default resolves to on CPU: bf16 only where
+    the CPU multiplies bf16 natively (AVX-512 BF16 or Intel AMX).
 
     Measured on the Parakeet-TDT encoder (125 frames x 1024 x 4096 GEMM,
     4 threads): AMD Zen 5 runs bf16 at 1091 GMAC/s vs 188 in fp32, so bf16
@@ -355,8 +308,14 @@ def cpu_default_dtype() -> torch.dtype:
     fp32 through Accelerate's AMX units at 456 GMAC/s but bf16 at 62, so
     fp32 is 7x faster on Apple silicon CPUs and on AVX2-only x86.
     """
-
-    return torch.bfloat16 if cpu_has_native_bf16() else torch.float32
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        fn = getattr(torch.cpu, probe, None)
+        try:
+            if fn is not None and fn():
+                return torch.bfloat16
+        except Exception:  # noqa: BLE001 — the probes are private torch API
+            continue
+    return torch.float32
 
 
 @dataclass
@@ -396,9 +355,9 @@ class RuntimeConfig:
     # GEMMs own a thread pool — and overridden by ``OMP_NUM_THREADS``).
     # Ignored off CPU.
     cpu_threads: int | None = None
-    # Weight cache for a ternary (2-bit) checkpoint: ``auto`` (the model's
-    # default), ``dense``, ``jit``, ``int8``, ``packed`` or ``vnni``. Ignored
-    # by models that are not ternary.
+    # How a ternary (2-bit) checkpoint keeps its weights: ``dense`` (dequantized
+    # once) or ``gemm8`` (packed, with int8 activations), or ``auto`` to leave
+    # the choice to kestrel-kernels. Ignored by models that are not ternary.
     ternary_mode: str = "auto"
 
     def __post_init__(self):
@@ -455,18 +414,6 @@ class RuntimeConfig:
         if self.dtype == torch.bfloat16 and device_type == "cpu":
             return cpu_default_dtype()
         return self.dtype
-
-    def resolved_cpu_threads(self, *, cap: int | None = None) -> int:
-        """Intra-op thread count for CPU inference (see ``cpu_threads``).
-
-        ``cap`` lets a runtime lower the default for its own execution shape
-        (see :data:`NATIVE_GEMM_THREAD_CAP`); an explicit ``cpu_threads`` is
-        the caller's decision and ignores it.
-        """
-
-        if self.cpu_threads is not None:
-            return self.cpu_threads
-        return default_cpu_threads(cap)
 
     def resolved_device(self) -> torch.device:
         """Return the torch device requested for inference."""
@@ -540,11 +487,9 @@ class RuntimeConfig:
 
 __all__ = [
     "DecodePath",
+    "NATIVE_GEMM_THREAD_CAP",
     "RuntimeConfig",
     "cpu_default_dtype",
-    "cpu_has_native_bf16",
-    "NATIVE_GEMM_THREAD_CAP",
     "default_cpu_threads",
-    "physical_cpu_count",
     "resolve_model_device",
 ]
