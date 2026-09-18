@@ -27,6 +27,9 @@ def decoder():
             return SimpleNamespace(seq_length=10+count)
 
     obj._target = lambda tokens, cache, slot, capture: ([8, 9, 99, 100], torch.ones(1, 4, 2), Verified())
+    obj._target_many = lambda candidates, sessions: [
+        obj._target(tokens, session.cache, session.state.batch_idx, capture=True)
+        for tokens, session in zip(candidates, sessions)]
     return obj, state, commits, erased
 
 
@@ -217,6 +220,71 @@ def test_dflash_config_accepts_concurrent_requests(concurrency):
                            draft_model_path="unused", max_batch_size=concurrency,
                            device="cuda", dtype=torch.bfloat16)
     assert config.max_batch_size == concurrency
+
+
+def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(monkeypatch):
+    from dataclasses import dataclass, replace
+    import kestrel.models.qwen35.spec_decoder as module
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+
+    obj, first, _, _ = decoder()
+    second = add_session(obj, slot=3)
+    sessions = [obj._sessions[3], obj._sessions[1]]
+    for session, start in zip(sessions, (7, 13)):
+        cache = Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
+        cache.seq_length = start
+        cache.layers[0].has_previous_state = True
+        cache.layers[0].conv_states = torch.full((1, 2, 3), float(start))
+        cache.layers[0].recurrent_states = torch.arange(4, dtype=torch.float32).reshape(4, 1, 1, 1)
+        session.cache = cache
+    page_table = torch.arange(32).reshape(4, 8)
+    obj.runtime.device = torch.device("cpu")
+    obj.runtime.page_size = 4
+    obj.runtime.page_table.page_table = page_table
+    obj.runtime.model = SimpleNamespace(lm_head=lambda hidden: torch.nn.functional.one_hot(
+        hidden[..., 0].long(), num_classes=16).float())
+    obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
+    monkeypatch.setattr(module, "get_runtime", lambda: SimpleNamespace(gated_delta=SimpleNamespace(
+        bind_packed_prefill_topology=lambda **kwargs: (torch.tensor([0, 2, 5]), object()))))
+
+    @dataclass
+    class Record:
+        state_indices: torch.Tensor
+
+        def split_sequences(self, lengths):
+            return tuple(replace(self, state_indices=self.state_indices[i:i+1]) for i in range(len(lengths)))
+
+    def text(**kwargs):
+        assert kwargs["sequence_lengths"] == (2, 3)
+        assert kwargs["position_ids"].tolist() == [[7, 8, 13, 14, 15]]
+        assert kwargs["paged_kv_seqlens_k"].tolist() == [9, 16]
+        assert kwargs["page_table"].equal(page_table[[3, 1]])
+        assert kwargs["seq_idx"].tolist() == [[0, 0, 1, 1, 1]]
+        expected_slots = [page_table[3, pos // 4].item() * 4 + pos % 4 for pos in (7, 8)]
+        expected_slots += [page_table[1, pos // 4].item() * 4 + pos % 4 for pos in (13, 14, 15)]
+        assert kwargs["slot_mapping"].tolist() == [expected_slots]
+        cache = kwargs["past_key_values"]
+        assert cache.layers[0].recurrent_states.flatten().tolist() == [3, 1]
+        cache.layers[0].recurrent_states.add_(100)
+        cache.layers[0].conv_states.add_(100)
+        cache._prefix_records[0] = Record(kwargs["gdn_state_indices"])
+        hidden = kwargs["input_ids"][..., None].float()
+        return SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=(hidden,))
+
+    obj.text = text
+    results = Qwen35DFlashDecoder._target_many(obj, [[2, 3], [4, 5, 6]], sessions)
+    for row, (result, session, count) in enumerate(zip(results, sessions, (2, 3))):
+        expected, features, branch = result
+        slot = session.state.batch_idx
+        assert expected == ([2, 3] if row == 0 else [4, 5, 6])
+        assert features.shape == (1, count, 1)
+        assert branch._prefix_source is session.cache
+        assert branch._prefix_start == session.cache.seq_length
+        assert branch.seq_length == session.cache.seq_length + count
+        assert branch._prefix_records[0].state_indices.tolist() == [slot]
+        assert branch.layers[0].recurrent_states[slot].item() == slot + 100
+        assert session.cache.layers[0].recurrent_states[slot].item() == slot
+        assert torch.all(session.cache.layers[0].conv_states == session.cache.seq_length)
 
 
 def test_unsupported_runtime_rejects_draft_config_before_loading():

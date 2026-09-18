@@ -1,6 +1,7 @@
 """Independent greedy DFlash sessions with native sequence verification."""
 
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -10,6 +11,7 @@ from kestrel.runtime.tokens import TextToken
 from kestrel_kernels import get_runtime
 from .cache import Qwen35InferenceCache
 from .dflash import DFlashContextCache, load_dflash_drafter
+from .gdn_state import LinearAttentionState
 
 
 @dataclass
@@ -23,7 +25,7 @@ class _Session:
 
 
 class Qwen35DFlashDecoder:
-    """Own scheduler rows; verification currently runs one sequence at a time."""
+    """Own independent scheduler rows and pack their target verification."""
 
     def __init__(self, runtime, draft_path):
         if runtime.device.type != "cuda" or runtime.dtype != torch.bfloat16:
@@ -126,6 +128,62 @@ class Qwen35DFlashDecoder:
         ids = self.runtime.model.lm_head(hidden[:, 1:]).argmax(-1).to(torch.int32)
         return DraftResult(token_ids=ids)
 
+    def _target_many(self, candidates, sessions):
+        """Verify independent sequences together, retaining separate commit owners."""
+        device = self.runtime.device
+        lengths = tuple(len(tokens) for tokens in candidates)
+        branches = [session.cache.fork_recurrent_state(capture_prefix=True) for session in sessions]
+        packed = copy(branches[0])
+        packed._prefix_records = {}
+        layers = []
+        for index, layer in enumerate(packed.layers):
+            if isinstance(layer, LinearAttentionState):
+                layer = copy(layer)
+                layer.conv_states = torch.cat([branch.layers[index].conv_states for branch in branches])
+                layer.recurrent_states = torch.cat([
+                    branch.layers[index].recurrent_states[session.state.batch_idx:session.state.batch_idx + 1]
+                    for branch, session in zip(branches, sessions)])
+            layers.append(layer)
+        packed.layers = tuple(layers)
+        ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
+        positions = torch.cat([
+            torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
+            for session, length in zip(sessions, lengths)])[None]
+        slot_ids = torch.tensor([session.state.batch_idx for session in sessions], device=device, dtype=torch.long)
+        page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
+        page_size = self.runtime.page_size
+        position_rows = positions[0].split(lengths)
+        slot_mapping = torch.cat([
+            page_table[row, position // page_size].long() * page_size + position % page_size
+            for row, position in enumerate(position_rows)])[None]
+        cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+            sequence_lengths=lengths, device=device)
+        output = self.text(
+            input_ids=ids, past_key_values=packed, position_ids=positions,
+            cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
+            paged_kv_seqlens_k=torch.tensor([
+                session.cache.seq_length + length for session, length in zip(sessions, lengths)
+            ], device=device, dtype=torch.int32),
+            cu_seq_lens_q=cu, sequence_lengths=lengths, topology_token=topology,
+            seq_idx=torch.cat([torch.full((length,), row, device=device, dtype=torch.int32)
+                               for row, length in enumerate(lengths)])[None],
+            gdn_state_indices=torch.arange(len(sessions), device=device, dtype=torch.long),
+            gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
+        features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
+        expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].split(lengths)
+        for index, record in packed._prefix_records.items():
+            records = record.split_sequences(lengths)
+            for row, (branch, session) in enumerate(zip(branches, sessions)):
+                slot = session.state.batch_idx
+                branch.layers[index].conv_states.copy_(packed.layers[index].conv_states[row:row + 1])
+                branch.layers[index].recurrent_states[slot:slot + 1].copy_(
+                    packed.layers[index].recurrent_states[row:row + 1])
+                branch._prefix_records[index] = replace(records[row], state_indices=slot_ids[row:row + 1])
+        for branch, session, length in zip(branches, sessions, lengths):
+            branch.advance_to(session.cache.seq_length + length)
+        return [(tokens.tolist(), feature, branch)
+                for tokens, feature, branch in zip(expected, features, branches)]
+
     def commit_accept(self, ctx):
         session, verified, features, expected, count = ctx
         cache = verified.commit_recurrent_prefix(count)
@@ -157,10 +215,14 @@ class Qwen35DFlashDecoder:
             sessions.append((session, cap))
         pending = []
         try:
-            for session, cap in sessions:
-                candidate = [session.bonus, *self.propose(session).token_ids[0].tolist()]
-                expected, features, verified = self._target(
-                    candidate, session.cache, session.state.batch_idx, capture=True)
+            candidates = [[session.bonus, *self.propose(session).token_ids[0].tolist()]
+                          for session, _ in sessions]
+            if len(sessions) == 1:
+                session = sessions[0][0]
+                results = [self._target(candidates[0], session.cache, session.state.batch_idx, capture=True)]
+            else:
+                results = self._target_many(candidates, [session for session, _ in sessions])
+            for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0
                 for proposed, wanted in zip(candidate[1:], expected):
                     if proposed != wanted:
