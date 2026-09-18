@@ -1,4 +1,4 @@
-"""Single-sequence greedy DFlash with native target sequence verification."""
+"""Independent greedy DFlash sessions with native sequence verification."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -19,14 +19,15 @@ class _Session:
     draft_cache: DFlashContextCache
     features: torch.Tensor
     bonus: int
+    failed: bool = False
 
 
 class Qwen35DFlashDecoder:
-    """Own one scheduler row; the scheduler owns output staging and lengths."""
+    """Own scheduler rows; verification currently runs one sequence at a time."""
 
     def __init__(self, runtime, draft_path):
-        if runtime.max_batch_size != 1 or runtime.device.type != "cuda" or runtime.dtype != torch.bfloat16:
-            raise ValueError("DFlash requires one CUDA BF16 sequence")
+        if runtime.device.type != "cuda" or runtime.dtype != torch.bfloat16:
+            raise ValueError("DFlash requires CUDA BF16 sequences")
         self.runtime = runtime
         self.text = runtime.model.model.language_model
         self.draft = load_dflash_drafter(draft_path, device=runtime.device)
@@ -40,11 +41,12 @@ class Qwen35DFlashDecoder:
             raise ValueError("DFlash checkpoint does not match target dimensions, taps, or vocabulary")
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
-        self._session = None
+        self._sessions = {}
 
     @property
     def free_slots(self):
-        return int(self._session is None and bool(self.runtime.page_table.free_batch_idx))
+        return min(self.runtime.max_batch_size - len(self._sessions),
+                   len(self.runtime.page_table.free_batch_idx))
 
     @staticmethod
     def _unconstrained(allowed, suppressed):
@@ -64,6 +66,8 @@ class Qwen35DFlashDecoder:
         capacity = int(state.max_length) + self.num_lookahead_tokens
         if capacity > self.runtime.max_seq_length:
             raise ValueError("request plus speculative lookahead exceeds model context")
+        if any(session.state is state for session in self._sessions.values()):
+            raise ValueError("speculative sequence is already admitted")
         if not self.free_slots:
             raise RuntimeError("Qwen DFlash sequence slot is occupied")
         tokens = [int(token.token_id) for token in prompt_tokens]
@@ -78,7 +82,7 @@ class Qwen35DFlashDecoder:
             cache = Qwen35InferenceCache(config=self.text.config, paged_kv=self.runtime._paged_kv)
             self.runtime._linear_state_pool.bind_prefill_state(cache)
             expected, features, cache = self._target(tokens, cache, slot, capture=False)
-            self._session = _Session(state, cache, DFlashContextCache(capacity), features, expected[-1])
+            self._sessions[slot] = _Session(state, cache, DFlashContextCache(capacity), features, expected[-1])
             return expected[-1], None
         except Exception:
             pages.erase(slot)
@@ -123,45 +127,65 @@ class Qwen35DFlashDecoder:
         return DraftResult(token_ids=ids)
 
     def commit_accept(self, ctx):
-        verified, features, expected, count = ctx
-        session = self._session
+        session, verified, features, expected, count = ctx
         cache = verified.commit_recurrent_prefix(count)
         session.cache = cache
         session.features = features[:, :count]
         session.bonus = expected[count-1]
 
     def step(self, states, *, allowed_token_ids=None, suppressed_token_ids=None, commit_caps=None):
-        session = self._session
-        if len(states) != 1 or session is None or states[0] is not session.state:
-            raise ValueError("Qwen DFlash requires its single admitted sequence")
+        if not states:
+            raise ValueError("Qwen DFlash requires admitted sequences")
         for values in (allowed_token_ids, suppressed_token_ids, commit_caps):
-            if values is not None and len(values) != 1:
-                raise ValueError("per-sequence options must match the admitted sequence")
-        self._unconstrained(None if allowed_token_ids is None else allowed_token_ids[0],
-                            None if suppressed_token_ids is None else suppressed_token_ids[0])
-        cap = None if commit_caps is None else commit_caps[0]
-        if cap is not None and (type(cap) is not int or cap < 1):
-            raise ValueError("commit cap must be a positive integer")
-        candidate = [session.bonus, *self.propose(session).token_ids[0].tolist()]
-        expected, features, verified = self._target(
-            candidate, session.cache, session.state.batch_idx, capture=True)
-        accepted = 0
-        for proposed, wanted in zip(candidate[1:], expected):
-            if proposed != wanted:
-                break
-            accepted += 1
-        count = min(accepted+1, cap if cap is not None else accepted+1)
-        self.commit_accept((verified, features, expected, count))
-        # The input's first token was emitted by admit/the preceding step.
-        # Outputs are accepted drafts followed by the replacement/bonus token.
-        return SpecStepResult(tokens=[expected[:count]], accept_counts=[count-1])
+            if values is not None and len(values) != len(states):
+                raise ValueError("per-sequence options must match the admitted sequences")
+        sessions = []
+        seen = set()
+        for row, state in enumerate(states):
+            slot = state.batch_idx
+            session = self._sessions.get(slot)
+            if session is None or session.state is not state or slot in seen:
+                raise ValueError("Qwen DFlash requires distinct admitted sequences")
+            if session.failed:
+                raise RuntimeError("failed speculative sequence must be retired")
+            seen.add(slot)
+            self._unconstrained(None if allowed_token_ids is None else allowed_token_ids[row],
+                                None if suppressed_token_ids is None else suppressed_token_ids[row])
+            cap = None if commit_caps is None else commit_caps[row]
+            if cap is not None and (type(cap) is not int or cap < 1):
+                raise ValueError("commit cap must be a positive integer")
+            sessions.append((session, cap))
+        pending = []
+        try:
+            for session, cap in sessions:
+                candidate = [session.bonus, *self.propose(session).token_ids[0].tolist()]
+                expected, features, verified = self._target(
+                    candidate, session.cache, session.state.batch_idx, capture=True)
+                accepted = 0
+                for proposed, wanted in zip(candidate[1:], expected):
+                    if proposed != wanted:
+                        break
+                    accepted += 1
+                count = min(accepted+1, cap if cap is not None else accepted+1)
+                pending.append((session, verified, features, expected, count))
+            for ctx in pending:
+                self.commit_accept(ctx)
+        except Exception:
+            # Draft caches and shared KV suffixes may already have advanced.
+            # Keep slots owned until scheduler retirement; retry is not safe.
+            for session, _ in sessions:
+                session.failed = True
+            raise
+        # Each input's first token was emitted by admit/the preceding step.
+        return SpecStepResult(tokens=[expected[:count] for _, _, _, expected, count in pending],
+                              accept_counts=[count-1 for _, _, _, _, count in pending])
 
     def retire(self, state):
-        session = self._session
+        session = self._sessions.get(state.batch_idx)
         if session is None:
             return
         if session.state is not state:
             raise ValueError("cannot retire a different speculative sequence")
         self.runtime.page_table.erase(state.batch_idx)
         # Scheduler cleanup still uses batch_idx to remove active_sequences.
-        self._session = None
+        del self._sessions[state.batch_idx]
