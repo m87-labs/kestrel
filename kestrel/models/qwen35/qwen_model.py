@@ -77,6 +77,28 @@ class _RecurrentPrefixRecord:
                 tuple(self.initial_state.shape[1:]), self.module.head_k_dim,
                 self.module.head_v_dim)
 
+    def split_sequences(self, sequence_lengths: Sequence[int]) -> tuple:
+        lengths = tuple(sequence_lengths)
+        if (not lengths or any(type(length) is not int or length <= 0 for length in lengths)
+                or sum(lengths) != self.qkv.shape[1]
+                or self.initial_state.shape[0] != len(lengths)
+                or self.state_indices.numel() != len(lengths)):
+            raise ValueError("captured packed sequences do not match recurrent records")
+        prefix = self.module.conv_kernel_size - 1
+        if self.conv_input.shape[-1] != sum(lengths) + prefix * len(lengths):
+            raise ValueError("captured convolution histories do not match packed sequences")
+        records = []
+        offset = conv_offset = 0
+        for index, length in enumerate(lengths):
+            records.append(_RecurrentPrefixRecord(
+                self.module, self.qkv[:, offset:offset + length],
+                self.a[:, offset:offset + length], self.b[:, offset:offset + length],
+                self.conv_input[..., conv_offset:conv_offset + prefix + length],
+                self.initial_state[index:index + 1], self.state_indices[index:index + 1]))
+            offset += length
+            conv_offset += prefix + length
+        return tuple(records)
+
     @staticmethod
     def replay_group(records: list[tuple[_RecurrentPrefixRecord, LinearAttentionState]],
                      length: int) -> None:
@@ -443,9 +465,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         capture_prefix = cache_params._prefix_source is not None
         if capture_prefix:
             if (batch_size != 1 or sequence_lengths is None
-                    or tuple(sequence_lengths) != (seq_len,) or not has_initial_state
+                    or sum(sequence_lengths) != seq_len or not has_initial_state
                     or not gdn_state_indices_allocator_owned):
-                raise ValueError("prefix capture requires one committed sequence and owned state indices")
+                raise ValueError("prefix capture requires committed sequences and owned state indices")
             if (cache_params.seq_length != cache_params._prefix_start
                     or self.layer_idx in cache_params._prefix_records):
                 raise RuntimeError("prefix capture permits only one verification forward")
@@ -488,8 +510,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         layer = cache_params.layers[self.layer_idx]
         conv_shape = (num_sequences, self.conv_dim, self.conv_kernel_size)
         if has_initial_state:
-            if num_sequences != 1:
-                raise ValueError("Qwen recurrent continuation currently requires one sequence")
+            if (sequence_lengths is None or len(sequence_lengths) != num_sequences
+                    or any(type(length) is not int or length <= 0 for length in sequence_lengths)
+                    or sum(sequence_lengths) != seq_len):
+                raise ValueError("Qwen recurrent continuation requires exact packed sequence lengths")
             if (layer.conv_states is None
                     or tuple(layer.conv_states.shape) != conv_shape
                     or layer.conv_states.dtype != mixed_qkv.dtype
@@ -533,11 +557,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         recurrence_cu_seqlens = cu_seqlens_q
         conv_prefix = self.conv_kernel_size - 1 if has_initial_state else 0
-        if conv_prefix:
+        if conv_prefix and num_sequences == 1:
             mixed_qkv = torch.cat(
                 (packed_conv_state[..., -conv_prefix:], mixed_qkv), dim=-1)
             seq_idx = torch.zeros(
                 (1, mixed_qkv.shape[-1]), device=mixed_qkv.device, dtype=torch.int32)
+        elif conv_prefix:
+            chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
+            mixed_qkv = torch.cat([
+                torch.cat((packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk), dim=-1)
+                for index, chunk in enumerate(chunks)
+            ], dim=-1)
+            seq_idx = torch.cat([
+                torch.full((1, length + conv_prefix), index, device=mixed_qkv.device, dtype=torch.int32)
+                for index, length in enumerate(sequence_lengths)
+            ], dim=-1)
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.
@@ -550,8 +584,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             activation=self.activation,
             final_state=packed_conv_state,
         )
-        if conv_prefix:
+        if conv_prefix and num_sequences == 1:
             mixed_qkv = mixed_qkv[..., conv_prefix:].contiguous()
+        elif conv_prefix:
+            chunks = mixed_qkv.split(tuple(length + conv_prefix for length in sequence_lengths), dim=-1)
+            mixed_qkv = torch.cat([chunk[..., conv_prefix:] for chunk in chunks], dim=-1).contiguous()
         mixed_qkv = mixed_qkv.transpose(1, 2)
         workspace = self._prefill_workspace_cache.get(
             mixed_qkv,
