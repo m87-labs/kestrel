@@ -355,11 +355,6 @@ class RuntimeConfig:
     # GEMMs own a thread pool — and overridden by ``OMP_NUM_THREADS``).
     # Ignored off CPU.
     cpu_threads: int | None = None
-    # How a ternary (2-bit) checkpoint keeps its weights: ``dense`` (dequantized
-    # once) or ``gemm8`` (packed, with int8 activations), or ``auto`` to leave
-    # the choice to kestrel-kernels. Ignored by models that are not ternary.
-    ternary_mode: str = "auto"
-
     def __post_init__(self):
         if self.decode_path not in ("auto", "native", "generated"):
             raise ValueError(

@@ -8,7 +8,7 @@ that file.
   python scripts/bench_parakeet_ternary.py --model fp --device cpu --threads 4 \
       --bench-dir /path/to/devclean50 --out fp_cpu.jsonl
   python scripts/bench_parakeet_ternary.py --model ternary --export-dir /path/to/rl6-ternary-hf --device mps \
-      --dtype fp16 --mode dense --bench-dir /path/to/devclean50 --out ternary_mps.jsonl
+      --dtype fp16 --bench-dir /path/to/devclean50 --out ternary_mps.jsonl
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ def main() -> None:
     ap.add_argument("--export-dir", default=None, help="thrush export with HF names (ternary)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="auto", choices=[*DTYPES, "auto"])
-    ap.add_argument("--mode", default="auto", choices=["auto", "dense", "gemm8"], help="ternary weight mode")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--bench-dir", required=True)
     ap.add_argument("--out", required=True)
@@ -58,10 +57,10 @@ def main() -> None:
 
     t0 = time.time()
     if args.model == "ternary":
-        checkpoint, label = args.export_dir, f"ternary {args.mode} {args.dtype}"
+        checkpoint, label = args.export_dir, f"ternary {args.dtype}"
     else:
         checkpoint, label = MODEL_ID, f"fp {args.dtype}"
-    loaded = load_parakeet_tdt(checkpoint, device=device, dtype=dtype, ternary_mode=args.mode)
+    loaded = load_parakeet_tdt(checkpoint, device=device, dtype=dtype)
     model, tokenizer = loaded.model, loaded.tokenizer
     load_s = time.time() - t0
     rss_after_load = peak_rss_mb()
