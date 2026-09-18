@@ -56,9 +56,10 @@ def main() -> None:
     ap.add_argument("--export-dir", default=None, help="thrush export with HF names (ternary)")
     ap.add_argument("--checkpoint", default=None, help="fp checkpoint (default: the pinned nvidia/parakeet-tdt-0.6b-v3)")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--dtype", default="fp32", choices=list(DTYPES))
+    ap.add_argument("--dtype", default="auto", choices=[*DTYPES, "auto"])
     ap.add_argument("--mode", default="int8", choices=["int8", "dense", "packed"])
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--legacy-conv", action="store_true", help="keep nn.Conv1d for the depthwise conv on CPU/MPS (A/B)")
     ap.add_argument("--bench-dir", required=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", required=True)
@@ -66,7 +67,17 @@ def main() -> None:
     if args.threads:
         torch.set_num_threads(args.threads)
     device = torch.device(args.device)
-    dtype = DTYPES[args.dtype]
+    if args.dtype == "auto":  # the runtime's policy: bf16 on CUDA / native-bf16 CPUs, fp16 on MPS, fp32 elsewhere
+        from kestrel.config import cpu_default_dtype
+
+        dtype = {"cuda": torch.bfloat16, "mps": torch.float16}.get(device.type) or cpu_default_dtype()
+        args.dtype = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}[dtype]
+    else:
+        dtype = DTYPES[args.dtype]
+    if args.legacy_conv:
+        import kestrel.models.parakeet_tdt.model as _pm
+
+        _pm.DEPTHWISE_LINEAR_LAYOUT_DEVICES = frozenset()
     from kestrel.models.parakeet_tdt.features import parakeet_features
 
     t0 = time.time()

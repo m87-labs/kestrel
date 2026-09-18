@@ -152,6 +152,31 @@ def _default_kv_cache_pages_for_device(device: str) -> int:
     return _KV_CACHE_PAGES_LARGE_VRAM
 
 
+def cpu_has_native_bf16() -> bool:
+    """Whether this CPU multiplies bf16 matrices natively (AVX-512 BF16 or Intel AMX)."""
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        fn = getattr(torch.cpu, probe, None)
+        try:
+            if fn is not None and fn():
+                return True
+        except Exception:  # noqa: BLE001 — probes are private torch API
+            continue
+    return False
+
+
+def cpu_default_dtype() -> torch.dtype:
+    """The dtype the ``bfloat16`` default resolves to on CPU.
+
+    Measured on the Parakeet-TDT encoder (125 frames x 1024 x 4096 GEMM,
+    4 threads): AMD Zen 5 runs bf16 at 1091 GMAC/s vs 188 in fp32, so bf16
+    triples the real-time factor there (34.5x vs 13.3x); an Apple M2 runs
+    fp32 through Accelerate's AMX units at 456 GMAC/s but bf16 at 62, so
+    fp32 is 7x faster on Apple silicon CPUs and on AVX2-only x86.
+    """
+
+    return torch.bfloat16 if cpu_has_native_bf16() else torch.float32
+
+
 @dataclass
 class RuntimeConfig:
     """Knobs controlling the text-only inference prototype."""
@@ -212,10 +237,18 @@ class RuntimeConfig:
         without saturating fp16's 65504 dynamic-range cap. Users who
         explicitly want fp32 on MPS still get fp32 — only the bf16
         default is overridden.
+
+        On CPU the ``bfloat16`` default becomes :func:`cpu_default_dtype`:
+        bf16 where the CPU has a native bf16 GEMM (AVX-512 BF16 / AMX),
+        fp32 everywhere else (Apple silicon CPUs, AVX2-only x86), where
+        torch's bf16 matmul runs through slow emulation.
         """
 
-        if self.dtype == torch.bfloat16 and self.resolved_device().type == "mps":
+        device_type = self.resolved_device().type
+        if self.dtype == torch.bfloat16 and device_type == "mps":
             return torch.float16
+        if self.dtype == torch.bfloat16 and device_type == "cpu":
+            return cpu_default_dtype()
         return self.dtype
 
     def resolved_device(self) -> torch.device:

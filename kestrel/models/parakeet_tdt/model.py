@@ -37,6 +37,15 @@ def _pointwise(conv: nn.Module, hidden: Tensor) -> Tensor:
     return conv(hidden)
 
 
+# Devices whose depthwise Conv1d runs as shifted multiply-adds in the [B, T, C] layout (see ``Convolution``).
+# CUDA keeps cuDNN's depthwise kernel (fast, and the validated reference numerics). On CPU the swap only pays
+# where torch has no oneDNN: with oneDNN (x86) the Conv1d path measured equal in fp32 and 8 % faster in bf16
+# on an EPYC 9575F; without it (macOS arm64) torch runs the conv one channel at a time, 53-67 % of the encoder's time.
+DEPTHWISE_LINEAR_LAYOUT_DEVICES: frozenset[str] = frozenset(
+    {"mps"} | (set() if torch.backends.mkldnn.is_available() else {"cpu"})
+)
+
+
 class Convolution(nn.Module):
     def __init__(self, config: ParakeetEncoderConfig) -> None:
         super().__init__()
@@ -59,9 +68,34 @@ class Convolution(nn.Module):
         hidden = F.glu(_pointwise(self.pointwise_conv1, hidden), dim=-1)
         if valid is not None:
             hidden = hidden.masked_fill(~valid[..., None], 0)
-        hidden = self.depthwise_conv(hidden.transpose(1, 2))
-        hidden = F.silu(self.norm(hidden)).transpose(1, 2)
+        if hidden.device.type in DEPTHWISE_LINEAR_LAYOUT_DEVICES and not self.norm.training:
+            hidden = F.silu(self._depthwise_norm_linear_layout(hidden))
+        else:
+            hidden = self.depthwise_conv(hidden.transpose(1, 2))
+            hidden = F.silu(self.norm(hidden)).transpose(1, 2)
         return _pointwise(self.pointwise_conv2, hidden)
+
+    def _depthwise_norm_linear_layout(self, hidden: Tensor) -> Tensor:
+        """Depthwise conv + eval-mode BatchNorm on ``[B, T, C]`` as ``k`` shifted multiply-adds.
+
+        torch's CPU depthwise Conv1d on macOS falls to ``_slow_conv2d_forward`` one channel at a time (251k calls
+        and 53-67 % of the encoder's time on an M2), and the transposed layout costs two copies per layer on every
+        backend. The taps accumulate in fp32 so the result rounds once, like the fused kernels do.
+        """
+        weight = self.depthwise_conv.weight[:, 0, :]  # [C, k]
+        taps = weight.shape[-1]
+        pad = (taps - 1) // 2
+        length = hidden.shape[1]
+        x = F.pad(hidden, (0, 0, pad, pad)).float()
+        out = x[:, :length] * weight[:, 0].float()
+        for j in range(1, taps):
+            out = torch.addcmul(out, x[:, j : j + length], weight[:, j].float())
+        if self.depthwise_conv.bias is not None:
+            out = out + self.depthwise_conv.bias.float()
+        norm = self.norm
+        scale = norm.weight.float() * torch.rsqrt(norm.running_var.float() + norm.eps)
+        shift = norm.bias.float() - norm.running_mean.float() * scale
+        return torch.addcmul(shift, out, scale).to(hidden.dtype)
 
 
 class RelativeAttention(nn.Module):
