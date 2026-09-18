@@ -11,8 +11,17 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.config import cpu_default_dtype
-from kestrel.device import empty_cache, make_stream, resolve_device
+from kestrel.config import (
+    NATIVE_GEMM_THREAD_CAP,
+    cpu_default_dtype,
+    default_cpu_threads,
+)
+from kestrel.device import (
+    configure_cpu_threads,
+    empty_cache,
+    make_stream,
+    resolve_device,
+)
 from kestrel.runtime import ExecutionShape
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
@@ -74,6 +83,17 @@ def _timed_segments(
     return tuple(segments)
 
 
+def _weight_modes(model: torch.nn.Module) -> frozenset[str]:
+    """Weight-cache modes present in ``model`` (``dense``/``vnni``/... for
+    ternary layers; empty for an ordinary fp checkpoint)."""
+    modes = set()
+    for module in model.modules():
+        mode = getattr(getattr(module, "weight", None), "mode", None)
+        if isinstance(mode, str):
+            modes.add(mode)
+    return frozenset(modes)
+
+
 def _encoder_frames(samples: int, factor: int) -> int:
     frames = samples // 160
     while factor > 1:
@@ -100,6 +120,9 @@ class _StreamWindow:
 class ParakeetTdtRuntime:
     execution_shape = ExecutionShape.SINGLE_PASS
     batch_capacity = 8
+    # Transducer decoding keeps its own small decoder state; there is no paged
+    # KV cache here, so the engine skips building (and importing) one.
+    needs_kv_pool = False
 
     def __init__(
         self,
@@ -149,6 +172,9 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        self.cpu_threads = (
+            self._configure_cpu_threads(cfg) if self.device.type == "cpu" else None
+        )
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -195,6 +221,25 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
         )
+
+    def _configure_cpu_threads(self, cfg: Any) -> int:
+        """Apply the CPU intra-op thread count for this model's weight mode.
+
+        Dense weights go through torch's own GEMM and want every physical
+        core; the ternary ``vnni`` mode runs its int8 GEMM on a separate
+        native pool, and torch's spinning OpenMP workers only steal cores
+        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`.
+        The mode is a property of the loaded weights, so this runs after the
+        model is built (and after weight materialization, which is itself
+        happier with every core).
+        """
+        cap = NATIVE_GEMM_THREAD_CAP if "vnni" in _weight_modes(self.model) else None
+        threads = (
+            cfg.resolved_cpu_threads(cap=cap)
+            if hasattr(cfg, "resolved_cpu_threads")
+            else getattr(cfg, "cpu_threads", None) or default_cpu_threads(cap)
+        )
+        return configure_cpu_threads(int(threads))
 
     @property
     def model_name(self) -> str:

@@ -58,6 +58,32 @@ def empty_cache(device: torch.device) -> None:
         torch.mps.empty_cache()
 
 
+_cpu_threads_lock = threading.Lock()
+_cpu_threads_applied: Optional[int] = None
+
+
+def configure_cpu_threads(threads: int) -> int:
+    """Set torch's intra-op thread count for CPU inference; returns the value in force.
+
+    ``torch.set_num_threads`` is process-global: the last runtime to ask wins,
+    and a request for the count already in force is a no-op. The value returned
+    is what torch reports afterwards, which can differ from the request when
+    the thread pool is already fixed (e.g. a build with a pinned OpenMP pool).
+    """
+    global _cpu_threads_applied
+    if threads <= 0:
+        raise ValueError("threads must be a positive integer")
+    with _cpu_threads_lock:
+        if _cpu_threads_applied == threads:
+            return threads
+        try:
+            torch.set_num_threads(threads)
+            _cpu_threads_applied = threads
+        except Exception:  # noqa: BLE001 — a fixed pool is not a fatal condition
+            pass
+        return torch.get_num_threads()
+
+
 def get_device_capability(device: torch.device) -> tuple[int, int]:
     """Return SM (major, minor) on CUDA; ``(0, 0)`` elsewhere.
 
@@ -172,6 +198,7 @@ def make_event(
 
 __all__ = [
     "NoopEvent",
+    "configure_cpu_threads",
     "empty_cache",
     "get_device_capability",
     "get_device_sm_count",

@@ -3,7 +3,14 @@
 from kestrel.models.registry import ModelSpec, register
 
 from .runtime import ParakeetTdtRuntime
-from .weights import MODEL_ID, REVISION, TERNARY_MODEL_ID, TERNARY_REVISION, load_parakeet_tdt
+from .weights import (
+    MODEL_ID,
+    REVISION,
+    TERNARY_DEVICE_TYPES,
+    TERNARY_MODEL_ID,
+    TERNARY_REVISION,
+    load_parakeet_tdt,
+)
 
 
 def _build_orchestrators():
@@ -31,7 +38,17 @@ register(
         revision=TERNARY_REVISION,
         runtime=ParakeetTdtRuntime,
         orchestrators=_build_orchestrators,
+        # The 2-bit kernels are CPU/ARM code: ``RuntimeConfig`` resolves an
+        # unset (or CUDA) device to MPS when available, else CPU.
+        device_types=TERNARY_DEVICE_TYPES,
     )
 )
 
-__all__ = ["MODEL_ID", "REVISION", "TERNARY_MODEL_ID", "ParakeetTdtRuntime", "load_parakeet_tdt"]
+__all__ = [
+    "MODEL_ID",
+    "REVISION",
+    "TERNARY_DEVICE_TYPES",
+    "TERNARY_MODEL_ID",
+    "ParakeetTdtRuntime",
+    "load_parakeet_tdt",
+]
