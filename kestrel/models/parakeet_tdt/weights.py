@@ -22,7 +22,7 @@ _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # tokenizer.json as usual, a packed ``model.safetensors`` and the ``ternary.json`` manifest written by thrush's
 # ``scripts/export_ternary.py --names hf``. That manifest is the only thing that marks a checkpoint as ternary.
 TERNARY_MODEL_ID = "moondream/parakeet-redux"
-TERNARY_REVISION = "7de2edad8498903dbc4c9b2bbdf714b163f8ad4e"  # release weights: rl12 x rl13 soup, private until Photon ships
+TERNARY_REVISION = "a0639ca117380949d782a505569d637d180f5378"  # release weights, private until Photon ships
 _MANIFEST = "ternary.json"
 _QKV = ("q_proj", "k_proj", "v_proj")
 
