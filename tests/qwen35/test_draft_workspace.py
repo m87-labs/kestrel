@@ -269,13 +269,19 @@ def test_draft_staging_survives_delayed_copy_and_allocator_churn():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_draft_commit_is_visible_to_ambient_eager_consumer():
+def test_draft_commit_is_visible_to_ambient_eager_consumer(monkeypatch):
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
     model, caches = _session_fixture()
     session = DFlashDraftGraphSession(model, caches)
     consumer = torch.cuda.Stream()
     consumer.wait_stream(torch.cuda.current_stream())
     starts = [cache.length for cache in caches]
+    copy_batches = []
+    original_copy = torch._foreach_copy_
+    def copy_many(destinations, sources):
+        copy_batches.append(len(destinations))
+        return original_copy(destinations, sources)
+    monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
     try:
         with torch.cuda.stream(consumer):
             noise = [torch.zeros(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
@@ -285,6 +291,8 @@ def test_draft_commit_is_visible_to_ambient_eager_consumer():
                 output[0, 0, 0].item()
                 # Commit copies are submitted after this consumer returns.
                 torch.cuda._sleep(10000000)
+                copy_batches.clear()
+            assert copy_batches == [2 * len(session.workspaces) * len(caches)]
             for cache, start in zip(caches, starts):
                 assert cache.length == start + 1
                 assert (cache.layers[0].keys[:, start:start + 1] == 0).all()

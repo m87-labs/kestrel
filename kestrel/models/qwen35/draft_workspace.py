@@ -205,15 +205,18 @@ class DFlashDraftGraphSession:
         try:
             with self.graph.launch(*inputs) as (output,):
                 yield output
+                destinations, sources = [], []
                 for index, workspace in enumerate(self.workspaces):
                     for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
                         if length:
-                            cache.layers[index].keys[0, start:start + length].copy_(
-                                workspace.keys[slot, start:start + length])
-                            cache.layers[index].values[0, start:start + length].copy_(
-                                workspace.values[slot, start:start + length])
+                            destinations.extend((cache.layers[index].keys[0, start:start + length],
+                                                 cache.layers[index].values[0, start:start + length]))
+                            sources.extend((workspace.keys[slot, start:start + length],
+                                            workspace.values[slot, start:start + length]))
                             cache.layers[index].keys.record_stream(self.stream)
                             cache.layers[index].values.record_stream(self.stream)
+                if destinations:
+                    torch._foreach_copy_(destinations, sources)
                 self.lengths = tuple(start + length for start, length in zip(self.lengths, lengths))
                 for cache, length in zip(self.caches, self.lengths):
                     cache.length = length
