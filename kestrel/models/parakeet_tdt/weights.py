@@ -86,11 +86,10 @@ def load_parakeet_tdt(
 ) -> LoadedParakeetTdt:
     """Load the pinned fp checkpoint, or the ternary student when the checkpoint carries a ``ternary.json``.
 
-    The ternary variant loads the packed export with ``strict=True`` and then materializes the weight cache
-    ``ternary_mode`` selects: ``dense`` (dequantized once, 2 bytes/weight, the default), ``int8``
-    (1 byte/weight, one scaling pass per call), ``packed``/``jit`` (0.25 byte/weight, expanded per call) or
-    ``vnni`` (packed GEMM panels and int8 activations). ``auto`` leaves the choice to kestrel-kernels.
-    Activations stay in ``dtype``; nothing is quantized at run time.
+    The ternary variant loads the packed export with ``strict=True`` and then materializes the weight form
+    ``ternary_mode`` selects: ``dense`` dequantizes the codes once (2 bytes/weight), ``gemm8`` keeps them
+    packed as GEMM panels and quantizes the activations to int8, and ``auto`` leaves the choice to
+    kestrel-kernels. Activations stay in ``dtype`` otherwise; nothing else is quantized at run time.
     """
     from safetensors.torch import load_file
 
