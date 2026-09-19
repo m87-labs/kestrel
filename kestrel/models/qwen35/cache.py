@@ -63,6 +63,7 @@ class Qwen35InferenceCache:
         self.seq_length = 0
         self._prefix_source: Qwen35InferenceCache | None = None
         self._prefix_start = 0
+        self._prefix_row = 0
         self._prefix_records: dict[int, _RecurrentPrefixRecord] = {}
         self._conv_sequence_layout = None
 
@@ -114,6 +115,7 @@ class Qwen35InferenceCache:
         branch._prefix_source = self if capture_prefix else None
         branch._prefix_start = self.seq_length if capture_prefix else 0
         branch._prefix_records = {}
+        branch._prefix_row = 0
         layers = []
         sources, destinations = [], []
         for layer in self.layers:
@@ -142,11 +144,12 @@ class Qwen35InferenceCache:
         if len({len(cache.layers) for cache in caches}) != 1:
             raise ValueError("packed verification layer counts must match")
         branches = []
-        for source in caches:
+        for row, source in enumerate(caches):
             branch = copy(source)
             branch._prefix_source = source
             branch._prefix_start = source.seq_length
             branch._prefix_records = {}
+            branch._prefix_row = row
             branch.layers = list(source.layers)
             branches.append(branch)
         packed = copy(branches[0])
@@ -174,6 +177,96 @@ class Qwen35InferenceCache:
         for branch in branches:
             branch.layers = tuple(branch.layers)
         return packed, branches
+
+    @staticmethod
+    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None):
+        """Finalize one packed verification before publishing any cache state."""
+        from contextlib import nullcontext
+        from kestrel_kernels import get_runtime
+
+        caches, lengths = tuple(caches), tuple(lengths)
+        if not caches or len(caches) != len(lengths):
+            raise ValueError("packed prefix owners and lengths must match")
+        records = caches[0]._prefix_records
+        indices = tuple(i for i, layer in enumerate(caches[0].layers)
+                        if isinstance(layer, LinearAttentionState))
+        if not indices or set(records) != set(indices):
+            raise RuntimeError("packed prefix is missing recurrent layers")
+        contexts = tuple(records[index].prefix_context for index in indices)
+        if any(context is None for context in contexts):
+            raise RuntimeError("packed prefix has no retained finalization context")
+        sources = tuple(cache._prefix_source for cache in caches)
+        if any(source is None for source in sources) or len({id(source) for source in sources}) != len(sources):
+            raise RuntimeError("packed prefix requires distinct committed sources")
+        count = len(caches)
+        for row, (cache, source, length) in enumerate(zip(caches, sources, lengths)):
+            if (cache._prefix_records is not records or cache._prefix_row != row
+                    or source.seq_length != cache._prefix_start
+                    or cache.seq_length != cache._prefix_start + 16):
+                raise RuntimeError("packed prefix source or row ownership changed")
+            if type(length) is not int or not 1 <= length <= 16:
+                raise ValueError("accepted prefix length must be in [1,16]")
+            if tuple(i for i, layer in enumerate(source.layers)
+                     if isinstance(layer, LinearAttentionState)) != indices:
+                raise ValueError("packed prefix recurrent layer layout changed")
+            for index in indices:
+                record, layer = records[index], source.layers[index]
+                if (record.qkv.shape[1] != count * 16
+                        or record.initial_state.shape[0] != count
+                        or not isinstance(layer, LinearAttentionState)
+                        or layer.recurrent_states.shape[0] != 1
+                        or layer.conv_states.shape[0] != 1):
+                    raise ValueError("packed prefix state geometry changed")
+        templates = tuple(records[index].initial_state for index in indices)
+        accepted = torch.tensor(lengths, device=templates[0].device, dtype=torch.int32)
+        if finalizer is None:
+            outputs = tuple(torch.empty_like(template) for template in templates)
+            get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
+                contexts, accepted, out_states=outputs)
+            lease = nullcontext(outputs)
+        else:
+            lease = finalizer(records, accepted)
+        with lease as outputs:
+            # Allocate after submission to overlap host work with finalization.
+            # Destinations remain detached until every state/history is written.
+            results = []
+            for source in sources:
+                result = copy(source)
+                result._prefix_source = None
+                result._prefix_start = result._prefix_row = 0
+                result._prefix_records = {}
+                layers = list(source.layers)
+                # Both fields are fully overwritten before publication.
+                for index in indices:
+                    layer = copy(layers[index])
+                    layer.conv_states = torch.empty_like(layer.conv_states)
+                    layer.recurrent_states = torch.empty_like(layer.recurrent_states)
+                    layers[index] = layer
+                result.layers = tuple(layers)
+                results.append(result)
+            results = tuple(results)
+            state_destinations, states = [], []
+            conv_destinations, histories = [], []
+            for index, state in zip(indices, outputs, strict=True):
+                record = records[index]
+                width = record.module.conv_kernel_size
+                for row, (result, length) in enumerate(zip(results, lengths)):
+                    layer = result.layers[index]
+                    start = row * (16 + width - 1) + length - 1
+                    state_destinations.append(layer.recurrent_states)
+                    states.append(state[row:row + 1])
+                    conv_destinations.append(layer.conv_states)
+                    histories.append(record.conv_input[..., start:start + width])
+                    layer.has_previous_state = True
+            # Strided histories must not disable the recurrent copies' fast path.
+            torch._foreach_copy_(state_destinations, states)
+            torch._foreach_copy_(conv_destinations, histories)
+        for cache, result, length in zip(caches, results, lengths):
+            result.advance_to(cache._prefix_start + length)
+            cache._prefix_records = {}
+            cache._prefix_source = None
+            cache._prefix_start = cache._prefix_row = 0
+        return results
 
     def commit_recurrent_prefix(self, length: int, *, replay_graph=None) -> Qwen35InferenceCache:
         """Commit one verified prefix without repeating its dense projections.

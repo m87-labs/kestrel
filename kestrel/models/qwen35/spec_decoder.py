@@ -245,10 +245,15 @@ class Qwen35DFlashDecoder:
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
         expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].split(lengths)
-        for index, record in packed._prefix_records.items():
-            records = record.split_sequences(lengths)
-            for row, branch in enumerate(branches):
-                branch._prefix_records[index] = replace(records[row], state_indices=local_state_indices[row:row + 1])
+        if packed._prefix_records and all(
+                record.prefix_context is not None for record in packed._prefix_records.values()):
+            for branch in branches:
+                branch._prefix_records = packed._prefix_records
+        else:
+            for index, record in packed._prefix_records.items():
+                records = record.split_sequences(lengths)
+                for row, branch in enumerate(branches):
+                    branch._prefix_records[index] = replace(records[row], state_indices=local_state_indices[row:row + 1])
         for branch, session, length in zip(branches, sessions, lengths):
             branch.advance_to(session.cache.seq_length + length)
         return [(tokens.tolist(), feature, branch)
@@ -307,8 +312,20 @@ class Qwen35DFlashDecoder:
                     accepted += 1
                 count = min(accepted+1, cap if cap is not None else accepted+1)
                 pending.append((session, verified, features, expected, count))
-            for ctx in pending:
-                self.commit_accept(ctx)
+            if all(verified._prefix_records and all(
+                    record.prefix_context is not None for record in verified._prefix_records.values())
+                    for _, verified, _, _, _ in pending):
+                committed = Qwen35InferenceCache.commit_recurrent_prefixes(
+                    [ctx[1] for ctx in pending], [ctx[4] for ctx in pending],
+                    finalizer=(None if self._target_graph is None
+                               else self._target_graph.finalize_prefixes))
+                for (session, _, features, expected, count), cache in zip(pending, committed):
+                    session.cache = cache
+                    session.features = features[:, :count]
+                    session.bonus = expected[count - 1]
+            else:
+                for ctx in pending:
+                    self.commit_accept(ctx)
         except Exception:
             if self._target_graph is not None:
                 self._graph_failed = True

@@ -29,6 +29,9 @@ def decoder():
     commits = []
 
     class Verified:
+        def __init__(self):
+            self._prefix_records = {}
+
         def commit_recurrent_prefix(self, count, *, replay_graph=None):
             commits.append(count)
             return SimpleNamespace(seq_length=10+count)
@@ -337,6 +340,7 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
     @dataclass
     class Record:
         state_indices: torch.Tensor
+        prefix_context: object | None = None
 
         def split_sequences(self, lengths):
             return tuple(replace(self, state_indices=self.state_indices[i:i+1]) for i in range(len(lengths)))

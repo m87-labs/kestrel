@@ -66,12 +66,15 @@ class _RecurrentPrefixRecord:
     conv_input: torch.Tensor
     initial_state: torch.Tensor
     state_indices: torch.Tensor
+    prefix_context: object | None = None
 
     @classmethod
-    def capture(cls, module, qkv, a, b, conv_input, initial_state, state_indices):
+    def capture(cls, module, qkv, a, b, conv_input, initial_state, state_indices,
+                prefix_context=None):
         # Scheduler metadata may be reused before the accepted prefix commits.
         # Derived records share this owned snapshot rather than copying it again.
-        return cls(module, qkv, a, b, conv_input, initial_state, state_indices.clone())
+        return cls(module, qkv, a, b, conv_input, initial_state, state_indices.clone(),
+                   prefix_context)
 
     @property
     def replay_geometry(self) -> tuple:
@@ -97,7 +100,8 @@ class _RecurrentPrefixRecord:
                 self.module, self.qkv[:, offset:offset + length],
                 self.a[:, offset:offset + length], self.b[:, offset:offset + length],
                 self.conv_input[..., conv_offset:conv_offset + prefix + length],
-                self.initial_state[index:index + 1], self.state_indices[index:index + 1]))
+                self.initial_state[index:index + 1], self.state_indices[index:index + 1],
+                self.prefix_context))
             offset += length
             conv_offset += prefix + length
         return tuple(records)
@@ -634,6 +638,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             head_dim=self.head_k_dim,
             allocate=self.allocate_packed_gdn_prefill_workspace,
         )
+        prefix_context = None
+        if capture_prefix and all(length == 16 for length in sequence_lengths):
+            prefix_context = get_runtime().gated_delta.allocate_packed_gated_delta_prefix_context(
+                workspace, initial_state, recurrence_cu_seqlens,
+                sequence_lengths=sequence_lengths, topology_token=topology_token)
         core_attn_out, _ = self.packed_gated_delta_rule_prefill(
             mixed_qkv,
             a,
@@ -649,6 +658,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             final_state=packed_recurrent_state,
             final_state_indices=state_indices,
             final_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
+            prefix_context=prefix_context,
         )
 
         # reshape input data into 2D tensor
@@ -663,7 +673,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # Projection/conv outputs own their storage; initial_state is the
             # independent copy made before writing the speculative pool.
             cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord.capture(
-                self, mixed_qkv, a, b, conv_input, initial_state, state_indices)
+                self, mixed_qkv, a, b, conv_input, initial_state, state_indices, prefix_context)
         return output
 
 

@@ -1,6 +1,7 @@
 """Tensor-only native verification over leased fixed-shape graph buffers."""
 
 from contextlib import contextmanager
+from collections import OrderedDict
 from dataclasses import fields
 import torch
 
@@ -24,6 +25,9 @@ class Qwen35TargetGraph:
         self._linear = tuple(i for i, kind in enumerate(text.config.layer_types)
                              if kind == 'linear_attention')
         self._layouts = {}
+        self._prefix_bindings = {}
+        self._bound_outputs = OrderedDict()
+        self._finalizers = OrderedDict()
         self._graphs = FixedShapeSinglePassGraph(
             enabled=True, device=runtime.device, stream=runtime._compute_stream,
             run_forward=self._forward, max_entries=runtime.max_batch_size)
@@ -58,10 +62,21 @@ class Qwen35TargetGraph:
             sequence_lengths=lengths, topology_token=topology,
             gdn_state_indices_allocator_owned=True, capture_layers=self._capture_layers)
         tensors = [output.last_hidden_state, *output.layer_hidden_states]
+        bindings = []
         for index in self._linear:
             layer, record = cache.layers[index], cache._prefix_records[index]
             tensors.extend((layer.conv_states, layer.recurrent_states))
             tensors.extend(getattr(record, name) for name in _RECORDS)
+            context = record.prefix_context
+            if context is None:
+                bindings.append(None)
+            else:
+                owners = context.owned_tensors
+                tensors.extend(owners)
+                bindings.append((context.binding_spec, len(owners)))
+        # These schemas contain no tensor owners. Each launch binds the actual
+        # leased outputs, including after an entry with the same C is recaptured.
+        self._prefix_bindings[count] = tuple(bindings)
         # Owner-only outputs tie scratch lifetime to the actual graph entry,
         # including when another C replaces the model's workspace cache.
         for index in self._linear:
@@ -97,21 +112,80 @@ class Qwen35TargetGraph:
             inputs.extend((layer.conv_states, layer.recurrent_states))
         with self._graphs.launch(*inputs) as values:
             hidden, taps = values[0], values[1:1 + len(self._capture_layers)]
-            remaining = iter(values[1 + len(self._capture_layers):])
-            destinations, sources = [], []
-            for index in self._linear:
-                layer = cache.layers[index]
-                destinations.extend((layer.conv_states, layer.recurrent_states))
-                sources.extend((next(remaining), next(remaining)))
-                record = _RecurrentPrefixRecord(self._text.layers[index].linear_attn,
-                    *(next(remaining) for _ in _RECORDS))
-                cache._prefix_records[index] = record
+            _, records, sources = self._bind_outputs(values, len(lengths))
+            cache._prefix_records = records
+            destinations = [tensor for index in self._linear
+                            for tensor in (cache.layers[index].conv_states,
+                                           cache.layers[index].recurrent_states)]
             if destinations:
                 torch._foreach_copy_(destinations, sources)
             yield _TextModelOutput(hidden, cache, tuple(taps))
+
+    def _bind_outputs(self, values, count):
+        # The graph owns one immutable output tuple per entry. Retaining it
+        # prevents id reuse and binds opaque contexts only once per capture.
+        key = id(values)
+        entry = self._bound_outputs.get(key)
+        if entry is None:
+            if len(self._bound_outputs) >= self._runtime.max_batch_size:
+                _, (_, retired, _) = self._bound_outputs.popitem(last=False)
+                finalizer = self._finalizers.pop(id(retired), None)
+                if finalizer is not None:
+                    finalizer[1].shutdown()
+            remaining = iter(values[1 + len(self._capture_layers):])
+            records, sources = {}, []
+            for index, binding in zip(self._linear, self._prefix_bindings[count], strict=True):
+                sources.extend((next(remaining), next(remaining)))
+                record_values = tuple(next(remaining) for _ in _RECORDS)
+                context = None
+                if binding is not None:
+                    spec, size = binding
+                    context = spec.bind(tuple(next(remaining) for _ in range(size)))
+                records[index] = _RecurrentPrefixRecord(
+                    self._text.layers[index].linear_attn, *record_values, context)
+            entry = (values, records, tuple(sources))
+            self._bound_outputs[key] = entry
+        self._bound_outputs.move_to_end(key)
+        return entry
+
+    @contextmanager
+    def finalize_prefixes(self, records, accepted_lengths):
+        """Bind finalization to the producing entry, not merely its batch size."""
+        key = id(records)
+        entry = self._finalizers.get(key)
+        if entry is None:
+            if len(self._finalizers) >= self._runtime.max_batch_size:
+                _, oldest = self._finalizers.popitem(last=False)
+                oldest[1].shutdown()
+            indices = tuple(sorted(records))
+            contexts = tuple(records[index].prefix_context for index in indices)
+            templates = tuple(records[index].initial_state for index in indices)
+            count = accepted_lengths.numel()
+
+            def forward(lengths):
+                outputs = tuple(template.new_empty((count, *template.shape[1:]))
+                                for template in templates)
+                get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
+                    contexts, lengths, out_states=outputs)
+                return outputs
+
+            graph = FixedShapeSinglePassGraph(
+                enabled=all(context.supports_graph_capture for context in contexts),
+                device=self._runtime.device,
+                stream=self._runtime._compute_stream, run_forward=forward, max_entries=1)
+            entry = (records, graph)
+            self._finalizers[key] = entry
+        self._finalizers.move_to_end(key)
+        with entry[1].launch(accepted_lengths) as outputs:
+            yield outputs
 
     def shutdown(self):
         try:
             self._graphs.shutdown()
         finally:
+            for _, graph in self._finalizers.values():
+                graph.shutdown()
+            self._finalizers.clear()
+            self._bound_outputs.clear()
             self._layouts.clear()
+            self._prefix_bindings.clear()
