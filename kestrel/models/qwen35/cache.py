@@ -16,6 +16,39 @@ if TYPE_CHECKING:
     from .qwen_model import _RecurrentPrefixRecord
 
 
+def _finalize_recurrent_prefixes(records, accepted_lengths):
+    """Return leased state/history pairs without changing their committed owners."""
+    from kestrel_kernels import get_runtime
+
+    ordered = tuple(records[index] for index in sorted(records))
+    count = accepted_lengths.numel()
+    for record in ordered:
+        history, initial = record.conv_input, record.initial_state
+        width = record.module.conv_kernel_size
+        if (type(width) is not int or width < 1
+                or history.ndim != 3 or history.shape[0] != 1
+                or history.shape[-1] != count * (16 + width - 1)
+                or initial.shape[0] != count
+                or history.device != initial.device or history.dtype != initial.dtype):
+            raise ValueError("packed prefix convolution history geometry changed")
+    states = tuple(torch.empty_like(record.initial_state) for record in ordered)
+    get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
+        tuple(record.prefix_context for record in ordered), accepted_lengths,
+        out_states=states)
+    lengths = accepted_lengths.to(torch.int64)
+    positions = {}
+    outputs = []
+    for record, state in zip(ordered, states):
+        width = record.module.conv_kernel_size
+        if width not in positions:
+            positions[width] = lengths[:, None] - 1 + torch.arange(
+                width, device=lengths.device, dtype=torch.int64)[None, :]
+        rows = record.conv_input.squeeze(0).unflatten(-1, (count, 16 + width - 1)).transpose(0, 1)
+        history = torch.gather(rows, 2, positions[width][:, None, :].expand(count, rows.shape[1], width))
+        outputs.extend((state, history))
+    return tuple(outputs)
+
+
 def qwen_paged_kv_specs(
     config: Any,
 ) -> tuple[PagedKVLayerSpec | None, ...]:
@@ -182,7 +215,6 @@ class Qwen35InferenceCache:
     def commit_recurrent_prefixes(caches, lengths, *, finalizer=None):
         """Finalize one packed verification before publishing any cache state."""
         from contextlib import nullcontext
-        from kestrel_kernels import get_runtime
 
         caches, lengths = tuple(caches), tuple(lengths)
         if not caches or len(caches) != len(lengths):
@@ -215,18 +247,18 @@ class Qwen35InferenceCache:
                         or record.initial_state.shape[0] != count
                         or not isinstance(layer, LinearAttentionState)
                         or layer.recurrent_states.shape[0] != 1
-                        or layer.conv_states.shape[0] != 1):
+                        or layer.conv_states.shape != (1, record.conv_input.shape[1],
+                                                       record.module.conv_kernel_size)):
                     raise ValueError("packed prefix state geometry changed")
         templates = tuple(records[index].initial_state for index in indices)
         accepted = torch.tensor(lengths, device=templates[0].device, dtype=torch.int32)
         if finalizer is None:
-            outputs = tuple(torch.empty_like(template) for template in templates)
-            get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
-                contexts, accepted, out_states=outputs)
-            lease = nullcontext(outputs)
+            lease = nullcontext(_finalize_recurrent_prefixes(records, accepted))
         else:
             lease = finalizer(records, accepted)
         with lease as outputs:
+            if len(outputs) != 2 * len(indices):
+                raise ValueError("packed prefix finalizer requires state/history pairs")
             # Allocate after submission to overlap host work with finalization.
             # Destinations remain detached until every state/history is written.
             results = []
@@ -247,18 +279,14 @@ class Qwen35InferenceCache:
             results = tuple(results)
             state_destinations, states = [], []
             conv_destinations, histories = [], []
-            for index, state in zip(indices, outputs, strict=True):
-                record = records[index]
-                width = record.module.conv_kernel_size
-                for row, (result, length) in enumerate(zip(results, lengths)):
+            for index, state, history in zip(indices, outputs[::2], outputs[1::2], strict=True):
+                for row, result in enumerate(results):
                     layer = result.layers[index]
-                    start = row * (16 + width - 1) + length - 1
                     state_destinations.append(layer.recurrent_states)
                     states.append(state[row:row + 1])
                     conv_destinations.append(layer.conv_states)
-                    histories.append(record.conv_input[..., start:start + width])
+                    histories.append(history[row:row + 1])
                     layer.has_previous_state = True
-            # Strided histories must not disable the recurrent copies' fast path.
             torch._foreach_copy_(state_destinations, states)
             torch._foreach_copy_(conv_destinations, histories)
         for cache, result, length in zip(caches, results, lengths):

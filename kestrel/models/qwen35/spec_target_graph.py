@@ -7,7 +7,7 @@ import torch
 
 from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 from kestrel_kernels import get_runtime
-from .cache import Qwen35InferenceCache
+from .cache import Qwen35InferenceCache, _finalize_recurrent_prefixes
 from .qwen_model import _RecurrentPrefixRecord, _TextModelOutput
 
 
@@ -159,15 +159,8 @@ class Qwen35TargetGraph:
                 oldest[1].shutdown()
             indices = tuple(sorted(records))
             contexts = tuple(records[index].prefix_context for index in indices)
-            templates = tuple(records[index].initial_state for index in indices)
-            count = accepted_lengths.numel()
-
             def forward(lengths):
-                outputs = tuple(template.new_empty((count, *template.shape[1:]))
-                                for template in templates)
-                get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
-                    contexts, lengths, out_states=outputs)
-                return outputs
+                return _finalize_recurrent_prefixes(records, lengths)
 
             graph = FixedShapeSinglePassGraph(
                 enabled=all(context.supports_graph_capture for context in contexts),

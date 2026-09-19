@@ -4,7 +4,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from kestrel.models.qwen35.cache import Qwen35InferenceCache
+from kestrel.models.qwen35.cache import Qwen35InferenceCache, _finalize_recurrent_prefixes
+
+
+def _paired_outputs(records, lengths, states):
+    outputs = []
+    for record, state in zip(records.values(), states, strict=True):
+        width = record.module.conv_kernel_size
+        history = torch.cat([
+            record.conv_input[..., row * (16 + width - 1) + length - 1:
+                              row * (16 + width - 1) + length - 1 + width]
+            for row, length in enumerate(lengths.tolist())], dim=0).contiguous()
+        outputs.extend((state, history))
+    return tuple(outputs)
 
 
 def _packed_prefixes(count=2, layers=1):
@@ -41,7 +53,8 @@ def test_packed_prefix_commit_keeps_sources_and_separate_rows(lengths):
     def finalize(records, accepted):
         assert records[0].prefix_context is record.prefix_context
         assert accepted.tolist() == list(lengths)
-        yield (accepted[:, None, None, None].expand(2, 2, 3, 3).to(torch.bfloat16),)
+        yield _paired_outputs(records, accepted,
+            (accepted[:, None, None, None].expand(2, 2, 3, 3).to(torch.bfloat16),))
 
     committed = Qwen35InferenceCache.commit_recurrent_prefixes(
         branches, lengths, finalizer=finalize)
@@ -106,7 +119,7 @@ def test_c8_multilayer_partial_failure_never_mutates_committed_or_verified_state
             written.append(index)
             if failure == "second_layer" and index == 1:
                 raise RuntimeError("second layer failed after writing")
-        yield outputs
+        yield _paired_outputs(records, accepted, outputs)
 
     original_copy = torch._foreach_copy_
     copy_calls = []
@@ -143,9 +156,10 @@ def test_c8_multilayer_mixed_full_partial_commit_has_independent_destinations():
     @contextmanager
     def finalize(records, accepted):
         templates = tuple(record.initial_state for record in records.values())
-        yield tuple((accepted[:, None, None, None] + index * 32)
+        states = tuple((accepted[:, None, None, None] + index * 32)
                     .expand_as(template).to(template.dtype)
                     for index, template in enumerate(templates))
+        yield _paired_outputs(records, accepted, states)
 
     results = Qwen35InferenceCache.commit_recurrent_prefixes(branches, counts, finalizer=finalize)
     for row, (source, result, count) in enumerate(zip(sources, results, counts)):
@@ -176,10 +190,7 @@ def test_commit_overwrites_poisoned_destinations_without_initialization_copy(mon
 
     def counted_copy(destinations, values):
         assert all(torch.isnan(tensor).all() for tensor in destinations)
-        if not copies:
-            assert all(tensor.is_contiguous() for tensor in values)
-        else:
-            assert all(not tensor.is_contiguous() for tensor in values)
+        assert all(tensor.is_contiguous() for tensor in values)
         copies.append(len(destinations))
         return copy_many(destinations, values)
 
@@ -187,7 +198,7 @@ def test_commit_overwrites_poisoned_destinations_without_initialization_copy(mon
     def finalize(records, accepted):
         assert allocations == []
         assert copies == []
-        yield (torch.full_like(record.initial_state, 42),)
+        yield _paired_outputs(records, accepted, (torch.full_like(record.initial_state, 42),))
 
     monkeypatch.setattr(torch, "empty_like", poisoned_empty)
     monkeypatch.setattr(torch, "_foreach_copy_", counted_copy)
@@ -230,7 +241,7 @@ def test_destination_allocation_failure_releases_lease_without_publishing(monkey
     def finalize(records, accepted):
         events.append("submitted")
         try:
-            yield (torch.full_like(record.initial_state, 42),)
+            yield _paired_outputs(records, accepted, (torch.full_like(record.initial_state, 42),))
         finally:
             events.append("released")
 
@@ -248,3 +259,89 @@ def test_destination_allocation_failure_releases_lease_without_publishing(monkey
         assert source.seq_length == branch._prefix_start
         assert torch.equal(source.layers[0].conv_states, conv)
         assert torch.equal(source.layers[0].recurrent_states, recurrent)
+
+
+@pytest.mark.parametrize("count", (1, 8))
+@pytest.mark.parametrize("token_major", (False, True))
+@pytest.mark.parametrize("width", (1, 4))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda",
+    marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))))
+def test_history_gather_matches_slices_with_poisoned_rejected_storage(monkeypatch, count, token_major, width, device):
+    lengths = torch.tensor(([1, 16, 3, 15, 7, 16, 2, 9])[:count], dtype=torch.int32, device=device)
+    span, channels = 16 + width - 1, 5
+    shape = (1, count * span, channels) if token_major else (1, channels, count * span)
+    history = torch.full(shape, float("nan"), dtype=torch.bfloat16, device=device)
+    if token_major:
+        history = history.transpose(1, 2)
+    expected = torch.arange(count * channels * width, device=device).reshape(count, channels, width).bfloat16()
+    expected[..., 0] = -0.0
+    for row, length in enumerate(lengths.tolist()):
+        start = row * span + length - 1
+        history[..., start:start + width].copy_(expected[row:row + 1])
+    initial = torch.ones((count, 2, 3, 3), dtype=torch.bfloat16, device=device)
+    record = SimpleNamespace(conv_input=history, initial_state=initial,
+        prefix_context=object(), module=SimpleNamespace(conv_kernel_size=width))
+    before = history.contiguous().view(torch.int16).clone()
+
+    def finalize(contexts, accepted, *, out_states):
+        assert accepted is lengths
+        out_states[0].fill_(23)
+
+    monkeypatch.setattr("kestrel_kernels.get_runtime", lambda: SimpleNamespace(
+        gated_delta=SimpleNamespace(finalize_packed_gated_delta_prefix=finalize)))
+    state, gathered = _finalize_recurrent_prefixes({0: record}, lengths)
+    assert gathered.is_contiguous()
+    assert torch.equal(gathered.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(history.contiguous().view(torch.int16), before)
+    assert torch.all(initial == 1) and torch.all(state == 23)
+    assert not torch._C._overlaps(gathered, history)
+
+
+def test_all_history_geometry_checked_before_state_writes(monkeypatch):
+    _, branches, _ = _packed_prefixes(count=8, layers=2)
+    records = branches[0]._prefix_records
+    records[1].conv_input = records[1].conv_input[..., :-1]
+
+    def never(*args, **kwargs):
+        raise AssertionError("must validate every history before state finalization")
+
+    monkeypatch.setattr("kestrel_kernels.get_runtime", never)
+    with pytest.raises(ValueError, match="history geometry"):
+        _finalize_recurrent_prefixes(records, torch.ones(8, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("fail_gather", (False, True))
+def test_eager_history_finalization_transaction(monkeypatch, fail_gather):
+    sources, branches, _ = _packed_prefixes(count=8, layers=2)
+    records = branches[0]._prefix_records
+    lengths = (1, 16, 3, 15, 7, 16, 2, 9)
+    calls = []
+
+    def finalize(contexts, accepted, *, out_states):
+        for index, output in enumerate(out_states):
+            output.fill_(31 + index)
+        calls.append("states_written")
+
+    monkeypatch.setattr("kestrel_kernels.get_runtime", lambda: SimpleNamespace(
+        gated_delta=SimpleNamespace(finalize_packed_gated_delta_prefix=finalize)))
+    if fail_gather:
+        def fail(*args, **kwargs):
+            assert calls == ["states_written"]
+            raise RuntimeError("history gather failed after states")
+        monkeypatch.setattr(torch, "gather", fail)
+        with pytest.raises(RuntimeError, match="history gather failed"):
+            Qwen35InferenceCache.commit_recurrent_prefixes(branches, lengths)
+        for source, branch in zip(sources, branches):
+            assert branch._prefix_source is source and branch._prefix_records is records
+            assert source.seq_length == branch._prefix_start
+    else:
+        results = Qwen35InferenceCache.commit_recurrent_prefixes(branches, lengths)
+        for row, (result, length) in enumerate(zip(results, lengths)):
+            for index, layer in enumerate(result.layers):
+                assert torch.all(layer.recurrent_states == 31 + index)
+                start = row * 19 + length - 1
+                assert torch.equal(layer.conv_states, records[index].conv_input[..., start:start + 4])
+    for row, source in enumerate(sources):
+        for index, layer in enumerate(source.layers):
+            assert torch.all(layer.recurrent_states == row + index * 10)
+            assert torch.all(layer.conv_states == row + index * 10)
