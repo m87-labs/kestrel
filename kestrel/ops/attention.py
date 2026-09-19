@@ -18,15 +18,19 @@ def dense_attention(
     window_size_left: int | None = None,
     window_size_right: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attend over ``[batch, heads, sequence, dim]`` or packed rows."""
-    if cu_seqlens is not None and (
-        cu_seqlens.dtype != torch.int32
-        or cu_seqlens.device != query.device
-        or cu_seqlens.ndim != 1
-        or not cu_seqlens.is_contiguous()
-    ):
-        raise ValueError("packed row boundaries must be contiguous int32 on-device")
+    if cu_seqlens_k is not None and cu_seqlens is None:
+        raise ValueError("packed key boundaries require query boundaries")
+    for boundaries in (cu_seqlens, cu_seqlens_k):
+        if boundaries is not None and (
+            boundaries.dtype != torch.int32 or boundaries.device != query.device
+            or boundaries.ndim != 1 or not boundaries.is_contiguous()
+        ):
+            raise ValueError("packed row boundaries must be contiguous int32 on-device")
+    if cu_seqlens_k is not None and cu_seqlens_k.shape != cu_seqlens.shape:
+        raise ValueError("packed query and key boundaries must describe the same sequences")
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     arguments: dict[str, Any] = {
         "causal": causal,
@@ -38,7 +42,7 @@ def dense_attention(
         q, k, v = (tensor.flatten(0, 1) for tensor in (q, k, v))
         arguments.update(
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_k=cu_seqlens if cu_seqlens_k is None else cu_seqlens_k,
         )
     out, _ = get_runtime().attention.flash_attn_fwd(q, k, v, **arguments)
     if cu_seqlens is not None:

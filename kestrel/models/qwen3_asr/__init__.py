@@ -1,41 +1,10 @@
-"""Qwen3-ASR 0.6B and 1.7B support for Kestrel."""
+"""Lightweight qwen3_asr registration and lazy public exports."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
+from kestrel.models.registry import register_lazy
+from .metadata import QWEN3_ASR_MODELS, ALIGNER_MODEL_ID
 
-from .alignment import (
-    MODEL_ID as _ALIGNER_MODEL_ID,
-    REVISION as _ALIGNER_REVISION,
-    Qwen3ForcedAlignerRuntime,
-)
-from .runtime import Qwen3AsrRuntime
-from .weights import QWEN3_ASR_MODELS, load_qwen3_asr
-
-
-def _build_skill_registry():
-    from .skill import build_skill_registry
-
-    return build_skill_registry()
-
-
-for _model_name, _revision in QWEN3_ASR_MODELS.items():
-    register(
-        ModelSpec(
-            name=_model_name,
-            repo_id=_model_name,
-            revision=_revision,
-            runtime=Qwen3AsrRuntime,
-            skills=_build_skill_registry,
-        )
-    )
-
-register(
-    ModelSpec(
-        name=_ALIGNER_MODEL_ID,
-        repo_id=_ALIGNER_MODEL_ID,
-        revision=_ALIGNER_REVISION,
-        runtime=Qwen3ForcedAlignerRuntime,
-    )
-)
+register_lazy([*QWEN3_ASR_MODELS, ALIGNER_MODEL_ID], __name__ + ".registration")
 
 __all__ = [
     "QWEN3_ASR_MODELS",
@@ -43,3 +12,17 @@ __all__ = [
     "Qwen3ForcedAlignerRuntime",
     "load_qwen3_asr",
 ]
+
+_LAZY_EXPORTS = {
+    "Qwen3AsrRuntime": ".runtime",
+    "Qwen3ForcedAlignerRuntime": ".alignment",
+    "load_qwen3_asr": ".weights"
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_LAZY_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

@@ -584,7 +584,7 @@ class GenerationScheduler:
                     f"{stalled.request_id} (needs {stalled.target_length} tokens)."
                 )
                 self.waiting.remove(stalled)
-                self._fail_request_early(stalled, error)
+                self._fail_request_early(stalled, error, resources_retired=True)
                 progressed = True
         return progressed
 
@@ -731,6 +731,8 @@ class GenerationScheduler:
             lifecycle.prefill_started_at = time.perf_counter()
             lifecycle.prefill_completed_at = lifecycle.prefill_started_at
             self._finalize_sequence(lifecycle, "length")
+            lifecycle.resources_retired()
+            lifecycle.scheduler_detached()
             progressed = True
 
         # Admit real (>=1 token) requests into free spec rows, capping the live
@@ -1081,6 +1083,8 @@ class GenerationScheduler:
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
                 self._retire_spec_row(state)
+                lifecycle.resources_retired()
+                lifecycle.scheduler_detached()
                 continue
             self.running.push(lifecycle)
         return progressed
@@ -1285,6 +1289,7 @@ class GenerationScheduler:
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
                         self._retire_spec_row(seq.state)
+                        seq.resources_retired()
                 else:
                     launchable.append(seq)
             active = launchable
@@ -1549,6 +1554,7 @@ class GenerationScheduler:
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._retire_spec_row(seq.state)
+                    seq.resources_retired()
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
             for j, token in enumerate(typed_run):
@@ -1558,8 +1564,10 @@ class GenerationScheduler:
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     self.running.remove(seq)
+                    seq.scheduler_detached()
                     if seq.inflight_refs == 0:
                         self._retire_spec_row(seq.state)
+                        seq.resources_retired()
                     break
 
     def pop_completed(self) -> List[SchedulerResult]:
@@ -1593,8 +1601,14 @@ class GenerationScheduler:
         adapter = self._adapter_provider.get(adapter_id)
         return self.runtime.acquire_adapter_slot(adapter_id, adapter)
 
-    def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
-        """Fail an uninstalled request and release scheduler-owned resources."""
+    def _fail_request_early(
+        self, request: GenerationRequest, exc: Exception, *, resources_retired: bool = False
+    ) -> None:
+        """Fail an uninstalled request and release scheduler-owned resources.
+
+        Only callers that prove no row ownership remains may retire the
+        request backedge. Best-effort/fatal cleanup deliberately stays strong.
+        """
         _LOGGER.error(
             "Failed to admit request %s: %s",
             request.request_id,
@@ -1631,6 +1645,10 @@ class GenerationScheduler:
             output={"error": str(exc)},
         )
         self._completed.append(result)
+        lifecycle.result_materialized()
+        if resources_retired:
+            lifecycle.resources_retired()
+            lifecycle.scheduler_detached()
 
     def _is_launchable_request(self, request: GenerationRequest) -> bool:
         lifecycle = request.lifecycle
@@ -2129,6 +2147,7 @@ class GenerationScheduler:
             seq.first_token_time = lifecycle.prefill_started_at or time.perf_counter()
             self._finalize_sequence(seq, "length")
             self.runtime.release_prefill_slot(prefill_slot)
+            seq.scheduler_detached()
             return True
 
         try:
@@ -2542,6 +2561,7 @@ class GenerationScheduler:
                     # Prefill sequences are enqueued into `running` immediately
                     # after token0 is sampled, so remove on termination here.
                     self.running.remove(seq)
+                    seq.scheduler_detached()
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
                         self._release_sequence(seq)
@@ -2591,6 +2611,7 @@ class GenerationScheduler:
                 seq.finalized = True
                 # Remove from running queue
                 self.running.remove(seq)
+                seq.scheduler_detached()
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
@@ -2628,6 +2649,7 @@ class GenerationScheduler:
                 # the batch slot/pages/adapter, then let the original exception
                 # propagate through the scheduler-fatal path.
                 self.runtime.release_sequence(seq.state)
+        seq.resources_retired()
 
     def _build_mask_spec(self, sequences: List[RequestLifecycle]) -> tuple:
         """Per-sequence sampling-mask inputs (skill_state/request only, no logits).
@@ -3183,6 +3205,7 @@ class GenerationScheduler:
             seq.transition(RequestPhase.FINALIZING)
 
         self._completed.append(self._build_result(seq))
+        seq.result_materialized()
 
     def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"

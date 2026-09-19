@@ -237,6 +237,13 @@ def _write_vision_grid_metadata(
 class Qwen35Runtime(UncachedPagedRuntime):
     """Runtime wrapping upstream Qwen 3.5 modeling for Kestrel."""
 
+    def shutdown(self) -> None:
+        try:
+            if self.spec is not None:
+                self.spec.decoder.shutdown()
+        finally:
+            super().shutdown()
+
     def __init__(
         self,
         cfg: Any,
@@ -264,6 +271,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         from kestrel.models.registry import get_spec
 
         self._spec = get_spec(cfg.model)
+        self._draft_model_path = getattr(cfg, "draft_model_path", None)
         self._model_name = cfg.model
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path == "native":
@@ -391,6 +399,20 @@ class Qwen35Runtime(UncachedPagedRuntime):
         self._prefill_slot_free = list(self._prefill_slots)
         self.prefill_slots: Sequence[Any] = self._prefill_slots
 
+        if self._draft_model_path is not None:
+            from kestrel.runtime.spec import SpecDecodeCaps
+            from .spec_decoder import Qwen35DFlashDecoder
+
+            self._decode_slots = ()
+            self.decode_slots = ()
+            self.active_sequences = {}
+            self.spatial_tables = None
+            decoder = Qwen35DFlashDecoder(self, self._draft_model_path)
+            self.spec = SpecDecodeCaps(
+                proposer=decoder, decoder=decoder,
+                capture_hidden_layers=decoder.draft.config.target_layer_ids)
+            return
+
         from .generated_decode import generated_decode_slot_capacity
 
         generated_decode_capacity = generated_decode_slot_capacity(
@@ -473,6 +495,10 @@ class Qwen35Runtime(UncachedPagedRuntime):
 
     def _load_model(self, source: str | Path) -> nn.Module:
         from .qwen_loader import load_qwen35_model
+
+        if self._draft_model_path is not None:
+            return load_qwen35_model(
+                source, device=self.device, dtype=self.dtype, revision=self._spec.revision)
 
         from kestrel.runtime.generated_decode import (
             finalize_generated_weight_storage_after_loading,

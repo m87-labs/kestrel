@@ -1,25 +1,22 @@
-"""NVIDIA Parakeet TDT 0.6B v3 support for Kestrel."""
+"""Lightweight parakeet_tdt registration and lazy public exports."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
+from kestrel.models.registry import register_lazy
+from .metadata import MODEL_ID, REVISION
 
-from .runtime import ParakeetTdtRuntime
-from .weights import MODEL_ID, REVISION, load_parakeet_tdt
-
-
-def _build_orchestrators():
-    from .longform import ParakeetLongFormOrchestrator
-
-    return {"transcribe": ParakeetLongFormOrchestrator()}
-
-
-register(
-    ModelSpec(
-        name=MODEL_ID,
-        repo_id=MODEL_ID,
-        revision=REVISION,
-        runtime=ParakeetTdtRuntime,
-        orchestrators=_build_orchestrators,
-    )
-)
+register_lazy([MODEL_ID], __name__ + ".registration")
 
 __all__ = ["MODEL_ID", "REVISION", "ParakeetTdtRuntime", "load_parakeet_tdt"]
+
+_LAZY_EXPORTS = {
+    "ParakeetTdtRuntime": ".runtime",
+    "load_parakeet_tdt": ".weights"
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_LAZY_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

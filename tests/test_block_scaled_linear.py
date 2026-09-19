@@ -4,6 +4,49 @@ import torch
 from kestrel.ops.block_scaled_linear import BlockScaledLinear
 
 
+def test_block_scaled_linear_forwards_explicit_activation(monkeypatch):
+    import importlib
+    source = importlib.import_module("kestrel.ops.block_scaled_linear")
+    module = BlockScaledLinear(128, 1024, interleaved_parts=2)
+    activation = torch.zeros(1, 128)
+    seen = []
+    def project(x, weight, scales, **kwargs):
+        seen.append(kwargs["gated_activation"])
+        return x.new_empty((1, 512 if kwargs["gated_activation"] else 1024))
+    monkeypatch.setattr(source, "_block_scaled_linear", project)
+    assert module(activation).shape == (1, 1024)
+    assert module(activation, gated_activation="silu").shape == (1, 512)
+    assert seen == [None, "silu"]
+
+
+@pytest.mark.parametrize("storage", ["dense", "fp8", "bias", "tail", "noninterleaved"])
+def test_qwen_mlp_requests_fused_activation_only_for_block_scaled_storage(storage, monkeypatch):
+    import kestrel.models.qwen35.qwen_model as source
+    module = source.Qwen3_5MLP.__new__(source.Qwen3_5MLP)
+    torch.nn.Module.__init__(module)
+    module.intermediate_size = 512
+    fp8 = storage == "fp8"
+    module.gate_up_proj = (torch.nn.Linear(128, 1024, bias=False) if storage == "dense"
+                          else BlockScaledLinear(
+                              128, 1024, quantized_rows=896 if storage == "tail" else 1024,
+                              interleaved_parts=1 if storage in ("tail", "noninterleaved") else 2,
+                              bias=storage == "bias"))
+    module.down_proj = torch.nn.Identity()
+    seen = []
+    def project(x, **kwargs):
+        seen.append(kwargs)
+        return x.new_zeros((1, 512 if kwargs else 1024))
+    monkeypatch.setattr(module.gate_up_proj, "forward", project)
+    def separate(out, gate_up, **kwargs):
+        assert not fp8
+        seen.append(kwargs)
+        out.zero_()
+    monkeypatch.setattr(source, "_kestrel_gated_activation_into", separate)
+    assert module(torch.zeros(1, 128)).shape == (1, 512)
+    assert seen == ([{"gated_activation": "silu"}] if fp8 else [
+        {}, {"activation": "silu", "layout": "interleaved_i8"}])
+
+
 @pytest.mark.parametrize("rows,quantized,parts", [(145, 145, 1), (146, 128, 1), (288, 288, 2)])
 @pytest.mark.parametrize("batch", [1, 8])
 def test_block_scaled_linear_preserves_blocks_and_unquantized_tail(rows, quantized, parts, batch):

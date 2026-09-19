@@ -11,7 +11,7 @@ from .protocols import (
 )
 from .registry import ModelSpec, get_spec, known_models, register
 
-# Model packages register their specs at import time.
+# Model packages advertise metadata without importing runtime implementations.
 from . import (  # noqa: F401
     gemma4,
     moondream,

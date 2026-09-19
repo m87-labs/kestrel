@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Any, Sequence
 
 import torch
@@ -27,6 +28,7 @@ from kestrel.ops.rotary import default_inv_freq
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
+from .gdn_state import LinearAttentionState
 
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
@@ -54,6 +56,157 @@ _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
 
 
+@dataclass(frozen=True)
+class _RecurrentPrefixRecord:
+    """One verification's immutable projection outputs, never shared workspace."""
+    module: Qwen3_5GatedDeltaNet
+    qkv: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+    conv_input: torch.Tensor
+    initial_state: torch.Tensor
+    state_indices: torch.Tensor
+    prefix_context: object | None = None
+
+    @classmethod
+    def capture(cls, module, qkv, a, b, conv_input, initial_state, state_indices,
+                prefix_context=None):
+        # Scheduler metadata may be reused before the accepted prefix commits.
+        # Derived records share this owned snapshot rather than copying it again.
+        return cls(module, qkv, a, b, conv_input, initial_state, state_indices.clone(),
+                   prefix_context)
+
+    @property
+    def replay_geometry(self) -> tuple:
+        return (self.qkv.device, self.qkv.dtype, self.qkv.shape[-1],
+                self.a.shape[-1], self.initial_state.dtype,
+                tuple(self.initial_state.shape[1:]), self.module.head_k_dim,
+                self.module.head_v_dim)
+
+    def split_sequences(self, sequence_lengths: Sequence[int]) -> tuple:
+        lengths = tuple(sequence_lengths)
+        if (not lengths or any(type(length) is not int or length <= 0 for length in lengths)
+                or sum(lengths) != self.qkv.shape[1]
+                or self.initial_state.shape[0] != len(lengths)
+                or self.state_indices.numel() != len(lengths)):
+            raise ValueError("captured packed sequences do not match recurrent records")
+        prefix = self.module.conv_kernel_size - 1
+        if self.conv_input.shape[-1] != sum(lengths) + prefix * len(lengths):
+            raise ValueError("captured convolution histories do not match packed sequences")
+        records = []
+        offset = conv_offset = 0
+        for index, length in enumerate(lengths):
+            records.append(_RecurrentPrefixRecord(
+                self.module, self.qkv[:, offset:offset + length],
+                self.a[:, offset:offset + length], self.b[:, offset:offset + length],
+                self.conv_input[..., conv_offset:conv_offset + prefix + length],
+                self.initial_state[index:index + 1], self.state_indices[index:index + 1],
+                self.prefix_context))
+            offset += length
+            conv_offset += prefix + length
+        return tuple(records)
+
+    @staticmethod
+    def replay_group(records: list[tuple[_RecurrentPrefixRecord, LinearAttentionState]],
+                     length: int, graph=None) -> None:
+        """Batch independent recurrences after layer-specific gate preparation."""
+        from kestrel_kernels import get_runtime
+
+        first = records[0][0]
+        if any(record.replay_geometry != first.replay_geometry for record, _ in records):
+            raise ValueError("recurrent replay group has incompatible geometry")
+        dim = first.module.head_k_dim
+        value_dim = first.module.head_v_dim
+        nv = first.initial_state.shape[1]
+        if tuple(first.initial_state.shape[2:]) != (value_dim, dim):
+            raise ValueError("recurrent replay state head geometry does not match module")
+        qk_width = first.qkv.shape[-1] - nv * value_dim
+        if qk_width <= 0 or qk_width % (2 * dim):
+            raise ValueError("recurrent replay mixed projection width is invalid")
+        mixed = torch.cat([record.qkv[:, :length] for record, _ in records], dim=1)
+        a = torch.cat([record.a[:, :length] for record, _ in records], dim=1)
+        b = torch.cat([record.b[:, :length] for record, _ in records], dim=1)
+        A_log = torch.stack([record.module.A_log for record, _ in records])
+        dt_bias = torch.stack([record.module.dt_bias for record, _ in records])
+        initial = torch.cat([record.initial_state for record, _ in records], dim=0)
+        inputs = (mixed, a, b, A_log, dt_bias, initial)
+        if graph is None:
+            cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=(length,) * len(records), device=first.qkv.device)
+            lease = nullcontext((_replay_recurrent_prefix(*inputs, cu, topology),))
+        else:
+            lease = graph.launch(*inputs)
+        with lease as (final,):
+            _RecurrentPrefixRecord.copy_replay_state(records, length, final)
+
+    @staticmethod
+    def copy_replay_state(records, length, final):
+        state_destinations, state_sources = [], []
+        conv_destinations, conv_sources = [], []
+        for index, (record, layer) in enumerate(records):
+            if layer.recurrent_states.shape[0] == 1 and record.state_indices.numel() == 1:
+                # Capture validated index0; the destination fork has the same pool extent.
+                state_destinations.append(layer.recurrent_states)
+                state_sources.append(final[index:index+1])
+            else:
+                layer.recurrent_states.index_copy_(0, record.state_indices, final[index:index+1])
+            conv_destinations.append(layer.conv_states)
+            conv_sources.append(record.conv_input[
+                ..., length-1:length-1+record.module.conv_kernel_size])
+            layer.has_previous_state = True
+        if state_destinations:
+            torch._foreach_copy_(state_destinations, state_sources)
+        # Tried stack+foreach histories: C8 1.85s vs 1.67s with extra GC;
+        # keeping direct copies despite the faster isolated copy kernel.
+        torch._foreach_copy_(conv_destinations, conv_sources)
+
+    def replay_into(self, layer: LinearAttentionState, length: int,
+                    cu: torch.Tensor, topology: object) -> None:
+        module = self.module
+        qkv, a, b = (value[:, :length].contiguous() for value in (self.qkv, self.a, self.b))
+        workspace = module._prefill_workspace_cache.get(
+            qkv, a, head_dim=module.head_k_dim,
+            allocate=module.allocate_packed_gdn_prefill_workspace)
+        module.packed_gated_delta_rule_prefill(
+            qkv, a, b, module.A_log, module.dt_bias, cu,
+            workspace=workspace, initial_state=self.initial_state,
+            output_final_state=True, sequence_lengths=(length,), topology_token=topology,
+            final_state=layer.recurrent_states, final_state_indices=self.state_indices,
+            final_state_indices_allocator_owned=True)
+        layer.conv_states.copy_(
+            self.conv_input[..., length-1:length-1+module.conv_kernel_size])
+        layer.has_previous_state = True
+
+
+def _replay_recurrent_prefix(mixed, a, b, A_log, dt_bias, initial, cu, topology):
+    from kestrel_kernels import get_runtime
+
+    runtime = get_runtime().gated_delta
+    count, nv, value_dim, dim = initial.shape
+    total = mixed.shape[1]
+    if total % count:
+        raise ValueError("recurrent replay requires equal sequence lengths")
+    lengths = (total // count,) * count
+    nk = (mixed.shape[-1] - nv * value_dim) // (2 * dim)
+    q = torch.empty((1, total, nk, dim), device=mixed.device, dtype=mixed.dtype)
+    k = torch.empty_like(q)
+    v = torch.empty((1, total, nv, value_dim), device=mixed.device, dtype=mixed.dtype)
+    g = torch.empty((1, total, nv), device=mixed.device, dtype=torch.float32)
+    beta = torch.empty_like(g)
+    runtime.packed_prefill_prepare(
+        mixed, a, b, A_log, dt_bias, cu_seqlens=cu,
+        sequence_lengths=lengths, topology_token=topology,
+        query=q, key=k, value=v, g=g, beta=beta)
+    final = torch.empty_like(initial)
+    indices = torch.arange(count, device=mixed.device, dtype=torch.int64)
+    runtime.packed_recurrent_gated_delta_rule_prefill(
+        q, k, v, g, beta, cu, initial_state=initial, final_state=final,
+        output_sequence=False,
+        final_state_indices=indices, final_state_indices_allocator_owned=True,
+        sequence_lengths=lengths, topology_token=topology)
+    return final
+
+
 def _text_linear(
     config: Qwen3_5TextConfig, in_features: int, out_features: int, *,
     quantized_rows: int | None = None, interleaved_parts: int = 1,
@@ -77,6 +230,7 @@ def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
 class _TextModelOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Qwen35InferenceCache | None = None
+    layer_hidden_states: tuple[torch.Tensor, ...] = ()
 
 
 def _copy_image_features_into_embeddings(
@@ -346,12 +500,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if cache_params is None:
             raise RuntimeError("Qwen GDN requires inference cache state")
         batch_size, seq_len, _ = hidden_states.shape
-        is_decode = cache_params.has_previous_state(self.layer_idx)
+        has_initial_state = cache_params.has_previous_state(self.layer_idx)
+        capture_prefix = cache_params._prefix_source is not None
+        if capture_prefix:
+            if (batch_size != 1 or sequence_lengths is None
+                    or sum(sequence_lengths) != seq_len or not has_initial_state
+                    or not gdn_state_indices_allocator_owned):
+                raise ValueError("prefix capture requires committed sequences and owned state indices")
+            if (cache_params.seq_length != cache_params._prefix_start
+                    or self.layer_idx in cache_params._prefix_records):
+                raise RuntimeError("prefix capture permits only one verification forward")
         cu_seqlens_q = cu_seq_lens_q
-        if is_decode:
-            raise RuntimeError(
-                "Qwen cached decode must run through the generated program"
-            )
         supports_packed_gdn = (
             self.supports_packed_gdn(
                 hidden_states.device,
@@ -389,6 +548,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         num_sequences = int(cu_seqlens_q.numel() - 1)
         layer = cache_params.layers[self.layer_idx]
         conv_shape = (num_sequences, self.conv_dim, self.conv_kernel_size)
+        if has_initial_state:
+            if (sequence_lengths is None or len(sequence_lengths) != num_sequences
+                    or any(type(length) is not int or length <= 0 for length in sequence_lengths)
+                    or sum(sequence_lengths) != seq_len):
+                raise ValueError("Qwen recurrent continuation requires exact packed sequence lengths")
+            if (layer.conv_states is None
+                    or tuple(layer.conv_states.shape) != conv_shape
+                    or layer.conv_states.dtype != mixed_qkv.dtype
+                    or layer.conv_states.device != mixed_qkv.device):
+                raise ValueError("Qwen recurrent continuation requires committed convolution history")
         if layer.conv_states is None or tuple(layer.conv_states.shape) != conv_shape:
             layer.conv_states = torch.empty(
                 conv_shape,
@@ -415,7 +584,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 "Qwen prefill requires one recurrent-state index per packed sequence"
             )
         packed_recurrent_state = layer.recurrent_states
-        layer.has_previous_state = True
+        initial_state = (
+            packed_recurrent_state.gather(
+                0, state_indices[:, None, None, None].expand(
+                    -1, *packed_recurrent_state.shape[1:]))
+            if has_initial_state else None
+        )
         if seq_idx is None:
             seq_idx = _packed_seq_idx_from_cu_seqlens(
                 cu_seqlens_q,
@@ -423,9 +597,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv.device,
             )
         recurrence_cu_seqlens = cu_seqlens_q
+        conv_prefix = self.conv_kernel_size - 1 if has_initial_state else 0
+        # Preserve channel-contiguous projection storage through history concatenation.
+        if conv_prefix and num_sequences == 1:
+            mixed_qkv = torch.cat(
+                (packed_conv_state[..., -conv_prefix:].transpose(1, 2),
+                 mixed_qkv.transpose(1, 2)), dim=1).transpose(1, 2)
+            seq_idx = cache_params.conv_sequence_indices(
+                (mixed_qkv.shape[-1] - conv_prefix,), conv_prefix, mixed_qkv.device)
+        elif conv_prefix:
+            chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
+            mixed_qkv = torch.cat([
+                part.transpose(1, 2)
+                for index, chunk in enumerate(chunks)
+                for part in (packed_conv_state[index:index + 1, ..., -conv_prefix:], chunk)
+            ], dim=1).transpose(1, 2)
+            seq_idx = cache_params.conv_sequence_indices(
+                sequence_lengths, conv_prefix, mixed_qkv.device)
         # Tried fusing packed conv + q/k/v/g/beta prep in CuTe DSL:
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.
+        conv_input = mixed_qkv
         mixed_qkv = self.causal_conv1d_packed(
             x=mixed_qkv,
             weight=self.conv1d.weight.squeeze(1),
@@ -435,12 +627,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             final_state=packed_conv_state,
         )
         mixed_qkv = mixed_qkv.transpose(1, 2)
+        if conv_prefix and num_sequences == 1:
+            mixed_qkv = mixed_qkv[:, conv_prefix:].contiguous()
+        elif conv_prefix:
+            chunks = mixed_qkv.split(tuple(length + conv_prefix for length in sequence_lengths), dim=1)
+            mixed_qkv = torch.cat([chunk[:, conv_prefix:] for chunk in chunks], dim=1)
         workspace = self._prefill_workspace_cache.get(
             mixed_qkv,
             a,
             head_dim=self.head_k_dim,
             allocate=self.allocate_packed_gdn_prefill_workspace,
         )
+        prefix_context = None
+        if capture_prefix and all(length == 16 for length in sequence_lengths):
+            prefix_context = get_runtime().gated_delta.allocate_packed_gated_delta_prefix_context(
+                workspace, initial_state, recurrence_cu_seqlens,
+                sequence_lengths=sequence_lengths, topology_token=topology_token)
         core_attn_out, _ = self.packed_gated_delta_rule_prefill(
             mixed_qkv,
             a,
@@ -449,12 +651,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.dt_bias,
             recurrence_cu_seqlens,
             workspace=workspace,
+            initial_state=initial_state,
             output_final_state=True,
             sequence_lengths=sequence_lengths,
             topology_token=topology_token,
             final_state=packed_recurrent_state,
             final_state_indices=state_indices,
             final_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
+            prefix_context=prefix_context,
         )
 
         # reshape input data into 2D tensor
@@ -464,6 +668,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
+        layer.has_previous_state = True
+        if capture_prefix:
+            # Projection/conv outputs own their storage; initial_state is the
+            # independent copy made before writing the speculative pool.
+            cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord.capture(
+                self, mixed_qkv, a, b, conv_input, initial_state, state_indices, prefix_context)
         return output
 
 
@@ -592,6 +802,11 @@ class Qwen3_5MLP(nn.Module):
         )
 
     def forward(self, x):
+        if (isinstance(self.gate_up_proj, BlockScaledLinear)
+                and self.gate_up_proj.interleaved_parts == 2
+                and self.gate_up_proj.weight_tail is None
+                and self.gate_up_proj.bias is None):
+            return self.down_proj(self.gate_up_proj(x, gated_activation="silu"))
         gate_up = self.gate_up_proj(x)
         hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
         _kestrel_gated_activation_into(
@@ -1192,7 +1407,12 @@ class Qwen3_5TextModel(nn.Module):
         seq_idx: torch.Tensor | None = None,
         gdn_state_indices: torch.Tensor | None = None,
         gdn_state_indices_allocator_owned: bool = False,
+        capture_layers: tuple[int, ...] = (),
     ) -> _TextModelOutput:
+        if (any(type(index) is not int or not 0 <= index < self.config.num_hidden_layers
+                for index in capture_layers)
+                or tuple(sorted(set(capture_layers))) != capture_layers):
+            raise ValueError("capture_layers must be increasing zero-based layer indices")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1219,6 +1439,7 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         decoder_layers = self.layers[: self.config.num_hidden_layers]
+        captured = []
 
         if decoder_layers:
             state = decoder_layers[0].input_layernorm
@@ -1253,6 +1474,10 @@ class Qwen3_5TextModel(nn.Module):
                 gdn_state_indices=gdn_state_indices,
                 gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
             )
+            if i in capture_layers:
+                # Capture the residual after this layer, before its successor's
+                # normalization; later layers may reuse the residual storage.
+                captured.append(hidden_states.clone())
 
         hidden_states = (
             normalized_hidden_states
@@ -1264,6 +1489,7 @@ class Qwen3_5TextModel(nn.Module):
         return _TextModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            layer_hidden_states=tuple(captured),
         )
 
     def _update_linear_attn_mask(self, attention_mask, past_key_values):
@@ -1341,6 +1567,7 @@ class Qwen3_5Model(nn.Module):
         vision_position_ids: torch.Tensor | None = None,
         vision_cu_seqlens: torch.Tensor | None = None,
         image_token_spans: Sequence[tuple[int, int]] | None = None,
+        capture_layers: tuple[int, ...] = (),
     ) -> _TextModelOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -1381,11 +1608,13 @@ class Qwen3_5Model(nn.Module):
             seq_idx=seq_idx,
             gdn_state_indices=gdn_state_indices,
             gdn_state_indices_allocator_owned=gdn_state_indices_allocator_owned,
+            capture_layers=capture_layers,
         )
 
         return _TextModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            layer_hidden_states=outputs.layer_hidden_states,
         )
 
 
