@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .config import ParakeetEncoderConfig, ParakeetTdtConfig
+from .vad import VadHead
+
+
+# Mel frames advance one hop of 160 samples at 16 kHz; the subsampler then
+# folds `subsampling_factor` of them into a single encoder frame.
+FRAME_HOP_SECONDS = 160 / 16_000
 
 
 class FeedForward(nn.Module):
@@ -485,6 +491,8 @@ def _decode_batch(
 
 
 class ParakeetTdt(nn.Module):
+    vad_head: VadHead | None
+
     def __init__(self, config: ParakeetTdtConfig) -> None:
         super().__init__()
         self.config = config
@@ -494,10 +502,41 @@ class ParakeetTdt(nn.Module):
         )
         self.decoder = Decoder(config)
         self.joint = Joint(config)
+        # Only checkpoints that ship `vad_head.*` get one; nothing is bundled.
+        self.vad_head = None
+
+    def attach_vad_head(self) -> None:
+        """Make room for a checkpoint's speech head before its tensors load."""
+
+        self.vad_head = VadHead(self.config.encoder.hidden_size)
+
+    @property
+    def encoder_frame_seconds(self) -> float:
+        return FRAME_HOP_SECONDS * self.config.encoder.subsampling_factor
 
     def reset_nonpersistent_buffers(self) -> None:
         self.encoder.reset_nonpersistent_buffers()
         self.decoder.prepare_inference()
+
+    def subsample(self, features: Tensor, attention_mask: Tensor) -> tuple[Tensor, Tensor]:
+        """The convolutional subsampler alone: `[B, T, hidden]` and its valid mask.
+
+        Purely local, so a block of a long recording subsamples to exactly the
+        frames it would have produced inside the whole file. That is what lets
+        the VAD head scan an hour of audio without an encoder pass over it.
+        """
+
+        return self.encoder.subsampling(features, attention_mask)
+
+    def speech_probabilities(
+        self, features: Tensor, attention_mask: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Per-frame speech probability from this checkpoint's own head."""
+
+        if self.vad_head is None:
+            raise ValueError("this Parakeet checkpoint carries no VAD head")
+        hidden, valid = self.subsample(features, attention_mask)
+        return torch.sigmoid(self.vad_head(hidden).float()), valid
 
     def encode(self, features: Tensor, attention_mask: Tensor) -> tuple[Tensor, Tensor]:
         encoded, valid = self.encoder(features, attention_mask)

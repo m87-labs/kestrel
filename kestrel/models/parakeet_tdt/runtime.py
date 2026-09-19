@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -29,8 +29,15 @@ from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
+from .segment import PauseSegmenter, energy_speech
 from .tokenizer import ParakeetTokenizer
+from .vad import VadHeadSpeech
 from .weights import MODEL_ID, load_parakeet_tdt
+
+
+# One live-PCM window: the block the orchestrator commits exactly, and the unit
+# the streaming decoder carries its state across.
+STREAM_WINDOW_SECONDS = 180
 
 
 def _timed_segments(
@@ -180,6 +187,21 @@ class ParakeetTdtRuntime:
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _segmenter(self) -> PauseSegmenter:
+        """One segmentation path; only the pause source follows the weights.
+
+        A checkpoint that carries `vad_head.*` marks speech with its own head,
+        reading the subsampler it already has to run. Everything else -- stock
+        NVIDIA checkpoints included -- reads frame energy. There is no option
+        and no bundled default head: the loaded tensors decide.
+        """
+
+        if getattr(self.model, "vad_head", None) is None:
+            return PauseSegmenter(energy_speech)
+        return PauseSegmenter(
+            VadHeadSpeech(self.model, device=self.device, dtype=self.dtype)
+        )
 
     def tasks(self) -> tuple[str, ...]:
         return ("transcribe",)
@@ -395,10 +417,21 @@ class ParakeetTdtRuntime:
                     )
                 except Exception as exc:
                     results[index] = exc
-            iterators = [
-                iter(source.chunks(180)) if source is not None else None
-                for source in sources
-            ]
+            # Pause-aligned segments of at most 30 s, contiguous and never
+            # overlapping: 6.37 WER against 10.82 for the fixed 180 s windows
+            # this replaces (six Earnings-22 calls, parakeet-tdt-0.6b-v3).
+            # A live stream window arrives already cut, carrying decoder state
+            # and sample offsets into itself, so it passes through whole.
+            segmenter = self._segmenter()
+            iterators: list[Iterator[DecodedAudio] | None] = []
+            for index, source in enumerate(sources):
+                item = parsed[index]
+                if source is None or item is None:
+                    iterators.append(None)
+                elif item[2] is not None:
+                    iterators.append(iter(source.chunks(STREAM_WINDOW_SECONDS)))
+                else:
+                    iterators.append(iter(segmenter.segments(source)))
             text_parts: list[list[str]] = [[] for _ in inputs]
             segments: list[list[Segment]] = [[] for _ in inputs]
 

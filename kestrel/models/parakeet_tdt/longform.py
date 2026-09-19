@@ -26,11 +26,13 @@ from kestrel.models.asr.longform import (
 )
 
 from .contract import parse_request
-from .runtime import _StreamWindow
+from .runtime import STREAM_WINDOW_SECONDS, _StreamWindow
 
 
-# Tried 30s: 39.1% live/file WER vs 0.0% at 180s on a 40s boundary gate.
-_STREAM_CHUNK_SECONDS = 180
+# Tried 30s: 39.1% live/file WER vs 0.0% at 180s on a 40s boundary gate. This
+# is the progress granularity and the live commit block, not the recogniser's
+# window: the runtime cuts each of these at pauses before transcribing it.
+_STREAM_CHUNK_SECONDS = STREAM_WINDOW_SECONDS
 # Tried 30s/60s left context: better on repeated audio but worse across natural
 # utterance boundaries (51.2%/72.0% vs 40.8% reference WER); keeping 10s.
 _LIVE_LEFT_SECONDS = 10
