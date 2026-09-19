@@ -14,10 +14,7 @@ from .model import Qwen3AsrForConditionalGeneration
 from .tokenizer import Qwen3AsrTokenizer
 
 
-QWEN3_ASR_MODELS = {
-    "Qwen/Qwen3-ASR-0.6B": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
-    "Qwen/Qwen3-ASR-1.7B": "7278e1e70fe206f11671096ffdd38061171dd6e5",
-}
+from .metadata import QWEN3_ASR_MODELS
 _FILES = (
     "config.json",
     "generation_config.json",
