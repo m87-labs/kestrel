@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -29,9 +30,9 @@ from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
-from .segment import PauseSegmenter, energy_speech
+from .segment import SpeechRegions, energy_speech, pause_segments
 from .tokenizer import ParakeetTokenizer
-from .vad import VadHeadSpeech
+from .vad import head_speech
 from .weights import MODEL_ID, load_parakeet_tdt
 
 
@@ -188,20 +189,19 @@ class ParakeetTdtRuntime:
     def model_name(self) -> str:
         return self._model_name
 
-    def _segmenter(self) -> PauseSegmenter:
-        """One segmentation path; only the pause source follows the weights.
+    def _speech_regions(self) -> SpeechRegions:
+        """The pause source, chosen by capability of the loaded weights.
 
-        A checkpoint that carries `vad_head.*` marks speech with its own head,
-        reading the subsampler it already has to run. Everything else -- stock
-        NVIDIA checkpoints included -- reads frame energy. There is no option
-        and no bundled default head: the loaded tensors decide.
+        A checkpoint carrying `vad_head.*` marks speech with its own head off
+        the subsampler it already runs. Everything else -- stock NVIDIA
+        checkpoints included -- reads frame energy. There is no option and no
+        bundled default head: the loaded tensors decide. Nothing is cached on
+        the runtime, so a shared one segments concurrent requests safely.
         """
 
         if getattr(self.model, "vad_head", None) is None:
-            return PauseSegmenter(energy_speech)
-        return PauseSegmenter(
-            VadHeadSpeech(self.model, device=self.device, dtype=self.dtype)
-        )
+            return energy_speech
+        return partial(head_speech, self.model)
 
     def tasks(self) -> tuple[str, ...]:
         return ("transcribe",)
@@ -422,7 +422,7 @@ class ParakeetTdtRuntime:
             # this replaces (six Earnings-22 calls, parakeet-tdt-0.6b-v3).
             # A live stream window arrives already cut, carrying decoder state
             # and sample offsets into itself, so it passes through whole.
-            segmenter = self._segmenter()
+            speech = self._speech_regions()
             iterators: list[Iterator[DecodedAudio] | None] = []
             for index, source in enumerate(sources):
                 item = parsed[index]
@@ -431,7 +431,7 @@ class ParakeetTdtRuntime:
                 elif item[2] is not None:
                     iterators.append(iter(source.chunks(STREAM_WINDOW_SECONDS)))
                 else:
-                    iterators.append(iter(segmenter.segments(source)))
+                    iterators.append(iter(pause_segments(source, speech)))
             text_parts: list[list[str]] = [[] for _ in inputs]
             segments: list[list[Segment]] = [[] for _ in inputs]
 
