@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from asyncio import CancelledError
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,8 @@ def _paired_outputs(records, lengths, states):
             record.conv_input[..., row * (16 + width - 1) + length - 1:
                               row * (16 + width - 1) + length - 1 + width]
             for row, length in enumerate(lengths.tolist())], dim=0).contiguous()
-        outputs.extend((state, history))
+        for row in range(lengths.numel()):
+            outputs.extend((state[row:row + 1], history[row:row + 1]))
     return tuple(outputs)
 
 
@@ -100,7 +102,55 @@ def test_packed_prefix_rejects_reordered_owners_before_finalizing():
         Qwen35InferenceCache.commit_recurrent_prefixes(branches[::-1], (3, 9), finalizer=never)
 
 
-@pytest.mark.parametrize("failure", ("second_layer", "recurrent_copy", "conv_copy"))
+def test_c8_cached_row_outputs_remove_768_commit_slice_constructions(monkeypatch):
+    sources, branches, _ = _packed_prefixes(count=8, layers=48)
+    records = branches[0]._prefix_records
+    lengths = torch.tensor([1, 16, 3, 15, 7, 16, 2, 9], dtype=torch.int32)
+    constructed = []
+    getitem = torch.Tensor.__getitem__
+
+    def count_slice(tensor, index):
+        result = getitem(tensor, index)
+        if (tensor.ndim in (3, 4) and tensor.shape[0] == 8
+                and isinstance(index, slice) and index.step is None
+                and isinstance(index.start, int) and isinstance(index.stop, int)
+                and index.stop - index.start == 1):
+            constructed.append(1)
+        return result
+
+    def finalize(contexts, accepted, *, out_states):
+        for state in out_states:
+            state.fill_(42)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", count_slice)
+    monkeypatch.setattr("kestrel_kernels.get_runtime", lambda: SimpleNamespace(
+        gated_delta=SimpleNamespace(finalize_packed_gated_delta_prefix=finalize)))
+    cached = _finalize_recurrent_prefixes(records, lengths)
+    assert len(cached) == len(constructed) == 768
+    identities = tuple(map(id, cached))
+    constructed.clear()
+
+    @contextmanager
+    def lease(bound_records, accepted):
+        assert bound_records is records
+        yield cached
+
+    results = Qwen35InferenceCache.commit_recurrent_prefixes(
+        branches, tuple(lengths.tolist()), finalizer=lease)
+    assert constructed == []
+    assert tuple(map(id, cached)) == identities
+    for index in range(48):
+        for row in range(8):
+            state, history = cached[2 * (index * 8 + row):2 * (index * 8 + row + 1)]
+            layer = results[row].layers[index]
+            assert torch.equal(layer.recurrent_states, state)
+            assert torch.equal(layer.conv_states, history)
+            assert not torch._C._overlaps(layer.recurrent_states, state)
+            assert not torch._C._overlaps(layer.conv_states, history)
+            assert torch.all(sources[row].layers[index].recurrent_states == row + index * 10)
+
+
+@pytest.mark.parametrize("failure", ("second_layer", "recurrent_copy", "conv_copy", "cancel"))
 def test_c8_multilayer_partial_failure_never_mutates_committed_or_verified_states(monkeypatch, failure):
     sources, branches, _ = _packed_prefixes(count=8, layers=3)
     records = branches[0]._prefix_records
@@ -126,14 +176,17 @@ def test_c8_multilayer_partial_failure_never_mutates_committed_or_verified_state
 
     def copy_many(destinations, values):
         copy_calls.append(len(destinations))
-        fail_call = {"recurrent_copy": 1, "conv_copy": 2}.get(failure)
+        fail_call = {"recurrent_copy": 1, "conv_copy": 2, "cancel": 2}.get(failure)
         if len(copy_calls) == fail_call:
             destinations[0].copy_(values[0])
+            if failure == "cancel":
+                raise CancelledError("copyback cancelled after writing")
             raise RuntimeError("copyback failed after writing")
         return original_copy(destinations, values)
 
     monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
-    with pytest.raises(RuntimeError, match="failed after writing"):
+    error = CancelledError if failure == "cancel" else RuntimeError
+    with pytest.raises(error, match="after writing"):
         Qwen35InferenceCache.commit_recurrent_prefixes(branches, counts, finalizer=finalize)
     assert len(written) >= 2
     for owner, length, layers in snapshots:
@@ -289,7 +342,8 @@ def test_history_gather_matches_slices_with_poisoned_rejected_storage(monkeypatc
 
     monkeypatch.setattr("kestrel_kernels.get_runtime", lambda: SimpleNamespace(
         gated_delta=SimpleNamespace(finalize_packed_gated_delta_prefix=finalize)))
-    state, gathered = _finalize_recurrent_prefixes({0: record}, lengths)
+    outputs = _finalize_recurrent_prefixes({0: record}, lengths)
+    state, gathered = torch.cat(outputs[::2]), torch.cat(outputs[1::2])
     assert gathered.is_contiguous()
     assert torch.equal(gathered.view(torch.int16), expected.view(torch.int16))
     assert torch.equal(history.contiguous().view(torch.int16), before)

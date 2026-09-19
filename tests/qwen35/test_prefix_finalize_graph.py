@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from asyncio import CancelledError
 from types import SimpleNamespace
 import weakref
 
@@ -41,6 +42,54 @@ class _Graph:
         self.forward = None
 
 
+@pytest.mark.parametrize("device,capture", [
+    ("cpu", False),
+    pytest.param("cuda", True, marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA required")),
+])
+def test_row_output_lease_reuse_and_cancellation(monkeypatch, device, capture):
+    graph = object.__new__(spec_target_graph.Qwen35TargetGraph)
+    graph._runtime = SimpleNamespace(max_batch_size=1, device=torch.device(device),
+        _compute_stream=torch.cuda.Stream(device=device) if capture else None)
+    graph._finalizers, graph._bound_outputs = OrderedDict(), OrderedDict()
+    graph._layouts, graph._prefix_bindings = {}, {}
+    graph._graphs = SimpleNamespace(shutdown=lambda: None)
+    template = torch.zeros(8, 2, 3, 3, device=device)
+    records = {i: _record(SimpleNamespace(supports_graph_capture=capture), template)
+               for i in range(48)}
+    for record in records.values():
+        record.conv_input = record.conv_input.to(device)
+
+    def finalize(contexts, lengths, *, out_states):
+        for state in out_states:
+            state.copy_(lengths[:, None, None, None].expand_as(state))
+
+    monkeypatch.setattr("kestrel_kernels.get_runtime", lambda: SimpleNamespace(
+        gated_delta=SimpleNamespace(finalize_packed_gated_delta_prefix=finalize)))
+    lengths = torch.arange(1, 9, device=device, dtype=torch.int32)
+    try:
+        with graph.finalize_prefixes(records, lengths) as first:
+            assert len(first) == 768
+            identities = tuple(map(id, first))
+            owned = tuple(value.clone() for value in first)
+            assert torch.all(first[0] == 1) and torch.all(first[14] == 8)
+            assert first[0].untyped_storage().data_ptr() == first[2].untyped_storage().data_ptr()
+            assert first[0].data_ptr() != first[2].data_ptr()
+        with pytest.raises(CancelledError):
+            with graph.finalize_prefixes(records, lengths.flip(0)) as second:
+                assert torch.all(second[0] == 8) and torch.all(second[14] == 1)
+                if capture:
+                    assert tuple(map(id, second)) == identities
+                else:
+                    assert not torch._C._overlaps(first[0], second[0])
+                raise CancelledError("consumer cancelled")
+        with graph.finalize_prefixes(records, lengths) as third:
+            assert all(torch.equal(left, right) for left, right in zip(third, owned))
+            assert torch.count_nonzero(template) == 0
+    finally:
+        graph.shutdown()
+
+
 @pytest.mark.parametrize("capture", (False, True))
 def test_same_shape_target_recapture_rebinds_finalizer_and_releases_evicted_owners(monkeypatch, capture):
     _Graph.instances = []
@@ -73,10 +122,10 @@ def test_same_shape_target_recapture_rebinds_finalizer_and_releases_evicted_owne
                      for index, (context, template) in enumerate(zip(first, templates))}
     history_owners = tuple(weakref.ref(record.conv_input) for record in first_records.values())
     with graph.finalize_prefixes(first_records, lengths) as outputs:
-        assert torch.all(outputs[0][0] == 11) and torch.all(outputs[0][1] == 26)
+        assert torch.all(outputs[0] == 11) and torch.all(outputs[2] == 26)
     del outputs
     with graph.finalize_prefixes(first_records, lengths.flip(0)) as outputs:
-        assert torch.all(outputs[2][0] == 27) and torch.all(outputs[2][1] == 12)
+        assert torch.all(outputs[4] == 27) and torch.all(outputs[6] == 12)
         assert outputs[1].is_contiguous() and outputs[3].is_contiguous()
     del outputs
     assert len(_Graph.instances) == 1 and _Graph.instances[0].calls == 2
@@ -96,7 +145,7 @@ def test_same_shape_target_recapture_rebinds_finalizer_and_releases_evicted_owne
     second_records = {index: _record(context, template)
                       for index, (context, template) in enumerate(zip(second, templates))}
     with graph.finalize_prefixes(second_records, lengths) as outputs:
-        assert torch.all(outputs[0][0] == 51) and torch.all(outputs[2][1] == 67)
+        assert torch.all(outputs[0] == 51) and torch.all(outputs[6] == 67)
     del outputs
     assert len(_Graph.instances) == 2 and _Graph.instances[0].closed
     assert _Graph.instances[1].enabled is capture

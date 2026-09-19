@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def _finalize_recurrent_prefixes(records, accepted_lengths):
-    """Return leased state/history pairs without changing their committed owners."""
+    """Return layer/row-ordered leased state/history pairs without changing owners."""
     from kestrel_kernels import get_runtime
 
     ordered = tuple(records[index] for index in sorted(records))
@@ -45,7 +45,9 @@ def _finalize_recurrent_prefixes(records, accepted_lengths):
                 width, device=lengths.device, dtype=torch.int64)[None, :]
         rows = record.conv_input.squeeze(0).unflatten(-1, (count, 16 + width - 1)).transpose(0, 1)
         history = torch.gather(rows, 2, positions[width][:, None, :].expand(count, rows.shape[1], width))
-        outputs.extend((state, history))
+        # Captured outputs retain these source views once per graph entry.
+        for row in range(count):
+            outputs.extend((state[row:row + 1], history[row:row + 1]))
     return tuple(outputs)
 
 
@@ -257,7 +259,7 @@ class Qwen35InferenceCache:
         else:
             lease = finalizer(records, accepted)
         with lease as outputs:
-            if len(outputs) != 2 * len(indices):
+            if len(outputs) != 2 * len(indices) * count:
                 raise ValueError("packed prefix finalizer requires state/history pairs")
             # Allocate after submission to overlap host work with finalization.
             # Destinations remain detached until every state/history is written.
@@ -279,13 +281,15 @@ class Qwen35InferenceCache:
             results = tuple(results)
             state_destinations, states = [], []
             conv_destinations, histories = [], []
-            for index, state, history in zip(indices, outputs[::2], outputs[1::2], strict=True):
-                for row, result in enumerate(results):
+            values = iter(outputs)
+            for index in indices:
+                for result in results:
+                    state, history = next(values), next(values)
                     layer = result.layers[index]
                     state_destinations.append(layer.recurrent_states)
-                    states.append(state[row:row + 1])
+                    states.append(state)
                     conv_destinations.append(layer.conv_states)
-                    histories.append(history[row:row + 1])
+                    histories.append(history)
                     layer.has_previous_state = True
             torch._foreach_copy_(state_destinations, states)
             torch._foreach_copy_(conv_destinations, histories)
