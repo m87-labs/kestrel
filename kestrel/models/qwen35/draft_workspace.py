@@ -157,9 +157,11 @@ class DFlashDraftGraphSession:
     def _forward(self, hidden, targets, positions, mapping, used):
         context = self.model.hidden_norm(self.model.fc(targets))
         cos, sin = self.model.rotary_emb(hidden, positions[..., None])
+        query_rotary = (cos[:, -hidden.shape[1]:], sin[:, -hidden.shape[1]:])
+        key_rotary = (cos, sin)
         for layer, workspace in zip(self.model.layers, self.workspaces):
             hidden = hidden + layer.self_attn.forward_stable(
-                layer.input_layernorm(hidden), context, cos, sin, workspace, mapping, used)
+                layer.input_layernorm(hidden), context, query_rotary, key_rotary, workspace, mapping, used)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
         return (self.model.norm(hidden),)
 

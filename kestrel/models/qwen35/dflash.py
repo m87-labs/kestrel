@@ -10,7 +10,7 @@ from torch import nn
 
 from kestrel.ops.attention import dense_attention
 from kestrel.ops.rotary import (
-    MultidimensionalRotaryEmbedding, apply_rotary, default_inv_freq,
+    MultidimensionalRotaryEmbedding, default_inv_freq,
 )
 from kestrel_kernels import get_runtime
 
@@ -138,15 +138,18 @@ class _Attention(nn.Module):
         self.q_norm = _Norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = _Norm(self.head_dim, config.rms_norm_eps)
 
-    def forward(self, hidden, context, cos, sin, *, cache=None, past_context=0,
+    def forward(self, hidden, context, query_rotary, key_rotary, *, cache=None, past_context=0,
                 cache_capacity=0):
         batch, rows, _ = hidden.shape
         joined = torch.cat((context, hidden), dim=1)
-        q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)).transpose(1, 2)
+        q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim))
+        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim))
         v = self.v_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim).transpose(1, 2)
-        q = apply_rotary(q, cos[:, -rows:], sin[:, -rows:])
-        k = apply_rotary(k, cos, sin)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
+        # Tried FP32-product rotary: C1 serving 0.679 -> 0.852s from worse
+        # draft acceptance; retain the checkpoint's BF16 intermediate products.
+        q, _ = get_runtime().rotary.text_mrope_apply(q, q[:, :0], *query_rotary)
+        k, _ = get_runtime().rotary.text_mrope_apply(k, k[:, :0], *key_rotary)
         if cache is not None:
             k, v = cache.append(k, v, past_context, cache_capacity)
         output = dense_attention(
@@ -156,22 +159,19 @@ class _Attention(nn.Module):
         )
         return self.o_proj(output.reshape(batch, rows, -1))
 
-    def forward_packed(self, hidden, contexts, cos, sin, caches, layer_index,
+    def forward_packed(self, hidden, contexts, query_rotary, key_rotary, caches, layer_index,
                        query_lengths, cu_q, cu_k):
         query_pieces = hidden.split(query_lengths, dim=1)
         joined_lengths = tuple(context.shape[1] + query.shape[1]
                                for context, query in zip(contexts, query_pieces))
         joined = torch.cat([torch.cat((context, query), dim=1)
                             for context, query in zip(contexts, query_pieces)], dim=1)
-        q = self.q_norm(self.q_proj(hidden).reshape(1, hidden.shape[1], -1, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(joined).reshape(1, joined.shape[1], -1, self.head_dim)).transpose(1, 2)
+        q = self.q_norm(self.q_proj(hidden).reshape(1, hidden.shape[1], -1, self.head_dim))
+        k = self.k_norm(self.k_proj(joined).reshape(1, joined.shape[1], -1, self.head_dim))
         v = self.v_proj(joined).reshape(1, joined.shape[1], -1, self.head_dim).transpose(1, 2)
-        q_cos = torch.cat([part[:, -length:] for part, length in
-                           zip(cos.split(joined_lengths, dim=1), query_lengths)], dim=1)
-        q_sin = torch.cat([part[:, -length:] for part, length in
-                           zip(sin.split(joined_lengths, dim=1), query_lengths)], dim=1)
-        q = apply_rotary(q, q_cos, q_sin)
-        k = apply_rotary(k, cos, sin)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
+        q, _ = get_runtime().rotary.text_mrope_apply(q, q[:, :0], *query_rotary)
+        k, _ = get_runtime().rotary.text_mrope_apply(k, k[:, :0], *key_rotary)
         keys, values = [], []
         for key, value, cache in zip(k.split(joined_lengths, dim=2),
                                      v.split(joined_lengths, dim=2), caches):
@@ -186,7 +186,7 @@ class _Attention(nn.Module):
             cu_seqlens=cu_q, cu_seqlens_k=cu_k)
         return self.o_proj(output.reshape(1, hidden.shape[1], -1))
 
-    def forward_stable(self, hidden, context, cos, sin, workspace,
+    def forward_stable(self, hidden, context, query_rotary, key_rotary, workspace,
                        slot_mapping, used_keys):
         """Fixed-shape layer primitive with session-owned committed KV lengths.
 
@@ -200,15 +200,17 @@ class _Attention(nn.Module):
                 or context.shape[:2] != (batch, workspace.context_rows)):
             raise ValueError("stable draft attention requires matching CUDA workspace inputs")
         joined = torch.cat((context, hidden), dim=1)
-        q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)).transpose(1, 2)
+        q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim))
+        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim))
         v = self.v_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)
-        q = apply_rotary(q, cos[:, -rows:], sin[:, -rows:])
-        k = apply_rotary(k, cos, sin).transpose(1, 2)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
+        q, _ = get_runtime().rotary.text_mrope_apply(q, q[:, :0], *query_rotary)
+        k, _ = get_runtime().rotary.text_mrope_apply(k, k[:, :0], *key_rotary)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
         keys, values = workspace.write(k.reshape(-1, k.shape[2], self.head_dim),
                                        v.reshape(-1, v.shape[2], self.head_dim), slot_mapping)
         output, _ = get_runtime().attention.flash_attn_fwd(
-            q.transpose(1, 2), keys, values, seqused_k=used_keys,
+            q, keys, values, seqused_k=used_keys,
             softmax_scale=self.head_dim ** -0.5, causal=self.causal,
             window_size_left=None if self.window is None else self.window - 1,
             window_size_right=None if self.window is None or not self.causal else 0,
@@ -235,8 +237,8 @@ class _Layer(nn.Module):
         self.input_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, hidden, context, cos, sin, **cache_args):
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), context, cos, sin,
+    def forward(self, hidden, context, query_rotary, key_rotary, **cache_args):
+        hidden = hidden + self.self_attn(self.input_layernorm(hidden), context, query_rotary, key_rotary,
                                         **cache_args)
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
@@ -274,10 +276,12 @@ class DFlashDraftModel(nn.Module):
         context = (self.hidden_norm(self.fc(target_hidden)) if target_hidden.shape[1]
                    else noise_embedding.new_empty((*target_hidden.shape[:2], self.config.hidden_size)))
         cos, sin = self.rotary_emb(noise_embedding, position_ids[..., None])
+        rows = noise_embedding.shape[1]
+        query_rotary, key_rotary = (cos[:, -rows:], sin[:, -rows:]), (cos, sin)
         hidden = noise_embedding
         for index, layer in enumerate(self.layers):
             hidden = layer(
-                hidden, context, cos, sin,
+                hidden, context, query_rotary, key_rotary,
                 cache=None if context_cache is None else context_cache.layers[index],
                 past_context=0 if context_cache is None else context_cache.length,
                 cache_capacity=0 if context_cache is None else context_cache.capacity)
@@ -317,12 +321,18 @@ class DFlashDraftModel(nn.Module):
         contexts = context.split(context_lengths, dim=1)
         positions = torch.cat(position_ids, dim=1)
         cos, sin = self.rotary_emb(noise, positions[..., None])
+        joined_lengths = tuple(context + query for context, query in zip(context_lengths, query_lengths))
+        q_cos = torch.cat([part[:, -length:] for part, length in
+                           zip(cos.split(joined_lengths, dim=1), query_lengths)], dim=1)
+        q_sin = torch.cat([part[:, -length:] for part, length in
+                           zip(sin.split(joined_lengths, dim=1), query_lengths)], dim=1)
+        query_rotary, key_rotary = (q_cos, q_sin), (cos, sin)
         cu_q = torch.tensor([0, *accumulate(query_lengths)], device=noise.device, dtype=torch.int32)
         cu_k = torch.tensor([0, *accumulate(key_lengths)], device=noise.device, dtype=torch.int32)
         hidden = noise
         for index, layer in enumerate(self.layers):
             hidden = hidden + layer.self_attn.forward_packed(
-                layer.input_layernorm(hidden), contexts, cos, sin, context_caches,
+                layer.input_layernorm(hidden), contexts, query_rotary, key_rotary, context_caches,
                 index, query_lengths, cu_q, cu_k)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
         result = self.norm(hidden).split(query_lengths, dim=1)

@@ -135,7 +135,9 @@ def test_draft_native_attention_matches_bottom_right_mask(layer):
     cos = torch.ones(1, 10, 128, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     with torch.inference_mode():
-        actual = module(hidden, context, cos, sin)
+        query_rotary = (cos[:, -3:], sin[:, -3:])
+        key_rotary = (cos, sin)
+        actual = module(hidden, context, query_rotary, key_rotary)
         joined = torch.cat((context, hidden), dim=1)
         q = module.q_norm(module.q_proj(hidden).reshape(1, 3, 4, 128)).transpose(1, 2)
         k = module.k_norm(module.k_proj(joined).reshape(1, 10, 1, 128)).transpose(1, 2)

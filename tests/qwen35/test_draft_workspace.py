@@ -106,20 +106,27 @@ def test_stable_attention_layer_matches_eager_sessions(sliding):
     graph = FixedShapeSinglePassGraph(
         enabled=True, device=torch.device("cuda:0"), stream=None,
         run_forward=lambda h, c, cos, sin, mapping, used: (
-            layer.forward_stable(h, c, cos, sin, workspace, mapping, used),),
+            layer.forward_stable(
+                h, c,
+                (cos[:, -16:], sin[:, -16:]),
+                (cos, sin), workspace, mapping, used),),
         max_entries=1)
     try:
         for lengths in ([3, 1], [0, 16]):
             hidden = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
             context = torch.randn_like(hidden)
-            cos = torch.ones(2, 32, 128, device="cuda", dtype=torch.bfloat16)
-            sin = torch.zeros_like(cos)
+            phase = torch.randn(2, 32, 64, device="cuda")
+            phase = torch.cat((phase, phase), dim=-1)
+            cos, sin = phase.cos().bfloat16(), phase.sin().bfloat16()
             mapping, used = workspace.append_inputs([5, 7], lengths)
             with graph.launch(hidden, context, cos, sin, mapping, used) as (actual,):
                 for slot, (start, length) in enumerate(zip([5, 7], lengths)):
                     expected = layer(
                         hidden[slot:slot + 1], context[slot:slot + 1, :length],
-                        cos[slot:slot + 1, :length + 16], sin[slot:slot + 1, :length + 16],
+                        (cos[slot:slot + 1, -16:], sin[slot:slot + 1, -16:]),
+                        (
+                            torch.cat((cos[slot:slot + 1, :length], cos[slot:slot + 1, -16:]), dim=1),
+                            torch.cat((sin[slot:slot + 1, :length], sin[slot:slot + 1, -16:]), dim=1)),
                         cache=caches[slot], past_context=start, cache_capacity=64)
                     assert torch.equal(actual[slot:slot + 1], expected)
         assert len(graph._entries) == 1
