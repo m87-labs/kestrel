@@ -150,6 +150,65 @@ def test_c8_cached_row_outputs_remove_768_commit_slice_constructions(monkeypatch
             assert torch.all(sources[row].layers[index].recurrent_states == row + index * 10)
 
 
+def test_c8_commit_reads_record_geometry_once_per_layer():
+    _, branches, _ = _packed_prefixes(count=8, layers=48)
+    records = branches[0]._prefix_records
+    lengths = torch.ones(8, dtype=torch.int32)
+    outputs = _paired_outputs(records, lengths,
+        tuple(torch.full_like(record.initial_state, 42) for record in records.values()))
+    accesses = []
+
+    class ShapeProbe:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        @property
+        def shape(self):
+            accesses.append(self)
+            return self.tensor.shape
+
+        @property
+        def device(self):
+            return self.tensor.device
+
+    for record in records.values():
+        for field in ("qkv", "initial_state", "conv_input"):
+            setattr(record, field, ShapeProbe(getattr(record, field)))
+
+    @contextmanager
+    def finalize(bound_records, accepted):
+        assert bound_records is records
+        assert len(accesses) == 48 * 3
+        assert len({id(probe) for probe in accesses}) == 48 * 3
+        yield outputs
+
+    committed = Qwen35InferenceCache.commit_recurrent_prefixes(
+        branches, (1,) * 8, finalizer=finalize)
+    assert len(accesses) == 144
+    assert all(result.seq_length == 11 + row for row, result in enumerate(committed))
+
+
+@pytest.mark.parametrize("field", ("conv_states", "recurrent_states"))
+def test_late_owner_geometry_failure_precedes_allocation_and_finalization(monkeypatch, field):
+    sources, branches, _ = _packed_prefixes(count=8, layers=48)
+    records = branches[0]._prefix_records
+    layer = sources[-1].layers[-1]
+    tensor = getattr(layer, field)
+    setattr(layer, field, tensor.expand(2, *tensor.shape[1:]))
+
+    def never(*args, **kwargs):
+        raise AssertionError("all source geometry must be validated before writes")
+
+    monkeypatch.setattr(torch, "empty_like", never)
+    monkeypatch.setattr(torch, "tensor", never)
+    with pytest.raises(ValueError, match="state geometry"):
+        Qwen35InferenceCache.commit_recurrent_prefixes(branches, (1,) * 8, finalizer=never)
+    for source, branch in zip(sources, branches):
+        assert branch._prefix_source is source
+        assert branch._prefix_records is records
+        assert source.seq_length == branch._prefix_start
+
+
 @pytest.mark.parametrize("failure", ("second_layer", "recurrent_copy", "conv_copy", "cancel"))
 def test_c8_multilayer_partial_failure_never_mutates_committed_or_verified_states(monkeypatch, failure):
     sources, branches, _ = _packed_prefixes(count=8, layers=3)

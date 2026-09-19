@@ -233,6 +233,12 @@ class Qwen35InferenceCache:
         if any(source is None for source in sources) or len({id(source) for source in sources}) != len(sources):
             raise RuntimeError("packed prefix requires distinct committed sources")
         count = len(caches)
+        conv_shapes = []
+        for index in indices:
+            record = records[index]
+            if record.qkv.shape[1] != count * 16 or record.initial_state.shape[0] != count:
+                raise ValueError("packed prefix state geometry changed")
+            conv_shapes.append((1, record.conv_input.shape[1], record.module.conv_kernel_size))
         for row, (cache, source, length) in enumerate(zip(caches, sources, lengths)):
             if (cache._prefix_records is not records or cache._prefix_row != row
                     or source.seq_length != cache._prefix_start
@@ -243,14 +249,11 @@ class Qwen35InferenceCache:
             if tuple(i for i, layer in enumerate(source.layers)
                      if isinstance(layer, LinearAttentionState)) != indices:
                 raise ValueError("packed prefix recurrent layer layout changed")
-            for index in indices:
-                record, layer = records[index], source.layers[index]
-                if (record.qkv.shape[1] != count * 16
-                        or record.initial_state.shape[0] != count
-                        or not isinstance(layer, LinearAttentionState)
+            for index, conv_shape in zip(indices, conv_shapes):
+                layer = source.layers[index]
+                if (not isinstance(layer, LinearAttentionState)
                         or layer.recurrent_states.shape[0] != 1
-                        or layer.conv_states.shape != (1, record.conv_input.shape[1],
-                                                       record.module.conv_kernel_size)):
+                        or layer.conv_states.shape != conv_shape):
                     raise ValueError("packed prefix state geometry changed")
         templates = tuple(records[index].initial_state for index in indices)
         accepted = torch.tensor(lengths, device=templates[0].device, dtype=torch.int32)
