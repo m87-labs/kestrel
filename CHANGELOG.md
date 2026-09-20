@@ -4,6 +4,31 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+- Speech: the Parakeet encoder hands the work between its matrix multiplies to the
+  `conformer` kernel domain rather than running it a tensor op at a time — each residual
+  add together with the normalization that follows it, the feed-forward and gate
+  activations, and the subsampling front end's depthwise convolutions. The references are
+  the ops they replace, so a backend without kernels for them is exactly where it was.
+- Speech: the encoder projects the relative-position table for all 24 blocks in one matrix
+  multiply instead of one per block. It does not depend on the activations, and it is 8.6 %
+  of the encoder's projection work at a 24x wider output.
+- Speech: on the CPU, how many cores the model uses is no longer a number anyone picks. The
+  kernels size their pool to the physical cores of the largest shared last-level-cache group
+  inside the process's affinity mask, capped at eight, and pin their workers there; the
+  runtime then confines the process to the same group, because the thread that submits a
+  region works in it. Sixteen cores spanning two CCDs of an EPYC 9575F are *slower* than
+  eight on one (86x against 113x real time), and an unpinned process on that machine goes
+  from 38x to 101x. For throughput on a many-core socket, run one process per cache domain.
+  `cpu_threads` remains the explicit override and suppresses the confinement.
+- Speech: the CPU intra-op thread count no longer depends on the weight form, because there
+  is only one. Set `OMP_WAIT_POLICY=passive` in a CPU deployment's environment: with the
+  encoder's work off the tensor library, its idle OpenMP workers otherwise spin on cores the
+  kernels' pool wants, which is worth 2.6x at four pinned cores.
+- Speech: taken together, the 50-utterance dev-clean benchmark on the CPU int8 path runs at
+  90 / 113 / 86x real time on 4 / 8 / 16 pinned cores of an EPYC 9575F (was 78 / 79 / 65x),
+  101x on that machine with no pinning at all (was 38x), and 38.0x on an M2 MacBook Air
+  (was 28.5x), transcripts unchanged.
+
 ## 0.7.2 — 2026-09-13
 
 - Updated to `kestrel-kernels` 0.6.2 and matching CUDA bundle companions.

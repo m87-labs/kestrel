@@ -24,8 +24,9 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from kestrel.config import cpu_default_dtype
+from kestrel.config import NATIVE_GEMM_THREAD_CAP, cpu_default_dtype, default_cpu_threads
 from kestrel.models.parakeet_tdt.features import parakeet_features
+from kestrel.models.parakeet_tdt.runtime import confine_to_cache_domain
 from kestrel.models.parakeet_tdt.weights import MODEL_ID, load_parakeet_tdt
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -42,13 +43,31 @@ def main() -> None:
     ap.add_argument("--export-dir", default=None, help="thrush export with HF names (ternary)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="auto", choices=[*DTYPES, "auto"])
-    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=0, help="0 applies the shipped CPU thread policy")
+    ap.add_argument(
+        "--isa",
+        default=None,
+        help="run the CPU kernels on a named instruction-set path instead of the widest this machine has "
+        "(the output is identical at every one); pass 'name,conformer-name' to pick both",
+    )
     ap.add_argument("--bench-dir", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.isa:
+        from kestrel_kernels.cpu import conformer as cpu_conformer
+        from kestrel_kernels.ternary import set_gemm_isa
+
+        gemm_isa, _, conformer_isa = args.isa.partition(",")
+        set_gemm_isa(gemm_isa or None)
+        cpu_conformer.set_isa(conformer_isa or None)
+    device = torch.device(args.device)
     if args.threads:
         torch.set_num_threads(args.threads)
-    device = torch.device(args.device)
+    elif device.type == "cpu":
+        # No --threads is the shipped policy: the kernels size and place their own pool, this process is
+        # confined to the cache domain they chose, and torch keeps the small cap beside them.
+        confine_to_cache_domain()
+        torch.set_num_threads(default_cpu_threads(NATIVE_GEMM_THREAD_CAP))
     if args.dtype == "auto":  # the runtime's policy: bf16 on CUDA / native-bf16 CPUs, fp16 on MPS, fp32 elsewhere
         dtype = {"cuda": torch.bfloat16, "mps": torch.float16}.get(device.type) or cpu_default_dtype()
         args.dtype = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}[dtype]

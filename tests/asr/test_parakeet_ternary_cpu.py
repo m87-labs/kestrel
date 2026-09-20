@@ -111,14 +111,24 @@ def build_tiny_ternary_export(root: Path, *, seed: int = 0) -> Path:
         reference = ParakeetTdt(config)
 
     # Every encoder linear is quantized. The export keeps the attention projections separate under their HF
-    # names, the way thrush writes them; ``ternarize`` fuses them back into the model's qkv_proj.
+    # names, the way thrush writes them; ``ternarize`` fuses them back into the model's qkv_proj, and the
+    # blocks' relative-position projections into the encoder's single one.
     hidden = config.encoder.hidden_size
+    layers = config.encoder.num_hidden_layers
     quantized: list[dict[str, Any]] = []
     fused: set[str] = set()
     for name, module in reference.named_modules():
-        if not name.startswith("encoder.layers.") or not isinstance(module, torch.nn.Linear):
+        if not isinstance(module, torch.nn.Linear):
             continue
-        if name.endswith("qkv_proj"):
+        if name == "encoder.relative_k_proj":
+            fused.add(name)
+            shapes = [
+                (f"encoder.layers.{index}.self_attn.relative_k_proj", hidden, hidden)
+                for index in range(layers)
+            ]
+        elif not name.startswith("encoder.layers."):
+            continue
+        elif name.endswith("qkv_proj"):
             fused.add(name)
             shapes = [(f"{name[: -len('qkv_proj')]}{attr}", hidden, hidden) for attr in ("q_proj", "k_proj", "v_proj")]
         else:
@@ -192,14 +202,12 @@ def test_unrestricted_models_keep_the_cuda_default() -> None:
     assert resolve_model_device("an-unregistered-model", None) == "cuda"
 
 
-def test_cpu_thread_policy(monkeypatch) -> None:
-    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+def test_cpu_thread_policy() -> None:
+    """The counts come from the machine and the caps, and from nowhere else -- there is no environment
+    variable that changes them; ``RuntimeConfig.cpu_threads`` is the way to name one."""
     assert 1 <= default_cpu_threads() <= 8
     assert 1 <= default_cpu_threads(NATIVE_GEMM_THREAD_CAP) <= NATIVE_GEMM_THREAD_CAP
-    # An explicit environment knob is a deliberate choice, cap or no cap.
-    monkeypatch.setenv("OMP_NUM_THREADS", "11")
-    assert default_cpu_threads() == 11
-    assert default_cpu_threads(NATIVE_GEMM_THREAD_CAP) == 11
+    assert default_cpu_threads(1) == 1
     with pytest.raises(ValueError):
         RuntimeConfig(
             model=TERNARY_MODEL_ID,
@@ -325,3 +333,23 @@ def test_ternarize_fuses_the_exports_separate_qkv(tmp_path) -> None:
     assert isinstance(attention.qkv_proj, TernaryLinear)
     assert attention.qkv_proj.out_features == 3 * config.encoder.hidden_size
     assert isinstance(attention.o_proj, TernaryLinear)
+
+
+def test_ternarize_fuses_the_blocks_relative_position_projections(tmp_path) -> None:
+    """They do not depend on the activations, so all of them are one layer on the encoder -- the export
+    still writes one per block, under the HF names."""
+    pytest.importorskip("kestrel_kernels.ternary")
+    from kestrel_kernels.ternary import TernaryLinear
+
+    root = build_tiny_ternary_export(tmp_path / "export")
+    config = ParakeetTdtConfig.from_json_file(root / "config.json")
+    names = {entry["name"] for entry in _quantized_modules(root / "ternary.json")}
+    assert "encoder.layers.0.self_attn.relative_k_proj" in names
+    assert "encoder.relative_k_proj" not in names
+    with torch.device("meta"):
+        model = ParakeetTdt(config)
+        ternarize(model, _quantized_modules(root / "ternary.json"))
+    projection = model.encoder.relative_k_proj
+    assert isinstance(projection, TernaryLinear)
+    assert projection.out_features == config.encoder.num_hidden_layers * config.encoder.hidden_size
+    assert not hasattr(model.encoder.layers[0].self_attn, "relative_k_proj")

@@ -289,12 +289,8 @@ def default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
     Physical cores (P-cores on Apple silicon), capped at ``cap``: a runtime
     whose GEMMs own a separate native thread pool passes
     :data:`NATIVE_GEMM_THREAD_CAP` so torch's workers stay out of the GEMM's
-    way. ``OMP_NUM_THREADS`` wins when the caller set it: an explicit
-    environment knob is a deliberate choice, not a default to override.
+    way. ``RuntimeConfig.cpu_threads`` is the way to name a count instead.
     """
-    env = os.environ.get("OMP_NUM_THREADS", "").strip()
-    if env.isdigit() and int(env) > 0:
-        return int(env)
     return max(1, min(_physical_cpu_count(), cap))
 
 
@@ -349,11 +345,12 @@ class RuntimeConfig:
     # that support it must bind compatible generated programs for the complete
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
-    # Intra-op threads for CPU inference. ``None`` uses
-    # :func:`default_cpu_threads` (physical cores, P-cores on Apple silicon,
-    # capped at 8 — or at :data:`NATIVE_GEMM_THREAD_CAP` for a runtime whose
-    # GEMMs own a thread pool — and overridden by ``OMP_NUM_THREADS``).
-    # Ignored off CPU.
+    # Intra-op threads for CPU inference, and the size of the kernels' own
+    # pool where a runtime has one. ``None`` uses :func:`default_cpu_threads`
+    # (physical cores, P-cores on Apple silicon, capped at 8 — or at
+    # :data:`NATIVE_GEMM_THREAD_CAP` for a runtime whose GEMMs own a pool) and
+    # lets that pool place itself on one cache domain. Naming a count here
+    # also means placement is the caller's business. Ignored off CPU.
     cpu_threads: int | None = None
     def __post_init__(self):
         if self.decode_path not in ("auto", "native", "generated"):
