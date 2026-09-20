@@ -168,7 +168,7 @@ _DEFAULT_DEVICE = "cuda"
 # thread per core for a workload that does not use them.
 _CPU_THREAD_CAP = 8
 # Cap for a model whose GEMMs run on their own native thread pool (the ternary
-# ``gemm8`` weight mode). Torch's OpenMP workers spin-wait between ops and fight
+# Parakeet student's packed int8 path). Torch's OpenMP workers spin-wait between ops and fight
 # that pool for cores: on a 16-core EPYC 9575F, torch at 4 intra-op threads ran
 # the 50-utterance set at 64x real time against 40x with torch at 16.
 NATIVE_GEMM_THREAD_CAP = 4

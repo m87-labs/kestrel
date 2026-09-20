@@ -176,18 +176,21 @@ engine = await InferenceEngine.create(
 On the CPU, `cpu_threads` sets torch's intra-op thread count; the default is
 the physical core count (performance cores on Apple silicon) capped at 8, which
 measured fastest on an 8-core Ryzen 9 7940HS — 14.4x real time at 8 threads
-against 12.6x at 6 and 12.2x at 16. Weight modes whose GEMM owns a native
-thread pool cap the default at 4 instead, so torch's workers stay out of its
-way. `OMP_NUM_THREADS` overrides the default when it is set.
+against 12.6x at 6 and 12.2x at 16. The ternary student's matrix multiplies and
+fused encoder ops run on kestrel-kernels' own pool, which sizes itself to one
+cache domain and pins its workers there, so for that model torch's default is
+capped at 4 instead and the process is confined to the same cores. Naming
+`cpu_threads` sizes both pools and suppresses the confinement; nothing reads
+`OMP_NUM_THREADS`. Set `OMP_WAIT_POLICY=passive` in a CPU deployment's
+environment, or torch's idle OpenMP workers spin on the cores the kernels want.
 
-`ternary_mode` picks how the 2-bit weights are kept: `dense` dequantizes them
-once (2 bytes per weight, and the only mode the accelerators run today), while
-`gemm8` keeps them packed and runs an int8-activation GEMM on the CPU — 0.78 GB
-resident and 62-68x real time on an EPYC 9575F, against 45x for dense bf16 at
-the same thread count. `auto`, the default, leaves the choice to
-kestrel-kernels. `dense` keeps the activations exact; `gemm8` quantizes them to
-int8 per 128-element group, so its arithmetic is not bit-exact — on the
-50-utterance dev-clean set it moved one hypothesis by a trailing period.
+The 2-bit weights are kept in the one form kestrel-kernels ships for each
+device, and there is nothing to select: packed panels with int8 activations on
+the CPU (0.78 GB resident for this model), and the packed codes read directly
+by a Metal matrix multiply on Apple silicon (220 MB of device memory against
+2495 MB dequantized). The CPU path quantizes activations to int8 per
+128-element group, so its arithmetic is not bit-exact — on the 50-utterance
+dev-clean set it moved one hypothesis by a trailing period.
 
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding

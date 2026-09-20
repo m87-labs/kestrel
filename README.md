@@ -306,8 +306,9 @@ cannot run on logs a warning and uses that same fallback rather than failing.
 
 `cpu_threads` sets torch's intra-op thread count for CPU inference. The default
 is the physical core count (performance cores on Apple silicon) capped at 8, or
-4 for weight modes whose GEMM runs on its own thread pool. `OMP_NUM_THREADS`
-overrides the default when it is set.
+4 for the ternary Parakeet student, whose matrix multiplies run on
+kestrel-kernels' own pool. Naming a count also sizes that pool; nothing reads
+`OMP_NUM_THREADS`.
 
 `decode_path="native"` disables generated decode construction on runtimes that
 provide a native decode path. Qwen 3.5/3.6 requires compatible bundled generated
