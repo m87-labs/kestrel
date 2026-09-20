@@ -13,6 +13,7 @@ from kestrel.models.asr.checkpoint import resolve_checkpoint
 from .config import ParakeetTdtConfig
 from .model import ParakeetTdt
 from .tokenizer import ParakeetTokenizer
+from .vad import VAD_HEAD_PREFIX
 
 
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
@@ -122,11 +123,17 @@ def load_parakeet_tdt(
     ):
         raise ValueError("Parakeet tokenizer and model special tokens disagree")
     manifest = root / _MANIFEST
+    state = load_file(str(root / "model.safetensors"), device="cpu")
     with torch.device("meta"):
         model = ParakeetTdt(config)
         if manifest.exists():
             ternarize(model, _quantized_modules(manifest))
-    state = load_file(str(root / "model.safetensors"), device="cpu")
+        # A capability of the weights, not a configured option: a checkpoint
+        # that ships a speech head segments its own long audio with it, and one
+        # that does not falls back to the energy detector. Checked on the fp
+        # and the ternary export alike, before the strict load.
+        if any(key.startswith(VAD_HEAD_PREFIX) for key in state):
+            model.attach_vad_head()
     model.load_state_dict(state, strict=True, assign=True)
     model.reset_nonpersistent_buffers()
     if manifest.exists():
