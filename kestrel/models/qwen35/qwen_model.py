@@ -584,6 +584,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 "Qwen prefill requires one recurrent-state index per packed sequence"
             )
         packed_recurrent_state = layer.recurrent_states
+        # Tried index_select: B200 C2/C4/C8 copies took 2.86/3.93/4.77x
+        # gather latency for [C,48,128,128] BF16 states; keeping gather.
         initial_state = (
             packed_recurrent_state.gather(
                 0, state_indices[:, None, None, None].expand(
@@ -606,6 +608,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             seq_idx = cache_params.conv_sequence_indices(
                 (mixed_qkv.shape[-1] - conv_prefix,), conv_prefix, mixed_qkv.device)
         elif conv_prefix:
+            # Tried two-input cat/reshape: B200 T16 C2/C4/C8 pack+trim took
+            # 8.18/10.81/16.28us vs 7.17/10.16/15.78us; keeping flat cat.
             chunks = mixed_qkv.split(tuple(sequence_lengths), dim=-1)
             mixed_qkv = torch.cat([
                 part.transpose(1, 2)
