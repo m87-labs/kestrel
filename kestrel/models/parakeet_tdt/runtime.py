@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from kestrel.config import NATIVE_GEMM_THREAD_CAP, default_cpu_threads
 from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
 
@@ -70,6 +71,15 @@ def _timed_segments(
     return tuple(segments)
 
 
+def _has_native_gemm_weights(model: torch.nn.Module) -> bool:
+    """Whether any layer runs its GEMM on the kernels' own thread pool: the ternary ``gemm8`` weight mode
+    (int8 activations, packed weight panels). Dense and fp weights go through torch's GEMM instead."""
+    return any(
+        getattr(getattr(module, "weight", None), "mode", None) == "gemm8"
+        for module in model.modules()
+    )
+
+
 def _encoder_frames(samples: int, factor: int) -> int:
     frames = samples // 160
     while factor > 1:
@@ -96,6 +106,9 @@ class _StreamWindow:
 class ParakeetTdtRuntime:
     execution_shape = ExecutionShape.SINGLE_PASS
     batch_capacity = 8
+    # Transducer decoding keeps its own small decoder state; there is no paged
+    # KV cache here, so the engine skips building (and importing) one.
+    needs_kv_pool = False
 
     def __init__(
         self,
@@ -125,11 +138,16 @@ class ParakeetTdtRuntime:
             else make_stream(self.device)
         )
         if model is None or tokenizer is None:
-            checkpoint = getattr(cfg, "model_path", None) or self._model_name
-            loaded = load_parakeet_tdt(checkpoint, device=self.device, dtype=self.dtype)
+            loaded = load_parakeet_tdt(
+                getattr(cfg, "model_path", None) or self._model_name,
+                device=self.device,
+                dtype=self.dtype,
+                ternary_mode=getattr(cfg, "ternary_mode", "auto"),
+            )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        self.cpu_threads = self._set_cpu_threads(cfg) if self.device.type == "cpu" else None
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -176,6 +194,25 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
         )
+
+    def _set_cpu_threads(self, cfg: Any) -> int:
+        """Apply torch's intra-op thread count for this model's weight mode; returns the count in force.
+
+        Dense weights go through torch's own GEMM and want every physical core; the ternary ``gemm8`` mode
+        runs its int8 GEMM on a separate native pool, and torch's spinning OpenMP workers only steal cores
+        from it — so the default drops to :data:`NATIVE_GEMM_THREAD_CAP`. The mode is a property of the
+        loaded weights, so this runs after the model is built. ``torch.set_num_threads`` is process-global:
+        the last runtime to ask wins.
+        """
+        threads = getattr(cfg, "cpu_threads", None)
+        if threads is None:
+            threads = (
+                default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
+                if _has_native_gemm_weights(self.model)
+                else default_cpu_threads()
+            )
+        torch.set_num_threads(int(threads))
+        return torch.get_num_threads()
 
     @property
     def model_name(self) -> str:

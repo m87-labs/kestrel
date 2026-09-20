@@ -12,7 +12,7 @@ package's ``__init__.py`` (see ``kestrel/models/moondream/__init__.py``).
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Mapping, Optional
 
 if TYPE_CHECKING:
     from kestrel.runtime import Runtime
@@ -49,6 +49,13 @@ class ModelSpec:
     # Immutable revision for artifacts hosted by ``repo_id``. Runtimes also
     # apply it to the tokenizer when ``tokenizer_id`` names that same repo.
     revision: Optional[str] = None
+    # Device types this model can execute on, e.g. ``frozenset({"cpu", "mps"})``
+    # for a model whose kernels are CPU/Apple-silicon only. ``None`` (the
+    # default) means "no restriction": the model runs wherever the caller asks,
+    # which is what every CUDA-first model wants. When set, ``RuntimeConfig``
+    # picks the device from this set — both when the caller leaves ``device``
+    # unset and when the requested device type is not in it.
+    device_types: Optional[FrozenSet[str]] = None
     # Optional model-owned composition around ordinary capability requests.
     # This is execution-shape independent: each leaf still runs through the
     # model's normal autoregressive or single-pass lane.
