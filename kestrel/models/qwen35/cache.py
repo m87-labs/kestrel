@@ -201,6 +201,8 @@ class Qwen35InferenceCache:
                 tensors = [getattr(owner, name) for owner in owners]
                 if any(tensor is None or tensor.shape[0] != 1 for tensor in tensors):
                     raise ValueError("packed verification requires initialized single-row state")
+                # Tried batched copies reusing branch views: C8 serving 1605
+                # vs 1667 tok/s (mixed GC), also slower in low-GC samples.
                 setattr(layer, name, torch.cat(tensors, dim=0))
             packed_layers[index] = layer
             for row, branch in enumerate(branches):
