@@ -17,11 +17,12 @@ _RECORDS = ('qkv', 'a', 'b', 'conv_input', 'initial_state', 'state_indices')
 
 
 class Qwen35TargetGraph:
-    def __init__(self, runtime, text, capture_layers, block_size):
+    def __init__(self, runtime, text, capture_layers, block_size, *, finalize_stream=None):
         self._runtime = runtime
         self._text = text
         self._capture_layers = tuple(capture_layers)
         self._block_size = block_size
+        self._finalize_stream = runtime._compute_stream if finalize_stream is None else finalize_stream
         self._linear = tuple(i for i, kind in enumerate(text.config.layer_types)
                              if kind == 'linear_attention')
         self._layouts = {}
@@ -165,7 +166,7 @@ class Qwen35TargetGraph:
             graph = FixedShapeSinglePassGraph(
                 enabled=all(context.supports_graph_capture for context in contexts),
                 device=self._runtime.device,
-                stream=self._runtime._compute_stream, run_forward=forward, max_entries=1)
+                stream=self._finalize_stream, run_forward=forward, max_entries=1)
             entry = (records, graph)
             self._finalizers[key] = entry
         self._finalizers.move_to_end(key)
