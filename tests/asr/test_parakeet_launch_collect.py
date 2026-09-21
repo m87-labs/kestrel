@@ -69,6 +69,7 @@ def _runtime() -> ParakeetTdtRuntime:
         vad_head=None,
     )
     runtime.tokenizer = _Tokenizer()
+    runtime._pin_waveforms = False
     decoder = _Decoder()
     runtime._batch_decoder = decoder
 
