@@ -680,17 +680,17 @@ wheels = [
 
 [[package]]
 name = "kestrel-mps-torch-ext"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "packaging" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/45/b2d1c72b8e56f02b8eb38a519361a32365c82f065030649fcecc08ca1ad3/kestrel_mps_torch_ext-0.1.1-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:6c99d03330472a649511b97fef9862307117208ffd375e3c826be2be93764c6b", size = 210347, upload-time = "2026-06-06T09:47:08.34Z" },
-    { url = "https://files.pythonhosted.org/packages/dc/d2/7064adb6e1f33307f875b15f7c6fe974a391d7644de40018da648c4c38c1/kestrel_mps_torch_ext-0.1.1-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:373946adcd489da9ea1f5d00ba433e7f582a5e8c887b92ea42078c40f4a2f542", size = 215681, upload-time = "2026-06-06T09:47:09.997Z" },
-    { url = "https://files.pythonhosted.org/packages/da/7d/ab54edfa1d13cef6a7fe516581e9e00b8ca76b7496c562f9ab375e14f045/kestrel_mps_torch_ext-0.1.1-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:1788454f8bee7144d005aac116ef2482ee017ab5ecc1dd725a1935cb27c6c4c6", size = 217452, upload-time = "2026-06-06T09:47:11.558Z" },
-    { url = "https://files.pythonhosted.org/packages/75/24/5abc7c34778b9e85eaa2650d8b09c595cab9e43f56d60ca427c66a6d8dfe/kestrel_mps_torch_ext-0.1.1-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:5af9ab20eb59d2f501c77e82f2756630dcaa626a29a43bf48015dadd37d43bdb", size = 217660, upload-time = "2026-06-06T09:47:13.226Z" },
-    { url = "https://files.pythonhosted.org/packages/f7/d1/19dfd608caa20b314cacb14089b28ad9a0a28f9cd8e503e515b51a836a2b/kestrel_mps_torch_ext-0.1.1-cp314-cp314-macosx_13_0_arm64.whl", hash = "sha256:f3b1468c5b2113671620183a137f930ab77f1d87dc89f50350179a5d75995b7c", size = 217829, upload-time = "2026-06-06T09:47:14.91Z" },
+    { url = "https://files.pythonhosted.org/packages/36/78/20a593ca0e17d54ba3eddcfcf17021390142db2935d6039d0bfd0c23436f/kestrel_mps_torch_ext-0.1.2-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:4f0ea9c82fa68e7aba7c616cad2d1bb18a41c0adebe1c1a50e8abbb8f3321b07", size = 315800, upload-time = "2026-09-18T11:22:52.002Z" },
+    { url = "https://files.pythonhosted.org/packages/da/f0/ed81182ce3cf4566ae78fa7f5d43d88b72641fbdf08efc3f7fca946ed583/kestrel_mps_torch_ext-0.1.2-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:367cc1988b9244f4574c90175e669552e640aab6e11dafc5706e49667153a32c", size = 324085, upload-time = "2026-09-18T11:22:53.61Z" },
+    { url = "https://files.pythonhosted.org/packages/74/05/869fb8240b4c4bdc9d61347d53ae25196e0effbdb1536a0d9368f5dfa381/kestrel_mps_torch_ext-0.1.2-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:2c7bd937239827dfa1e7fde2980851f308608dbc86a51970bf92cd3515fc9dae", size = 326590, upload-time = "2026-09-18T11:22:54.874Z" },
+    { url = "https://files.pythonhosted.org/packages/28/0e/a602c90deb6b88504aafdf14571e576f8d2d3be125c3f6dc8b046d6d1154/kestrel_mps_torch_ext-0.1.2-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:10edab7280b63fa64595510e117b8f1398f014d474a7cf16c1fb03666affdf7b", size = 326889, upload-time = "2026-09-18T11:22:56.234Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/49/819f1518ac97bbfd60df90ffaa6f5ec97f6e7b2422277c4861b0fc8a9e52/kestrel_mps_torch_ext-0.1.2-cp314-cp314-macosx_13_0_arm64.whl", hash = "sha256:d548e18aa9edc5bdb6da7ec6c114443df1d0f04f3992f8c364d70a6c4bebf94f", size = 327100, upload-time = "2026-09-18T11:22:57.695Z" },
 ]
 
 [[package]]
