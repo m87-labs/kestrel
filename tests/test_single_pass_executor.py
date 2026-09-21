@@ -193,6 +193,8 @@ def test_forward_stays_in_flight_until_event_fires(monkeypatch) -> None:
 class _PipelinedDriver(_StubDriver):
     """Driver that splits its forward: launch enqueues, collect reads back."""
 
+    pipelined = True
+
     def __init__(self) -> None:
         super().__init__()
         self.collected: list[Any] = []

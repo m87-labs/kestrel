@@ -10,9 +10,10 @@ It presents the same uniform :class:`Executor` face the kernel folds over
 the event loop.
 
 One forward is in flight by default; each forward may contain up to the
-runtime's declared ``batch_capacity``. A runtime that splits its forward into
-``launch`` (enqueue) and ``collect`` (read back) gets two, so the next cohort's
-device work is already queued while the current one's is still running.
+runtime's declared ``batch_capacity``. A runtime that declares ``pipelined``
+splits its forward into ``launch`` (enqueue) and ``collect`` (read back) and
+gets two, so the next cohort's device work is already queued while the current
+one's is still running.
 """
 
 from __future__ import annotations
@@ -104,9 +105,9 @@ def _cancelled_completion(request: _SinglePassRequest) -> Completion:
 class _InFlight:
     """A forward whose kernels are enqueued and whose result is pending.
 
-    ``outputs`` holds the results of a plain ``forward``; ``batch`` holds the
-    runtime handle of a ``launch`` still owing its ``collect``. Exactly one of
-    the two is set.
+    ``outputs`` holds the results of a plain ``forward``; when ``pipelined``,
+    ``batch`` holds the runtime handle of a ``launch`` still owing its
+    ``collect`` and ``outputs`` is empty until then.
 
     ``error`` is set instead when the launch call raised; it surfaces as an
     error completion on the next collect, keeping launch failures on the same
@@ -118,6 +119,7 @@ class _InFlight:
     done_event: Any  # torch.cuda.Event | NoopEvent | None
     error: Optional[BaseException] = None
     batch: Any = None
+    pipelined: bool = False
 
 
 class SinglePassExecutor:
@@ -139,9 +141,11 @@ class SinglePassExecutor:
         self._runtime = runtime
         self._device = runtime.device
         self._stream = compute_stream
-        self._pipelined = callable(getattr(runtime, "launch", None)) and callable(
-            getattr(runtime, "collect", None)
-        )
+        # A runtime that declares ``pipelined`` offers ``launch``/``collect``
+        # and returns from ``launch`` once its device work is enqueued, without
+        # waiting on it. Everything else declares ``forward`` alone, which is
+        # still a complete implementation.
+        self._pipelined = bool(getattr(runtime, "pipelined", False))
         if max_in_flight is None:
             max_in_flight = self.PIPELINED_IN_FLIGHT if self._pipelined else 1
         if max_in_flight < 1:
@@ -300,6 +304,7 @@ class SinglePassExecutor:
                 done_event=done_event,
                 error=None,
                 batch=batch,
+                pipelined=self._pipelined,
             )
         )
         return True
@@ -332,7 +337,7 @@ class SinglePassExecutor:
             self._in_flight.pop(0)
             error = f.error
             outputs = f.outputs
-            if error is None and f.batch is not None:
+            if error is None and f.pipelined:
                 try:
                     with stream_context(self._stream):
                         outputs = self._checked(

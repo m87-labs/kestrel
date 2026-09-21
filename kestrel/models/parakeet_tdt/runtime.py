@@ -321,6 +321,12 @@ class ParakeetTdtRuntime:
     # Transducer decoding keeps its own small decoder state; there is no paged
     # KV cache here, so the engine skips building (and importing) one.
     needs_kv_pool = False
+    # ``forward`` also splits into ``launch`` (enqueue) and ``collect`` (read
+    # back), so the single-pass executor can keep a second cohort in flight.
+    # ``launch`` returns as soon as its device work is enqueued whenever the
+    # cohort allows it; ``collect`` turns its handle into the results
+    # ``forward`` would have returned.
+    pipelined = True
 
     def __init__(
         self,
