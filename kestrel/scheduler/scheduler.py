@@ -27,6 +27,7 @@ from kestrel.runtime import (
     Token,
 )
 from kestrel.runtime.sampling import SamplingHooks
+from kestrel.runtime.spec import SpecAdmission
 from kestrel.skills import (
     SkillRegistry,
     SkillState,
@@ -753,7 +754,9 @@ class GenerationScheduler:
         # rows retire. The non-spec path can instead keep one extra prefilled
         # request resident because its page-table rows are allocated on demand.
         max_running = self.runtime.max_batch_size
-        while decoder.free_slots > 0 and len(self.running) < max_running:
+        pending = []
+        pending_tokens = 0
+        while len(pending) < decoder.free_slots and len(self.running) + len(pending) < max_running:
             request = next(
                 (
                     r
@@ -764,6 +767,10 @@ class GenerationScheduler:
                 None,
             )
             if request is None:
+                break
+            prompt_cost = len(request.prefill_tokens) + request.image_length
+            # Bound packed work without delaying a long prompt for batching.
+            if pending and pending_tokens + prompt_cost > 512:
                 break
             lifecycle = request.lifecycle
             # Zero-token requests were already finalized in the pre-pass above
@@ -968,49 +975,45 @@ class GenerationScheduler:
                     == request.generated_prefix_length
                 ):
                     suppress_next_token_ids = request.suppress_next_token_ids
-                with torch.inference_mode():
-                    # Pass the request's image AND its multi-crop tiles
-                    # (``image_crops``) -- exactly what the non-spec
-                    # ``prepare_sequence`` forwards (it hands both to the vision
-                    # encoder, which reads ``image_crops`` as the ``overlap`` so
-                    # the high-res crop tiles are encoded, not just the
-                    # global/thumbnail image). Forwarding ``image`` alone would
-                    # give a multi-crop request an incomplete image prefill on
-                    # the spec path and diverge from the non-spec output. Skill
-                    # mask, one-shot suppression, and sampling params
-                    # (temperature/top_p) likewise go through ``admit`` so image
-                    # + constrained + non-greedy requests run on the spec path
-                    # with no fallback. ``admit`` returns ``(first_token_id,
-                    # first_logprob)``: the real selected-token logprob for a
-                    # ``return_logprobs`` request, or ``None`` otherwise.
-                    first_token_id, first_logprob = decoder.admit(
-                        state,
-                        prompt_tokens,
-                        image=request.image,
-                        image_crops=request.image_crops,
-                        allowed_token_ids=allowed_token_ids,
-                        suppressed_token_ids=suppressed_token_ids,
-                        suppress_next_token_ids=suppress_next_token_ids,
-                        temperature=float(request.temperature),
-                        top_p=float(request.top_p),
-                    )
+                admission = SpecAdmission(state, prompt_tokens, dict(
+                    image=request.image,
+                    image_crops=request.image_crops,
+                    allowed_token_ids=allowed_token_ids,
+                    suppressed_token_ids=suppressed_token_ids,
+                    suppress_next_token_ids=suppress_next_token_ids,
+                    temperature=float(request.temperature),
+                    top_p=float(request.top_p),
+                ))
+                pending.append((request, state, admission))
+                pending_tokens += prompt_cost
             except Exception as exc:
-                # ``admit`` prefills into a free spec pool row and assigns
-                # ``state.batch_idx`` before the prefill's image/CUDA work
-                # runs, so a mid-admit failure can leave the row reserved
-                # (and ``batch_idx`` set) even though no token was staged.
-                # This request has already left ``waiting`` and
-                # ``lifecycle.sequence_state`` is not set yet, so no later
-                # finish/zombie path will ever call ``decoder.retire`` for
-                # it -- the row would leak permanently and repeated failures
-                # would drain ``decoder.free_slots`` and stall unrelated spec
-                # requests. ``_fail_admitted_spec_request`` retires the row
-                # (when ``admit`` got far enough to reserve one) and releases
-                # the LoRA slot before failing the request cleanly.
+                # Preparation already removed the request from waiting and may
+                # own an adapter slot, even though no decoder row exists yet.
                 self._fail_admitted_spec_request(request, state, exc)
                 progressed = True
                 continue
 
+        if not pending:
+            return progressed
+        try:
+            with torch.inference_mode():
+                results = self.runtime.spec.admit_many(decoder, [item[2] for item in pending])
+            if len(results) != len(pending):
+                raise RuntimeError("speculative admission result count differs from requests")
+        except Exception as error:
+            results = [error] * len(pending)
+        for (request, state, _), result in zip(pending, results, strict=True):
+            if isinstance(result, Exception):
+                self._fail_admitted_spec_request(request, state, result)
+                progressed = True
+                continue
+            lifecycle = request.lifecycle
+            try:
+                first_token_id, first_logprob = result
+            except Exception as error:
+                self._fail_admitted_spec_request(request, state, error)
+                progressed = True
+                continue
             lifecycle.sequence_state = state
             lifecycle.prefill_completed_at = time.perf_counter()
             self.runtime.active_sequences[state.batch_idx] = state

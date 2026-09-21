@@ -286,6 +286,52 @@ def test_spec_admit_stages_first_token_and_queues() -> None:
     assert r0.lifecycle.state.batch_idx in rt.active_sequences
 
 
+@pytest.mark.parametrize("lengths,groups", [
+    ([3, 2, 4], [[3, 2, 4]]),
+    ([300, 300, 2], [[300], [300, 2]]),
+    ([600, 2], [[600], [2]]),
+])
+def test_spec_admission_batches_ready_prompts_without_delaying_long_ones(lengths, groups):
+    from kestrel.runtime.spec import admit_independently
+    dec = _FakeDecoder(n_rows=len(lengths), plans={},
+                       first_tokens={row: 10 + row for row in range(len(lengths))})
+    runtime = _spec_runtime(dec)
+    observed = []
+    def batch(decoder, requests):
+        observed.append([len(request.prompt_tokens) for request in requests])
+        return admit_independently(decoder, requests)
+    runtime.spec.admit_many = batch
+    scheduler = _make_scheduler(runtime)
+    for index, length in enumerate(lengths):
+        _enqueue(scheduler, index, prompt_len=length, max_new=8)
+    for _ in groups:
+        assert scheduler._spec_admit()
+    assert observed == groups
+    assert len(scheduler.running) == len(lengths)
+
+
+@pytest.mark.parametrize("failure", ["raise", "count", "one_result"])
+def test_batch_admission_failure_retires_reserved_rows(failure):
+    from kestrel.runtime.spec import admit_independently
+    dec = _FakeDecoder(n_rows=2, plans={}, first_tokens={0: 10, 1: 11})
+    runtime = _spec_runtime(dec)
+    def batch(decoder, requests):
+        results = admit_independently(decoder, requests)
+        if failure == "raise":
+            raise RuntimeError("injected post-allocation failure")
+        if failure == "count":
+            return results[:1]
+        return [None, results[1]]
+    runtime.spec.admit_many = batch
+    scheduler = _make_scheduler(runtime)
+    for index in range(2):
+        _enqueue(scheduler, index, prompt_len=3, max_new=8)
+    assert scheduler._spec_admit()
+    assert dec.retired == ([0] if failure == "one_result" else [0, 1])
+    assert len(scheduler.running) == (1 if failure == "one_result" else 0)
+    assert len(runtime.active_sequences) == len(scheduler.running)
+
+
 def test_spec_step_variable_advance_and_state_length() -> None:
     dec = _FakeDecoder(
         n_rows=2,

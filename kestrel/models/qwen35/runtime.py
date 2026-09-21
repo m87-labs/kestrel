@@ -410,6 +410,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             decoder = Qwen35DFlashDecoder(self, self._draft_model_path)
             self.spec = SpecDecodeCaps(
                 proposer=decoder, decoder=decoder,
+                admit_many=Qwen35DFlashDecoder.admit_many,
                 capture_hidden_layers=decoder.draft.config.target_layer_ids)
             return
 
