@@ -101,6 +101,8 @@ class Qwen35InferenceCache:
         self._prefix_start = 0
         self._prefix_row = 0
         self._prefix_records: dict[int, _RecurrentPrefixRecord] = {}
+        # Graph-owned sequence-ordered snapshots, separate from writable outputs.
+        self._prefix_initial_states: dict[int, torch.Tensor] | None = None
         self._conv_sequence_layout = None
 
     def conv_sequence_indices(self, lengths: Sequence[int], prefix: int, device: torch.device) -> torch.Tensor:

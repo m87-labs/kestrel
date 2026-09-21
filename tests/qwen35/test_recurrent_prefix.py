@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -77,7 +78,8 @@ def test_packed_prefix_records_split_independent_histories():
 
 
 @pytest.mark.parametrize("state_indices", [(1, 0), (1, 1)])
-def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, state_indices):
+@pytest.mark.parametrize("snapshot", [None, "packed", "alias", "overlap"])
+def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, state_indices, snapshot):
     observed = {}
     layer = SimpleNamespace(
         conv_states=torch.tensor([[[10., 11., 12.]], [[20., 21., 22.]]]),
@@ -90,6 +92,22 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
     cache._prefix_source = object()
     cache._prefix_start = 9
     cache._prefix_records = {}
+    if snapshot is not None:
+        if snapshot == "overlap":
+            storage = torch.zeros(3, 1, 1, 1, dtype=torch.bfloat16)
+            storage[:2].copy_(layer.recurrent_states)
+            layer.recurrent_states = storage[:2]
+            initial = storage[1:]
+        elif snapshot == "alias":
+            initial = layer.recurrent_states
+        else:
+            initial = layer.recurrent_states.gather(0, torch.tensor(state_indices).view(2, 1, 1, 1))
+        cache._prefix_initial_states = {0: initial}
+
+        def reject_gather(*args, **kwargs):
+            raise AssertionError("read-only snapshot must not be copied again")
+
+        monkeypatch.setattr(torch.Tensor, "gather", reject_gather)
     def conv(**kwargs):
         observed["conv"] = kwargs["x"].clone()
         observed["conv_stride"] = kwargs["x"].stride()
@@ -117,10 +135,16 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         concatenations.append(len(values))
         return original_cat(values, *args, **kwargs)
     monkeypatch.setattr(torch, "cat", concatenate)
-    output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
-        cache_params=cache, cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
-        sequence_lengths=(2, 3), topology_token=object(),
-        gdn_state_indices=torch.tensor(state_indices), gdn_state_indices_allocator_owned=True)
+    invalid = snapshot in ("alias", "overlap")
+    with pytest.raises(ValueError, match="separate packed output storage") if invalid else nullcontext():
+        output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
+            cache_params=cache, cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+            sequence_lengths=(2, 3), topology_token=object(),
+            gdn_state_indices=torch.tensor(state_indices), gdn_state_indices_allocator_owned=True)
+    if invalid:
+        return
+    if snapshot == "packed":
+        assert observed["initial"] is initial
     assert output.shape == (1, 5, 1)
     assert concatenations[0] == 4  # Prefix/token pairs need no intermediate copies.
     assert observed["conv_stride"][1] == 1

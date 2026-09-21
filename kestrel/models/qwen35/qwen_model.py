@@ -586,12 +586,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         packed_recurrent_state = layer.recurrent_states
         # Tried index_select: B200 C2/C4/C8 copies took 2.86/3.93/4.77x
         # gather latency for [C,48,128,128] BF16 states; keeping gather.
-        initial_state = (
-            packed_recurrent_state.gather(
-                0, state_indices[:, None, None, None].expand(
-                    -1, *packed_recurrent_state.shape[1:]))
-            if has_initial_state else None
-        )
+        if cache_params._prefix_initial_states is not None:
+            initial_state = cache_params._prefix_initial_states[self.layer_idx]
+            if (not capture_prefix or not has_initial_state
+                    or initial_state.shape != (num_sequences, *expected_tail)
+                    or initial_state.dtype != packed_recurrent_state.dtype
+                    or initial_state.device != packed_recurrent_state.device
+                    or not initial_state.is_contiguous()
+                    or initial_state.data_ptr() - initial_state.storage_offset() * initial_state.element_size()
+                    == packed_recurrent_state.data_ptr()
+                    - packed_recurrent_state.storage_offset() * packed_recurrent_state.element_size()):
+                raise ValueError("prefix input snapshots require separate packed output storage")
+        else:
+            initial_state = (
+                packed_recurrent_state.gather(
+                    0, state_indices[:, None, None, None].expand(
+                        -1, *packed_recurrent_state.shape[1:]))
+                if has_initial_state else None
+            )
         if seq_idx is None:
             seq_idx = _packed_seq_idx_from_cu_seqlens(
                 cu_seqlens_q,
@@ -674,8 +686,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output = self.out_proj(core_attn_out)
         layer.has_previous_state = True
         if capture_prefix:
-            # Projection/conv outputs own their storage; initial_state is the
-            # independent copy made before writing the speculative pool.
+            # Projection/conv outputs own their storage; initial_state retains
+            # the read-only snapshot separately from the speculative output.
             cache_params._prefix_records[self.layer_idx] = _RecurrentPrefixRecord.capture(
                 self, mixed_qkv, a, b, conv_input, initial_state, state_indices, prefix_context)
         return output

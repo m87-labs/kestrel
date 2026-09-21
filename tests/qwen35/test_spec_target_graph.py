@@ -75,15 +75,18 @@ def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
 
         def __call__(self, **kwargs):
             packed = kwargs['past_key_values']
-            seen.append(tuple(value.clone() for layer in packed.layers
-                              for value in (layer.conv_states, layer.recurrent_states)))
+            initial = packed._prefix_initial_states
+            seen.append(tuple(value.clone() for index, layer in enumerate(packed.layers)
+                              for value in (layer.conv_states,
+                                  initial[index] if initial is not None else layer.recurrent_states)))
             for index, layer in enumerate(packed.layers):
+                state = initial[index] if initial is not None else layer.recurrent_states.clone()
                 packed._prefix_records[index] = SimpleNamespace(
                     qkv=torch.zeros(1, 32, 2), a=torch.zeros(1), b=torch.zeros(1),
-                    conv_input=torch.zeros(1), initial_state=layer.recurrent_states.clone(),
+                    conv_input=torch.zeros(1), initial_state=state,
                     state_indices=torch.arange(2), prefix_context=None)
                 layer.conv_states.add_(10)
-                layer.recurrent_states.add_(10)
+                layer.recurrent_states.copy_(state + 10)
             return SimpleNamespace(last_hidden_state=torch.zeros(1, 32, 2), layer_hidden_states=())
 
     graph = object.__new__(Qwen35TargetGraph)
@@ -91,8 +94,12 @@ def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
     graph._layout = lambda count, device: (cache, (16,)*count, torch.tensor([0, 16, 32]), None)
     graph._text = Text()
     metadata = [torch.zeros(1, 32, dtype=torch.long) for _ in range(7)] + [torch.arange(2)]
-    graph._forward(*metadata, *rows)
+    output = graph._forward(*metadata, *rows)
+    assert cache._prefix_initial_states is None
     assert all(torch.all(value == index) for index, value in enumerate(rows))
+    for offset, start in ((0, 2), (8, 6)):
+        torch.testing.assert_close(output[7 + offset], torch.cat(rows[start:start + 2]))
+        assert output[2 + offset].data_ptr() != output[7 + offset].data_ptr()
     graph._forward(*metadata, *(torch.cat(rows[i:i+2]) for i in range(0, 8, 2)))
     assert all(torch.equal(a, b) for a, b in zip(*seen, strict=True))
 

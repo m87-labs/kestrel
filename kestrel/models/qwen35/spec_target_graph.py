@@ -61,11 +61,17 @@ class Qwen35TargetGraph:
         cache._prefix_records = {}
         states = iter(values[len(_INPUTS):])
         row_inputs = len(values) != len(_INPUTS) + 2 * len(self._linear)
+        cache._prefix_initial_states = {} if row_inputs else None
+        if row_inputs:
+            # Direct sources are supplied in sequence order, not pool-slot order.
+            inputs['gdn_state_indices'] = torch.arange(count, device=inputs['input_ids'].device)
         for index in self._linear:
             layer = cache.layers[index]
             if row_inputs:
                 layer.conv_states = torch.cat([next(states) for _ in range(count)], dim=0)
-                layer.recurrent_states = torch.cat([next(states) for _ in range(count)], dim=0)
+                initial = torch.cat([next(states) for _ in range(count)], dim=0)
+                cache._prefix_initial_states[index] = initial
+                layer.recurrent_states = torch.empty_like(initial)
             else:
                 layer.conv_states, layer.recurrent_states = next(states), next(states)
             layer.has_previous_state = True
@@ -96,11 +102,13 @@ class Qwen35TargetGraph:
                            if isinstance(value := getattr(workspace, field.name), torch.Tensor))
             cache.layers[index].conv_states = cache.layers[index].recurrent_states = None
         cache._prefix_records = {}
+        cache._prefix_initial_states = None
         tensors.append(cu)
         return tuple(tensors)
 
     @contextmanager
     def launch(self, *, state_sources=None, **kwargs):
+        """Lease verification outputs; direct sources are in sequence order."""
         lengths = tuple(kwargs['sequence_lengths'])
         if not lengths or any(length != self._block_size for length in lengths):
             raise ValueError('verification graph requires complete speculative blocks')
