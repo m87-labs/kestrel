@@ -126,7 +126,10 @@ def test_multi_segment_cohort_finishes_inside_launch() -> None:
 
     batch = runtime.launch(
         "transcribe",
-        ({"audio": long_audio, "sample_rate": 16_000, "timestamps": "none"}, _clip(4.0)),
+        (
+            {"audio": long_audio, "sample_rate": 16_000, "timestamps": "none"},
+            _clip(4.0),
+        ),
     )
 
     assert batch.encoded is None
@@ -155,14 +158,55 @@ def test_a_batch_the_decoder_will_not_take_is_not_deferred() -> None:
 def test_a_bad_input_does_not_stop_the_cohort_from_deferring() -> None:
     runtime = _runtime()
 
-    batch = runtime.launch(
-        "transcribe", (_clip(4.0), "not a mapping", _clip(5.0))
-    )
+    batch = runtime.launch("transcribe", (_clip(4.0), "not a mapping", _clip(5.0)))
 
     assert batch.encoded is not None
     results = runtime.collect(batch)
     assert isinstance(results[1], ValueError)
     assert [results[0]["text"], results[2]["text"]] == ["part 1.", "part 2."]
+
+
+def test_two_decode_settings_in_one_cohort_are_not_deferred() -> None:
+    """Deferring hands the decoder one encoding, so it takes one setting.
+
+    Rows asking for different `max_tokens` are two groups, and a cohort that
+    is not a single group is finished in place rather than half deferred.
+    """
+    runtime = _runtime()
+
+    batch = runtime.launch(
+        "transcribe",
+        (
+            _clip(4.0) | {"settings": {"max_tokens": 16}},
+            _clip(5.0) | {"settings": {"max_tokens": 32}},
+        ),
+    )
+
+    assert batch.encoded is None
+    assert [result["text"] for result in runtime.collect(batch)] == [
+        "part 1.",
+        "part 2.",
+    ]
+
+
+def test_a_clip_that_may_decode_past_the_cap_is_not_deferred() -> None:
+    """`launch` and the segmenter read the same predicate.
+
+    A clip of exactly 30 s at 8 kHz can resample to a few samples more than the
+    cap, which the segmenter would then cut in two -- so `launch` must not
+    promise the decoder one segment per row for it.
+    """
+    runtime = _runtime()
+    at_the_cap = {
+        "audio": _speech(30.0)[::2].copy(),  # 240,000 samples = 30.0 s at 8 kHz
+        "sample_rate": 8_000,
+        "timestamps": "none",
+    }
+
+    batch = runtime.launch("transcribe", (at_the_cap, _clip(4.0)))
+
+    assert batch.encoded is None
+    assert runtime.collect(batch)[1]["text"].startswith("part ")
 
 
 def test_rejects_a_task_it_does_not_serve() -> None:
