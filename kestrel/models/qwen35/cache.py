@@ -96,6 +96,7 @@ class Qwen35InferenceCache:
             layers.append(layer)
         self.layers = tuple(layers)
         self.seq_length = 0
+        self._borrowed_recurrent_state = False
         self._prefix_source: Qwen35InferenceCache | None = None
         self._prefix_start = 0
         self._prefix_row = 0
@@ -145,6 +146,7 @@ class Qwen35InferenceCache:
         writes the shared suffix; this is not concurrent branch storage.
         """
         branch = copy(self)
+        branch._borrowed_recurrent_state = False
         if capture_prefix and (self._prefix_source is not None or self.seq_length <= 0):
             raise ValueError("prefix capture requires a committed nonempty cache")
         branch._prefix_source = self if capture_prefix else None
@@ -337,7 +339,8 @@ class Qwen35InferenceCache:
         if type(length) is not int or not 1 <= length <= total:
             raise ValueError("prefix length must be within the verified token range")
         if length == total:
-            result = self
+            # Graph outputs are valid only while the verification lease is held.
+            result = self.fork_recurrent_state() if self._borrowed_recurrent_state else self
         else:
             from kestrel_kernels import get_runtime
 

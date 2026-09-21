@@ -236,10 +236,16 @@ def captured():
     return source, branch
 
 
-def test_partial_commit_isolated_and_consumes_records():
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_partial_commit_isolated_and_consumes_records(borrowed):
     source, branch = captured()
+    branch._borrowed_recurrent_state = borrowed
     result = branch.commit_recurrent_prefix(7)
     assert result.seq_length == 38
+    assert not result._borrowed_recurrent_state
+    for layer in branch.layers:
+        layer.recurrent_states.zero_()
+        layer.conv_states.zero_()
     for old, new in zip(source.layers, result.layers):
         assert torch.all(old.recurrent_states == 1)
         assert torch.all(old.conv_states == 1)

@@ -325,7 +325,8 @@ def test_dflash_config_accepts_concurrent_requests(concurrency):
     assert config.max_batch_size == concurrency
 
 
-def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(monkeypatch):
+@pytest.mark.parametrize("leased", [False, True])
+def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(monkeypatch, leased):
     from dataclasses import dataclass, replace
     import kestrel.models.qwen35.spec_decoder as module
     from kestrel.models.qwen35.cache import Qwen35InferenceCache
@@ -369,8 +370,13 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         assert kwargs["slot_mapping"].tolist() == [expected_slots]
         cache = kwargs["past_key_values"]
         assert cache.layers[0].recurrent_states.flatten().tolist() == [3, 1]
-        cache.layers[0].recurrent_states.add_(100)
-        cache.layers[0].conv_states.add_(100)
+        if leased:
+            cache.layers[0].recurrent_states = cache.layers[0].recurrent_states + 100
+            cache.layers[0].conv_states = cache.layers[0].conv_states + 100
+            cache._borrowed_recurrent_state = True
+        else:
+            cache.layers[0].recurrent_states.add_(100)
+            cache.layers[0].conv_states.add_(100)
         cache._prefix_records[0] = Record(kwargs["gdn_state_indices"])
         hidden = kwargs["input_ids"][..., None].float()
         return SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=(hidden,))
@@ -387,6 +393,7 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         assert branch.seq_length == session.cache.seq_length + count
         assert branch._prefix_records[0].state_indices.tolist() == [0]
         assert branch.layers[0].recurrent_states.shape[0] == 1
+        assert branch._borrowed_recurrent_state is leased
         assert branch.layers[0].recurrent_states[0].item() == slot + 100
         assert session.cache.layers[0].recurrent_states[0].item() == slot
         assert torch.all(session.cache.layers[0].conv_states == session.cache.seq_length)
