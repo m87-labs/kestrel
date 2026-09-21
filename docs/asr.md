@@ -159,7 +159,9 @@ revised without changing committed transcription quality.
 ### Running on the CPU or on Apple silicon
 
 `moondream/parakeet-redux`, the ternary Parakeet, also runs on the CPU and on
-Apple silicon; pass `device="cpu"` or `device="mps"`.
+Apple silicon; pass `device="cpu"` or `device="mps"`. On CUDA the packed codes
+are expanded to dense weights at load, so it runs at the fp model's speed from
+the 178 MB download.
 
 ```python
 engine = await InferenceEngine.create(

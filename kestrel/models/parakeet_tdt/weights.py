@@ -149,8 +149,9 @@ def load_parakeet_tdt(
     """Load the pinned fp checkpoint, or the ternary student when the checkpoint carries a ``ternary.json``.
 
     The ternary variant loads the packed export with ``strict=True`` and then materializes the resident
-    weight form for the device it is on -- packed on both shipped targets, and there is nothing to select;
-    see ``kestrel_kernels.ternary``. Activations stay in ``dtype``; nothing else is quantized at run time.
+    weight form for the device it is on: the packed codes on the CPU and on Metal, the dense weight in
+    ``dtype`` on CUDA (the small download at the fp model's speed). There is nothing to select; see
+    ``kestrel_kernels.ternary``. Activations stay in ``dtype``; nothing else is quantized at run time.
     """
     from safetensors.torch import load_file
 
@@ -169,8 +170,6 @@ def load_parakeet_tdt(
     ):
         raise ValueError("Parakeet tokenizer and model special tokens disagree")
     manifest = root / _MANIFEST
-    if manifest.exists() and torch.device(device).type not in {"cpu", "mps"}:
-        raise ValueError("ternary Parakeet checkpoints support CPU and MPS only")
     state = load_file(str(root / "model.safetensors"), device="cpu")
     with torch.device("meta"):
         model = ParakeetTdt(config)

@@ -188,10 +188,18 @@ def test_cpu_dtype_uses_bf16_only_when_the_cpu_supports_it(monkeypatch) -> None:
     assert runtime._cpu_dtype(torch.bfloat16) is torch.bfloat16
 
 
-def test_ternary_checkpoint_rejects_cuda_at_the_loader_boundary(tmp_path) -> None:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_ternary_checkpoint_loads_dense_on_cuda(tmp_path) -> None:
+    """CUDA has no packed kernel; the codes become the dense weight at load and the model runs as fp would."""
+    from kestrel_kernels.ternary import TernaryLinear
+
     root = build_tiny_ternary_export(tmp_path / "export")
-    with pytest.raises(ValueError, match="support CPU and MPS only"):
-        load_parakeet_tdt(root, device="cuda")
+    loaded = load_parakeet_tdt(root, device="cuda", dtype=torch.bfloat16)
+    layers = [m for m in loaded.model.modules() if isinstance(m, TernaryLinear)]
+    assert layers
+    assert all(layer.weight.mode == "dense" for layer in layers)
+    assert all(layer.weight.device.type == "cuda" for layer in layers)
+    assert all(layer.weight.dequantized(torch.bfloat16).dtype is torch.bfloat16 for layer in layers)
 
 
 def test_cpu_thread_policy() -> None:
