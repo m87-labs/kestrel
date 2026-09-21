@@ -172,8 +172,8 @@ class Qwen35InferenceCache:
         return branch
 
     @staticmethod
-    def fork_packed_recurrent_state(caches):
-        """Copy independent committed rows once into packed verification storage."""
+    def fork_packed_recurrent_state(caches, *, materialize=True):
+        """Fork packed verification; metadata-only forks require graph staging."""
         if not caches or len({id(cache) for cache in caches}) != len(caches):
             raise ValueError("packed verification requires distinct caches")
         if any(cache._prefix_source is not None or cache.seq_length <= 0 for cache in caches):
@@ -205,12 +205,14 @@ class Qwen35InferenceCache:
                     raise ValueError("packed verification requires initialized single-row state")
                 # Tried batched copies reusing branch views: C8 serving 1605
                 # vs 1667 tok/s (mixed GC), also slower in low-GC samples.
-                setattr(layer, name, torch.cat(tensors, dim=0))
+                if materialize:
+                    setattr(layer, name, torch.cat(tensors, dim=0))
             packed_layers[index] = layer
             for row, branch in enumerate(branches):
                 owned = copy(owners[row])
-                owned.conv_states = layer.conv_states[row:row + 1]
-                owned.recurrent_states = layer.recurrent_states[row:row + 1]
+                if materialize:
+                    owned.conv_states = layer.conv_states[row:row + 1]
+                    owned.recurrent_states = layer.recurrent_states[row:row + 1]
                 branch.layers[index] = owned
         packed.layers = tuple(packed_layers)
         for branch in branches:

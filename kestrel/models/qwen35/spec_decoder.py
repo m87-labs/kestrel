@@ -64,10 +64,12 @@ class Qwen35DFlashDecoder:
             self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
                 target.num_hidden_layers)
 
-    def _verify(self, leases, **kwargs):
+    def _verify(self, leases, *, state_sources=None, **kwargs):
         if leases is None or self._target_graph is None:
+            if state_sources is not None:
+                raise RuntimeError("unmaterialized recurrent rows require a verification graph")
             return self.text(**kwargs)
-        return leases.enter_context(self._target_graph.launch(**kwargs))
+        return leases.enter_context(self._target_graph.launch(state_sources=state_sources, **kwargs))
 
     def shutdown(self):
         self._closed = True
@@ -317,8 +319,10 @@ class Qwen35DFlashDecoder:
         self._wait_for_commit()
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
+        sources = [session.cache for session in sessions]
+        graph_staging = leases is not None and self._target_graph is not None
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
-            [session.cache for session in sessions])
+            sources, materialize=not graph_staging)
         ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
         positions = torch.cat([
             torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
@@ -333,7 +337,7 @@ class Qwen35DFlashDecoder:
             for row, position in enumerate(position_rows)])[None]
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=lengths, device=device)
-        output = self._verify(leases,
+        output = self._verify(leases, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
             paged_kv_seqlens_k=torch.tensor([
