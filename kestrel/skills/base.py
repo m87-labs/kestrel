@@ -329,6 +329,41 @@ class SkillState:
 
         return None
 
+    def pop_stream_output(
+        self,
+        runtime: "AutoregressiveRuntime",
+    ) -> Optional[Mapping[str, object]]:
+        """Return one append-only streaming update.
+
+        Text skills inherit the existing ``pop_stream_delta`` behavior. A
+        capability that streams another payload, such as synthesized PCM, can
+        override this hook without teaching the scheduler about that modality.
+        Return ``None`` when no update is ready, or an empty mapping to retain
+        a token-only update. The default preserves text skills' per-token stream.
+        """
+
+        text = self.pop_stream_delta(runtime)
+        reasoning = self.pop_reasoning_stream_delta(runtime)
+        output = {}
+        if text:
+            output["text"] = text
+        if reasoning:
+            output["reasoning"] = reasoning
+        return output
+
+    def next_output_deadline(
+        self,
+        runtime: "AutoregressiveRuntime",
+    ) -> Optional[float]:
+        """Return the monotonic deadline for the next streaming update.
+
+        Skills with playback or other real-time output can opt into
+        deadline-ordered decode. ``None`` retains the scheduler's stable FIFO
+        cohort policy.
+        """
+
+        return None
+
 
 class SkillRegistry:
     """Maps a model's capability names to their skills.
