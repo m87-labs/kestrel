@@ -156,6 +156,25 @@ four seconds of initial context. Completed 180-second blocks and the final
 result use the same full-context path as file transcription, so previews may be
 revised without changing committed transcription quality.
 
+### Running on the CPU or on Apple silicon
+
+`moondream/parakeet-redux`, the ternary Parakeet, also runs on the CPU and on
+Apple silicon; pass `device="cpu"` or `device="mps"`. On CUDA the packed codes
+are expanded to dense weights at load, so it runs at the fp model's speed from
+the 178 MB download.
+
+```python
+engine = await InferenceEngine.create(
+    RuntimeConfig(model="moondream/parakeet-redux", device="cpu")
+)
+```
+
+On the CPU, `cpu_threads` sets the thread count (default: the physical cores,
+capped at 8). Set `OMP_WAIT_POLICY=passive` in the environment before torch is
+imported, or torch's idle OpenMP workers spin on the cores the kernels use.
+The weights stay packed in memory on both devices: the CPU matrix multiplies
+read them with int8 activations, the Metal ones decode them in place.
+
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding
 use Kestrel's bundled generated-decode programs. Installed runtimes do not
