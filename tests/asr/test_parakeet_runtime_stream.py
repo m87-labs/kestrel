@@ -40,20 +40,18 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
             max_tokens: int,
         ) -> SimpleNamespace:
             del max_tokens
-            with torch.cuda.stream(compute_stream):
-                streams.append(("decode", torch.cuda.current_stream(device)))
-                torch.testing.assert_close(encoded, torch.full_like(encoded, 4))
-                batch = encoded.shape[0]
-                return SimpleNamespace(
-                    lengths=torch.ones(batch, dtype=torch.long, device=device),
-                    sequences=torch.zeros(
-                        (batch, 2), dtype=torch.long, device=device
-                    ),
-                    durations=torch.zeros(
-                        (batch, 2), dtype=torch.long, device=device
-                    ),
-                    encoder_frame_seconds=0.08,
-                )
+            # Whatever stream the runtime left us on -- the encoding is only
+            # ordered against work on the one it came out of, so reading it
+            # here is correct exactly when that is the configured stream.
+            streams.append(("decode", torch.cuda.current_stream(device)))
+            torch.testing.assert_close(encoded, torch.full_like(encoded, 4))
+            batch = encoded.shape[0]
+            return SimpleNamespace(
+                lengths=torch.ones(batch, dtype=torch.long, device=device),
+                sequences=torch.zeros((batch, 2), dtype=torch.long, device=device),
+                durations=torch.zeros((batch, 2), dtype=torch.long, device=device),
+                encoder_frame_seconds=0.08,
+            )
 
     class _Tokenizer:
         def decode(self, _token_ids: list[int]) -> str:
@@ -94,5 +92,7 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
         )
 
     assert result[0]["text"] == "ok"
+    # Both halves of the split forward run where the graph session put the
+    # encoder, not on the stream the caller happened to be holding.
     assert streams == [("encode", compute_stream), ("decode", compute_stream)]
     runtime.shutdown()
