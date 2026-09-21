@@ -200,6 +200,61 @@ def _encoder_frames(samples: int, factor: int) -> int:
     return frames
 
 
+@dataclass(slots=True)
+class _StagingSlot:
+    host: torch.Tensor | None = None
+    copied: torch.cuda.Event | None = None
+
+
+class _WaveformStaging:
+    """Pinned host staging for one cohort's waveforms: one packed async copy.
+
+    ``torch.from_numpy(...).to(device)`` copies from pageable memory, which
+    Torch completes with a stream synchronize -- so one such copy per distinct
+    waveform length did not just cost a transfer, it drained every kernel the
+    compute stream still held. Measured on a B200 behind 145 ms of queued GEMMs,
+    128 pageable copies returned after 155 ms; the same rows packed into one
+    pinned buffer and copied once returned in 3.4 ms. That is what lets a batch
+    be enqueued while its predecessor is still running.
+
+    ``slots`` buffers rotate so the copy out of one buffer may still be in
+    flight while the next cohort is packed into another.
+    """
+
+    def __init__(self, device: torch.device, *, slots: int = 2) -> None:
+        if slots < 1:
+            raise ValueError("waveform staging needs at least one slot")
+        self._device = device
+        self._slots = [_StagingSlot() for _ in range(slots)]
+        self._next = 0
+
+    def stage(self, blocks: Sequence[np.ndarray]) -> torch.Tensor:
+        """Pack ``blocks`` end to end on the device, ordered as given."""
+
+        total = sum(int(block.size) for block in blocks)
+        slot = self._slots[self._next]
+        self._next = (self._next + 1) % len(self._slots)
+        if slot.copied is not None:
+            # The previous copy out of this buffer must have read it before we
+            # overwrite it. In steady state this event is long past.
+            slot.copied.synchronize()
+        if slot.host is None or slot.host.numel() < total:
+            slot.host = torch.empty(total, dtype=torch.float32, pin_memory=True)
+        host = slot.host[:total]
+        view = host.numpy()
+        at = 0
+        for block in blocks:
+            size = int(block.size)
+            view[at : at + size] = block
+            at += size
+        device = torch.empty(total, dtype=torch.float32, device=self._device)
+        device.copy_(host, non_blocking=True)
+        if slot.copied is None:
+            slot.copied = torch.cuda.Event()
+        slot.copied.record()
+        return device
+
+
 @dataclass(frozen=True, slots=True)
 class _StreamState:
     decoder: TdtState
@@ -265,6 +320,8 @@ class ParakeetTdtRuntime:
     # Transducer decoding keeps its own small decoder state; there is no paged
     # KV cache here, so the engine skips building (and importing) one.
     needs_kv_pool = False
+    # Pinned staging for waveform uploads; CUDA only, resolved per instance.
+    _staging: "_WaveformStaging | None" = None
 
     def __init__(
         self,
@@ -352,6 +409,11 @@ class ParakeetTdtRuntime:
                 max_batch=self.batch_capacity,
                 compute_stream=stream,
             )
+        self._staging = (
+            _WaveformStaging(self.device)
+            if self.device.type == "cuda" and torch.cuda.is_available()
+            else None
+        )
         self._encoder_graph = ParakeetEncoderGraph(
             self.model,
             max_batch=self.batch_capacity,
@@ -399,12 +461,28 @@ class ParakeetTdtRuntime:
         for group_index, (_request_index, audio) in enumerate(rows):
             groups.setdefault(audio.waveform.size, []).append(group_index)
 
+        staged = None
+        if self._staging is not None:
+            staged = self._staging.stage(
+                [
+                    rows[index][1].waveform
+                    for indices in groups.values()
+                    for index in indices
+                ]
+            )
+
         feature_rows: dict[int, torch.Tensor] = {}
         mask_rows: dict[int, torch.Tensor] = {}
-        for indices in groups.values():
-            waveforms = torch.from_numpy(
-                np.stack([rows[index][1].waveform for index in indices])
-            ).to(self.device)
+        at = 0
+        for size, indices in groups.items():
+            if staged is None:
+                waveforms = torch.from_numpy(
+                    np.stack([rows[index][1].waveform for index in indices])
+                ).to(self.device)
+            else:
+                span = len(indices) * size
+                waveforms = staged[at : at + span].view(len(indices), size)
+                at += span
             features, masks = parakeet_features(waveforms)
             for batch_index, row_index in enumerate(indices):
                 feature_rows[row_index] = features[batch_index]
