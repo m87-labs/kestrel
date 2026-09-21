@@ -17,11 +17,16 @@ import numpy as np
 import pytest
 import torch
 
-from kestrel.config import NATIVE_GEMM_THREAD_CAP, RuntimeConfig, default_cpu_threads
+from kestrel.config import RuntimeConfig
 from kestrel.models.parakeet_tdt import TERNARY_MODEL_ID
+import kestrel.models.parakeet_tdt.runtime as runtime
 from kestrel.models.parakeet_tdt.config import ParakeetTdtConfig
 from kestrel.models.parakeet_tdt.model import ParakeetTdt
-from kestrel.models.parakeet_tdt.weights import _quantized_modules, ternarize
+from kestrel.models.parakeet_tdt.weights import (
+    _quantized_modules,
+    load_parakeet_tdt,
+    ternarize,
+)
 
 
 # The real export's group size. The native GEMM constrains it (a multiple of 64
@@ -170,44 +175,29 @@ def build_tiny_ternary_export(root: Path, *, seed: int = 0) -> Path:
     return root
 
 
-# ---- device / thread policy (no ternary kernels needed) -------------------
+# ---- device / thread policy ----------------------------------------------
 
 
-def test_ternary_model_resolves_to_cpu_without_accelerators(monkeypatch) -> None:
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    for requested in (None, "cuda", "cpu"):
-        cfg = RuntimeConfig(
-            model=TERNARY_MODEL_ID, model_path="/nonexistent", device=requested
-        )
-        assert cfg.device == "cpu"
-        assert cfg.resolved_device() == torch.device("cpu")
+def test_cpu_dtype_uses_bf16_only_when_the_cpu_supports_it(monkeypatch) -> None:
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        monkeypatch.setattr(torch.cpu, probe, lambda: False, raising=False)
+    assert runtime._cpu_dtype(torch.bfloat16) is torch.float32
+    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: True, raising=False)
+    assert runtime._cpu_dtype(torch.bfloat16) is torch.bfloat16
 
 
-def test_ternary_model_prefers_mps_when_available(monkeypatch) -> None:
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
-    cfg = RuntimeConfig(model=TERNARY_MODEL_ID, model_path="/nonexistent", device=None)
-    assert cfg.device == "mps"
-    assert cfg.resolved_dtype() == torch.float16
-
-
-def test_unrestricted_models_keep_the_cuda_default() -> None:
-    """A model with no device_types is unaffected: unset still means CUDA."""
-    from kestrel.config import resolve_model_device
-
-    # The dataclass default is "you choose", not a hard-coded device.
-    assert RuntimeConfig.__dataclass_fields__["device"].default is None
-    assert resolve_model_device("moondream3-preview", None) == "cuda"
-    assert resolve_model_device("moondream3-preview", "cpu") == "cpu"
-    assert resolve_model_device("an-unregistered-model", None) == "cuda"
+def test_ternary_checkpoint_rejects_cuda_at_the_loader_boundary(tmp_path) -> None:
+    root = build_tiny_ternary_export(tmp_path / "export")
+    with pytest.raises(ValueError, match="support CPU and MPS only"):
+        load_parakeet_tdt(root, device="cuda")
 
 
 def test_cpu_thread_policy() -> None:
     """The counts come from the machine and the caps, and from nowhere else -- there is no environment
     variable that changes them; ``RuntimeConfig.cpu_threads`` is the way to name one."""
-    assert 1 <= default_cpu_threads() <= 8
-    assert 1 <= default_cpu_threads(NATIVE_GEMM_THREAD_CAP) <= NATIVE_GEMM_THREAD_CAP
-    assert default_cpu_threads(1) == 1
+    assert 1 <= runtime._default_cpu_threads() <= 8
+    assert 1 <= runtime._default_cpu_threads(runtime._NATIVE_GEMM_THREAD_CAP) <= 4
+    assert runtime._default_cpu_threads(1) == 1
     with pytest.raises(ValueError):
         RuntimeConfig(
             model=TERNARY_MODEL_ID,
@@ -215,6 +205,57 @@ def test_cpu_thread_policy() -> None:
             device="cpu",
             cpu_threads=0,
         )
+
+
+def test_cpu_thread_policy_resets_the_pool_before_reading_its_affinity(
+    monkeypatch,
+) -> None:
+    events: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        runtime,
+        "_set_kernel_worker_threads",
+        lambda threads: events.append(("workers", threads)),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_confine_submitter_to_cache_domain",
+        lambda: events.append(("affinity", None)),
+    )
+    caps: list[int] = []
+
+    def default_threads(cap: int = 8) -> int:
+        caps.append(cap)
+        return min(cap, 3)
+
+    monkeypatch.setattr(
+        runtime,
+        "_default_cpu_threads",
+        default_threads,
+    )
+    current = [0]
+
+    def set_torch_threads(threads: int) -> None:
+        current[0] = threads
+        events.append(("torch", threads))
+
+    monkeypatch.setattr(
+        torch,
+        "set_num_threads",
+        set_torch_threads,
+    )
+    monkeypatch.setattr(torch, "get_num_threads", lambda: current[0])
+
+    assert runtime._configure_cpu_threads(None, native_gemm=True) == 3
+    assert events == [("workers", None), ("affinity", None), ("torch", 3)]
+    assert caps == [runtime._NATIVE_GEMM_THREAD_CAP]
+
+    events.clear()
+    assert runtime._configure_cpu_threads(2, native_gemm=True) == 2
+    assert events == [("workers", 2), ("torch", 2)]
+
+    events.clear()
+    assert runtime._configure_cpu_threads(None, native_gemm=False) == 3
+    assert caps == [runtime._NATIVE_GEMM_THREAD_CAP, 8]
 
 
 # ---- the engine path ------------------------------------------------------
@@ -267,6 +308,7 @@ def test_tiny_ternary_export_loads_and_transcribes_on_cpu(
             runtime = engine._runtimes[TERNARY_MODEL_ID]
             assert runtime.device == torch.device("cpu")
             assert runtime.cpu_threads == 2
+            assert runtime.model.is_ternary
             handle = engine.model(TERNARY_MODEL_ID)
             assert handle.tasks == ("transcribe",)
 
@@ -333,6 +375,24 @@ def test_ternarize_fuses_the_exports_separate_qkv(tmp_path) -> None:
     assert isinstance(attention.qkv_proj, TernaryLinear)
     assert attention.qkv_proj.out_features == 3 * config.encoder.hidden_size
     assert isinstance(attention.o_proj, TernaryLinear)
+
+
+@pytest.mark.parametrize("field,value", [("group_size", 64), ("out_features", 64)])
+def test_ternarize_rejects_incompatible_fused_projection_metadata(
+    tmp_path, field, value
+) -> None:
+    pytest.importorskip("kestrel_kernels.ternary")
+
+    root = build_tiny_ternary_export(tmp_path / "export")
+    config = ParakeetTdtConfig.from_json_file(root / "config.json")
+    quantized = [dict(entry) for entry in _quantized_modules(root / "ternary.json")]
+    key = "encoder.layers.0.self_attn.k_proj"
+    next(entry for entry in quantized if entry["name"] == key)[field] = value
+
+    with torch.device("meta"):
+        model = ParakeetTdt(config)
+        with pytest.raises(ValueError, match=f"disagree on {field}"):
+            ternarize(model, tuple(quantized))
 
 
 def test_ternarize_fuses_the_blocks_relative_position_projections(tmp_path) -> None:

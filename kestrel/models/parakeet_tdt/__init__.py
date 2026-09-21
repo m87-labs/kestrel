@@ -31,9 +31,6 @@ register(
         revision=TERNARY_REVISION,
         runtime=ParakeetTdtRuntime,
         orchestrators=_build_orchestrators,
-        # The 2-bit kernels are CPU/ARM code: ``RuntimeConfig`` resolves an unset (or CUDA) device to MPS
-        # when available, else CPU.
-        device_types=frozenset({"cpu", "mps"}),
     )
 )
 
@@ -41,6 +38,7 @@ __all__ = [
     "MODEL_ID",
     "REVISION",
     "TERNARY_MODEL_ID",
+    "TERNARY_REVISION",
     "ParakeetTdtRuntime",
     "load_parakeet_tdt",
 ]

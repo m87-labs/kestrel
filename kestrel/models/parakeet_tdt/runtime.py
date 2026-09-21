@@ -6,14 +6,15 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
-
 import os
+from pathlib import Path
+import platform
+import subprocess
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.config import NATIVE_GEMM_THREAD_CAP, default_cpu_threads
 from kestrel.device import empty_cache, make_stream, resolve_device
 from kestrel.runtime import ExecutionShape
 
@@ -42,6 +43,56 @@ from .weights import MODEL_ID, load_parakeet_tdt
 # One live-PCM window: the block the orchestrator commits exactly, and the unit
 # the streaming decoder carries its state across.
 STREAM_WINDOW_SECONDS = 180
+_CPU_THREAD_CAP = 8
+_NATIVE_GEMM_THREAD_CAP = 4
+
+
+def _cpu_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Avoid emulated BF16 GEMMs on CPUs without native BF16 support."""
+
+    if dtype != torch.bfloat16:
+        return dtype
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        fn = getattr(torch.cpu, probe, None)
+        try:
+            if fn is not None and fn():
+                return torch.bfloat16
+        except Exception:  # noqa: BLE001 — private torch capability probes
+            continue
+    return torch.float32
+
+
+def _physical_cpu_count() -> int:
+    """Physical cores available to this process (P-cores on Apple silicon)."""
+
+    if platform.system() == "Darwin":
+        for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+            try:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
+                )
+                return int(out.strip())
+            except Exception:  # noqa: BLE001 — probe, never fatal
+                continue
+        return os.cpu_count() or 1
+    try:
+        usable = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+    cores: set[tuple[str, str]] = set()
+    for cpu in usable:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return len(usable)
+        cores.add((package, core))
+    return len(cores) or len(usable)
+
+
+def _default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
+    return max(1, min(_physical_cpu_count(), cap))
 
 
 def _timed_segments(
@@ -90,14 +141,12 @@ def _set_kernel_worker_threads(threads: int | None) -> None:
     set_worker_threads(threads)
 
 
-def confine_to_cache_domain() -> None:
-    """Pin this process to the cores the kernels chose, when the caller has not already pinned it.
+def _confine_submitter_to_cache_domain() -> None:
+    """Pin the calling thread to the cores chosen by the native kernel pool.
 
-    The kernels pin their own workers; a library may not move a caller's other threads, but the model
-    runtime may, and it has to: the thread that submits a parallel region works in it, so a submitter
-    roaming a 256-CPU box undoes the locality the workers were placed for. Measured on an unpinned process
-    on an EPYC 9575F, 50 utterances: 49.7x real time with only the workers pinned, 113x with the process
-    confined as well.
+    The submitting thread participates in each parallel region, so letting it
+    roam outside the pool's cache domain defeats the workers' placement. Linux
+    affinity is per-thread; other application threads are left alone.
 
     A no-op where the topology cannot be read (macOS has no affinity interface), and where the current mask
     is already inside the chosen group.
@@ -116,6 +165,31 @@ def confine_to_cache_domain() -> None:
         os.sched_setaffinity(0, cpus)
     except OSError:  # a container that forbids it; the workers are still placed
         pass
+
+
+def _configure_cpu_threads(threads: int | None, *, native_gemm: bool) -> int:
+    """Apply the shared CPU policy to torch and the native kernel pool.
+
+    With no explicit count, the pool chooses one cache domain and the calling
+    thread joins it. Torch uses the smaller cap only when the ternary model's
+    GEMMs run in that pool. An explicit count sizes both pools and leaves
+    affinity to the caller.
+    """
+
+    if threads is None:
+        # Reset the pool first: ``pool_cpus`` must describe the placement this
+        # runtime will actually use, not a previous explicit configuration.
+        _set_kernel_worker_threads(None)
+        _confine_submitter_to_cache_domain()
+        threads = (
+            _default_cpu_threads(_NATIVE_GEMM_THREAD_CAP)
+            if native_gemm
+            else _default_cpu_threads()
+        )
+    else:
+        _set_kernel_worker_threads(int(threads))
+    torch.set_num_threads(int(threads))
+    return torch.get_num_threads()
 
 
 def _encoder_frames(samples: int, factor: int) -> int:
@@ -170,6 +244,8 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
+        if self.device.type == "cpu":
+            self.dtype = _cpu_dtype(self.dtype)
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
@@ -184,7 +260,14 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
-        self.cpu_threads = self._set_cpu_threads(cfg) if self.device.type == "cpu" else None
+        self.cpu_threads = (
+            _configure_cpu_threads(
+                getattr(cfg, "cpu_threads", None),
+                native_gemm=self.model.is_ternary,
+            )
+            if self.device.type == "cpu"
+            else None
+        )
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -231,50 +314,6 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
         )
-
-    def _set_cpu_threads(self, cfg: Any) -> int:
-        """Apply torch's intra-op thread count; returns the count in force.
-
-        On the CPU this model's weights have exactly one resident form — packed codes with int8
-        activations — and that matrix multiply runs on the kernels' own pool, as do the fused encoder ops
-        beside it. torch is left with the subsampling convolutions, the decoder and the joint, and its
-        spinning OpenMP workers otherwise only steal cores from the pool, so the default is
-        :data:`NATIVE_GEMM_THREAD_CAP` whenever the model is on the CPU. ``torch.set_num_threads`` is
-        process-global: the last runtime to ask wins.
-
-        How many cores the model uses is not a number to pick either. Every kernel region here is short —
-        a 4.6 s utterance issues a few hundred — so a hand-off that crosses a last-level cache costs more
-        than the extra cores pay back, which is why sixteen cores spanning two CCDs of an EPYC 9575F is
-        *slower* than eight on one (86x against 113x real time). So the kernels size their pool to the
-        largest group of physical cores inside this process's affinity mask that share a cache, capped at
-        eight, and pin their workers there; :func:`confine_to_cache_domain` then confines this process to
-        the same group, because the thread that submits a region takes part in it and a submitter on
-        another CCD costs what the workers saved. For throughput on a many-core socket, run one process per
-        cache domain, each of them pinned, rather than one process across the socket.
-
-        ``cpu_threads`` in the config is the explicit override: it sizes the kernels' pool as well as
-        torch's, and suppresses the confinement, because an operator who names a count is managing placement
-        themselves. There is no environment variable for any of it.
-
-        A CPU deployment should also set ``OMP_WAIT_POLICY=passive`` in the environment before torch is
-        imported: measured on that machine at 4 / 8 / 16 pinned cores, the 50-utterance benchmark runs at
-        34 / 94 / 84x real time with torch's workers spinning and 90 / 113 / 86x with them parked. It
-        cannot be set from here — libgomp reads it when it loads.
-        """
-        threads = getattr(cfg, "cpu_threads", None)
-        if self.device.type != "cpu":
-            torch.set_num_threads(int(threads or default_cpu_threads()))
-            return torch.get_num_threads()
-        if threads is None:
-            confine_to_cache_domain()
-            _set_kernel_worker_threads(None)
-            threads = default_cpu_threads(NATIVE_GEMM_THREAD_CAP)
-        else:
-            # A named count sizes the kernels' pool as well, and suppresses the confinement: an operator who
-            # picks a number is managing placement themselves.
-            _set_kernel_worker_threads(int(threads))
-        torch.set_num_threads(int(threads))
-        return torch.get_num_threads()
 
     @property
     def model_name(self) -> str:

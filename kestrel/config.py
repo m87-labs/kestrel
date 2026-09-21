@@ -3,20 +3,13 @@
 
 import ctypes
 from dataclasses import dataclass
-import logging
-import os
 from pathlib import Path
-import platform
 import re
-import subprocess
 from typing import Literal
 
 import torch
 
 from kestrel.device import resolve_device
-
-
-logger = logging.getLogger(__name__)
 
 
 _SMALL_VRAM_THRESHOLD_BYTES = 24 * 1024**3
@@ -115,6 +108,8 @@ def _mps_total_memory_bytes() -> int | None:
     a coarse tier when sysctl is unavailable).
     """
     try:
+        import subprocess
+
         out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=2)
         return int(out.strip())
     except Exception:
@@ -158,174 +153,12 @@ def _default_kv_cache_pages_for_device(device: str) -> int:
     return _KV_CACHE_PAGES_LARGE_VRAM
 
 
-# Device types in the order the engine prefers them when a model restricts
-# where it can run (``ModelSpec.device_types``) and the caller did not name a
-# device. Unrestricted models keep the CUDA-first default.
-_DEVICE_PREFERENCE = ("cuda", "mps", "cpu")
-_DEFAULT_DEVICE = "cuda"
-# Upper bound on the CPU thread default. Parakeet's encoder GEMMs stop scaling
-# well past this, and an unbounded default on a many-core server would spawn a
-# thread per core for a workload that does not use them.
-_CPU_THREAD_CAP = 8
-# Cap for a model whose GEMMs run on their own native thread pool (the ternary
-# Parakeet student's packed int8 path). Torch's OpenMP workers spin-wait between ops and fight
-# that pool for cores: on a 16-core EPYC 9575F, torch at 4 intra-op threads ran
-# the 50-utterance set at 64x real time against 40x with torch at 16.
-NATIVE_GEMM_THREAD_CAP = 4
-
-
-def _device_type_available(device_type: str) -> bool:
-    if device_type == "cuda":
-        try:
-            return torch.cuda.is_available()
-        except Exception:  # noqa: BLE001 — a broken CUDA install must not crash config
-            return False
-    if device_type == "mps":
-        try:
-            return torch.backends.mps.is_available()
-        except Exception:  # noqa: BLE001
-            return False
-    return device_type == "cpu"
-
-
-def _model_device_types(model: str | None) -> frozenset[str] | None:
-    """The device types ``model`` is restricted to, or ``None`` when free.
-
-    Imported lazily: ``kestrel.models`` imports this module, so a top-level
-    import here would be circular.
-    """
-    if not model:
-        return None
-    try:
-        from kestrel.models import get_spec
-
-        types = get_spec(model).device_types
-    except Exception:  # noqa: BLE001 — unknown/unimportable models keep the default
-        return None
-    return frozenset(types) if types else None
-
-
-def _preferred_device(supported: frozenset[str]) -> str:
-    for device_type in _DEVICE_PREFERENCE:
-        if device_type in supported and _device_type_available(device_type):
-            return device_type
-    # Nothing in the set is usable here; name one anyway so the caller gets the
-    # model's own error rather than a silently wrong device.
-    return sorted(supported)[0]
-
-
-def resolve_model_device(model: str | None, device: str | None) -> str:
-    """Pick the device string a model actually runs on.
-
-    ``device=None`` means "you choose": an unrestricted model gets the
-    CUDA-first default, a model that declares ``ModelSpec.device_types`` gets
-    the first of those that exists on this machine (MPS before CPU on a Mac).
-    An explicit device outside the model's set is redirected the same way with
-    a warning rather than failing deep inside runtime construction.
-    """
-    supported = _model_device_types(model)
-    if supported is None:
-        return _DEFAULT_DEVICE if device is None else device
-    if device is None:
-        return _preferred_device(supported)
-    if torch.device(device).type in supported:
-        return device
-    target = _preferred_device(supported)
-    logger.warning(
-        "%s runs on %s only; using %s instead of the requested %s",
-        model,
-        "/".join(sorted(supported)),
-        target,
-        device,
-    )
-    return target
-
-
-def _physical_cpu_count() -> int:
-    """Physical cores available to this process.
-
-    Apple silicon counts performance cores only (the efficiency cores drag a
-    latency-bound GEMM down rather than help it); elsewhere SMT siblings are
-    collapsed, so an 8-core/16-thread laptop answers 8, and a process pinned to
-    a subset of the machine (``taskset``, a cgroup's cpuset) never counts more
-    cores than it may run on.
-    """
-    if platform.system() == "Darwin":
-        for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
-            try:
-                out = subprocess.check_output(
-                    ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
-                )
-                return int(out.strip())
-            except Exception:  # noqa: BLE001 — probe, never fatal
-                continue
-        return os.cpu_count() or 1
-    try:
-        usable = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        usable = os.cpu_count() or 1
-    cores: set[tuple[str, str]] = set()
-    package = core = None
-    try:
-        text = Path("/proc/cpuinfo").read_text()
-    except OSError:
-        text = ""
-    for line in text.splitlines():
-        key, _, value = line.partition(":")
-        key, value = key.strip(), value.strip()
-        if key == "physical id":
-            package = value
-        elif key == "core id":
-            core = value
-        if package is not None and core is not None:
-            cores.add((package, core))
-            package = core = None
-    return min(len(cores), usable) if cores else usable
-
-
-def default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
-    """The intra-op thread count Kestrel uses for CPU inference.
-
-    Physical cores (P-cores on Apple silicon), capped at ``cap``: a runtime
-    whose GEMMs own a separate native thread pool passes
-    :data:`NATIVE_GEMM_THREAD_CAP` so torch's workers stay out of the GEMM's
-    way. ``RuntimeConfig.cpu_threads`` is the way to name a count instead.
-    """
-    return max(1, min(_physical_cpu_count(), cap))
-
-
-def cpu_default_dtype() -> torch.dtype:
-    """The dtype the ``bfloat16`` default resolves to on CPU: bf16 only where
-    the CPU multiplies bf16 natively (AVX-512 BF16 or Intel AMX).
-
-    Measured on the Parakeet-TDT encoder (125 frames x 1024 x 4096 GEMM,
-    4 threads): AMD Zen 5 runs bf16 at 1091 GMAC/s vs 188 in fp32, so bf16
-    triples the real-time factor there (34.5x vs 13.3x); an Apple M2 runs
-    fp32 through Accelerate's AMX units at 456 GMAC/s but bf16 at 62, so
-    fp32 is 7x faster on Apple silicon CPUs and on AVX2-only x86.
-    """
-    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
-        fn = getattr(torch.cpu, probe, None)
-        try:
-            if fn is not None and fn():
-                return torch.bfloat16
-        except Exception:  # noqa: BLE001 — the probes are private torch API
-            continue
-    return torch.float32
-
-
 @dataclass
 class RuntimeConfig:
     """Knobs controlling the text-only inference prototype."""
 
     model_path: str | Path | None = None
-    # ``None`` means "pick for me": CUDA for an unrestricted model, and for a
-    # model that declares ``ModelSpec.device_types`` (e.g. the ternary Parakeet
-    # student, CPU/MPS only) the best device it supports on this machine — MPS
-    # when available, else CPU. An explicit device the model cannot run on is
-    # redirected the same way, with a warning. Resolved to a concrete string in
-    # ``__post_init__``, so ``cfg.device`` is always a device string afterwards.
-    device: str | None = None
+    device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     # Effective batch size (excluding reserved batch_idx 0).
     max_batch_size: int = 4
@@ -345,13 +178,11 @@ class RuntimeConfig:
     # that support it must bind compatible generated programs for the complete
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
-    # Intra-op threads for CPU inference, and the size of the kernels' own
-    # pool where a runtime has one. ``None`` uses :func:`default_cpu_threads`
-    # (physical cores, P-cores on Apple silicon, capped at 8 — or at
-    # :data:`NATIVE_GEMM_THREAD_CAP` for a runtime whose GEMMs own a pool) and
-    # lets that pool place itself on one cache domain. Naming a count here
-    # also means placement is the caller's business. Ignored off CPU.
+    # Intra-op threads for CPU inference. Runtimes may also use this to size
+    # their native worker pools. ``None`` lets the runtime choose; ignored off
+    # CPU.
     cpu_threads: int | None = None
+
     def __post_init__(self):
         if self.decode_path not in ("auto", "native", "generated"):
             raise ValueError(
@@ -365,10 +196,6 @@ class RuntimeConfig:
 
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be a positive integer")
-
-        # Before the availability check: a model restricted to CPU/MPS must
-        # resolve to one of those rather than trip the CUDA diagnostics.
-        self.device = resolve_model_device(self.model, self.device)
 
         self._validate_device_available()
 
@@ -393,18 +220,10 @@ class RuntimeConfig:
         without saturating fp16's 65504 dynamic-range cap. Users who
         explicitly want fp32 on MPS still get fp32 — only the bf16
         default is overridden.
-
-        On CPU the ``bfloat16`` default becomes :func:`cpu_default_dtype`:
-        bf16 where the CPU has a native bf16 GEMM (AVX-512 BF16 / AMX),
-        fp32 everywhere else (Apple silicon CPUs, AVX2-only x86), where
-        torch's bf16 matmul runs through slow emulation.
         """
 
-        device_type = self.resolved_device().type
-        if self.dtype == torch.bfloat16 and device_type == "mps":
+        if self.dtype == torch.bfloat16 and self.resolved_device().type == "mps":
             return torch.float16
-        if self.dtype == torch.bfloat16 and device_type == "cpu":
-            return cpu_default_dtype()
         return self.dtype
 
     def resolved_device(self) -> torch.device:
@@ -477,11 +296,4 @@ class RuntimeConfig:
         raise RuntimeError(" ".join(details))
 
 
-__all__ = [
-    "DecodePath",
-    "NATIVE_GEMM_THREAD_CAP",
-    "RuntimeConfig",
-    "cpu_default_dtype",
-    "default_cpu_threads",
-    "resolve_model_device",
-]
+__all__ = ["DecodePath", "RuntimeConfig"]

@@ -1,34 +1,8 @@
-"""Pause-aligned segmentation of long audio for Parakeet TDT.
+"""Cut long Parakeet audio at pauses into contiguous segments of at most 30 s.
 
-Measured with ``nvidia/parakeet-tdt-0.6b-v3`` over six Earnings-22 calls of
-15-22 minutes:
-
-=========================================================  ===========
-protocol                                                           WER
-=========================================================  ===========
-pause-aligned 30 s segments, no overlap (VAD-head pauses)         6.37
-pause-aligned 30 s segments, no overlap (energy pauses)           6.81
-pause-aligned 30 s segments, +/- 4 s context margins               6.60
-fixed 30 s grid, no overlap                                       7.97
-whole recording, full attention                                  10.42
-fixed 180 s windows, no overlap (what this replaces)             10.82
-whole recording, local attention 512 / 256 / 128 / 64      10.39-12.70
-=========================================================  ===========
-
-So: cut the recording at pauses, never mid-word, cap every segment at 30 s,
-run full attention inside the segment, and join the text in order. Overlap and
-context margins are deliberately absent -- they make a transducer *worse*. It
-emits a window's last words only when that window's audio ends, so a margin
-that hides the true end loses them, and a window that opens mid-speech deletes
-its first words. Contiguous, pause-aligned cuts avoid both.
-
-The cut policy is one walk from the start of the recording: the next cut is the
-midpoint of the last pause that ends before ``SEGMENT_SECONDS`` and begins
-after ``MIN_SEGMENT_SECONDS``; with no such pause the cut falls at the cap. A
-pause is a gap of at least ``MIN_PAUSE_SECONDS`` between speech regions, and
-speech comes from either ``energy_speech`` here or the loaded checkpoint's own
-head (``vad.head_speech``). The walk, the per-segment run, the text join and
-the timestamps are shared; only that one callable differs.
+Speech boundaries come from frame energy or a checkpoint's VAD head. A cut is
+the midpoint of the last usable pause before the cap; no overlap or context
+margins are added because both measured worse for the transducer.
 """
 
 from __future__ import annotations

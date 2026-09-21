@@ -43,7 +43,11 @@ def _quantized_modules(manifest: Path) -> tuple[dict, ...]:
             "expected a thrush-ternary-v1 export with HF tensor names (export_ternary.py --names hf), got "
             f"format={export.get('format')!r} names={export.get('names')!r}"
         )
-    return tuple(export["quantized_modules"])
+    modules = tuple(export["quantized_modules"])
+    names = [entry["name"] for entry in modules]
+    if len(names) != len(set(names)):
+        raise ValueError("the ternary manifest contains duplicate module names")
+    return modules
 
 
 def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
@@ -65,6 +69,14 @@ def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
             bias=entry["has_bias"],
         )
 
+    def validate_fused(entries: tuple[dict, ...], label: str) -> None:
+        for field in ("in_features", "out_features", "group_size", "has_bias"):
+            values = {entry[field] for entry in entries}
+            if len(values) != 1:
+                raise ValueError(f"{label}: fused projections disagree on {field}")
+        if entries[0]["has_bias"]:
+            raise ValueError(f"{label}: fused projection biases are not supported")
+
     fused: dict[str, dict[str, dict]] = {}
     relative: list[dict] = []
     for entry in quantized:
@@ -78,14 +90,21 @@ def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
     for parent, parts in fused.items():
         if set(parts) != set(_QKV):
             raise ValueError(f"{parent}: the export quantizes {sorted(parts)}, not all of q/k/v")
-        out_features = sum(parts[attr]["out_features"] for attr in _QKV)
-        model.set_submodule(f"{parent}.qkv_proj", layer(parts["q_proj"], out_features))
+        ordered = tuple(parts[attr] for attr in _QKV)
+        validate_fused(ordered, parent)
+        out_features = sum(entry["out_features"] for entry in ordered)
+        model.set_submodule(f"{parent}.qkv_proj", layer(ordered[0], out_features))
     if relative:
-        if len(relative) != len(model.encoder.layers):
+        expected = {
+            f"encoder.layers.{index}.self_attn.{_REL}"
+            for index in range(len(model.encoder.layers))
+        }
+        names = {entry["name"] for entry in relative}
+        if len(relative) != len(expected) or names != expected:
             raise ValueError(
-                f"the export quantizes {len(relative)} relative-position projections, not one per encoder "
-                f"block ({len(model.encoder.layers)})"
+                "the export's relative-position projections do not match the encoder blocks"
             )
+        validate_fused(tuple(relative), f"encoder.{_REL}")
         model.set_submodule(
             f"encoder.{_REL}",
             layer(relative[0], sum(entry["out_features"] for entry in relative)),
@@ -123,11 +142,14 @@ def load_parakeet_tdt(
     ):
         raise ValueError("Parakeet tokenizer and model special tokens disagree")
     manifest = root / _MANIFEST
+    if manifest.exists() and torch.device(device).type not in {"cpu", "mps"}:
+        raise ValueError("ternary Parakeet checkpoints support CPU and MPS only")
     state = load_file(str(root / "model.safetensors"), device="cpu")
     with torch.device("meta"):
         model = ParakeetTdt(config)
         if manifest.exists():
             ternarize(model, _quantized_modules(manifest))
+            model.is_ternary = True
         # A capability of the weights, not a configured option: a checkpoint
         # that ships a speech head segments its own long audio with it, and one
         # that does not falls back to the energy detector. Checked on the fp

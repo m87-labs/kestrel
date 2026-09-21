@@ -590,6 +590,7 @@ def _decode_batch(
 
 class ParakeetTdt(nn.Module):
     vad_head: VadHead | None
+    is_ternary: bool
 
     def __init__(self, config: ParakeetTdtConfig) -> None:
         super().__init__()
@@ -600,6 +601,7 @@ class ParakeetTdt(nn.Module):
         )
         self.decoder = Decoder(config)
         self.joint = Joint(config)
+        self.is_ternary = False
         # Only checkpoints that ship `vad_head.*` get one; nothing is bundled.
         self.vad_head = None
 

@@ -158,18 +158,19 @@ revised without changing committed transcription quality.
 
 ### Running on the CPU or on Apple silicon
 
-Transcription runtimes need no paged KV cache, so they start without one and
-run wherever the caller points them. Leave `device` unset and Kestrel picks:
-CUDA for a model that can use it, and for a model restricted to CPU and Apple
-silicon — the 2-bit Parakeet student — MPS when the machine has it, else the
-CPU. Asking such a model for CUDA logs a warning and falls back the same way
-instead of raising.
+Transcription runtimes need no paged KV cache, so they start without one. The
+2-bit Parakeet student supports CPU and Apple silicon; select `device="cpu"` or
+`device="mps"` explicitly.
 
 ```python
 from kestrel.models.parakeet_tdt import TERNARY_MODEL_ID
 
 engine = await InferenceEngine.create(
-    RuntimeConfig(model=TERNARY_MODEL_ID, model_path="/models/parakeet-ternary")
+    RuntimeConfig(
+        model=TERNARY_MODEL_ID,
+        model_path="/models/parakeet-ternary",
+        device="mps",
+    )
 )
 ```
 
@@ -179,10 +180,11 @@ measured fastest on an 8-core Ryzen 9 7940HS — 14.4x real time at 8 threads
 against 12.6x at 6 and 12.2x at 16. The ternary student's matrix multiplies and
 fused encoder ops run on kestrel-kernels' own pool, which sizes itself to one
 cache domain and pins its workers there, so for that model torch's default is
-capped at 4 instead and the process is confined to the same cores. Naming
-`cpu_threads` sizes both pools and suppresses the confinement; nothing reads
-`OMP_NUM_THREADS`. Set `OMP_WAIT_POLICY=passive` in a CPU deployment's
-environment, or torch's idle OpenMP workers spin on the cores the kernels want.
+capped at 4 instead and the submitting thread joins the same cache domain.
+Naming `cpu_threads` sizes both pools and leaves affinity to the caller;
+nothing reads `OMP_NUM_THREADS`. Set `OMP_WAIT_POLICY=passive` in a CPU
+deployment's environment, or torch's idle OpenMP workers spin on the cores the
+kernels want.
 
 The 2-bit weights are kept in the one form kestrel-kernels ships for each
 device, and there is nothing to select: packed panels with int8 activations on
