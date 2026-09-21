@@ -55,7 +55,6 @@ class MoEModule(nn.Module):
         self.input_size = input_size
         self.num_experts = num_experts
         self.config = config or MoEConfig()
-        self._moe_runtime = get_runtime().moe
 
     def _spec_for_weights(
         self,
@@ -92,7 +91,10 @@ class MoEModule(nn.Module):
             max_lora_rank=max_lora_rank,
             mode=mode,
         )
-        return self._moe_runtime.prepare(
+        runtime = getattr(self, "_moe_runtime", None) or get_runtime(
+            hidden_states.device
+        ).moe
+        return runtime.prepare(
             spec,
             capacity,
             device=hidden_states.device,
@@ -160,7 +162,10 @@ class MoEModule(nn.Module):
                 lora_ranks=lora_workspace.lora_ranks,
             )
 
-        return self._moe_runtime.forward(
+        runtime = getattr(self, "_moe_runtime", None) or get_runtime(
+            hidden_states.device
+        ).moe
+        return runtime.forward(
             handle,
             x=hidden_states,
             topk_ids=topk_ids,

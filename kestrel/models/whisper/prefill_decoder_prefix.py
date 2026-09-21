@@ -31,13 +31,6 @@ from .weights import (
     WhisperModelWeights,
 )
 
-_KERNELS = get_runtime()
-_ATTENTION = _KERNELS.attention
-_CACHE = _KERNELS.cache
-_DENSE = _KERNELS.dense
-_LINEAR = _KERNELS.linear
-_VISION = _KERNELS.vision
-
 CONTROL_PREFIX_CAPACITY = 4
 MAX_TARGET_POSITIONS = 448
 VOCAB_SIZE = 51866
@@ -370,7 +363,7 @@ def _write_self_kv(
     values = qkv_heads[:, :, 2].reshape_as(keys)
     key_pool = self_kv.keys[layer_index]
     value_pool = self_kv.values[layer_index]
-    _CACHE.reshape_and_cache_flash(
+    get_runtime(qkv.device).cache.reshape_and_cache_flash(
         keys,
         values,
         key_pool.unsqueeze(2).permute(0, 2, 1, 3),
@@ -396,14 +389,15 @@ def _run_decoder_layer(
 ) -> torch.Tensor:
     batch = workspace.batch_size
     rows = batch * CONTROL_PREFIX_CAPACITY
-    _DENSE.layernorm_bias_into(
+    runtime = get_runtime(hidden_states.device)
+    runtime.dense.layernorm_bias_into(
         workspace.normalized,
         hidden_states,
         layer.self_attention_layer_norm.weight,
         layer.self_attention_layer_norm.bias,
         LAYER_NORM_EPS,
     )
-    _LINEAR.linear(
+    runtime.linear.linear(
         workspace.normalized,
         layer.self_qkv_weight,
         layer.self_qkv_bias,
@@ -417,7 +411,7 @@ def _run_decoder_layer(
         ATTENTION_HEADS,
         HEAD_DIM,
     )
-    attention, _ = _ATTENTION.flash_attn_fwd(
+    attention, _ = runtime.attention.flash_attn_fwd(
         qkv[:, :, 0],
         qkv[:, :, 1],
         qkv[:, :, 2],
@@ -430,7 +424,7 @@ def _run_decoder_layer(
     if attention.data_ptr() != workspace.attention.data_ptr():
         raise RuntimeError("Whisper self-attention did not honor stable output")
     assert layer.self_attention_output.bias is not None
-    _VISION.fused_linear_bias_residual_into(
+    runtime.vision.fused_linear_bias_residual_into(
         x=workspace.attention.view(batch, CONTROL_PREFIX_CAPACITY, HIDDEN_SIZE),
         w=layer.self_attention_output.weight,
         b=layer.self_attention_output.bias,
@@ -438,7 +432,7 @@ def _run_decoder_layer(
         out=workspace.post_self_attention,
     )
 
-    _DENSE.layernorm_bias_into(
+    runtime.dense.layernorm_bias_into(
         workspace.normalized,
         workspace.post_self_attention,
         layer.cross_attention_layer_norm.weight,
@@ -446,13 +440,13 @@ def _run_decoder_layer(
         LAYER_NORM_EPS,
     )
     assert layer.cross_query.bias is not None
-    _LINEAR.linear(
+    runtime.linear.linear(
         workspace.normalized,
         layer.cross_query.weight,
         layer.cross_query.bias,
         out=workspace.cross_query,
     )
-    attention, _ = _ATTENTION.flash_attn_fwd(
+    attention, _ = runtime.attention.flash_attn_fwd(
         workspace.cross_query.view(
             batch, CONTROL_PREFIX_CAPACITY, ATTENTION_HEADS, HEAD_DIM
         ),
@@ -467,7 +461,7 @@ def _run_decoder_layer(
     if attention.data_ptr() != workspace.attention.data_ptr():
         raise RuntimeError("Whisper cross-attention did not honor stable output")
     assert layer.cross_attention_output.bias is not None
-    _VISION.fused_linear_bias_residual_into(
+    runtime.vision.fused_linear_bias_residual_into(
         x=workspace.attention.view(batch, CONTROL_PREFIX_CAPACITY, HIDDEN_SIZE),
         w=layer.cross_attention_output.weight,
         b=layer.cross_attention_output.bias,
@@ -475,7 +469,7 @@ def _run_decoder_layer(
         out=workspace.post_cross_attention,
     )
 
-    _DENSE.layernorm_bias_into(
+    runtime.dense.layernorm_bias_into(
         workspace.normalized,
         workspace.post_cross_attention,
         layer.final_layer_norm.weight,
@@ -483,7 +477,7 @@ def _run_decoder_layer(
         LAYER_NORM_EPS,
     )
     assert layer.fc1.bias is not None and layer.fc2.bias is not None
-    _DENSE.fused_mlp_gelu_bias_residual(
+    runtime.dense.fused_mlp_gelu_bias_residual(
         workspace.hidden.view(rows, HIDDEN_SIZE),
         workspace.mlp_hidden,
         workspace.normalized.view(rows, HIDDEN_SIZE),
@@ -549,6 +543,7 @@ def whisper_decoder_prefix(
     )
     workspace.hidden.add_(weights.position_embedding[:CONTROL_PREFIX_CAPACITY])
     hidden_states = workspace.hidden
+    runtime = get_runtime(hidden_states.device)
     for index, layer in enumerate(weights.layers):
         hidden_states = _run_decoder_layer(
             hidden_states,
@@ -561,7 +556,7 @@ def whisper_decoder_prefix(
             self_kv,
             require_packed=require_packed,
         )
-    _DENSE.layernorm_bias_into(
+    runtime.dense.layernorm_bias_into(
         workspace.final_hidden,
         hidden_states,
         weights.final_layer_norm.weight,
@@ -581,7 +576,7 @@ def whisper_decoder_prefix(
         # so its last-token logits already are the upstream SOT distribution.
         # Keep that graph on the original B-row projection instead of paying
         # for the packed 2B projection used by earlier-SOT prefixes.
-        _LINEAR.linear(
+        runtime.linear.linear(
             workspace.last_hidden,
             weights.token_embedding,
             None,
@@ -605,7 +600,7 @@ def whisper_decoder_prefix(
             workspace.batch_size, 1, HIDDEN_SIZE
         ),
     )
-    _LINEAR.linear(
+    runtime.linear.linear(
         workspace.projection_hidden,
         weights.token_embedding,
         None,

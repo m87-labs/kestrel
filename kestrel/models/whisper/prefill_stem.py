@@ -7,8 +7,6 @@ import torch.nn.functional as F
 
 from kestrel_kernels import get_runtime
 
-_GELU = get_runtime().gelu
-
 MEL_BINS = 128
 INPUT_FRAMES = 3000
 HIDDEN_SIZE = 1280
@@ -169,7 +167,7 @@ def _postprocess(
     # faster (101.5 vs 104.8 us; 55.46 vs 55.74 us). At B8 it won both eager
     # and graphed: H100 626.9/596.1 vs 665.4/642.8 us, B200 304.4/276.6 vs
     # 321.6/294.2 us. Keeping the generic GELU/add epilogue for graph serving.
-    return _GELU.gelu_cute(
+    return get_runtime(inp.device).gelu.gelu_cute(
         inp,
         out=out,
         add=position,

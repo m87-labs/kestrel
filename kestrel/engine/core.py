@@ -356,7 +356,9 @@ class InferenceEngine:
                 else None
             )
             if max_lora_rank is not None:
-                if not get_runtime().moe.supports_lora(self._runtime_cfg.device):
+                if not get_runtime(
+                    self._runtime_cfg.resolved_device()
+                ).moe.supports_lora(self._runtime_cfg.device):
                     _LOGGER.warning(
                         "MoE LoRA adapters are unavailable in this kernel runtime. "
                         "Disabling LoRA — base model inference will still work, but "

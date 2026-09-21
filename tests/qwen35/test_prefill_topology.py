@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from kestrel.models.qwen35 import runtime as qwen_runtime
+from kestrel.models.qwen35 import qwen_model
 from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
 from kestrel.models.qwen35.runtime import Qwen35Runtime, _PackedPrefillBatch
 from kestrel.runtime.tokens import TextToken
@@ -21,7 +22,7 @@ def test_builder_binds_topology_from_ordered_host_lengths(monkeypatch) -> None:
     monkeypatch.setattr(
         qwen_runtime,
         "get_runtime",
-        lambda: SimpleNamespace(
+        lambda _device: SimpleNamespace(
             gated_delta=SimpleNamespace(
                 bind_packed_prefill_topology=bind_packed_prefill_topology
             )
@@ -101,7 +102,7 @@ def test_packed_prefill_batch_forwards_host_sequence_lengths() -> None:
     assert observed["max"] == 544
 
 
-def test_gdn_prefill_forwards_topology_to_combined_prefill() -> None:
+def test_gdn_prefill_forwards_topology_to_combined_prefill(monkeypatch) -> None:
     observed: dict[str, object] = {}
     layer = SimpleNamespace(
         conv_states=None,
@@ -137,13 +138,20 @@ def test_gdn_prefill_forwards_topology_to_combined_prefill() -> None:
         in_proj=lambda hidden: torch.zeros((1, 3, 4)),
         supports_packed_gdn=lambda *args: True,
         causal_conv1d_packed=lambda **kwargs: kwargs["x"],
-        allocate_packed_gdn_prefill_workspace=lambda *args, **kwargs: object(),
+        allocate_packed_gated_delta_prefill_workspace=(
+            lambda *args, **kwargs: object()
+        ),
         _prefill_workspace_cache=SimpleNamespace(
             get=lambda *args, **kwargs: object()
         ),
         packed_gated_delta_rule_prefill=packed_prefill,
         norm=lambda value, gate: value,
         out_proj=lambda value: value,
+    )
+    monkeypatch.setattr(
+        qwen_model,
+        "get_runtime",
+        lambda _device: SimpleNamespace(gated_delta=fake),
     )
 
     result = Qwen3_5GatedDeltaNet.forward(

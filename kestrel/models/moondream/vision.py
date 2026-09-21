@@ -14,12 +14,6 @@ from kestrel.utils.image import ensure_srgb
 from kestrel.ops.fused_mlp import fused_mlp_gelu_bias_residual_into
 from kestrel_kernels import get_runtime
 
-_KERNELS = get_runtime()
-fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
-_flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
-_layernorm_bias_into = _KERNELS.dense.layernorm_bias_into
-
-
 def prepare_crops(
     image: np.ndarray,
     config: VisionConfig,
@@ -132,6 +126,7 @@ def vision_encoder(
     x = create_patches(crops, config.enc_patch_size)
     x = module.patch_emb(x)
     x = x + module.pos_emb
+    runtime = get_runtime(x.device)
     early = None
     # Cross-arch: ``_layernorm_bias_into`` dispatches to the .so kernel
     # on CUDA / the Metal kernel on MPS. The kernel handles the SigLIP
@@ -139,7 +134,7 @@ def vision_encoder(
     x_norm_buf = torch.empty(x.shape, device=x.device, dtype=x.dtype)
 
     def _layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
-        _layernorm_bias_into(
+        runtime.dense.layernorm_bias_into(
             x_norm_buf, x, ln.weight, ln.bias, float(ln.eps),
         )
         return x_norm_buf
@@ -157,7 +152,7 @@ def vision_encoder(
             and attn_out.is_contiguous()
             and b_proj is not None
         ):
-            fused_linear_bias_residual_into(
+            runtime.vision.fused_linear_bias_residual_into(
                 x=attn_out,
                 w=block.attn["proj"].weight,
                 b=b_proj,
@@ -210,7 +205,9 @@ def _vision_attn(
     q = q.view(x.size(0), -1, n_heads, head_dim)
     k = k.view(x.size(0), -1, n_heads, head_dim)
     v = v.view(x.size(0), -1, n_heads, head_dim)
-    out, _ = _flash_attn_fwd(q, k, v, causal=False)
+    out, _ = get_runtime(q.device).attention.flash_attn_fwd(
+        q, k, v, causal=False
+    )
     return out.reshape(x.size(0), -1, dim)
 
 
