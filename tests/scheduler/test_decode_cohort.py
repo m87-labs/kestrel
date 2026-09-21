@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -97,8 +98,19 @@ def test_runtime_backpressure_accounts_for_inflight_steps() -> None:
     assert scheduler.schedule_decode_step().sequences == [ready]
     assert seen == [(blocked.skill_state, 1), (ready.skill_state, 0)]
 
+    blocked.skill_state.deadline = time.perf_counter() - 1
+    ready.skill_state.deadline = time.perf_counter() + 60
+    assert scheduler.schedule_decode_step() is None
+    blocked.inflight_refs = 0
+    assert scheduler.schedule_decode_step().sequences == [blocked]
+    scheduler._hooks = SamplingHooks(
+        can_dispatch=lambda state, *, inflight_steps: state is ready.skill_state
+    )
+    assert scheduler.schedule_decode_step().sequences == [ready]
 
-def test_stream_deadline_can_promote_a_resident_tail() -> None:
+
+def test_stream_deadline_can_promote_a_resident_tail(monkeypatch) -> None:
+    monkeypatch.setattr("kestrel.scheduler.scheduler.time.perf_counter", lambda: 0.0)
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
     scheduler._hooks = SamplingHooks()
@@ -114,7 +126,8 @@ def test_stream_deadline_can_promote_a_resident_tail() -> None:
     assert plan.sequences == [sequences[2], sequences[0]]
 
 
-def test_stream_deadline_reserves_one_dispatchable_ordinary_slot() -> None:
+def test_stream_deadline_reserves_one_dispatchable_ordinary_slot(monkeypatch) -> None:
+    monkeypatch.setattr("kestrel.scheduler.scheduler.time.perf_counter", lambda: 0.0)
     scheduler = object.__new__(GenerationScheduler)
     scheduler.runtime = FakeRuntime(max_batch_size=2, max_batch_slots=4)
     scheduler._hooks = SamplingHooks()
@@ -136,6 +149,10 @@ def test_stream_deadline_reserves_one_dispatchable_ordinary_slot() -> None:
         deadline_early,
         deadline_late,
     ]
+    monkeypatch.setattr("kestrel.scheduler.scheduler.time.perf_counter", lambda: 5.0)
+    assert scheduler.schedule_decode_step().sequences == [deadline_early]
+    ordinary.inflight_refs = 0
+    assert scheduler.schedule_decode_step().sequences == [deadline_early, ordinary]
 
 
 def test_decode_launch_retains_maximum_staged_position() -> None:
