@@ -283,6 +283,34 @@ class SinglePassRuntime(Runtime, Protocol):
     ) -> Sequence[Any | BaseException]: ...
 
 
+class PipelinedSinglePassRuntime(SinglePassRuntime, Protocol):
+    """Single-pass runtime whose forward splits into enqueue and read back.
+
+    ``forward`` is one call, so the executor cannot start a second cohort
+    until the first has been turned into results -- and a runtime that reads
+    its device work back before returning leaves the device idle for the whole
+    host half of the next cohort. A runtime that can stop after enqueueing
+    offers these two instead, and the executor keeps more than one cohort in
+    flight: ``launch`` returns a handle, and ``collect`` turns that handle into
+    the same results ``forward`` would have returned.
+
+    The executor discovers the pair by their presence, so declaring
+    ``forward`` alone remains a complete implementation.
+
+    ``launch`` must return once its device work is enqueued, without waiting
+    on it; the executor records the completion event on the compute stream
+    immediately afterwards and calls ``collect`` only once that event fires.
+    Both run on the executor's thread, inside its compute-stream context, and
+    in launch order.
+    """
+
+    # Enqueue one same-task cohort and return an opaque handle for it.
+    def launch(self, task: str, inputs: Sequence[Any]) -> Any: ...
+
+    # Turn a handle from ``launch`` into one result per input, in order.
+    def collect(self, batch: Any) -> Sequence[Any | BaseException]: ...
+
+
 class StreamingRuntime(Runtime, Protocol):
     """Runtime that advances model-owned state over caller-supplied chunks.
 

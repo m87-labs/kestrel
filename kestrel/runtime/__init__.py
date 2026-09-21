@@ -10,6 +10,7 @@ scheduler↔runtime contract. Concrete runtimes (e.g.
 from kestrel.runtime.protocol import (
     AutoregressiveRuntime,
     ExecutionShape,
+    PipelinedSinglePassRuntime,
     Runtime,
     SinglePassRuntime,
     StreamingRuntime,
@@ -33,6 +34,7 @@ __all__ = [
     "CoordToken",
     "ExecutionShape",
     "ImageMarker",
+    "PipelinedSinglePassRuntime",
     "PrefillClassification",
     "PreparedSequence",
     "Runtime",
