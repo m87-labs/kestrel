@@ -200,59 +200,36 @@ def _encoder_frames(samples: int, factor: int) -> int:
     return frames
 
 
-@dataclass(slots=True)
-class _StagingSlot:
-    host: torch.Tensor | None = None
-    copied: torch.cuda.Event | None = None
-
-
-class _WaveformStaging:
-    """Pinned host staging for one cohort's waveforms: one packed async copy.
+def _stage_waveforms(
+    blocks: Sequence[np.ndarray], device: torch.device
+) -> torch.Tensor:
+    """Pack ``blocks`` end to end on ``device`` with one pinned, async copy.
 
     ``torch.from_numpy(...).to(device)`` copies from pageable memory, which
     Torch completes with a stream synchronize -- so one such copy per distinct
     waveform length did not just cost a transfer, it drained every kernel the
-    compute stream still held. Measured on a B200 behind 145 ms of queued GEMMs,
-    128 pageable copies returned after 155 ms; the same rows packed into one
-    pinned buffer and copied once returned in 3.4 ms. That is what lets a batch
-    be enqueued while its predecessor is still running.
+    compute stream still held. Measured on a B200 behind 145 ms of queued
+    GEMMs, 128 pageable copies returned after 155 ms; the same rows packed into
+    one pinned buffer and copied once returned in 3.4 ms. That is what lets a
+    cohort be enqueued while its predecessor is still running.
 
-    ``slots`` buffers rotate so the copy out of one buffer may still be in
-    flight while the next cohort is packed into another.
+    The pinned buffer is per call and nothing holds it: Torch's caching host
+    allocator records the copy on the block and will not hand that block out
+    again until the copy has completed, so no buffer has to be retained or
+    waited on here. A warm allocator returns one in about a microsecond.
     """
 
-    def __init__(self, device: torch.device, *, slots: int = 2) -> None:
-        if slots < 1:
-            raise ValueError("waveform staging needs at least one slot")
-        self._device = device
-        self._slots = [_StagingSlot() for _ in range(slots)]
-        self._next = 0
-
-    def stage(self, blocks: Sequence[np.ndarray]) -> torch.Tensor:
-        """Pack ``blocks`` end to end on the device, ordered as given."""
-
-        total = sum(int(block.size) for block in blocks)
-        slot = self._slots[self._next]
-        self._next = (self._next + 1) % len(self._slots)
-        if slot.copied is not None:
-            # The previous copy out of this buffer must have read it before we
-            # overwrite it. In steady state this event is long past.
-            slot.copied.synchronize()
-        if slot.host is None or slot.host.numel() < total:
-            slot.host = torch.empty(total, dtype=torch.float32, pin_memory=True)
-        host = slot.host[:total]
-        view = host.numpy()
-        at = 0
-        for block in blocks:
-            size = int(block.size)
-            view[at : at + size] = block
-            at += size
-        device = torch.empty(total, dtype=torch.float32, device=self._device)
-        device.copy_(host, non_blocking=True)
-        if slot.copied is None:
-            slot.copied = torch.cuda.Event()
-        slot.copied.record()
-        return device
+    total = sum(int(block.size) for block in blocks)
+    host = torch.empty(total, dtype=torch.float32, pin_memory=True)
+    view = host.numpy()
+    at = 0
+    for block in blocks:
+        size = int(block.size)
+        view[at : at + size] = block
+        at += size
+    staged = torch.empty(total, dtype=torch.float32, device=device)
+    staged.copy_(host, non_blocking=True)
+    return staged
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,8 +321,6 @@ class ParakeetTdtRuntime:
     # Transducer decoding keeps its own small decoder state; there is no paged
     # KV cache here, so the engine skips building (and importing) one.
     needs_kv_pool = False
-    # Pinned staging for waveform uploads; CUDA only, resolved per instance.
-    _staging: "_WaveformStaging | None" = None
 
     def __init__(
         self,
@@ -433,11 +408,9 @@ class ParakeetTdtRuntime:
                 max_batch=self.batch_capacity,
                 compute_stream=stream,
             )
-        self._staging = (
-            _WaveformStaging(self.device)
-            if self.device.type == "cuda" and torch.cuda.is_available()
-            else None
-        )
+        # Pinned staging is a CUDA-only win; elsewhere the upload is a copy
+        # into host memory the model reads directly.
+        self._pin_waveforms = self.device.type == "cuda" and torch.cuda.is_available()
         self._encoder_graph = ParakeetEncoderGraph(
             self.model,
             max_batch=self.batch_capacity,
@@ -486,13 +459,14 @@ class ParakeetTdtRuntime:
             groups.setdefault(audio.waveform.size, []).append(group_index)
 
         staged = None
-        if self._staging is not None:
-            staged = self._staging.stage(
+        if self._pin_waveforms:
+            staged = _stage_waveforms(
                 [
                     rows[index][1].waveform
                     for indices in groups.values()
                     for index in indices
-                ]
+                ],
+                self.device,
             )
 
         feature_rows: dict[int, torch.Tensor] = {}

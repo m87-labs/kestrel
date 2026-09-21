@@ -119,6 +119,7 @@ def _runtime(vad_head=None):
         vad_head=vad_head,
     )
     runtime.tokenizer = _Tokenizer()
+    runtime._pin_waveforms = False
     runtime._batch_decoder = None
     runtime._encoder_graph = None
     return runtime

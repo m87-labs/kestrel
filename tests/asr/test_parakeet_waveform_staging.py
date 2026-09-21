@@ -3,8 +3,7 @@
 The rows a cohort uploads used to travel as one pageable ``.to(device)`` per
 distinct waveform length, and Torch finishes a pageable copy with a stream
 synchronize -- so the upload drained whatever the compute stream still held.
-These pin the packing contract (order, values, buffer reuse) the async copy
-replaces it with.
+These pin the packing contract (order, values) the async copy replaces it with.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import pytest
 import torch
 
 from kestrel.models.asr.audio import DecodedAudio
-from kestrel.models.parakeet_tdt.runtime import ParakeetTdtRuntime, _WaveformStaging
+from kestrel.models.parakeet_tdt.runtime import ParakeetTdtRuntime, _stage_waveforms
 
 
 requires_cuda = pytest.mark.skipif(
@@ -28,30 +27,41 @@ def _audio(waveform: np.ndarray) -> DecodedAudio:
 
 @requires_cuda
 def test_stage_packs_rows_end_to_end_in_order() -> None:
-    staging = _WaveformStaging(torch.device("cuda"))
     blocks = [
         np.arange(4, dtype=np.float32),
         np.arange(10, 13, dtype=np.float32),
         np.arange(20, 27, dtype=np.float32),
     ]
 
-    staged = staging.stage(blocks)
+    staged = _stage_waveforms(blocks, torch.device("cuda"))
 
     assert staged.shape == (14,)
     assert staged.tolist() == [float(v) for block in blocks for v in block]
 
 
 @requires_cuda
-def test_stage_reuses_its_buffers_without_corrupting_a_live_copy() -> None:
-    """Rotating slots: an earlier stage's values survive later stages."""
-    staging = _WaveformStaging(torch.device("cuda"), slots=2)
-    first = staging.stage([np.full(2048, 1.0, dtype=np.float32)])
-    second = staging.stage([np.full(2048, 2.0, dtype=np.float32)])
-    third = staging.stage([np.full(2048, 3.0, dtype=np.float32)])
+def test_a_staged_copy_is_not_overtaken_by_the_next_one() -> None:
+    """Each cohort gets its own pinned buffer and drops it on the way out.
 
-    assert first.max().item() == 1.0
-    assert second.max().item() == 2.0
-    assert third.max().item() == 3.0
+    Nothing here waits on the copy: Torch's caching host allocator records it
+    on the pinned block and will not hand that block back until it has
+    completed, so a buffer freed mid-flight cannot be repacked underneath a
+    copy still reading it. Stage several cohorts behind queued device work and
+    every one of them must still read back the values it was given.
+    """
+
+    device = torch.device("cuda")
+    ballast = torch.randn(4096, 4096, device=device)
+    staged = []
+    for value in range(1, 6):
+        ballast @ ballast  # keep the copies queued behind real work
+        staged.append(
+            _stage_waveforms([np.full(2**20, value, dtype=np.float32)], device)
+        )
+    torch.cuda.synchronize()
+
+    assert [int(item.min().item()) for item in staged] == [1, 2, 3, 4, 5]
+    assert [int(item.max().item()) for item in staged] == [1, 2, 3, 4, 5]
 
 
 @requires_cuda
@@ -66,9 +76,9 @@ def test_batch_features_match_the_pageable_upload() -> None:
         for index, size in enumerate((16_000, 16_000, 9_600, 24_321))
     ]
 
-    runtime._staging = None
+    runtime._pin_waveforms = False
     pageable_features, pageable_mask = runtime._batch_audio_features(rows)
-    runtime._staging = _WaveformStaging(runtime.device)
+    runtime._pin_waveforms = True
     staged_features, staged_mask = runtime._batch_audio_features(rows)
 
     assert torch.equal(staged_features, pageable_features)
