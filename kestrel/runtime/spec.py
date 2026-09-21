@@ -421,4 +421,3 @@ class SpecDecodeCaps:
     # Every backend reports one result or exception per request in input order.
     admit_many: Callable[[SpecDecoder, Sequence[SpecAdmission]],
                          list[tuple[int, float | None] | Exception]] = admit_independently
-    admission_token_budget: int = 512

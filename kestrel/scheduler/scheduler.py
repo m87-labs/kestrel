@@ -756,7 +756,6 @@ class GenerationScheduler:
         max_running = self.runtime.max_batch_size
         pending = []
         pending_tokens = 0
-        token_budget = self.runtime.spec.admission_token_budget
         while len(pending) < decoder.free_slots and len(self.running) + len(pending) < max_running:
             request = next(
                 (
@@ -770,7 +769,8 @@ class GenerationScheduler:
             if request is None:
                 break
             prompt_cost = len(request.prefill_tokens) + request.image_length
-            if pending and pending_tokens + prompt_cost > token_budget:
+            # Bound packed work without delaying a long prompt for batching.
+            if pending and pending_tokens + prompt_cost > 512:
                 break
             lifecycle = request.lifecycle
             # Zero-token requests were already finalized in the pre-pass above

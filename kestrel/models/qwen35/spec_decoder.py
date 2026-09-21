@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager
-from copy import copy
 from collections import Counter
 from typing import Any
 
@@ -196,7 +195,8 @@ class Qwen35DFlashDecoder:
                 state = source.recurrent_states
                 layer.recurrent_states = torch.empty(
                     (len(prompts), *state.shape[1:]), device=state.device, dtype=state.dtype)
-        ids = torch.tensor([sum(prompts, [])], device=device, dtype=torch.long)
+        ids = torch.tensor([[token for prompt in prompts for token in prompt]],
+                           device=device, dtype=torch.long)
         positions = torch.cat([torch.arange(length, device=device) for length in lengths])[None]
         slot_ids = torch.tensor(slots, device=device, dtype=torch.long)
         page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
@@ -220,14 +220,11 @@ class Qwen35DFlashDecoder:
         last = output.last_hidden_state.index_select(1, ends)
         tokens = self.runtime.model.lm_head(last).argmax(-1)[0].tolist()
         for row, (cache, length) in enumerate(zip(caches, lengths, strict=True)):
-            layers = list(cache.layers)
-            for index, layer in enumerate(packed.layers):
+            for owned, layer in zip(cache.layers, packed.layers, strict=True):
                 if isinstance(layer, LinearAttentionState):
-                    owned = copy(layer)
                     owned.conv_states = layer.conv_states[row:row + 1]
                     owned.recurrent_states = layer.recurrent_states[row:row + 1]
-                    layers[index] = owned
-            cache.layers = tuple(layers)
+                    owned.has_previous_state = layer.has_previous_state
             cache.advance_to(length)
         return list(zip(tokens, features, caches, strict=True))
 

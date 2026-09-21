@@ -500,6 +500,8 @@ def test_packed_admission_isolates_slots_lengths_and_failures(monkeypatch, fail_
         assert results[0] == (2, None) and results[2] == (3, None)
         first, second = obj._sessions[3], obj._sessions[2]
         assert (first.cache.seq_length, second.cache.seq_length) == (2, 1)
+        assert first.cache.layers[0].has_previous_state
+        assert second.cache.layers[0].has_previous_state
         assert first.features.flatten().tolist() == [1, 2]
         assert second.features.flatten().tolist() == [3]
         first.cache.layers[0].recurrent_states.fill_(99)
