@@ -253,8 +253,13 @@ def test_rejects_a_non_positive_in_flight_limit() -> None:
 
 
 def test_pipelined_collect_follows_launch_order(monkeypatch) -> None:
-    """The second cohort's event fires first; its results still wait."""
-    events = iter([_PendingEvent(not_done_polls=1), _PendingEvent(not_done_polls=0)])
+    """The second cohort's event fires first; its results still wait.
+
+    The first cohort's event is polled twice per tick -- once by ``_launch``,
+    deciding whether a second cohort is worth starting, and once by
+    ``_collect`` -- so two not-done polls hold it for one tick.
+    """
+    events = iter([_PendingEvent(not_done_polls=2), _PendingEvent(not_done_polls=0)])
     monkeypatch.setattr(single_pass_mod, "make_event", lambda device: next(events))
     driver = _PipelinedDriver()
     ex = SinglePassExecutor(driver, compute_stream=None)
@@ -276,12 +281,13 @@ def test_pipelined_launch_failure_fails_only_its_cohort() -> None:
     ex.submit(_req(1, "boom", 1))
     ex.submit(_req(2, "a", 2))
 
-    tick = ex.advance()
+    first, second = ex.advance(), ex.advance()
 
-    assert isinstance(tick.completed[0].error, ValueError)
-    assert tick.completed[0].request.request_id == 1
-    assert tick.completed[1].error is None
-    assert tick.completed[1].result.output == {"task": "a", "inputs": 2}
+    assert [c.request.request_id for c in first.completed] == [1]
+    assert isinstance(first.completed[0].error, ValueError)
+    assert [c.request.request_id for c in second.completed] == [2]
+    assert second.completed[0].error is None
+    assert second.completed[0].result.output == {"task": "a", "inputs": 2}
 
 
 def test_pipelined_collect_failure_fails_only_its_cohort() -> None:
@@ -290,11 +296,37 @@ def test_pipelined_collect_failure_fails_only_its_cohort() -> None:
     ex.submit(_req(1, "kaboom", 1))
     ex.submit(_req(2, "a", 2))
 
-    tick = ex.advance()
+    first, second = ex.advance(), ex.advance()
 
-    assert [c.request.request_id for c in tick.completed] == [1, 2]
-    assert str(tick.completed[0].error) == "collect failed"
-    assert tick.completed[1].error is None
+    assert [c.request.request_id for c in first.completed] == [1]
+    assert str(first.completed[0].error) == "collect failed"
+    assert [c.request.request_id for c in second.completed] == [2]
+    assert second.completed[0].error is None
+
+
+def test_a_launch_that_already_finished_does_not_start_the_next_cohort() -> None:
+    """``max_in_flight`` is a ceiling, not a target.
+
+    A pipelined ``launch`` only defers when the cohort lets it: not on CPU or
+    MPS, where the completion event is a stand-in that reads as fired the
+    moment it is recorded, and not for a cohort it had to finish in place.
+    Starting a second cohort behind one that is already done buys no overlap
+    and runs a whole forward before delivering results that are ready.
+    """
+    driver = _PipelinedDriver()
+    ex = SinglePassExecutor(driver, compute_stream=None)
+    for request_id in range(4):
+        ex.submit(_req(request_id, "a", request_id))
+
+    first = ex.advance()
+
+    assert [inputs for _task, inputs in driver.calls] == [(0, 1)]
+    assert [c.request.request_id for c in first.completed] == [0, 1]
+
+    second = ex.advance()
+
+    assert [inputs for _task, inputs in driver.calls] == [(0, 1), (2, 3)]
+    assert [c.request.request_id for c in second.completed] == [2, 3]
 
 
 def test_pipelined_collect_must_answer_every_request() -> None:

@@ -241,6 +241,15 @@ class SinglePassExecutor:
         progressed = False
         completed: List[Completion] = []
         while len(self._in_flight) < self._max_in_flight:
+            if self._in_flight and self._settled(self._in_flight[-1]):
+                # A second cohort is only worth launching while the newest one
+                # is still running on the device. A pipelined runtime returns
+                # from ``launch`` with results already in hand whenever the
+                # cohort would not let it stop after the encoder -- and always
+                # on CPU and MPS, where the event is a no-op that reads as
+                # fired -- so launching again here would run the next cohort's
+                # whole forward before delivering results that are ready.
+                break
             try:
                 requests = self._take_batch()
             except queue.Empty:
@@ -310,6 +319,11 @@ class SinglePassExecutor:
         return True
 
     @staticmethod
+    def _settled(in_flight: _InFlight) -> bool:
+        """Whether this forward is already finished, event and all."""
+        return in_flight.error is not None or in_flight.done_event.query()
+
+    @staticmethod
     def _checked(
         values: Sequence[Any], requests: Sequence[_SinglePassRequest]
     ) -> tuple[Any, ...]:
@@ -332,7 +346,7 @@ class SinglePassExecutor:
         completed: List[Completion] = []
         while self._in_flight:
             f = self._in_flight[0]
-            if f.error is None and not f.done_event.query():
+            if not self._settled(f):
                 break
             self._in_flight.pop(0)
             error = f.error
