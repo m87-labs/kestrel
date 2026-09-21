@@ -6,6 +6,111 @@ import torch
 from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_retired_gemm_graph_releases_workspace():
+    import gc
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.Stream(device=device)
+    value = torch.randn(128, 5120, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(96, 5120, device=device, dtype=torch.bfloat16)
+    expected = torch.nn.functional.linear(value, weight)
+    torch.cuda.synchronize()
+    gc.collect()
+    baseline = torch.cuda.memory_allocated(device)
+    for _ in range(40):
+        session = FixedShapeSinglePassGraph(
+            enabled=True, device=device, stream=stream,
+            run_forward=lambda x: (torch.nn.functional.linear(x, weight),))
+        try:
+            with session.launch(value) as (output,):
+                stream.synchronize()
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        finally:
+            session.shutdown()
+        del output, session
+        gc.collect()
+        torch.cuda.synchronize()
+        # Allow small library bookkeeping, but not a retained cuBLAS workspace.
+        assert torch.cuda.memory_allocated(device) <= baseline + 1024 * 1024
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_live_gemm_survives_unrelated_graph_retirement():
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    weight = torch.randn(96, 5120, device=device, dtype=torch.bfloat16)
+    value = torch.randn(128, 5120, device=device, dtype=torch.bfloat16)
+    survivor = FixedShapeSinglePassGraph(
+        enabled=True, device=device, stream=stream,
+        run_forward=lambda x: (torch.nn.functional.linear(x, weight),))
+    try:
+        with survivor.launch(value) as (output,):
+            expected = output.clone()
+        for _ in range(40):
+            other = FixedShapeSinglePassGraph(
+                enabled=True, device=device, stream=stream,
+                run_forward=lambda x: (x + 1,))
+            try:
+                with other.launch(value):
+                    pass
+            finally:
+                other.shutdown()
+            torch.cuda.empty_cache()
+            with survivor.launch(value) as (output,):
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    finally:
+        survivor.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capture_failure_closes_owned_stream(monkeypatch):
+    import kestrel.runtime.single_pass_graph as streams
+
+    created = []
+    original = streams.OwnedCudaStream
+
+    class TrackedStream(original):
+        def __init__(self, device):
+            super().__init__(device)
+            created.append(self)
+
+    monkeypatch.setattr(streams, "OwnedCudaStream", TrackedStream)
+
+    def fail(value):
+        raise RuntimeError("forward failed")
+
+    session = FixedShapeSinglePassGraph(
+        enabled=True, device=torch.device("cuda"), stream=None, run_forward=fail)
+    try:
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with session.launch(torch.ones(16, device="cuda")):
+                pass
+        assert len(created) == 1
+        assert created[0]._handle.value is None
+        assert not session._entries
+    finally:
+        session.shutdown()
+
+
+def test_shutdown_closes_all_entries_when_one_close_fails():
+    from unittest.mock import Mock
+
+    session = FixedShapeSinglePassGraph(
+        enabled=False, device=torch.device("cpu"), stream=None,
+        run_forward=lambda x: (x,))
+    entries = [Mock(), Mock()]
+    entries[1].close.side_effect = RuntimeError("close failed")
+    session._entries.update(enumerate(entries))
+    with pytest.raises(RuntimeError, match="close failed"):
+        session.shutdown()
+    for entry in entries:
+        entry.close.assert_called_once_with()
+    assert not session._entries
+    assert session._stream is None
+    session.shutdown()
+
+
 def test_graph_input_copies_group_dtypes_and_preserve_views(monkeypatch):
     from kestrel.runtime.single_pass_graph import _GraphInputCopies
 
@@ -150,10 +255,13 @@ def test_shutdown_releases_state_when_stream_synchronize_fails() -> None:
 
     session.enabled = True
     session._stream = _FailingStream()  # type: ignore[assignment]
-    session._entries[()] = object()  # type: ignore[index,assignment]
+    from unittest.mock import Mock
+    entry = Mock()
+    session._entries[()] = entry
     with pytest.raises(RuntimeError, match="sync failed"):
         session.shutdown()
     assert not session._entries
+    entry.close.assert_called_once_with()
     assert session._stream is None
     assert session._run_forward(torch.tensor([1])) == ()
     session.shutdown()

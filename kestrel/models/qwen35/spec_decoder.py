@@ -22,6 +22,7 @@ class _Session:
     features: torch.Tensor
     bonus: int
     failed: bool = False
+    spare_cache: Qwen35InferenceCache | None = None
 
 
 class Qwen35DFlashDecoder:
@@ -50,11 +51,15 @@ class Qwen35DFlashDecoder:
         self._draft_graph_enabled = runtime._cfg.enable_cuda_graphs
         self._graph_failed = False
         self._closed = False
+        self._commit_stream = torch.cuda.Stream(device=runtime.device)
+        self._commit_inputs_ready = torch.cuda.Event()
+        self._commit_ready = torch.cuda.Event()
+        self._commit_pending = False
         if runtime._cfg.enable_cuda_graphs:
             from .spec_target_graph import Qwen35TargetGraph
             from .spec_replay_graph import Qwen35ReplayGraph
             self._target_graph = Qwen35TargetGraph(runtime, self.text,
-                config.target_layer_ids, config.block_size)
+                config.target_layer_ids, config.block_size, finalize_stream=self._commit_stream)
             self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
                 target.num_hidden_layers)
 
@@ -66,6 +71,7 @@ class Qwen35DFlashDecoder:
     def shutdown(self):
         self._closed = True
         try:
+            self._commit_stream.synchronize()
             if self._target_graph is not None:
                 self._target_graph.shutdown()
         finally:
@@ -122,7 +128,8 @@ class Qwen35DFlashDecoder:
                 if isinstance(layer, LinearAttentionState):
                     layer.recurrent_states = layer.recurrent_states[slot:slot + 1]
             expected, features, cache = self._target(tokens, cache, slot, capture=False)
-            self._sessions[slot] = _Session(state, cache, DFlashContextCache(capacity), features, expected[-1])
+            self._sessions[slot] = _Session(state, cache, DFlashContextCache(capacity), features,
+                expected[-1], spare_cache=cache.fork_recurrent_state())
             return expected[-1], None
         except Exception:
             pages.erase(slot)
@@ -130,6 +137,7 @@ class Qwen35DFlashDecoder:
             raise
 
     def _target(self, tokens, committed, slot, *, capture, leases=None):
+        self._wait_for_commit()
         cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
@@ -214,6 +222,7 @@ class Qwen35DFlashDecoder:
 
     def _target_many(self, candidates, sessions, *, leases=None):
         """Verify independent sequences together, retaining separate commit owners."""
+        self._wait_for_commit()
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
@@ -315,11 +324,14 @@ class Qwen35DFlashDecoder:
             if all(verified._prefix_records and all(
                     record.prefix_context is not None for record in verified._prefix_records.values())
                     for _, verified, _, _, _ in pending):
-                committed = Qwen35InferenceCache.commit_recurrent_prefixes(
-                    [ctx[1] for ctx in pending], [ctx[4] for ctx in pending],
-                    finalizer=(None if self._target_graph is None
-                               else self._target_graph.finalize_prefixes))
+                with self._finalization_stream():
+                    committed = Qwen35InferenceCache.commit_recurrent_prefixes(
+                        [ctx[1] for ctx in pending], [ctx[4] for ctx in pending],
+                        finalizer=(None if self._target_graph is None
+                                   else self._target_graph.finalize_prefixes),
+                        _destinations=[session.spare_cache for session, _ in sessions])
                 for (session, _, features, expected, count), cache in zip(pending, committed):
+                    session.spare_cache = session.cache
                     session.cache = cache
                     session.features = features[:, :count]
                     session.bonus = expected[count - 1]
@@ -338,12 +350,36 @@ class Qwen35DFlashDecoder:
         return SpecStepResult(tokens=[expected[:count] for _, _, _, expected, count in pending],
                               accept_counts=[count-1 for _, _, _, _, count in pending])
 
+    def _wait_for_commit(self):
+        if self._commit_pending:
+            torch.cuda.current_stream(self.runtime.device).wait_event(self._commit_ready)
+
+    @contextmanager
+    def _finalization_stream(self):
+        if self._target_graph is None:
+            # Eager prefix tensors are released after commit. Keep their reads
+            # on the allocation stream; graph-owned buffers outlive async work.
+            yield
+            return
+        stream = self._commit_stream
+        self._commit_inputs_ready.record(torch.cuda.current_stream(self.runtime.device))
+        stream.wait_event(self._commit_inputs_ready)
+        with torch.cuda.stream(stream):
+            try:
+                yield
+            finally:
+                # Even a failed partial copy may still be using slot storage.
+                self._commit_ready.record(stream)
+                self._commit_pending = True
+
     def retire(self, state):
         session = self._sessions.get(state.batch_idx)
         if session is None:
             return
         if session.state is not state:
             raise ValueError("cannot retire a different speculative sequence")
+        if self._commit_pending:
+            self._commit_ready.synchronize()
         self.runtime.page_table.erase(state.batch_idx)
         # Scheduler cleanup still uses batch_idx to remove active_sequences.
         del self._sessions[state.batch_idx]

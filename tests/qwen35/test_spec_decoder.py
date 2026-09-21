@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -15,6 +16,10 @@ def decoder():
     obj._draft_graph = None
     obj._draft_graph_enabled = False
     obj._graph_failed = obj._closed = False
+    obj._commit_stream = SimpleNamespace(synchronize=lambda: None)
+    obj._finalization_stream = nullcontext
+    obj._commit_ready = None
+    obj._commit_pending = False
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(
@@ -61,6 +66,14 @@ def test_retire_releases_slot_and_capture_once():
     obj.retire(state)
     assert erased == [1]
     assert obj.free_slots == 1 and not obj._sessions
+
+
+def test_retire_waits_for_pending_state_writes_before_releasing_slot():
+    obj, state, _, erased = decoder()
+    obj._commit_pending = True
+    obj._commit_ready = SimpleNamespace(synchronize=lambda: erased.append("completed"))
+    obj.retire(state)
+    assert erased == ["completed", 1]
 
 
 def test_shutdown_releases_replay_graph_after_target_shutdown_error():

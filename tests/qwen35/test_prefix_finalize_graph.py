@@ -51,6 +51,7 @@ def test_row_output_lease_reuse_and_cancellation(monkeypatch, device, capture):
     graph = object.__new__(spec_target_graph.Qwen35TargetGraph)
     graph._runtime = SimpleNamespace(max_batch_size=1, device=torch.device(device),
         _compute_stream=torch.cuda.Stream(device=device) if capture else None)
+    graph._finalize_stream = graph._runtime._compute_stream
     graph._finalizers, graph._bound_outputs = OrderedDict(), OrderedDict()
     graph._layouts, graph._prefix_bindings = {}, {}
     graph._graphs = SimpleNamespace(shutdown=lambda: None)
@@ -106,6 +107,7 @@ def test_same_shape_target_recapture_rebinds_finalizer_and_releases_evicted_owne
     graph = object.__new__(spec_target_graph.Qwen35TargetGraph)
     graph._runtime = SimpleNamespace(max_batch_size=1, device=torch.device("cpu"),
                                      _compute_stream=None)
+    graph._finalize_stream = None
     graph._finalizers = OrderedDict()
     graph._bound_outputs = OrderedDict()
     graph._graphs = SimpleNamespace(shutdown=lambda: None)
@@ -199,6 +201,7 @@ def test_bound_target_entry_reuses_records_and_evicts_matching_finalizer(monkeyp
     graph = object.__new__(spec_target_graph.Qwen35TargetGraph)
     graph._runtime = SimpleNamespace(max_batch_size=1, device=torch.device("cpu"),
                                      _compute_stream=None)
+    graph._finalize_stream = None
     graph._finalizers = OrderedDict()
     graph._bound_outputs = OrderedDict()
     graph._capture_layers = ()

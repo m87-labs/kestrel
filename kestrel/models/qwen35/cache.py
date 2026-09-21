@@ -201,6 +201,8 @@ class Qwen35InferenceCache:
                 tensors = [getattr(owner, name) for owner in owners]
                 if any(tensor is None or tensor.shape[0] != 1 for tensor in tensors):
                     raise ValueError("packed verification requires initialized single-row state")
+                # Tried batched copies reusing branch views: C8 serving 1605
+                # vs 1667 tok/s (mixed GC), also slower in low-GC samples.
                 setattr(layer, name, torch.cat(tensors, dim=0))
             packed_layers[index] = layer
             for row, branch in enumerate(branches):
@@ -214,7 +216,7 @@ class Qwen35InferenceCache:
         return packed, branches
 
     @staticmethod
-    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None):
+    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None, _destinations=None):
         """Finalize one packed verification before publishing any cache state."""
         from contextlib import nullcontext
 
@@ -232,6 +234,15 @@ class Qwen35InferenceCache:
         sources = tuple(cache._prefix_source for cache in caches)
         if any(source is None for source in sources) or len({id(source) for source in sources}) != len(sources):
             raise RuntimeError("packed prefix requires distinct committed sources")
+        # Decoder-owned inactive banks are never exposed as cache snapshots.
+        # Ordinary callers retain the detached-allocation contract below.
+        if _destinations is not None:
+            _destinations = tuple(_destinations)
+            if (len(_destinations) != len(caches)
+                    or len({id(value) for value in _destinations}) != len(caches)
+                    or any(value is source or value is branch
+                           for value in _destinations for source, branch in zip(sources, caches))):
+                raise ValueError("prefix destinations must be distinct inactive cache banks")
         count = len(caches)
         conv_shapes = []
         for index in indices:
@@ -266,8 +277,8 @@ class Qwen35InferenceCache:
                 raise ValueError("packed prefix finalizer requires state/history pairs")
             # Allocate after submission to overlap host work with finalization.
             # Destinations remain detached until every state/history is written.
-            results = []
-            for source in sources:
+            results = [] if _destinations is None else list(_destinations)
+            for source in (() if _destinations is not None else sources):
                 result = copy(source)
                 result._prefix_source = None
                 result._prefix_start = result._prefix_row = 0
