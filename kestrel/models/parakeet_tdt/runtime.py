@@ -215,9 +215,31 @@ class _StreamWindow:
     duration_seconds: float
 
 
+# Requests per forward. On CUDA the encoder runs eagerly above the graph threshold, so a large batch is pure
+# throughput: measured on a B200 with parakeet-tdt-0.6b-v3 on LibriSpeech test-clean (longest rows 35 s), real
+# time factor and peak allocated memory -- capacity 8 2,324x / 2.0 GiB, 16 2,530x / 2.7 GiB, 64 3,800x / 7.0 GiB,
+# 128 4,051x / 12.8 GiB, 256 4,516x / 24.4 GiB. CPU and MPS keep 8: there a batch costs latency and memory and
+# buys little. ``RuntimeConfig.single_pass_batch_capacity`` overrides the choice.
+_BATCH_CAPACITY = 8
+_CUDA_BATCH_CAPACITY = 128
+_CUDA_BATCH_CAPACITY_SMALL = 64  # devices under 40 GiB
+
+
+def _batch_capacity(cfg: Any, device: torch.device) -> int:
+    configured = getattr(cfg, "single_pass_batch_capacity", None)
+    if configured is not None:
+        if type(configured) is not int or configured <= 0:
+            raise ValueError("single_pass_batch_capacity must be a positive integer")
+        return configured
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return _BATCH_CAPACITY
+    total = torch.cuda.get_device_properties(device).total_memory
+    return _CUDA_BATCH_CAPACITY if total >= 40 * 2**30 else _CUDA_BATCH_CAPACITY_SMALL
+
+
 class ParakeetTdtRuntime:
     execution_shape = ExecutionShape.SINGLE_PASS
-    batch_capacity = 8
+    batch_capacity = _BATCH_CAPACITY  # resolved per instance in __init__
     # Transducer decoding keeps its own small decoder state; there is no paged
     # KV cache here, so the engine skips building (and importing) one.
     needs_kv_pool = False
@@ -246,6 +268,7 @@ class ParakeetTdtRuntime:
         )
         if self.device.type == "cpu":
             self.dtype = _cpu_dtype(self.dtype)
+        self.batch_capacity = _batch_capacity(cfg, self.device)
         self.compute_stream = (
             compute_stream
             if compute_stream is not None

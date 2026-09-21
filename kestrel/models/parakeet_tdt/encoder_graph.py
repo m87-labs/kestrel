@@ -17,9 +17,9 @@ _ENCODER_GRAPH_BUCKETS = (48, 80, 128, 224)
 # bucket padding (1.25x the real frames on LibriSpeech test-clean, 1.95x on AMI, whose median segment is 1.5 s
 # against the 3.8 s smallest bucket) and one capture per (batch, bucket) pair cost more than the launches saved.
 # Measured on a B200 with parakeet-tdt-0.6b-v3, graphed over eager real-time factor, LibriSpeech test-clean / AMI
-# test: batch 1 1.46x / 1.64x, 2 1.40x / 1.56x, 4 1.30x / 1.47x, 8 1.22x / 1.36x, 32 0.99x / 1.00x, 128 0.70x / 0.74x.
-# Batches above this size run eagerly, padded only to their own longest row.
-_ENCODER_GRAPH_MAX_BATCH = 8
+# test: batch 1 1.46x / 1.64x, 2 1.40x / 1.56x, 4 1.30x / 1.47x, 8 1.22x / 1.36x, 16 1.18x / 1.15x, 32 0.99x / 1.00x,
+# 128 0.70x / 0.74x. Batches above this size run eagerly, padded only to their own longest row.
+_ENCODER_GRAPH_MAX_BATCH = 16
 
 
 def _normalize_buckets(buckets: tuple[int, ...]) -> tuple[int, ...]:

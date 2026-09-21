@@ -178,6 +178,10 @@ class RuntimeConfig:
     # that support it must bind compatible generated programs for the complete
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
+    # Requests per forward for single-pass runtimes (Parakeet). ``None`` lets
+    # the runtime choose by device: 128 on CUDA devices of 40 GiB or more, 64
+    # on smaller ones, 8 on CPU and MPS.
+    single_pass_batch_capacity: int | None = None
     # Intra-op threads for CPU inference. Runtimes may also use this to size
     # their native worker pools. ``None`` lets the runtime choose; ignored off
     # CPU.
@@ -196,6 +200,11 @@ class RuntimeConfig:
 
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be a positive integer")
+        if self.single_pass_batch_capacity is not None and (
+            type(self.single_pass_batch_capacity) is not int
+            or self.single_pass_batch_capacity <= 0
+        ):
+            raise ValueError("single_pass_batch_capacity must be a positive integer")
 
         self._validate_device_available()
 
