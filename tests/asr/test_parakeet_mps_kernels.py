@@ -1,7 +1,8 @@
 """The encoder must give the same answer whichever conformer backend the runtime resolves to.
 
-The model calls ``get_runtime().conformer`` and never branches on the device, so the check is: run the encoder
-against the backend this host has, then against the torch reference, and compare. On a Mac that exercises the
+The model selects ``get_runtime(tensor.device).conformer`` without branching on
+the device, so the check is: run the encoder against the backend this host has,
+then against the torch reference, and compare. On a Mac that exercises the
 fused Metal kernels; anywhere else both sides are the reference and the test still guards the wiring.
 """
 
@@ -53,7 +54,7 @@ def _use_reference(monkeypatch) -> None:
     monkeypatch.setattr(
         parakeet_model,
         "get_runtime",
-        lambda: SimpleNamespace(conformer=torch_conformer_runtime("shifted")),
+        lambda _device: SimpleNamespace(conformer=torch_conformer_runtime("shifted")),
     )
 
 

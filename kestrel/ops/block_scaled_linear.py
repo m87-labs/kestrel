@@ -6,9 +6,6 @@ from torch import nn
 from kestrel_kernels import get_runtime
 
 
-_block_scaled_linear = get_runtime().linear.block_scaled_linear
-
-
 class BlockScaledLinear(nn.Module):
     """Keep FP8 checkpoint bytes and an optional unquantized row suffix.
 
@@ -98,7 +95,7 @@ class BlockScaledLinear(nn.Module):
         return torch.cat((prefix, self.weight_tail.to(dtype)), dim=0)
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
-        return _block_scaled_linear(
+        return get_runtime(activation.device).linear.block_scaled_linear(
             activation,
             self.weight,
             self.weight_scale_inv,

@@ -4,6 +4,9 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.8.1 — 2026-09-21
+
+- Kept CPU-selected Parakeet inference on CPU and avoided allocating GPU memory during import.
 - Resolved compiler-declared runtime resources when fusion changes generated
   output argument names.
 - Added the model-bound `synthesize` capability and append-only streaming

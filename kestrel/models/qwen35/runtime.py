@@ -1173,7 +1173,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
         batch_size = len(prepared_sequences)
         sequence_lengths = tuple(lengths)
         cu_seq_lens_q, topology_token = (
-            get_runtime().gated_delta.bind_packed_prefill_topology(
+            get_runtime(self.device).gated_delta.bind_packed_prefill_topology(
                 sequence_lengths=sequence_lengths,
                 device=self.device,
             )

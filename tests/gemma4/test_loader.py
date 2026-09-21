@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -407,7 +408,11 @@ def test_text_attention_k_equals_v_still_normalizes_k_and_v_separately(
             observed["normalized_k"] = kwargs["k_val"]
             observed["normalized_v"] = kwargs["v_val"]
 
-    monkeypatch.setattr(gemma_model, "_dense_runtime", DenseRuntime())
+    monkeypatch.setattr(
+        gemma_model,
+        "get_runtime",
+        lambda _device: SimpleNamespace(dense=DenseRuntime()),
+    )
     monkeypatch.setattr(
         gemma_model,
         "_apply_neox_rotary",

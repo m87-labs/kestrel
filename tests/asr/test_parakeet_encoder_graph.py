@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,9 @@ import torch.nn.functional as F
 from kestrel.models.parakeet_tdt.config import ParakeetEncoderConfig, ParakeetTdtConfig
 from kestrel.models.parakeet_tdt.encoder_graph import ParakeetEncoderGraph
 from kestrel.models.parakeet_tdt.model import ParakeetTdt
+import kestrel.models.parakeet_tdt.model as parakeet_model
+from kestrel_kernels.conformer_ops import torch_conformer_runtime
+from kestrel_kernels.tdt_ops import torch_tdt_runtime
 
 
 def _model(device="cpu", dtype=torch.float32) -> ParakeetTdt:
@@ -47,6 +51,27 @@ def _features(valid_frames, *, batch=1, device="cpu", dtype=torch.float32):
     mask = torch.arange(valid_frames + 1, device=device)[None] < valid_frames
     mask = mask.expand(batch, -1)
     return features.masked_fill(~mask[..., None], 0), mask
+
+
+@torch.inference_mode()
+def test_model_selects_kernel_runtime_from_its_tensor_device(monkeypatch) -> None:
+    selected = []
+    runtime = SimpleNamespace(
+        conformer=torch_conformer_runtime("conv1d"),
+        tdt=torch_tdt_runtime(),
+    )
+
+    def select(device):
+        selected.append(torch.device(device))
+        return runtime
+
+    monkeypatch.setattr(parakeet_model, "get_runtime", select)
+    model = _model()
+    model.reset_nonpersistent_buffers()
+    features, mask = _features(16)
+    model.generate(features, mask, max_tokens=1)
+
+    assert selected and set(selected) == {torch.device("cpu")}
 
 
 @pytest.mark.parametrize("buckets", [(0,), (32, 32), (64, 32)])

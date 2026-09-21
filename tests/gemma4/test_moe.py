@@ -143,7 +143,11 @@ def test_experts_use_shared_contiguous_geglu_runtime(monkeypatch) -> None:
             calls.update(handle=handle, forward=kwargs)
             return kwargs["x"] + 1
 
-    monkeypatch.setattr(model_module, "_moe_runtime", FakeMoeRuntime())
+    monkeypatch.setattr(
+        model_module,
+        "get_runtime",
+        lambda _device: SimpleNamespace(moe=FakeMoeRuntime()),
+    )
     hidden = torch.zeros((1, 2, config.hidden_size))
     indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
     weights = torch.full((2, 2), 0.5)

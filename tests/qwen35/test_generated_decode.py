@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from kestrel.models.qwen35 import generated_decode as qwen_generated
+from kestrel.models.qwen35 import qwen_model
 from kestrel.models.qwen35.cache import (
     Qwen35InferenceCache,
     Qwen35LinearStatePool,
@@ -141,7 +142,9 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
         assert torch.count_nonzero(state[3]) > 0
 
 
-def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
+def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel(
+    monkeypatch,
+):
     config = SimpleNamespace(
         hidden_size=4,
         linear_num_key_heads=1,
@@ -161,7 +164,7 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
         out=torch.empty((1, 3, 2, 2), dtype=torch.bfloat16),
         can_serve=lambda *_args, **_kwargs: True,
     )
-    module.allocate_packed_gdn_prefill_workspace = (
+    module.allocate_packed_gated_delta_prefill_workspace = (
         lambda *_args, **_kwargs: workspace
     )
     captured = {}
@@ -181,6 +184,11 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
         return torch.zeros_like(workspace.out), state
 
     module.packed_gated_delta_rule_prefill = combined
+    monkeypatch.setattr(
+        qwen_model,
+        "get_runtime",
+        lambda _device: SimpleNamespace(gated_delta=module),
+    )
     pool = _state_pool(config)
     recurrent_states = pool.recurrent_tensors_for_form(_generated_form())
     cache = Qwen35InferenceCache(

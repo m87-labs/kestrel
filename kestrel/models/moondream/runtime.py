@@ -2375,7 +2375,7 @@ class MoondreamRuntime:
             moe_lora_metadata = None
         else:
             lora_workspace = self._lora_workspace
-            moe_runtime = get_runtime().moe
+            moe_runtime = get_runtime(inputs_embeds.device).moe
             max_loras = max(0, lora_workspace.max_slots - 1) if lora_workspace else 0
             active_lora_max_rank = (
                 lora_workspace.moe_lora_rank_for_slot(lora_slot)
@@ -2538,7 +2538,9 @@ class MoondreamRuntime:
             return
 
         max_loras = max(0, workspace.max_slots - 1)
-        slot.meta.moe_lora_metadata = get_runtime().moe.prepare_lora_metadata(
+        slot.meta.moe_lora_metadata = get_runtime(
+            slot.meta.active_token_ids.gpu.device
+        ).moe.prepare_lora_metadata(
             lora_slot_ids_cpu=slot.meta.lora_slot_ids.cpu,
             active_token_ids_cpu=slot.meta.active_token_ids.cpu,
             active_token_ids_gpu=slot.meta.active_token_ids.gpu,

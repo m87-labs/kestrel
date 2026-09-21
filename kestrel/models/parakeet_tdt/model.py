@@ -35,7 +35,7 @@ class FeedForward(nn.Module):
     def forward(self, hidden: Tensor) -> Tensor:
         # The activation is a runtime op so a backend can do it in one pass over the [B, T, 4C] projection
         # instead of the read-write-read torch needs; the reference is F.silu.
-        return self.linear2(get_runtime().conformer.silu(self.linear1(hidden)))
+        return self.linear2(get_runtime(hidden.device).conformer.silu(self.linear1(hidden)))
 
 
 class Convolution(nn.Module):
@@ -83,11 +83,11 @@ class Convolution(nn.Module):
         )
 
     def forward(self, hidden: Tensor, valid: Tensor | None) -> Tensor:
-        hidden = get_runtime().conformer.glu(self.pointwise_conv1(hidden))
+        hidden = get_runtime(hidden.device).conformer.glu(self.pointwise_conv1(hidden))
         norm = self.norm
         # The depthwise convolution, the eval-mode BatchNorm and the SiLU are one runtime op: it masks the
         # invalid rows, and each backend picks its own implementation (see kestrel_kernels.conformer_ops).
-        hidden = get_runtime().conformer.depthwise_conv_bn_silu(
+        hidden = get_runtime(hidden.device).conformer.depthwise_conv_bn_silu(
             hidden,
             self.depthwise_conv.weight[:, 0, :],  # the op takes the depthwise weight as [C, k]
             norm.running_mean,
@@ -153,7 +153,7 @@ class RelativeAttention(nn.Module):
         # Everything between the projections and o_proj is one runtime op: the relative shift, the two score
         # products, the mask and the softmax. It takes the projections fused, which is what lets a backend
         # read q, k and v in place instead of materializing the chunk/view/transpose chain.
-        attended = get_runtime().conformer.rel_attention(
+        attended = get_runtime(hidden.device).conformer.rel_attention(
             self.qkv_proj(hidden),
             rel_k,
             self.bias_u,
@@ -189,7 +189,7 @@ class EncoderBlock(nn.Module):
         # A backend that fuses them reads the activation once instead of three times; the reference is the
         # ``hidden + alpha * y`` then ``LayerNorm`` this replaces, and alpha is a power of two, so the bits
         # are the ones the model had.
-        conformer = get_runtime().conformer
+        conformer = get_runtime(hidden.device).conformer
         normed = conformer.layer_norm(hidden, *_norm_args(self.norm_feed_forward1))
         hidden, normed = conformer.add_scaled_layer_norm(
             hidden, self.feed_forward1(normed), 0.5, *_norm_args(self.norm_self_att)
@@ -246,7 +246,7 @@ class Subsampling(nn.Module):
     def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         hidden = features.unsqueeze(1)
         lengths = mask.sum(-1)
-        conformer = get_runtime().conformer
+        conformer = get_runtime(hidden.device).conformer
         for layer in self.layers:
             if isinstance(layer, nn.Conv2d) and layer.groups == layer.in_channels > 1:
                 # The two depthwise convolutions go through the runtime: the reference is this same
@@ -691,7 +691,7 @@ class ParakeetTdt(nn.Module):
         durations = [min(carry, end_frame - start_frame)]
         steps_remaining = self.config.max_symbols_per_step * (end_frame - start_frame)
         tokens_remaining = max_tokens
-        greedy_step = get_runtime().tdt.greedy_step
+        greedy_step = get_runtime(encoded.device).tdt.greedy_step
         while (
             frame < end_frame
             and steps_remaining > 0

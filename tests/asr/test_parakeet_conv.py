@@ -35,7 +35,7 @@ def conv(request, monkeypatch) -> Convolution:
     monkeypatch.setattr(
         parakeet_model,
         "get_runtime",
-        lambda: SimpleNamespace(conformer=torch_conformer_runtime(request.param)),
+        lambda _device: SimpleNamespace(conformer=torch_conformer_runtime(request.param)),
     )
     torch.manual_seed(0)
     module = Convolution(_config()).eval()
