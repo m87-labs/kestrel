@@ -6,13 +6,7 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## 0.8.0 — 2026-09-21
 
-- Updated to `kestrel-kernels` 0.7.0 and matching CUDA bundle companions.
-- Speech: added `moondream/parakeet-redux`, the ternary Parakeet, on CPU and
-  Apple silicon.
-- Speech: Parakeet now cuts long recordings at pauses into segments of at most
-  30 seconds. Checkpoints may provide a VAD head; others use frame energy.
-- Speech: Parakeet's CPU runtime sizes its native and torch worker pools for
-  the available physical cores and accepts `cpu_threads` as an override.
+- Added fast, memory-efficient transcription with `moondream/parakeet-redux` on CPUs and Apple silicon, including pause-aware processing for long audio.
 
 ## 0.7.2 — 2026-09-13
 
