@@ -85,9 +85,10 @@ def _pack_ternary(out_features: int, in_features: int, generator: torch.Generato
     codes = torch.randint(
         0, 3, (out_features, in_features), generator=generator, dtype=torch.uint8
     )
-    packed = torch.zeros(out_features, in_features // 4, dtype=torch.uint8)
-    for shift in range(4):
-        packed |= codes[:, shift::4] << (2 * shift)
+    # the export's base-3 rows: five codes per byte, least significant digit first, zero-padded to a multiple of 5
+    pad = (-in_features) % 5
+    padded = torch.cat([codes.to(torch.int16), torch.zeros(out_features, pad, dtype=torch.int16)], dim=1)
+    packed = (padded.reshape(out_features, -1, 5) * torch.tensor([1, 3, 9, 27, 81], dtype=torch.int16)).sum(-1).to(torch.uint8)
     scales = (
         torch.rand(
             out_features, in_features // GROUP_SIZE, generator=generator
@@ -145,7 +146,7 @@ def build_tiny_ternary_export(root: Path, *, seed: int = 0) -> Path:
     (root / "ternary.json").write_text(
         json.dumps(
             {
-                "format": "thrush-ternary-v1",
+                "format": "thrush-ternary-v2",
                 "names": "hf",
                 "quant": {"mode": "ternary", "group_size": GROUP_SIZE},
                 "quantized_modules": quantized,

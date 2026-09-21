@@ -20,9 +20,11 @@ MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
 _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # The ternary student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID: config.json and
-# tokenizer.json as usual, a packed ``model.safetensors`` and the ``ternary.json`` manifest written by thrush's
+# tokenizer.json as usual, a ``model.safetensors`` with the encoder projections as base-3 packed codes (1.6 bits
+# per weight, decoded to the kernels' two-bit layout at load) and the ``ternary.json`` manifest written by thrush's
 # ``scripts/export_ternary.py --names hf``. That manifest is the only thing that marks a checkpoint as ternary.
 TERNARY_MODEL_ID = "moondream/parakeet-redux"
+EXPORT_FORMAT = "thrush-ternary-v2"  # base-3 packed codes on disk; see ``unpack_export``
 TERNARY_REVISION = "a0639ca117380949d782a505569d637d180f5378"  # release weights, private until Photon ships
 _MANIFEST = "ternary.json"
 _QKV = ("q_proj", "k_proj", "v_proj")
@@ -38,9 +40,9 @@ class LoadedParakeetTdt:
 def _quantized_modules(manifest: Path) -> tuple[dict, ...]:
     """The manifest's quantized-module entries: name, shape, group size and bias per ternary layer."""
     export = json.loads(manifest.read_text())
-    if export.get("format") != "thrush-ternary-v1" or export.get("names") != "hf":
+    if export.get("format") != EXPORT_FORMAT or export.get("names") != "hf":
         raise ValueError(
-            "expected a thrush-ternary-v1 export with HF tensor names (export_ternary.py --names hf), got "
+            f"expected a {EXPORT_FORMAT} export with HF tensor names (export_ternary.py --names hf), got "
             f"format={export.get('format')!r} names={export.get('names')!r}"
         )
     modules = tuple(export["quantized_modules"])
@@ -48,6 +50,31 @@ def _quantized_modules(manifest: Path) -> tuple[dict, ...]:
     if len(names) != len(set(names)):
         raise ValueError("the ternary manifest contains duplicate module names")
     return modules
+
+
+_POW3 = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int16)
+
+
+def _base3_digits() -> torch.Tensor:
+    """uint8 ``[256, 5]``: the five base-3 digits of every byte value, least significant first."""
+    return ((torch.arange(256, dtype=torch.int16).unsqueeze(1) // _POW3) % 3).to(torch.uint8)
+
+
+def unpack_export(qweight: torch.Tensor, in_features: int) -> torch.Tensor:
+    """The export's base-3 codes -> the kernels' two-bit layout.
+
+    On disk (thrush ``export_ternary.py``, ``thrush-ternary-v2``) a quantized row is ``ceil(in/5)`` bytes of five
+    base-3 digits each, element ``i`` being digit ``i % 5`` of byte ``i // 5`` (least significant first), code
+    {0,1,2} = {-1,0,+1} — 1.6 bits per weight. In memory the kernels take ``uint8 [out, in/4]`` with four
+    two-bit codes per byte (``kestrel_kernels.ternary``); the conversion is a table lookup per byte and runs once,
+    at load.
+    """
+    from kestrel_kernels.ternary import pack_codes
+
+    if qweight.dtype != torch.uint8 or qweight.shape[1] * 5 < in_features:
+        raise ValueError(f"qweight must be uint8 [out, ceil(in/5)], got {tuple(qweight.shape)} for in={in_features}")
+    codes = _base3_digits()[qweight.long()].reshape(qweight.shape[0], -1)[:, :in_features]
+    return pack_codes(codes.to(torch.int8) - 1)
 
 
 def ternarize(model: ParakeetTdt, quantized: tuple[dict, ...]) -> None:
@@ -148,7 +175,8 @@ def load_parakeet_tdt(
     with torch.device("meta"):
         model = ParakeetTdt(config)
         if manifest.exists():
-            ternarize(model, _quantized_modules(manifest))
+            quantized = _quantized_modules(manifest)
+            ternarize(model, quantized)
             model.is_ternary = True
         # A capability of the weights, not a configured option: a checkpoint
         # that ships a speech head segments its own long audio with it, and one
@@ -156,6 +184,10 @@ def load_parakeet_tdt(
         # and the ternary export alike, before the strict load.
         if any(key.startswith(VAD_HEAD_PREFIX) for key in state):
             model.attach_vad_head()
+    if manifest.exists():  # the export's base-3 rows become the kernels' two-bit rows, once, here (not on meta)
+        for entry in quantized:
+            key = f"{entry['name']}.qweight"
+            state[key] = unpack_export(state[key], entry["in_features"])
     model.load_state_dict(state, strict=True, assign=True)
     model.reset_nonpersistent_buffers()
     if manifest.exists():
@@ -179,4 +211,5 @@ __all__ = [
     "TERNARY_REVISION",
     "load_parakeet_tdt",
     "ternarize",
+    "unpack_export",
 ]
