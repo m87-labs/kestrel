@@ -5,13 +5,17 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from kestrel.device import resolve_device, stream_context
+
+if TYPE_CHECKING:
+    from kestrel_kernels.cuda_stream import OwnedCudaStream
 
 
 _InputKey = tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...]
@@ -64,6 +68,13 @@ class _GraphEntry:
     outputs: tuple[Tensor, ...]
     graph: torch.cuda.CUDAGraph
     copies: _GraphInputCopies
+    capture: OwnedCudaStream
+
+    def close(self):
+        try:
+            self.graph.reset()
+        finally:
+            self.capture.close()
 
 
 class FixedShapeSinglePassGraph:
@@ -146,23 +157,38 @@ class FixedShapeSinglePassGraph:
             for value in inputs
         )
         copies = _GraphInputCopies(static_inputs)
-        with (
-            torch.cuda.device(self.device),
-            stream_context(stream),
-            torch.inference_mode(),
-            graph_execution_scope(),
-        ):
-            copies.copy(inputs)
-            # Materialize library handles and algorithm selection outside capture.
-            self._outputs(self._run_forward(*static_inputs))
-            copies.copy(inputs)
-            stream.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                outputs = self._outputs(self._run_forward(*static_inputs))
-            copies.copy(inputs)
-            graph.replay()
-        return _GraphEntry(static_inputs, outputs, graph, copies)
+        # Graph destruction may clear cuBLAS workspaces for its capture stream.
+        # Pooled streams can alias another live graph after the pool wraps.
+        from kestrel_kernels.cuda_stream import OwnedCudaStream
+
+        capture = OwnedCudaStream(self.device)
+        graph = None
+        try:
+            capture.stream.wait_stream(stream)
+            with (
+                torch.cuda.device(self.device),
+                stream_context(capture.stream),
+                torch.inference_mode(),
+                graph_execution_scope(),
+            ):
+                copies.copy(inputs)
+                self._outputs(self._run_forward(*static_inputs))
+                copies.copy(inputs)
+                capture.stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture.stream):
+                    outputs = self._outputs(self._run_forward(*static_inputs))
+                copies.copy(inputs)
+                graph.replay()
+            stream.wait_stream(capture.stream)
+            return _GraphEntry(static_inputs, outputs, graph, copies, capture)
+        except BaseException:
+            try:
+                if graph is not None:
+                    graph.reset()
+            finally:
+                capture.close()
+            raise
 
     @contextmanager
     def _ordered_stream(self) -> Iterator[None]:
@@ -214,7 +240,8 @@ class FixedShapeSinglePassGraph:
                         if entry is None:
                             if len(self._entries) >= self._max_entries:
                                 stream.synchronize()
-                                self._entries.popitem(last=False)
+                                _, retired = self._entries.popitem(last=False)
+                                retired.close()
                             entry = self._capture(values)
                             self._entries[key] = entry
                         else:
@@ -235,14 +262,17 @@ class FixedShapeSinglePassGraph:
                     "single-pass graph cannot shut down during an active lease"
                 )
             self._closed = True
-            try:
-                stream = self._stream
-                if stream is not None:
-                    stream.synchronize()
-            finally:
-                self._entries.clear()
-                self._run_forward = lambda *_args: ()
-                self._stream = None
+            with ExitStack() as cleanup:
+                for entry in self._entries.values():
+                    cleanup.callback(entry.close)
+                try:
+                    stream = self._stream
+                    if stream is not None:
+                        stream.synchronize()
+                finally:
+                    self._entries.clear()
+                    self._run_forward = lambda *_args: ()
+                    self._stream = None
 
 
 __all__ = ["FixedShapeSinglePassGraph"]
