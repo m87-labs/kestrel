@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 import ctypes
 import os
@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from kestrel.device import empty_cache, make_stream, resolve_device
+from kestrel.device import empty_cache, make_stream, resolve_device, stream_context
 from kestrel.runtime import ExecutionShape
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
@@ -268,6 +268,30 @@ class _StreamWindow:
     start_sample: int
     sample_count: int | None
     duration_seconds: float
+
+
+# One request as ``launch`` read it: the transcription request, its decode
+# settings, and the live stream window it belongs to (``None`` for a clip).
+_Parsed = tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None]
+
+
+@dataclass(slots=True)
+class _ParakeetBatch:
+    """A cohort between ``launch`` and ``collect``.
+
+    ``encoded``/``valid`` hold device tensors only when the cohort stopped
+    after the encoder -- one segment per request, a batch the decoder takes
+    encoded. Every other cohort arrives with ``results`` already filled in and
+    nothing left on the device; ``collect`` then just hands them back.
+    """
+
+    parsed: list[_Parsed | None]
+    results: list[dict[str, object] | Exception | None]
+    totals: list[tuple[float, float, float] | None] = field(default_factory=list)
+    rows: tuple[tuple[int, DecodedAudio], ...] = ()
+    encoded: torch.Tensor | None = None
+    valid: torch.Tensor | None = None
+    max_tokens: int | None = None
 
 
 # Requests per forward. On CUDA the encoder runs eagerly above the graph threshold, so a large batch is pure
@@ -627,18 +651,15 @@ class ParakeetTdtRuntime:
                 values.append(value)
         return tuple(values)
 
-    @torch.inference_mode()
-    def forward(
+    def _parse_inputs(
         self, task: str, inputs: Sequence[Any]
-    ) -> tuple[dict[str, object] | Exception, ...]:
+    ) -> tuple[list[_Parsed | None], list[dict[str, object] | Exception | None]]:
         if task != "transcribe":
             raise ValueError("ParakeetTdtRuntime only accepts transcribe requests")
         if getattr(self, "_confine_cpu_submitter", False):
             _confine_submitter_to_cache_domain()
 
-        parsed: list[
-            tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None] | None
-        ] = [None] * len(inputs)
+        parsed: list[_Parsed | None] = [None] * len(inputs)
         results: list[dict[str, object] | Exception | None] = [None] * len(inputs)
         for index, value in enumerate(inputs):
             try:
@@ -658,8 +679,205 @@ class ParakeetTdtRuntime:
                 parsed[index] = (request, settings, stream_window)
             except Exception as exc:
                 results[index] = exc
+        return parsed, results
 
-        with ExitStack() as stack:
+    @staticmethod
+    def _next_chunks(
+        iterators: list[Iterator[DecodedAudio] | None],
+        results: list[dict[str, object] | Exception | None],
+    ) -> list[tuple[int, DecodedAudio]]:
+        """Pull one segment from every live row, retiring the exhausted ones."""
+
+        chunks: list[tuple[int, DecodedAudio]] = []
+        for index, iterator in enumerate(iterators):
+            if iterator is None:
+                continue
+            try:
+                chunks.append((index, next(iterator)))
+            except StopIteration:
+                iterators[index] = None
+            except Exception as exc:
+                iterators[index] = None
+                results[index] = exc
+        return chunks
+
+    @staticmethod
+    def _grouped(
+        parsed: Sequence[_Parsed | None],
+        chunks: Sequence[tuple[int, DecodedAudio]],
+    ) -> dict[tuple[int, bool], list[tuple[int, DecodedAudio]]]:
+        groups: dict[tuple[int, bool], list[tuple[int, DecodedAudio]]] = {}
+        for index, audio in chunks:
+            item = parsed[index]
+            assert item is not None
+            groups.setdefault((item[1].max_tokens, item[2] is not None), []).append(
+                (index, audio)
+            )
+        return groups
+
+    @staticmethod
+    def _long_enough(
+        group: Sequence[tuple[int, DecodedAudio]],
+        iterators: list[Iterator[DecodedAudio] | None],
+        results: list[dict[str, object] | Exception | None],
+    ) -> list[tuple[int, DecodedAudio]]:
+        keep: list[tuple[int, DecodedAudio]] = []
+        for index, audio in group:
+            if audio.waveform.size < 320:
+                iterators[index] = None
+                results[index] = ValueError("Parakeet audio is too short to normalize")
+            else:
+                keep.append((index, audio))
+        return keep
+
+    def _packed_decode(
+        self, encoded: torch.Tensor, valid: torch.Tensor, *, max_tokens: int | None
+    ) -> tuple[Any, list[list[int]]]:
+        assert self._batch_decoder is not None
+        output = self._batch_decoder.generate(encoded, valid, max_tokens=max_tokens)
+        packed = torch.cat(
+            (output.lengths[:, None], output.sequences, output.durations), dim=1
+        ).tolist()
+        return output, packed
+
+    def _append_group_results(
+        self,
+        parsed: Sequence[_Parsed | None],
+        group: Sequence[tuple[int, DecodedAudio]],
+        output: Any,
+        packed: Sequence[Sequence[int]],
+        text_parts: list[list[str]],
+        segments: list[list[Segment]],
+    ) -> None:
+        width = output.sequences.shape[1]
+        for (index, audio), row in zip(group, packed, strict=True):
+            length = row[0]
+            token_ids = list(row[1 : 1 + length])
+            durations = list(row[1 + width :][:length])
+            item = parsed[index]
+            assert item is not None
+            self._append_chunk_result(
+                item[0],
+                audio,
+                token_ids,
+                durations,
+                text_parts[index],
+                segments[index],
+                frame_seconds=output.encoder_frame_seconds,
+            )
+
+    def _run_group(
+        self,
+        parsed: Sequence[_Parsed | None],
+        results: list[dict[str, object] | Exception | None],
+        iterators: list[Iterator[DecodedAudio] | None],
+        group: Sequence[tuple[int, DecodedAudio]],
+        *,
+        max_tokens: int | None,
+        is_stream: bool,
+        text_parts: list[list[str]],
+        segments: list[list[Segment]],
+    ) -> None:
+        """Features -> encoder -> decode -> transcript for one segment group."""
+
+        valid_group = self._long_enough(group, iterators, results)
+        if not valid_group:
+            return
+        features, mask = self._batch_audio_features(valid_group)
+        if is_stream:
+            stream_windows = []
+            stream_requests = []
+            for index, _audio in valid_group:
+                item = parsed[index]
+                assert item is not None and item[2] is not None
+                stream_requests.append(item[0])
+                stream_windows.append(item[2])
+            stream_results = self._run_stream_group(
+                valid_group,
+                stream_windows,
+                stream_requests,
+                features,
+                mask,
+                max_tokens=max_tokens,
+            )
+            for (index, _audio), value in zip(
+                valid_group, stream_results, strict=True
+            ):
+                results[index] = value
+            return
+        encoder_lease = (
+            self._encoder_graph.launch(features, mask)
+            if self._splits_decode(len(valid_group))
+            else nullcontext(None)
+        )
+        with encoder_lease as encoded_result:
+            if encoded_result is None:
+                output = self.model.generate(
+                    features,
+                    mask,
+                    max_tokens=max_tokens,
+                )
+                packed = torch.cat(
+                    (
+                        output.lengths[:, None],
+                        output.sequences,
+                        output.durations,
+                    ),
+                    dim=1,
+                ).tolist()
+            else:
+                encoded, valid = encoded_result
+                output, packed = self._packed_decode(
+                    encoded, valid, max_tokens=max_tokens
+                )
+        self._append_group_results(
+            parsed, valid_group, output, packed, text_parts, segments
+        )
+
+    def _splits_decode(self, batch: int) -> bool:
+        """Whether this cohort size runs the encoder and the decoder apart."""
+
+        return (
+            self._batch_decoder is not None
+            and batch >= self._batch_decoder.minimum_batch
+        )
+
+    @staticmethod
+    def _finalize(
+        results: list[dict[str, object] | Exception | None],
+        totals: Sequence[tuple[float, float, float] | None],
+        text_parts: Sequence[list[str]],
+        segments: Sequence[list[Segment]],
+    ) -> None:
+        for index, total in enumerate(totals):
+            if total is None or results[index] is not None:
+                continue
+            duration, source_duration, clip_start = total
+            results[index] = TranscriptionResult(
+                text=" ".join(part for part in text_parts[index] if part),
+                language=None,
+                duration_seconds=duration,
+                source_duration_seconds=source_duration,
+                clip_start_seconds=clip_start,
+                segments=tuple(segments[index]),
+            ).as_dict()
+
+    @torch.inference_mode()
+    def launch(self, task: str, inputs: Sequence[Any]) -> _ParakeetBatch:
+        """Enqueue a cohort's device work and return what collecting it needs.
+
+        A cohort whose every request fits in one pause-aligned segment stops
+        after the encoder: the encoding, not the transcript, is what ``launch``
+        returns, so the caller can enqueue the next cohort while this one's
+        encoder still runs. Anything else -- several segments, a live stream
+        window, a batch the decoder will not take encoded -- is finished here,
+        because its segments have to be decoded before the next can be cut.
+        """
+
+        parsed, results = self._parse_inputs(task, inputs)
+        batch = _ParakeetBatch(parsed=parsed, results=results)
+        stack = ExitStack()
+        try:
             sources: list[AudioChunks | None] = [None] * len(inputs)
             for index, item in enumerate(parsed):
                 if item is None:
@@ -678,6 +896,16 @@ class ParakeetTdtRuntime:
                     )
                 except Exception as exc:
                     results[index] = exc
+            batch.totals = [
+                None
+                if source is None
+                else (
+                    source.duration_seconds,
+                    source.source_duration_seconds,
+                    source.clip_start_seconds,
+                )
+                for source in sources
+            ]
             # Pause-aligned segments of at most 30 s, contiguous and never
             # overlapping: 6.37 WER against 10.82 for the fixed 180 s windows
             # this replaces (six Earnings-22 calls, parakeet-tdt-0.6b-v3).
@@ -696,116 +924,76 @@ class ParakeetTdtRuntime:
             text_parts: list[list[str]] = [[] for _ in inputs]
             segments: list[list[Segment]] = [[] for _ in inputs]
 
-            while any(iterator is not None for iterator in iterators):
-                chunks = []
-                for index, iterator in enumerate(iterators):
-                    if iterator is None:
-                        continue
-                    try:
-                        chunks.append((index, next(iterator)))
-                    except StopIteration:
-                        iterators[index] = None
-                    except Exception as exc:
-                        iterators[index] = None
-                        results[index] = exc
-                groups: dict[tuple[int, bool], list[tuple[int, DecodedAudio]]] = {}
-                for index, audio in chunks:
-                    item = parsed[index]
-                    assert item is not None
-                    groups.setdefault(
-                        (item[1].max_tokens, item[2] is not None), []
-                    ).append((index, audio))
-                for (max_tokens, is_stream), group in groups.items():
-                    valid_group = []
-                    for index, audio in group:
-                        if audio.waveform.size < 320:
-                            iterators[index] = None
-                            results[index] = ValueError(
-                                "Parakeet audio is too short to normalize"
-                            )
-                        else:
-                            valid_group.append((index, audio))
-                    if not valid_group:
-                        continue
-                    features, mask = self._batch_audio_features(valid_group)
-                    if is_stream:
-                        stream_windows = []
-                        stream_requests = []
-                        for index, _audio in valid_group:
-                            item = parsed[index]
-                            assert item is not None and item[2] is not None
-                            stream_requests.append(item[0])
-                            stream_windows.append(item[2])
-                        stream_results = self._run_stream_group(
-                            valid_group,
-                            stream_windows,
-                            stream_requests,
-                            features,
-                            mask,
-                            max_tokens=max_tokens,
-                        )
-                        for (index, _audio), value in zip(
-                            valid_group, stream_results, strict=True
-                        ):
-                            results[index] = value
-                        continue
-                    use_encoded_decode = (
-                        self._batch_decoder is not None
-                        and features.shape[0] >= self._batch_decoder.minimum_batch
+            first = self._next_chunks(iterators, results)
+            # One more pull decides the shape of the cohort: empty means every
+            # row held a single segment, and nothing here needs the transcript
+            # of one segment to cut the next.
+            second = self._next_chunks(iterators, results)
+            groups = self._grouped(parsed, first)
+            if not second and len(groups) == 1:
+                (max_tokens, is_stream), group = next(iter(groups.items()))
+                rows = self._long_enough(group, iterators, results)
+                if not is_stream and rows and self._splits_decode(len(rows)):
+                    stack.close()  # the waveforms are decoded; the readers are not needed
+                    features, mask = self._batch_audio_features(rows)
+                    encoded, valid = self._encoder_graph.encode(features, mask)
+                    batch.rows = tuple(rows)
+                    batch.encoded = encoded
+                    batch.valid = valid
+                    batch.max_tokens = max_tokens
+                    return batch
+                groups = {(max_tokens, is_stream): rows} if rows else {}
+
+            queued = [groups, self._grouped(parsed, second)]
+            while queued or any(
+                iterator is not None for iterator in iterators
+            ):
+                pending = (
+                    queued.pop(0)
+                    if queued
+                    else self._grouped(
+                        parsed, self._next_chunks(iterators, results)
                     )
-                    encoder_lease = (
-                        self._encoder_graph.launch(features, mask)
-                        if use_encoded_decode
-                        else nullcontext(None)
+                )
+                for (max_tokens, is_stream), group in pending.items():
+                    self._run_group(
+                        parsed,
+                        results,
+                        iterators,
+                        group,
+                        max_tokens=max_tokens,
+                        is_stream=is_stream,
+                        text_parts=text_parts,
+                        segments=segments,
                     )
-                    with encoder_lease as encoded_result:
-                        if encoded_result is None:
-                            output = self.model.generate(
-                                features,
-                                mask,
-                                max_tokens=max_tokens,
-                            )
-                        else:
-                            assert self._batch_decoder is not None
-                            encoded, valid = encoded_result
-                            output = self._batch_decoder.generate(
-                                encoded,
-                                valid,
-                                max_tokens=max_tokens,
-                            )
-                        packed = torch.cat(
-                            (
-                                output.lengths[:, None],
-                                output.sequences,
-                                output.durations,
-                            ),
-                            dim=1,
-                        ).tolist()
-                    for (index, audio), row in zip(valid_group, packed, strict=True):
-                        length = row[0]
-                        token_ids = row[1 : 1 + length]
-                        durations = row[1 + output.sequences.shape[1] :][:length]
-                        item = parsed[index]
-                        assert item is not None
-                        self._append_chunk_result(
-                            item[0],
-                            audio,
-                            token_ids,
-                            durations,
-                            text_parts[index],
-                            segments[index],
-                            frame_seconds=output.encoder_frame_seconds,
-                        )
-            for index, source in enumerate(sources):
-                if source is not None and results[index] is None:
-                    results[index] = TranscriptionResult(
-                        text=" ".join(part for part in text_parts[index] if part),
-                        language=None,
-                        duration_seconds=source.duration_seconds,
-                        source_duration_seconds=source.source_duration_seconds,
-                        clip_start_seconds=source.clip_start_seconds,
-                        segments=tuple(segments[index]),
-                    ).as_dict()
+            self._finalize(results, batch.totals, text_parts, segments)
+            return batch
+        finally:
+            stack.close()
+
+    @torch.inference_mode()
+    def collect(
+        self, batch: _ParakeetBatch
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        """Read back a launched cohort and assemble one result per request."""
+
+        results = batch.results
+        if batch.encoded is not None:
+            assert batch.valid is not None
+            text_parts: list[list[str]] = [[] for _ in results]
+            segments: list[list[Segment]] = [[] for _ in results]
+            # The encoding was produced on the runtime's compute stream, and
+            # so is everything read back from it here.
+            with stream_context(self.compute_stream):
+                output, packed = self._packed_decode(
+                    batch.encoded, batch.valid, max_tokens=batch.max_tokens
+                )
+            batch.encoded = None
+            batch.valid = None
+            self._append_group_results(
+                batch.parsed, batch.rows, output, packed, text_parts, segments
+            )
+            self._finalize(results, batch.totals, text_parts, segments)
 
         finalized = []
         for result in results:
@@ -814,6 +1002,11 @@ class ParakeetTdtRuntime:
         if self.device.type == "cpu":
             _trim_heap()
         return tuple(finalized)
+
+    def forward(
+        self, task: str, inputs: Sequence[Any]
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        return self.collect(self.launch(task, inputs))
 
     def shutdown(self) -> None:
         self._encoder_graph.shutdown()
