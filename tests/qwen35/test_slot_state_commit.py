@@ -78,6 +78,7 @@ def test_finalization_overlaps_draft_but_target_waits():
     decoder._commit_inputs_ready = torch.cuda.Event()
     decoder._commit_ready = torch.cuda.Event()
     decoder._commit_pending = False
+    decoder._target_graph = object()
     compute = torch.cuda.Stream()
     with torch.cuda.stream(compute):
         state = torch.zeros(1, device="cuda")
@@ -98,6 +99,18 @@ def test_finalization_overlaps_draft_but_target_waits():
     compute.synchronize()
     assert draft.item() == 2
     assert observed.item() == 7
+
+
+def test_eager_finalization_keeps_ambient_stream(monkeypatch):
+    decoder = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    decoder._target_graph = None
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("eager finalization changed streams")
+
+    monkeypatch.setattr(torch.cuda, "stream", unexpected)
+    with decoder._finalization_stream():
+        pass
 
 
 def test_partial_copy_failure_does_not_publish_inactive_bank(monkeypatch):

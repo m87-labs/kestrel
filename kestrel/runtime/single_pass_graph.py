@@ -7,15 +7,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from kestrel.device import resolve_device, stream_context
-
-if TYPE_CHECKING:
-    from kestrel_kernels.cuda_stream import OwnedCudaStream
+from kestrel.runtime.cuda_stream import OwnedCudaStream
 
 
 _InputKey = tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...]
@@ -159,8 +156,6 @@ class FixedShapeSinglePassGraph:
         copies = _GraphInputCopies(static_inputs)
         # Graph destruction may clear cuBLAS workspaces for its capture stream.
         # Pooled streams can alias another live graph after the pool wraps.
-        from kestrel_kernels.cuda_stream import OwnedCudaStream
-
         capture = OwnedCudaStream(self.device)
         graph = None
         try:

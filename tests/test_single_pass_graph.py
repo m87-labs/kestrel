@@ -65,7 +65,7 @@ def test_live_gemm_survives_unrelated_graph_retirement():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_capture_failure_closes_owned_stream(monkeypatch):
-    import kestrel_kernels.cuda_stream as streams
+    import kestrel.runtime.single_pass_graph as streams
 
     created = []
     original = streams.OwnedCudaStream

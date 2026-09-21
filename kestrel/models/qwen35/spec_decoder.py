@@ -356,6 +356,11 @@ class Qwen35DFlashDecoder:
 
     @contextmanager
     def _finalization_stream(self):
+        if self._target_graph is None:
+            # Eager prefix tensors are released after commit. Keep their reads
+            # on the allocation stream; graph-owned buffers outlive async work.
+            yield
+            return
         stream = self._commit_stream
         self._commit_inputs_ready.record(torch.cuda.current_stream(self.runtime.device))
         stream.wait_event(self._commit_inputs_ready)
