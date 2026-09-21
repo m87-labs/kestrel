@@ -172,17 +172,15 @@ def _confine_submitter_to_cache_domain() -> None:
 def _configure_cpu_threads(threads: int | None, *, native_gemm: bool) -> int:
     """Apply the shared CPU policy to torch and the native kernel pool.
 
-    With no explicit count, the pool chooses one cache domain and the calling
-    thread joins it. Torch uses the smaller cap only when the ternary model's
-    GEMMs run in that pool. An explicit count sizes both pools and leaves
-    affinity to the caller.
+    With no explicit count, the pool chooses one cache domain. Torch uses the
+    smaller cap only when the ternary model's GEMMs run in that pool. An
+    explicit count sizes both pools and leaves affinity to the caller.
     """
 
     if threads is None:
         # Reset the pool first: ``pool_cpus`` must describe the placement this
         # runtime will actually use, not a previous explicit configuration.
         _set_kernel_worker_threads(None)
-        _confine_submitter_to_cache_domain()
         threads = (
             _default_cpu_threads(_NATIVE_GEMM_THREAD_CAP)
             if native_gemm
@@ -307,9 +305,13 @@ class ParakeetTdtRuntime:
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        configured_cpu_threads = getattr(cfg, "cpu_threads", None)
+        self._confine_cpu_submitter = (
+            self.device.type == "cpu" and configured_cpu_threads is None
+        )
         self.cpu_threads = (
             _configure_cpu_threads(
-                getattr(cfg, "cpu_threads", None),
+                configured_cpu_threads,
                 native_gemm=self.model.is_ternary,
             )
             if self.device.type == "cpu"
@@ -553,6 +555,8 @@ class ParakeetTdtRuntime:
     ) -> tuple[dict[str, object] | Exception, ...]:
         if task != "transcribe":
             raise ValueError("ParakeetTdtRuntime only accepts transcribe requests")
+        if getattr(self, "_confine_cpu_submitter", False):
+            _confine_submitter_to_cache_domain()
 
         parsed: list[
             tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None] | None

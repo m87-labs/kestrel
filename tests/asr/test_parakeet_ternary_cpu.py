@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -208,7 +209,7 @@ def test_cpu_thread_policy() -> None:
         )
 
 
-def test_cpu_thread_policy_resets_the_pool_before_reading_its_affinity(
+def test_cpu_thread_policy_resets_the_pool_before_sizing_torch(
     monkeypatch,
 ) -> None:
     events: list[tuple[str, int | None]] = []
@@ -216,11 +217,6 @@ def test_cpu_thread_policy_resets_the_pool_before_reading_its_affinity(
         runtime,
         "_set_kernel_worker_threads",
         lambda threads: events.append(("workers", threads)),
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_confine_submitter_to_cache_domain",
-        lambda: events.append(("affinity", None)),
     )
     caps: list[int] = []
 
@@ -247,7 +243,7 @@ def test_cpu_thread_policy_resets_the_pool_before_reading_its_affinity(
     monkeypatch.setattr(torch, "get_num_threads", lambda: current[0])
 
     assert runtime._configure_cpu_threads(None, native_gemm=True) == 3
-    assert events == [("workers", None), ("affinity", None), ("torch", 3)]
+    assert events == [("workers", None), ("torch", 3)]
     assert caps == [runtime._NATIVE_GEMM_THREAD_CAP]
 
     events.clear()
@@ -290,31 +286,42 @@ def _noise(seconds: float = 1.0, sample_rate: int = 16_000) -> np.ndarray:
 
 
 def test_tiny_ternary_export_loads_and_transcribes_on_cpu(
-    tmp_path, offline_engine
+    tmp_path, offline_engine, monkeypatch
 ) -> None:
     root = build_tiny_ternary_export(tmp_path / "export")
+    affinity_threads: list[int] = []
+    monkeypatch.setattr(
+        runtime,
+        "_confine_submitter_to_cache_domain",
+        lambda: affinity_threads.append(threading.get_ident()),
+    )
 
     async def run() -> None:
         cfg = RuntimeConfig(
             model=TERNARY_MODEL_ID,
             model_path=root,
             device="cpu",
-            cpu_threads=2,
         )
         assert cfg.device == "cpu"
         engine = await offline_engine.create(cfg)
         try:
             # The engine builds no KV pool for a runtime that stores no KV cache.
             assert engine._kv_pool is None
-            runtime = engine._runtimes[TERNARY_MODEL_ID]
-            assert runtime.device == torch.device("cpu")
-            assert runtime.cpu_threads == 2
-            assert runtime.model.is_ternary
+            parakeet_runtime = engine._runtimes[TERNARY_MODEL_ID]
+            assert parakeet_runtime.device == torch.device("cpu")
+            assert (
+                1
+                <= parakeet_runtime.cpu_threads
+                <= runtime._NATIVE_GEMM_THREAD_CAP
+            )
+            assert parakeet_runtime.model.is_ternary
+            assert affinity_threads == []
             handle = engine.model(TERNARY_MODEL_ID)
             assert handle.tasks == ("transcribe",)
 
             result = await handle.transcribe(audio=_noise(), sample_rate=16_000)
             output = result.output
+            assert affinity_threads == [engine._scheduler_thread.ident]
             assert isinstance(output["text"], str)
             assert output["task"] == "transcribe"
             assert output["duration_seconds"] == pytest.approx(1.0, abs=0.05)
