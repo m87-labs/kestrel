@@ -346,6 +346,14 @@ class Qwen35DFlashDecoder:
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
         expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].split(lengths)
+        if packed._borrowed_recurrent_state:
+            for branch in branches:
+                branch._borrowed_recurrent_state = True
+            for index, layer in enumerate(packed.layers):
+                if isinstance(layer, LinearAttentionState):
+                    for row, branch in enumerate(branches):
+                        branch.layers[index].conv_states = layer.conv_states[row:row + 1]
+                        branch.layers[index].recurrent_states = layer.recurrent_states[row:row + 1]
         if packed._prefix_records and all(
                 record.prefix_context is not None for record in packed._prefix_records.values()):
             for branch in branches:

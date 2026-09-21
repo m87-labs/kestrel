@@ -115,11 +115,13 @@ class Qwen35TargetGraph:
             hidden, taps = values[0], values[1:1 + len(self._capture_layers)]
             _, records, sources = self._bind_outputs(values, len(lengths))
             cache._prefix_records = records
-            destinations = [tensor for index in self._linear
-                            for tensor in (cache.layers[index].conv_states,
-                                           cache.layers[index].recurrent_states)]
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
+            # Prefix finalization consumes the leased records, not a copied full
+            # block. Full-block commits detach these states before publication.
+            states = iter(sources)
+            for index in self._linear:
+                layer = cache.layers[index]
+                layer.conv_states, layer.recurrent_states = next(states), next(states)
+            cache._borrowed_recurrent_state = True
             yield _TextModelOutput(hidden, cache, tuple(taps))
 
     def _bind_outputs(self, values, count):

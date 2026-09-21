@@ -10,7 +10,7 @@ from kestrel.models.qwen35.spec_target_graph import Qwen35TargetGraph
 
 
 @pytest.mark.parametrize("retain_prefix", [False, True])
-def test_target_state_copies_are_batched_and_remain_owned(monkeypatch, retain_prefix):
+def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_prefix):
     config = SimpleNamespace(layer_types=("linear_attention", "linear_attention"))
     source = Qwen35InferenceCache(config=config, paged_kv=(None, None))
     source.seq_length = 3
@@ -67,12 +67,18 @@ def test_target_state_copies_are_batched_and_remain_owned(monkeypatch, retain_pr
                       seq_idx=row, gdn_state_indices=torch.zeros(1, dtype=torch.long),
                       past_key_values=branch, sequence_lengths=(16,),
                       gdn_state_indices_allocator_owned=True, capture_layers=()):
-        assert copies == [4]
+        assert copies == []
+        assert branch._borrowed_recurrent_state
         if retain_prefix:
             for index, record in branch._prefix_records.items():
                 assert record.prefix_context.owned_tensors[0] is prefix_owners[index]
-    for index, (old, owned) in enumerate(zip(source.layers, branch.layers)):
+        branch.advance_to(19)
+        committed = branch.commit_recurrent_prefix(16)
+        assert copies == [4]
+        assert not committed._borrowed_recurrent_state
+    for index, (old, owned) in enumerate(zip(source.layers, committed.layers)):
         assert torch.all(old.conv_states == 1) and torch.all(old.recurrent_states == 1)
         assert torch.all(owned.conv_states == index + 2)
         assert torch.all(owned.recurrent_states == index + 4)
         assert owned.conv_states.data_ptr() != graph_states[index * 2].data_ptr()
+        assert torch.all(branch.layers[index].recurrent_states == 0)
