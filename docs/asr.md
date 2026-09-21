@@ -158,42 +158,20 @@ revised without changing committed transcription quality.
 
 ### Running on the CPU or on Apple silicon
 
-Transcription runtimes need no paged KV cache, so they start without one. The
-ternary Parakeet student supports CPU and Apple silicon; select `device="cpu"` or
-`device="mps"` explicitly.
+`moondream/parakeet-redux`, the ternary Parakeet, also runs on the CPU and on
+Apple silicon; pass `device="cpu"` or `device="mps"`.
 
 ```python
-from kestrel.models.parakeet_tdt import TERNARY_MODEL_ID
-
 engine = await InferenceEngine.create(
-    RuntimeConfig(
-        model=TERNARY_MODEL_ID,
-        model_path="/models/parakeet-ternary",
-        device="mps",
-    )
+    RuntimeConfig(model="moondream/parakeet-redux", device="cpu")
 )
 ```
 
-On the CPU, `cpu_threads` sets torch's intra-op thread count; the default is
-the physical core count (performance cores on Apple silicon) capped at 8, which
-measured fastest on an 8-core Ryzen 9 7940HS — 14.4x real time at 8 threads
-against 12.6x at 6 and 12.2x at 16. The ternary student's matrix multiplies and
-fused encoder ops run on kestrel-kernels' own pool, which sizes itself to one
-cache domain and pins its workers there, so for that model torch's default is
-capped at 4 instead and the submitting thread joins the same cache domain.
-Naming `cpu_threads` sizes both pools and leaves affinity to the caller;
-nothing reads `OMP_NUM_THREADS`. Set `OMP_WAIT_POLICY=passive` in a CPU
-deployment's environment, or torch's idle OpenMP workers spin on the cores the
-kernels want.
-
-The ternary weights are kept in the one form kestrel-kernels ships for each
-device, and there is nothing to select: a 2-bit packed execution representation
-with int8 activations on the CPU (0.78 GB resident for this model), and the
-packed codes read directly
-by a Metal matrix multiply on Apple silicon (220 MB of device memory against
-2495 MB dequantized). The CPU path quantizes activations to int8 per
-128-element group, so its arithmetic is not bit-exact — on the 50-utterance
-dev-clean set it moved one hypothesis by a trailing period.
+On the CPU, `cpu_threads` sets the thread count (default: the physical cores,
+capped at 8). Set `OMP_WAIT_POLICY=passive` in the environment before torch is
+imported, or torch's idle OpenMP workers spin on the cores the kernels use.
+The weights stay packed in memory on both devices: the CPU matrix multiplies
+read them with int8 activations, the Metal ones decode them in place.
 
 All implementations are inference-only. Qwen and Parakeet audio features stay
 on the GPU after the input waveform is transferred. Whisper and Qwen decoding

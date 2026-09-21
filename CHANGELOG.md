@@ -4,10 +4,8 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-- Speech: added the ternary Parakeet student on CPU and Apple silicon. The
-  encoder routes fused attention, normalization, activations, and depthwise
-  convolutions through the `conformer` kernel domain, and projects relative
-  positions for all blocks in one matrix multiply.
+- Speech: added `moondream/parakeet-redux`, the ternary Parakeet, on CPU and
+  Apple silicon.
 - Speech: Parakeet now cuts long recordings at pauses into segments of at most
   30 seconds. Checkpoints may provide a VAD head; others use frame energy.
 - Speech: Parakeet's CPU runtime sizes its native and torch worker pools for
