@@ -14,6 +14,7 @@ from kestrel.models.parakeet_tdt.runtime import ParakeetTdtRuntime
 from kestrel.models.parakeet_tdt.segment import (
     SEGMENT_SECONDS,
     energy_speech,
+    fits_one_segment,
     next_cut,
     pause_segments,
     pauses_from_speech,
@@ -296,6 +297,49 @@ def test_a_clip_just_over_the_cap_is_still_marked_and_cut() -> None:
 
     assert marked > 0
     assert len(segments) > 1
+
+
+@pytest.mark.parametrize("slack", [-2, -1, 0, 1])
+def test_a_resampled_clip_at_the_cap_agrees_with_its_decoded_samples(
+    slack: int,
+) -> None:
+    """The short circuit reads the clip's length; the walk reads its samples.
+
+    `AudioChunks` bounds a resampled block at `ceil(seconds * rate) + 16`
+    output samples, so a clip whose duration sits on the cap can decode a
+    little past it -- and the walk, which measures what it actually got, then
+    cuts it in two. A short circuit taken on the duration alone would hand
+    back one segment for the same audio, so it has to allow for the slack.
+    """
+
+    cap = round(SEGMENT_SECONDS * SAMPLE_RATE)
+    source_rate = 8_000
+    waveform = _bursts(14)[::2][: round(SEGMENT_SECONDS * source_rate) + slack].copy()
+    source = _source(waveform, rate=source_rate)
+    marked = 0
+
+    def counting(block: np.ndarray, rate: int) -> list[tuple[float, float]]:
+        nonlocal marked
+        marked += 1
+        return energy_speech(block, rate)
+
+    claimed = fits_one_segment(source)
+    segments = list(pause_segments(source, counting))
+    decoded = sum(item.waveform.size for item in segments)
+
+    assert (len(segments) == 1) == (decoded <= cap)
+    assert claimed == (marked == 0)
+    if claimed:
+        assert decoded <= cap
+
+
+def test_a_clip_of_exactly_the_cap_at_the_target_rate_is_claimed() -> None:
+    """No resampler, no slack: 30 s of 16 kHz is exactly the cap's samples."""
+
+    source = _source(_bursts(14)[: round(SEGMENT_SECONDS * SAMPLE_RATE)].copy())
+
+    assert fits_one_segment(source)
+    assert len(list(pause_segments(source, energy_speech))) == 1
 
 
 def test_pause_segments_reads_a_resampled_source() -> None:
