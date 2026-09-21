@@ -14,8 +14,7 @@ from .model import ParakeetTdt
 from .tokenizer import ParakeetTokenizer
 
 
-MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
-REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+from .metadata import MODEL_ID, REVISION
 _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 
 

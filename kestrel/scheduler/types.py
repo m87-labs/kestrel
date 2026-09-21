@@ -33,9 +33,14 @@ class RequestPhase(str, Enum):
 
 @dataclass
 class RequestLifecycle:
-    """Scheduler-owned lifecycle state for a request."""
+    """Scheduler-owned state, retaining terminal metrics after request teardown.
 
-    request: "GenerationRequest"
+    ``request`` becomes None only after result materialization, successful
+    resource retirement, and queue detachment. The originating request still
+    exposes this lifecycle, its state, tokens, and logprobs for inspection.
+    """
+
+    request: Optional["GenerationRequest"]
     skill_state: SkillState
     sequence_state: Optional[SequenceState] = None
     phase: RequestPhase = RequestPhase.NEW
@@ -64,8 +69,41 @@ class RequestLifecycle:
     finish_reason: Optional[str] = None
     error: Optional[BaseException] = None
     logprobs: List[float] = field(default_factory=list)
+    _result_materialized: bool = field(default=False, init=False, repr=False)
+    _resources_retired: bool = field(default=False, init=False, repr=False)
+    _scheduler_detached: bool = field(default=False, init=False, repr=False)
+    _terminal_prompt_length: int = field(default=0, init=False, repr=False)
+    _terminal_image_length: int = field(default=0, init=False, repr=False)
+
+    def scheduler_detached(self) -> None:
+        self._scheduler_detached = True
+        self._detach_terminal_request()
+
+    def result_materialized(self) -> None:
+        self._result_materialized = True
+        self._detach_terminal_request()
+
+    def resources_retired(self) -> None:
+        if self.inflight_refs != 0:
+            raise RuntimeError("cannot retire request ownership with in-flight work")
+        self._resources_retired = True
+        self._detach_terminal_request()
+
+    def _detach_terminal_request(self) -> None:
+        if (not (self._result_materialized and self._resources_retired
+                 and self._scheduler_detached) or self.inflight_refs != 0
+                or self.request is None):
+            return
+        request = self.request
+        self._terminal_prompt_length = request.prompt_length
+        self._terminal_image_length = request.image_length
+        if isinstance(self.skill_state, SkillState) and self.skill_state.request is request:
+            self.skill_state.request = None
+        self.request = None
 
     def __post_init__(self) -> None:
+        if self.request is None:
+            raise ValueError("new request lifecycle requires a request owner")
         prefix_logprobs = self.request.generated_prefix.logprobs
         if self.request.return_logprobs is True and prefix_logprobs is not None:
             self.logprobs.extend(float(value) for value in prefix_logprobs)
@@ -103,7 +141,8 @@ class RequestLifecycle:
             prompt_tokens = self.sequence_state.prompt_length
             cached = self.sequence_state.reused_page_count
         else:
-            prompt_tokens = self.request.prompt_length
+            prompt_tokens = (self.request.prompt_length if self.request is not None
+                             else self._terminal_prompt_length)
             cached = 0
         if cached_tokens is None:
             cached_tokens = cached
@@ -126,6 +165,8 @@ class RequestLifecycle:
         *,
         logprob: float | None = None,
     ) -> None:
+        if self.request is None:
+            raise RuntimeError("cannot stage tokens after terminal request detachment")
         if self.request.return_logprobs is True and logprob is None:
             raise RuntimeError(
                 "Missing token logprob for request that asked for logprobs"
@@ -163,6 +204,9 @@ class RequestLifecycle:
 
     @property
     def total_length(self) -> int:
+        if self.request is None:
+            return (self._terminal_prompt_length + self._terminal_image_length
+                    + self.skill_state.token_count)
         return (
             self.request.prompt_length
             + self.request.image_length

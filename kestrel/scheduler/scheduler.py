@@ -27,6 +27,7 @@ from kestrel.runtime import (
     Token,
 )
 from kestrel.runtime.sampling import SamplingHooks
+from kestrel.runtime.spec import SpecAdmission
 from kestrel.skills import (
     SkillRegistry,
     SkillState,
@@ -584,7 +585,7 @@ class GenerationScheduler:
                     f"{stalled.request_id} (needs {stalled.target_length} tokens)."
                 )
                 self.waiting.remove(stalled)
-                self._fail_request_early(stalled, error)
+                self._fail_request_early(stalled, error, resources_retired=True)
                 progressed = True
         return progressed
 
@@ -731,6 +732,8 @@ class GenerationScheduler:
             lifecycle.prefill_started_at = time.perf_counter()
             lifecycle.prefill_completed_at = lifecycle.prefill_started_at
             self._finalize_sequence(lifecycle, "length")
+            lifecycle.resources_retired()
+            lifecycle.scheduler_detached()
             progressed = True
 
         # Admit real (>=1 token) requests into free spec rows, capping the live
@@ -751,7 +754,9 @@ class GenerationScheduler:
         # rows retire. The non-spec path can instead keep one extra prefilled
         # request resident because its page-table rows are allocated on demand.
         max_running = self.runtime.max_batch_size
-        while decoder.free_slots > 0 and len(self.running) < max_running:
+        pending = []
+        pending_tokens = 0
+        while len(pending) < decoder.free_slots and len(self.running) + len(pending) < max_running:
             request = next(
                 (
                     r
@@ -762,6 +767,10 @@ class GenerationScheduler:
                 None,
             )
             if request is None:
+                break
+            prompt_cost = len(request.prefill_tokens) + request.image_length
+            # Bound packed work without delaying a long prompt for batching.
+            if pending and pending_tokens + prompt_cost > 512:
                 break
             lifecycle = request.lifecycle
             # Zero-token requests were already finalized in the pre-pass above
@@ -966,49 +975,45 @@ class GenerationScheduler:
                     == request.generated_prefix_length
                 ):
                     suppress_next_token_ids = request.suppress_next_token_ids
-                with torch.inference_mode():
-                    # Pass the request's image AND its multi-crop tiles
-                    # (``image_crops``) -- exactly what the non-spec
-                    # ``prepare_sequence`` forwards (it hands both to the vision
-                    # encoder, which reads ``image_crops`` as the ``overlap`` so
-                    # the high-res crop tiles are encoded, not just the
-                    # global/thumbnail image). Forwarding ``image`` alone would
-                    # give a multi-crop request an incomplete image prefill on
-                    # the spec path and diverge from the non-spec output. Skill
-                    # mask, one-shot suppression, and sampling params
-                    # (temperature/top_p) likewise go through ``admit`` so image
-                    # + constrained + non-greedy requests run on the spec path
-                    # with no fallback. ``admit`` returns ``(first_token_id,
-                    # first_logprob)``: the real selected-token logprob for a
-                    # ``return_logprobs`` request, or ``None`` otherwise.
-                    first_token_id, first_logprob = decoder.admit(
-                        state,
-                        prompt_tokens,
-                        image=request.image,
-                        image_crops=request.image_crops,
-                        allowed_token_ids=allowed_token_ids,
-                        suppressed_token_ids=suppressed_token_ids,
-                        suppress_next_token_ids=suppress_next_token_ids,
-                        temperature=float(request.temperature),
-                        top_p=float(request.top_p),
-                    )
+                admission = SpecAdmission(state, prompt_tokens, dict(
+                    image=request.image,
+                    image_crops=request.image_crops,
+                    allowed_token_ids=allowed_token_ids,
+                    suppressed_token_ids=suppressed_token_ids,
+                    suppress_next_token_ids=suppress_next_token_ids,
+                    temperature=float(request.temperature),
+                    top_p=float(request.top_p),
+                ))
+                pending.append((request, state, admission))
+                pending_tokens += prompt_cost
             except Exception as exc:
-                # ``admit`` prefills into a free spec pool row and assigns
-                # ``state.batch_idx`` before the prefill's image/CUDA work
-                # runs, so a mid-admit failure can leave the row reserved
-                # (and ``batch_idx`` set) even though no token was staged.
-                # This request has already left ``waiting`` and
-                # ``lifecycle.sequence_state`` is not set yet, so no later
-                # finish/zombie path will ever call ``decoder.retire`` for
-                # it -- the row would leak permanently and repeated failures
-                # would drain ``decoder.free_slots`` and stall unrelated spec
-                # requests. ``_fail_admitted_spec_request`` retires the row
-                # (when ``admit`` got far enough to reserve one) and releases
-                # the LoRA slot before failing the request cleanly.
+                # Preparation already removed the request from waiting and may
+                # own an adapter slot, even though no decoder row exists yet.
                 self._fail_admitted_spec_request(request, state, exc)
                 progressed = True
                 continue
 
+        if not pending:
+            return progressed
+        try:
+            with torch.inference_mode():
+                results = self.runtime.spec.admit_many(decoder, [item[2] for item in pending])
+            if len(results) != len(pending):
+                raise RuntimeError("speculative admission result count differs from requests")
+        except Exception as error:
+            results = [error] * len(pending)
+        for (request, state, _), result in zip(pending, results, strict=True):
+            if isinstance(result, Exception):
+                self._fail_admitted_spec_request(request, state, result)
+                progressed = True
+                continue
+            lifecycle = request.lifecycle
+            try:
+                first_token_id, first_logprob = result
+            except Exception as error:
+                self._fail_admitted_spec_request(request, state, error)
+                progressed = True
+                continue
             lifecycle.sequence_state = state
             lifecycle.prefill_completed_at = time.perf_counter()
             self.runtime.active_sequences[state.batch_idx] = state
@@ -1081,6 +1086,8 @@ class GenerationScheduler:
             if self._mark_finished_if_needed(lifecycle):
                 lifecycle.finalized = True
                 self._retire_spec_row(state)
+                lifecycle.resources_retired()
+                lifecycle.scheduler_detached()
                 continue
             self.running.push(lifecycle)
         return progressed
@@ -1285,6 +1292,7 @@ class GenerationScheduler:
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
                         self._retire_spec_row(seq.state)
+                        seq.resources_retired()
                 else:
                     launchable.append(seq)
             active = launchable
@@ -1549,6 +1557,7 @@ class GenerationScheduler:
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._retire_spec_row(seq.state)
+                    seq.resources_retired()
                 continue
             seq_logprobs = logprobs[i] if logprobs is not None else None
             for j, token in enumerate(typed_run):
@@ -1558,8 +1567,10 @@ class GenerationScheduler:
                 if self._mark_finished_if_needed(seq):
                     seq.finalized = True
                     self.running.remove(seq)
+                    seq.scheduler_detached()
                     if seq.inflight_refs == 0:
                         self._retire_spec_row(seq.state)
+                        seq.resources_retired()
                     break
 
     def pop_completed(self) -> List[SchedulerResult]:
@@ -1593,8 +1604,14 @@ class GenerationScheduler:
         adapter = self._adapter_provider.get(adapter_id)
         return self.runtime.acquire_adapter_slot(adapter_id, adapter)
 
-    def _fail_request_early(self, request: GenerationRequest, exc: Exception) -> None:
-        """Fail an uninstalled request and release scheduler-owned resources."""
+    def _fail_request_early(
+        self, request: GenerationRequest, exc: Exception, *, resources_retired: bool = False
+    ) -> None:
+        """Fail an uninstalled request and release scheduler-owned resources.
+
+        Only callers that prove no row ownership remains may retire the
+        request backedge. Best-effort/fatal cleanup deliberately stays strong.
+        """
         _LOGGER.error(
             "Failed to admit request %s: %s",
             request.request_id,
@@ -1631,6 +1648,10 @@ class GenerationScheduler:
             output={"error": str(exc)},
         )
         self._completed.append(result)
+        lifecycle.result_materialized()
+        if resources_retired:
+            lifecycle.resources_retired()
+            lifecycle.scheduler_detached()
 
     def _is_launchable_request(self, request: GenerationRequest) -> bool:
         lifecycle = request.lifecycle
@@ -2129,6 +2150,7 @@ class GenerationScheduler:
             seq.first_token_time = lifecycle.prefill_started_at or time.perf_counter()
             self._finalize_sequence(seq, "length")
             self.runtime.release_prefill_slot(prefill_slot)
+            seq.scheduler_detached()
             return True
 
         try:
@@ -2542,6 +2564,7 @@ class GenerationScheduler:
                     # Prefill sequences are enqueued into `running` immediately
                     # after token0 is sampled, so remove on termination here.
                     self.running.remove(seq)
+                    seq.scheduler_detached()
                     if seq.inflight_refs == 0:
                         seq.transition(RequestPhase.COMPLETED)
                         self._release_sequence(seq)
@@ -2591,6 +2614,7 @@ class GenerationScheduler:
                 seq.finalized = True
                 # Remove from running queue
                 self.running.remove(seq)
+                seq.scheduler_detached()
                 if seq.inflight_refs == 0:
                     seq.transition(RequestPhase.COMPLETED)
                     self._release_sequence(seq)
@@ -2628,6 +2652,7 @@ class GenerationScheduler:
                 # the batch slot/pages/adapter, then let the original exception
                 # propagate through the scheduler-fatal path.
                 self.runtime.release_sequence(seq.state)
+        seq.resources_retired()
 
     def _build_mask_spec(self, sequences: List[RequestLifecycle]) -> tuple:
         """Per-sequence sampling-mask inputs (skill_state/request only, no logits).
@@ -3183,6 +3208,7 @@ class GenerationScheduler:
             seq.transition(RequestPhase.FINALIZING)
 
         self._completed.append(self._build_result(seq))
+        seq.result_materialized()
 
     def _build_result(self, seq: RequestLifecycle) -> SchedulerResult:
         finish_reason = seq.finish_reason or "unknown"

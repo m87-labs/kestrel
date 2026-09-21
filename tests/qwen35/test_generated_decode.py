@@ -144,6 +144,7 @@ def test_generated_prefill_writes_pool_rows_directly_and_reset_is_row_scoped():
 def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     config = SimpleNamespace(
         hidden_size=4,
+        dense_weight_format="bf16",
         linear_num_key_heads=1,
         linear_num_value_heads=2,
         linear_key_head_dim=2,
@@ -210,9 +211,10 @@ def test_indexed_prefill_passes_authoritative_bf16_pool_to_combined_kernel():
     assert not hasattr(cache.layers[0], "replay_checkpoint_states")
 
 
-def test_cached_gdn_call_requires_the_generated_program():
+def test_cached_gdn_call_requires_packed_continuation_metadata():
     config = SimpleNamespace(
         hidden_size=4,
+        dense_weight_format="bf16",
         linear_num_key_heads=1,
         linear_num_value_heads=2,
         linear_key_head_dim=2,
@@ -222,17 +224,75 @@ def test_cached_gdn_call_requires_the_generated_program():
         layer_types=("linear_attention",),
     )
     module = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    module.supports_packed_gdn = lambda *_args: True
     cache = Qwen35InferenceCache(config=config, paged_kv=(None,))
     cache.layers[0].has_previous_state = True
 
     with pytest.raises(
         RuntimeError,
-        match="cached decode must run through the generated program",
+        match="prefill requires packed sequence metadata",
     ):
         module(
             torch.zeros((1, 1, 4), dtype=torch.bfloat16),
             cache_params=cache,
         )
+
+
+def test_gdn_continuation_preserves_initial_state_and_conv_history():
+    config = SimpleNamespace(
+        hidden_size=4, dense_weight_format="bf16",
+        linear_num_key_heads=1, linear_num_value_heads=2,
+        linear_key_head_dim=2, linear_value_head_dim=2,
+        linear_conv_kernel_dim=2, rms_norm_eps=1e-6,
+        layer_types=("linear_attention",),
+    )
+    module = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    module.supports_packed_gdn = lambda *_args: True
+    module.norm.forward = lambda value, _gate: value
+    cache = Qwen35InferenceCache(config=config, paged_kv=(None,))
+    pool = _state_pool(config)
+    pool.bind_prefill_state(cache)
+    layer = cache.layers[0]
+    layer.has_previous_state = True
+    layer.conv_states = torch.full((1, 8, 2), 17, dtype=torch.bfloat16)
+    layer.conv_states[..., -1] = 23
+    layer.recurrent_states[3].fill_(7)
+    workspace = SimpleNamespace(
+        out=torch.zeros((1, 3, 2, 2), dtype=torch.bfloat16),
+        can_serve=lambda *_args, **_kwargs: True,
+    )
+    module.allocate_packed_gdn_prefill_workspace = lambda *_args, **_kwargs: workspace
+    captured = {}
+
+    def conv(*, x, final_state, seq_idx, **_kwargs):
+        captured["conv_input"] = x.clone()
+        assert seq_idx.shape == (1, 4)
+        assert torch.count_nonzero(seq_idx) == 0
+        final_state.fill_(31)
+        return x
+
+    def recurrence(mixed, _a, _b, _log, _bias, cu, **kwargs):
+        initial = kwargs["initial_state"]
+        assert initial.shape == (1, 2, 2, 2)
+        assert torch.all(initial == 7)
+        assert mixed.shape == (1, 3, 8)
+        assert mixed.transpose(1, 2).is_contiguous()
+        assert torch.count_nonzero(mixed) == 0
+        assert cu.tolist() == [0, 3]
+        kwargs["final_state"][3].fill_(9)
+        assert torch.all(initial == 7)
+        return workspace.out, kwargs["final_state"]
+
+    module.causal_conv1d_packed = conv
+    module.packed_gated_delta_rule_prefill = recurrence
+    module(torch.zeros((1, 3, 4), dtype=torch.bfloat16), cache_params=cache,
+           cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+           gdn_state_indices=torch.tensor([3]), sequence_lengths=(3,))
+    assert torch.all(captured["conv_input"][..., 0] == 23)
+    assert torch.count_nonzero(captured["conv_input"][..., 1:]) == 0
+    assert torch.all(layer.conv_states == 31)
+    assert torch.all(layer.recurrent_states[3] == 9)
+    assert torch.count_nonzero(layer.recurrent_states[0]) == 0
 
 
 def test_packed_gdn_prefill_workspace_cache_reuses_capacity():

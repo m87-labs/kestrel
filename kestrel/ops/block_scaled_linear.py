@@ -97,7 +97,7 @@ class BlockScaledLinear(nn.Module):
             return prefix
         return torch.cat((prefix, self.weight_tail.to(dtype)), dim=0)
 
-    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+    def forward(self, activation: torch.Tensor, *, gated_activation: str | None = None) -> torch.Tensor:
         return _block_scaled_linear(
             activation,
             self.weight,
@@ -106,4 +106,5 @@ class BlockScaledLinear(nn.Module):
             interleaved_parts=self.interleaved_parts,
             weight_tail=self.weight_tail,
             bias=self.bias,
+            gated_activation=gated_activation,
         )
