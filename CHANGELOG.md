@@ -4,6 +4,9 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.8.0 — 2026-09-21
+
+- Updated to `kestrel-kernels` 0.7.0 and matching CUDA bundle companions.
 - Speech: added `moondream/parakeet-redux`, the ternary Parakeet, on CPU and
   Apple silicon.
 - Speech: Parakeet now cuts long recordings at pauses into segments of at most
