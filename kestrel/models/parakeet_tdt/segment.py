@@ -130,6 +130,20 @@ def pause_segments(
 
     rate = source.target_sample_rate
     cap_samples = round(SEGMENT_SECONDS * rate)
+    if source.duration_seconds <= SEGMENT_SECONDS:
+        # A clip that already fits in one segment is emitted whole, and the
+        # pause marks are only ever read to choose a cut -- so there is no
+        # cut to choose and no reason to mark anything. Skipping the pause
+        # source here is what most requests do: every LibriSpeech and AMI
+        # utterance, and any clip a caller already segmented.
+        for block in source.chunks(BLOCK_SECONDS, boundary_search_seconds=0.0):
+            yield DecodedAudio(
+                block.waveform,
+                block.waveform.size / rate,
+                block.source_duration_seconds,
+                block.clip_start_seconds,
+            )
+        return
     carry = np.empty(0, dtype=np.float32)
     regions: list[tuple[float, float]] = []
     origin = source_duration = 0.0
