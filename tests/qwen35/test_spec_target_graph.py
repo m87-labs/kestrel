@@ -1,16 +1,105 @@
 from contextlib import contextmanager
+from dataclasses import dataclass
 from collections import OrderedDict
 from types import SimpleNamespace
+import weakref
 
 import torch
 import pytest
 
 from kestrel.models.qwen35.cache import Qwen35InferenceCache
 from kestrel.models.qwen35.spec_target_graph import Qwen35TargetGraph
+from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_topology_owners_survive_capture_replacement_and_retirement():
+    from kestrel_kernels import runtime as runtime_api
+
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    target = object.__new__(Qwen35TargetGraph)
+    target._runtime = SimpleNamespace(max_batch_size=2, _paged_kv=(None,))
+    target._text = SimpleNamespace(config=SimpleNamespace(layer_types=("linear_attention",)))
+    target._block_size = 16
+    target._layouts, target._prefix_bindings = {}, {2: ()}
+    target._bound_outputs, target._finalizers = OrderedDict(), OrderedDict()
+    target._capture_layers, target._linear = (), ()
+    owners = []
+
+    def forward(value):
+        _, lengths, offsets, token = target._layout(2, device)
+        authority = runtime_api._resolve_packed_prefill_topology_authority(token, offsets, lengths)
+        canonical = runtime_api._prepare_packed_prefill_topology_launch(authority, value)
+        # No peer-stream registration should be necessary for capture metadata.
+        assert authority.allocation_stream == torch.cuda.current_stream(device)
+        return value + canonical.sum(), offsets
+
+    target._graphs = FixedShapeSinglePassGraph(
+        enabled=True, device=device, stream=stream, run_forward=forward, max_entries=2)
+    try:
+        for index, size in enumerate((1, 2, 1, 3, 2)):
+            value = torch.ones(size, device=device)
+            with target._graphs.launch(value) as outputs:
+                binding = target._bind_outputs(outputs, 2)
+                owners.append(weakref.ref(binding[3][1][3]))
+                torch.testing.assert_close(outputs[0], torch.full_like(value, 49))
+            del binding, outputs
+            if index == 1:
+                assert owners[0]() is not None
+                assert owners[0]() is not owners[1]()
+            if index == 2:
+                assert owners[0]() is owners[2]()
+            if index == 3:
+                assert owners[1]() is None
+        assert owners[1]() is None and owners[4]() is not None
+    finally:
+        target.shutdown()
+    torch.cuda.synchronize(device)
+
+
+def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
+    config = SimpleNamespace(layer_types=("linear_attention", "linear_attention"))
+    cache = Qwen35InferenceCache(config=config, paged_kv=(None, None))
+    rows = [torch.full((1, 2, 4), float(index)) for index in range(8)]
+    seen = []
+
+    @dataclass
+    class Workspace:
+        owner: torch.Tensor
+
+    class Text:
+        layers = [SimpleNamespace(linear_attn=SimpleNamespace(
+            _prefill_workspace_cache=SimpleNamespace(workspace=Workspace(torch.zeros(1)))))
+            for _ in range(2)]
+
+        def __call__(self, **kwargs):
+            packed = kwargs['past_key_values']
+            seen.append(tuple(value.clone() for layer in packed.layers
+                              for value in (layer.conv_states, layer.recurrent_states)))
+            for index, layer in enumerate(packed.layers):
+                packed._prefix_records[index] = SimpleNamespace(
+                    qkv=torch.zeros(1, 32, 2), a=torch.zeros(1), b=torch.zeros(1),
+                    conv_input=torch.zeros(1), initial_state=layer.recurrent_states.clone(),
+                    state_indices=torch.arange(2), prefix_context=None)
+                layer.conv_states.add_(10)
+                layer.recurrent_states.add_(10)
+            return SimpleNamespace(last_hidden_state=torch.zeros(1, 32, 2), layer_hidden_states=())
+
+    graph = object.__new__(Qwen35TargetGraph)
+    graph._linear, graph._capture_layers, graph._prefix_bindings = (0, 1), (), {}
+    graph._layout = lambda count, device: (cache, (16,)*count, torch.tensor([0, 16, 32]), None)
+    graph._text = Text()
+    metadata = [torch.zeros(1, 32, dtype=torch.long) for _ in range(7)] + [torch.arange(2)]
+    graph._forward(*metadata, *rows)
+    assert all(torch.all(value == index) for index, value in enumerate(rows))
+    graph._forward(*metadata, *(torch.cat(rows[i:i+2]) for i in range(0, 8, 2)))
+    assert all(torch.equal(a, b) for a, b in zip(*seen, strict=True))
 
 
 @pytest.mark.parametrize("retain_prefix", [False, True])
-def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_prefix):
+@pytest.mark.parametrize("direct_rows", [False, True])
+def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_prefix, direct_rows):
     config = SimpleNamespace(layer_types=("linear_attention", "linear_attention"))
     source = Qwen35InferenceCache(config=config, paged_kv=(None, None))
     source.seq_length = 3
@@ -39,6 +128,10 @@ def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_p
 
     @contextmanager
     def launch(*inputs):
+        expected = source if direct_rows else branch
+        assert all(actual is wanted for actual, wanted in zip(inputs[8:],
+            (value for layer in expected.layers
+             for value in (layer.conv_states, layer.recurrent_states)), strict=True))
         yield tuple(tensors)
         for value in graph_states:
             value.zero_()
@@ -51,6 +144,7 @@ def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_p
     graph._graphs = SimpleNamespace(launch=launch)
     graph._runtime = SimpleNamespace(max_batch_size=1)
     graph._bound_outputs = OrderedDict()
+    graph._layouts = {}
     graph._finalizers = OrderedDict()
     graph._prefix_bindings = {1: tuple(bindings)}
     copies = []
@@ -62,7 +156,8 @@ def test_target_state_is_leased_until_full_commit_detaches(monkeypatch, retain_p
 
     monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
     row = torch.zeros(1, 16, dtype=torch.long)
-    with graph.launch(input_ids=row, position_ids=row, cache_position_ids=row,
+    with graph.launch(state_sources=[source] if direct_rows else None,
+                      input_ids=row, position_ids=row, cache_position_ids=row,
                       slot_mapping=row, page_table=row, paged_kv_seqlens_k=torch.tensor([19]),
                       seq_idx=row, gdn_state_indices=torch.zeros(1, dtype=torch.long),
                       past_key_values=branch, sequence_lengths=(16,),

@@ -34,7 +34,9 @@ class Qwen35TargetGraph:
             run_forward=self._forward, max_entries=runtime.max_batch_size)
 
     def _layout(self, count, device):
-        if count not in self._layouts:
+        stream = torch.cuda.current_stream(device)
+        previous = self._layouts.get(count)
+        if previous is None or previous[0] != stream:
             if not 1 <= count <= self._runtime.max_batch_size:
                 raise ValueError('verification graph exceeds sequence capacity')
             lengths = (self._block_size,) * count
@@ -46,8 +48,11 @@ class Qwen35TargetGraph:
             source = Qwen35InferenceCache(config=self._text.config, paged_kv=self._runtime._paged_kv)
             source.seq_length = cache.seq_length = cache._prefix_start = 1
             cache._prefix_source = source
-            self._layouts[count] = cache, lengths, cu, topology
-        return self._layouts[count]
+            # Separate graph entries own separate capture streams. Sharing a
+            # topology would record its storage against a stream that can retire
+            # before that storage, and import external waits during capture.
+            self._layouts[count] = stream, (cache, lengths, cu, topology)
+        return self._layouts[count][1]
 
     def _forward(self, *values):
         inputs = dict(zip(_INPUTS, values[:len(_INPUTS)], strict=True))
@@ -55,9 +60,14 @@ class Qwen35TargetGraph:
         cache, lengths, cu, topology = self._layout(count, inputs['input_ids'].device)
         cache._prefix_records = {}
         states = iter(values[len(_INPUTS):])
+        row_inputs = len(values) != len(_INPUTS) + 2 * len(self._linear)
         for index in self._linear:
             layer = cache.layers[index]
-            layer.conv_states, layer.recurrent_states = next(states), next(states)
+            if row_inputs:
+                layer.conv_states = torch.cat([next(states) for _ in range(count)], dim=0)
+                layer.recurrent_states = torch.cat([next(states) for _ in range(count)], dim=0)
+            else:
+                layer.conv_states, layer.recurrent_states = next(states), next(states)
             layer.has_previous_state = True
         output = self._text(**inputs, past_key_values=cache, cu_seq_lens_q=cu,
             sequence_lengths=lengths, topology_token=topology,
@@ -90,7 +100,7 @@ class Qwen35TargetGraph:
         return tuple(tensors)
 
     @contextmanager
-    def launch(self, **kwargs):
+    def launch(self, *, state_sources=None, **kwargs):
         lengths = tuple(kwargs['sequence_lengths'])
         if not lengths or any(length != self._block_size for length in lengths):
             raise ValueError('verification graph requires complete speculative blocks')
@@ -106,14 +116,20 @@ class Qwen35TargetGraph:
         inputs = [kwargs[name] for name in _INPUTS]
         if inputs[0].shape != (1, sum(lengths)) or inputs[-1].numel() != len(lengths):
             raise ValueError('verification graph metadata does not match packed sequences')
+        if state_sources is not None and len(state_sources) != len(lengths):
+            raise ValueError('verification graph requires one committed source per sequence')
         for index in self._linear:
             layer = cache.layers[index]
             if not layer.has_previous_state:
                 raise ValueError('verification graph requires committed recurrent state')
-            inputs.extend((layer.conv_states, layer.recurrent_states))
+            if state_sources is None:
+                inputs.extend((layer.conv_states, layer.recurrent_states))
+            else:
+                for name in ('conv_states', 'recurrent_states'):
+                    inputs.extend(getattr(source.layers[index], name) for source in state_sources)
         with self._graphs.launch(*inputs) as values:
             hidden, taps = values[0], values[1:1 + len(self._capture_layers)]
-            _, records, sources = self._bind_outputs(values, len(lengths))
+            _, records, sources, _ = self._bind_outputs(values, len(lengths))
             cache._prefix_records = records
             # Prefix finalization consumes the leased records, not a copied full
             # block. Full-block commits detach these states before publication.
@@ -131,7 +147,7 @@ class Qwen35TargetGraph:
         entry = self._bound_outputs.get(key)
         if entry is None:
             if len(self._bound_outputs) >= self._runtime.max_batch_size:
-                _, (_, retired, _) = self._bound_outputs.popitem(last=False)
+                _, (_, retired, _, _) = self._bound_outputs.popitem(last=False)
                 finalizer = self._finalizers.pop(id(retired), None)
                 if finalizer is not None:
                     finalizer[1].shutdown()
@@ -146,7 +162,9 @@ class Qwen35TargetGraph:
                     context = spec.bind(tuple(next(remaining) for _ in range(size)))
                 records[index] = _RecurrentPrefixRecord(
                     self._text.layers[index].linear_attn, *record_values, context)
-            entry = (values, records, tuple(sources))
+            # Retain the topology's private canonical offsets as well as its
+            # public tensor when a same-count capture replaces the warmup layout.
+            entry = (values, records, tuple(sources), self._layouts.get(count))
             self._bound_outputs[key] = entry
         self._bound_outputs.move_to_end(key)
         return entry

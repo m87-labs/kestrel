@@ -418,6 +418,28 @@ def test_packed_fork_rejects_shared_owner_and_noncompact_state():
         Qwen35InferenceCache.fork_packed_recurrent_state([cache])
 
 
+def test_metadata_fork_defers_tensor_packing_and_eager_rejects_it(monkeypatch):
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+    sources = [Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)),
+                                   paged_kv=(None,)) for _ in range(2)]
+    for source in sources:
+        source.seq_length = 3
+        source.layers[0].conv_states = torch.ones(1, 2, 4)
+        source.layers[0].recurrent_states = torch.ones(1, 2, 4, 4)
+        source.layers[0].has_previous_state = True
+    def unexpected(*args, **kwargs):
+        pytest.fail("metadata-only fork must not pack tensor storage")
+    monkeypatch.setattr(torch, "cat", unexpected)
+    packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(sources, materialize=False)
+    for source, branch in zip(sources, branches, strict=True):
+        assert branch._prefix_source is source
+        assert branch.layers[0] is not source.layers[0]
+        assert branch.layers[0].recurrent_states is source.layers[0].recurrent_states
+    obj, _, _, _ = decoder()
+    with pytest.raises(RuntimeError, match="require a verification graph"):
+        obj._verify(None, state_sources=sources, past_key_values=packed)
+
+
 def test_admission_forks_only_owned_recurrent_row():
     obj, first, _, erased = decoder()
     state = SimpleNamespace(batch_idx=-1, max_length=100)
