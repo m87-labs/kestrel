@@ -6,10 +6,12 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from functools import partial
+import ctypes
 import os
 from pathlib import Path
 import platform
 import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -225,6 +227,28 @@ _CUDA_BATCH_CAPACITY = 128
 _CUDA_BATCH_CAPACITY_SMALL = 64  # devices under 40 GiB
 
 
+_libc: Any = None
+
+
+def _trim_heap() -> None:
+    """Return freed heap pages to the OS on Linux (glibc ``malloc_trim``); a no-op elsewhere.
+
+    Loading decodes the packed weights through transient tensors and every batch frees its activations, and
+    glibc keeps those pages resident: on the ternary model at 8 threads the process held about 200 MB of such
+    slack after the load and about 300 MB more in steady state at batch 1 (2026-09-21, LibriSpeech test-clean),
+    a third of its resident memory. One syscall per call.
+    """
+    global _libc
+    if sys.platform != "linux":
+        return
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        return
+
+
 def _batch_capacity(cfg: Any, device: torch.device) -> int:
     configured = getattr(cfg, "single_pass_batch_capacity", None)
     if configured is not None:
@@ -337,6 +361,8 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
         )
+        if self.device.type == "cpu":
+            _trim_heap()
 
     @property
     def model_name(self) -> str:
@@ -703,6 +729,8 @@ class ParakeetTdtRuntime:
         for result in results:
             assert result is not None
             finalized.append(result)
+        if self.device.type == "cpu":
+            _trim_heap()
         return tuple(finalized)
 
     def shutdown(self) -> None:
