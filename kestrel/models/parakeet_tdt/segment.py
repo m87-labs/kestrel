@@ -7,6 +7,7 @@ margins are added because both measured worse for the transducer.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterator
 
 import numpy as np
@@ -23,6 +24,11 @@ MIN_SEGMENT_SECONDS = 1.0
 BLOCK_SECONDS = 120.0
 # `parakeet_features` refuses to normalize anything shorter.
 _MIN_SEGMENT_SAMPLES = 320
+# `AudioChunks.chunks` bounds a resampled block at `ceil(seconds * rate) + 16`
+# output samples, so a clip whose duration is exactly the cap can still decode
+# to a few samples past it. `fits_one_segment` allows for that; anything it
+# turns down goes through the walk, which measures the samples it actually got.
+_RESAMPLE_SLACK_SAMPLES = 16
 _ENERGY_FRAME_SECONDS = 0.02
 _ENERGY_FLOOR_PERCENTILE = 2.0
 _ENERGY_LOUD_PERCENTILE = 90.0
@@ -114,6 +120,26 @@ def next_cut(pauses: list[tuple[float, float]]) -> float:
     return (first + last) / 2
 
 
+def fits_one_segment(source: AudioChunks) -> bool:
+    """Whether `source` is short enough that `pause_segments` emits it whole.
+
+    Decided from the clip's duration, before a sample is read, so a caller can
+    know the shape of a batch without cutting it. The answer is the one the
+    walk over the decoded samples would give, and conservative where it cannot
+    be: a resampled clip is measured against the most samples the resampler may
+    return, so a clip this accepts is never one the walk would cut.
+    """
+
+    rate = source.target_sample_rate
+    samples = source.duration_seconds * rate
+    most = (
+        round(samples)
+        if source.sample_rate == rate
+        else math.ceil(samples) + _RESAMPLE_SLACK_SAMPLES
+    )
+    return most <= round(SEGMENT_SECONDS * rate)
+
+
 def pause_segments(
     source: AudioChunks, speech: SpeechRegions
 ) -> Iterator[DecodedAudio]:
@@ -130,7 +156,7 @@ def pause_segments(
 
     rate = source.target_sample_rate
     cap_samples = round(SEGMENT_SECONDS * rate)
-    if source.duration_seconds <= SEGMENT_SECONDS:
+    if fits_one_segment(source):
         # A clip that already fits in one segment is emitted whole, and the
         # pause marks are only ever read to choose a cut -- so there is no
         # cut to choose and no reason to mark anything. Skipping the pause
@@ -208,6 +234,7 @@ __all__ = [
     "SEGMENT_SECONDS",
     "SpeechRegions",
     "energy_speech",
+    "fits_one_segment",
     "next_cut",
     "pause_segments",
     "pauses_from_speech",
