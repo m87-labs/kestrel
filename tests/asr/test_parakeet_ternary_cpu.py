@@ -1,6 +1,6 @@
 """The ternary Parakeet student runs end to end on CPU through the public engine.
 
-Builds a tiny ternary export (small config, random packed 2-bit weights, a
+Builds a tiny ternary export (small config, random packed ternary weights, a
 throwaway tokenizer) in ``tmp_path`` and drives ``InferenceEngine`` over it, so
 the CPU path — device policy, no KV pool, thread policy, the ASR contract —
 is covered without a GPU and without downloading a checkpoint.
@@ -81,7 +81,7 @@ def _write_tokenizer(path: Path, vocab_size: int, *, blank: int, pad: int) -> No
 
 
 def _pack_ternary(out_features: int, in_features: int, generator: torch.Generator):
-    """Random 2-bit codes in ``{0, 1, 2}``, four to a byte, plus fp16 scales."""
+    """Random ternary codes in ``{0, 1, 2}``, packed four per byte, plus fp16 scales."""
     codes = torch.randint(
         0, 3, (out_features, in_features), generator=generator, dtype=torch.uint8
     )

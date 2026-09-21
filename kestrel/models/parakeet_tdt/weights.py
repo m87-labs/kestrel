@@ -19,7 +19,7 @@ from .vad import VAD_HEAD_PREFIX
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
 _FILES = ("config.json", "tokenizer.json", "model.safetensors")
-# The ternary (2-bit) student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID: config.json and
+# The ternary student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID: config.json and
 # tokenizer.json as usual, a packed ``model.safetensors`` and the ``ternary.json`` manifest written by thrush's
 # ``scripts/export_ternary.py --names hf``. That manifest is the only thing that marks a checkpoint as ternary.
 TERNARY_MODEL_ID = "moondream/parakeet-redux"

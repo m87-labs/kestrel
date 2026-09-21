@@ -4,7 +4,7 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-- Speech: added the 2-bit Parakeet student on CPU and Apple silicon. The
+- Speech: added the ternary Parakeet student on CPU and Apple silicon. The
   encoder routes fused attention, normalization, activations, and depthwise
   convolutions through the `conformer` kernel domain, and projects relative
   positions for all blocks in one matrix multiply.

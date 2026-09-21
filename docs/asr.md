@@ -159,7 +159,7 @@ revised without changing committed transcription quality.
 ### Running on the CPU or on Apple silicon
 
 Transcription runtimes need no paged KV cache, so they start without one. The
-2-bit Parakeet student supports CPU and Apple silicon; select `device="cpu"` or
+ternary Parakeet student supports CPU and Apple silicon; select `device="cpu"` or
 `device="mps"` explicitly.
 
 ```python
@@ -186,9 +186,10 @@ nothing reads `OMP_NUM_THREADS`. Set `OMP_WAIT_POLICY=passive` in a CPU
 deployment's environment, or torch's idle OpenMP workers spin on the cores the
 kernels want.
 
-The 2-bit weights are kept in the one form kestrel-kernels ships for each
-device, and there is nothing to select: packed panels with int8 activations on
-the CPU (0.78 GB resident for this model), and the packed codes read directly
+The ternary weights are kept in the one form kestrel-kernels ships for each
+device, and there is nothing to select: a 2-bit packed execution representation
+with int8 activations on the CPU (0.78 GB resident for this model), and the
+packed codes read directly
 by a Metal matrix multiply on Apple silicon (220 MB of device memory against
 2495 MB dequantized). The CPU path quantizes activations to int8 per
 128-element group, so its arithmetic is not bit-exact — on the 50-utterance

@@ -22,7 +22,7 @@ register(
     )
 )
 
-# The 2-bit (ternary) student: same runtime, same contract, weights at ``repo_id`` (private for now);
+# The ternary student: same runtime, same contract, weights at ``repo_id`` (private for now);
 # ``RuntimeConfig(model=TERNARY_MODEL_ID)`` downloads them, ``model_path=<export dir>`` loads a local export.
 register(
     ModelSpec(
