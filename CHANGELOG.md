@@ -4,6 +4,10 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.8.0 — 2026-09-21
+
+- Added fast, memory-efficient transcription with `moondream/parakeet-redux` on CPUs, Apple silicon and CUDA, including pause-aware processing for long audio.
+
 ## 0.7.2 — 2026-09-13
 
 - Updated to `kestrel-kernels` 0.6.2 and matching CUDA bundle companions.

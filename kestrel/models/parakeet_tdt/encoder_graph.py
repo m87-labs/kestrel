@@ -13,6 +13,13 @@ from .model import ParakeetTdt
 
 
 _ENCODER_GRAPH_BUCKETS = (48, 80, 128, 224)
+# A captured graph saves the encoder's kernel launches, which only matter while the batch is small; past that the
+# bucket padding (1.25x the real frames on LibriSpeech test-clean, 1.95x on AMI, whose median segment is 1.5 s
+# against the 3.8 s smallest bucket) and one capture per (batch, bucket) pair cost more than the launches saved.
+# Measured on a B200 with parakeet-tdt-0.6b-v3, graphed over eager real-time factor, LibriSpeech test-clean / AMI
+# test: batch 1 1.46x / 1.64x, 2 1.40x / 1.56x, 4 1.30x / 1.47x, 8 1.22x / 1.36x, 16 1.18x / 1.15x, 32 0.99x / 1.00x,
+# 128 0.70x / 0.74x. Batches above this size run eagerly, padded only to their own longest row.
+_ENCODER_GRAPH_MAX_BATCH = 16
 
 
 def _normalize_buckets(buckets: tuple[int, ...]) -> tuple[int, ...]:
@@ -38,8 +45,12 @@ class ParakeetEncoderGraph:
         device: torch.device,
         stream: torch.cuda.Stream | None,
         buckets: tuple[int, ...] = _ENCODER_GRAPH_BUCKETS,
+        graph_max_batch: int = _ENCODER_GRAPH_MAX_BATCH,
     ) -> None:
         self.buckets = _normalize_buckets(buckets)
+        if type(graph_max_batch) is not int or graph_max_batch <= 0:
+            raise ValueError("encoder graph_max_batch must be a positive integer")
+        self.graph_max_batch = graph_max_batch
         self._model = model
         if stream is None:
             stream = make_stream(device)
@@ -51,7 +62,7 @@ class ParakeetEncoderGraph:
             device=device,
             stream=stream,
             run_forward=model.encode_subsampled,
-            max_entries=max(1, max_batch * len(self.buckets)),
+            max_entries=max(1, min(max_batch, graph_max_batch) * len(self.buckets)),
         )
         # The outer session keeps stream ordering and the output lease through
         # the caller's decoding; the inner cache reuses its output buffers.
@@ -70,7 +81,7 @@ class ParakeetEncoderGraph:
         factor = self._model.config.encoder.subsampling_factor
         length = (features.shape[1] + factor - 1) // factor
         bucket = next((size for size in self.buckets if size >= length), None)
-        if not self.enabled or bucket is None:
+        if not self.enabled or bucket is None or features.shape[0] > self.graph_max_batch:
             return self._model.encode(features, mask)
 
         hidden, valid = self._model.encoder.subsampling(features, mask)

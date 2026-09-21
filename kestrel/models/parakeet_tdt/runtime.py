@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+from functools import partial
+import ctypes
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -29,8 +36,65 @@ from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
 from .features import parakeet_features
 from .model import ParakeetTdt, TdtState
+from .segment import SpeechRegions, energy_speech, pause_segments
 from .tokenizer import ParakeetTokenizer
+from .vad import head_speech
 from .weights import MODEL_ID, load_parakeet_tdt
+
+
+# One live-PCM window: the block the orchestrator commits exactly, and the unit
+# the streaming decoder carries its state across.
+STREAM_WINDOW_SECONDS = 180
+_CPU_THREAD_CAP = 8
+_NATIVE_GEMM_THREAD_CAP = 4
+
+
+def _cpu_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Avoid emulated BF16 GEMMs on CPUs without native BF16 support."""
+
+    if dtype != torch.bfloat16:
+        return dtype
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        fn = getattr(torch.cpu, probe, None)
+        try:
+            if fn is not None and fn():
+                return torch.bfloat16
+        except Exception:  # noqa: BLE001 — private torch capability probes
+            continue
+    return torch.float32
+
+
+def _physical_cpu_count() -> int:
+    """Physical cores available to this process (P-cores on Apple silicon)."""
+
+    if platform.system() == "Darwin":
+        for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+            try:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
+                )
+                return int(out.strip())
+            except Exception:  # noqa: BLE001 — probe, never fatal
+                continue
+        return os.cpu_count() or 1
+    try:
+        usable = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+    cores: set[tuple[str, str]] = set()
+    for cpu in usable:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return len(usable)
+        cores.add((package, core))
+    return len(cores) or len(usable)
+
+
+def _default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
+    return max(1, min(_physical_cpu_count(), cap))
 
 
 def _timed_segments(
@@ -70,6 +134,64 @@ def _timed_segments(
     return tuple(segments)
 
 
+def _set_kernel_worker_threads(threads: int | None) -> None:
+    """Hand the kernels their pool size, or ``None`` to leave them their cache-domain policy."""
+    try:
+        from kestrel_kernels.ternary import set_worker_threads
+    except ImportError:
+        return
+    set_worker_threads(threads)
+
+
+def _confine_submitter_to_cache_domain() -> None:
+    """Pin the calling thread to the cores chosen by the native kernel pool.
+
+    The submitting thread participates in each parallel region, so letting it
+    roam outside the pool's cache domain defeats the workers' placement. Linux
+    affinity is per-thread; other application threads are left alone.
+
+    A no-op where the topology cannot be read (macOS has no affinity interface), and where the current mask
+    is already inside the chosen group.
+    """
+    try:
+        from kestrel_kernels import _cpu
+    except ImportError:
+        return
+    cpus = set(getattr(_cpu, "pool_cpus", tuple)())
+    if not cpus or not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        current = os.sched_getaffinity(0)
+        if current <= cpus:
+            return
+        os.sched_setaffinity(0, cpus)
+    except OSError:  # a container that forbids it; the workers are still placed
+        pass
+
+
+def _configure_cpu_threads(threads: int | None, *, native_gemm: bool) -> int:
+    """Apply the shared CPU policy to torch and the native kernel pool.
+
+    With no explicit count, the pool chooses one cache domain. Torch uses the
+    smaller cap only when the ternary model's GEMMs run in that pool. An
+    explicit count sizes both pools and leaves affinity to the caller.
+    """
+
+    if threads is None:
+        # Reset the pool first: ``pool_cpus`` must describe the placement this
+        # runtime will actually use, not a previous explicit configuration.
+        _set_kernel_worker_threads(None)
+        threads = (
+            _default_cpu_threads(_NATIVE_GEMM_THREAD_CAP)
+            if native_gemm
+            else _default_cpu_threads()
+        )
+    else:
+        _set_kernel_worker_threads(int(threads))
+    torch.set_num_threads(int(threads))
+    return torch.get_num_threads()
+
+
 def _encoder_frames(samples: int, factor: int) -> int:
     frames = samples // 160
     while factor > 1:
@@ -93,9 +215,56 @@ class _StreamWindow:
     duration_seconds: float
 
 
+# Requests per forward. On CUDA the encoder runs eagerly above the graph threshold, so a large batch is pure
+# throughput: measured on a B200 with parakeet-tdt-0.6b-v3 on LibriSpeech test-clean (longest rows 35 s), real
+# time factor and peak allocated memory -- capacity 8 2,324x / 2.0 GiB, 16 2,530x / 2.7 GiB, 64 3,800x / 7.0 GiB,
+# 128 4,051x / 12.8 GiB, 256 4,516x / 24.4 GiB. CPU and MPS keep 8: there a batch costs latency and memory and
+# buys little. ``RuntimeConfig.single_pass_batch_capacity`` overrides the choice.
+_BATCH_CAPACITY = 8
+_CUDA_BATCH_CAPACITY = 128
+_CUDA_BATCH_CAPACITY_SMALL = 64  # devices under 40 GiB
+
+
+_libc: Any = None
+
+
+def _trim_heap() -> None:
+    """Return freed heap pages to the OS on Linux (glibc ``malloc_trim``); a no-op elsewhere.
+
+    Loading decodes the packed weights through transient tensors and every batch frees its activations, and
+    glibc keeps those pages resident: on the ternary model at 8 threads the process held about 200 MB of such
+    slack after the load and about 300 MB more in steady state at batch 1 (2026-09-21, LibriSpeech test-clean),
+    a third of its resident memory. One syscall per call.
+    """
+    global _libc
+    if sys.platform != "linux":
+        return
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        return
+
+
+def _batch_capacity(cfg: Any, device: torch.device) -> int:
+    configured = getattr(cfg, "single_pass_batch_capacity", None)
+    if configured is not None:
+        if type(configured) is not int or configured <= 0:
+            raise ValueError("single_pass_batch_capacity must be a positive integer")
+        return configured
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return _BATCH_CAPACITY
+    total = torch.cuda.get_device_properties(device).total_memory
+    return _CUDA_BATCH_CAPACITY if total >= 40 * 2**30 else _CUDA_BATCH_CAPACITY_SMALL
+
+
 class ParakeetTdtRuntime:
     execution_shape = ExecutionShape.SINGLE_PASS
-    batch_capacity = 8
+    batch_capacity = _BATCH_CAPACITY  # resolved per instance in __init__
+    # Transducer decoding keeps its own small decoder state; there is no paged
+    # KV cache here, so the engine skips building (and importing) one.
+    needs_kv_pool = False
 
     def __init__(
         self,
@@ -119,17 +288,35 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
+        if self.device.type == "cpu":
+            self.dtype = _cpu_dtype(self.dtype)
+        self.batch_capacity = _batch_capacity(cfg, self.device)
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
             else make_stream(self.device)
         )
         if model is None or tokenizer is None:
-            checkpoint = getattr(cfg, "model_path", None) or self._model_name
-            loaded = load_parakeet_tdt(checkpoint, device=self.device, dtype=self.dtype)
+            loaded = load_parakeet_tdt(
+                getattr(cfg, "model_path", None) or self._model_name,
+                device=self.device,
+                dtype=self.dtype,
+            )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        configured_cpu_threads = getattr(cfg, "cpu_threads", None)
+        self._confine_cpu_submitter = (
+            self.device.type == "cpu" and configured_cpu_threads is None
+        )
+        self.cpu_threads = (
+            _configure_cpu_threads(
+                configured_cpu_threads,
+                native_gemm=self.model.is_ternary,
+            )
+            if self.device.type == "cpu"
+            else None
+        )
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -176,10 +363,26 @@ class ParakeetTdtRuntime:
             device=self.device,
             stream=self.compute_stream,
         )
+        if self.device.type == "cpu":
+            _trim_heap()
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _speech_regions(self) -> SpeechRegions:
+        """The pause source, chosen by capability of the loaded weights.
+
+        A checkpoint carrying `vad_head.*` marks speech with its own head off
+        the subsampler it already runs. Everything else -- stock NVIDIA
+        checkpoints included -- reads frame energy. There is no option and no
+        bundled default head: the loaded tensors decide. Nothing is cached on
+        the runtime, so a shared one segments concurrent requests safely.
+        """
+
+        if getattr(self.model, "vad_head", None) is None:
+            return energy_speech
+        return partial(head_speech, self.model)
 
     def tasks(self) -> tuple[str, ...]:
         return ("transcribe",)
@@ -352,6 +555,8 @@ class ParakeetTdtRuntime:
     ) -> tuple[dict[str, object] | Exception, ...]:
         if task != "transcribe":
             raise ValueError("ParakeetTdtRuntime only accepts transcribe requests")
+        if getattr(self, "_confine_cpu_submitter", False):
+            _confine_submitter_to_cache_domain()
 
         parsed: list[
             tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None] | None
@@ -395,10 +600,21 @@ class ParakeetTdtRuntime:
                     )
                 except Exception as exc:
                     results[index] = exc
-            iterators = [
-                iter(source.chunks(180)) if source is not None else None
-                for source in sources
-            ]
+            # Pause-aligned segments of at most 30 s, contiguous and never
+            # overlapping: 6.37 WER against 10.82 for the fixed 180 s windows
+            # this replaces (six Earnings-22 calls, parakeet-tdt-0.6b-v3).
+            # A live stream window arrives already cut, carrying decoder state
+            # and sample offsets into itself, so it passes through whole.
+            speech = self._speech_regions()
+            iterators: list[Iterator[DecodedAudio] | None] = []
+            for index, source in enumerate(sources):
+                item = parsed[index]
+                if source is None or item is None:
+                    iterators.append(None)
+                elif item[2] is not None:
+                    iterators.append(iter(source.chunks(STREAM_WINDOW_SECONDS)))
+                else:
+                    iterators.append(iter(pause_segments(source, speech)))
             text_parts: list[list[str]] = [[] for _ in inputs]
             segments: list[list[Segment]] = [[] for _ in inputs]
 
@@ -517,6 +733,8 @@ class ParakeetTdtRuntime:
         for result in results:
             assert result is not None
             finalized.append(result)
+        if self.device.type == "cpu":
+            _trim_heap()
         return tuple(finalized)
 
     def shutdown(self) -> None:

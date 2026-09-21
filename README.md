@@ -52,6 +52,7 @@ Kestrel supports these model families:
 | Whisper large-v3-turbo | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | Transcription, translation, long-form audio, and word timestamps |
 | Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
 | Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
+| parakeet-redux | [moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux) | The ternary Parakeet: 178 MB, the same capabilities, and runs on the CPU and Apple silicon as well as CUDA |
 
 ## Quick Start
 
@@ -132,7 +133,9 @@ asyncio.run(main())
 ```
 
 Kestrel accepts encoded paths, bytes, bounded binary streams, raw mono PCM,
-and asynchronous PCM iterators. Long paths are decoded incrementally. See
+and asynchronous PCM iterators. Long paths are decoded incrementally.
+`moondream/parakeet-redux` also runs on the CPU and on Apple silicon: pass
+`device="cpu"` or `device="mps"`. See
 [Speech-to-text models](https://github.com/m87-labs/kestrel/blob/main/docs/asr.md)
 for the shared interface and model
 capability matrix, model-specific options, formats, and resource limits.
@@ -330,6 +333,7 @@ architecture and checkpoint format.
 | `MOONDREAM_API_KEY` | Optional. Only needed for finetuned-model inference. Get this from [moondream.ai](https://moondream.ai). |
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
 | `HF_TOKEN` | Hugging Face token for private or gated model repositories. Alternatively, run `huggingface-cli login`. |
+| `OMP_WAIT_POLICY` | Set to `passive` before torch loads when transcribing on the CPU, or torch's idle OpenMP workers spin on the cores the kernels use. |
 
 ## Triton Inference Server
 

@@ -58,6 +58,45 @@ def test_encoder_rejects_invalid_buckets(buckets) -> None:
         )
 
 
+@pytest.mark.parametrize("graph_max_batch", [0, -1, 2.0])
+def test_encoder_rejects_invalid_graph_max_batch(graph_max_batch) -> None:
+    with pytest.raises(ValueError, match="graph_max_batch"):
+        ParakeetEncoderGraph(
+            _model(), enabled=False, max_batch=8, device=torch.device("cpu"), stream=None,
+            graph_max_batch=graph_max_batch,
+        )
+
+
+@torch.inference_mode()
+def test_batches_above_graph_max_batch_run_eagerly(monkeypatch) -> None:
+    model = _model()
+    session = ParakeetEncoderGraph(
+        model, enabled=False, max_batch=16, device=torch.device("cpu"), stream=None,
+        graph_max_batch=4,
+    )
+    assert session._graphs._max_entries == 4 * len(session.buckets)
+    calls = []
+
+    @contextmanager
+    def replay(hidden, valid):
+        calls.append(tuple(hidden.shape[:2]))
+        yield model.encode_subsampled(hidden, valid)
+
+    monkeypatch.setattr(session._graphs, "enabled", True)
+    monkeypatch.setattr(session._graphs, "launch", replay)
+    try:
+        for batch in (1, 4, 5, 16):
+            features, mask = _features(129, batch=batch)
+            with session.launch(features, mask) as (actual, valid):
+                expected, expected_valid = model.encode(features, mask)
+                assert actual.shape == expected.shape
+                assert torch.equal(valid, expected_valid)
+                torch.testing.assert_close(actual[valid], expected[valid])
+        assert calls == [(1, 48), (4, 48)]
+    finally:
+        session.shutdown()
+
+
 @torch.inference_mode()
 def test_padding_after_subsampling_preserves_boundary_outputs() -> None:
     model = _model()
