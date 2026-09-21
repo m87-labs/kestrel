@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from kestrel.models.qwen35.spec_decoder import Qwen35DFlashDecoder, _Session
-from kestrel.runtime.spec import DraftResult
+from kestrel.runtime.spec import DraftResult, SpecAdmission
 from kestrel.runtime.tokens import TextToken
 
 
@@ -439,6 +439,85 @@ def test_admission_forks_only_owned_recurrent_row():
     assert pool.flatten().tolist() == [0, 1, 2, 3]
     assert obj._sessions[2].cache.layers[0].recurrent_states.item() == 102
     assert obj._sessions[1].state is first and erased == []
+
+
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_packed_admission_isolates_slots_lengths_and_failures(monkeypatch, fail_forward):
+    obj, existing, _, erased = decoder()
+    obj.runtime.max_batch_size = 3
+    obj.runtime.device = torch.device("cpu")
+    obj.runtime.page_size = 2
+    available = [3, 2]
+    obj.runtime.page_table.free_batch_idx = available
+    obj.runtime.page_table.allocate = lambda: available.pop(0)
+    obj.runtime.page_table.reserve = lambda *args: None
+    obj.runtime.page_table.commit_block_table = lambda *args: None
+    obj.runtime.page_table.page_table = torch.arange(40).reshape(4, 10)
+    obj.runtime._paged_kv = (None,)
+    obj.text = SimpleNamespace(config=SimpleNamespace(layer_types=("linear_attention",)))
+    obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
+    pool = torch.arange(4, dtype=torch.bfloat16).reshape(4, 1, 1, 1)
+    obj.runtime._linear_state_pool = SimpleNamespace(bind_prefill_state=lambda cache:
+        setattr(cache.layers[0], "recurrent_states", pool))
+    obj.runtime.model = SimpleNamespace(lm_head=lambda hidden:
+        torch.nn.functional.one_hot(hidden.long().squeeze(-1), num_classes=16).float())
+    from kestrel.models.qwen35 import spec_decoder as module
+    def topology(*, sequence_lengths, device):
+        return torch.tensor([0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+                            device=device, dtype=torch.int32), None
+    monkeypatch.setattr(module, "get_runtime", lambda: SimpleNamespace(gated_delta=
+        SimpleNamespace(bind_packed_prefill_topology=topology)))
+    calls = []
+    def verify(leases, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["sequence_lengths"] == (2, 1)
+        assert kwargs["position_ids"].tolist() == [[0, 1, 0]]
+        assert kwargs["slot_mapping"].tolist() == [[60, 61, 40]]
+        assert kwargs["gdn_state_indices"].tolist() == [0, 1]
+        assert kwargs["seq_idx"].tolist() == [[0, 0, 1]]
+        if fail_forward:
+            raise RuntimeError("injected packed prefill failure")
+        layer = kwargs["past_key_values"].layers[0]
+        assert not layer.has_previous_state
+        layer.recurrent_states.copy_(torch.tensor([2, 3]).reshape(2, 1, 1, 1))
+        layer.conv_states = torch.tensor([2, 1]).reshape(2, 1, 1)
+        layer.has_previous_state = True
+        hidden = kwargs["input_ids"].float().unsqueeze(-1)
+        return SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=(hidden,))
+    obj._verify = verify
+    states = [SimpleNamespace(batch_idx=-1, max_length=100) for _ in range(3)]
+    requests = [SpecAdmission(state, [TextToken(token_id=t) for t in tokens], {})
+                for state, tokens in zip(states, ([1, 2], [999], [3]))]
+    results = obj.admit_many(requests)
+    assert len(calls) == 1 and isinstance(results[1], ValueError)
+    assert obj._sessions[1].state is existing
+    assert pool.flatten().tolist() == [0, 1, 2, 3]
+    if fail_forward:
+        assert all(isinstance(result, Exception) for result in results)
+        assert erased == [3, 2] and all(state.batch_idx == -1 for state in states)
+        assert set(obj._sessions) == {1}
+    else:
+        assert results[0] == (2, None) and results[2] == (3, None)
+        first, second = obj._sessions[3], obj._sessions[2]
+        assert (first.cache.seq_length, second.cache.seq_length) == (2, 1)
+        assert first.features.flatten().tolist() == [1, 2]
+        assert second.features.flatten().tolist() == [3]
+        first.cache.layers[0].recurrent_states.fill_(99)
+        assert second.cache.layers[0].recurrent_states.item() == 3
+        assert first.spare_cache.layers[0].recurrent_states.item() == 2
+
+
+def test_duplicate_admission_state_cannot_acquire_two_owners():
+    obj, existing, _, erased = decoder()
+    state = SimpleNamespace(batch_idx=-1, max_length=100)
+    request = SpecAdmission(state, [TextToken(token_id=1)], {})
+    def unexpected(*args, **kwargs):
+        pytest.fail("duplicate state must be rejected before allocation")
+    obj._prepare_admission = unexpected
+    results = obj.admit_many([request, request])
+    assert all(isinstance(result, ValueError) for result in results)
+    assert state.batch_idx == -1 and not erased
+    assert obj._sessions[1].state is existing
 
 
 def test_unsupported_runtime_rejects_draft_config_before_loading():

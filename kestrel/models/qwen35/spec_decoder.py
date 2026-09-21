@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager
+from copy import copy
+from collections import Counter
 from typing import Any
 
 import torch
@@ -92,7 +94,7 @@ class Qwen35DFlashDecoder:
         if allowed is not None or suppressed:
             raise ValueError("Qwen DFlash currently requires unconstrained greedy text generation")
 
-    def admit(self, state, prompt_tokens, *, image=None, image_crops=None,
+    def _prepare_admission(self, state, prompt_tokens, *, image=None, image_crops=None,
               allowed_token_ids=None, suppressed_token_ids=None,
               suppress_next_token_ids=None, temperature=0.0, top_p=1.0):
         if self._closed or self._graph_failed:
@@ -127,14 +129,107 @@ class Qwen35DFlashDecoder:
             for layer in cache.layers:
                 if isinstance(layer, LinearAttentionState):
                     layer.recurrent_states = layer.recurrent_states[slot:slot + 1]
+            return slot, capacity, tokens, cache
+        except Exception:
+            pages.erase(slot)
+            state.batch_idx = -1
+            raise
+
+    def admit(self, state, prompt_tokens, **options):
+        slot, capacity, tokens, cache = self._prepare_admission(state, prompt_tokens, **options)
+        try:
             expected, features, cache = self._target(tokens, cache, slot, capture=False)
             self._sessions[slot] = _Session(state, cache, DFlashContextCache(capacity), features,
                 expected[-1], spare_cache=cache.fork_recurrent_state())
             return expected[-1], None
         except Exception:
-            pages.erase(slot)
+            self.runtime.page_table.erase(slot)
             state.batch_idx = -1
             raise
+
+    def admit_many(self, requests):
+        """Prefill independent new sessions together; report errors per request."""
+        if len(requests) == 1:
+            from kestrel.runtime.spec import admit_independently
+            return admit_independently(self, requests)
+        prepared, results = [], [None] * len(requests)
+        counts = Counter(id(request.state) for request in requests)
+        for index, request in enumerate(requests):
+            try:
+                if counts[id(request.state)] != 1:
+                    raise ValueError("duplicate speculative admission state")
+                if len(prepared) >= self.runtime.max_batch_size - len(self._sessions):
+                    raise RuntimeError("Qwen DFlash sequence slot is occupied")
+                values = self._prepare_admission(request.state, request.prompt_tokens, **request.options)
+                prepared.append((index, request.state, *values))
+            except Exception as error:
+                results[index] = error
+        if not prepared:
+            return results
+        try:
+            outputs = self._target_prefill_many(
+                [item[4] for item in prepared], [item[5] for item in prepared],
+                [item[2] for item in prepared])
+            sessions = [
+                _Session(state, cache, DFlashContextCache(capacity), features, token,
+                         spare_cache=cache.fork_recurrent_state())
+                for (_, state, _, capacity, _, _), (token, features, cache)
+                in zip(prepared, outputs, strict=True)]
+        except Exception as error:
+            for index, state, slot, *_ in prepared:
+                self.runtime.page_table.erase(slot)
+                state.batch_idx = -1
+                results[index] = error
+            return results
+        for (index, _, slot, *_), session in zip(prepared, sessions, strict=True):
+            self._sessions[slot] = session
+            results[index] = session.bonus, None
+        return results
+
+    def _target_prefill_many(self, prompts, caches, slots):
+        self._wait_for_commit()
+        lengths = tuple(map(len, prompts))
+        device = self.runtime.device
+        packed = Qwen35InferenceCache(config=self.text.config, paged_kv=self.runtime._paged_kv)
+        for layer, source in zip(packed.layers, caches[0].layers, strict=True):
+            if isinstance(layer, LinearAttentionState):
+                state = source.recurrent_states
+                layer.recurrent_states = torch.empty(
+                    (len(prompts), *state.shape[1:]), device=state.device, dtype=state.dtype)
+        ids = torch.tensor([sum(prompts, [])], device=device, dtype=torch.long)
+        positions = torch.cat([torch.arange(length, device=device) for length in lengths])[None]
+        slot_ids = torch.tensor(slots, device=device, dtype=torch.long)
+        page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
+        page_size = self.runtime.page_size
+        slot_mapping = torch.cat([
+            page_table[row, position // page_size].long() * page_size + position % page_size
+            for row, position in enumerate(positions[0].split(lengths))])[None]
+        cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+            sequence_lengths=lengths, device=device)
+        output = self._verify(None,
+            input_ids=ids, past_key_values=packed, position_ids=positions,
+            cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
+            paged_kv_seqlens_k=torch.tensor(lengths, device=device, dtype=torch.int32),
+            cu_seq_lens_q=cu, sequence_lengths=lengths, topology_token=topology,
+            seq_idx=torch.cat([torch.full((length,), row, device=device, dtype=torch.int32)
+                               for row, length in enumerate(lengths)])[None],
+            gdn_state_indices=torch.arange(len(prompts), device=device, dtype=torch.long),
+            gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
+        features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
+        ends = cu[1:].long() - 1
+        last = output.last_hidden_state.index_select(1, ends)
+        tokens = self.runtime.model.lm_head(last).argmax(-1)[0].tolist()
+        for row, (cache, length) in enumerate(zip(caches, lengths, strict=True)):
+            layers = list(cache.layers)
+            for index, layer in enumerate(packed.layers):
+                if isinstance(layer, LinearAttentionState):
+                    owned = copy(layer)
+                    owned.conv_states = layer.conv_states[row:row + 1]
+                    owned.recurrent_states = layer.recurrent_states[row:row + 1]
+                    layers[index] = owned
+            cache.layers = tuple(layers)
+            cache.advance_to(length)
+        return list(zip(tokens, features, caches, strict=True))
 
     def _target(self, tokens, committed, slot, *, capture, leases=None):
         self._wait_for_commit()

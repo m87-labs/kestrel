@@ -15,7 +15,7 @@ with scheduler integration, where they are actually consumed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
@@ -379,6 +379,24 @@ class SpecDecoder(Protocol):
 
 
 @dataclass
+class SpecAdmission:
+    state: Any
+    prompt_tokens: Sequence[Token]
+    options: dict[str, Any]
+
+
+def admit_independently(decoder, requests):
+    """Preserve individual admission errors for decoders without packed prefill."""
+    results = []
+    for request in requests:
+        try:
+            results.append(decoder.admit(request.state, request.prompt_tokens, **request.options))
+        except Exception as error:
+            results.append(error)
+    return results
+
+
+@dataclass
 class SpecDecodeCaps:
     """A runtime's speculative-decoding capability.
 
@@ -400,3 +418,7 @@ class SpecDecodeCaps:
     proposer: SpecProposer
     capture_hidden_layers: tuple[int, ...] = ()
     decoder: SpecDecoder | None = None
+    # Every backend reports one result or exception per request in input order.
+    admit_many: Callable[[SpecDecoder, Sequence[SpecAdmission]],
+                         list[tuple[int, float | None] | Exception]] = admit_independently
+    admission_token_budget: int = 512
