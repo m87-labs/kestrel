@@ -4,18 +4,11 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
-- Speech: added `moondream/parakeet-ultra`, the full-precision Parakeet
-  trained further, with its own VAD head.
-- Increased CUDA transcription throughput by keeping two Parakeet request
-  cohorts in flight, uploading each cohort's audio in one pinned transfer,
-  and skipping pause detection for clips that already fit in one segment.
-- Increased it further by delivering a cohort's results together, building a
-  cohort's audio features in one spectrogram, and running the transducer
-  decode loop on the GPU.
+## 0.8.1 — 2026-09-22
 
-## 0.8.1 — 2026-09-21
-
-- Kept CPU-selected Parakeet inference on CPU and avoided allocating GPU memory during import.
+- Added `moondream/parakeet-ultra`, a full-precision Parakeet model with its own voice activity detector.
+- Increased Parakeet transcription throughput on CUDA by overlapping batches and batching audio preprocessing and GPU decoding.
+- Updated to `kestrel-kernels` 0.7.1, keeping CPU-selected inference on CPU and avoiding GPU allocation during import.
 - Resolved compiler-declared runtime resources when fusion changes generated
   output argument names.
 - Added the model-bound `synthesize` capability and append-only streaming
