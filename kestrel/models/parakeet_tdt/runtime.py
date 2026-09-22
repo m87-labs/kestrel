@@ -223,14 +223,21 @@ def _stage_waveforms(
 
     Nothing holds the pinned buffer: Torch's caching host allocator records
     the copy on the block and will not hand that block out again until the
-    copy has completed, so no buffer has to be retained or waited on here. A
-    warm allocator returns one in about a microsecond.
+    copy has completed. A warm allocator returns one in about a microsecond,
+    but only for a size it has seen, and ``rows * longest`` is different
+    almost every time; a miss is a ``cudaHostAlloc``, which is neither cheap
+    nor asynchronous. So the buffer is a slice of a power-of-two block: a
+    handful of sizes for any workload. Without it a pass over long clips left
+    the allocator holding nothing a pass over short ones could use, and the
+    short pass ran about a tenth slower for it.
     """
 
     rows = len(blocks)
     width = max(int(block.size) for block in blocks)
     if pinned:
-        host = torch.empty((rows, width), dtype=torch.float32, pin_memory=True)
+        block_size = 1 << max(20, (rows * width - 1).bit_length())
+        host = torch.empty(block_size, dtype=torch.float32, pin_memory=True)
+        host = host[: rows * width].view(rows, width)
     else:
         host = torch.empty((rows, width), dtype=torch.float32)
     view = host.numpy()
