@@ -18,6 +18,8 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
     streams = []
 
     class _Model:
+        config = SimpleNamespace(encoder=SimpleNamespace(subsampling_factor=8))
+
         def encode(
             self, features: torch.Tensor, mask: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
