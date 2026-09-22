@@ -12,7 +12,11 @@ from collections.abc import Callable, Iterator
 
 import numpy as np
 
-from kestrel.models.asr.audio import AudioChunks, DecodedAudio
+from kestrel.models.asr.audio import (
+    RESAMPLE_SLACK_SAMPLES,
+    AudioChunks,
+    DecodedAudio,
+)
 
 
 SEGMENT_SECONDS = 30.0
@@ -24,11 +28,6 @@ MIN_SEGMENT_SECONDS = 1.0
 BLOCK_SECONDS = 120.0
 # `parakeet_features` refuses to normalize anything shorter.
 _MIN_SEGMENT_SAMPLES = 320
-# `AudioChunks.chunks` bounds a resampled block at `ceil(seconds * rate) + 16`
-# output samples, so a clip whose duration is exactly the cap can still decode
-# to a few samples past it. `fits_one_segment` allows for that; anything it
-# turns down goes through the walk, which measures the samples it actually got.
-_RESAMPLE_SLACK_SAMPLES = 16
 _ENERGY_FRAME_SECONDS = 0.02
 _ENERGY_FLOOR_PERCENTILE = 2.0
 _ENERGY_LOUD_PERCENTILE = 90.0
@@ -135,7 +134,7 @@ def fits_one_segment(source: AudioChunks) -> bool:
     most = (
         round(samples)
         if source.sample_rate == rate
-        else math.ceil(samples) + _RESAMPLE_SLACK_SAMPLES
+        else math.ceil(samples) + RESAMPLE_SLACK_SAMPLES
     )
     return most <= round(SEGMENT_SECONDS * rate)
 
