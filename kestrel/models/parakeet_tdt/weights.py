@@ -26,7 +26,12 @@ _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 TERNARY_MODEL_ID = "moondream/parakeet-redux"
 EXPORT_FORMAT = "thrush-ternary-v2"  # base-3 packed codes on disk; see ``unpack_export``
 TERNARY_REVISION = "af60db939ebab3ca8b95b5983174e669599a2352"  # p0g-p1a-warp5-2way in thrush-ternary-v2 (base-3), private until Photon ships
+# The full-precision student trained further from MODEL_ID (thrush), published at ULTRA_MODEL_ID: the same three
+# files as the original, fp16, with the VAD head the segmenter uses. No manifest, so it loads as an fp checkpoint.
+ULTRA_MODEL_ID = "moondream/parakeet-ultra"
+ULTRA_REVISION = "510e6f5a1c4619f39c72b083c091476935734e65"  # p0d-res2-ultra-slerp2-pp with its own VAD head
 _MANIFEST = "ternary.json"
+_PINNED_REVISIONS = {MODEL_ID: REVISION, TERNARY_MODEL_ID: TERNARY_REVISION, ULTRA_MODEL_ID: ULTRA_REVISION}
 _QKV = ("q_proj", "k_proj", "v_proj")
 _REL = "relative_k_proj"
 
@@ -158,7 +163,7 @@ def load_parakeet_tdt(
     ternary_repo = str(checkpoint) == TERNARY_MODEL_ID
     root = resolve_checkpoint(
         checkpoint,
-        revision=revision or (TERNARY_REVISION if ternary_repo else REVISION),
+        revision=revision or _PINNED_REVISIONS.get(str(checkpoint), REVISION),
         filenames=_FILES + ((_MANIFEST,) if ternary_repo else ()),
         local_files_only=local_files_only,
     )
