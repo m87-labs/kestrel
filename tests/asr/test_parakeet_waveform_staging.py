@@ -1,9 +1,10 @@
-"""Pinned waveform staging: one packed async copy per cohort.
+"""Waveform staging: one padded batch per cohort, pinned and async on CUDA.
 
 The rows a cohort uploads used to travel as one pageable ``.to(device)`` per
 distinct waveform length, and Torch finishes a pageable copy with a stream
 synchronize -- so the upload drained whatever the compute stream still held.
-These pin the packing contract (order, values) the async copy replaces it with.
+These pin the contract (shape, order, values, padding) the async copy replaces
+it with: the padded batch the cohort's single spectrogram runs on.
 """
 
 from __future__ import annotations
@@ -25,18 +26,25 @@ def _audio(waveform: np.ndarray) -> DecodedAudio:
     return DecodedAudio(waveform, waveform.size / 16_000, waveform.size / 16_000, 0.0)
 
 
-@requires_cuda
-def test_stage_packs_rows_end_to_end_in_order() -> None:
+@pytest.mark.parametrize("pinned", [False, True])
+def test_stage_pads_rows_to_the_longest_in_order(pinned: bool) -> None:
+    if pinned and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     blocks = [
         np.arange(4, dtype=np.float32),
         np.arange(10, 13, dtype=np.float32),
         np.arange(20, 27, dtype=np.float32),
     ]
+    device = torch.device("cuda" if pinned else "cpu")
 
-    staged = _stage_waveforms(blocks, torch.device("cuda"))
+    staged = _stage_waveforms(blocks, device, pinned=pinned)
 
-    assert staged.shape == (14,)
-    assert staged.tolist() == [float(v) for block in blocks for v in block]
+    assert staged.shape == (3, 7)
+    assert staged.tolist() == [
+        [0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+        [10.0, 11.0, 12.0, 0.0, 0.0, 0.0, 0.0],
+        [20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0],
+    ]
 
 
 @requires_cuda
@@ -56,7 +64,9 @@ def test_a_staged_copy_is_not_overtaken_by_the_next_one() -> None:
     for value in range(1, 6):
         ballast @ ballast  # keep the copies queued behind real work
         staged.append(
-            _stage_waveforms([np.full(2**20, value, dtype=np.float32)], device)
+            _stage_waveforms(
+                [np.full(2**20, value, dtype=np.float32)], device, pinned=True
+            )
         )
     torch.cuda.synchronize()
 
