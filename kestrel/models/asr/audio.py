@@ -284,7 +284,12 @@ def _float_pcm(audio: np.ndarray | Tensor) -> np.ndarray:
     else:
         raise TypeError("raw PCM must have a real numeric dtype")
     value = np.ascontiguousarray(value)
-    if not np.isfinite(value).all() or np.abs(value).max() > 1.000001:
+    # Two reductions and no allocation. The finite check this replaces built a
+    # full boolean array and a full magnitude array, two allocations the size
+    # of the audio per request; the bounds catch what it caught, since a NaN
+    # propagates through ``min`` and either infinity falls outside the range.
+    low, high = float(value.min()), float(value.max())
+    if not (low >= -1.000001 and high <= 1.000001):
         raise ValueError("PCM must contain finite samples in [-1, 1]")
     return value
 
