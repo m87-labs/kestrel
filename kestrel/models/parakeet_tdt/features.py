@@ -10,6 +10,19 @@ from kestrel.models.asr.features import mel_filters
 from torch import Tensor
 
 
+def _on_device(values: Sequence[int], device: torch.device) -> Tensor:
+    """A small integer vector on ``device``, without draining the stream.
+
+    ``torch.tensor(values, device=...)`` copies out of pageable memory, and
+    Torch ends such a copy with a stream synchronize -- which here would wait
+    on every kernel the cohort in front of this one still has queued. Pinned
+    and asynchronous, it waits on nothing.
+    """
+
+    host = torch.tensor(values, dtype=torch.long, pin_memory=device.type == "cuda")
+    return host.to(device, non_blocking=True)
+
+
 def _emphasise(samples: Tensor) -> Tensor:
     return torch.cat(
         (samples[:, :1], samples[:, 1:] - 0.97 * samples[:, :-1]), dim=1
@@ -32,7 +45,7 @@ def _log_mel(emphasised: Tensor) -> Tensor:
         .abs()
         .square()
     )
-    mel = mel_filters(512, 128, 16_000).to(emphasised.device) @ spectrum
+    mel = mel_filters(512, 128, 16_000, emphasised.device) @ spectrum
     return torch.log(mel + 2**-24)
 
 
@@ -90,19 +103,24 @@ def parakeet_cohort_features(
         raise ValueError("Parakeet audio is too short to normalize")
 
     device = waveforms.device
-    lengths = torch.tensor(sizes, device=device)
+    lengths = _on_device(sizes, device)
     inside = torch.arange(waveforms.shape[1], device=device)[None] < lengths[:, None]
     energies = _log_mel(torch.where(inside, _emphasise(waveforms), 0.0))
 
     groups: dict[int, list[int]] = {}
     for row, size in enumerate(sizes):
         groups.setdefault(size, []).append(row)
+    # Every group's rows in one transfer: a tensor per group would be a
+    # pageable copy per group, and 53 stream synchronizes a cohort.
+    order = _on_device([row for rows in groups.values() for row in rows], device)
     mean = torch.empty(
         (len(sizes), 1, energies.shape[1]), dtype=energies.dtype, device=device
     )
     std = torch.empty_like(mean)
+    at = 0
     for size, rows in groups.items():
-        where = torch.tensor(rows, device=device)
+        where = order[at : at + len(rows)]
+        at += len(rows)
         block = energies[:, :, : 1 + size // 160][where].transpose(1, 2)
         block = block[:, : size // 160]
         mean[where] = block.mean(1, keepdim=True)
