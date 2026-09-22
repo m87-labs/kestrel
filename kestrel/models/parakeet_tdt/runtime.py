@@ -915,11 +915,11 @@ class ParakeetTdtRuntime:
             defers = self._stops_after_the_encoder(parsed, sources)
 
             while any(iterator is not None for iterator in iterators):
-                chunks = self._next_chunks(iterators, results)
+                chunks = self._next_chunks(iterators, batch.results)
                 for (max_tokens, is_stream), group in self._grouped(
                     parsed, chunks
                 ).items():
-                    rows = self._long_enough(group, iterators, results)
+                    rows = self._long_enough(group, iterators, batch.results)
                     if not rows:
                         continue
                     if defers and self._splits_decode(len(rows)):
