@@ -160,7 +160,11 @@ def pause_segments(
         # pause marks are only ever read to choose a cut -- so there is no
         # cut to choose and no reason to mark anything. Skipping the pause
         # source here is what most requests do: every LibriSpeech and AMI
-        # utterance, and any clip a caller already segmented.
+        # utterance, and any clip a caller already segmented. The block is
+        # re-made rather than passed through because a segment's duration is
+        # its decoded samples over the target rate, which is what the walk
+        # below reports; `block.duration_seconds` counts source frames, and a
+        # resampled clip's two answers differ by the resampler's slack.
         for block in source.chunks(BLOCK_SECONDS, boundary_search_seconds=0.0):
             yield DecodedAudio(
                 block.waveform,
