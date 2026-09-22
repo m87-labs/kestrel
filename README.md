@@ -53,6 +53,7 @@ Kestrel supports these model families:
 | Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
 | Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
 | parakeet-redux | [moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux) | The ternary Parakeet: 178 MB, the same capabilities, and runs on the CPU and Apple silicon as well as CUDA |
+| parakeet-ultra | [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra) | The full-precision Parakeet trained further: the same capabilities, better on every benchmark than the original |
 
 ## Quick Start
 

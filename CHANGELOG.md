@@ -4,6 +4,8 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+- Speech: added `moondream/parakeet-ultra`, the full-precision Parakeet
+  trained further, with its own VAD head.
 - Increased CUDA transcription throughput by keeping two Parakeet request
   cohorts in flight, uploading each cohort's audio in one pinned transfer,
   and skipping pause detection for clips that already fit in one segment.

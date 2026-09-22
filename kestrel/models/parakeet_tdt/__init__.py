@@ -3,7 +3,15 @@
 from kestrel.models.registry import ModelSpec, register
 
 from .runtime import ParakeetTdtRuntime
-from .weights import MODEL_ID, REVISION, TERNARY_MODEL_ID, TERNARY_REVISION, load_parakeet_tdt
+from .weights import (
+    MODEL_ID,
+    REVISION,
+    TERNARY_MODEL_ID,
+    TERNARY_REVISION,
+    ULTRA_MODEL_ID,
+    ULTRA_REVISION,
+    load_parakeet_tdt,
+)
 
 
 def _build_orchestrators():
@@ -34,11 +42,24 @@ register(
     )
 )
 
+# The full-precision student: the original's architecture and files, trained further, with its own VAD head.
+register(
+    ModelSpec(
+        name=ULTRA_MODEL_ID,
+        repo_id=ULTRA_MODEL_ID,
+        revision=ULTRA_REVISION,
+        runtime=ParakeetTdtRuntime,
+        orchestrators=_build_orchestrators,
+    )
+)
+
 __all__ = [
     "MODEL_ID",
     "REVISION",
     "TERNARY_MODEL_ID",
     "TERNARY_REVISION",
+    "ULTRA_MODEL_ID",
+    "ULTRA_REVISION",
     "ParakeetTdtRuntime",
     "load_parakeet_tdt",
 ]

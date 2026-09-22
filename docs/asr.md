@@ -7,6 +7,8 @@ Kestrel serves four speech-to-text checkpoints through the same model-bound
 - `Qwen/Qwen3-ASR-0.6B`
 - `Qwen/Qwen3-ASR-1.7B`
 - `nvidia/parakeet-tdt-0.6b-v3`
+- `moondream/parakeet-redux`
+- `moondream/parakeet-ultra`
 
 ## Basic usage
 
@@ -161,7 +163,8 @@ revised without changing committed transcription quality.
 `moondream/parakeet-redux`, the ternary Parakeet, also runs on the CPU and on
 Apple silicon; pass `device="cpu"` or `device="mps"`. On CUDA the packed codes
 are expanded to dense weights at load, so it runs at the fp model's speed from
-the 178 MB download.
+the 178 MB download. `moondream/parakeet-ultra` is the full-precision sibling
+for GPUs: the original's files and speed, better on every benchmark.
 
 ```python
 engine = await InferenceEngine.create(
