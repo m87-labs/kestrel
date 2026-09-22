@@ -16,7 +16,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from kestrel.device import empty_cache, make_stream, resolve_device, stream_context
 from kestrel.runtime import ExecutionShape
 
@@ -34,7 +33,7 @@ from .contract import parse_request
 from .decode_graph import _TdtBatchGraphDecoder
 from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
-from .features import parakeet_features
+from .features import parakeet_cohort_features
 from .model import ParakeetTdt, TdtState
 from .segment import (
     SpeechRegions,
@@ -206,35 +205,40 @@ def _encoder_frames(samples: int, factor: int) -> int:
 
 
 def _stage_waveforms(
-    blocks: Sequence[np.ndarray], device: torch.device
+    blocks: Sequence[np.ndarray], device: torch.device, *, pinned: bool
 ) -> torch.Tensor:
-    """Pack ``blocks`` end to end on ``device`` with one pinned, async copy.
+    """Stack ``blocks`` into one padded ``[rows, longest]`` batch on ``device``.
 
+    Each row is zero-filled past its own samples, which is the batch the
+    cohort's single spectrogram runs on.
+
+    On CUDA the rows travel through one pinned buffer and one async copy.
     ``torch.from_numpy(...).to(device)`` copies from pageable memory, which
-    Torch completes with a stream synchronize -- so one such copy per distinct
+    Torch ends with a stream synchronize -- so one such copy per distinct
     waveform length did not just cost a transfer, it drained every kernel the
-    compute stream still held. Measured on a B200 behind 145 ms of queued
-    GEMMs, 128 pageable copies returned after 155 ms; the same rows packed into
-    one pinned buffer and copied once returned in 3.4 ms. That is what lets a
-    cohort be enqueued while its predecessor is still running.
+    compute stream still held: measured on a B200 behind 145 ms of queued
+    GEMMs, 128 pageable copies returned after 155 ms against 3.4 ms for one
+    pinned copy. That is what lets a cohort be enqueued while its predecessor
+    is still running.
 
-    The pinned buffer is per call and nothing holds it: Torch's caching host
-    allocator records the copy on the block and will not hand that block out
-    again until the copy has completed, so no buffer has to be retained or
-    waited on here. A warm allocator returns one in about a microsecond.
+    Nothing holds the pinned buffer: Torch's caching host allocator records
+    the copy on the block and will not hand that block out again until the
+    copy has completed, so no buffer has to be retained or waited on here. A
+    warm allocator returns one in about a microsecond.
     """
 
-    total = sum(int(block.size) for block in blocks)
-    host = torch.empty(total, dtype=torch.float32, pin_memory=True)
+    rows = len(blocks)
+    width = max(int(block.size) for block in blocks)
+    if pinned:
+        host = torch.empty((rows, width), dtype=torch.float32, pin_memory=True)
+    else:
+        host = torch.empty((rows, width), dtype=torch.float32)
     view = host.numpy()
-    at = 0
-    for block in blocks:
+    for row, block in enumerate(blocks):
         size = int(block.size)
-        view[at : at + size] = block
-        at += size
-    staged = torch.empty(total, dtype=torch.float32, device=device)
-    staged.copy_(host, non_blocking=True)
-    return staged
+        view[row, :size] = block
+        view[row, size:] = 0.0
+    return host.to(device, non_blocking=pinned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,41 +475,14 @@ class ParakeetTdtRuntime:
         self,
         rows: Sequence[tuple[int, DecodedAudio]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        groups: dict[int, list[int]] = {}
-        for group_index, (_request_index, audio) in enumerate(rows):
-            groups.setdefault(audio.waveform.size, []).append(group_index)
-
-        # One upload per cohort, packed in group order, so the per-group STFT
-        # reads slices of it instead of uploading its own rows.
-        packed = [
-            rows[index][1].waveform for indices in groups.values() for index in indices
-        ]
-        uploaded = (
-            _stage_waveforms(packed, self.device)
-            if self._pin_waveforms
-            else torch.from_numpy(np.concatenate(packed)).to(self.device)
-        )
-
-        feature_rows: dict[int, torch.Tensor] = {}
-        mask_rows: dict[int, torch.Tensor] = {}
-        at = 0
-        for size, indices in groups.items():
-            span = len(indices) * size
-            waveforms = uploaded[at : at + span].view(len(indices), size)
-            at += span
-            features, masks = parakeet_features(waveforms)
-            for batch_index, row_index in enumerate(indices):
-                feature_rows[row_index] = features[batch_index]
-                mask_rows[row_index] = masks[batch_index]
-
-        completed_features = [feature_rows[index] for index in range(len(rows))]
-        completed_masks = [mask_rows[index] for index in range(len(rows))]
-        width = max(row.shape[0] for row in completed_features)
-        features = torch.stack(
-            [F.pad(row, (0, 0, 0, width - row.shape[0])) for row in completed_features]
-        )
-        masks = torch.stack(
-            [F.pad(row, (0, width - row.shape[0])) for row in completed_masks]
+        # One upload and one spectrogram for the cohort. What this replaces
+        # cut the cohort by waveform length and ran a spectrogram per distinct
+        # length -- around 80 of them for a LibriSpeech cohort of 128 -- then
+        # padded and stacked the results a row at a time, a sixth of the pass.
+        blocks = [audio.waveform for _request_index, audio in rows]
+        staged = _stage_waveforms(blocks, self.device, pinned=self._pin_waveforms)
+        features, masks = parakeet_cohort_features(
+            staged, [int(block.size) for block in blocks]
         )
         return features.to(self.dtype), masks
 
