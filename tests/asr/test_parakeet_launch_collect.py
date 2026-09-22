@@ -166,6 +166,32 @@ def test_a_bad_input_does_not_stop_the_cohort_from_deferring() -> None:
     assert [results[0]["text"], results[2]["text"]] == ["part 1.", "part 2."]
 
 
+def test_a_row_retired_after_parsing_stays_out_of_the_encoding() -> None:
+    """Deferring is decided from the clips' lengths, before any audio is cut.
+
+    A row can still drop out after that -- its audio may not open, or it may
+    decode to fewer samples than the feature extractor takes -- and the rows
+    the encoding covers have to be the ones that survived, not the ones the
+    decision was taken over.
+    """
+    runtime = _runtime()
+    unopenable = _clip(4.0) | {"clip_start_seconds": 10.0}  # past the end
+    too_short = {"audio": _speech(0.01), "sample_rate": 16_000, "timestamps": "none"}
+
+    batch = runtime.launch(
+        "transcribe", (_clip(4.0), unopenable, too_short, _clip(5.0))
+    )
+
+    assert batch.encoded is not None
+    assert [index for index, _audio in batch.rows] == [0, 3]
+
+    results = runtime.collect(batch)
+
+    assert isinstance(results[1], ValueError)
+    assert isinstance(results[2], ValueError)
+    assert [results[0]["text"], results[3]["text"]] == ["part 1.", "part 2."]
+
+
 def test_two_decode_settings_in_one_cohort_are_not_deferred() -> None:
     """Deferring hands the decoder one encoding, so it takes one setting.
 
