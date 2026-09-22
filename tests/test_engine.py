@@ -19,6 +19,7 @@ from kestrel.engine import (
     _AdmissionCoordinator,
     _AutoregressiveRequest,
 )
+from kestrel.engine.core import _settle_futures
 from kestrel.models.moondream.runtime import TextToken
 from kestrel.runtime import ExecutionShape
 from kestrel.scheduler import GeneratedPrefix, StreamUpdate
@@ -43,6 +44,34 @@ def test_default_prepared_skill_prompt_preserves_tokens_context_and_budget() -> 
         tokens=(),
         max_new_tokens=7,
     )
+
+
+def test_settling_a_batch_skips_a_future_that_is_already_done() -> None:
+    """A whole cohort settles from one callback, on the event loop.
+
+    A request cancelled between the scheduler reading its future and this
+    callback running has a future that is already done; it is skipped, not
+    raised on, and the rest of the batch still settles.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        cancelled: asyncio.Future = loop.create_future()
+        cancelled.cancel()
+        live: asyncio.Future = loop.create_future()
+        result = EngineResult(
+            request_id=1,
+            tokens=[],
+            finish_reason="stop",
+            metrics=EngineMetrics(0, 0, 0.0, 0.0, 0.0),
+            output={},
+        )
+
+        _settle_futures([(cancelled, result), (live, result)])
+
+        assert cancelled.cancelled()
+        assert live.result() is result
+    finally:
+        loop.close()
 
 
 def test_engine_stream_close_stops_a_waiter_and_settles() -> None:

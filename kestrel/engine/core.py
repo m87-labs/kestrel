@@ -102,6 +102,18 @@ _ALLOWED_API_BASE_URLS = (
 _SINGLE_PASS_POLL_INTERVAL_S = 0.001
 
 
+def _settle_futures(settled: Sequence[Tuple[Any, "EngineResult"]]) -> None:
+    """Resolve a whole batch's futures in one event-loop callback.
+
+    Runs on the event loop, so a future that was cancelled between the
+    scheduler reading it and this callback is skipped rather than raising.
+    """
+
+    for future, result in settled:
+        if not future.done():
+            future.set_result(result)
+
+
 class InferenceEngine:
     """Orchestrates batched inference over a shared runtime and scheduler."""
 
@@ -1613,6 +1625,15 @@ class InferenceEngine:
         def deliver(completions: tuple[Completion, ...]) -> None:
             loop = self._loop
             assert loop is not None
+            # One hand-off for the whole batch. Every ``call_soon_threadsafe``
+            # writes the loop's self-pipe and that write releases the GIL, so
+            # delivering a cohort a call at a time let the loop wake partway
+            # through and run the caller's continuations -- and a caller that
+            # resubmits on completion then submitted in fragments, which the
+            # scheduler dutifully batched: an AMI pass with 128 requests in
+            # flight throughout ran cohorts of 23 and 105, 27 and 101, 18 and
+            # 110, at roughly double the forwards it needed.
+            settled: list[Tuple[Any, EngineResult]] = []
             for c in completions:
                 req = c.request
                 if c.error is not None:
@@ -1631,9 +1652,11 @@ class InferenceEngine:
                         _LOGGER.exception("Failed to record Photon usage telemetry")
                 future = req.future
                 if future and not future.done():
-                    loop.call_soon_threadsafe(future.set_result, engine_result)
+                    settled.append((future, engine_result))
                 self._complete_stream(req, result=engine_result)
                 self._complete_model_stream(req, result=engine_result)
+            if settled:
+                loop.call_soon_threadsafe(_settle_futures, settled)
 
         def deliver_model_stream_updates(
             updates: tuple[ModelStreamUpdate, ...]
