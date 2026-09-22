@@ -13,6 +13,10 @@ from torch import Tensor
 AudioInput = str | Path | bytes | BinaryIO | np.ndarray | Tensor
 MAX_SHORT_AUDIO_SECONDS = 30.0
 MAX_AUDIO_SECONDS = 24 * 60 * 60
+# A resampled chunk may come back a few samples longer than its ratio implies;
+# `chunks` bounds it by this much, and a caller that has to know a chunk's
+# length before decoding it must allow for the same.
+RESAMPLE_SLACK_SAMPLES = 16
 _MAX_READ_FRAMES = 1_048_576
 _MAX_ENCODED_BYTES = 64 * 1024 * 1024
 _ENCODED_READ_BYTES = 1024 * 1024
@@ -245,7 +249,8 @@ class AudioChunks:
                         rate,
                         self.target_sample_rate,
                         max_output_values=(
-                            int(np.ceil(duration * self.target_sample_rate)) + 16
+                            int(np.ceil(duration * self.target_sample_rate))
+                            + RESAMPLE_SLACK_SAMPLES
                         ),
                     )
                 )
@@ -315,6 +320,7 @@ __all__ = [
     "DecodedAudio",
     "MAX_AUDIO_SECONDS",
     "MAX_SHORT_AUDIO_SECONDS",
+    "RESAMPLE_SLACK_SAMPLES",
     "decode_audio",
     "snapshot_file_like",
 ]
