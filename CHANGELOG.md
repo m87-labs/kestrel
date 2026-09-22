@@ -7,6 +7,9 @@ All notable changes since `v0.1.2` are documented in this file.
 - Increased CUDA transcription throughput by keeping two Parakeet request
   cohorts in flight, uploading each cohort's audio in one pinned transfer,
   and skipping pause detection for clips that already fit in one segment.
+- Increased it further by delivering a cohort's results together, building a
+  cohort's audio features in one spectrogram, and running the transducer
+  decode loop on the GPU.
 
 ## 0.8.1 — 2026-09-21
 
