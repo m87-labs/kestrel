@@ -475,29 +475,24 @@ class ParakeetTdtRuntime:
         for group_index, (_request_index, audio) in enumerate(rows):
             groups.setdefault(audio.waveform.size, []).append(group_index)
 
-        staged = None
-        if self._pin_waveforms:
-            staged = _stage_waveforms(
-                [
-                    rows[index][1].waveform
-                    for indices in groups.values()
-                    for index in indices
-                ],
-                self.device,
-            )
+        # One upload per cohort, packed in group order, so the per-group STFT
+        # reads slices of it instead of uploading its own rows.
+        packed = [
+            rows[index][1].waveform for indices in groups.values() for index in indices
+        ]
+        uploaded = (
+            _stage_waveforms(packed, self.device)
+            if self._pin_waveforms
+            else torch.from_numpy(np.concatenate(packed)).to(self.device)
+        )
 
         feature_rows: dict[int, torch.Tensor] = {}
         mask_rows: dict[int, torch.Tensor] = {}
         at = 0
         for size, indices in groups.items():
-            if staged is None:
-                waveforms = torch.from_numpy(
-                    np.stack([rows[index][1].waveform for index in indices])
-                ).to(self.device)
-            else:
-                span = len(indices) * size
-                waveforms = staged[at : at + span].view(len(indices), size)
-                at += span
+            span = len(indices) * size
+            waveforms = uploaded[at : at + span].view(len(indices), size)
+            at += span
             features, masks = parakeet_features(waveforms)
             for batch_index, row_index in enumerate(indices):
                 feature_rows[row_index] = features[batch_index]
