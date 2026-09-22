@@ -83,7 +83,7 @@ def _runtime() -> ParakeetTdtRuntime:
     runtime.model.generate = lambda features, mask, *, max_tokens: decoder.generate(
         encode(features, mask)[0], mask, max_tokens=max_tokens
     )
-    runtime._encoder_graph = SimpleNamespace(encode=encode, launch=launch)
+    runtime._encoder_graph = SimpleNamespace(launch=launch)
     return runtime
 
 

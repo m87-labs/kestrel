@@ -931,9 +931,8 @@ class ParakeetTdtRuntime:
                         features, mask = self._batch_audio_features(rows)
                         batch.rows = tuple(rows)
                         batch.max_tokens = max_tokens
-                        batch.encoded, batch.valid = self._encoder_graph.encode(
-                            features, mask
-                        )
+                        with self._encoder_graph.launch(features, mask) as leased:
+                            batch.encoded, batch.valid = leased
                         return batch
                     self._run_group(
                         batch, rows, max_tokens=max_tokens, is_stream=is_stream

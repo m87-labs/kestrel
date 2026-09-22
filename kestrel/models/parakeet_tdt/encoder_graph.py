@@ -54,7 +54,6 @@ class ParakeetEncoderGraph:
         self._model = model
         if stream is None:
             stream = make_stream(device)
-        self._stream = stream
         # Retain every batch/bucket graph until shutdown: evicting one can free
         # cuBLAS workspace still used by other graphs on the same stream.
         # https://github.com/pytorch/pytorch/issues/193402
@@ -78,52 +77,29 @@ class ParakeetEncoderGraph:
     def enabled(self) -> bool:
         return self._graphs.enabled
 
-    def _replay(self, features: Tensor) -> tuple[int, int] | None:
-        """Subsampled length and the bucket to pad it to, or None to run eagerly."""
-        if not self.enabled or features.shape[0] > self.graph_max_batch:
-            return None
+    def _encode(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         factor = self._model.config.encoder.subsampling_factor
         length = (features.shape[1] + factor - 1) // factor
         bucket = next((size for size in self.buckets if size >= length), None)
-        return None if bucket is None else (length, bucket)
-
-    def _encode(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        replay = self._replay(features)
-        if replay is None:
+        if not self.enabled or bucket is None or features.shape[0] > self.graph_max_batch:
             return self._model.encode(features, mask)
-        length, bucket = replay
 
         hidden, valid = self._model.encoder.subsampling(features, mask)
         hidden = F.pad(hidden, (0, 0, 0, bucket - length)).contiguous()
         valid = F.pad(valid, (0, bucket - length)).contiguous()
         with self._graphs.launch(hidden, valid) as (encoded, valid):
-            return encoded[:, :length], valid[:, :length]
+            # A replay writes the captured graph's static outputs, which the
+            # next replay of this shape overwrites. The eager branch above
+            # returns fresh tensors, so copy here and the encoding is the
+            # caller's either way -- including a caller that holds it while
+            # the next cohort is enqueued.
+            return encoded[:, :length].clone(), valid[:, :length].clone()
 
     def launch(
         self, features: Tensor, mask: Tensor
     ) -> AbstractContextManager[tuple[Tensor, ...]]:
+        """Encode on the session's stream; the encoding is the caller's to keep."""
         return self._session.launch(features, mask)
-
-    def encode(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        """Encode into caller-owned tensors that outlive this call.
-
-        ``launch`` leases session-owned buffers: under replay its outputs are
-        views of a captured graph's static outputs, which the next replay of
-        that shape overwrites. A caller holding an encoding while the next
-        batch is enqueued needs a copy of its own -- and, when it consumes the
-        encoding on a different stream than the session's, that stream ordered
-        after the session's.
-        """
-        with self.launch(features, mask) as leased:
-            encoded, valid = leased
-            if self._replay(features) is not None:
-                encoded, valid = encoded.clone(), valid.clone()
-        stream = self._stream
-        if stream is not None:
-            current = torch.cuda.current_stream(stream.device)
-            if current != stream:
-                current.wait_stream(stream)
-        return encoded, valid
 
     def shutdown(self) -> None:
         self._session.shutdown()
