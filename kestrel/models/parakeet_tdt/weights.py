@@ -25,13 +25,10 @@ _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # ``scripts/export_ternary.py --names hf``. That manifest is the only thing that marks a checkpoint as ternary.
 TERNARY_MODEL_ID = "moondream/parakeet-redux"
 EXPORT_FORMAT = "thrush-ternary-v2"  # base-3 packed codes on disk; see ``unpack_export``
-TERNARY_REVISION = "af60db939ebab3ca8b95b5983174e669599a2352"  # p0g-p1a-warp5-2way in thrush-ternary-v2 (base-3), private until Photon ships
 # The full-precision student trained further from MODEL_ID (thrush), published at ULTRA_MODEL_ID: the same three
 # files as the original, fp16, with the VAD head the segmenter uses. No manifest, so it loads as an fp checkpoint.
 ULTRA_MODEL_ID = "moondream/parakeet-ultra"
-ULTRA_REVISION = "510e6f5a1c4619f39c72b083c091476935734e65"  # p0d-res2-ultra-slerp2-pp with its own VAD head
 _MANIFEST = "ternary.json"
-_PINNED_REVISIONS = {MODEL_ID: REVISION, TERNARY_MODEL_ID: TERNARY_REVISION, ULTRA_MODEL_ID: ULTRA_REVISION}
 _QKV = ("q_proj", "k_proj", "v_proj")
 _REL = "relative_k_proj"
 
@@ -151,7 +148,7 @@ def load_parakeet_tdt(
     dtype: torch.dtype = torch.float32,
     local_files_only: bool = False,
 ) -> LoadedParakeetTdt:
-    """Load the pinned fp checkpoint, or the ternary student when the checkpoint carries a ``ternary.json``.
+    """Load the fp checkpoint, or the ternary student when the checkpoint carries a ``ternary.json``.
 
     The ternary variant loads the packed export with ``strict=True`` and then materializes the resident
     weight form for the device it is on: the packed codes on the CPU and on Metal, the dense weight in
@@ -160,10 +157,14 @@ def load_parakeet_tdt(
     """
     from safetensors.torch import load_file
 
-    ternary_repo = str(checkpoint) == TERNARY_MODEL_ID
+    name = str(checkpoint)
+    ternary_repo = name == TERNARY_MODEL_ID
     root = resolve_checkpoint(
         checkpoint,
-        revision=revision or _PINNED_REVISIONS.get(str(checkpoint), REVISION),
+        # Only the upstream checkpoint is pinned: that repository is not ours, and a new commit there would
+        # change the weights under a release. Ours track their `main` -- a commit hash is not a durable address
+        # on the Hub, since rewriting a repository's history leaves it unreachable to every client naming it.
+        revision=revision or (REVISION if name == MODEL_ID else "main"),
         filenames=_FILES + ((_MANIFEST,) if ternary_repo else ()),
         local_files_only=local_files_only,
     )
@@ -212,7 +213,7 @@ __all__ = [
     "MODEL_ID",
     "REVISION",
     "TERNARY_MODEL_ID",
-    "TERNARY_REVISION",
+    "ULTRA_MODEL_ID",
     "load_parakeet_tdt",
     "ternarize",
     "unpack_export",

@@ -95,7 +95,7 @@ asyncio.run(main())
 
 Whisper, Qwen3-ASR, and Parakeet use the same model-bound `transcribe`
 capability. Choose a Hugging Face repository ID from the model table; Kestrel
-resolves its pinned revision and selects that model's optimized runtime.
+downloads its weights and selects that model's optimized runtime.
 
 ```python
 import asyncio

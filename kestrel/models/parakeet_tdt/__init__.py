@@ -7,9 +7,7 @@ from .weights import (
     MODEL_ID,
     REVISION,
     TERNARY_MODEL_ID,
-    TERNARY_REVISION,
     ULTRA_MODEL_ID,
-    ULTRA_REVISION,
     load_parakeet_tdt,
 )
 
@@ -30,13 +28,12 @@ register(
     )
 )
 
-# The ternary student: same runtime, same contract, weights at ``repo_id`` (private for now);
+# The ternary student: same runtime, same contract, weights at ``repo_id``, no pinned revision;
 # ``RuntimeConfig(model=TERNARY_MODEL_ID)`` downloads them, ``model_path=<export dir>`` loads a local export.
 register(
     ModelSpec(
         name=TERNARY_MODEL_ID,
         repo_id=TERNARY_MODEL_ID,
-        revision=TERNARY_REVISION,
         runtime=ParakeetTdtRuntime,
         orchestrators=_build_orchestrators,
     )
@@ -47,7 +44,6 @@ register(
     ModelSpec(
         name=ULTRA_MODEL_ID,
         repo_id=ULTRA_MODEL_ID,
-        revision=ULTRA_REVISION,
         runtime=ParakeetTdtRuntime,
         orchestrators=_build_orchestrators,
     )
@@ -57,9 +53,7 @@ __all__ = [
     "MODEL_ID",
     "REVISION",
     "TERNARY_MODEL_ID",
-    "TERNARY_REVISION",
     "ULTRA_MODEL_ID",
-    "ULTRA_REVISION",
     "ParakeetTdtRuntime",
     "load_parakeet_tdt",
 ]
