@@ -4,9 +4,72 @@ import torch
 
 from kestrel.models.qwen35 import runtime as qwen_runtime
 from kestrel.models.qwen35 import qwen_model
-from kestrel.models.qwen35.qwen_model import Qwen3_5GatedDeltaNet
+from kestrel.models.qwen35.qwen_model import Qwen3_5Attention, Qwen3_5GatedDeltaNet
 from kestrel.models.qwen35.runtime import Qwen35Runtime, _PackedPrefillBatch
 from kestrel.runtime.tokens import TextToken
+
+
+def test_attention_uses_contiguous_kv_only_for_empty_packed_prefill(monkeypatch) -> None:
+    calls: list[str] = []
+    paged_layer = SimpleNamespace(
+        update=lambda **_kwargs: calls.append("cache_update")
+    )
+    fake = SimpleNamespace(
+        head_dim=2,
+        q_gate_size=4,
+        kv_size=2,
+        qkv_proj=lambda _hidden: torch.zeros((1, 3, 8)),
+        q_norm=SimpleNamespace(weight=torch.ones(2), eps=1e-6),
+        k_norm=SimpleNamespace(weight=torch.ones(2), eps=1e-6),
+        layer_idx=0,
+        scaling=2**-0.5,
+        o_proj=lambda output: output,
+    )
+    monkeypatch.setattr(
+        qwen_model,
+        "get_runtime",
+        lambda _device: SimpleNamespace(
+            dense=SimpleNamespace(rmsnorm=lambda value, *_args: value),
+            rotary=SimpleNamespace(
+                text_mrope_apply=lambda q, k, *_args: (q, k)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        qwen_model,
+        "dense_attention",
+        lambda *_args, **_kwargs: calls.append("dense") or torch.ones((1, 3, 1, 2)),
+    )
+    monkeypatch.setattr(
+        qwen_model,
+        "paged_attention",
+        lambda *_args, **_kwargs: calls.append("paged") or torch.ones((1, 3, 1, 2)),
+    )
+
+    def forward(previous_length, cu_seqlens):
+        cache = SimpleNamespace(
+            layers=[paged_layer], get_seq_length=lambda: previous_length
+        )
+        calls.clear()
+        output, _ = Qwen3_5Attention.forward(
+            fake,
+            torch.zeros((1, 3, 2)),
+            (torch.ones(1), torch.ones(1)),
+            None,
+            past_key_values=cache,
+            cache_position_ids=torch.zeros((1, 3), dtype=torch.int32),
+            slot_mapping=torch.zeros((1, 3), dtype=torch.int32),
+            page_table=torch.zeros((1, 3), dtype=torch.int32),
+            paged_kv_seqlens_k=torch.tensor([3], dtype=torch.int32),
+            cu_seq_lens_q=cu_seqlens,
+        )
+        assert output.shape == (1, 3, 2)
+        return list(calls)
+
+    packed = torch.tensor([0, 3], dtype=torch.int32)
+    assert forward(0, packed) == ["cache_update", "dense"]
+    assert forward(3, packed) == ["cache_update", "paged"]
+    assert forward(0, None) == ["cache_update", "paged"]
 
 
 def test_builder_binds_topology_from_ordered_host_lengths(monkeypatch) -> None:
