@@ -10,7 +10,7 @@ import torch
 from kestrel.device import empty_cache, resolve_device
 from kestrel.runtime import ExecutionShape
 
-from .contract import PreparedKokoroSynthesis
+from .contract import KokoroSynthesisRequest
 from .model import KokoroModel, KokoroOutput
 from .weights import (
     DEFAULT_KOKORO_MODEL,
@@ -26,7 +26,7 @@ SAMPLE_RATE = 24000
 
 def _prepared_synthesis(
     value: object,
-) -> PreparedKokoroSynthesis:
+) -> KokoroSynthesisRequest:
     """Validate the model-owned payload prepared outside the scheduler."""
 
     if not isinstance(value, Mapping) or set(value) != {"_prepared"}:
@@ -35,7 +35,7 @@ def _prepared_synthesis(
             "ModelHandle.synthesize()"
         )
     prepared = value["_prepared"]
-    if not isinstance(prepared, PreparedKokoroSynthesis):
+    if not isinstance(prepared, KokoroSynthesisRequest):
         raise TypeError("Kokoro leaf payload has an invalid prepared value")
     return prepared
 
@@ -89,9 +89,8 @@ class KokoroRuntime:
         if len(inputs) != 1:
             raise ValueError("KokoroRuntime serves one request per forward")
         prepared = _prepared_synthesis(inputs[0])
-        request = prepared.request
-        reference = self.voices.style(request.voice, len(prepared.phonemes))
-        output = self.model(prepared.phonemes, reference, request.speed)
+        reference = self.voices.style(prepared.voice, len(prepared.phonemes))
+        output = self.model(prepared.phonemes, reference, prepared.speed)
         if not isinstance(output, KokoroOutput):
             raise TypeError(
                 f"Kokoro model returned {type(output).__name__}, expected KokoroOutput"
@@ -116,8 +115,7 @@ class KokoroRuntime:
                 "audio": waveform,
                 "sample_rate": SAMPLE_RATE,
                 "duration_seconds": waveform.numel() / SAMPLE_RATE,
-                "voice": request.voice,
-                "language": request.language,
+                "voice": prepared.voice,
             },
         )
 
@@ -135,13 +133,6 @@ def create_kokoro_runtime(
     kv_pool: Any = None,
     max_lora_rank: int | None = None,
 ) -> KokoroRuntime:
-    try:
-        __import__("misaki")
-    except ImportError as exc:
-        raise RuntimeError(
-            "Kokoro text synthesis requires misaki>=0.9.4, whose "
-            "published package supports Python 3.10-3.12"
-        ) from exc
     checkpoint = getattr(cfg, "model_path", None)
     device = resolve_device(
         cfg.resolved_device()

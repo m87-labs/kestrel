@@ -215,9 +215,12 @@ class KokoroModel(nn.Module):
     def encode_phonemes(self, phonemes: str) -> torch.Tensor:
         if not isinstance(phonemes, str) or not phonemes:
             raise ValueError("phonemes must be a non-empty string")
-        token_ids = [self.vocab[symbol] for symbol in phonemes if symbol in self.vocab]
-        if not token_ids:
-            raise ValueError("phonemes contain no symbols in the Kokoro vocabulary")
+        unknown = set(phonemes) - self.vocab.keys()
+        if unknown:
+            raise ValueError(
+                f"phonemes contain unsupported Kokoro symbols: {sorted(unknown)}"
+            )
+        token_ids = [self.vocab[symbol] for symbol in phonemes]
         if len(token_ids) + 2 > self.context_length:
             raise ValueError(
                 f"phonemes encode to {len(token_ids)} tokens; maximum is "

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
-from typing import Protocol
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -14,13 +12,29 @@ from kestrel.audio import SpeechOnsetTrimmer
 from kestrel.engine import CapabilityStream, EngineMetrics, EngineResult
 from kestrel.skills import CapabilityInvoker, CapabilityOrchestrator
 
-from .contract import KokoroSynthesisRequest, PreparedKokoroSynthesis
-from .g2p import KokoroG2P, normalize_language
+from .contract import KokoroSynthesisRequest
 from .runtime import SAMPLE_RATE
 
 
-class Phonemizer(Protocol):
-    def phonemize_segments(self, text: str, language: str) -> tuple[str, ...]: ...
+_MAX_PHONEMES = 510
+_PHONEME_BREAKS = frozenset(" \t\n.!?…:;,—。！？、，；：")
+
+
+def _split_phonemes(phonemes: str) -> tuple[str, ...]:
+    chunks = []
+    remaining = phonemes.strip()
+    while len(remaining) > _MAX_PHONEMES:
+        window = remaining[:_MAX_PHONEMES]
+        boundary = max((window.rfind(char) + 1 for char in _PHONEME_BREAKS), default=0)
+        if boundary == 0:
+            boundary = _MAX_PHONEMES
+        chunk = remaining[:boundary].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[boundary:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return tuple(chunks)
 
 
 def _pcm(result: EngineResult) -> np.ndarray:
@@ -33,30 +47,7 @@ def _pcm(result: EngineResult) -> np.ndarray:
 
 
 class KokoroSynthesisOrchestrator(CapabilityOrchestrator):
-    """Run G2P on one model-owned worker before submitting inference leaves."""
-
-    def __init__(self, phonemizer: Phonemizer | None = None) -> None:
-        self._phonemizer = phonemizer or KokoroG2P()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="kokoro-g2p",
-        )
-
-    async def _phonemize(
-        self,
-        request: KokoroSynthesisRequest,
-        text: str,
-    ) -> tuple[str, ...]:
-        loop = asyncio.get_running_loop()
-        phonemes = await loop.run_in_executor(
-            self._executor,
-            self._phonemizer.phonemize_segments,
-            text,
-            normalize_language(request.language),
-        )
-        if not phonemes:
-            raise ValueError("G2P produced no Kokoro phonemes")
-        return phonemes
+    """Split long phoneme inputs and stream completed audio segments."""
 
     async def _synthesize(
         self,
@@ -68,10 +59,8 @@ class KokoroSynthesisOrchestrator(CapabilityOrchestrator):
         results: list[EngineResult] = []
         audio: list[np.ndarray] = []
         onset = SpeechOnsetTrimmer(SAMPLE_RATE)
-        for phonemes in await self._phonemize(request, request.text):
-            result = await invoke(
-                {"_prepared": PreparedKokoroSynthesis(request, phonemes)}
-            )
+        for phonemes in _split_phonemes(request.phonemes):
+            result = await invoke({"_prepared": replace(request, phonemes=phonemes)})
             if not isinstance(result, EngineResult):
                 raise TypeError("Kokoro leaf invocation must return EngineResult")
             chunk = onset.push(_pcm(result))
@@ -111,7 +100,6 @@ class KokoroSynthesisOrchestrator(CapabilityOrchestrator):
                 "sample_rate": SAMPLE_RATE,
                 "duration_seconds": waveform.size / SAMPLE_RATE,
                 "voice": results[-1].output.get("voice", request.voice),
-                "language": results[-1].output.get("language", request.language),
             },
         )
 

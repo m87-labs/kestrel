@@ -1,4 +1,4 @@
-# Text-to-speech models
+# Speech synthesis models
 
 Kestrel supports three checkpoints through `model().synthesize(...)`:
 
@@ -6,9 +6,10 @@ Kestrel supports three checkpoints through `model().synthesize(...)`:
 - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - `hexgrad/Kokoro-82M`
 
-The models share a text, voice, and streaming interface. Qwen3-TTS accepts
-language selection and the 1.7B checkpoint also accepts `instructions`.
-Kokoro accepts `speed` and comma-separated voice blends. Each returns mono
+Both models use `model().synthesize(...)` and support streaming. Qwen3-TTS
+accepts text, voice, and language selection; its 1.7B checkpoint also accepts
+`instructions`. Kokoro accepts a phoneme string, `speed`, and comma-separated
+voice blends. Each returns mono
 24 kHz floating-point PCM in `output["audio"]` and the sample rate in
 `output["sample_rate"]`.
 Qwen3-TTS serving requires a CUDA GPU and BF16; Kokoro supports CPU and CUDA.
@@ -50,14 +51,14 @@ finally:
     await engine.shutdown()
 ```
 
-Kokoro uses the same calls with `model_id = "hexgrad/Kokoro-82M"`; its default
-voice is `af_heart`, its default language is `en-us`, and its optional `speed`
-must be positive. It segments long text and streams completed segments.
-For English text, install the optional dependencies with
-`pip install 'kestrel[kokoro]'`, then run
-`python -m spacy download en_core_web_sm`. Misaki currently supports Python
-3.10–3.12. Japanese and Mandarin require Misaki's corresponding language
-extras and, for Japanese, UniDic data.
+Kokoro uses the same call with `model_id = "hexgrad/Kokoro-82M"`, but takes
+`phonemes=` instead of `text=`. Pass a Unicode string using the Kokoro
+checkpoint's phoneme vocabulary, for example `phonemes="həlˈO"` with the
+default `af_heart` voice. Kestrel segments long phoneme strings and streams
+completed segments. Its optional `speed` must be positive. Kokoro does not
+convert text to phonemes; callers can use a frontend such as
+[Misaki](https://github.com/hexgrad/misaki) before calling Kestrel. Misaki and
+spaCy are not Kestrel dependencies.
 
 Qwen3-TTS CustomVoice supports both model sizes, automatic or explicit
 language selection, and streamed or complete output. Its `settings` mapping

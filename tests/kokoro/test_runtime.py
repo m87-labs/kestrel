@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,10 +10,7 @@ import torch
 
 from kestrel.engine import EngineMetrics, EngineResult
 from kestrel.runtime import ExecutionShape
-from kestrel.models.kokoro.contract import (
-    KokoroSynthesisRequest,
-    PreparedKokoroSynthesis,
-)
+from kestrel.models.kokoro.contract import KokoroSynthesisRequest
 from kestrel.models.kokoro.model import KokoroOutput
 from kestrel.models.kokoro.orchestrator import (
     KokoroSynthesisOrchestrator,
@@ -49,17 +45,6 @@ class _Voices:
         return torch.ones(1, 256)
 
 
-class _G2P:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
-        self.threads: list[str] = []
-
-    def phonemize_segments(self, text: str, language: str) -> tuple[str, ...]:
-        self.calls.append((text, language))
-        self.threads.append(threading.current_thread().name)
-        return ("həlˈO", "wɜrld")
-
-
 def _cfg() -> SimpleNamespace:
     return SimpleNamespace(
         model="hexgrad/Kokoro-82M",
@@ -81,10 +66,7 @@ def test_runtime_serves_validated_single_pass_synthesis(
         "synthesize",
         (
             {
-                "_prepared": PreparedKokoroSynthesis(
-                    KokoroSynthesisRequest(text="Hello", speed=1.25),
-                    "həlˈO",
-                ),
+                "_prepared": KokoroSynthesisRequest(phonemes="həlˈO", speed=1.25),
             },
         ),
     )
@@ -94,7 +76,6 @@ def test_runtime_serves_validated_single_pass_synthesis(
     assert result["sample_rate"] == SAMPLE_RATE
     assert result["duration_seconds"] == 2 / SAMPLE_RATE
     assert voices.calls == [("af_heart", 5)]
-    assert result["language"] == "en-us"
     assert model.calls[0][0] == "həlˈO"
     assert model.calls[0][2] == 1.25
     runtime.shutdown()
@@ -113,7 +94,6 @@ def _result(request_id: int, samples: int) -> EngineResult:
             "audio": audio,
             "sample_rate": SAMPLE_RATE,
             "voice": "af_heart",
-            "language": "a",
         },
     )
 
@@ -121,41 +101,35 @@ def _result(request_id: int, samples: int) -> EngineResult:
 def test_long_form_streaming_preserves_synthesis_and_is_lossless() -> None:
     async def scenario() -> None:
         calls: list[dict[str, object]] = []
-        g2p = _G2P()
 
         async def invoke(prompt: Any, **_kwargs: Any) -> EngineResult:
             calls.append(dict(prompt))
             return _result(len(calls), SAMPLE_RATE // 25)
 
-        text = "First sentence. " + "word " * 80 + "Last sentence."
-        orchestrator = KokoroSynthesisOrchestrator(g2p)
+        phonemes = "a" * 509 + "." + "b" * 511
+        orchestrator = KokoroSynthesisOrchestrator()
         result = await orchestrator.run(
             invoke,
             image=None,
-            prompt={"text": text},
+            prompt={"phonemes": phonemes},
             settings=None,
         )
         assert isinstance(result, EngineResult)
-        assert g2p.calls == [(text, "a")]
-        assert all(thread.startswith("kokoro-g2p") for thread in g2p.threads)
-        assert len(calls) == 2
+        assert len(calls) == 3
         nonstream_audio = result.output["audio"].copy()
         nonstream_phonemes = tuple(
             call["_prepared"].phonemes for call in calls
         )
         prepared = calls[0]["_prepared"]
-        assert isinstance(prepared, PreparedKokoroSynthesis)
-        assert prepared.request.text == text
-        assert prepared.phonemes == "həlˈO"
+        assert isinstance(prepared, KokoroSynthesisRequest)
+        assert prepared.phonemes == phonemes[:510]
 
         calls.clear()
-        g2p.calls.clear()
-        g2p.threads.clear()
         stream = await orchestrator.run(
             invoke,
             image=None,
             prompt={
-                "text": text,
+                "phonemes": phonemes,
                 "stream": True,
             },
             settings=None,
@@ -169,11 +143,8 @@ def test_long_form_streaming_preserves_synthesis_and_is_lossless() -> None:
             result.output["audio"], np.concatenate(updates)
         )
         np.testing.assert_array_equal(result.output["audio"], nonstream_audio)
-        assert g2p.calls == [(text, "a")]
-        assert len(calls) == 2
+        assert len(calls) == 3
         assert tuple(call["_prepared"].phonemes for call in calls) == nonstream_phonemes
-        assert all(language == "a" for _text, language in g2p.calls)
-        assert all(thread.startswith("kokoro-g2p") for thread in g2p.threads)
         assert all(set(call) == {"_prepared"} for call in calls)
         assert build_orchestrators()["synthesize"] is build_orchestrators()[
             "synthesize"

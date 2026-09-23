@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import sys
 import warnings
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from kestrel.models.kokoro.albert import KokoroAlbert
 from kestrel.models.kokoro.config import AlbertConfig, IstftNetConfig, KokoroConfig
-from kestrel.models.kokoro.g2p import KokoroG2P, _split_phonemes
 from kestrel.models.kokoro.model import KokoroModel
+from kestrel.models.kokoro.orchestrator import _split_phonemes
 from kestrel.models.kokoro.weights import VoiceStore, _materialize_weight_norm
 
 
@@ -78,29 +76,11 @@ def test_phoneme_chunks_preserve_cjk_breaks_and_model_limit() -> None:
     assert "".join(chunks) == phonemes
 
 
-def test_english_g2p_requires_espeak_instead_of_downloading_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class BrokenEspeakFallback:
-        def __init__(self, *, british: bool) -> None:
-            del british
-            raise OSError("eSpeak is unavailable")
-
-    misaki = ModuleType("misaki")
-    misaki.en = SimpleNamespace(G2P=lambda **_kwargs: None)  # type: ignore[attr-defined]
-    misaki.espeak = SimpleNamespace(  # type: ignore[attr-defined]
-        EspeakFallback=BrokenEspeakFallback
-    )
-    spacy = ModuleType("spacy")
-    spacy_util = ModuleType("spacy.util")
-    spacy_util.is_package = lambda _name: True  # type: ignore[attr-defined]
-    spacy.util = spacy_util  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "misaki", misaki)
-    monkeypatch.setitem(sys.modules, "spacy", spacy)
-    monkeypatch.setitem(sys.modules, "spacy.util", spacy_util)
-
-    with pytest.raises(RuntimeError, match="bundled eSpeak NG backend"):
-        KokoroG2P()._frontend("a")
+def test_phoneme_input_rejects_unknown_symbols() -> None:
+    with torch.device("meta"):
+        model = KokoroModel(_config())
+    with pytest.raises(ValueError, match="unsupported Kokoro symbols"):
+        model.encode_phonemes("a!")
 
 
 def test_direct_albert_matches_transformers_reference() -> None:

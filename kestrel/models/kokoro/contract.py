@@ -7,13 +7,12 @@ from dataclasses import dataclass
 from typing import Mapping
 
 
-_PROMPT_KEYS = frozenset({"text", "language", "voice", "speed", "stream"})
+_PROMPT_KEYS = frozenset({"phonemes", "voice", "speed", "stream"})
 
 
 @dataclass(frozen=True, slots=True)
 class KokoroSynthesisRequest:
-    text: str
-    language: str = "en-us"
+    phonemes: str
     voice: str = "af_heart"
     speed: float = 1.0
     stream: bool = False
@@ -26,24 +25,25 @@ class KokoroSynthesisRequest:
             raise TypeError("synthesize inputs must be a mapping")
         if "speaker" in prompt:
             raise ValueError("use voice, not speaker, for speech synthesis")
+        if "text" in prompt:
+            raise ValueError(
+                "Kokoro requires phonemes, not text; phonemize text before synthesis"
+            )
         unknown = set(prompt) - _PROMPT_KEYS
         if unknown:
             raise ValueError(f"unsupported synthesize inputs: {sorted(unknown)}")
         return cls(
-            text=prompt.get("text"),  # type: ignore[arg-type]
-            language=prompt.get("language", "en-us"),  # type: ignore[arg-type]
+            phonemes=prompt.get("phonemes"),  # type: ignore[arg-type]
             voice=prompt.get("voice", "af_heart"),  # type: ignore[arg-type]
             speed=prompt.get("speed", 1.0),  # type: ignore[arg-type]
             stream=prompt.get("stream", False),  # type: ignore[arg-type]
         )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.text, str) or not self.text.strip():
-            raise ValueError("text must be a non-empty string")
-        for name in ("language", "voice"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.phonemes, str) or not self.phonemes.strip():
+            raise ValueError("phonemes must be a non-empty string")
+        if not isinstance(self.voice, str) or not self.voice.strip():
+            raise ValueError("voice must be a non-empty string")
         if isinstance(self.speed, bool) or not isinstance(self.speed, (int, float)):
             raise TypeError("speed must be a number")
         speed = float(self.speed)
@@ -52,18 +52,6 @@ class KokoroSynthesisRequest:
         object.__setattr__(self, "speed", speed)
         if type(self.stream) is not bool:
             raise TypeError("stream must be a boolean")
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedKokoroSynthesis:
-    """Validated leaf payload produced before scheduler admission."""
-
-    request: KokoroSynthesisRequest
-    phonemes: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.phonemes, str) or not self.phonemes:
-            raise ValueError("prepared Kokoro phonemes must be a non-empty string")
 
 
 __all__ = ["KokoroSynthesisRequest"]
