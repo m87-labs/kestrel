@@ -12,7 +12,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 
 - **Async micro-batching** — Cooperative scheduler batches heterogeneous requests without compromising per-request latency
 - **Streaming** — Real-time token and transcription progress
-- **Multi-task** — Vision-language generation, spatial reasoning, and speech transcription
+- **Multi-task** — Vision-language generation, spatial reasoning, transcription, and speech synthesis
 - **Paged KV cache** — Efficient memory management for high concurrency
 - **Prefix caching** — Radix tree-based caching for repeated prompts and images
 - **LoRA adapters** — Parameter-efficient fine-tuning support with automatic cloud loading
@@ -54,6 +54,8 @@ Kestrel supports these model families:
 | Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
 | parakeet-redux | [moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux) | The ternary Parakeet: 178 MB, the same capabilities, and runs on the CPU and Apple silicon as well as CUDA |
 | parakeet-ultra | [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra) | The full-precision Parakeet trained further: the same capabilities, better on every benchmark than the original |
+| Qwen3-TTS CustomVoice | [0.6B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice), [1.7B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Streaming 24 kHz speech synthesis with voice and language selection |
+| Kokoro-82M | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | 24 kHz speech synthesis with voice blends and speed control |
 
 ## Quick Start
 
@@ -140,6 +142,9 @@ and asynchronous PCM iterators. Long paths are decoded incrementally.
 [Speech-to-text models](https://github.com/m87-labs/kestrel/blob/main/docs/asr.md)
 for the shared interface and model
 capability matrix, model-specific options, formats, and resource limits.
+
+For speech synthesis with Qwen3-TTS or Kokoro, see
+[Text-to-speech models](https://github.com/m87-labs/kestrel/blob/main/docs/tts.md).
 
 ## Tasks
 

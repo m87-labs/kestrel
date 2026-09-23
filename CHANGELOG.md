@@ -6,6 +6,9 @@ All notable changes since `v0.1.2` are documented in this file.
 
 - Speech: the Parakeet checkpoints we publish now track their repository instead of a
   pinned commit, so a published release keeps resolving them.
+- Added Qwen3-TTS CustomVoice 0.6B/1.7B and Kokoro-82M speech synthesis through
+  the model-bound `synthesize` interface.
+
 ## 0.8.1 — 2026-09-22
 
 - Added `moondream/parakeet-ultra`, a full-precision Parakeet model with its own voice activity detector.

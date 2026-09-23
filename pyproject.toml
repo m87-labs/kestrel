@@ -21,6 +21,9 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+kokoro = ["misaki[en]>=0.9.4; python_version < '3.13'"]
+
 [tool.setuptools.packages.find]
 include = ["kestrel", "kestrel.*"]
 exclude = ["tests", "tests.*"]
