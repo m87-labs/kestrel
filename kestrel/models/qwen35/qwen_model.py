@@ -530,15 +530,27 @@ class Qwen3_5Attention(nn.Module):
                 raise RuntimeError(
                     "Qwen paged attention requires page_table and seqused_k"
                 )
-            attn_output = paged_attention(
-                query_states,
-                paged_kv_layer=paged_kv_layer,
-                page_table=page_table,
-                paged_kv_seqlens_q=paged_kv_seqlens_q,
-                paged_kv_seqlens_k=paged_kv_seqlens_k,
-                cu_seqlens_q=cu_seq_lens_q,
-                scaling=self.scaling,
-            )
+            # Empty-cache prefill can read contiguous K/V; the cache write above
+            # still establishes the page-1 layout required by generated decode.
+            if past_key_values.get_seq_length() == 0 and cu_seq_lens_q is not None:
+                attn_output = dense_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling=self.scaling,
+                    causal=True,
+                    cu_seqlens=cu_seq_lens_q,
+                )
+            else:
+                attn_output = paged_attention(
+                    query_states,
+                    paged_kv_layer=paged_kv_layer,
+                    page_table=page_table,
+                    paged_kv_seqlens_q=paged_kv_seqlens_q,
+                    paged_kv_seqlens_k=paged_kv_seqlens_k,
+                    cu_seqlens_q=cu_seq_lens_q,
+                    scaling=self.scaling,
+                )
             attn_weights = None
 
         attn_output = attn_output * torch.sigmoid(gate)
