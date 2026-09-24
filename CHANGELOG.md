@@ -4,12 +4,16 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.8.2 — 2026-09-24
+
 - Speech: the Parakeet checkpoints we publish now track their repository instead of a
   pinned commit, so a published release keeps resolving them.
 - Added Qwen3-TTS CustomVoice 0.6B/1.7B text-to-speech and Kokoro-82M
   phoneme-to-speech through the model-bound `synthesize` interface.
 - Updated to `kestrel-kernels` 0.7.3, which resolves platform-specific kernel
   companions without listing them as direct Kestrel dependencies.
+- Improved uncached packed Qwen prefill by using contiguous attention inputs
+  while retaining paged attention when requests have prior KV history.
 
 ## 0.8.1 — 2026-09-22
 
