@@ -55,7 +55,7 @@ Kestrel supports these model families:
 | parakeet-redux | [moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux) | The ternary Parakeet: 178 MB, the same capabilities, and runs on the CPU and Apple silicon as well as CUDA |
 | parakeet-ultra | [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra) | The full-precision Parakeet trained further: the same capabilities, better on every benchmark than the original |
 | Qwen3-TTS CustomVoice | [0.6B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice), [1.7B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Streaming 24 kHz speech synthesis with voice and language selection |
-| Kokoro-82M | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | 24 kHz speech synthesis with voice blends and speed control |
+| Kokoro-82M | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | 24 kHz phoneme-to-speech with voice blends, speed control, and segment streaming |
 
 ## Quick Start
 

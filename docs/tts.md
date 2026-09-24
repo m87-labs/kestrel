@@ -6,13 +6,15 @@ Kestrel supports three checkpoints through `model().synthesize(...)`:
 - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - `hexgrad/Kokoro-82M`
 
-Both models use `model().synthesize(...)` and support streaming. Qwen3-TTS
-accepts text, voice, and language selection; its 1.7B checkpoint also accepts
+All three checkpoints support streaming through `model().synthesize(...)`.
+Qwen3-TTS accepts text, voice, and language selection; its 1.7B checkpoint also accepts
 `instructions`. Kokoro accepts a phoneme string, `speed`, and comma-separated
 voice blends. Each returns mono
 24 kHz floating-point PCM in `output["audio"]` and the sample rate in
 `output["sample_rate"]`.
 Qwen3-TTS serving requires a CUDA GPU and BF16; Kokoro supports CPU and CUDA.
+To run Kokoro on CPU even when a GPU is present, set
+`RuntimeConfig(model=model_id, device="cpu")`.
 
 ```python
 from kestrel.config import RuntimeConfig
