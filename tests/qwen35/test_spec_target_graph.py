@@ -93,8 +93,14 @@ def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
     graph._linear, graph._capture_layers, graph._prefix_bindings = (0, 1), (), {}
     graph._layout = lambda count, device: (cache, (16,)*count, torch.tensor([0, 16, 32]), None)
     graph._text = Text()
+    graph._runtime = SimpleNamespace(model=SimpleNamespace(lm_head=lambda hidden: hidden))
     metadata = [torch.zeros(1, 32, dtype=torch.long) for _ in range(7)] + [torch.arange(2)]
-    output = graph._forward(*metadata, *rows)
+    staged = graph._allocate_inputs(tuple(metadata + rows))
+    for destination, source in zip(staged, metadata + rows, strict=True):
+        destination.copy_(source)
+    assert staged[9].data_ptr() == staged[8].data_ptr() + rows[0].numel() * rows[0].element_size()
+    output = graph._forward(*staged)
+    assert torch.equal(output[-1], torch.zeros(1, 32, dtype=torch.long))
     assert cache._prefix_initial_states is None
     assert all(torch.all(value == index) for index, value in enumerate(rows))
     for offset, start in ((0, 2), (8, 6)):

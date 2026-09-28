@@ -81,6 +81,9 @@ class FixedShapeSinglePassGraph:
     holds the session lock until its context exits; callers must submit every
     consumer of the outputs inside that context.  This makes lazy capture and
     replay safe even when a runtime can be entered from more than one thread.
+
+    An input allocator may pack disjoint input views into shared owned storage.
+    It must preserve every input layout and must not alias caller storage.
     """
 
     def __init__(
@@ -91,6 +94,7 @@ class FixedShapeSinglePassGraph:
         stream: torch.cuda.Stream | None,
         run_forward: Callable[..., Sequence[Tensor]],
         max_entries: int = 4,
+        allocate_inputs: Callable[[tuple[Tensor, ...]], tuple[Tensor, ...]] | None = None,
     ) -> None:
         if max_entries <= 0:
             raise ValueError("single-pass graph max_entries must be positive")
@@ -114,6 +118,7 @@ class FixedShapeSinglePassGraph:
         self._stream = stream
         self._run_forward = run_forward
         self._max_entries = int(max_entries)
+        self._allocate_inputs = allocate_inputs
         self._entries: OrderedDict[_InputKey, _GraphEntry] = OrderedDict()
         self._lock = threading.RLock()
         self._active_lease_thread: int | None = None
@@ -144,7 +149,7 @@ class FixedShapeSinglePassGraph:
         stream = self._stream
         if stream is None:
             raise RuntimeError("single-pass graph capture has no CUDA stream")
-        static_inputs = tuple(
+        static_inputs = self._allocate_inputs(inputs) if self._allocate_inputs else tuple(
             torch.empty_strided(
                 value.shape,
                 value.stride(),
@@ -153,6 +158,8 @@ class FixedShapeSinglePassGraph:
             )
             for value in inputs
         )
+        if self._key(static_inputs) != self._key(inputs):
+            raise ValueError("graph input allocator changed input layout")
         copies = _GraphInputCopies(static_inputs)
         # Graph destruction may clear cuBLAS workspaces for its capture stream.
         # Pooled streams can alias another live graph after the pool wraps.

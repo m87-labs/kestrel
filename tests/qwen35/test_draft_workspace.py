@@ -151,6 +151,29 @@ def _session_fixture():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_captured_draft_head_matches_eager_projection():
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    model, caches = _session_fixture()
+    head = torch.nn.Linear(128, 257, bias=False).cuda().bfloat16().requires_grad_(False)
+    hidden_session = DFlashDraftGraphSession(model, caches)
+    token_session = DFlashDraftGraphSession(model, caches, lm_head=head)
+    noise = [torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
+    features = [value[:, :0] for value in noise]
+    positions = [torch.arange(cache.length, cache.length + 16, device="cuda")[None]
+                 for cache in caches]
+    try:
+        for _ in range(3):
+            with hidden_session.launch(noise, features, positions) as hidden:
+                expected = head(hidden[:, 1:].reshape(1, -1, 128)).argmax(-1).reshape(2, 15)
+            with token_session.launch(noise, features, positions) as tokens:
+                assert tokens.dtype == torch.int32
+                assert torch.equal(tokens, expected)
+    finally:
+        hidden_session.shutdown()
+        token_session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_draft_session_consumer_failure_does_not_commit(monkeypatch):
     from contextlib import contextmanager
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession

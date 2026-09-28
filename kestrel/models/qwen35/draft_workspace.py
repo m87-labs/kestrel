@@ -79,10 +79,11 @@ class DFlashDraftGraphSession:
     A failed launch/consumer poisons the session rather than attempting rollback.
     """
 
-    def __init__(self, model, caches):
+    def __init__(self, model, caches, *, lm_head=None):
         from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
         self.model = model
+        self.lm_head = lm_head
         self.caches = tuple(caches)
         if not self.caches or len({id(cache) for cache in self.caches}) != len(self.caches):
             raise ValueError("draft graph requires distinct cache owners")
@@ -119,6 +120,10 @@ class DFlashDraftGraphSession:
                 workspace.values[slot, :cache.length].copy_(cache.layers[index].values[0, :cache.length])
             self.workspaces.append(workspace)
         self.stream = torch.cuda.Stream(device=parameter.device)
+        self.targets = parameter.new_empty((len(self.caches), self.context_rows,
+                                            len(config.target_layer_ids) * config.hidden_size))
+        self.positions = torch.empty((len(self.caches), self.context_rows + self.query_rows),
+                                     device=parameter.device, dtype=torch.int64)
         self.graph = FixedShapeSinglePassGraph(
             enabled=True, device=parameter.device, stream=self.stream,
             run_forward=self._forward, max_entries=1)
@@ -163,7 +168,11 @@ class DFlashDraftGraphSession:
             hidden = hidden + layer.self_attn.forward_stable(
                 layer.input_layernorm(hidden), context, query_rotary, key_rotary, workspace, mapping, used)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
-        return (self.model.norm(hidden),)
+        hidden = self.model.norm(hidden)
+        if self.lm_head is None:
+            return (hidden,)
+        rows = hidden[:, 1:].reshape(1, -1, hidden.shape[-1])
+        return (self.lm_head(rows).argmax(-1).reshape(hidden.shape[0], -1).to(torch.int32),)
 
     @contextmanager
     def launch(self, noise_embeddings, target_hiddens, position_ids):
@@ -189,16 +198,25 @@ class DFlashDraftGraphSession:
                     or noise.dtype != parameter.dtype or target.dtype != parameter.dtype
                     or positions.dtype != torch.int64):
                 raise ValueError("draft graph input geometry or capacity mismatch")
-        targets = parameter.new_zeros((count, self.context_rows,
-                                      len(config.target_layer_ids) * config.hidden_size))
-        positions = torch.zeros((count, self.context_rows + self.query_rows),
-                                device=parameter.device, dtype=torch.int64)
-        for slot, (target, position, length) in enumerate(zip(target_hiddens, position_ids, lengths)):
-            targets[slot, :length].copy_(target[0])
-            positions[slot, :length].copy_(position[0, :length])
-            positions[slot, self.context_rows:].copy_(position[0, length:])
-        mapping, used = self.workspaces[0].append_inputs(self.lengths, lengths)
-        inputs = (torch.cat(noise_embeddings, dim=0), targets, positions, mapping, used)
+        # Stage on the retained stream so the next call cannot overwrite these
+        # buffers before the preceding graph's input copies have consumed them.
+        self.stream.wait_stream(consumer_stream)
+        with torch.cuda.stream(self.stream):
+            targets, positions = self.targets, self.positions
+            targets.zero_()
+            positions.zero_()
+            target_dst, target_src, position_dst, position_src = [], [], [], []
+            for slot, (target, position, length) in enumerate(zip(target_hiddens, position_ids, lengths)):
+                target_dst.append(targets[slot, :length])
+                target_src.append(target[0])
+                position_dst.extend((positions[slot, :length], positions[slot, self.context_rows:]))
+                position_src.extend((position[0, :length], position[0, length:]))
+            torch._foreach_copy_(target_dst, target_src)
+            torch._foreach_copy_(position_dst, position_src)
+            mapping, used = self.workspaces[0].append_inputs(self.lengths, lengths)
+            inputs = (torch.cat(noise_embeddings, dim=0), targets, positions, mapping, used)
+            for value in (*noise_embeddings, *target_hiddens, *position_ids):
+                value.record_stream(self.stream)
         # These staging tensors are allocated on the caller stream but copied
         # on our retained stream; keep their storage live through that copy.
         for value in inputs:

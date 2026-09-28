@@ -46,6 +46,7 @@ class Qwen35DFlashDecoder:
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
+        self._verification_layouts = {}
         self._target_graph = None
         self._replay_graph = None
         self._draft_graph = None
@@ -73,7 +74,8 @@ class Qwen35DFlashDecoder:
         if leases is None or self._target_graph is None:
             if state_sources is not None:
                 raise RuntimeError("unmaterialized recurrent rows require a verification graph")
-            return self.text(**kwargs)
+            output = self.text(**kwargs)
+            return output, self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)
         return leases.enter_context(self._target_graph.launch(state_sources=state_sources, **kwargs))
 
     def shutdown(self):
@@ -213,7 +215,7 @@ class Qwen35DFlashDecoder:
             for row, position in enumerate(positions[0].split(lengths))])[None]
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=lengths, device=device)
-        output = self._verify(None,
+        output = self.text(
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
             paged_kv_seqlens_k=torch.tensor(lengths, device=device, dtype=torch.int32),
@@ -249,7 +251,7 @@ class Qwen35DFlashDecoder:
         slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
-        output = self._verify(leases,
+        output, predictions = self._verify(leases,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
@@ -259,20 +261,22 @@ class Qwen35DFlashDecoder:
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         cache.advance_to(start+length)
         features = torch.cat(output.layer_hidden_states, dim=-1)
-        expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].tolist()
+        expected = predictions[0].tolist()
         return expected, features, cache
 
     @contextmanager
-    def _draft_hidden(self, noise, features, positions, caches):
+    def _draft_tokens(self, noise, features, positions, caches):
         eligible = (self._draft_graph_enabled
                     and all(cache.layers for cache in caches)
                     and all(value.shape[1] <= self.draft.config.block_size for value in features))
         if not eligible:
             if len(caches) == 1:
-                yield self.draft(noise[0], features[0], positions[0], context_cache=caches[0])
+                hidden = self.draft(noise[0], features[0], positions[0], context_cache=caches[0])
             else:
-                yield torch.cat(self.draft.forward_many(
+                hidden = torch.cat(self.draft.forward_many(
                     noise, features, positions, context_caches=caches), dim=0)
+            rows = hidden[:, 1:].reshape(1, -1, hidden.shape[-1])
+            yield self.runtime.model.lm_head(rows).argmax(-1).reshape(len(caches), -1).to(torch.int32)
             return
         from .draft_workspace import DFlashDraftGraphSession
         if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
@@ -280,7 +284,8 @@ class Qwen35DFlashDecoder:
                 != tuple(cache.capacity for cache in caches)):
             if self._draft_graph is not None:
                 self._draft_graph.shutdown()
-            self._draft_graph = DFlashDraftGraphSession(self.draft, caches)
+            self._draft_graph = DFlashDraftGraphSession(
+                self.draft, caches, lm_head=self.runtime.model.lm_head)
         elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
               or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
             self._draft_graph.rebind(caches)
@@ -296,9 +301,8 @@ class Qwen35DFlashDecoder:
         positions = torch.arange(ctx.draft_cache.length, start+config.block_size,
                                  device=self.runtime.device)[None]
         consumer_stream = torch.cuda.current_stream(self.runtime.device)
-        with self._draft_hidden([self.text.embed_tokens(noise)], [ctx.features],
-                                [positions], [ctx.draft_cache]) as hidden:
-            ids = self.runtime.model.lm_head(hidden[:, 1:]).argmax(-1).to(torch.int32)
+        with self._draft_tokens([self.text.embed_tokens(noise)], [ctx.features],
+                                [positions], [ctx.draft_cache]) as ids:
             producer_stream = torch.cuda.current_stream(self.runtime.device)
         if producer_stream != consumer_stream:
             ids.record_stream(consumer_stream)
@@ -314,11 +318,10 @@ class Qwen35DFlashDecoder:
                                   session.cache.seq_length + config.block_size,
                                   device=self.runtime.device)[None]
                      for session in sessions]
-        with self._draft_hidden(
+        with self._draft_tokens(
                 self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
-                positions, [session.draft_cache for session in sessions]) as hidden:
-            logits = self.runtime.model.lm_head(hidden[:, 1:].reshape(1, -1, hidden.shape[-1]))
-            ids = logits.argmax(-1).reshape(len(sessions), config.block_size - 1).tolist()
+                positions, [session.draft_cache for session in sessions]) as tokens:
+            ids = tokens.tolist()
         return [[session.bonus, *row] for session, row in zip(sessions, ids)]
 
     def _target_many(self, candidates, sessions, *, leases=None):
@@ -326,6 +329,7 @@ class Qwen35DFlashDecoder:
         self._wait_for_commit()
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
+        cacheable = lengths == (self.num_lookahead_tokens,) * len(sessions)
         sources = [session.cache for session in sessions]
         graph_staging = leases is not None and self._target_graph is not None
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
@@ -335,28 +339,36 @@ class Qwen35DFlashDecoder:
             torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
             for session, length in zip(sessions, lengths)])[None]
         slot_ids = torch.tensor([session.state.batch_idx for session in sessions], device=device, dtype=torch.long)
-        local_state_indices = torch.zeros_like(slot_ids)
         page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
         page_size = self.runtime.page_size
         position_rows = positions[0].split(lengths)
         slot_mapping = torch.cat([
             page_table[row, position // page_size].long() * page_size + position % page_size
             for row, position in enumerate(position_rows)])[None]
-        cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
-            sequence_lengths=lengths, device=device)
-        output = self._verify(leases, state_sources=sources if graph_staging else None,
+        layout = self._verification_layouts.get(lengths) if cacheable else None
+        if layout is None:
+            cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
+                sequence_lengths=lengths, device=device)
+            state_indices = torch.arange(len(sessions), device=device, dtype=torch.long)
+            seq_idx = torch.tensor([row for row, length in enumerate(lengths) for _ in range(length)],
+                                   device=device, dtype=torch.int32)[None]
+            local_state_indices = torch.zeros_like(state_indices)
+            layout = cu, topology, state_indices, seq_idx, local_state_indices
+            if cacheable:
+                self._verification_layouts[lengths] = layout
+        cu, topology, state_indices, seq_idx, local_state_indices = layout
+        output, predictions = self._verify(leases, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
             paged_kv_seqlens_k=torch.tensor([
                 session.cache.seq_length + length for session, length in zip(sessions, lengths)
             ], device=device, dtype=torch.int32),
             cu_seq_lens_q=cu, sequence_lengths=lengths, topology_token=topology,
-            seq_idx=torch.cat([torch.full((length,), row, device=device, dtype=torch.int32)
-                               for row, length in enumerate(lengths)])[None],
-            gdn_state_indices=torch.arange(len(sessions), device=device, dtype=torch.long),
+            seq_idx=seq_idx,
+            gdn_state_indices=state_indices,
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
-        expected = self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)[0].split(lengths)
+        expected = predictions[0].split(lengths)
         if packed._borrowed_recurrent_state:
             for branch in branches:
                 branch._borrowed_recurrent_state = True
@@ -381,6 +393,8 @@ class Qwen35DFlashDecoder:
 
     def commit_accept(self, ctx):
         if self._generated_verification is not None:
+            # Tried separate-stream replay: C1 stayed near 396 tok/s;
+            # keep the single-stream owner without additional event traffic.
             self._generated_verification.commit(ctx)
             return
         session, verified, features, expected, count = ctx

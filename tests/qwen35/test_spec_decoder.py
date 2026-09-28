@@ -21,6 +21,7 @@ def decoder():
     obj._commit_ready = None
     obj._commit_pending = False
     obj._generated_verification = None
+    obj._verification_layouts = {}
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(
@@ -105,9 +106,9 @@ def test_single_draft_device_ids_are_ordered_after_stream_lease():
         stream.wait_stream(caller)
         with torch.cuda.stream(stream):
             torch.cuda._sleep(1000000)
-            yield torch.zeros(1, 4, 1, device="cuda")
+            yield torch.ones(1, 3, device="cuda", dtype=torch.int32)
         caller.wait_stream(stream)
-    obj._draft_hidden = hidden
+    obj._draft_tokens = hidden
     ctx = SimpleNamespace(cache=SimpleNamespace(seq_length=8),
                           draft_cache=SimpleNamespace(length=6), bonus=1,
                           features=torch.zeros(1, 2, 1, device="cuda"))
@@ -514,7 +515,13 @@ def test_packed_admission_isolates_slots_lengths_and_failures(monkeypatch, fail_
         layer.has_previous_state = True
         hidden = kwargs["input_ids"].float().unsqueeze(-1)
         return SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=(hidden,))
-    obj._verify = verify
+    class Text:
+        config = obj.text.config
+
+        def __call__(self, **kwargs):
+            return verify(None, **kwargs)
+
+    obj.text = Text()
     states = [SimpleNamespace(batch_idx=-1, max_length=100) for _ in range(3)]
     requests = [SpecAdmission(state, [TextToken(token_id=t) for t in tokens], {})
                 for state, tokens in zip(states, ([1, 2], [999], [3]))]

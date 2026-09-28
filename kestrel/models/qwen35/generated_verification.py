@@ -67,6 +67,8 @@ class Qwen35GeneratedVerification:
                                  page_table_capacity=inputs["page_table"].shape[1]),
             stream=self.stream, device=device)
         self.invocation = self.program.bind(self.bindings)
+        # Tried host live-kv overrides: 395.62 vs 395.77 tok/s at C1;
+        # keep the fixed launcher (device work already follows input_pos).
         self.launch = self.invocation.prepare_repeated_launch(active_batch=self.block)
         self.inputs = inputs
         self.positions = torch.arange(self.block, dtype=torch.int32, device=device)

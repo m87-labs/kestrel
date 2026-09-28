@@ -111,6 +111,28 @@ def test_shutdown_closes_all_entries_when_one_close_fails():
     session.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_custom_staging_allocation_keeps_packed_rows_current():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.Stream(device=device)
+    def allocate(inputs):
+        packed = inputs[0].new_empty((2, 4))
+        return packed[:1], packed[1:]
+    def forward(first, second):
+        return (first.as_strided((2, 4), first.stride()).square(),)
+    session = FixedShapeSinglePassGraph(enabled=True, device=device, stream=stream,
+        run_forward=forward, allocate_inputs=allocate)
+    try:
+        for value in (1., 3., 7.):
+            a = torch.full((1, 4), value, device=device)
+            b = torch.full((1, 4), value + 1, device=device)
+            with session.launch(a, b) as (out,):
+                stream.synchronize()
+                torch.testing.assert_close(out, torch.cat((a, b)).square())
+    finally:
+        session.shutdown()
+
+
 def test_graph_input_copies_group_dtypes_and_preserve_views(monkeypatch):
     from kestrel.runtime.single_pass_graph import _GraphInputCopies
 

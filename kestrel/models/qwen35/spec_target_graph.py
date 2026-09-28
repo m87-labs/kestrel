@@ -31,7 +31,27 @@ class Qwen35TargetGraph:
         self._finalizers = OrderedDict()
         self._graphs = FixedShapeSinglePassGraph(
             enabled=True, device=runtime.device, stream=runtime._compute_stream,
-            run_forward=self._forward, max_entries=runtime.max_batch_size)
+            run_forward=self._forward, max_entries=runtime.max_batch_size,
+            allocate_inputs=self._allocate_inputs)
+
+    def _allocate_inputs(self, inputs):
+        count = inputs[_INPUTS.index('gdn_state_indices')].numel()
+        prefix = len(_INPUTS)
+        row_inputs = len(inputs) != prefix + 2 * len(self._linear)
+        if not row_inputs:
+            prefix = len(inputs)
+        result = [torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
+                  for x in inputs[:prefix]]
+        for offset in range(prefix, len(inputs), count):
+            rows = inputs[offset:offset + count]
+            first = rows[0]
+            if (len(rows) != count or first.shape[0] != 1
+                    or any(not x.is_contiguous() or x.shape != first.shape
+                           or x.dtype != first.dtype or x.device != first.device for x in rows)):
+                raise ValueError('packed verification needs matching contiguous state rows')
+            owner = first.new_empty((count, *first.shape[1:]))
+            result.extend(owner[row:row + 1] for row in range(count))
+        return tuple(result)
 
     def _layout(self, count, device):
         stream = torch.cuda.current_stream(device)
@@ -68,8 +88,14 @@ class Qwen35TargetGraph:
         for index in self._linear:
             layer = cache.layers[index]
             if row_inputs:
-                layer.conv_states = torch.cat([next(states) for _ in range(count)], dim=0)
-                initial = torch.cat([next(states) for _ in range(count)], dim=0)
+                conv_rows = [next(states) for _ in range(count)]
+                state_rows = [next(states) for _ in range(count)]
+                # The input allocator gives each cohort one contiguous owner;
+                # staging writes directly into its rows before graph replay.
+                layer.conv_states = conv_rows[0].as_strided(
+                    (count, *conv_rows[0].shape[1:]), conv_rows[0].stride())
+                initial = state_rows[0].as_strided(
+                    (count, *state_rows[0].shape[1:]), state_rows[0].stride())
                 cache._prefix_initial_states[index] = initial
                 layer.recurrent_states = torch.empty_like(initial)
             else:
@@ -104,6 +130,7 @@ class Qwen35TargetGraph:
         cache._prefix_records = {}
         cache._prefix_initial_states = None
         tensors.append(cu)
+        tensors.append(self._runtime.model.lm_head(output.last_hidden_state).argmax(-1))
         return tuple(tensors)
 
     @contextmanager
@@ -146,7 +173,7 @@ class Qwen35TargetGraph:
                 layer = cache.layers[index]
                 layer.conv_states, layer.recurrent_states = next(states), next(states)
             cache._borrowed_recurrent_state = True
-            yield _TextModelOutput(hidden, cache, tuple(taps))
+            yield _TextModelOutput(hidden, cache, tuple(taps)), values[-1]
 
     def _bind_outputs(self, values, count):
         # The graph owns one immutable output tuple per entry. Retaining it
