@@ -13,6 +13,7 @@ from .registry import ModelSpec, get_spec, known_models, register
 
 # Model packages advertise metadata without importing runtime implementations.
 from . import (  # noqa: F401
+    dinov2,
     gemma4,
     kokoro,
     moondream,

@@ -268,6 +268,11 @@ class ModelHandle:
     ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
         return await self._capability("detect", prompt)
 
+    async def embed(
+        self, **prompt: Any
+    ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":
+        return await self._capability("embed", prompt)
+
     async def point(
         self, **prompt: Any
     ) -> "EngineResult | EngineStream | ModelStream | CapabilityStream":

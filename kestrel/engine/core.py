@@ -452,7 +452,7 @@ class InferenceEngine:
         # instance) opts out with ``needs_kv_pool = False``: the engine then
         # holds no pool at all rather than budgeting paged attention storage
         # on a device whose only model never pages anything.
-        if getattr(spec.runtime, "needs_kv_pool", True):
+        if spec.needs_kv_pool and getattr(spec.runtime, "needs_kv_pool", True):
             kwargs["kv_pool"] = self._shared_kv_pool()
         if model_id == self._default_model:
             return spec.runtime(
