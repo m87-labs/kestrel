@@ -46,6 +46,7 @@ Kestrel supports these model families:
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
 | Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Public, no approval needed |
 | Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
+| DINOv2 ViT-S/14 | [facebook/dinov2-small](https://huggingface.co/facebook/dinov2-small) | Image embeddings; one-launch encoder on H100 BF16 |
 | Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 | Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, 26B-A4B, and 31B base/instruction variants |
@@ -88,6 +89,32 @@ async def main():
 
     # Clean up
     await engine.shutdown()
+
+
+asyncio.run(main())
+```
+
+## Image embeddings
+
+`dinov2-small` serves the single-pass `embed` task. Its output contains FP32
+`last_hidden_state` (`[1, 257, 384]`) and `pooler_output` (`[1, 384]`) tensors.
+The H100 BF16 path loads the shipped encoder; other devices use the inference
+model with the same output contract.
+
+```python
+import asyncio
+from PIL import Image
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
+
+
+async def main():
+    engine = await InferenceEngine.create(RuntimeConfig(model="dinov2-small"))
+    try:
+        result = await engine.model().embed(image=Image.open("photo.jpg"))
+        print(result.output["pooler_output"].shape)
+    finally:
+        await engine.shutdown()
 
 
 asyncio.run(main())
