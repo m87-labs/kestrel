@@ -20,6 +20,7 @@ def decoder():
     obj._finalization_stream = nullcontext
     obj._commit_ready = None
     obj._commit_pending = False
+    obj._generated_verification = None
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(

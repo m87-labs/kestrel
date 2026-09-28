@@ -56,7 +56,12 @@ class Qwen35DFlashDecoder:
         self._commit_inputs_ready = torch.cuda.Event()
         self._commit_ready = torch.cuda.Event()
         self._commit_pending = False
-        if runtime._cfg.enable_cuda_graphs:
+        self._generated_verification = None
+        if runtime.decode_path == "generated":
+            from .generated_verification import Qwen35GeneratedVerification
+
+            self._generated_verification = Qwen35GeneratedVerification(runtime, self.draft)
+        if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
             from .spec_target_graph import Qwen35TargetGraph
             from .spec_replay_graph import Qwen35ReplayGraph
             self._target_graph = Qwen35TargetGraph(runtime, self.text,
@@ -232,6 +237,8 @@ class Qwen35DFlashDecoder:
 
     def _target(self, tokens, committed, slot, *, capture, leases=None):
         self._wait_for_commit()
+        if capture and self._generated_verification is not None:
+            return self._generated_verification.target(tokens, committed, slot)
         cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
@@ -373,6 +380,9 @@ class Qwen35DFlashDecoder:
                 for tokens, feature, branch in zip(expected, features, branches)]
 
     def commit_accept(self, ctx):
+        if self._generated_verification is not None:
+            self._generated_verification.commit(ctx)
+            return
         session, verified, features, expected, count = ctx
         cache = verified.commit_recurrent_prefix(count, replay_graph=self._replay_graph)
         session.cache = cache

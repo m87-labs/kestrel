@@ -187,8 +187,8 @@ class RuntimeConfig:
                 raise ValueError("draft_model_path currently requires a Qwen 3.5/3.6 runtime")
             if self.device.split(":")[0] != "cuda" or self.dtype != torch.bfloat16:
                 raise ValueError("Qwen DFlash requires CUDA BF16 sequences")
-            if self.decode_path != "auto":
-                raise ValueError("Qwen DFlash uses native sequence verification; decode_path must be auto")
+            if self.decode_path not in ("auto", "generated"):
+                raise ValueError("Qwen DFlash decode_path must be auto or generated")
         if self.decode_path not in ("auto", "native", "generated"):
             raise ValueError(
                 "decode_path must be 'auto', 'native', or 'generated'"
