@@ -5,16 +5,58 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
 from kestrel.device import resolve_device, stream_context
+from kestrel.runtime.cuda_stream import OwnedCudaStream
 
 
 _InputKey = tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...]
+
+
+class _GraphInputCopies:
+    """Reuse staging metadata while preserving cross-input alias ordering."""
+
+    def __init__(self, destinations: tuple[Tensor, ...]):
+        self.destinations = destinations
+        self.storage = {
+            value.data_ptr() - value.storage_offset() * value.element_size()
+            for value in destinations
+        }
+        groups: dict[torch.dtype, tuple[list[int], list[Tensor]]] = {}
+        for index, destination in enumerate(destinations):
+            indices, dst = groups.setdefault(destination.dtype, ([], []))
+            indices.append(index)
+            dst.append(destination)
+        self.groups = tuple(
+            (indices, dst, list(dst)) for indices, dst in groups.values()
+        )
+
+    def copy(self, sources: tuple[Tensor, ...]) -> None:
+        if len(sources) != len(self.destinations):
+            raise ValueError("graph input count changed")
+        # untyped_storage() attaches a GC-tracked Python wrapper to each source.
+        if len(sources) < 2 or any(
+            value.data_ptr() - value.storage_offset() * value.element_size()
+            in self.storage
+            for value in sources
+        ):
+            for destination, source in zip(self.destinations, sources, strict=True):
+                destination.copy_(source)
+            return
+        for indices, dst, src in self.groups:
+            try:
+                for offset, index in enumerate(indices):
+                    src[offset] = sources[index]
+                torch._foreach_copy_(dst, src)
+            finally:
+                # Never retain a caller's state after staging has been enqueued.
+                for offset in range(len(src)):
+                    src[offset] = dst[offset]
 
 
 @dataclass(slots=True)
@@ -22,6 +64,14 @@ class _GraphEntry:
     inputs: tuple[Tensor, ...]
     outputs: tuple[Tensor, ...]
     graph: torch.cuda.CUDAGraph
+    copies: _GraphInputCopies
+    capture: OwnedCudaStream
+
+    def close(self):
+        try:
+            self.graph.reset()
+        finally:
+            self.capture.close()
 
 
 class FixedShapeSinglePassGraph:
@@ -31,6 +81,9 @@ class FixedShapeSinglePassGraph:
     holds the session lock until its context exits; callers must submit every
     consumer of the outputs inside that context.  This makes lazy capture and
     replay safe even when a runtime can be entered from more than one thread.
+
+    An input allocator may pack disjoint input views into shared owned storage.
+    It must preserve every input layout and must not alias caller storage.
     """
 
     def __init__(
@@ -41,6 +94,7 @@ class FixedShapeSinglePassGraph:
         stream: torch.cuda.Stream | None,
         run_forward: Callable[..., Sequence[Tensor]],
         max_entries: int = 4,
+        allocate_inputs: Callable[[tuple[Tensor, ...]], tuple[Tensor, ...]] | None = None,
     ) -> None:
         if max_entries <= 0:
             raise ValueError("single-pass graph max_entries must be positive")
@@ -64,6 +118,7 @@ class FixedShapeSinglePassGraph:
         self._stream = stream
         self._run_forward = run_forward
         self._max_entries = int(max_entries)
+        self._allocate_inputs = allocate_inputs
         self._entries: OrderedDict[_InputKey, _GraphEntry] = OrderedDict()
         self._lock = threading.RLock()
         self._active_lease_thread: int | None = None
@@ -89,10 +144,12 @@ class FixedShapeSinglePassGraph:
         )
 
     def _capture(self, inputs: tuple[Tensor, ...]) -> _GraphEntry:
+        from kestrel_kernels.cubin_runtime import graph_execution_scope
+
         stream = self._stream
         if stream is None:
             raise RuntimeError("single-pass graph capture has no CUDA stream")
-        static_inputs = tuple(
+        static_inputs = self._allocate_inputs(inputs) if self._allocate_inputs else tuple(
             torch.empty_strided(
                 value.shape,
                 value.stride(),
@@ -101,21 +158,39 @@ class FixedShapeSinglePassGraph:
             )
             for value in inputs
         )
-        with (
-            torch.cuda.device(self.device),
-            stream_context(stream),
-            torch.inference_mode(),
-        ):
-            for destination, source in zip(static_inputs, inputs, strict=True):
-                destination.copy_(source)
-            # Materialize library handles and algorithm selection outside capture.
-            self._outputs(self._run_forward(*static_inputs))
-            stream.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                outputs = self._outputs(self._run_forward(*static_inputs))
-            graph.replay()
-        return _GraphEntry(static_inputs, outputs, graph)
+        if self._key(static_inputs) != self._key(inputs):
+            raise ValueError("graph input allocator changed input layout")
+        copies = _GraphInputCopies(static_inputs)
+        # Graph destruction may clear cuBLAS workspaces for its capture stream.
+        # Pooled streams can alias another live graph after the pool wraps.
+        capture = OwnedCudaStream(self.device)
+        graph = None
+        try:
+            capture.stream.wait_stream(stream)
+            with (
+                torch.cuda.device(self.device),
+                stream_context(capture.stream),
+                torch.inference_mode(),
+                graph_execution_scope(),
+            ):
+                copies.copy(inputs)
+                self._outputs(self._run_forward(*static_inputs))
+                copies.copy(inputs)
+                capture.stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture.stream):
+                    outputs = self._outputs(self._run_forward(*static_inputs))
+                copies.copy(inputs)
+                graph.replay()
+            stream.wait_stream(capture.stream)
+            return _GraphEntry(static_inputs, outputs, graph, copies, capture)
+        except BaseException:
+            try:
+                if graph is not None:
+                    graph.reset()
+            finally:
+                capture.close()
+            raise
 
     @contextmanager
     def _ordered_stream(self) -> Iterator[None]:
@@ -167,15 +242,13 @@ class FixedShapeSinglePassGraph:
                         if entry is None:
                             if len(self._entries) >= self._max_entries:
                                 stream.synchronize()
-                                self._entries.popitem(last=False)
+                                _, retired = self._entries.popitem(last=False)
+                                retired.close()
                             entry = self._capture(values)
                             self._entries[key] = entry
                         else:
                             self._entries.move_to_end(key)
-                            for destination, source in zip(
-                                entry.inputs, values, strict=True
-                            ):
-                                destination.copy_(source)
+                            entry.copies.copy(values)
                             entry.graph.replay()
                         yield entry.outputs
             finally:
@@ -191,14 +264,17 @@ class FixedShapeSinglePassGraph:
                     "single-pass graph cannot shut down during an active lease"
                 )
             self._closed = True
-            try:
-                stream = self._stream
-                if stream is not None:
-                    stream.synchronize()
-            finally:
-                self._entries.clear()
-                self._run_forward = lambda *_args: ()
-                self._stream = None
+            with ExitStack() as cleanup:
+                for entry in self._entries.values():
+                    cleanup.callback(entry.close)
+                try:
+                    stream = self._stream
+                    if stream is not None:
+                        stream.synchronize()
+                finally:
+                    self._entries.clear()
+                    self._run_forward = lambda *_args: ()
+                    self._stream = None
 
 
 __all__ = ["FixedShapeSinglePassGraph"]

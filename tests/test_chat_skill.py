@@ -4,7 +4,7 @@ flatten-into-query subclass."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -333,11 +333,14 @@ def test_state_reasoning_splits_thinking_and_answer() -> None:
         runtime, SimpleNamespace(), _ctx([{"role": "user", "content": "hi"}], reasoning=True)
     )
     state.on_prefill(runtime)
+    assert state.mask_is_stateful
     _drive(state, runtime, _ords("think"))
     state.consume_step(runtime, DecodeStep(token=TextToken(token_id=THINK_E), position=99))
     assert list(state.allowed_token_ids(runtime)) == [DNL]
+    assert state.mask_is_stateful
     _drive(state, runtime, [DNL])
     assert state.allowed_token_ids(runtime) is None
+    assert not state.mask_is_stateful
     _drive(state, runtime, _ords("ans") + [IM_END])
     result = state.finalize(runtime, reason="stop")
     # OpenRouter style: reasoning is a string on the message, beside content.
@@ -346,6 +349,18 @@ def test_state_reasoning_splits_thinking_and_answer() -> None:
         "content": "ans",
         "reasoning": "think",
     }
+
+
+@pytest.mark.parametrize("reasoning,prefix", [(False, [DNL]), (False, []), (True, [])])
+def test_chat_without_future_mask_transition_allows_multi_token_commit(reasoning, prefix):
+    runtime = _chat_runtime()
+    runtime.prompt_template._chat = replace(runtime.prompt_template._chat, post_reasoning_prefix=prefix)
+    state = ChatSkill().create_state(
+        runtime, SimpleNamespace(), _ctx([{"role": "user", "content": "hi"}], reasoning=reasoning))
+    state.on_prefill(runtime)
+    assert state.allowed_token_ids(runtime) is None and not state.mask_is_stateful
+    _drive(state, runtime, [THINK_E, ord("o"), ord("k")])
+    assert state.allowed_token_ids(runtime) is None and not state.mask_is_stateful
 
 
 def test_state_streams_reasoning_separately_from_answer() -> None:

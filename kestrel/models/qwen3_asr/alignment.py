@@ -30,8 +30,7 @@ from .model import AudioEncoder, TextDecoder
 from .tokenizer import language_code, resolve_language
 
 
-MODEL_ID = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
-REVISION = "c07281df297b9905d24a508279258cccf987a064"
+from .metadata import ALIGNER_MODEL_ID as MODEL_ID, ALIGNER_REVISION as REVISION
 _FILES = (
     "config.json",
     "model.safetensors",

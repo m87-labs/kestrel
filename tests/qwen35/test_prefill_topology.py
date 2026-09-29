@@ -175,6 +175,8 @@ def test_gdn_prefill_forwards_topology_to_combined_prefill(monkeypatch) -> None:
     cache = SimpleNamespace(
         layers=[layer],
         has_previous_state=lambda layer_idx: False,
+        _prefix_source=None,
+        _prefix_initial_states=None,
     )
     conv1d = SimpleNamespace(
         weight=torch.ones((1, 1, 1)),

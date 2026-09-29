@@ -204,10 +204,14 @@ class Qwen3_5Config:
         model_type = str(required_config(data, "model_type", "Qwen"))
         text_data = dict(required_config(data, "text_config", "Qwen"))
         quantization = data.get("quantization_config") or {}
+        if (
+            quantization.get("quant_method") == "fp8"
+            and quantization.get("fmt", "e4m3") != "e4m3"
+        ):
+            raise ValueError("Qwen FP8 requires E4M3 checkpoint weights")
         expert_weight_format = (
             "fp8_e4m3"
             if quantization.get("quant_method") == "fp8"
-            and quantization.get("fmt") == "e4m3"
             else "bf16"
         )
         if (

@@ -178,6 +178,7 @@ class RuntimeConfig:
     # that support it must bind compatible generated programs for the complete
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
+    draft_model_path: str | Path | None = None
     # Requests per forward for single-pass runtimes (Parakeet). ``None`` lets
     # the runtime choose by device: 128 on CUDA devices of 40 GiB or more, 64
     # on smaller ones, 8 on CPU and MPS.
@@ -188,6 +189,15 @@ class RuntimeConfig:
     cpu_threads: int | None = None
 
     def __post_init__(self):
+        if self.draft_model_path is not None:
+            from kestrel.models import get_spec
+
+            if get_spec(self.model).checkpoint_format != "qwen3_5":
+                raise ValueError("draft_model_path currently requires a Qwen 3.5/3.6 runtime")
+            if self.device.split(":")[0] != "cuda" or self.dtype != torch.bfloat16:
+                raise ValueError("Qwen DFlash requires CUDA BF16 sequences")
+            if self.decode_path not in ("auto", "generated"):
+                raise ValueError("Qwen DFlash decode_path must be auto or generated")
         if self.decode_path not in ("auto", "native", "generated"):
             raise ValueError(
                 "decode_path must be 'auto', 'native', or 'generated'"

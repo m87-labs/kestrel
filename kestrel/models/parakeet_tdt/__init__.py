@@ -1,59 +1,23 @@
-"""NVIDIA Parakeet TDT 0.6B v3 support for Kestrel."""
+"""Lightweight parakeet_tdt registration and lazy public exports."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
+from kestrel.models.registry import register_lazy
+from .metadata import MODEL_ID, REVISION, TERNARY_MODEL_ID, ULTRA_MODEL_ID
 
-from .runtime import ParakeetTdtRuntime
-from .weights import (
-    MODEL_ID,
-    REVISION,
-    TERNARY_MODEL_ID,
-    ULTRA_MODEL_ID,
-    load_parakeet_tdt,
-)
+register_lazy([MODEL_ID, TERNARY_MODEL_ID, ULTRA_MODEL_ID], __name__ + ".registration")
 
+__all__ = ["MODEL_ID", "REVISION", "TERNARY_MODEL_ID", "ULTRA_MODEL_ID",
+           "ParakeetTdtRuntime", "load_parakeet_tdt"]
 
-def _build_orchestrators():
-    from .longform import ParakeetLongFormOrchestrator
-
-    return {"transcribe": ParakeetLongFormOrchestrator()}
+_LAZY_EXPORTS = {
+    "ParakeetTdtRuntime": ".runtime",
+    "load_parakeet_tdt": ".weights"
+}
 
 
-register(
-    ModelSpec(
-        name=MODEL_ID,
-        repo_id=MODEL_ID,
-        revision=REVISION,
-        runtime=ParakeetTdtRuntime,
-        orchestrators=_build_orchestrators,
-    )
-)
-
-# The ternary student: same runtime, same contract, weights at ``repo_id``, no pinned revision;
-# ``RuntimeConfig(model=TERNARY_MODEL_ID)`` downloads them, ``model_path=<export dir>`` loads a local export.
-register(
-    ModelSpec(
-        name=TERNARY_MODEL_ID,
-        repo_id=TERNARY_MODEL_ID,
-        runtime=ParakeetTdtRuntime,
-        orchestrators=_build_orchestrators,
-    )
-)
-
-# The full-precision student: the original's architecture and files, trained further, with its own VAD head.
-register(
-    ModelSpec(
-        name=ULTRA_MODEL_ID,
-        repo_id=ULTRA_MODEL_ID,
-        runtime=ParakeetTdtRuntime,
-        orchestrators=_build_orchestrators,
-    )
-)
-
-__all__ = [
-    "MODEL_ID",
-    "REVISION",
-    "TERNARY_MODEL_ID",
-    "ULTRA_MODEL_ID",
-    "ParakeetTdtRuntime",
-    "load_parakeet_tdt",
-]
+def __getattr__(name):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_LAZY_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

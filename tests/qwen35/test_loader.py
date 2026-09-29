@@ -473,6 +473,7 @@ def test_runtime_replaces_prepared_storage_with_finalized_storage(
     monkeypatch.setattr(qwen_loader, "load_qwen35_model", load_model)
 
     runtime = object.__new__(Qwen35Runtime)
+    runtime._draft_model_path = None
     runtime.device = torch.device("cpu")
     runtime.dtype = torch.bfloat16
     runtime.max_batch_size = 4

@@ -16,18 +16,15 @@ from .tokenizer import ParakeetTokenizer
 from .vad import VAD_HEAD_PREFIX
 
 
-MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
-REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+from .metadata import MODEL_ID, REVISION, TERNARY_MODEL_ID, ULTRA_MODEL_ID
 _FILES = ("config.json", "tokenizer.json", "model.safetensors")
 # The ternary student distilled from MODEL_ID (thrush), published at TERNARY_MODEL_ID: config.json and
 # tokenizer.json as usual, a ``model.safetensors`` with the encoder projections as base-3 packed codes (1.6 bits
 # per weight, decoded to the kernels' two-bit layout at load) and the ``ternary.json`` manifest written by thrush's
 # ``scripts/export_ternary.py --names hf``. That manifest is the only thing that marks a checkpoint as ternary.
-TERNARY_MODEL_ID = "moondream/parakeet-redux"
 EXPORT_FORMAT = "thrush-ternary-v2"  # base-3 packed codes on disk; see ``unpack_export``
 # The full-precision student trained further from MODEL_ID (thrush), published at ULTRA_MODEL_ID: the same three
 # files as the original, fp16, with the VAD head the segmenter uses. No manifest, so it loads as an fp checkpoint.
-ULTRA_MODEL_ID = "moondream/parakeet-ultra"
 _MANIFEST = "ternary.json"
 _QKV = ("q_proj", "k_proj", "v_proj")
 _REL = "relative_k_proj"

@@ -7,11 +7,13 @@ coordinates, checkpoint-format tag, tokenizer id, default config) consumed by
 a specific runtime family. A single-pass model whose runtime factory owns its
 own loading leaves them unset.
 
-New model families register themselves at import time from their
-package's ``__init__.py`` (see ``kestrel/models/moondream/__init__.py``).
+Model packages advertise names at import time; their registration modules
+resolve concrete specs only when selected. Application specs can still be
+registered directly.
 """
 
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
 
 if TYPE_CHECKING:
@@ -73,6 +75,13 @@ def _empty_orchestrators() -> "Mapping[str, CapabilityOrchestrator]":
 
 
 _REGISTRY: Dict[str, ModelSpec] = {}
+_LAZY_REGISTRY: Dict[str, str] = {}
+
+
+def register_lazy(names: list[str], module: str) -> None:
+    """Advertise a family's names without importing its implementation."""
+    for name in names:
+        _LAZY_REGISTRY[name] = module
 
 
 def register(spec: ModelSpec) -> None:
@@ -80,17 +89,24 @@ def register(spec: ModelSpec) -> None:
     _REGISTRY[spec.name] = spec
 
 
+def register_builtin(spec: ModelSpec) -> None:
+    """Deferred defaults must not replace an explicit application registration."""
+    _REGISTRY.setdefault(spec.name, spec)
+
+
 def get_spec(name: str) -> ModelSpec:
     """Look up a registered model by name."""
+    if name not in _REGISTRY and name in _LAZY_REGISTRY:
+        import_module(_LAZY_REGISTRY[name])
     if name not in _REGISTRY:
-        known = ", ".join(sorted(_REGISTRY))
+        known = ", ".join(known_models())
         raise ValueError(f"Unknown model {name!r}. Known models: {known}")
     return _REGISTRY[name]
 
 
 def known_models() -> List[str]:
     """Return the names of all registered models, sorted."""
-    return sorted(_REGISTRY)
+    return sorted(_REGISTRY.keys() | _LAZY_REGISTRY.keys())
 
 
 __all__ = [

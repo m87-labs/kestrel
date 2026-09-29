@@ -1,6 +1,7 @@
-"""Self-contained Moondream model components used by Kestrel."""
+"""Moondream registration metadata and lazy public model exports."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
+from kestrel.models.registry import register_lazy
 
 from .config import (
     DEFAULT_MOONDREAM2_CONFIG,
@@ -12,52 +13,9 @@ from .config import (
     TokenizerConfig,
     VisionConfig,
 )
-from .model import MoondreamModel, MoondreamTextModel
-from .runtime import MoondreamRuntime, SequenceState, DEFAULT_MAX_TOKENS
-from .weights import load_moondream_weights, load_text_weights
 
-# Imported after ``.runtime``: the skill modules pull Moondream's token
-# types from it, so the runtime module must be fully initialized first.
-from .skills import build_skill_registry
-
-# Both MD2 and MD3 share the Starmie tokenizer; the checkpoint_format tag
-# is what the weight loader keys off to pick the right key-name layout.
-register(
-    ModelSpec(
-        name="moondream2",
-        repo_id="vikhyatk/moondream2",
-        filename="model.safetensors",
-        checkpoint_format="md2",
-        default_config=DEFAULT_MOONDREAM2_CONFIG,
-        tokenizer_id="moondream/starmie-v1",
-        runtime=MoondreamRuntime,
-        skills=build_skill_registry,
-    )
-)
-register(
-    ModelSpec(
-        name="moondream3-preview",
-        repo_id="moondream/moondream3-preview",
-        filename="model_fp8.pt",
-        checkpoint_format="md3",
-        default_config=DEFAULT_MOONDREAM3_CONFIG,
-        tokenizer_id="moondream/starmie-v1",
-        runtime=MoondreamRuntime,
-        skills=build_skill_registry,
-    )
-)
-register(
-    ModelSpec(
-        name="moondream3.1-9B-A2B",
-        repo_id="moondream/moondream3.1-9B-A2B",
-        filename="model.safetensors",
-        checkpoint_format="md3",
-        default_config=DEFAULT_MOONDREAM3_CONFIG,
-        tokenizer_id="moondream/starmie-v1",
-        runtime=MoondreamRuntime,
-        skills=build_skill_registry,
-    )
-)
+_MODEL_NAMES = ["moondream2", "moondream3-preview", "moondream3.1-9B-A2B"]
+register_lazy(_MODEL_NAMES, __name__ + ".registration")
 
 __all__ = [
     "DEFAULT_MOONDREAM2_CONFIG",
@@ -76,3 +34,19 @@ __all__ = [
     "load_moondream_weights",
     "load_text_weights",
 ]
+
+_LAZY_EXPORTS = {
+    "build_skill_registry": ".skills",
+    "MoondreamModel": ".model", "MoondreamTextModel": ".model",
+    "MoondreamRuntime": ".runtime", "SequenceState": ".runtime",
+    "DEFAULT_MAX_TOKENS": ".runtime",
+    "load_moondream_weights": ".weights", "load_text_weights": ".weights",
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_LAZY_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

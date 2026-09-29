@@ -251,11 +251,15 @@ class SkillFinalizeResult:
 
 
 class SkillState:
-    """Per-request controller that interprets decode steps for a skill."""
+    """Per-request controller that interprets decode steps for a skill.
+
+    After fully retired result materialization, ``request`` is None. Tokens
+    remain available for inspection; the controller must not resume execution.
+    """
 
     def __init__(self, spec: SkillSpec, request: "GenerationRequest") -> None:
         self.spec = spec
-        self.request = request
+        self.request: GenerationRequest | None = request
         self._tokens: List["Token"] = []
 
     # ------------------------------------------------------------------

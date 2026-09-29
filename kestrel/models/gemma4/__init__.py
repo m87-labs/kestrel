@@ -1,11 +1,8 @@
-"""Gemma 4 model support for the Kestrel inference engine."""
+"""Lightweight gemma4 registration; implementation imports are demand-driven."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
 
-from .prompt_template import Gemma4PromptTemplate
-from .runtime import Gemma4Runtime
-from .skills import build_skill_registry
-
+from kestrel.models.registry import register_lazy
 
 _VARIANTS = [
     "google/gemma-4-E2B-it",
@@ -18,18 +15,20 @@ _VARIANTS = [
     "google/gemma-4-26B-A4B",
 ]
 
-for _repo_id in _VARIANTS:
-    register(
-        ModelSpec(
-            name=_repo_id,
-            repo_id=_repo_id,
-            checkpoint_format="gemma4",
-            default_config={},
-            tokenizer_id=_repo_id,
-            runtime=Gemma4Runtime,
-            skills=build_skill_registry,
-        )
-    )
-
+register_lazy(_VARIANTS, __name__ + ".registration")
 
 __all__ = ["Gemma4PromptTemplate", "Gemma4Runtime"]
+
+
+def __getattr__(name):
+    if name == "Gemma4PromptTemplate":
+        module = ".prompt_template"
+    elif name == "Gemma4Runtime":
+        module = ".runtime"
+    elif name == "build_skill_registry":
+        module = ".skills"
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
