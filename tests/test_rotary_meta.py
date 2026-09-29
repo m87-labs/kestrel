@@ -55,3 +55,17 @@ def test_meta_rotary_matches_real_metadata(fn, partial):
 def test_meta_rotary_still_validates_dimensions(fn):
     with pytest.raises(ValueError):
         fn(127, 10000, device=torch.device("meta"))
+
+
+@pytest.mark.parametrize("fn", [default_inv_freq, proportional_inv_freq])
+@pytest.mark.parametrize("partial", [0.5, 1.0])
+def test_meta_rotary_preserves_default_dtype_promotion(fn, partial):
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        real = fn(128, 10000, partial_rotary_factor=partial)
+        meta = fn(128, 10000, partial_rotary_factor=partial,
+                  device=torch.device("meta"))
+        assert meta.shape == real.shape and meta.dtype == real.dtype
+    finally:
+        torch.set_default_dtype(previous)
