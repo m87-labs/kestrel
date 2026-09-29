@@ -26,6 +26,9 @@ def default_inv_freq(
     rotated_dim = int(head_dim * partial_rotary_factor)
     if rotated_dim <= 0 or rotated_dim % 2:
         raise ValueError(f"partial RoPE dimension must be positive and even: {rotated_dim}")
+    # Meta construction needs only shape/dtype, not compiler-backed decompositions.
+    if torch.empty(0, device=device).is_meta:
+        return torch.empty(rotated_dim // 2, dtype=torch.float32, device=device)
     exponents = torch.arange(
         0, rotated_dim, 2, dtype=torch.int64, device=device
     ).float() / rotated_dim
@@ -43,6 +46,8 @@ def proportional_inv_freq(
     """Rotate a proportional prefix while leaving remaining pairs unchanged."""
     _validate_schedule(head_dim, base, partial_rotary_factor, factor)
     rotated_pairs = int(partial_rotary_factor * head_dim // 2)
+    if torch.empty(0, device=device).is_meta:
+        return torch.empty(head_dim // 2, dtype=torch.float32, device=device)
     exponents = torch.arange(
         0, 2 * rotated_pairs, 2, dtype=torch.int64, device=device
     ).float() / head_dim
