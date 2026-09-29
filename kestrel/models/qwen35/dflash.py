@@ -13,6 +13,8 @@ from kestrel.ops.rotary import (
     MultidimensionalRotaryEmbedding, default_inv_freq,
 )
 from kestrel_kernels import get_runtime
+from kestrel_kernels.dynamic_conv import causal_dynamic_conv1d
+from kestrel_kernels.candidate_chain import greedy_candidate_chain
 
 
 @dataclass
@@ -65,10 +67,25 @@ class DFlashConfig:
     layer_types: tuple[str, ...]
     sliding_window: int | None
     causal_override: bool | None = None
+    conv_kernel_size: int = 0
+    conv_group_size: int = 0
+    selector_rank: int = 0
+    selector_top_k: int = 0
+    vocab_size: int = 0
 
     @classmethod
     def from_dict(cls, data):
         draft = data["dflash_config"]
+        architecture = data.get("architectures", ["DFlashDraftModel"])
+        if architecture not in (["DFlashDraftModel"], ["DFlash2DraftModel"]):
+            raise ValueError("unsupported DFlash draft architecture")
+        is_v2 = architecture == ["DFlash2DraftModel"]
+        extra = tuple(int(draft[name]) for name in (
+            "conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"
+        )) if is_v2 else (0, 0, 0, 0)
+        if is_v2 and (min(extra) <= 0 or int(data["hidden_size"]) % extra[1]
+                      or extra[3] > int(data["vocab_size"])):
+            raise ValueError("invalid DFlash 2 convolution or selector dimensions")
         layers = int(data["num_hidden_layers"])
         if layers <= 0:
             raise ValueError("DFlash requires positive layer count")
@@ -107,7 +124,8 @@ class DFlashConfig:
             float(rope.get("rope_theta", data.get("rope_theta", 10000000))),
             block_size,
             int(draft["mask_token_id"]), taps, kinds,
-            None if window is None else int(window), causal,
+            None if window is None else int(window), causal, *extra,
+            int(data.get("vocab_size", 0)),
         )
 
     def attention(self, layer):
@@ -155,7 +173,7 @@ class _Attention(nn.Module):
         output = dense_attention(
             q, k, v, scaling=self.head_dim ** -0.5, causal=self.causal,
             window_size_left=None if self.window is None else self.window - 1,
-            window_size_right=None if self.window is None or not self.causal else 0,
+            window_size_right=None if self.window is None else (0 if self.causal else self.window - 1),
         )
         return self.o_proj(output.reshape(batch, rows, -1))
 
@@ -182,7 +200,7 @@ class _Attention(nn.Module):
             q, torch.cat(keys, dim=2), torch.cat(values, dim=2),
             scaling=self.head_dim ** -0.5, causal=self.causal,
             window_size_left=None if self.window is None else self.window - 1,
-            window_size_right=None if self.window is None or not self.causal else 0,
+            window_size_right=None if self.window is None else (0 if self.causal else self.window - 1),
             cu_seqlens=cu_q, cu_seqlens_k=cu_k)
         return self.o_proj(output.reshape(1, hidden.shape[1], -1))
 
@@ -213,7 +231,7 @@ class _Attention(nn.Module):
             q, keys, values, seqused_k=used_keys,
             softmax_scale=self.head_dim ** -0.5, causal=self.causal,
             window_size_left=None if self.window is None else self.window - 1,
-            window_size_right=None if self.window is None or not self.causal else 0,
+            window_size_right=None if self.window is None else (0 if self.causal else self.window - 1),
             require_native=True, pack_gqa=False)
         return self.o_proj(output.reshape(batch, rows, -1))
 
@@ -229,6 +247,42 @@ class _MLP(nn.Module):
         return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
 
 
+class _DynamicConv(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.group_size = config.conv_group_size
+        self.kernel_size = config.conv_kernel_size
+        self.base_kernel = nn.Parameter(torch.empty(2, self.kernel_size, config.hidden_size))
+        self.kernel_projection = nn.Linear(
+            config.hidden_size, 2 * self.kernel_size * config.hidden_size // self.group_size,
+            bias=False)
+
+    def prepare(self, hidden):
+        dynamic = self.kernel_projection(hidden).reshape(
+            *hidden.shape[:-1], 2, self.kernel_size, hidden.shape[-1] // self.group_size)
+        return causal_dynamic_conv1d(hidden, dynamic[..., 0, :, :], self.base_kernel[0],
+                                     group_size=self.group_size), dynamic[..., 1, :, :]
+
+    def finish(self, hidden, dynamic):
+        return causal_dynamic_conv1d(hidden, dynamic, self.base_kernel[1], group_size=self.group_size)
+
+
+class _CandidateSelector(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.selector_top_k
+        self.predecessor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.hidden_projection = nn.Linear(config.hidden_size, config.selector_rank, bias=False)
+
+    def forward(self, hidden, logits, anchors):
+        unary, candidates = torch.topk(logits, self.top_k, dim=-1, sorted=False)
+        projected = self.hidden_projection(hidden)
+        return greedy_candidate_chain(projected, unary, candidates,
+                                      self.predecessor_codebook.weight,
+                                      self.successor_codebook.weight, anchors)
+
+
 class _Layer(nn.Module):
     def __init__(self, config, index):
         super().__init__()
@@ -236,11 +290,34 @@ class _Layer(nn.Module):
         self.mlp = _MLP(config)
         self.input_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = _Norm(config.hidden_size, config.rms_norm_eps)
+        self.attention_conv = _DynamicConv(config) if config.conv_kernel_size else None
+        self.mlp_conv = _DynamicConv(config) if config.conv_kernel_size else None
+
+    def run(self, hidden, attention, lengths=None):
+        # Packed sequences must not share convolution history at row boundaries.
+        lengths = lengths or (hidden.shape[1],)
+        normalized = self.input_layernorm(hidden)
+        kernels = None
+        if self.attention_conv is not None:
+            prepared = [self.attention_conv.prepare(part) for part in normalized.split(lengths, dim=1)]
+            normalized = torch.cat([part for part, _ in prepared], dim=1)
+            kernels = [kernel for _, kernel in prepared]
+        output = attention(normalized)
+        if kernels is not None:
+            output = torch.cat([self.attention_conv.finish(part, kernel) for part, kernel in
+                                zip(output.split(lengths, dim=1), kernels)], dim=1)
+        hidden = hidden + output
+        normalized = self.post_attention_layernorm(hidden)
+        if self.mlp_conv is None:
+            return hidden + self.mlp(normalized)
+        prepared = [self.mlp_conv.prepare(part) for part in normalized.split(lengths, dim=1)]
+        output = self.mlp(torch.cat([part for part, _ in prepared], dim=1))
+        return hidden + torch.cat([self.mlp_conv.finish(part, kernel) for part, (_, kernel) in
+                                   zip(output.split(lengths, dim=1), prepared)], dim=1)
 
     def forward(self, hidden, context, query_rotary, key_rotary, **cache_args):
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), context, query_rotary, key_rotary,
-                                        **cache_args)
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        return self.run(hidden, lambda value: self.self_attn(
+            value, context, query_rotary, key_rotary, **cache_args))
 
 
 class DFlashDraftModel(nn.Module):
@@ -253,6 +330,7 @@ class DFlashDraftModel(nn.Module):
         self.norm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.fc = nn.Linear(len(config.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = _Norm(config.hidden_size, config.rms_norm_eps)
+        self.candidate_selector = _CandidateSelector(config) if config.selector_rank else None
         self.rotary_emb = MultidimensionalRotaryEmbedding(
             config.head_dim, config.rope_theta, dimensions=1)
 
@@ -331,14 +409,21 @@ class DFlashDraftModel(nn.Module):
         cu_k = torch.tensor([0, *accumulate(key_lengths)], device=noise.device, dtype=torch.int32)
         hidden = noise
         for index, layer in enumerate(self.layers):
-            hidden = hidden + layer.self_attn.forward_packed(
-                layer.input_layernorm(hidden), contexts, query_rotary, key_rotary, context_caches,
-                index, query_lengths, cu_q, cu_k)
-            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = layer.run(hidden, lambda value: layer.self_attn.forward_packed(
+                value, contexts, query_rotary, key_rotary, context_caches,
+                index, query_lengths, cu_q, cu_k), query_lengths)
         result = self.norm(hidden).split(query_lengths, dim=1)
         for cache, length in zip(context_caches, context_lengths):
             cache.length += length
         return result
+
+    def select_tokens(self, hidden, lm_head, anchors):
+        rows = hidden[:, 1:]
+        logits = lm_head(rows.reshape(1, -1, rows.shape[-1])).reshape(
+            rows.shape[0], rows.shape[1], -1)
+        if self.candidate_selector is None:
+            return logits.argmax(-1).to(torch.int32)
+        return self.candidate_selector(rows, logits, anchors).to(torch.int32)
 
 
 def load_dflash_drafter(path: str | Path, *, device: torch.device) -> DFlashDraftModel:
@@ -349,6 +434,10 @@ def load_dflash_drafter(path: str | Path, *, device: torch.device) -> DFlashDraf
     with torch.device("meta"):
         model = DFlashDraftModel(config)
     state = load_file(path / "model.safetensors", device=str(device))
+    for name in ("predecessor_codebook", "successor_codebook"):
+        key = f"candidate_selector.{name}"
+        if key in state:
+            state[key + ".weight"] = state.pop(key)
     if any(value.dtype != torch.bfloat16 for value in state.values()):
         raise ValueError("DFlash draft checkpoint must contain BF16 weights")
     model.load_state_dict(state, strict=True, assign=True)

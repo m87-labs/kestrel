@@ -159,23 +159,21 @@ class DFlashDraftGraphSession:
         self.caches = caches
         self.lengths = tuple(cache.length for cache in caches)
 
-    def _forward(self, hidden, targets, positions, mapping, used):
+    def _forward(self, hidden, targets, positions, mapping, used, anchors):
         context = self.model.hidden_norm(self.model.fc(targets))
         cos, sin = self.model.rotary_emb(hidden, positions[..., None])
         query_rotary = (cos[:, -hidden.shape[1]:], sin[:, -hidden.shape[1]:])
         key_rotary = (cos, sin)
         for layer, workspace in zip(self.model.layers, self.workspaces):
-            hidden = hidden + layer.self_attn.forward_stable(
-                layer.input_layernorm(hidden), context, query_rotary, key_rotary, workspace, mapping, used)
-            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = layer.run(hidden, lambda value: layer.self_attn.forward_stable(
+                value, context, query_rotary, key_rotary, workspace, mapping, used))
         hidden = self.model.norm(hidden)
         if self.lm_head is None:
             return (hidden,)
-        rows = hidden[:, 1:].reshape(1, -1, hidden.shape[-1])
-        return (self.lm_head(rows).argmax(-1).reshape(hidden.shape[0], -1).to(torch.int32),)
+        return (self.model.select_tokens(hidden, self.lm_head, anchors),)
 
     @contextmanager
-    def launch(self, noise_embeddings, target_hiddens, position_ids):
+    def launch(self, noise_embeddings, target_hiddens, position_ids, anchors=None):
         if self.failed or self.closed or self.active:
             raise RuntimeError("draft graph session is failed or retired")
         count = len(self.caches)
@@ -187,6 +185,12 @@ class DFlashDraftGraphSession:
         config = self.model.config
         parameter = next(self.model.parameters())
         consumer_stream = torch.cuda.current_stream(parameter.device)
+        if anchors is None:
+            if self.lm_head is not None and self.model.candidate_selector is not None:
+                raise ValueError("DFlash2 requires anchor tokens")
+            anchors = torch.zeros(count, device=parameter.device, dtype=torch.long)
+        if anchors.shape != (count,) or anchors.device != parameter.device or anchors.dtype != torch.long:
+            raise ValueError("draft anchors must match cache owners and device")
         for noise, target, positions, cache, length in zip(
                 noise_embeddings, target_hiddens, position_ids, self.caches, lengths):
             if (noise.shape != (1, self.query_rows, config.hidden_size)
@@ -214,7 +218,7 @@ class DFlashDraftGraphSession:
             torch._foreach_copy_(target_dst, target_src)
             torch._foreach_copy_(position_dst, position_src)
             mapping, used = self.workspaces[0].append_inputs(self.lengths, lengths)
-            inputs = (torch.cat(noise_embeddings, dim=0), targets, positions, mapping, used)
+            inputs = (torch.cat(noise_embeddings, dim=0), targets, positions, mapping, used, anchors)
             for value in (*noise_embeddings, *target_hiddens, *position_ids):
                 value.record_stream(self.stream)
         # These staging tensors are allocated on the caller stream but copied

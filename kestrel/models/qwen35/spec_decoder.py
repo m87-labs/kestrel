@@ -41,6 +41,7 @@ class Qwen35DFlashDecoder:
                 or not config.target_layer_ids
                 or any(i < 0 or i >= target.num_hidden_layers for i in config.target_layer_ids)
                 or not 0 <= config.mask_token_id < target.vocab_size
+                or (config.selector_rank and config.vocab_size != target.vocab_size)
                 or config.block_size < 2):
             raise ValueError("DFlash checkpoint does not match target dimensions, taps, or vocabulary")
         self.num_speculative_tokens = config.block_size - 1
@@ -62,6 +63,11 @@ class Qwen35DFlashDecoder:
             from .generated_verification import Qwen35GeneratedVerification
 
             self._generated_verification = Qwen35GeneratedVerification(runtime, self.draft)
+            self._generated_verifiers = {1: self._generated_verification}
+            for sequences in range(2, runtime.max_batch_size + 1):
+                self._generated_verifiers[sequences] = Qwen35GeneratedVerification(
+                    runtime, self.draft, sequences=sequences,
+                    weights=self._generated_verification.weights)
         if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
             from .spec_target_graph import Qwen35TargetGraph
             from .spec_replay_graph import Qwen35ReplayGraph
@@ -240,6 +246,7 @@ class Qwen35DFlashDecoder:
     def _target(self, tokens, committed, slot, *, capture, leases=None):
         self._wait_for_commit()
         if capture and self._generated_verification is not None:
+            self._generated_verification = self._generated_verifiers[1]
             return self._generated_verification.target(tokens, committed, slot)
         cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
@@ -265,7 +272,7 @@ class Qwen35DFlashDecoder:
         return expected, features, cache
 
     @contextmanager
-    def _draft_tokens(self, noise, features, positions, caches):
+    def _draft_tokens(self, noise, features, positions, caches, anchors=None):
         eligible = (self._draft_graph_enabled
                     and all(cache.layers for cache in caches)
                     and all(value.shape[1] <= self.draft.config.block_size for value in features))
@@ -275,8 +282,7 @@ class Qwen35DFlashDecoder:
             else:
                 hidden = torch.cat(self.draft.forward_many(
                     noise, features, positions, context_caches=caches), dim=0)
-            rows = hidden[:, 1:].reshape(1, -1, hidden.shape[-1])
-            yield self.runtime.model.lm_head(rows).argmax(-1).reshape(len(caches), -1).to(torch.int32)
+            yield self.draft.select_tokens(hidden, self.runtime.model.lm_head, anchors)
             return
         from .draft_workspace import DFlashDraftGraphSession
         if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
@@ -289,8 +295,8 @@ class Qwen35DFlashDecoder:
         elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
               or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
             self._draft_graph.rebind(caches)
-        with self._draft_graph.launch(noise, features, positions) as hidden:
-            yield hidden
+        with self._draft_graph.launch(noise, features, positions, anchors) as tokens:
+            yield tokens
 
     def propose(self, ctx):
         config = self.draft.config
@@ -302,7 +308,7 @@ class Qwen35DFlashDecoder:
                                  device=self.runtime.device)[None]
         consumer_stream = torch.cuda.current_stream(self.runtime.device)
         with self._draft_tokens([self.text.embed_tokens(noise)], [ctx.features],
-                                [positions], [ctx.draft_cache]) as ids:
+                                [positions], [ctx.draft_cache], noise[:, 0]) as ids:
             producer_stream = torch.cuda.current_stream(self.runtime.device)
         if producer_stream != consumer_stream:
             ids.record_stream(consumer_stream)
@@ -320,11 +326,17 @@ class Qwen35DFlashDecoder:
                      for session in sessions]
         with self._draft_tokens(
                 self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
-                positions, [session.draft_cache for session in sessions]) as tokens:
+                positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
             ids = tokens.tolist()
         return [[session.bonus, *row] for session, row in zip(sessions, ids)]
 
     def _target_many(self, candidates, sessions, *, leases=None):
+        if self._generated_verification is not None:
+            self._wait_for_commit()
+            self._generated_verification = self._generated_verifiers[len(sessions)]
+            return self._generated_verification.target_many(candidates,
+                [session.cache for session in sessions],
+                [session.state.batch_idx for session in sessions])
         """Verify independent sequences together, retaining separate commit owners."""
         self._wait_for_commit()
         device = self.runtime.device
