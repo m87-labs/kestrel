@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from itertools import groupby
 from types import SimpleNamespace
 
 import pytest
@@ -140,5 +141,37 @@ def test_generated_verification_repeated_requests():
                 assert result.tokens
             finally:
                 await engine.shutdown()
+
+    asyncio.run(run())
+
+
+def test_generated_verification_long_reasoning_does_not_repeat_zeros():
+    target = os.environ.get("QWEN_VERIFICATION_TARGET")
+    draft = os.environ.get("QWEN_VERIFICATION_DRAFT")
+    if not target or not draft or not torch.cuda.is_available():
+        pytest.skip("Qwen target/draft weights and B200 required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("B200 required")
+
+    async def run():
+        engine = await InferenceEngine.create(RuntimeConfig(
+            model="Qwen/Qwen3.5-27B-FP8", model_path=target, tokenizer_path=target,
+            draft_model_path=draft, decode_path="generated", max_batch_size=1,
+            page_size=1, kv_cache_pages=32768, enable_prefix_cache=False))
+        try:
+            for _ in range(2):
+                result = await engine.chat(
+                    [{"role": "user", "content":
+                      "Explain how to derive the quadratic formula by completing the square. "
+                      "Work through several examples and discuss numerical stability when implementing it."}],
+                    reasoning=True, settings={"temperature": 0, "max_tokens": 16384})
+                assert result.output.get("finish_reason") == "stop"
+                ids = [token.token_id for token in result.tokens]
+                assert ids
+                longest_run = max(sum(1 for _ in values) for _, values in groupby(ids))
+                assert longest_run < 64, "long reasoning collapsed into repeated tokens"
+                assert not engine.runtime.spec.decoder._generated_verification.pending
+        finally:
+            await engine.shutdown()
 
     asyncio.run(run())
