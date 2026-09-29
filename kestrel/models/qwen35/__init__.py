@@ -21,6 +21,8 @@ _VARIANTS = [
     "Qwen/Qwen3.6-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B",
     "Qwen/Qwen3.6-35B-A3B-FP8",
+    "Qwen/Qwen3.8-27B",
+    "Qwen/Qwen3.8-27B-FP8",
 ]
 
 register_lazy(_VARIANTS, __name__ + ".registration")
