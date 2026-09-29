@@ -22,7 +22,9 @@ assert names == sorted(set(names))
 assert "Qwen/Qwen3.5-27B-FP8" in names
 assert "moondream3.1-9B-A2B" in names
 assert "nvidia/parakeet-tdt-0.6b-v3" in names
-for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper"):
+assert "hexgrad/Kokoro-82M" in names
+assert "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" in names
+for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts"):
     assert f"kestrel.models.{family}.runtime" not in sys.modules, family
 ''')
 
@@ -33,6 +35,8 @@ for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "wh
     ("moondream3.1-9B-A2B", "moondream", "MoondreamRuntime"),
     ("Qwen/Qwen3-ASR-0.6B", "qwen3_asr", "Qwen3AsrRuntime"),
     ("nvidia/parakeet-tdt-0.6b-v3", "parakeet_tdt", "ParakeetTdtRuntime"),
+    ("hexgrad/Kokoro-82M", "kokoro", "create_kokoro_runtime"),
+    ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "qwen3_tts", "Qwen3TTSRuntime"),
 ])
 def test_lookup_resolves_only_selected_runtime(name, family, runtime_name):
     _fresh(f'''
@@ -43,7 +47,7 @@ spec = get_spec({name!r})
 assert spec.runtime is getattr(import_module("kestrel.models." + {family!r}), {runtime_name!r})
 assert get_spec({name!r}) is spec
 assert known_models() == before
-for other in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper"):
+for other in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts"):
     if other != {family!r}:
         assert f"kestrel.models.{{other}}.runtime" not in sys.modules, other
 ''')
@@ -58,6 +62,43 @@ assert get_spec(spec.name) is spec
 assert "kestrel.models.qwen35.runtime" not in sys.modules
 get_spec("Qwen/Qwen3.5-9B")
 assert get_spec(spec.name) is spec
+''')
+
+
+def test_custom_speech_registration_survives_sibling_lookup():
+    _fresh('''
+from kestrel.models.registry import ModelSpec, register, get_spec
+name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+custom = ModelSpec(name=name, runtime=lambda: None)
+register(custom)
+assert get_spec(name) is custom
+assert "kestrel.models.qwen3_tts.runtime" not in sys.modules
+get_spec("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+assert get_spec(name) is custom
+''')
+
+
+def test_speech_exports_remain_available_on_demand():
+    _fresh('''
+from kestrel.models import kokoro, qwen3_tts, get_spec
+assert "kestrel.models.kokoro.weights" not in sys.modules
+assert kokoro.DEFAULT_KOKORO_MODEL == "hexgrad/Kokoro-82M"
+assert kokoro.KokoroRuntime.__name__ == "KokoroRuntime"
+spec = get_spec(kokoro.DEFAULT_KOKORO_MODEL)
+assert spec.runtime is kokoro.create_kokoro_runtime
+assert spec.repo_id == kokoro.DEFAULT_KOKORO_REPO_ID
+assert spec.revision == kokoro.DEFAULT_KOKORO_REVISION
+for name, revision in qwen3_tts.SUPPORTED_CHECKPOINTS.items():
+    spec = get_spec(name)
+    assert spec.runtime is qwen3_tts.Qwen3TTSRuntime
+    assert spec.repo_id == name and spec.revision == revision
+for module in (kokoro, qwen3_tts):
+    try:
+        module.not_an_export
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("unknown attribute accepted")
 ''')
 
 
