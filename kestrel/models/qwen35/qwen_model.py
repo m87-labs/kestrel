@@ -33,24 +33,6 @@ from .gdn_state import LinearAttentionState
 from kestrel_kernels import get_runtime
 from kestrel_kernels import moe as _MOE_API
 
-_kestrel_runtime = get_runtime()
-_kestrel_causal_conv1d_packed = _kestrel_runtime.gated_delta.causal_conv1d_packed
-_kestrel_allocate_packed_gdn_prefill_workspace = (
-    _kestrel_runtime.gated_delta.allocate_packed_gated_delta_prefill_workspace
-)
-_kestrel_packed_gated_delta_rule_prefill = (
-    _kestrel_runtime.gated_delta.packed_gated_delta_rule_prefill
-)
-_kestrel_gated_rmsnorm = _kestrel_runtime.gated_delta.gated_rmsnorm
-_kestrel_rmsnorm = _kestrel_runtime.dense.rmsnorm
-_kestrel_supports_packed_gdn = _kestrel_runtime.gated_delta.supports_packed_gdn
-_kestrel_add_rmsnorm = _kestrel_runtime.dense.add_rmsnorm
-_kestrel_gated_activation_into = _kestrel_runtime.dense.gated_activation_into
-_kestrel_fused_mlp_gelu_bias_residual = _kestrel_runtime.dense.fused_mlp_gelu_bias_residual
-_kestrel_text_mrope_apply = _kestrel_runtime.rotary.text_mrope_apply
-_kestrel_spatial_rope_apply = _kestrel_runtime.rotary.spatial_rope_apply
-_kestrel_moe_runtime = _kestrel_runtime.moe
-_kestrel_moe_topk_fwd = _kestrel_moe_runtime.topk_fwd
 _KESTREL_MOE_DECODE_MAX_TOKENS = 16
 _KESTREL_MOE_GATE_UP_LAYOUT = "interleaved_i8"
 _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT = "block128_interleaved8"
@@ -164,10 +146,11 @@ class _RecurrentPrefixRecord:
                     cu: torch.Tensor, topology: object) -> None:
         module = self.module
         qkv, a, b = (value[:, :length].contiguous() for value in (self.qkv, self.a, self.b))
+        gated_delta = get_runtime(qkv.device).gated_delta
         workspace = module._prefill_workspace_cache.get(
             qkv, a, head_dim=module.head_k_dim,
-            allocate=module.allocate_packed_gdn_prefill_workspace)
-        module.packed_gated_delta_rule_prefill(
+            allocate=gated_delta.allocate_packed_gated_delta_prefill_workspace)
+        gated_delta.packed_gated_delta_rule_prefill(
             qkv, a, b, module.A_log, module.dt_bias, cu,
             workspace=workspace, initial_state=self.initial_state,
             output_final_state=True, sequence_lengths=(length,), topology_token=topology,
@@ -401,10 +384,8 @@ class Qwen3_5RMSNormGated(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
         self.variance_epsilon = eps
-        self.gated_rmsnorm = _kestrel_gated_rmsnorm
-
     def forward(self, hidden_states, gate=None):
-        return self.gated_rmsnorm(
+        return get_runtime(hidden_states.device).gated_delta.gated_rmsnorm(
             hidden_states,
             gate,
             self.weight,
@@ -466,14 +447,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.out_proj = _text_linear(config, self.value_dim, self.hidden_size)
 
-        self.causal_conv1d_packed = _kestrel_causal_conv1d_packed
-        self.allocate_packed_gdn_prefill_workspace = (
-            _kestrel_allocate_packed_gdn_prefill_workspace
-        )
-        self.packed_gated_delta_rule_prefill = (
-            _kestrel_packed_gated_delta_rule_prefill
-        )
-        self.supports_packed_gdn = _kestrel_supports_packed_gdn
         self._prefill_workspace_cache = _PackedGatedDeltaPrefillWorkspaceCache()
 
         self.in_proj = _text_linear(
@@ -511,8 +484,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     or self.layer_idx in cache_params._prefix_records):
                 raise RuntimeError("prefix capture permits only one verification forward")
         cu_seqlens_q = cu_seq_lens_q
+        gated_delta = get_runtime(hidden_states.device).gated_delta
         supports_packed_gdn = (
-            self.supports_packed_gdn(
+            gated_delta.supports_packed_gdn(
                 hidden_states.device,
                 hidden_states.dtype,
                 self.num_k_heads,
@@ -634,7 +608,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # 0.0358 ms vs 0.0250 at T=384 and 0.0515 vs 0.0333 at T=768
         # on H100; keeping the separate kernels.
         conv_input = mixed_qkv
-        mixed_qkv = self.causal_conv1d_packed(
+        mixed_qkv = gated_delta.causal_conv1d_packed(
             x=mixed_qkv,
             weight=self.conv1d.weight.squeeze(1),
             seq_idx=seq_idx,
@@ -652,14 +626,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             mixed_qkv,
             a,
             head_dim=self.head_k_dim,
-            allocate=self.allocate_packed_gdn_prefill_workspace,
+            allocate=gated_delta.allocate_packed_gated_delta_prefill_workspace,
         )
         prefix_context = None
         if capture_prefix and all(length == 16 for length in sequence_lengths):
-            prefix_context = get_runtime().gated_delta.allocate_packed_gated_delta_prefix_context(
+            prefix_context = gated_delta.allocate_packed_gated_delta_prefix_context(
                 workspace, initial_state, recurrence_cu_seqlens,
                 sequence_lengths=sequence_lengths, topology_token=topology_token)
-        core_attn_out, _ = self.packed_gated_delta_rule_prefill(
+        core_attn_out, _ = gated_delta.packed_gated_delta_rule_prefill(
             mixed_qkv,
             a,
             b,
@@ -740,16 +714,17 @@ class Qwen3_5Attention(nn.Module):
             dim=-1,
         )
 
-        query_states = _kestrel_rmsnorm(
+        runtime = get_runtime(hidden_states.device)
+        query_states = runtime.dense.rmsnorm(
             query_states.reshape(hidden_shape), self.q_norm.weight, self.q_norm.eps
         ).transpose(1, 2)
-        key_states = _kestrel_rmsnorm(
+        key_states = runtime.dense.rmsnorm(
             key_states.reshape(hidden_shape), self.k_norm.weight, self.k_norm.eps
         ).transpose(1, 2)
         value_states = value_states.reshape(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = _kestrel_text_mrope_apply(
+        query_states, key_states = runtime.rotary.text_mrope_apply(
             query_states, key_states, cos, sin
         )
 
@@ -782,15 +757,27 @@ class Qwen3_5Attention(nn.Module):
                 raise RuntimeError(
                     "Qwen paged attention requires page_table and seqused_k"
                 )
-            attn_output = paged_attention(
-                query_states,
-                paged_kv_layer=paged_kv_layer,
-                page_table=page_table,
-                paged_kv_seqlens_q=paged_kv_seqlens_q,
-                paged_kv_seqlens_k=paged_kv_seqlens_k,
-                cu_seqlens_q=cu_seq_lens_q,
-                scaling=self.scaling,
-            )
+            # Empty-cache prefill can read contiguous K/V; the cache write above
+            # still establishes the page-1 layout required by generated decode.
+            if past_key_values.get_seq_length() == 0 and cu_seq_lens_q is not None:
+                attn_output = dense_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling=self.scaling,
+                    causal=True,
+                    cu_seqlens=cu_seq_lens_q,
+                )
+            else:
+                attn_output = paged_attention(
+                    query_states,
+                    paged_kv_layer=paged_kv_layer,
+                    page_table=page_table,
+                    paged_kv_seqlens_q=paged_kv_seqlens_q,
+                    paged_kv_seqlens_k=paged_kv_seqlens_k,
+                    cu_seqlens_q=cu_seq_lens_q,
+                    scaling=self.scaling,
+                )
             attn_weights = None
 
         attn_output = attn_output * torch.sigmoid(gate)
@@ -825,7 +812,7 @@ class Qwen3_5MLP(nn.Module):
             return self.down_proj(self.gate_up_proj(x, gated_activation="silu"))
         gate_up = self.gate_up_proj(x)
         hidden = gate_up.new_empty(*gate_up.shape[:-1], self.intermediate_size)
-        _kestrel_gated_activation_into(
+        get_runtime(gate_up.device).dense.gated_activation_into(
             hidden,
             gate_up,
             activation="silu",
@@ -929,7 +916,8 @@ class Qwen3_5Experts(nn.Module):
             dtype=hidden_states.dtype,
             backend="auto",
         )
-        handle = _kestrel_moe_runtime.prepare(
+        moe_runtime = get_runtime(hidden_states.device).moe
+        handle = moe_runtime.prepare(
             spec,
             _MOE_API.MoeCapacity(
                 max_tokens=tokens,
@@ -954,7 +942,7 @@ class Qwen3_5Experts(nn.Module):
             down=self.down_proj,
             **pack_kwargs,
         )
-        return _kestrel_moe_runtime.forward(
+        return moe_runtime.forward(
             handle,
             x=hidden_states,
             topk_ids=top_k_index,
@@ -976,7 +964,7 @@ class Qwen3_5TopKRouter(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)
-        return _kestrel_moe_topk_fwd(
+        return get_runtime(router_logits.device).moe.topk_fwd(
             router_logits,
             self.top_k,
             softmax=True,
@@ -1029,7 +1017,9 @@ def qwen_add_rms_norm(
         and weight.dtype == torch.float32
         and abs(float(eps) - 1.0e-6) < 1.0e-12
     ):
-        return residual, _kestrel_add_rmsnorm(residual, x, weight, eps)
+        return residual, get_runtime(residual.device).dense.add_rmsnorm(
+            residual, x, weight, eps
+        )
     # Tried MPS _kestrel_add_rmsnorm: standalone [1, 2048] add-RMSNorm was
     # 1.65x faster, but Qwen 64-token median fell to 16.8 tok/s vs 17.4 with
     # in-place add + PyTorch RMSNorm; keep the end-to-end winner.
@@ -1182,7 +1172,7 @@ class Qwen3_5VisionMLP(nn.Module):
                 hidden = torch.empty(
                     (m, self.intermediate_size), device=x.device, dtype=x.dtype
                 )
-            _kestrel_fused_mlp_gelu_bias_residual(
+            get_runtime(x.device).dense.fused_mlp_gelu_bias_residual(
                 out,
                 hidden,
                 x,
@@ -1250,7 +1240,9 @@ class Qwen3_5VisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = _kestrel_spatial_rope_apply(
+        query_states, key_states = get_runtime(
+            query_states.device
+        ).rotary.spatial_rope_apply(
             query_states, key_states, cos, sin, axis_blocks=1
         )
 
@@ -1459,7 +1451,9 @@ class Qwen3_5TextModel(nn.Module):
 
         if decoder_layers:
             state = decoder_layers[0].input_layernorm
-            normalized_hidden_states = _kestrel_rmsnorm(
+            normalized_hidden_states = get_runtime(
+                hidden_states.device
+            ).dense.rmsnorm(
                 hidden_states, state.weight, state.eps)
 
         for i, decoder_layer in enumerate(decoder_layers):
@@ -1498,7 +1492,7 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = (
             normalized_hidden_states
             if decoder_layers
-            else _kestrel_rmsnorm(
+            else get_runtime(hidden_states.device).dense.rmsnorm(
                 hidden_states, self.norm.weight, self.norm.eps)
         )
 

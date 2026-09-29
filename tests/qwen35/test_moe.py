@@ -48,7 +48,11 @@ def test_bf16_experts_use_device_selected_moe_backend(monkeypatch) -> None:
             calls.update(handle=handle, forward=kwargs)
             return kwargs["x"] + 1
 
-    monkeypatch.setattr(model_module, "_kestrel_moe_runtime", FakeMoeRuntime())
+    monkeypatch.setattr(
+        model_module,
+        "get_runtime",
+        lambda _device: SimpleNamespace(moe=FakeMoeRuntime()),
+    )
     experts = Qwen3_5Experts(_moe_config()).to(dtype=torch.bfloat16)
     hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
     indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)

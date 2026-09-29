@@ -42,6 +42,10 @@ def _program(
         capacity=capacity,
         static_extent_bindings=static,
         runtime_extent_minimums=runtime_minimums,
+        runtime_extent_maximums={},
+        identity=repr((capacity, static, runtime_minimums, name, num_ctas)),
+        descriptor={"program": name or f"b{capacity}",
+                    "device_program": {"shape_env": {"active_batch": capacity}}},
         name=name,
         num_ctas=num_ctas,
     )
@@ -59,6 +63,17 @@ def _generated_with_programs(*programs):
     return generated
 
 
+def _load_time_weight_runtime(monkeypatch):
+    from kestrel_kernels import generated_decode
+
+    for capability in (
+        "allocate_weight_storage_for_loading",
+        "finalize_weight_storage_after_loading",
+    ):
+        monkeypatch.setattr(generated_decode, capability, Mock(), raising=False)
+    return generated_decode
+
+
 def test_try_create_binds_physical_sm_count_to_program_resolution():
     runtime = SimpleNamespace(
         device=torch.device("cuda", 0),
@@ -70,6 +85,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         weight_root=Mock(),
         weight_layer_prefix="model.layers",
         weight_sources=weight_sources,
+        program_names=frozenset({"selected_b1"}),
     )
     properties = SimpleNamespace(major=10, minor=0, multi_processor_count=148)
 
@@ -88,6 +104,7 @@ def test_try_create_binds_physical_sm_count_to_program_resolution():
         arch="sm100",
         device_sms=148,
         weight_sources=weight_sources,
+        program_names=frozenset({"selected_b1"}),
     )
 
 
@@ -134,7 +151,9 @@ def test_program_selection_partitions_dynamic_runtime_intervals():
 
 
 def test_program_selection_reselects_by_live_runtime_extent():
-    u2 = _program(8, minimum_batch=5, name="u2")
+    # The shared selector rejects equal-priority overlapping artifacts. Use a
+    # wider fallback so the smaller eligible specialization has clear priority.
+    u2 = _program(16, minimum_batch=5, name="u2")
     u4 = _program(
         8,
         minimum_batch=5,
@@ -254,8 +273,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
     monkeypatch: pytest.MonkeyPatch,
     missing_capability: str,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     runtime = SimpleNamespace(
         device=torch.device("cuda", 0),
         dtype=torch.bfloat16,
@@ -269,7 +287,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
         "resolve_compatible_programs",
         lambda *_args, **_kwargs: (program,),
     )
-    monkeypatch.delattr(generated_runtime, missing_capability)
+    monkeypatch.delattr(generated_runtime, missing_capability, raising=False)
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda _device: properties
     )
@@ -291,8 +309,7 @@ def test_load_time_weight_preparation_fails_soft_only_when_optional(
 def test_binding_reservation_allocates_every_program_slot_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     programs = tuple(
         SimpleNamespace(descriptor={"owned_bytes": owned_bytes})
         for owned_bytes in (10, 20)
@@ -359,8 +376,7 @@ def test_binding_reservation_allocates_every_program_slot_pair(
 def test_binding_reservation_fails_soft_only_when_optional(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kestrel_kernels import generated_decode as generated_runtime
-
+    generated_runtime = _load_time_weight_runtime(monkeypatch)
     monkeypatch.delattr(
         generated_runtime,
         "reserve_binding_storage",

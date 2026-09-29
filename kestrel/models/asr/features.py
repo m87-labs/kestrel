@@ -31,7 +31,16 @@ def _mel_to_hz(mel: np.ndarray) -> np.ndarray:
 
 
 @lru_cache(maxsize=8)
-def mel_filters(n_fft: int, n_mels: int, sample_rate: int) -> Tensor:
+def mel_filters(
+    n_fft: int, n_mels: int, sample_rate: int, device: torch.device | None = None
+) -> Tensor:
+    """The filterbank, cached per device.
+
+    Callers that want it beside their audio pass ``device``: moving it there
+    per call is a pageable copy, and Torch ends such a copy with a stream
+    synchronize.
+    """
+
     bins = n_fft // 2 + 1
     edges = _mel_to_hz(
         np.linspace(_hz_to_mel(0.0), _hz_to_mel(sample_rate / 2), n_mels + 2)
@@ -43,7 +52,7 @@ def mel_filters(n_fft: int, n_mels: int, sample_rate: int) -> Tensor:
         0, np.minimum(-slopes[:, :-2] / delta[:-1], slopes[:, 2:] / delta[1:])
     )
     filters *= 2 / (edges[2:] - edges[:-2])[None]
-    return torch.from_numpy(filters.astype(np.float32).T.copy())
+    return torch.from_numpy(filters.astype(np.float32).T.copy()).to(device)
 
 
 __all__ = ["mel_filters"]

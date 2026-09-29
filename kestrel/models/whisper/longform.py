@@ -1130,10 +1130,7 @@ async def _close_candidate_streams(values: Sequence[object]) -> None:
         if callable(close):
             await close()
             return
-        # EngineStream does not currently expose scheduler cancellation. Do
-        # not return ownership while its request is still consuming the GPU;
-        # settle it instead. A future engine cancellation hook can replace
-        # this fallback without changing the orchestrator contract.
+        # Custom stream implementations may expose only terminal settlement.
         result = getattr(value, "result", None)
         if callable(result):
             await result()

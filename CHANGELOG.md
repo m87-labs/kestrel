@@ -4,6 +4,34 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.8.2 — 2026-09-24
+
+- Speech: the Parakeet checkpoints we publish now track their repository instead of a
+  pinned commit, so a published release keeps resolving them.
+- Added Qwen3-TTS CustomVoice 0.6B/1.7B text-to-speech and Kokoro-82M
+  phoneme-to-speech through the model-bound `synthesize` interface.
+- Updated to `kestrel-kernels` 0.7.3, which resolves platform-specific kernel
+  companions without listing them as direct Kestrel dependencies.
+- Improved uncached packed Qwen prefill by using contiguous attention inputs
+  while retaining paged attention when requests have prior KV history.
+
+## 0.8.1 — 2026-09-22
+
+- Added `moondream/parakeet-ultra`, a full-precision Parakeet model with its own voice activity detector.
+- Increased Parakeet transcription throughput on CUDA by overlapping batches and batching audio preprocessing and GPU decoding.
+- Updated to `kestrel-kernels` 0.7.1, keeping CPU-selected inference on CPU and avoiding GPU allocation during import.
+- Resolved compiler-declared runtime resources when fusion changes generated
+  output argument names.
+- Added the model-bound `synthesize` capability and append-only streaming
+  payloads for generated media such as PCM audio, including lossless compound
+  capability streams, immediate publication of completed output, explicit
+  cancellation, payload-only media updates, shared speech-onset trimming, and
+  deadline-aware decode that prioritizes due streaming output.
+
+## 0.8.0 — 2026-09-21
+
+- Added fast, memory-efficient transcription with `moondream/parakeet-redux` on CPUs, Apple silicon and CUDA, including pause-aware processing for long audio.
+
 ## 0.7.2 — 2026-09-13
 
 - Updated to `kestrel-kernels` 0.6.2 and matching CUDA bundle companions.

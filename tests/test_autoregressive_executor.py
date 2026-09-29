@@ -11,7 +11,6 @@ covered by tests/scheduler/.
 from __future__ import annotations
 
 import asyncio
-import threading
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -19,7 +18,6 @@ import pytest
 
 from kestrel.engine import (
     AutoregressiveExecutor,
-    Completion,
     EngineResult,
     EngineMetrics,
     _AutoregressiveRequest,
@@ -65,10 +63,11 @@ def _executor() -> AutoregressiveExecutor:
     ex._admission_capacity = 4
     ex._to_engine_result = _fake_to_engine_result
     ex._active = {}
-    ex._admission_failures = []
+    ex._admission_completions = []
     ex._scheduler = SimpleNamespace(
         _completed=[],
         waiting=[],
+        _drain_pipeline=lambda: None,
         has_pending_work=lambda: bool(ex._scheduler._completed),
         advance=lambda: False,
         pop_completed=lambda: [
@@ -79,6 +78,7 @@ def _executor() -> AutoregressiveExecutor:
     ex._admission = SimpleNamespace(
         has_pending=lambda: False,
         pending_count=0,
+        pop_cancelled=lambda: [],
         take_ready=lambda: None,
         fail_all=lambda exc: None,
     )
@@ -233,6 +233,20 @@ def test_admission_failure_surfaces_as_completion() -> None:
     assert ex.has_work is False
 
 
+def test_pause_drain_settles_cancelled_admission() -> None:
+    ex = _executor()
+    request = _pending(5)
+    request.cancel_event.set()
+    ex._admission.pop_cancelled = lambda: [request]
+
+    (completion,) = ex.drain()
+
+    assert completion.request is request
+    assert completion.result is not None
+    assert completion.result.finish_reason == "cancelled"
+    assert ex._admission_completions == []
+
+
 @pytest.mark.parametrize(
     ("configure", "message"),
     [
@@ -272,7 +286,7 @@ def test_unsupported_custom_greedy_request_fails_before_admission(
 def test_advance_raising_preserves_queued_admission_failures() -> None:
     """Regression: a buffered admission failure must survive advance() raising.
 
-    advance() must not move _admission_failures into a local that's lost
+    advance() must not move admission completions into a local that's lost
     if scheduler.advance() raises mid-tick. The kernel responds to the
     exception by calling shutdown(exc); that must still see the buffered
     failure and return it, or the failed-admission caller hangs.
@@ -305,7 +319,7 @@ def test_shutdown_returns_requests_failed_during_fail_all() -> None:
 
     The real admission coordinator's fail_all() synchronously routes
     in-flight preprocessing requests through _fail_via_admission, which
-    appends to _admission_failures. shutdown() must collect that list
+    appends to the admission completion buffer. shutdown() must collect that list
     *after* fail_all() runs, or those requests' completions are dropped
     and their callers hang forever.
     """
@@ -319,7 +333,7 @@ def test_shutdown_returns_requests_failed_during_fail_all() -> None:
 
     assert [c.request for c in completions] == [stuck]
     assert isinstance(completions[0].error, RuntimeError)
-    assert ex._admission_failures == []
+    assert ex._admission_completions == []
 
 
 def test_shutdown_retires_spec_rows_through_the_decoder() -> None:

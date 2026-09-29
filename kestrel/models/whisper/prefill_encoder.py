@@ -22,12 +22,6 @@ from .weights import (
     WhisperModelWeights,
 )
 
-_KERNELS = get_runtime()
-_ATTENTION = _KERNELS.attention
-_DENSE = _KERNELS.dense
-_LINEAR = _KERNELS.linear
-_VISION = _KERNELS.vision
-
 ENCODER_LAYERS = 32
 DECODER_LAYERS = 4
 ATTENTION_HEADS = 20
@@ -371,21 +365,22 @@ def _run_encoder_layer(
 ) -> torch.Tensor:
     batch = workspace.batch_size
     rows = batch * ENCODER_FRAMES
-    _DENSE.layernorm_bias_into(
+    runtime = get_runtime(hidden_states.device)
+    runtime.dense.layernorm_bias_into(
         workspace.normalized,
         hidden_states,
         layer.self_attention_layer_norm.weight,
         layer.self_attention_layer_norm.bias,
         LAYER_NORM_EPS,
     )
-    _LINEAR.linear(
+    runtime.linear.linear(
         workspace.normalized,
         layer.qkv_weight,
         layer.qkv_bias,
         out=workspace.qkv,
     )
     qkv = workspace.qkv.view(batch, ENCODER_FRAMES, 3, ATTENTION_HEADS, HEAD_DIM)
-    attention, _ = _ATTENTION.flash_attn_fwd(
+    attention, _ = runtime.attention.flash_attn_fwd(
         qkv[:, :, 0],
         qkv[:, :, 1],
         qkv[:, :, 2],
@@ -398,14 +393,14 @@ def _run_encoder_layer(
     if attention.data_ptr() != workspace.attention.data_ptr():
         raise RuntimeError("Whisper attention did not honor its stable output buffer")
     assert layer.attention_output.bias is not None
-    _VISION.fused_linear_bias_residual_into(
+    runtime.vision.fused_linear_bias_residual_into(
         x=workspace.attention.view(batch, ENCODER_FRAMES, HIDDEN_SIZE),
         w=layer.attention_output.weight,
         b=layer.attention_output.bias,
         residual=hidden_states,
         out=workspace.post_attention,
     )
-    _DENSE.layernorm_bias_into(
+    runtime.dense.layernorm_bias_into(
         workspace.normalized,
         workspace.post_attention,
         layer.final_layer_norm.weight,
@@ -413,7 +408,7 @@ def _run_encoder_layer(
         LAYER_NORM_EPS,
     )
     assert layer.fc1.bias is not None and layer.fc2.bias is not None
-    _DENSE.fused_mlp_gelu_bias_residual(
+    runtime.dense.fused_mlp_gelu_bias_residual(
         workspace.hidden.view(rows, HIDDEN_SIZE),
         workspace.mlp_hidden,
         workspace.normalized.view(rows, HIDDEN_SIZE),
@@ -460,7 +455,7 @@ def whisper_encoder(
             workspace,
             require_packed=require_packed,
         )
-    _DENSE.layernorm_bias_into(
+    get_runtime(hidden_states.device).dense.layernorm_bias_into(
         workspace.encoder_output,
         hidden_states,
         weights.final_layer_norm.weight,
@@ -512,20 +507,21 @@ def whisper_cross_kv(
         )
     rows = workspace.batch_size * ENCODER_FRAMES
     encoder_rows = encoder_hidden_states.view(rows, HIDDEN_SIZE)
+    linear = get_runtime(encoder_hidden_states.device).linear.linear
     # Tried fusing K|V per layer (4 GEMMs + 8 copies) and across all layers
     # (1 GEMM + 2 transpose-copies): with the same global scatter they took
     # 1.16-1.40x and 1.13-1.42x the latency of these 8 direct GEMMs at
     # B1/B4/B8 on H100/B200. Keeping direct projections, which also avoid
     # additional 2D/8D scratch arenas.
     for index, projection in enumerate(weights.cross_projections):
-        _LINEAR.linear(
+        linear(
             encoder_rows,
             projection.key.weight,
             None,
             out=workspace.compact_cross_keys[index].view(rows, HIDDEN_SIZE),
         )
         assert projection.value.bias is not None
-        _LINEAR.linear(
+        linear(
             encoder_rows,
             projection.value.weight,
             projection.value.bias,

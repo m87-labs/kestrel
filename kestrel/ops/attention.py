@@ -44,7 +44,7 @@ def dense_attention(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens if cu_seqlens_k is None else cu_seqlens_k,
         )
-    out, _ = get_runtime().attention.flash_attn_fwd(q, k, v, **arguments)
+    out, _ = get_runtime(q.device).attention.flash_attn_fwd(q, k, v, **arguments)
     if cu_seqlens is not None:
         out = out.reshape(query.shape[0], query.shape[2], *out.shape[-2:])
     return out
@@ -70,7 +70,7 @@ def paged_attention(
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(f"paged attention requires fp16/bf16 query, got {q.dtype}")
 
-    out, _ = get_runtime().attention.flash_attn_fwd(
+    out, _ = get_runtime(q.device).attention.flash_attn_fwd(
         q,
         paged_kv_layer.k_cache.permute(0, 2, 1, 3),
         paged_kv_layer.v_cache.permute(0, 2, 1, 3),

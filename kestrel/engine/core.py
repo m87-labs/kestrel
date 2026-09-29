@@ -102,6 +102,18 @@ _ALLOWED_API_BASE_URLS = (
 _SINGLE_PASS_POLL_INTERVAL_S = 0.001
 
 
+def _settle_futures(settled: Sequence[Tuple[Any, "EngineResult"]]) -> None:
+    """Resolve a whole batch's futures in one event-loop callback.
+
+    Runs on the event loop, so a future that was cancelled between the
+    scheduler reading it and this callback is skipped rather than raising.
+    """
+
+    for future, result in settled:
+        if not future.done():
+            future.set_result(result)
+
+
 class InferenceEngine:
     """Orchestrates batched inference over a shared runtime and scheduler."""
 
@@ -356,7 +368,9 @@ class InferenceEngine:
                 else None
             )
             if max_lora_rank is not None:
-                if not get_runtime().moe.supports_lora(self._runtime_cfg.device):
+                if not get_runtime(
+                    self._runtime_cfg.resolved_device()
+                ).moe.supports_lora(self._runtime_cfg.device):
                     _LOGGER.warning(
                         "MoE LoRA adapters are unavailable in this kernel runtime. "
                         "Disabling LoRA — base model inference will still work, but "
@@ -433,10 +447,13 @@ class InferenceEngine:
         from kestrel.models import get_spec
 
         spec = get_spec(model_id)
-        kwargs: dict[str, Any] = {
-            "compute_stream": self._compute_stream,
-            "kv_pool": self._shared_kv_pool(),
-        }
+        kwargs: dict[str, Any] = {"compute_stream": self._compute_stream}
+        # A runtime that stores no KV cache (single-pass ASR encoders, for
+        # instance) opts out with ``needs_kv_pool = False``: the engine then
+        # holds no pool at all rather than budgeting paged attention storage
+        # on a device whose only model never pages anything.
+        if getattr(spec.runtime, "needs_kv_pool", True):
+            kwargs["kv_pool"] = self._shared_kv_pool()
         if model_id == self._default_model:
             return spec.runtime(
                 self._runtime_cfg,
@@ -576,6 +593,7 @@ class InferenceEngine:
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineResult:
+        cancel_event = threading.Event()
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
@@ -597,12 +615,22 @@ class InferenceEngine:
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=None,
             skill=skill,
+            cancel_event=cancel_event,
         )
         # Ingress owns the request payload; the remainder of this frame only
         # needs the result future, which may stay pending for a full decode.
         del request_context, image, encoder_input
         del generated_prefix, suppress_next_token_ids
-        return await future
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            self._scheduler_event.set()
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
 
     @overload
     async def query(
@@ -788,6 +816,7 @@ class InferenceEngine:
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
+        cancel_event = threading.Event()
         generated_prefix = self._normalize_generated_prefix(
             _generated_prefix,
             "_generated_prefix",
@@ -809,8 +838,20 @@ class InferenceEngine:
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=queue,
             skill=skill,
+            cancel_event=cancel_event,
         )
-        return EngineStream(request_id=request_id, queue=queue, result_future=future)
+        wake_event = self._scheduler_event
+
+        def cancel() -> None:
+            cancel_event.set()
+            wake_event.set()
+
+        return EngineStream(
+            request_id=request_id,
+            queue=queue,
+            result_future=future,
+            cancel=cancel,
+        )
 
     # ------------------------------------------------------------------
     # Control APIs
@@ -870,12 +911,14 @@ class InferenceEngine:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[EngineResult] = loop.create_future()
+        cancel_event = threading.Event()
         req = _SinglePassRequest(
             request_id=next(self._request_ids),
             future=future,
             task=task,
             inputs=inputs,
             submitted_at=time.perf_counter(),
+            cancel_event=cancel_event,
         )
         self._raise_if_scheduler_failed()
         self._single_pass_queue.put((model, req))
@@ -883,7 +926,16 @@ class InferenceEngine:
         if self._scheduler_error is not None:
             self._fail_all_pending(self._scheduler_failed_error())
         del inputs, req
-        return await future
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            self._scheduler_event.set()
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
 
     async def stream(
         self,
@@ -1050,6 +1102,7 @@ class InferenceEngine:
         suppress_next_token_ids: Optional[tuple[int, ...]],
         stream_queue: Optional[_StreamQueue],
         skill: str,
+        cancel_event: threading.Event | None = None,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -1058,6 +1111,7 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         req_id = next(self._request_ids)
         future: asyncio.Future[EngineResult] = loop.create_future()
+        cancel_event = cancel_event or threading.Event()
 
         skill_spec = self._skill_registry().resolve(skill)
         adapter_id = self._normalize_adapter_id(adapter)
@@ -1128,6 +1182,7 @@ class InferenceEngine:
             return_logprobs=return_logprobs,
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
+            cancel_event=cancel_event,
         )
         del prepared_prompt
         await self._queue.put(payload)
@@ -1570,6 +1625,15 @@ class InferenceEngine:
         def deliver(completions: tuple[Completion, ...]) -> None:
             loop = self._loop
             assert loop is not None
+            # One hand-off for the whole batch. Every ``call_soon_threadsafe``
+            # writes the loop's self-pipe and that write releases the GIL, so
+            # delivering a cohort a call at a time let the loop wake partway
+            # through and run the caller's continuations -- and a caller that
+            # resubmits on completion then submitted in fragments, which the
+            # scheduler dutifully batched: an AMI pass with 128 requests in
+            # flight throughout ran cohorts of 23 and 105, 27 and 101, 18 and
+            # 110, at roughly double the forwards it needed.
+            settled: list[Tuple[Any, EngineResult]] = []
             for c in completions:
                 req = c.request
                 if c.error is not None:
@@ -1588,15 +1652,33 @@ class InferenceEngine:
                         _LOGGER.exception("Failed to record Photon usage telemetry")
                 future = req.future
                 if future and not future.done():
-                    loop.call_soon_threadsafe(future.set_result, engine_result)
+                    settled.append((future, engine_result))
                 self._complete_stream(req, result=engine_result)
                 self._complete_model_stream(req, result=engine_result)
+            if settled:
+                loop.call_soon_threadsafe(_settle_futures, settled)
 
         def deliver_model_stream_updates(
             updates: tuple[ModelStreamUpdate, ...]
         ) -> None:
             for update in updates:
                 self._deliver_model_stream_update(update)
+
+        def route_single_pass_ingress() -> bool:
+            progressed = False
+            while True:
+                try:
+                    model, req = self._single_pass_queue.get_nowait()
+                except queue.Empty:
+                    return progressed
+                lane = single_pass.get(model)
+                if lane is None:  # pragma: no cover - guarded in run()
+                    self._fail_request(
+                        req, ValueError(f"No single-pass lane for {model!r}")
+                    )
+                else:
+                    lane.submit(req)
+                progressed = True
 
         def any_work() -> bool:
             return (ar_executor is not None and ar_executor.has_work) or any(
@@ -1608,6 +1690,39 @@ class InferenceEngine:
                 while True:
                     # If paused, wait until resumed or shutdown completes.
                     if paused_flag.is_set():
+                        if paused_event.is_set() and not wake_event.is_set():
+                            run_gate.wait(timeout=0.1)
+                            continue
+
+                        # Clear before scanning so work arriving during the
+                        # scan leaves the event set for another pass.
+                        wake_event.clear()
+
+                        # A stream can be closed after its request entered the
+                        # thread queue but before admission. Settle only those
+                        # canceled requests; leave every other request queued.
+                        deferred = []
+                        for _ in range(self._scheduler_queue.qsize()):
+                            try:
+                                item = self._scheduler_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                            if item is None:
+                                shutdown_requested = True
+                            elif (
+                                ar_executor is not None
+                                and item.cancel_event.is_set()
+                            ):
+                                ar_executor.submit(item)
+                            else:
+                                deferred.append(item)
+                        for item in deferred:
+                            self._scheduler_queue.put(item)
+
+                        # Route without launching; ``drain`` below settles only
+                        # cancelled requests and already-completed forwards.
+                        route_single_pass_ingress()
+
                         # Drain in-flight work before pause — callers may
                         # mutate runtime state while paused (e.g. rebuild
                         # CUDA graphs). Only the AR lane has graph state;
@@ -1621,8 +1736,10 @@ class InferenceEngine:
                                 synchronize(runtime.device)
                         else:
                             synchronize(runtime.device)
+                        for lane in single_pass.values():
+                            deliver(lane.drain())
                         paused_event.set()
-                        if shutdown_requested and not any_work():
+                        if shutdown_requested:
                             break
                         run_gate.wait(timeout=0.1)
                         continue
@@ -1653,19 +1770,7 @@ class InferenceEngine:
                         ar_executor.submit(item)
                         progressed = True
                     # Single-pass ingress (model-tagged).
-                    while True:
-                        try:
-                            model, req = self._single_pass_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        lane = single_pass.get(model)
-                        if lane is None:  # pragma: no cover - guarded in run()
-                            self._fail_request(
-                                req, ValueError(f"No single-pass lane for {model!r}")
-                            )
-                        else:
-                            lane.submit(req)
-                        progressed = True
+                    progressed |= route_single_pass_ingress()
                     # Streaming session starts (model-tagged).
                     while True:
                         try:
@@ -1833,6 +1938,7 @@ class InferenceEngine:
             return_logprobs=req.return_logprobs,
             generated_prefix=req.generated_prefix,
             suppress_next_token_ids=req.suppress_next_token_ids,
+            cancel_event=req.cancel_event,
         )
         limit = runtime.max_seq_length
         target_total = request_obj.target_length

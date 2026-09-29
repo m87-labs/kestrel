@@ -20,6 +20,7 @@ import torch
 
 from kestrel.engine import InferenceEngine
 from kestrel.engine._types import _AutoregressiveRequest
+from kestrel.engine.single_pass import _SinglePassRequest
 from kestrel.runtime import ExecutionShape
 
 from tests.scheduler._fake_runtime import FakeRuntime
@@ -102,6 +103,119 @@ async def _run(task: str, inputs: Any) -> Any:
 def test_run_routes_single_pass_through_kernel_loop() -> None:
     result = asyncio.run(_run("segment", {"points": [[1, 2]]}))
     assert result.output == {"task": "segment", "inputs": {"points": [[1, 2]]}}
+
+
+def test_paused_loop_settles_cancelled_ingress_and_shutdown() -> None:
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        single_pass = _StubSinglePass()
+        engine = _engine_with(ar, single_pass)
+        engine._loop = asyncio.get_running_loop()
+        engine._paused_flag.set()
+        engine._run_gate.clear()
+
+        future = engine._loop.create_future()
+        single_pass_future = engine._loop.create_future()
+        cancelled = threading.Event()
+        cancelled.set()
+        engine._scheduler_queue.put(
+            _AutoregressiveRequest(
+                request_id=1,
+                prompt="",
+                prompt_tokens=(),
+                image=None,
+                image_hash=None,
+                max_new_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                submitted_at=0.0,
+                future=future,
+                stream_queue=None,
+                skill=ar.skills().resolve("query"),
+                request_context=object(),
+                cancel_event=cancelled,
+            )
+        )
+        engine._single_pass_queue.put(
+            (
+                single_pass.model_name,
+                _SinglePassRequest(
+                    request_id=2,
+                    future=single_pass_future,
+                    task="segment",
+                    inputs={},
+                    submitted_at=0.0,
+                    cancel_event=cancelled,
+                ),
+            )
+        )
+
+        thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+        thread.start()
+        assert (await asyncio.wait_for(future, timeout=5.0)).finish_reason == "cancelled"
+        assert (
+            await asyncio.wait_for(single_pass_future, timeout=5.0)
+        ).finish_reason == "cancelled"
+
+        engine._scheduler_queue.put(None)
+        engine._scheduler_event.set()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    asyncio.run(go())
+
+
+def test_paused_shutdown_does_not_wait_for_executor_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BusyExecutor:
+        has_work = True
+
+        def __init__(self) -> None:
+            self.drains = 0
+
+        def drain(self):  # type: ignore[no-untyped-def]
+            self.drains += 1
+            return ()
+
+        def shutdown(self):  # type: ignore[no-untyped-def]
+            return ()
+
+    ar = FakeRuntime(model_name="ar-default", device="cpu")
+    engine = _engine_with(ar, _StubSinglePass())
+    engine._loop = asyncio.new_event_loop()
+    engine._paused_flag.set()
+    engine._run_gate.clear()
+    executor = BusyExecutor()
+    monkeypatch.setattr(
+        "kestrel.engine.core.AutoregressiveExecutor",
+        lambda *args, **kwargs: executor,
+    )
+
+    class ShutdownAfterIdleWait(threading.Event):
+        waits = 0
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.waits += 1
+            if self.waits == 2:
+                engine._scheduler_queue.put(None)
+                engine._scheduler_event.set()
+            return False
+
+    engine._run_gate = ShutdownAfterIdleWait()
+    thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+    stopped = not thread.is_alive()
+    if not stopped:
+        engine._paused_flag.clear()
+        engine._run_gate.set()
+        engine._scheduler_event.set()
+        thread.join(timeout=5.0)
+
+    engine._loop.close()
+    assert stopped
+    assert executor.drains == 2  # initial pause and shutdown, not the idle poll
 
 
 def test_default_model_can_be_single_pass() -> None:
@@ -342,6 +456,72 @@ def test_run_resolves_when_event_pending_with_no_other_traffic() -> None:
                 thread.join(timeout=5.0)
         finally:
             sp_mod.make_event = orig_make_event
+
+    asyncio.run(go())
+
+
+def test_run_cancellation_skips_queued_work_and_drains_launched_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kestrel.engine.single_pass as sp_mod
+
+    recorded = threading.Event()
+    ready = threading.Event()
+
+    class _ControlledEvent:
+        def record(self, *a: Any, **k: Any) -> None:
+            recorded.set()
+
+        def query(self) -> bool:
+            return ready.is_set()
+
+    monkeypatch.setattr(sp_mod, "make_event", lambda device: _ControlledEvent())
+
+    async def go() -> None:
+        ar = FakeRuntime(model_name="ar-default", device="cpu")
+        sp = _StubSinglePass()
+        engine = _engine_with(ar, sp)
+        engine._loop = asyncio.get_running_loop()
+        engine._initialized = True
+        engine._init_task = None
+        thread = threading.Thread(target=engine._scheduler_loop, daemon=True)
+        thread.start()
+        requests: list[asyncio.Task[Any]] = []
+        try:
+            launched = asyncio.create_task(
+                engine.run(sp.model_name, "segment", {"request": "launched"})
+            )
+            requests.append(launched)
+            assert await asyncio.to_thread(recorded.wait, 1.0)
+
+            queued = asyncio.create_task(
+                engine.run(sp.model_name, "segment", {"request": "queued"})
+            )
+            requests.append(queued)
+            await asyncio.sleep(0)
+            launched.cancel()
+            queued.cancel()
+            await asyncio.sleep(0)
+
+            assert not launched.done()
+            assert not queued.done()
+            ready.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*requests, return_exceptions=True), timeout=5.0
+            )
+            assert all(
+                isinstance(outcome, asyncio.CancelledError) for outcome in outcomes
+            )
+            assert sp.calls == [
+                ("segment", ({"request": "launched"},)),
+            ]
+        finally:
+            ready.set()
+            await asyncio.gather(*requests, return_exceptions=True)
+            engine._shutdown = True
+            engine._scheduler_queue.put(None)
+            engine._scheduler_event.set()
+            thread.join(timeout=5.0)
 
     asyncio.run(go())
 

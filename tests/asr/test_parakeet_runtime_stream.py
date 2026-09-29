@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import torch
 
+from kestrel.models.parakeet_tdt.encoder_graph import ParakeetEncoderGraph
 from kestrel.models.parakeet_tdt.runtime import ParakeetTdtRuntime
-from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -18,11 +18,18 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
     streams = []
 
     class _Model:
+        config = SimpleNamespace(encoder=SimpleNamespace(subsampling_factor=8))
+
         def encode(
             self, features: torch.Tensor, mask: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
             streams.append(("encode", torch.cuda.current_stream(device)))
             return features + 1, mask
+
+        def encode_subsampled(
+            self, hidden: torch.Tensor, valid: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            raise AssertionError("replay is disabled")
 
     class _Decoder:
         minimum_batch = 1
@@ -35,20 +42,18 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
             max_tokens: int,
         ) -> SimpleNamespace:
             del max_tokens
-            with torch.cuda.stream(compute_stream):
-                streams.append(("decode", torch.cuda.current_stream(device)))
-                torch.testing.assert_close(encoded, torch.full_like(encoded, 4))
-                batch = encoded.shape[0]
-                return SimpleNamespace(
-                    lengths=torch.ones(batch, dtype=torch.long, device=device),
-                    sequences=torch.zeros(
-                        (batch, 2), dtype=torch.long, device=device
-                    ),
-                    durations=torch.zeros(
-                        (batch, 2), dtype=torch.long, device=device
-                    ),
-                    encoder_frame_seconds=0.08,
-                )
+            # Whatever stream the runtime left us on -- the encoding is only
+            # ordered against work on the one it came out of, so reading it
+            # here is correct exactly when that is the configured stream.
+            streams.append(("decode", torch.cuda.current_stream(device)))
+            torch.testing.assert_close(encoded, torch.full_like(encoded, 4))
+            batch = encoded.shape[0]
+            return SimpleNamespace(
+                lengths=torch.ones(batch, dtype=torch.long, device=device),
+                sequences=torch.zeros((batch, 2), dtype=torch.long, device=device),
+                durations=torch.zeros((batch, 2), dtype=torch.long, device=device),
+                encoder_frame_seconds=0.08,
+            )
 
     class _Tokenizer:
         def decode(self, _token_ids: list[int]) -> str:
@@ -61,11 +66,13 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
     runtime.model = model
     runtime.tokenizer = _Tokenizer()
     runtime._batch_decoder = _Decoder()
-    runtime._encoder_graph = FixedShapeSinglePassGraph(
+    runtime.compute_stream = compute_stream
+    runtime._encoder_graph = ParakeetEncoderGraph(
+        model,  # type: ignore[arg-type]
         enabled=False,
+        max_batch=1,
         device=device,
         stream=compute_stream,
-        run_forward=model.encode,
     )
 
     features = torch.zeros((1, 4), dtype=torch.bfloat16, device=device)
@@ -87,5 +94,7 @@ def test_disabled_encoder_graph_keeps_generated_decode_on_configured_stream() ->
         )
 
     assert result[0]["text"] == "ok"
+    # Both halves of the split forward run where the graph session put the
+    # encoder, not on the stream the caller happened to be holding.
     assert streams == [("encode", compute_stream), ("decode", compute_stream)]
     runtime.shutdown()

@@ -12,7 +12,7 @@ Kestrel provides async, micro-batched inference with streaming support, paged KV
 
 - **Async micro-batching** — Cooperative scheduler batches heterogeneous requests without compromising per-request latency
 - **Streaming** — Real-time token and transcription progress
-- **Multi-task** — Vision-language generation, spatial reasoning, and speech transcription
+- **Multi-task** — Vision-language generation, spatial reasoning, transcription, and speech synthesis
 - **Paged KV cache** — Efficient memory management for high concurrency
 - **Prefix caching** — Radix tree-based caching for repeated prompts and images
 - **LoRA adapters** — Parameter-efficient fine-tuning support with automatic cloud loading
@@ -52,6 +52,10 @@ Kestrel supports these model families:
 | Whisper large-v3-turbo | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | Transcription, translation, long-form audio, and word timestamps |
 | Qwen3-ASR | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Transcription, long-form/live audio, language hints, prompting, and forced-aligned word timestamps |
 | Parakeet TDT 0.6B v3 | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Multilingual transcription, long-form/live audio, and native word/character timestamps |
+| parakeet-redux | [moondream/parakeet-redux](https://huggingface.co/moondream/parakeet-redux) | The ternary Parakeet: 178 MB, the same capabilities, and runs on the CPU and Apple silicon as well as CUDA |
+| parakeet-ultra | [moondream/parakeet-ultra](https://huggingface.co/moondream/parakeet-ultra) | The full-precision Parakeet trained further: the same capabilities, better on every benchmark than the original |
+| Qwen3-TTS CustomVoice | [0.6B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice), [1.7B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Streaming 24 kHz speech synthesis with voice and language selection |
+| Kokoro-82M | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | 24 kHz phoneme-to-speech with voice blends, speed control, and segment streaming |
 
 ## Quick Start
 
@@ -93,7 +97,7 @@ asyncio.run(main())
 
 Whisper, Qwen3-ASR, and Parakeet use the same model-bound `transcribe`
 capability. Choose a Hugging Face repository ID from the model table; Kestrel
-resolves its pinned revision and selects that model's optimized runtime.
+downloads its weights and selects that model's optimized runtime.
 
 ```python
 import asyncio
@@ -132,10 +136,15 @@ asyncio.run(main())
 ```
 
 Kestrel accepts encoded paths, bytes, bounded binary streams, raw mono PCM,
-and asynchronous PCM iterators. Long paths are decoded incrementally. See
+and asynchronous PCM iterators. Long paths are decoded incrementally.
+`moondream/parakeet-redux` also runs on the CPU and on Apple silicon: pass
+`device="cpu"` or `device="mps"`. See
 [Speech-to-text models](https://github.com/m87-labs/kestrel/blob/main/docs/asr.md)
 for the shared interface and model
 capability matrix, model-specific options, formats, and resource limits.
+
+For speech synthesis with Qwen3-TTS or Kokoro, see
+[Text-to-speech models](https://github.com/m87-labs/kestrel/blob/main/docs/tts.md).
 
 ## Tasks
 
@@ -330,6 +339,7 @@ architecture and checkpoint format.
 | `MOONDREAM_API_KEY` | Optional. Only needed for finetuned-model inference. Get this from [moondream.ai](https://moondream.ai). |
 | `HF_HOME` | Override HuggingFace cache directory for downloaded weights (default: `~/.cache/huggingface`). |
 | `HF_TOKEN` | Hugging Face token for private or gated model repositories. Alternatively, run `huggingface-cli login`. |
+| `OMP_WAIT_POLICY` | Set to `passive` before torch loads when transcribing on the CPU, or torch's idle OpenMP workers spin on the cores the kernels use. |
 
 ## Triton Inference Server
 

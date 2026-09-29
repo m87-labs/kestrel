@@ -18,9 +18,6 @@ from .config import AudioEncoderConfig, Qwen3AsrConfig, TextDecoderConfig
 
 
 KvCache = list[tuple[Tensor, Tensor]]
-_rmsnorm = get_runtime().dense.rmsnorm
-
-
 class RmsNorm(nn.Module):
     def __init__(self, size: int, eps: float) -> None:
         super().__init__()
@@ -34,7 +31,9 @@ class RmsNorm(nn.Module):
     def forward(self, value: Tensor) -> Tensor:
         # Preserve normalized-value rounding before the learned weight multiply.
         # L4 C1 text prefill: unit RMS + BF16 multiply saved 5.9–6.4 ms.
-        return self.weight * _rmsnorm(value, self.unit_weight, self.eps)
+        return self.weight * get_runtime(value.device).dense.rmsnorm(
+            value, self.unit_weight, self.eps
+        )
 
 
 class AudioAttention(nn.Module):

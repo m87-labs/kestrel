@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+from functools import partial
+import ctypes
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from kestrel.device import empty_cache, make_stream, resolve_device
+from kestrel.device import empty_cache, make_stream, resolve_device, stream_context
 from kestrel.runtime import ExecutionShape
-from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 from kestrel.models.asr.audio import AudioChunks, DecodedAudio
 from kestrel.models.asr.contract import (
@@ -26,11 +31,74 @@ from kestrel.models.asr.contract import (
 
 from .contract import parse_request
 from .decode_graph import _TdtBatchGraphDecoder
+from .encoder_graph import ParakeetEncoderGraph
 from .generated_decode import _TdtBatchGeneratedDecoder
-from .features import parakeet_features
+from .features import parakeet_cohort_features
 from .model import ParakeetTdt, TdtState
+from .segment import (
+    SpeechRegions,
+    energy_speech,
+    fits_one_segment,
+    pause_segments,
+)
 from .tokenizer import ParakeetTokenizer
+from .vad import head_speech
 from .weights import MODEL_ID, load_parakeet_tdt
+
+
+# One live-PCM window: the block the orchestrator commits exactly, and the unit
+# the streaming decoder carries its state across.
+STREAM_WINDOW_SECONDS = 180
+_CPU_THREAD_CAP = 8
+_NATIVE_GEMM_THREAD_CAP = 4
+
+
+def _cpu_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Avoid emulated BF16 GEMMs on CPUs without native BF16 support."""
+
+    if dtype != torch.bfloat16:
+        return dtype
+    for probe in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+        fn = getattr(torch.cpu, probe, None)
+        try:
+            if fn is not None and fn():
+                return torch.bfloat16
+        except Exception:  # noqa: BLE001 — private torch capability probes
+            continue
+    return torch.float32
+
+
+def _physical_cpu_count() -> int:
+    """Physical cores available to this process (P-cores on Apple silicon)."""
+
+    if platform.system() == "Darwin":
+        for key in ("hw.perflevel0.physicalcpu", "hw.physicalcpu"):
+            try:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", key], timeout=2, stderr=subprocess.DEVNULL
+                )
+                return int(out.strip())
+            except Exception:  # noqa: BLE001 — probe, never fatal
+                continue
+        return os.cpu_count() or 1
+    try:
+        usable = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+    cores: set[tuple[str, str]] = set()
+    for cpu in usable:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            return len(usable)
+        cores.add((package, core))
+    return len(cores) or len(usable)
+
+
+def _default_cpu_threads(cap: int = _CPU_THREAD_CAP) -> int:
+    return max(1, min(_physical_cpu_count(), cap))
 
 
 def _timed_segments(
@@ -70,12 +138,114 @@ def _timed_segments(
     return tuple(segments)
 
 
+def _set_kernel_worker_threads(threads: int | None) -> None:
+    """Hand the kernels their pool size, or ``None`` to leave them their cache-domain policy."""
+    try:
+        from kestrel_kernels.ternary import set_worker_threads
+    except ImportError:
+        return
+    set_worker_threads(threads)
+
+
+def _confine_submitter_to_cache_domain() -> None:
+    """Pin the calling thread to the cores chosen by the native kernel pool.
+
+    The submitting thread participates in each parallel region, so letting it
+    roam outside the pool's cache domain defeats the workers' placement. Linux
+    affinity is per-thread; other application threads are left alone.
+
+    A no-op where the topology cannot be read (macOS has no affinity interface), and where the current mask
+    is already inside the chosen group.
+    """
+    try:
+        from kestrel_kernels import _cpu
+    except ImportError:
+        return
+    cpus = set(getattr(_cpu, "pool_cpus", tuple)())
+    if not cpus or not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        current = os.sched_getaffinity(0)
+        if current <= cpus:
+            return
+        os.sched_setaffinity(0, cpus)
+    except OSError:  # a container that forbids it; the workers are still placed
+        pass
+
+
+def _configure_cpu_threads(threads: int | None, *, native_gemm: bool) -> int:
+    """Apply the shared CPU policy to torch and the native kernel pool.
+
+    With no explicit count, the pool chooses one cache domain. Torch uses the
+    smaller cap only when the ternary model's GEMMs run in that pool. An
+    explicit count sizes both pools and leaves affinity to the caller.
+    """
+
+    if threads is None:
+        # Reset the pool first: ``pool_cpus`` must describe the placement this
+        # runtime will actually use, not a previous explicit configuration.
+        _set_kernel_worker_threads(None)
+        threads = (
+            _default_cpu_threads(_NATIVE_GEMM_THREAD_CAP)
+            if native_gemm
+            else _default_cpu_threads()
+        )
+    else:
+        _set_kernel_worker_threads(int(threads))
+    torch.set_num_threads(int(threads))
+    return torch.get_num_threads()
+
+
 def _encoder_frames(samples: int, factor: int) -> int:
     frames = samples // 160
     while factor > 1:
         frames = (frames + 1) // 2
         factor //= 2
     return frames
+
+
+def _stage_waveforms(
+    blocks: Sequence[np.ndarray], device: torch.device, *, pinned: bool
+) -> torch.Tensor:
+    """Stack ``blocks`` into one padded ``[rows, longest]`` batch on ``device``.
+
+    Each row is zero-filled past its own samples, which is the batch the
+    cohort's single spectrogram runs on.
+
+    On CUDA the rows travel through one pinned buffer and one async copy.
+    ``torch.from_numpy(...).to(device)`` copies from pageable memory, which
+    Torch ends with a stream synchronize -- so one such copy per distinct
+    waveform length did not just cost a transfer, it drained every kernel the
+    compute stream still held: measured on a B200 behind 145 ms of queued
+    GEMMs, 128 pageable copies returned after 155 ms against 3.4 ms for one
+    pinned copy. That is what lets a cohort be enqueued while its predecessor
+    is still running.
+
+    Nothing holds the pinned buffer: Torch's caching host allocator records
+    the copy on the block and will not hand that block out again until the
+    copy has completed. A warm allocator returns one in about a microsecond,
+    but only for a size it has seen, and ``rows * longest`` is different
+    almost every time; a miss is a ``cudaHostAlloc``, which is neither cheap
+    nor asynchronous. So the buffer is a slice of a power-of-two block: a
+    handful of sizes for any workload. Without it a pass over long clips left
+    the allocator holding nothing a pass over short ones could use, and the
+    short pass ran about a tenth slower for it.
+    """
+
+    rows = len(blocks)
+    width = max(int(block.size) for block in blocks)
+    if pinned:
+        block_size = 1 << max(20, (rows * width - 1).bit_length())
+        host = torch.empty(block_size, dtype=torch.float32, pin_memory=True)
+        host = host[: rows * width].view(rows, width)
+    else:
+        host = torch.empty((rows, width), dtype=torch.float32)
+    view = host.numpy()
+    for row, block in enumerate(blocks):
+        size = int(block.size)
+        view[row, :size] = block
+        view[row, size:] = 0.0
+    return host.to(device, non_blocking=pinned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,9 +263,92 @@ class _StreamWindow:
     duration_seconds: float
 
 
+# One request as ``launch`` read it: the transcription request, its decode
+# settings, and the live stream window it belongs to (``None`` for a clip).
+_Parsed = tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None]
+
+
+@dataclass(slots=True)
+class _ParakeetBatch:
+    """A cohort between ``launch`` and ``collect``.
+
+    ``parsed``, ``results``, ``totals``, ``text_parts`` and ``segments`` carry
+    one slot per request; ``collect`` turns the last three into the results of
+    every request that has not already failed.
+
+    ``encoded``/``valid`` hold device tensors only when the cohort stopped
+    after the encoder -- one segment per request, a batch the decoder takes
+    encoded. Every other cohort arrives with its transcripts already appended
+    and nothing left on the device.
+    """
+
+    parsed: list[_Parsed | None]
+    results: list[dict[str, object] | Exception | None]
+    totals: list[tuple[float, float, float] | None]
+    text_parts: list[list[str]]
+    segments: list[list[Segment]]
+    rows: tuple[tuple[int, DecodedAudio], ...] = ()
+    encoded: torch.Tensor | None = None
+    valid: torch.Tensor | None = None
+    max_tokens: int | None = None
+
+
+# Requests per forward. On CUDA the encoder runs eagerly above the graph threshold, so a large batch is pure
+# throughput: measured on a B200 with parakeet-tdt-0.6b-v3 on LibriSpeech test-clean (longest rows 35 s), real
+# time factor and peak allocated memory -- capacity 8 2,324x / 2.0 GiB, 16 2,530x / 2.7 GiB, 64 3,800x / 7.0 GiB,
+# 128 4,051x / 12.8 GiB, 256 4,516x / 24.4 GiB. CPU and MPS keep 8: there a batch costs latency and memory and
+# buys little. ``RuntimeConfig.single_pass_batch_capacity`` overrides the choice.
+_BATCH_CAPACITY = 8
+_CUDA_BATCH_CAPACITY = 128
+_CUDA_BATCH_CAPACITY_SMALL = 64  # devices under 40 GiB
+
+
+_libc: Any = None
+
+
+def _trim_heap() -> None:
+    """Return freed heap pages to the OS on Linux (glibc ``malloc_trim``); a no-op elsewhere.
+
+    Loading decodes the packed weights through transient tensors and every batch frees its activations, and
+    glibc keeps those pages resident: on the ternary model at 8 threads the process held about 200 MB of such
+    slack after the load and about 300 MB more in steady state at batch 1 (2026-09-21, LibriSpeech test-clean),
+    a third of its resident memory. One syscall per call.
+    """
+    global _libc
+    if sys.platform != "linux":
+        return
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        return
+
+
+def _batch_capacity(cfg: Any, device: torch.device) -> int:
+    configured = getattr(cfg, "single_pass_batch_capacity", None)
+    if configured is not None:
+        if type(configured) is not int or configured <= 0:
+            raise ValueError("single_pass_batch_capacity must be a positive integer")
+        return configured
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return _BATCH_CAPACITY
+    total = torch.cuda.get_device_properties(device).total_memory
+    return _CUDA_BATCH_CAPACITY if total >= 40 * 2**30 else _CUDA_BATCH_CAPACITY_SMALL
+
+
 class ParakeetTdtRuntime:
     execution_shape = ExecutionShape.SINGLE_PASS
-    batch_capacity = 8
+    batch_capacity = _BATCH_CAPACITY  # resolved per instance in __init__
+    # Transducer decoding keeps its own small decoder state; there is no paged
+    # KV cache here, so the engine skips building (and importing) one.
+    needs_kv_pool = False
+    # ``forward`` also splits into ``launch`` (enqueue) and ``collect`` (read
+    # back), so the single-pass executor can keep a second cohort in flight.
+    # ``launch`` returns as soon as its device work is enqueued whenever the
+    # cohort allows it; ``collect`` turns its handle into the results
+    # ``forward`` would have returned.
+    pipelined = True
 
     def __init__(
         self,
@@ -119,17 +372,35 @@ class ParakeetTdtRuntime:
             if hasattr(cfg, "resolved_dtype")
             else getattr(cfg, "dtype", torch.float32)
         )
+        if self.device.type == "cpu":
+            self.dtype = _cpu_dtype(self.dtype)
+        self.batch_capacity = _batch_capacity(cfg, self.device)
         self.compute_stream = (
             compute_stream
             if compute_stream is not None
             else make_stream(self.device)
         )
         if model is None or tokenizer is None:
-            checkpoint = getattr(cfg, "model_path", None) or self._model_name
-            loaded = load_parakeet_tdt(checkpoint, device=self.device, dtype=self.dtype)
+            loaded = load_parakeet_tdt(
+                getattr(cfg, "model_path", None) or self._model_name,
+                device=self.device,
+                dtype=self.dtype,
+            )
             model, tokenizer = loaded.model, loaded.tokenizer
         self.model = model.eval()
         self.tokenizer = tokenizer
+        configured_cpu_threads = getattr(cfg, "cpu_threads", None)
+        self._confine_cpu_submitter = (
+            self.device.type == "cpu" and configured_cpu_threads is None
+        )
+        self.cpu_threads = (
+            _configure_cpu_threads(
+                configured_cpu_threads,
+                native_gemm=self.model.is_ternary,
+            )
+            if self.device.type == "cpu"
+            else None
+        )
         self.decode_path = getattr(cfg, "decode_path", "auto")
         if self.decode_path not in {"auto", "native", "generated"}:
             raise ValueError("decode_path must be 'auto', 'native', or 'generated'")
@@ -165,7 +436,12 @@ class ParakeetTdtRuntime:
                 max_batch=self.batch_capacity,
                 compute_stream=stream,
             )
-        self._encoder_graph = FixedShapeSinglePassGraph(
+        # Pinned staging is a CUDA-only win; elsewhere the upload is a copy
+        # into host memory the model reads directly.
+        self._pin_waveforms = self.device.type == "cuda" and torch.cuda.is_available()
+        self._encoder_graph = ParakeetEncoderGraph(
+            self.model,
+            max_batch=self.batch_capacity,
             enabled=(
                 bool(getattr(cfg, "enable_cuda_graphs", True))
                 and self.device.type == "cuda"
@@ -173,15 +449,27 @@ class ParakeetTdtRuntime:
             ),
             device=self.device,
             stream=self.compute_stream,
-            run_forward=self.model.encode,
-            # Three exact B1/B4/B8 shapes retained 372 MiB on L4 and avoided
-            # 107-146 ms recaptures; cap at four independent graph pools.
-            max_entries=4,
         )
+        if self.device.type == "cpu":
+            _trim_heap()
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _speech_regions(self) -> SpeechRegions:
+        """The pause source, chosen by capability of the loaded weights.
+
+        A checkpoint carrying `vad_head.*` marks speech with its own head off
+        the subsampler it already runs. Everything else -- stock NVIDIA
+        checkpoints included -- reads frame energy. There is no option and no
+        bundled default head: the loaded tensors decide. Nothing is cached on
+        the runtime, so a shared one segments concurrent requests safely.
+        """
+
+        if getattr(self.model, "vad_head", None) is None:
+            return energy_speech
+        return partial(head_speech, self.model)
 
     def tasks(self) -> tuple[str, ...]:
         return ("transcribe",)
@@ -194,29 +482,14 @@ class ParakeetTdtRuntime:
         self,
         rows: Sequence[tuple[int, DecodedAudio]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        groups: dict[int, list[int]] = {}
-        for group_index, (_request_index, audio) in enumerate(rows):
-            groups.setdefault(audio.waveform.size, []).append(group_index)
-
-        feature_rows: dict[int, torch.Tensor] = {}
-        mask_rows: dict[int, torch.Tensor] = {}
-        for indices in groups.values():
-            waveforms = torch.from_numpy(
-                np.stack([rows[index][1].waveform for index in indices])
-            ).to(self.device)
-            features, masks = parakeet_features(waveforms)
-            for batch_index, row_index in enumerate(indices):
-                feature_rows[row_index] = features[batch_index]
-                mask_rows[row_index] = masks[batch_index]
-
-        completed_features = [feature_rows[index] for index in range(len(rows))]
-        completed_masks = [mask_rows[index] for index in range(len(rows))]
-        width = max(row.shape[0] for row in completed_features)
-        features = torch.stack(
-            [F.pad(row, (0, 0, 0, width - row.shape[0])) for row in completed_features]
-        )
-        masks = torch.stack(
-            [F.pad(row, (0, width - row.shape[0])) for row in completed_masks]
+        # One upload and one spectrogram for the cohort. What this replaces
+        # cut the cohort by waveform length and ran a spectrogram per distinct
+        # length -- around 80 of them for a LibriSpeech cohort of 128 -- then
+        # padded and stacked the results a row at a time, a sixth of the pass.
+        blocks = [audio.waveform for _request_index, audio in rows]
+        staged = _stage_waveforms(blocks, self.device, pinned=self._pin_waveforms)
+        features, masks = parakeet_cohort_features(
+            staged, [int(block.size) for block in blocks]
         )
         return features.to(self.dtype), masks
 
@@ -348,16 +621,15 @@ class ParakeetTdtRuntime:
                 values.append(value)
         return tuple(values)
 
-    @torch.inference_mode()
-    def forward(
+    def _parse_inputs(
         self, task: str, inputs: Sequence[Any]
-    ) -> tuple[dict[str, object] | Exception, ...]:
+    ) -> tuple[list[_Parsed | None], list[dict[str, object] | Exception | None]]:
         if task != "transcribe":
             raise ValueError("ParakeetTdtRuntime only accepts transcribe requests")
+        if getattr(self, "_confine_cpu_submitter", False):
+            _confine_submitter_to_cache_domain()
 
-        parsed: list[
-            tuple[TranscriptionRequest, DecodeSettings, _StreamWindow | None] | None
-        ] = [None] * len(inputs)
+        parsed: list[_Parsed | None] = [None] * len(inputs)
         results: list[dict[str, object] | Exception | None] = [None] * len(inputs)
         for index, value in enumerate(inputs):
             try:
@@ -377,7 +649,203 @@ class ParakeetTdtRuntime:
                 parsed[index] = (request, settings, stream_window)
             except Exception as exc:
                 results[index] = exc
+        return parsed, results
 
+    @staticmethod
+    def _next_chunks(
+        iterators: list[Iterator[DecodedAudio] | None],
+        results: list[dict[str, object] | Exception | None],
+    ) -> list[tuple[int, DecodedAudio]]:
+        """Pull one segment from every live row, retiring the exhausted ones."""
+
+        chunks: list[tuple[int, DecodedAudio]] = []
+        for index, iterator in enumerate(iterators):
+            if iterator is None:
+                continue
+            try:
+                chunks.append((index, next(iterator)))
+            except StopIteration:
+                iterators[index] = None
+            except Exception as exc:
+                iterators[index] = None
+                results[index] = exc
+        return chunks
+
+    @staticmethod
+    def _grouped(
+        parsed: Sequence[_Parsed | None],
+        chunks: Sequence[tuple[int, DecodedAudio]],
+    ) -> dict[tuple[int, bool], list[tuple[int, DecodedAudio]]]:
+        groups: dict[tuple[int, bool], list[tuple[int, DecodedAudio]]] = {}
+        for index, audio in chunks:
+            item = parsed[index]
+            assert item is not None
+            groups.setdefault((item[1].max_tokens, item[2] is not None), []).append(
+                (index, audio)
+            )
+        return groups
+
+    @staticmethod
+    def _long_enough(
+        group: Sequence[tuple[int, DecodedAudio]],
+        iterators: list[Iterator[DecodedAudio] | None],
+        results: list[dict[str, object] | Exception | None],
+    ) -> list[tuple[int, DecodedAudio]]:
+        keep: list[tuple[int, DecodedAudio]] = []
+        for index, audio in group:
+            if audio.waveform.size < 320:
+                iterators[index] = None
+                results[index] = ValueError("Parakeet audio is too short to normalize")
+            else:
+                keep.append((index, audio))
+        return keep
+
+    @staticmethod
+    def _packed(output: Any) -> list[list[int]]:
+        """Lengths, tokens and durations read back as one host transfer."""
+
+        return torch.cat(
+            (output.lengths[:, None], output.sequences, output.durations), dim=1
+        ).tolist()
+
+    def _packed_decode(
+        self, encoded: torch.Tensor, valid: torch.Tensor, *, max_tokens: int | None
+    ) -> tuple[Any, list[list[int]]]:
+        assert self._batch_decoder is not None
+        output = self._batch_decoder.generate(encoded, valid, max_tokens=max_tokens)
+        return output, self._packed(output)
+
+    def _append_group_results(
+        self,
+        batch: _ParakeetBatch,
+        group: Sequence[tuple[int, DecodedAudio]],
+        output: Any,
+        packed: Sequence[Sequence[int]],
+    ) -> None:
+        width = output.sequences.shape[1]
+        for (index, audio), row in zip(group, packed, strict=True):
+            length = row[0]
+            token_ids = list(row[1 : 1 + length])
+            durations = list(row[1 + width :][:length])
+            item = batch.parsed[index]
+            assert item is not None
+            self._append_chunk_result(
+                item[0],
+                audio,
+                token_ids,
+                durations,
+                batch.text_parts[index],
+                batch.segments[index],
+                frame_seconds=output.encoder_frame_seconds,
+            )
+
+    def _run_group(
+        self,
+        batch: _ParakeetBatch,
+        group: Sequence[tuple[int, DecodedAudio]],
+        *,
+        max_tokens: int,
+        is_stream: bool,
+    ) -> None:
+        """Features -> encoder -> decode -> transcript for one segment group."""
+
+        features, mask = self._batch_audio_features(group)
+        if is_stream:
+            windows = []
+            requests = []
+            for index, _audio in group:
+                item = batch.parsed[index]
+                assert item is not None and item[2] is not None
+                requests.append(item[0])
+                windows.append(item[2])
+            values = self._run_stream_group(
+                group, windows, requests, features, mask, max_tokens=max_tokens
+            )
+            for (index, _audio), value in zip(group, values, strict=True):
+                batch.results[index] = value
+            return
+        encoder_lease = (
+            self._encoder_graph.launch(features, mask)
+            if self._splits_decode(len(group))
+            else nullcontext(None)
+        )
+        with encoder_lease as encoded_result:
+            if encoded_result is None:
+                output = self.model.generate(features, mask, max_tokens=max_tokens)
+                packed = self._packed(output)
+            else:
+                encoded, valid = encoded_result
+                output, packed = self._packed_decode(
+                    encoded, valid, max_tokens=max_tokens
+                )
+        self._append_group_results(batch, group, output, packed)
+
+    def _splits_decode(self, batch: int) -> bool:
+        """Whether this cohort size runs the encoder and the decoder apart."""
+
+        return (
+            self._batch_decoder is not None
+            and batch >= self._batch_decoder.minimum_batch
+        )
+
+    @staticmethod
+    def _stops_after_the_encoder(
+        parsed: Sequence[_Parsed | None],
+        sources: Sequence[AudioChunks | None],
+    ) -> bool:
+        """Whether this cohort may hand back an encoding instead of transcripts.
+
+        Every live row has to be a clip the segmenter emits whole, so that no
+        segment's transcript is needed to cut the next one, and they all have
+        to share a decode setting, so that the cohort is the single group the
+        encoder is given. Both are known from the request and the clip length,
+        before any audio is cut.
+        """
+
+        live = [
+            (item, source)
+            for item, source in zip(parsed, sources, strict=True)
+            if item is not None and source is not None
+        ]
+        return (
+            bool(live)
+            and len({item[1].max_tokens for item, _source in live}) == 1
+            and all(
+                item[2] is None and fits_one_segment(source) for item, source in live
+            )
+        )
+
+    @staticmethod
+    def _finalize(batch: _ParakeetBatch) -> None:
+        """Assemble a transcript for every row that has not already failed."""
+
+        for index, total in enumerate(batch.totals):
+            if total is None or batch.results[index] is not None:
+                continue
+            duration, source_duration, clip_start = total
+            batch.results[index] = TranscriptionResult(
+                text=" ".join(part for part in batch.text_parts[index] if part),
+                language=None,
+                duration_seconds=duration,
+                source_duration_seconds=source_duration,
+                clip_start_seconds=clip_start,
+                segments=tuple(batch.segments[index]),
+            ).as_dict()
+
+    @torch.inference_mode()
+    def launch(self, task: str, inputs: Sequence[Any]) -> _ParakeetBatch:
+        """Enqueue a cohort's device work and return what collecting it needs.
+
+        A cohort whose every request fits in one pause-aligned segment stops
+        after the encoder: the encoding, not the transcript, is what ``launch``
+        leaves behind, so the caller can enqueue the next cohort while this
+        one's encoder still runs. Anything else -- several segments, a live
+        stream window, a batch the decoder will not take encoded -- is decoded
+        here, because its segments have to be transcribed before the next can
+        be cut.
+        """
+
+        parsed, results = self._parse_inputs(task, inputs)
         with ExitStack() as stack:
             sources: list[AudioChunks | None] = [None] * len(inputs)
             for index, item in enumerate(parsed):
@@ -397,129 +865,91 @@ class ParakeetTdtRuntime:
                     )
                 except Exception as exc:
                     results[index] = exc
-            iterators = [
-                iter(source.chunks(180)) if source is not None else None
-                for source in sources
-            ]
-            text_parts: list[list[str]] = [[] for _ in inputs]
-            segments: list[list[Segment]] = [[] for _ in inputs]
+            batch = _ParakeetBatch(
+                parsed=parsed,
+                results=results,
+                totals=[
+                    None
+                    if source is None
+                    else (
+                        source.duration_seconds,
+                        source.source_duration_seconds,
+                        source.clip_start_seconds,
+                    )
+                    for source in sources
+                ],
+                text_parts=[[] for _ in inputs],
+                segments=[[] for _ in inputs],
+            )
+            # Pause-aligned segments of at most 30 s, contiguous and never
+            # overlapping: 6.37 WER against 10.82 for the fixed 180 s windows
+            # this replaces (six Earnings-22 calls, parakeet-tdt-0.6b-v3).
+            # A live stream window arrives already cut, carrying decoder state
+            # and sample offsets into itself, so it passes through whole.
+            speech = self._speech_regions()
+            iterators: list[Iterator[DecodedAudio] | None] = []
+            for index, source in enumerate(sources):
+                item = parsed[index]
+                if source is None or item is None:
+                    iterators.append(None)
+                elif item[2] is not None:
+                    iterators.append(iter(source.chunks(STREAM_WINDOW_SECONDS)))
+                else:
+                    iterators.append(iter(pause_segments(source, speech)))
+            defers = self._stops_after_the_encoder(parsed, sources)
 
             while any(iterator is not None for iterator in iterators):
-                chunks = []
-                for index, iterator in enumerate(iterators):
-                    if iterator is None:
+                chunks = self._next_chunks(iterators, batch.results)
+                for (max_tokens, is_stream), group in self._grouped(
+                    parsed, chunks
+                ).items():
+                    rows = self._long_enough(group, iterators, batch.results)
+                    if not rows:
                         continue
-                    try:
-                        chunks.append((index, next(iterator)))
-                    except StopIteration:
-                        iterators[index] = None
-                    except Exception as exc:
-                        iterators[index] = None
-                        results[index] = exc
-                groups: dict[tuple[int, bool], list[tuple[int, DecodedAudio]]] = {}
-                for index, audio in chunks:
-                    item = parsed[index]
-                    assert item is not None
-                    groups.setdefault(
-                        (item[1].max_tokens, item[2] is not None), []
-                    ).append((index, audio))
-                for (max_tokens, is_stream), group in groups.items():
-                    valid_group = []
-                    for index, audio in group:
-                        if audio.waveform.size < 320:
-                            iterators[index] = None
-                            results[index] = ValueError(
-                                "Parakeet audio is too short to normalize"
-                            )
-                        else:
-                            valid_group.append((index, audio))
-                    if not valid_group:
-                        continue
-                    features, mask = self._batch_audio_features(valid_group)
-                    if is_stream:
-                        stream_windows = []
-                        stream_requests = []
-                        for index, _audio in valid_group:
-                            item = parsed[index]
-                            assert item is not None and item[2] is not None
-                            stream_requests.append(item[0])
-                            stream_windows.append(item[2])
-                        stream_results = self._run_stream_group(
-                            valid_group,
-                            stream_windows,
-                            stream_requests,
-                            features,
-                            mask,
-                            max_tokens=max_tokens,
-                        )
-                        for (index, _audio), value in zip(
-                            valid_group, stream_results, strict=True
-                        ):
-                            results[index] = value
-                        continue
-                    use_encoded_decode = (
-                        self._batch_decoder is not None
-                        and features.shape[0] >= self._batch_decoder.minimum_batch
+                    if defers and self._splits_decode(len(rows)):
+                        features, mask = self._batch_audio_features(rows)
+                        batch.rows = tuple(rows)
+                        batch.max_tokens = max_tokens
+                        with self._encoder_graph.launch(features, mask) as leased:
+                            batch.encoded, batch.valid = leased
+                        return batch
+                    self._run_group(
+                        batch, rows, max_tokens=max_tokens, is_stream=is_stream
                     )
-                    encoder_lease = (
-                        self._encoder_graph.launch(features, mask)
-                        if use_encoded_decode
-                        else nullcontext(None)
-                    )
-                    with encoder_lease as encoded_result:
-                        if encoded_result is None:
-                            output = self.model.generate(
-                                features,
-                                mask,
-                                max_tokens=max_tokens,
-                            )
-                        else:
-                            assert self._batch_decoder is not None
-                            encoded, valid = encoded_result
-                            output = self._batch_decoder.generate(
-                                encoded,
-                                valid,
-                                max_tokens=max_tokens,
-                            )
-                        packed = torch.cat(
-                            (
-                                output.lengths[:, None],
-                                output.sequences,
-                                output.durations,
-                            ),
-                            dim=1,
-                        ).tolist()
-                    for (index, audio), row in zip(valid_group, packed, strict=True):
-                        length = row[0]
-                        token_ids = row[1 : 1 + length]
-                        durations = row[1 + output.sequences.shape[1] :][:length]
-                        item = parsed[index]
-                        assert item is not None
-                        self._append_chunk_result(
-                            item[0],
-                            audio,
-                            token_ids,
-                            durations,
-                            text_parts[index],
-                            segments[index],
-                            frame_seconds=output.encoder_frame_seconds,
-                        )
-            for index, source in enumerate(sources):
-                if source is not None and results[index] is None:
-                    results[index] = TranscriptionResult(
-                        text=" ".join(part for part in text_parts[index] if part),
-                        language=None,
-                        duration_seconds=source.duration_seconds,
-                        source_duration_seconds=source.source_duration_seconds,
-                        clip_start_seconds=source.clip_start_seconds,
-                        segments=tuple(segments[index]),
-                    ).as_dict()
+            return batch
 
-        finalized = []
-        for result in results:
+    @torch.inference_mode()
+    def collect(
+        self, batch: _ParakeetBatch
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        """Read back a launched cohort and assemble one result per request."""
+
+        if batch.encoded is not None:
+            assert batch.valid is not None
+            # The encoding is only ordered against work on the runtime's own
+            # stream. The executor is already inside it, but ``forward`` hands
+            # the encoder the caller's stream -- which is what orders the
+            # encoder after whatever produced the waveforms -- so the read back
+            # has to name the stream the encoding came out on.
+            with stream_context(self.compute_stream):
+                output, packed = self._packed_decode(
+                    batch.encoded, batch.valid, max_tokens=batch.max_tokens
+                )
+            batch.encoded = batch.valid = None
+            self._append_group_results(batch, batch.rows, output, packed)
+        self._finalize(batch)
+        results: list[dict[str, object] | Exception] = []
+        for result in batch.results:
             assert result is not None
-            finalized.append(result)
-        return tuple(finalized)
+            results.append(result)
+        if self.device.type == "cpu":
+            _trim_heap()
+        return tuple(results)
+
+    def forward(
+        self, task: str, inputs: Sequence[Any]
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        return self.collect(self.launch(task, inputs))
 
     def shutdown(self) -> None:
         self._encoder_graph.shutdown()

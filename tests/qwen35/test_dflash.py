@@ -49,7 +49,8 @@ def _tap_model(monkeypatch):
     model.layers = torch.nn.ModuleList([Layer(1), Layer(2), Layer(3)])
     model.norm = SimpleNamespace(weight=None, eps=1e-6)
     model.rotary_emb = lambda hidden, positions: ()
-    monkeypatch.setattr(qwen_model, "_kestrel_rmsnorm", lambda value, *args: value + 100)
+    monkeypatch.setattr(qwen_model, "get_runtime", lambda device: SimpleNamespace(
+        dense=SimpleNamespace(rmsnorm=lambda value, *args: value + 100)))
     return model
 
 

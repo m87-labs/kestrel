@@ -2,11 +2,12 @@
 
 from importlib import import_module
 from kestrel.models.registry import register_lazy
-from .metadata import MODEL_ID, REVISION
+from .metadata import MODEL_ID, REVISION, TERNARY_MODEL_ID, ULTRA_MODEL_ID
 
-register_lazy([MODEL_ID], __name__ + ".registration")
+register_lazy([MODEL_ID, TERNARY_MODEL_ID, ULTRA_MODEL_ID], __name__ + ".registration")
 
-__all__ = ["MODEL_ID", "REVISION", "ParakeetTdtRuntime", "load_parakeet_tdt"]
+__all__ = ["MODEL_ID", "REVISION", "TERNARY_MODEL_ID", "ULTRA_MODEL_ID",
+           "ParakeetTdtRuntime", "load_parakeet_tdt"]
 
 _LAZY_EXPORTS = {
     "ParakeetTdtRuntime": ".runtime",

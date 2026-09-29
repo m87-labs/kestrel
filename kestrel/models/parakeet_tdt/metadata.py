@@ -2,3 +2,5 @@
 
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 REVISION = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+TERNARY_MODEL_ID = "moondream/parakeet-redux"
+ULTRA_MODEL_ID = "moondream/parakeet-ultra"

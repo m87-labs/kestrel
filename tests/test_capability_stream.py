@@ -39,6 +39,23 @@ def test_progress_is_coalesced_and_result_does_not_require_iteration() -> None:
     asyncio.run(scenario())
 
 
+def test_append_only_stream_keeps_every_update() -> None:
+    async def scenario() -> None:
+        async def produce(emit):
+            emit({"audio": b"first"})
+            emit({"audio": b"second"})
+            return _result("done")
+
+        stream = CapabilityStream("synthesize", produce, coalesce=False)
+        assert (await stream.result()).output == {"text": "done"}
+        assert (await anext(stream)).output == {"audio": b"first"}
+        assert (await anext(stream)).output == {"audio": b"second"}
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    asyncio.run(scenario())
+
+
 def test_close_cancels_compound_producer() -> None:
     async def scenario() -> None:
         cancelled = asyncio.Event()
@@ -53,6 +70,63 @@ def test_close_cancels_compound_producer() -> None:
         await asyncio.sleep(0)
         await stream.aclose()
         assert cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_context_exit_discards_append_only_backlog() -> None:
+    async def scenario() -> None:
+        async def produce(emit):
+            emit({"audio": b"first"})
+            emit({"audio": b"second"})
+            return _result("done")
+
+        stream = CapabilityStream("synthesize", produce, coalesce=False)
+        async with stream:
+            pass
+
+        assert stream._queue.qsize() == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    asyncio.run(scenario())
+
+
+def test_close_wakes_pending_next() -> None:
+    async def scenario() -> None:
+        async def produce(emit):
+            await asyncio.Future()
+
+        stream = CapabilityStream("synthesize", produce, coalesce=False)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        await stream.aclose()
+
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(pending, timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_close_does_not_swallow_caller_cancellation() -> None:
+    async def scenario() -> None:
+        cleaning = asyncio.Event()
+
+        async def produce(emit):
+            try:
+                await asyncio.Future()
+            finally:
+                cleaning.set()
+                await asyncio.Future()
+
+        stream = CapabilityStream("synthesize", produce, coalesce=False)
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(stream.aclose())
+        await cleaning.wait()
+        closing.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await closing
 
     asyncio.run(scenario())
 

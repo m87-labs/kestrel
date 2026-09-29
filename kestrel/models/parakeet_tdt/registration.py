@@ -3,7 +3,8 @@
 from kestrel.models.registry import ModelSpec, register_builtin
 
 from .runtime import ParakeetTdtRuntime
-from .weights import MODEL_ID, REVISION, load_parakeet_tdt
+from .metadata import MODEL_ID, REVISION, TERNARY_MODEL_ID, ULTRA_MODEL_ID
+from .weights import load_parakeet_tdt
 
 
 def _build_orchestrators():
@@ -21,5 +22,9 @@ register_builtin(
         orchestrators=_build_orchestrators,
     )
 )
+
+for model_id in (TERNARY_MODEL_ID, ULTRA_MODEL_ID):
+    register_builtin(ModelSpec(name=model_id, repo_id=model_id,
+        runtime=ParakeetTdtRuntime, orchestrators=_build_orchestrators))
 
 __all__ = ["MODEL_ID", "REVISION", "ParakeetTdtRuntime", "load_parakeet_tdt"]

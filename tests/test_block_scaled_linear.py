@@ -1,5 +1,7 @@
 import pytest
 import torch
+import torch.nn.functional as F
+from types import SimpleNamespace
 
 from kestrel.ops.block_scaled_linear import BlockScaledLinear
 
@@ -13,7 +15,8 @@ def test_block_scaled_linear_forwards_explicit_activation(monkeypatch):
     def project(x, weight, scales, **kwargs):
         seen.append(kwargs["gated_activation"])
         return x.new_empty((1, 512 if kwargs["gated_activation"] else 1024))
-    monkeypatch.setattr(source, "_block_scaled_linear", project)
+    monkeypatch.setattr(source, "get_runtime", lambda device: SimpleNamespace(
+        linear=SimpleNamespace(block_scaled_linear=project)))
     assert module(activation).shape == (1, 1024)
     assert module(activation, gated_activation="silu").shape == (1, 512)
     assert seen == [None, "silu"]
@@ -41,7 +44,8 @@ def test_qwen_mlp_requests_fused_activation_only_for_block_scaled_storage(storag
         assert not fp8
         seen.append(kwargs)
         out.zero_()
-    monkeypatch.setattr(source, "_kestrel_gated_activation_into", separate)
+    monkeypatch.setattr(source, "get_runtime", lambda device: SimpleNamespace(
+        dense=SimpleNamespace(gated_activation_into=separate)))
     assert module(torch.zeros(1, 128)).shape == (1, 512)
     assert seen == ([{"gated_activation": "silu"}] if fp8 else [
         {}, {"activation": "silu", "layout": "interleaved_i8"}])
@@ -67,7 +71,21 @@ def test_block_scaled_linear_preserves_blocks_and_unquantized_tail(rows, quantiz
         expected[quantized:] = module.weight_tail.float()
     torch.testing.assert_close(module.dequantized_weight(torch.float32), expected, rtol=0, atol=0)
     activation = torch.randn(batch, 136)
-    torch.testing.assert_close(module(activation), activation @ expected.T)
+    padded = F.pad(activation, (0, (-activation.shape[1]) % module.block_size))
+    blocks = padded.reshape(batch, -1, module.block_size)
+    scale = (blocks.abs().amax(dim=-1) / 448).clamp_min(1e-6)
+    quantized_activation = (blocks / scale[..., None]).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    )
+    restored = (
+        quantized_activation.float() * scale[..., None]
+    ).reshape(batch, -1)[:, : activation.shape[1]]
+    output = restored @ expected[:quantized].T
+    if quantized < rows:
+        output = torch.cat(
+            (output, activation @ expected[quantized:].T), dim=1
+        )
+    torch.testing.assert_close(module(activation), output)
     assert module.weight.dtype == torch.uint8
     assert module.weight.element_size() == 1
 

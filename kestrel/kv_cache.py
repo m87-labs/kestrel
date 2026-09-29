@@ -12,11 +12,6 @@ from kestrel_kernels import get_runtime
 from kestrel.device import resolve_device, stream_context
 from kestrel.utils import CpuGpuBuffer
 
-_KERNELS = get_runtime()
-reshape_and_cache_flash_cuda = _KERNELS.cache.reshape_and_cache_flash
-build_paged_kv_metadata_runtime = _KERNELS.cache.build_paged_kv_metadata
-
-
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
     return (x + multiple - 1) // multiple
 
@@ -251,7 +246,8 @@ class PagedKVCache(torch.nn.Module):
             key_cache = key_cache.view(torch.uint8)
             value_cache = value_cache.view(torch.uint8)
 
-        if reshape_and_cache_flash_cuda is None:
+        reshape_and_cache = get_runtime(k_view.device).cache.reshape_and_cache_flash
+        if reshape_and_cache is None:
             if self._kv_cache_dtype.startswith("fp8"):
                 raise RuntimeError(
                     "FP8 KV cache update requires a compatible kestrel-kernels build."
@@ -262,7 +258,7 @@ class PagedKVCache(torch.nn.Module):
             key_cache[page_idx, page_off] = k_view
             value_cache[page_idx, page_off] = v_view
         else:
-            reshape_and_cache_flash_cuda(
+            reshape_and_cache(
                 k_view,
                 v_view,
                 key_cache,
@@ -1025,7 +1021,7 @@ class PageTable:
         if batch_size == 0:
             return
 
-        build_paged_kv_metadata_runtime(
+        get_runtime(device).cache.build_paged_kv_metadata(
             self.page_table,
             batch_idx,
             input_pos,

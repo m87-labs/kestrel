@@ -261,7 +261,10 @@ class SinglePassRuntime(Runtime, Protocol):
     Runtimes should return after enqueueing device work when their algorithm
     permits it. A runtime that needs host decisions may finish the forward
     synchronously; that blocks interleaving with other engine lanes until it
-    returns.
+    returns. One that can reliably stop at the enqueue declares
+    ``pipelined = True`` and offers ``launch``/``collect`` beside ``forward``,
+    which lets the executor keep a second cohort in flight; see
+    :class:`~kestrel.engine.single_pass.SinglePassExecutor`.
     """
 
     # Capability names this runtime serves, e.g. ("segment_masks",). The

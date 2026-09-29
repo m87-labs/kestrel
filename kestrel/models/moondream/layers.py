@@ -18,10 +18,6 @@ from ...dense_lora import (
 )
 from kestrel_kernels import get_runtime
 
-_KERNELS = get_runtime()
-_layernorm_bias = _KERNELS.dense.layernorm_bias  # cross-arch (.so on CUDA, Metal on MPS)
-_moe_topk_fwd = _KERNELS.moe.topk_fwd
-
 # Re-export LoRA for convenience
 from .lora import LoRA, MoEMLPLoRA, DenseMLPLoRA  # noqa: F401
 from .lora_workspace import DenseLoRALayerWorkspace, MoELoRALayerWorkspace
@@ -41,7 +37,7 @@ def layer_norm(x: torch.Tensor, w: LayerNormWeights) -> torch.Tensor:
     # Cross-arch: dispatches to the .so kernel on CUDA, the Metal kernel
     # on MPS. The kernel handles Moondream's configs directly and raises
     # on anything unsupported (no torch fallback).
-    return _layernorm_bias(x, w.weight, w.bias)
+    return get_runtime(x.device).dense.layernorm_bias(x, w.weight, w.bias)
 
 
 @dataclass
@@ -51,7 +47,7 @@ class LinearWeights:
 
 
 def linear(x: torch.Tensor, w: LinearWeights) -> torch.Tensor:
-    return _KERNELS.linear.linear(x, w.weight, w.bias)
+    return get_runtime(x.device).linear.linear(x, w.weight, w.bias)
 
 
 @dataclass
@@ -164,8 +160,9 @@ def moe_mlp(
     router = mlp_module["router"]
     fused_mlp = mlp_module["mlp"]
 
-    router_logits = _KERNELS.linear.linear(x_flat, router.weight, router.bias)
-    topk_weights, topk_idxs = _moe_topk_fwd(
+    runtime = get_runtime(x.device)
+    router_logits = runtime.linear.linear(x_flat, router.weight, router.bias)
+    topk_weights, topk_idxs = runtime.moe.topk_fwd(
         router_logits,
         experts_per_token,
         softmax=True,

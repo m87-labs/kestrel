@@ -74,9 +74,6 @@ from .weights import (
 )
 
 _CUTE_JIT_ENABLED_AT_RUNTIME_IMPORT = is_cute_jit_enabled()
-_SAMPLING = get_runtime().sampling
-
-
 _PREFILL_SLOT_COUNT = 2
 _DECODE_SLOT_COUNT = 2
 _CONTROL_TOKEN_CAPACITY = 4
@@ -986,7 +983,7 @@ class WhisperRuntime(UncachedPagedRuntime):
             sequences=sequences,
             batch_idx=batch_idx,
         )
-        _SAMPLING.apply_logits_constraints_(
+        get_runtime(logits.device).sampling.apply_logits_constraints_(
             logits,
             constraints,
             require_packed=self._require_native,
@@ -1520,13 +1517,14 @@ class WhisperRuntime(UncachedPagedRuntime):
                 )
                 with capture_packed_artifact_receipts() as receipt_capture:
                     with stream_context(self._compute_stream):
-                        _SAMPLING.apply_logits_constraints_(
+                        sampling = get_runtime(self.device).sampling
+                        sampling.apply_logits_constraints_(
                             logits,
                             constraints,
                             require_packed=self._require_native,
                         )
                         if self._require_native:
-                            _SAMPLING.greedy_logprobs_from_logits(
+                            sampling.greedy_logprobs_from_logits(
                                 logits,
                                 out=torch.empty(
                                     (1,), dtype=torch.int64, device=self.device

@@ -126,7 +126,7 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         conv1d=SimpleNamespace(weight=torch.ones(1, 1, 3), bias=None),
         in_proj=lambda _: projected, supports_packed_gdn=lambda *args: True,
         causal_conv1d_packed=conv, packed_gated_delta_rule_prefill=recurrence,
-        allocate_packed_gdn_prefill_workspace=lambda *args, **kwargs: object(),
+        allocate_packed_gated_delta_prefill_workspace=lambda *args, **kwargs: object(),
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         norm=lambda value, gate: value, out_proj=lambda value: value)
     concatenations = []
@@ -135,6 +135,8 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         concatenations.append(len(values))
         return original_cat(values, *args, **kwargs)
     monkeypatch.setattr(torch, "cat", concatenate)
+    import kestrel.models.qwen35.qwen_model as qwen_model
+    monkeypatch.setattr(qwen_model, "get_runtime", lambda device: SimpleNamespace(gated_delta=fake))
     invalid = snapshot in ("alias", "overlap")
     with pytest.raises(ValueError, match="separate packed output storage") if invalid else nullcontext():
         output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
@@ -177,7 +179,8 @@ def test_native_packed_continuation_matches_independent_sequences(monkeypatch, l
     module.norm.weight.data = module.norm.weight.data.float()
     module.in_proj = torch.nn.Identity()
     module.out_proj = torch.nn.Identity()
-    native_conv = module.causal_conv1d_packed
+    backend = get_runtime(torch.device('cuda')).gated_delta
+    native_conv = backend.causal_conv1d_packed
     def checked_conv(**kwargs):
         assert kwargs["x"].stride(1) == 1
         output = native_conv(**kwargs)
@@ -187,7 +190,10 @@ def test_native_packed_continuation_matches_independent_sequences(monkeypatch, l
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
         torch.testing.assert_close(kwargs["final_state"], reference_state, rtol=0, atol=0)
         return output
-    module.causal_conv1d_packed = checked_conv
+    from dataclasses import replace
+    import kestrel.models.qwen35.qwen_model as qwen_model
+    patched_backend = replace(backend, causal_conv1d_packed=checked_conv)
+    monkeypatch.setattr(qwen_model, "get_runtime", lambda device: SimpleNamespace(gated_delta=patched_backend))
     width = module.conv_dim + module.value_dim + 2 * module.num_v_heads
     x = torch.randn(1, sum(lengths), width, device="cuda", dtype=torch.bfloat16) * .1
     conv = torch.randn(2, module.conv_dim, 4, device="cuda", dtype=torch.bfloat16) * .1
@@ -367,7 +373,7 @@ def test_duplicate_forward_and_invalid_lengths_rejected_before_kernels():
             sequence_lengths=(8, 7), gdn_state_indices_allocator_owned=True)
 
 
-def test_captured_indices_survive_caller_metadata_reuse():
+def test_captured_indices_survive_caller_metadata_reuse(monkeypatch):
     from kestrel.models.qwen35.qwen_model import _RecurrentPrefixRecord
 
     source, branch = captured()
@@ -382,6 +388,9 @@ def test_captured_indices_survive_caller_metadata_reuse():
         allocate_packed_gdn_prefill_workspace=None,
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         packed_gated_delta_rule_prefill=native)
+    import kestrel.models.qwen35.qwen_model as qwen_model
+    monkeypatch.setattr(qwen_model, "get_runtime", lambda device: SimpleNamespace(gated_delta=SimpleNamespace(
+        allocate_packed_gated_delta_prefill_workspace=None, packed_gated_delta_rule_prefill=native)))
     for index in range(2):
         branch._prefix_records[index] = _RecurrentPrefixRecord.capture(
             module, torch.zeros(1, 16, 8 + index * 8), torch.zeros(1, 16, 2),

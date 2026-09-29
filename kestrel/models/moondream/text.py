@@ -27,13 +27,24 @@ from .rope import precompute_freqs_cis
 from ...dense_lora import DenseLoRATorchMLPScratch
 from kestrel_kernels import get_runtime
 
-_KERNELS = get_runtime()
-_flash_attn_fwd = _KERNELS.attention.flash_attn_fwd
-cute_block_bidirectional_mask = _KERNELS.attention.block_bidirectional_mask
-tau_tail_apply_into = _KERNELS.tau.tau_tail_apply_into
-rotary_embedding = _KERNELS.rotary.rotary_embedding
-_fused_linear_bias_residual_into = _KERNELS.vision.fused_linear_bias_residual_into
-_kestrel_linear = _KERNELS.linear.linear
+def tau_tail_apply_into(**kwargs) -> None:
+    get_runtime(kwargs["qkv_out"].device).tau.tau_tail_apply_into(**kwargs)
+
+
+def rotary_embedding(
+    position_ids: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+) -> None:
+    get_runtime(q.device).rotary.rotary_embedding(
+        position_ids, q, k, head_dim, cos_sin_cache
+    )
+
+
+def _kestrel_linear(x: torch.Tensor, *args, **kwargs):
+    return get_runtime(x.device).linear.linear(x, *args, **kwargs)
 
 
 def text_encoder(input_ids: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -90,6 +101,7 @@ def attn(
 ) -> torch.Tensor:
     bsz, q_len, d_model = x.shape
     head_dim = d_model // n_heads
+    runtime = get_runtime(x.device)
 
     if position_ids.ndim == 1:
         position_matrix = position_ids.view(-1, 1)
@@ -153,9 +165,9 @@ def attn(
             if block_sequence_ids is None:
                 raise RuntimeError("use_prefix_attn requires block_sequence_ids")
             causal = False
-            mask_mod = cute_block_bidirectional_mask
+            mask_mod = runtime.attention.block_bidirectional_mask
             aux_tensors = [block_sequence_ids]
-        out, _ = _flash_attn_fwd(
+        out, _ = runtime.attention.flash_attn_fwd(
             q,
             k_cache,
             v_cache,
@@ -171,7 +183,7 @@ def attn(
             v_scale=v_scale,
         )
     else:
-        out, _ = _flash_attn_fwd(
+        out, _ = runtime.attention.flash_attn_fwd(
             q,
             k_cache,
             v_cache,
@@ -186,7 +198,7 @@ def attn(
 
     out = out.view(bsz, q_len, d_model)
     if residual is not None:
-        _fused_linear_bias_residual_into(
+        runtime.vision.fused_linear_bias_residual_into(
             x=out, w=module.proj.weight, b=module.proj.bias,
             residual=residual, out=residual,
         )
