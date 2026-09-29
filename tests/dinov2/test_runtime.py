@@ -462,3 +462,17 @@ def test_generic_handle_run() -> None:
         "task": "embed",
         "inputs": {"pixel_values": pixels},
     }
+
+
+def test_compiled_pixels_cast_on_cpu_and_reject_other_device():
+    compiled = _FakeCompiled(Dinov2ExecutableCapability(
+        device=torch.device("cpu"), dtype=torch.bfloat16))
+    runtime = Dinov2Runtime(_cfg(dtype=torch.bfloat16), processor=_FakeProcessor(),
+                            compiled_executable=compiled)
+    pixels = torch.randn(1, 3, 224, 224).transpose(2, 3)
+    prepared = runtime._pixel_values({"pixel_values": pixels})
+    assert prepared.device.type == "cpu" and prepared.dtype == torch.bfloat16
+    assert prepared.is_contiguous()
+    torch.testing.assert_close(prepared.float(), pixels.to(torch.bfloat16).float())
+    with pytest.raises(ValueError, match="model device/dtype"):
+        runtime._pixel_values({"pixel_values": torch.empty(1, 3, 224, 224, device="meta")})

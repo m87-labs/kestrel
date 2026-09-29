@@ -394,6 +394,11 @@ sent.
 Local inference is free and requires no API key. Finetuned-model inference
 requires a Moondream API key — see [moondream.ai/pricing](https://moondream.ai/pricing).
 
+For the DINOv2 Hopper route, supplied GPU `pixel_values` must already be contiguous
+BF16 on the model device. CPU preprocessing casts before transfer. The native
+Torch fallback continues to accept floating-point tensors and converts them to
+its configured device and dtype.
+
 ### RF-DETR detection
 
 RF-DETR runs through the single-pass detection API on Hopper with BF16:

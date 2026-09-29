@@ -188,6 +188,17 @@ class Dinov2Runtime:
             )
         if not pixels.is_floating_point():
             raise TypeError("pixel_values must be floating point")
+        if self._use_compiled:
+            # Cast on the host before transfer, keeping the prepared GPU forward
+            # free of separate conversion or layout-copy kernels.
+            if pixels.device.type == "cpu":
+                return pixels.to(dtype=self.dtype).contiguous().to(self.device)
+            if (pixels.device != self.device or pixels.dtype != self.dtype
+                    or not pixels.is_contiguous()):
+                raise ValueError(
+                    "compiled pixel_values must be contiguous and match the model device/dtype"
+                )
+            return pixels
         return pixels.to(device=self.device, dtype=self.dtype)
 
     @torch.inference_mode()
