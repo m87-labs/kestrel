@@ -1,4 +1,4 @@
-"""Qwen 3.5/3.6 hybrid model support for the Kestrel inference engine."""
+"""Qwen 3.5/3.6/3.8 hybrid model support for the Kestrel inference engine."""
 
 from kestrel.models.registry import ModelSpec, register_builtin
 

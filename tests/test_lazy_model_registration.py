@@ -20,6 +20,8 @@ from kestrel.models import known_models
 names = known_models()
 assert names == sorted(set(names))
 assert "Qwen/Qwen3.5-27B-FP8" in names
+assert "Qwen/Qwen3.8-27B" in names
+assert "Qwen/Qwen3.8-27B-FP8" in names
 assert "moondream3.1-9B-A2B" in names
 assert "nvidia/parakeet-tdt-0.6b-v3" in names
 assert "hexgrad/Kokoro-82M" in names
@@ -31,6 +33,8 @@ for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "wh
 
 @pytest.mark.parametrize("name,family,runtime_name", [
     ("Qwen/Qwen3.5-27B-FP8", "qwen35", "Qwen35Runtime"),
+    ("Qwen/Qwen3.8-27B", "qwen35", "Qwen35Runtime"),
+    ("Qwen/Qwen3.8-27B-FP8", "qwen35", "Qwen35Runtime"),
     ("google/gemma-4-31B-it", "gemma4", "Gemma4Runtime"),
     ("moondream3.1-9B-A2B", "moondream", "MoondreamRuntime"),
     ("Qwen/Qwen3-ASR-0.6B", "qwen3_asr", "Qwen3AsrRuntime"),

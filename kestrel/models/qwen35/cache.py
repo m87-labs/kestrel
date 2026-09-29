@@ -22,12 +22,15 @@ def _finalize_recurrent_prefixes(records, accepted_lengths):
 
     ordered = tuple(records[index] for index in sorted(records))
     count = accepted_lengths.numel()
+    block = ordered[0].conv_input.shape[-1] // count - ordered[0].module.conv_kernel_size + 1
+    if not 1 <= block <= 64:
+        raise ValueError("packed prefix must fit one recurrence chunk")
     for record in ordered:
         history, initial = record.conv_input, record.initial_state
         width = record.module.conv_kernel_size
         if (type(width) is not int or width < 1
                 or history.ndim != 3 or history.shape[0] != 1
-                or history.shape[-1] != count * (16 + width - 1)
+                or history.shape[-1] != count * (block + width - 1)
                 or initial.shape[0] != count
                 or history.device != initial.device or history.dtype != initial.dtype):
             raise ValueError("packed prefix convolution history geometry changed")
@@ -43,7 +46,7 @@ def _finalize_recurrent_prefixes(records, accepted_lengths):
         if width not in positions:
             positions[width] = lengths[:, None] - 1 + torch.arange(
                 width, device=lengths.device, dtype=torch.int64)[None, :]
-        rows = record.conv_input.squeeze(0).unflatten(-1, (count, 16 + width - 1)).transpose(0, 1)
+        rows = record.conv_input.squeeze(0).unflatten(-1, (count, block + width - 1)).transpose(0, 1)
         history = torch.gather(rows, 2, positions[width][:, None, :].expand(count, rows.shape[1], width))
         # Captured outputs retain these source views once per graph entry.
         for row in range(count):
@@ -250,19 +253,22 @@ class Qwen35InferenceCache:
                            for value in _destinations for source, branch in zip(sources, caches))):
                 raise ValueError("prefix destinations must be distinct inactive cache banks")
         count = len(caches)
+        block = caches[0].seq_length - caches[0]._prefix_start
+        if not 1 <= block <= 64:
+            raise ValueError("packed prefix must fit one recurrence chunk")
         conv_shapes = []
         for index in indices:
             record = records[index]
-            if record.qkv.shape[1] != count * 16 or record.initial_state.shape[0] != count:
+            if record.qkv.shape[1] != count * block or record.initial_state.shape[0] != count:
                 raise ValueError("packed prefix state geometry changed")
             conv_shapes.append((1, record.conv_input.shape[1], record.module.conv_kernel_size))
         for row, (cache, source, length) in enumerate(zip(caches, sources, lengths)):
             if (cache._prefix_records is not records or cache._prefix_row != row
                     or source.seq_length != cache._prefix_start
-                    or cache.seq_length != cache._prefix_start + 16):
+                    or cache.seq_length != cache._prefix_start + block):
                 raise RuntimeError("packed prefix source or row ownership changed")
-            if type(length) is not int or not 1 <= length <= 16:
-                raise ValueError("accepted prefix length must be in [1,16]")
+            if type(length) is not int or not 1 <= length <= block:
+                raise ValueError(f"accepted prefix length must be in [1,{block}]")
             if tuple(i for i, layer in enumerate(source.layers)
                      if isinstance(layer, LinearAttentionState)) != indices:
                 raise ValueError("packed prefix recurrent layer layout changed")

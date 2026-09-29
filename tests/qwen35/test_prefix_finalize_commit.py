@@ -12,16 +12,17 @@ def _paired_outputs(records, lengths, states):
     outputs = []
     for record, state in zip(records.values(), states, strict=True):
         width = record.module.conv_kernel_size
+        block = record.qkv.shape[1] // lengths.numel()
         history = torch.cat([
-            record.conv_input[..., row * (16 + width - 1) + length - 1:
-                              row * (16 + width - 1) + length - 1 + width]
+            record.conv_input[..., row * (block + width - 1) + length - 1:
+                              row * (block + width - 1) + length - 1 + width]
             for row, length in enumerate(lengths.tolist())], dim=0).contiguous()
         for row in range(lengths.numel()):
             outputs.extend((state[row:row + 1], history[row:row + 1]))
     return tuple(outputs)
 
 
-def _packed_prefixes(count=2, layers=1):
+def _packed_prefixes(count=2, layers=1, block=16):
     config = SimpleNamespace(layer_types=("linear_attention",) * layers)
     sources = []
     for row in range(count):
@@ -34,20 +35,22 @@ def _packed_prefixes(count=2, layers=1):
         sources.append(source)
     _, branches = Qwen35InferenceCache.fork_packed_recurrent_state(sources)
     records = {index: SimpleNamespace(
-        prefix_context=object(), qkv=torch.zeros(1, count * 16, 2),
+        prefix_context=object(), qkv=torch.zeros(1, count * block, 2),
         initial_state=torch.zeros(count, 2, 3, 3, dtype=torch.bfloat16),
-        conv_input=(torch.arange(count * 38).reshape(1, 2, count * 19)
+        conv_input=(torch.arange(count * 2 * (block + 3)).reshape(1, 2, count * (block + 3))
                     + index * 1000).to(torch.bfloat16),
         module=SimpleNamespace(conv_kernel_size=4)) for index in range(layers)}
     for branch in branches:
         branch._prefix_records = records
-        branch.advance_to(branch._prefix_start + 16)
+        branch.advance_to(branch._prefix_start + block)
     return sources, branches, records[0]
 
 
 @pytest.mark.parametrize("lengths", [(1, 16), (16, 16), (7, 3)])
-def test_packed_prefix_commit_keeps_sources_and_separate_rows(lengths):
-    sources, branches, record = _packed_prefixes()
+@pytest.mark.parametrize("block", [8, 16, 32, 64])
+def test_packed_prefix_commit_keeps_sources_and_separate_rows(lengths, block):
+    lengths = tuple(min(length, block) for length in lengths)
+    sources, branches, record = _packed_prefixes(block=block)
     snapshots = [(source.layers[0].conv_states.clone(),
                   source.layers[0].recurrent_states.clone()) for source in sources]
 
@@ -67,7 +70,7 @@ def test_packed_prefix_commit_keeps_sources_and_separate_rows(lengths):
         assert torch.equal(source.layers[0].conv_states, before[0])
         assert torch.equal(source.layers[0].recurrent_states, before[1])
         assert torch.all(result.layers[0].recurrent_states == length)
-        start = row * 19 + length - 1
+        start = row * (block + 3) + length - 1
         assert torch.equal(result.layers[0].conv_states, record.conv_input[..., start:start + 4])
         assert branch._prefix_source is None and not branch._prefix_records
     committed[0].layers[0].recurrent_states.zero_()

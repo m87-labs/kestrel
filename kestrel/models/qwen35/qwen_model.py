@@ -629,7 +629,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             allocate=gated_delta.allocate_packed_gated_delta_prefill_workspace,
         )
         prefix_context = None
-        if capture_prefix and all(length == 16 for length in sequence_lengths):
+        if (capture_prefix and len(set(sequence_lengths)) == 1
+                and 1 <= sequence_lengths[0] <= 64):
             prefix_context = gated_delta.allocate_packed_gated_delta_prefix_context(
                 workspace, initial_state, recurrence_cu_seqlens,
                 sequence_lengths=sequence_lengths, topology_token=topology_token)
