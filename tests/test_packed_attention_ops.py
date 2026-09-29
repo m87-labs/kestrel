@@ -20,7 +20,7 @@ def test_distinct_query_key_boundaries_are_forwarded(monkeypatch):
         assert kwargs["cu_seqlens_k"] is cu_k
         return torch.zeros_like(query), None
 
-    monkeypatch.setattr(attention, "get_runtime", lambda: SimpleNamespace(
+    monkeypatch.setattr(attention, "get_runtime", lambda device: SimpleNamespace(
         attention=SimpleNamespace(flash_attn_fwd=forward)))
     result = attention.dense_attention(q, k, v, scaling=.25, causal=False,
                                       cu_seqlens=cu_q, cu_seqlens_k=cu_k)
