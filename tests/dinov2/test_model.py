@@ -128,8 +128,9 @@ def test_position_interpolation_is_cached_under_inference() -> None:
     torch.testing.assert_close(reloaded, first * 2.0)
 
     with torch.enable_grad():
-        grad_path = model.embeddings.interpolate_pos_encoding(embeddings, 4, 6)
-    assert grad_path.grad_fn is not None  # never served from the detached cache
+        cached = model.embeddings.interpolate_pos_encoding(embeddings, 4, 6)
+    assert cached is reloaded
+    assert cached.grad_fn is None  # inference-only preprocessing even under an outer grad context
 
 
 @pytest.mark.parametrize(

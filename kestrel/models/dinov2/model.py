@@ -63,16 +63,13 @@ class Dinov2Embeddings(nn.Module):
             torch.empty(1, config.num_position_embeddings, config.hidden_size)
         )
         self.patch_size = config.patch_size
-        # Inference-time resample cache: serving a fixed non-518 crop re-derives the same
-        # bicubic table every forward (the 224 crop never hits the equal-size early
-        # return). Keyed on the source table's identity facts so a device/dtype move or a
-        # weight reload recomputes; caching reuses the identical tensor, so outputs stay
-        # bitwise equal to the uncached path. Populated only under no_grad/inference --
-        # a grad-enabled caller must keep the autograd edge to the parameter.
+        # Cache fixed-resolution positions; the parameter version invalidates
+        # them after a checkpoint reload. This model supports inference only.
         self._resampled_positions: dict[tuple, torch.Tensor] = {}
         nn.init.trunc_normal_(self.cls_token, std=config.initializer_range)
         nn.init.trunc_normal_(self.position_embeddings, std=config.initializer_range)
 
+    @torch.no_grad()
     def interpolate_pos_encoding(
         self,
         embeddings: torch.Tensor,
@@ -93,10 +90,9 @@ class Dinov2Embeddings(nn.Module):
             table.data_ptr(),
             table._version,
         )
-        if not torch.is_grad_enabled():
-            cached = self._resampled_positions.get(cache_key)
-            if cached is not None:
-                return cached
+        cached = self._resampled_positions.get(cache_key)
+        if cached is not None:
+            return cached
 
         base_grid = math.isqrt(num_positions)
         if base_grid * base_grid != num_positions:
@@ -120,8 +116,7 @@ class Dinov2Embeddings(nn.Module):
         ).to(target_dtype)
         patch_positions = patch_positions.permute(0, 2, 3, 1).reshape(1, -1, dim)
         resampled = torch.cat((class_position, patch_positions), dim=1)
-        if not torch.is_grad_enabled():
-            self._resampled_positions[cache_key] = resampled
+        self._resampled_positions[cache_key] = resampled
         return resampled
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:

@@ -110,15 +110,12 @@ def _copy_checkpoint_into_model(
     provided = set(checkpoint_state)
     missing = expected - provided
     unexpected = provided - expected - _IGNORED_CHECKPOINT_KEYS
-    ignored_missing = _IGNORED_CHECKPOINT_KEYS - provided
-    if missing or unexpected or ignored_missing:
+    if missing or unexpected:
         parts = []
         if missing:
             parts.append(f"missing={sorted(missing)}")
         if unexpected:
             parts.append(f"unexpected={sorted(unexpected)}")
-        if ignored_missing:
-            parts.append(f"expected training-only keys absent={sorted(ignored_missing)}")
         raise RuntimeError("invalid DINOv2 checkpoint keys: " + "; ".join(parts))
 
     shape_errors = [
@@ -162,7 +159,11 @@ def load_dinov2(
     processor_config = Dinov2ProcessorConfig.from_json_file(files.processor_config)
     processor_config.validate_v1()
 
-    model = Dinov2Model(model_config).to(device=device, dtype=dtype)
+    # Checkpoint loading overwrites every inference parameter; avoid allocating
+    # and randomly initializing a second full model before that copy.
+    with torch.device("meta"):
+        model = Dinov2Model(model_config).to(dtype=dtype)
+    model.to_empty(device=device)
     from safetensors.torch import load_file
 
     checkpoint_state = load_file(str(files.weights), device="cpu")

@@ -51,7 +51,7 @@ def test_checkpoint_copy_is_strict_and_ignores_only_mask_token() -> None:
         torch.testing.assert_close(destination.state_dict()[name], tensor)
 
 
-@pytest.mark.parametrize("fault", ["missing", "unexpected", "shape", "mask"])
+@pytest.mark.parametrize("fault", ["missing", "unexpected", "shape"])
 def test_checkpoint_copy_refuses_invalid_tensors(fault: str) -> None:
     model = _small_model()
     checkpoint = _checkpoint_for(model)
@@ -64,9 +64,6 @@ def test_checkpoint_copy_refuses_invalid_tensors(fault: str) -> None:
     elif fault == "shape":
         checkpoint["layernorm.weight"] = torch.zeros(17)
         pattern = "checkpoint.*model"
-    else:
-        del checkpoint["embeddings.mask_token"]
-        pattern = "training-only"
     with pytest.raises(RuntimeError, match=pattern):
         _copy_checkpoint_into_model(model, checkpoint)
 
@@ -87,3 +84,22 @@ def test_checkpoint_file_path_preserves_hub_symlink_name(tmp_path: Path) -> None
     assert files.root == snapshot.resolve()
     assert files.weights.name == WEIGHTS_FILENAME
     assert files.weights.resolve() == blob.resolve()
+
+
+def test_inference_checkpoint_does_not_require_pretraining_mask_token():
+    source = _small_model()
+    destination = _small_model()
+    _copy_checkpoint_into_model(destination, source.state_dict())
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(destination.state_dict()[name], value)
+
+
+def test_meta_model_materialization_loads_every_inference_parameter():
+    source = _small_model()
+    with torch.device("meta"):
+        destination = Dinov2Model(source.config).to(dtype=torch.float32)
+    assert all(p.is_meta for p in destination.parameters())
+    destination.to_empty(device="cpu")
+    _copy_checkpoint_into_model(destination, source.state_dict())
+    pixels = torch.randn(1, 3, 8, 8)
+    torch.testing.assert_close(destination(pixels).last_hidden_state, source(pixels).last_hidden_state)
