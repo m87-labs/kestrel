@@ -4,6 +4,17 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.9.0 — 2026-09-29
+
+- Added Qwen3.8-27B BF16 and FP8 checkpoints to Photon local inference.
+- Added DFlash2 speculative decoding, including generated verification on
+  NVIDIA B200 for one or two concurrent requests with
+  `decode_path="generated"` and `page_size=1`.
+- Improved speculative request handling for independent sessions and
+  corrected sliding-window attention in DFlash drafting.
+- Updated to `kestrel-kernels` 0.7.4 with precompiled kernels for the new
+  model and speculative workloads.
+
 ## 0.8.2 — 2026-09-24
 
 - Speech: the Parakeet checkpoints we publish now track their repository instead of a
