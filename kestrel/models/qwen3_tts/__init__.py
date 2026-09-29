@@ -1,27 +1,20 @@
 """Qwen3-TTS CustomVoice support for Kestrel."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
+
+from kestrel.models.registry import register_lazy
 
 from .config import SUPPORTED_CHECKPOINTS
-from .runtime import Qwen3TTSRuntime
 
-
-def _build_skill_registry():
-    from .skill import build_skill_registry
-
-    return build_skill_registry()
-
-
-for repo_id, revision in SUPPORTED_CHECKPOINTS.items():
-    register(
-        ModelSpec(
-            name=repo_id,
-            repo_id=repo_id,
-            revision=revision,
-            runtime=Qwen3TTSRuntime,
-            skills=_build_skill_registry,
-        )
-    )
+register_lazy(list(SUPPORTED_CHECKPOINTS), __name__ + ".registration")
 
 
 __all__ = ["SUPPORTED_CHECKPOINTS", "Qwen3TTSRuntime"]
+
+
+def __getattr__(name):
+    if name != "Qwen3TTSRuntime":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(".runtime", __name__), name)
+    globals()[name] = value
+    return value

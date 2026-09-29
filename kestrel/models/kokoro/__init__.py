@@ -1,30 +1,17 @@
 """Inference-only direct Kokoro-82M support."""
 
-from kestrel.models.registry import ModelSpec, register
+from importlib import import_module
 
-from .runtime import KokoroRuntime, create_kokoro_runtime
-from .weights import (
+from kestrel.models.registry import register_lazy
+
+from .metadata import (
     DEFAULT_KOKORO_MODEL,
     DEFAULT_KOKORO_REPO_ID,
     DEFAULT_KOKORO_REVISION,
 )
 
 
-def _build_orchestrators():
-    from .orchestrator import build_orchestrators
-
-    return build_orchestrators()
-
-
-register(
-    ModelSpec(
-        name=DEFAULT_KOKORO_MODEL,
-        repo_id=DEFAULT_KOKORO_REPO_ID,
-        revision=DEFAULT_KOKORO_REVISION,
-        runtime=create_kokoro_runtime,
-        orchestrators=_build_orchestrators,
-    )
-)
+register_lazy([DEFAULT_KOKORO_MODEL], __name__ + ".registration")
 
 
 __all__ = [
@@ -34,3 +21,11 @@ __all__ = [
     "KokoroRuntime",
     "create_kokoro_runtime",
 ]
+
+
+def __getattr__(name):
+    if name not in ("KokoroRuntime", "create_kokoro_runtime"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(".runtime", __name__), name)
+    globals()[name] = value
+    return value

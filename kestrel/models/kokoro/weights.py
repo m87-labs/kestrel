@@ -10,11 +10,9 @@ import torch
 
 from .config import KokoroConfig
 from .model import KokoroModel
+from .metadata import DEFAULT_KOKORO_MODEL, DEFAULT_KOKORO_REPO_ID, DEFAULT_KOKORO_REVISION
 
 
-DEFAULT_KOKORO_MODEL = "hexgrad/Kokoro-82M"
-DEFAULT_KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
-DEFAULT_KOKORO_REVISION = "f3ff3571791e39611d31c381e3a41a3af07b4987"
 CONFIG_FILENAME = "config.json"
 WEIGHTS_FILENAME = "kokoro-v1_0.pth"
 
