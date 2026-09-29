@@ -79,8 +79,11 @@ def test_packed_prefix_records_split_independent_histories():
 
 @pytest.mark.parametrize("state_indices", [(1, 0), (1, 1)])
 @pytest.mark.parametrize("snapshot", [None, "packed", "alias", "overlap"])
-def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, state_indices, snapshot):
+@pytest.mark.parametrize("prefix_block", [False, True])
+def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, state_indices, snapshot, prefix_block):
     observed = {}
+    lengths = (16, 16) if prefix_block else (2, 3)
+    tokens = sum(lengths)
     layer = SimpleNamespace(
         conv_states=torch.tensor([[[10., 11., 12.]], [[20., 21., 22.]]]),
         recurrent_states=torch.tensor([10., 20.], dtype=torch.bfloat16).view(2, 1, 1, 1),
@@ -117,9 +120,12 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         assert qkv.is_contiguous()
         observed["qkv"] = qkv.clone()
         observed["initial"] = kwargs["initial_state"]
-        return torch.zeros(1, 5, 1), None
-    projected = torch.zeros(1, 5, 4)
-    projected[0, :, 0] = torch.arange(1, 6)
+        assert kwargs["output_final_state"] is not prefix_block
+        assert (kwargs["final_state"] is None) == prefix_block
+        assert (kwargs["final_state_indices"] is None) == prefix_block
+        return torch.zeros(1, tokens, 1), None
+    projected = torch.zeros(1, tokens, 4)
+    projected[0, :, 0] = torch.arange(1, tokens + 1)
     fake = SimpleNamespace(layer_idx=0, num_k_heads=1, num_v_heads=1,
         head_k_dim=1, head_v_dim=1, conv_dim=1, conv_kernel_size=3, value_dim=1,
         activation="silu", A_log=torch.zeros(1), dt_bias=torch.zeros(1),
@@ -127,6 +133,7 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
         in_proj=lambda _: projected, supports_packed_gdn=lambda *args: True,
         causal_conv1d_packed=conv, packed_gated_delta_rule_prefill=recurrence,
         allocate_packed_gated_delta_prefill_workspace=lambda *args, **kwargs: object(),
+        allocate_packed_gated_delta_prefix_context=lambda *args, **kwargs: object(),
         _prefill_workspace_cache=SimpleNamespace(get=lambda *args, **kwargs: object()),
         norm=lambda value, gate: value, out_proj=lambda value: value)
     concatenations = []
@@ -139,15 +146,18 @@ def test_packed_continuation_keeps_convolution_histories_separate(monkeypatch, s
     monkeypatch.setattr(qwen_model, "get_runtime", lambda device: SimpleNamespace(gated_delta=fake))
     invalid = snapshot in ("alias", "overlap")
     with pytest.raises(ValueError, match="separate packed output storage") if invalid else nullcontext():
-        output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, 5, 1),
-            cache_params=cache, cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
-            sequence_lengths=(2, 3), topology_token=object(),
+        output = Qwen3_5GatedDeltaNet.forward(fake, torch.zeros(1, tokens, 1),
+            cache_params=cache, cu_seq_lens_q=torch.tensor([0, lengths[0], tokens], dtype=torch.int32),
+            sequence_lengths=lengths, topology_token=object(),
             gdn_state_indices=torch.tensor(state_indices), gdn_state_indices_allocator_owned=True)
     if invalid:
         return
     if snapshot == "packed":
         assert observed["initial"] is initial
-    assert output.shape == (1, 5, 1)
+    assert output.shape == (1, tokens, 1)
+    if prefix_block:
+        assert cache._prefix_records[0].prefix_context is not None
+        return
     assert concatenations[0] == 4  # Prefix/token pairs need no intermediate copies.
     assert observed["conv_stride"][1] == 1
     assert observed["conv"].flatten().tolist() == [11, 12, 1, 2, 21, 22, 3, 4, 5]
