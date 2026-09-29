@@ -31,8 +31,6 @@ class ModelSpec:
     # model. Kwargs (e.g. ``max_lora_rank``) are forwarded from the
     # engine's runtime-construction path.
     runtime: Callable[..., "Runtime"]
-    # A model without paged KV state need not allocate a KV pool.
-    needs_kv_pool: bool = True
     # Factory for the model's capabilities. Returns the
     # :class:`~kestrel.skills.SkillRegistry` this model serves. Static
     # metadata — callable without building the (GPU) runtime — so the
@@ -59,6 +57,8 @@ class ModelSpec:
     orchestrators: Callable[
         [], "Mapping[str, CapabilityOrchestrator]"
     ] = lambda: _empty_orchestrators()
+    # A model without paged KV state need not allocate a KV pool.
+    needs_kv_pool: bool = True
 
 
 def _empty_skill_registry() -> "SkillRegistry":

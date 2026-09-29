@@ -393,3 +393,41 @@ sent.
 
 Local inference is free and requires no API key. Finetuned-model inference
 requires a Moondream API key — see [moondream.ai/pricing](https://moondream.ai/pricing).
+
+### RF-DETR detection
+
+RF-DETR runs through the single-pass detection API on Hopper with BF16:
+
+```python
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
+
+engine = await InferenceEngine.create(RuntimeConfig(model="rfdetr-nano"))
+result = await engine.model("rfdetr-nano").detect(image=image, threshold=0.5)
+print(result.output["objects"])
+await engine.shutdown()
+```
+
+Available model names are `rfdetr-nano`, `rfdetr-small`, `rfdetr-medium`,
+`rfdetr-base`, `rfdetr-large`, `rfdetr-xlarge`, and `rfdetr-2xlarge`.
+Large means the current single-P4 model, not DeprecatedLarge. Each variant uses
+its checkpoint's fixed resolution and batch size one. Unsupported devices or
+precisions fail at startup; this route requires the corresponding artifacts in
+`kestrel-kernels`.
+
+`image` accepts RGB PIL images, encoded image bytes, HWC NumPy arrays, or CPU CHW
+tensors. Floating-point pixels must be in `[0, 1]`. Alternatively, `pixel_values`
+accepts preprocessed `[1, 3, resolution, resolution]` tensors. GPU inputs must
+already be contiguous BF16 on the model device. Resizing and ImageNet normalization
+run on CPU before the input transfer; the detector itself uses one GPU launch.
+
+Each object contains normalized `x_min`, `y_min`, `x_max`, `y_max`, `score`,
+`class_id`, and `label`. Classes use the original sparse COCO IDs, including
+`90` for toothbrush; unused IDs have an empty label. This is fixed-vocabulary
+detection, not an open-vocabulary `object=` prompt. `threshold` defaults to `0.5`;
+`max_objects` caps results at 300. There is no NMS.
+
+Use `model_path` to supply a checkpoint. Nano through Large download the released
+COCO checkpoint when no path is provided. XL and 2XL currently require an explicit
+path to their released checkpoint. Custom class vocabularies and segmentation
+checkpoints are not supported by these declared executables.
