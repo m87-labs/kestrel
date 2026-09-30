@@ -4,6 +4,12 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.9.2 — 2026-09-30
+
+- Added DINOv2 embeddings and RF-DETR object detection through the public
+  inference interface, using generated single-launch kernels on H100.
+- Updated to `kestrel-kernels` 0.7.5 and `kestrel-native` 0.1.9.
+
 ## 0.9.1 - 2026-09-29
 
 - Automatically select generated DFlash verification on B200 when the target,
