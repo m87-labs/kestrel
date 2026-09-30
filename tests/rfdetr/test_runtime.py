@@ -67,7 +67,7 @@ def test_registry_all_current_variants_without_kv():
 
 def test_lease_owned_until_cpu_result_created():
     class Executable:
-        closed = False
+        close_calls = 0
         active = False
         @contextmanager
         def borrow_outputs(self, pixels):
@@ -79,7 +79,7 @@ def test_lease_owned_until_cpu_result_created():
             logits.fill_(float('nan'))
             self.active = False
         def close(self):
-            self.closed = True
+            self.close_calls += 1
     executable = Executable()
     runtime = RFDetrRuntime(name='rfdetr-nano', config=CONFIGS['nano'], executable=executable, device=torch.device('cpu'))
     result, = runtime.forward('detect', ({'image': Image.new('RGB', (4, 4))},))
@@ -87,7 +87,7 @@ def test_lease_owned_until_cpu_result_created():
     assert not executable.active
     runtime.shutdown()
     runtime.shutdown()
-    assert executable.closed
+    assert executable.close_calls == 1
     with pytest.raises(RuntimeError):
         runtime.forward('detect', ({'image': Image.new('RGB', (4, 4))},))
 
@@ -156,3 +156,13 @@ def test_invalid_request_fails_before_launch(options):
                             executable=None, device=torch.device('cpu'))
     with pytest.raises(ValueError):
         runtime.forward('detect', ({'image': Image.new('RGB', (4, 4)), **options},))
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), 1e39, -1e39])
+def test_cpu_pixels_must_remain_finite_after_conversion(value):
+    runtime = RFDetrRuntime(name='rfdetr-nano', config=CONFIGS['nano'],
+                           executable=None, device=torch.device('cpu'))
+    pixels = torch.zeros((1, 3, 384, 384), dtype=torch.float64)
+    pixels[0, 0, 0, 0] = value
+    with pytest.raises(ValueError, match='finite after BF16 conversion'):
+        runtime.forward('detect', ({'pixel_values': pixels},))

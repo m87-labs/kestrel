@@ -91,9 +91,10 @@ class RFDetrRuntime:
         # CPU casting avoids a separate GPU conversion kernel. Already prepared
         # GPU pixels must use the executable's BF16 dtype and contiguous layout.
         if pixels.device.type == 'cpu':
+            pixels = pixels.to(dtype=self.dtype).contiguous()
             if not torch.isfinite(pixels).all():
-                raise ValueError('pixel_values must be finite')
-            pixels = pixels.to(dtype=self.dtype).contiguous().to(self.device)
+                raise ValueError('pixel_values must be finite after BF16 conversion')
+            pixels = pixels.to(self.device)
         elif pixels.device != self.device or pixels.dtype != self.dtype or not pixels.is_contiguous():
             raise ValueError('GPU pixel_values must be contiguous BF16 on the model device')
         with self.executable.borrow_outputs(pixels) as (boxes, logits):
