@@ -1,4 +1,4 @@
-"""Independent greedy DFlash sessions with native sequence verification."""
+"""Independent greedy DFlash sessions with automatic target verification."""
 
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager
@@ -59,9 +59,11 @@ class Qwen35DFlashDecoder:
         self._commit_ready = torch.cuda.Event()
         self._commit_pending = False
         self._generated_verification = None
-        if runtime.decode_path == "generated":
-            from .generated_verification import Qwen35GeneratedVerification
+        from .generated_verification import Qwen35GeneratedVerification
 
+        if (runtime.decode_path == "generated" or
+                (runtime.decode_path == "auto" and
+                 Qwen35GeneratedVerification.supports(runtime, self.draft))):
             self._generated_verification = Qwen35GeneratedVerification(runtime, self.draft)
             self._generated_verifiers = {1: self._generated_verification}
             for sequences in range(2, runtime.max_batch_size + 1):

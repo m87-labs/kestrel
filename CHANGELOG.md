@@ -4,6 +4,12 @@ All notable changes since `v0.1.2` are documented in this file.
 
 ## Unreleased
 
+## 0.9.1 - 2026-09-29
+
+- Automatically select generated DFlash verification on B200 when the target,
+  draft checkpoint, page layout, and configured concurrency are supported.
+  Compatible requests no longer need `decode_path="generated"`.
+
 ## 0.9.0 — 2026-09-29
 
 - Added Qwen3.8-27B BF16 and FP8 checkpoints to Photon local inference.
