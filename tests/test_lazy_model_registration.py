@@ -25,8 +25,10 @@ assert "Qwen/Qwen3.8-27B-FP8" in names
 assert "moondream3.1-9B-A2B" in names
 assert "nvidia/parakeet-tdt-0.6b-v3" in names
 assert "hexgrad/Kokoro-82M" in names
+assert "dinov2-small" in names
+assert "rfdetr-2xlarge" in names
 assert "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" in names
-for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts"):
+for family in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts", "dinov2", "rfdetr"):
     assert f"kestrel.models.{family}.runtime" not in sys.modules, family
 ''')
 
@@ -51,7 +53,7 @@ spec = get_spec({name!r})
 assert spec.runtime is getattr(import_module("kestrel.models." + {family!r}), {runtime_name!r})
 assert get_spec({name!r}) is spec
 assert known_models() == before
-for other in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts"):
+for other in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts", "dinov2", "rfdetr"):
     if other != {family!r}:
         assert f"kestrel.models.{{other}}.runtime" not in sys.modules, other
 ''')
@@ -128,4 +130,29 @@ for name in names:
     assert spec.name == name
     assert callable(spec.runtime)
 assert known_models() == names
+''')
+
+
+@pytest.mark.parametrize("name,family", [("dinov2-small", "dinov2"), ("rfdetr-nano", "rfdetr")])
+def test_vision_lookup_does_not_load_other_models(name, family):
+    _fresh(f'''
+from kestrel.models import get_spec
+spec = get_spec({name!r})
+assert spec.runtime.__name__ == "create_" + {family!r} + "_runtime"
+assert spec.needs_kv_pool is False
+for other in ("moondream", "qwen35", "gemma4", "qwen3_asr", "parakeet_tdt", "whisper", "kokoro", "qwen3_tts", "dinov2", "rfdetr"):
+    if other != {family!r}:
+        assert f"kestrel.models.{{other}}.runtime" not in sys.modules, other
+''')
+
+
+@pytest.mark.parametrize("name,sibling", [("dinov2-small", "facebook/dinov2-small"),
+                                          ("rfdetr-nano", "rfdetr-small")])
+def test_custom_vision_registration_survives_sibling_lookup(name, sibling):
+    _fresh(f'''
+from kestrel.models.registry import ModelSpec, register, get_spec
+custom = ModelSpec(name={name!r}, runtime=lambda: None)
+register(custom)
+get_spec({sibling!r})
+assert get_spec({name!r}) is custom
 ''')

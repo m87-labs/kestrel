@@ -10,11 +10,8 @@ import torch
 
 from .config import Dinov2Config, Dinov2ProcessorConfig
 from .model import Dinov2Model
+from .metadata import DEFAULT_DINOV2_REPO_ID, DEFAULT_DINOV2_REVISION
 
-
-DEFAULT_DINOV2_MODEL = "dinov2-small"
-DEFAULT_DINOV2_REPO_ID = "facebook/dinov2-small"
-DEFAULT_DINOV2_REVISION = "ed25f3a31f01632728cabb09d1542f84ab7b0056"
 
 CONFIG_FILENAME = "config.json"
 PROCESSOR_CONFIG_FILENAME = "preprocessor_config.json"
@@ -179,9 +176,6 @@ def load_dinov2(
 
 __all__ = [
     "CONFIG_FILENAME",
-    "DEFAULT_DINOV2_MODEL",
-    "DEFAULT_DINOV2_REPO_ID",
-    "DEFAULT_DINOV2_REVISION",
     "Dinov2CheckpointFiles",
     "LoadedDinov2",
     "PROCESSOR_CONFIG_FILENAME",

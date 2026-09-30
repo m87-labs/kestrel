@@ -20,7 +20,7 @@ from kestrel.models.dinov2.model import Dinov2Output
 from kestrel.models.dinov2.runtime import (
     Dinov2Runtime,
 )
-from kestrel.models.dinov2.weights import (
+from kestrel.models.dinov2.metadata import (
     DEFAULT_DINOV2_MODEL,
     DEFAULT_DINOV2_REPO_ID,
     DEFAULT_DINOV2_REVISION,

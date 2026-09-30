@@ -12,12 +12,13 @@ from kestrel.device import get_device_capability, resolve_device
 from .preprocessing import Dinov2ImageProcessor
 from .runtime import Dinov2Runtime
 from .shipped_runtime import Dinov2ShippedExecutable
-from .weights import (
+from .metadata import (
     DEFAULT_DINOV2_MODEL,
     DEFAULT_DINOV2_REPO_ID,
     DEFAULT_DINOV2_REVISION,
-    load_dinov2,
 )
+
+from .weights import load_dinov2
 
 _MODEL_REPOS = {
     DEFAULT_DINOV2_MODEL: DEFAULT_DINOV2_REPO_ID,

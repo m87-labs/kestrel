@@ -10,7 +10,7 @@ import torch
 from kestrel.device import empty_cache, resolve_device
 from kestrel.runtime import ExecutionShape
 from .model import Dinov2Model, Dinov2Output
-from .weights import DEFAULT_DINOV2_MODEL
+from .metadata import DEFAULT_DINOV2_MODEL
 
 
 class Dinov2CompiledExecutable(Protocol):
