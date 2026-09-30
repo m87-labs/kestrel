@@ -13,6 +13,83 @@ from kestrel.engine import InferenceEngine
 from kestrel.models.qwen35.generated_verification import Qwen35GeneratedVerification
 
 
+def _verification_runtime(*, capacity=1, page_size=1, weight_format="fp8_e4m3"):
+    target = SimpleNamespace(hidden_size=5120, num_hidden_layers=64,
+                             intermediate_size=17408, vocab_size=248320,
+                             dense_weight_format=weight_format)
+    return SimpleNamespace(
+        max_batch_size=capacity, page_size=page_size, device=torch.device("cuda"),
+        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False),
+        model=SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(config=target))))
+
+
+def _verification_draft(block=16):
+    taps = (1, 10, 18, 27, 35, 44, 52, 61) if block == 16 else (5, 19, 33, 47, 61)
+    return SimpleNamespace(config=SimpleNamespace(
+        block_size=block, target_layer_ids=taps, hidden_size=5120,
+        mask_token_id=1, selector_rank=0))
+
+
+@pytest.mark.parametrize("capacity,block,page,arch,weight_format,expected", [
+    (1, 16, 1, (10, 0), "fp8_e4m3", True),
+    (1, 8, 1, (10, 0), "fp8_e4m3", True),
+    (2, 8, 1, (10, 0), "fp8_e4m3", True),
+    (2, 16, 1, (10, 0), "fp8_e4m3", False),
+    (4, 16, 1, (10, 0), "fp8_e4m3", False),
+    (1, 16, 64, (10, 0), "fp8_e4m3", False),
+    (1, 16, 1, (9, 0), "fp8_e4m3", False),
+    (1, 16, 1, (10, 0), "bf16", False),
+])
+def test_generated_verification_auto_coverage(monkeypatch, capacity, block, page, arch,
+                                            weight_format, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: arch)
+    runtime = _verification_runtime(capacity=capacity, page_size=page, weight_format=weight_format)
+    assert Qwen35GeneratedVerification.supports(runtime, _verification_draft(block)) is expected
+
+
+def test_generated_verification_auto_rejects_other_target_and_taps(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    runtime, draft = _verification_runtime(), _verification_draft()
+    runtime.model.model.language_model.config.hidden_size = 2048
+    assert not Qwen35GeneratedVerification.supports(runtime, draft)
+    runtime.model.model.language_model.config.hidden_size = 5120
+    draft.config.target_layer_ids = (1, 2, 3)
+    assert not Qwen35GeneratedVerification.supports(runtime, draft)
+
+
+@pytest.mark.parametrize("capacity,block,expected_rows", [(1, 16, [1]), (2, 8, [1, 2]), (2, 16, [])])
+def test_dflash_auto_constructs_supported_generated_verifiers(monkeypatch, capacity, block, expected_rows):
+    from kestrel.models.qwen35 import spec_decoder
+
+    runtime, draft = _verification_runtime(capacity=capacity), _verification_draft(block)
+    monkeypatch.setattr(spec_decoder, "load_dflash_drafter", lambda *a, **k: draft)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    rows = []
+    def init(self, runtime, draft, *, sequences=1, weights=None):
+        rows.append(sequences)
+        self.weights = object()
+    monkeypatch.setattr(Qwen35GeneratedVerification, "__init__", init)
+    decoder = spec_decoder.Qwen35DFlashDecoder(runtime, "draft")
+    assert rows == expected_rows
+    assert (decoder._generated_verification is not None) == bool(expected_rows)
+
+
+def test_dflash_auto_does_not_hide_generated_binding_errors(monkeypatch):
+    from kestrel.models.qwen35 import spec_decoder
+
+    monkeypatch.setattr(spec_decoder, "load_dflash_drafter", lambda *a, **k: _verification_draft())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    def init(self, *args, **kwargs):
+        raise RuntimeError("missing AOT Qwen generated verification program")
+    monkeypatch.setattr(Qwen35GeneratedVerification, "__init__", init)
+    with pytest.raises(RuntimeError, match="missing AOT"):
+        spec_decoder.Qwen35DFlashDecoder(_verification_runtime(), "draft")
+
+
 def test_generated_verification_rejects_unqualified_concurrency():
     with pytest.raises(ValueError, match="one or two sequences"):
         Qwen35GeneratedVerification(SimpleNamespace(max_batch_size=3), None)
@@ -122,8 +199,7 @@ def test_generated_verification_repeated_requests():
                 page_size=1, kv_cache_pages=4096, enable_prefix_cache=False))
             try:
                 decoder = engine.runtime.spec.decoder
-                if path == "generated":
-                    assert decoder._generated_verification is not None
+                assert decoder._generated_verification is not None
                 for _ in range(3):
                     result = await engine.chat(
                         [{"role": "user", "content": "Explain why the sky is blue in two sentences."}],
@@ -133,8 +209,7 @@ def test_generated_verification_repeated_requests():
                     if reference is None:
                         reference = ids
                     assert ids == reference
-                    if path == "generated":
-                        assert decoder._generated_verification.pending is False
+                    assert decoder._generated_verification.pending is False
                 result = await engine.chat(
                     [{"role": "user", "content": "Write a Python function to compute Fibonacci numbers."}],
                     reasoning=False, settings={"temperature": 0, "max_tokens": 32})

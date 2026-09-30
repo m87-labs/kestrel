@@ -8,16 +8,32 @@ from kestrel_kernels.generated_verification import GeneratedGdnPrefixReplay
 from .cache import Qwen35InferenceCache
 
 
+_PROGRAMS = {
+    (1, 16, (1, 10, 18, 27, 35, 44, 52, 61)): "qwen35_27b_fp8_dflash_c1_t16",
+    (1, 8, (5, 19, 33, 47, 61)): "qwen35_27b_fp8_dflash2_c1_t8",
+    (2, 8, (5, 19, 33, 47, 61)): "qwen35_27b_fp8_dflash2_c2_t8",
+}
+
+
 class Qwen35GeneratedVerification:
+    @staticmethod
+    def supports(runtime, draft):
+        if runtime.max_batch_size not in (1, 2) or runtime.page_size != 1:
+            return False
+        target = runtime.model.model.language_model.config
+        if (target.hidden_size != 5120 or target.num_hidden_layers != 64
+                or target.intermediate_size != 17408 or target.vocab_size != 248320
+                or target.dense_weight_format != "fp8_e4m3"):
+            return False
+        if torch.cuda.get_device_capability(runtime.device) != (10, 0):
+            return False
+        return all((sequences, draft.config.block_size, tuple(draft.config.target_layer_ids))
+                   in _PROGRAMS for sequences in range(1, runtime.max_batch_size + 1))
+
     def __init__(self, runtime, draft, *, sequences=1, weights=None):
         if runtime.max_batch_size not in (1, 2) or not 1 <= sequences <= runtime.max_batch_size:
             raise ValueError("generated DFlash verification supports one or two sequences")
-        programs = {
-            (1, 16, (1, 10, 18, 27, 35, 44, 52, 61)): "qwen35_27b_fp8_dflash_c1_t16",
-            (1, 8, (5, 19, 33, 47, 61)): "qwen35_27b_fp8_dflash2_c1_t8",
-            (2, 8, (5, 19, 33, 47, 61)): "qwen35_27b_fp8_dflash2_c2_t8",
-        }
-        program = programs.get((sequences, draft.config.block_size, tuple(draft.config.target_layer_ids)))
+        program = _PROGRAMS.get((sequences, draft.config.block_size, tuple(draft.config.target_layer_ids)))
         if (runtime.page_size != 1
                 or torch.cuda.get_device_capability(runtime.device) != (10, 0)
                 or program is None):
