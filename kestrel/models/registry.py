@@ -57,6 +57,8 @@ class ModelSpec:
     orchestrators: Callable[
         [], "Mapping[str, CapabilityOrchestrator]"
     ] = lambda: _empty_orchestrators()
+    # A model without paged KV state need not allocate a KV pool.
+    needs_kv_pool: bool = True
 
 
 def _empty_skill_registry() -> "SkillRegistry":

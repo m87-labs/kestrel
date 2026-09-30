@@ -46,6 +46,8 @@ Kestrel supports these model families:
 | Moondream 2 | [vikhyatk/moondream2](https://huggingface.co/vikhyatk/moondream2) | Public, no approval needed |
 | Moondream 3 | [moondream/moondream3-preview](https://huggingface.co/moondream/moondream3-preview) | Public, no approval needed |
 | Moondream 3.1 9B A2B | [moondream/moondream3.1-9B-A2B](https://huggingface.co/moondream/moondream3.1-9B-A2B) | Public, no approval needed |
+| RF-DETR | Nano, Small, Medium, Base, Large, XL, 2XL | Object detection on H100 BF16; XL/2XL require `model_path` |
+| DINOv2 ViT-S/14 | [facebook/dinov2-small](https://huggingface.co/facebook/dinov2-small) | Image embeddings; one-launch encoder on H100 BF16 |
 | Qwen 3.5 | [Qwen 3.5 collection](https://huggingface.co/collections/Qwen/qwen35) | 0.8B, 2B, 4B, 9B, 27B, and 35B-A3B; Base variants where published |
 | Qwen 3.6 | [Qwen 3.6 collection](https://huggingface.co/collections/Qwen/qwen36) | 27B and 35B-A3B; BF16 and FP8 checkpoints |
 | Gemma 4 | [Gemma 4 collection](https://huggingface.co/collections/google/gemma-4) | E2B, E4B, 26B-A4B, and 31B base/instruction variants |
@@ -92,6 +94,92 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Image embeddings
+
+`dinov2-small` serves the single-pass `embed` task. Its output contains FP32
+`last_hidden_state` (`[1, 257, 384]`) and `pooler_output` (`[1, 384]`) tensors.
+The complete encoder loads from `kestrel-kernels` on supported Hopper devices
+with BF16 inputs. Unsupported devices, precisions, or missing artifacts fail at
+startup.
+
+```python
+import asyncio
+from PIL import Image
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
+
+
+async def main():
+    engine = await InferenceEngine.create(RuntimeConfig(model="dinov2-small"))
+    try:
+        result = await engine.model().embed(image=Image.open("photo.jpg"))
+        print(result.output["pooler_output"].shape)
+    finally:
+        await engine.shutdown()
+
+
+asyncio.run(main())
+```
+
+DINOv2 `image` accepts a PIL image or a NumPy array. Integer pixels use
+`[0, 255]`; floating-point pixels use `[0, 1]`. Preprocessed inputs can instead
+be passed as `pixel_values` with shape `[1, 3, 224, 224]`.
+
+Supplied GPU `pixel_values` must already be contiguous BF16 on the model device.
+CPU preprocessing casts before transfer.
+
+For either vision model, CUDA tensor inputs must be ready on the caller's current
+stream. Keep them unchanged until the awaited request completes; the engine
+handles the stream handoff internally.
+
+## Object detection with RF-DETR
+
+RF-DETR runs through the single-pass detection API on Hopper with BF16:
+
+```python
+import asyncio
+from PIL import Image
+from kestrel.config import RuntimeConfig
+from kestrel.engine import InferenceEngine
+
+async def main():
+    engine = await InferenceEngine.create(RuntimeConfig(model="rfdetr-nano"))
+    try:
+        result = await engine.model().detect(
+            image=Image.open("photo.jpg"), threshold=0.5, max_objects=20
+        )
+        print(result.output["objects"])
+    finally:
+        await engine.shutdown()
+
+
+asyncio.run(main())
+```
+
+Available model names are `rfdetr-nano`, `rfdetr-small`, `rfdetr-medium`,
+`rfdetr-base`, `rfdetr-large`, `rfdetr-xlarge`, and `rfdetr-2xlarge`.
+Large means the current single-P4 model, not DeprecatedLarge. Each variant uses
+its checkpoint's fixed resolution and batch size one. Unsupported devices or
+precisions fail at startup; this route requires the corresponding artifacts in
+`kestrel-kernels`.
+
+`image` accepts RGB PIL images, encoded image bytes, HWC NumPy arrays, or CPU CHW
+tensors. Floating-point pixels must be in `[0, 1]`. Alternatively, `pixel_values`
+accepts preprocessed `[1, 3, resolution, resolution]` tensors. GPU inputs must
+already be contiguous BF16 on the model device. Resizing and ImageNet normalization
+run on CPU before the input transfer; the detector itself uses one GPU launch.
+
+Each object contains normalized `x_min`, `y_min`, `x_max`, `y_max`, `score`,
+`class_id`, and `label`. Classes use the original sparse COCO IDs, including
+`90` for toothbrush; unused IDs have an empty label. This is fixed-vocabulary
+detection, not an open-vocabulary `object=` prompt. `threshold` defaults to `0.5`;
+`max_objects` caps results at 300. There is no NMS.
+
+Use `model_path` to supply a checkpoint. Nano through Large download the released
+COCO checkpoint when no path is provided. XL and 2XL currently require an explicit
+path to their released checkpoint. Custom class vocabularies and segmentation
+checkpoints are not supported by these declared executables.
 
 ## Speech transcription
 

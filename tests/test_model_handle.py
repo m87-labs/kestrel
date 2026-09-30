@@ -581,6 +581,23 @@ def test_capability_dispatches_to_run_for_single_pass() -> None:
     assert captured["inputs"] == {"image": img, "points": [[1, 2]], "labels": [1]}
 
 
+def test_embed_dispatches_to_single_pass_model() -> None:
+    eng = _engine()
+    eng._runtimes["image-encoder"] = _StubSinglePass("image-encoder", ("embed",))
+    captured: dict[str, Any] = {}
+
+    async def fake_run(model: str, task: str, inputs: Any) -> str:
+        captured.update(model=model, task=task, inputs=inputs)
+        return "EMBEDDING"
+
+    eng.run = fake_run  # type: ignore[method-assign]
+    image = object()
+    assert asyncio.run(eng.model("image-encoder").embed(image=image)) == "EMBEDDING"
+    assert captured == {
+        "model": "image-encoder", "task": "embed", "inputs": {"image": image},
+    }
+
+
 def _prestart_engine_building(captured: dict[str, Any]) -> InferenceEngine:
     """A not-yet-started engine whose (stubbed) startup builds a co-hosted
     single-pass runtime — mirrors eager ``models=[...]`` construction."""

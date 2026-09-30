@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
 
-from kestrel.device import make_event, stream_context
+from kestrel.device import InputStreamHandoff, make_event, stream_context
 from kestrel.runtime import SinglePassRuntime
 
 from kestrel.engine._types import (
@@ -59,6 +59,11 @@ class _SinglePassRequest:
     adapter: Optional[str] = None
     stream_queue: "Optional[_StreamQueue]" = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    input_handoff: InputStreamHandoff = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Requests are constructed on the caller thread, before queueing.
+        self.input_handoff = InputStreamHandoff(self.inputs)
 
 
 def _single_pass_result(
@@ -287,6 +292,8 @@ class SinglePassExecutor:
         outputs: tuple[Any, ...] = ()
         try:
             with stream_context(self._stream):
+                for request in requests:
+                    request.input_handoff.wait()
                 inputs = tuple(request.inputs for request in requests)
                 if self._pipelined:
                     batch = self._runtime.launch(requests[0].task, inputs)  # type: ignore[attr-defined]

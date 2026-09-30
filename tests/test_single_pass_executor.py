@@ -371,3 +371,57 @@ def test_shutdown_fails_queued_and_in_flight() -> None:
     assert ids == [5, 6]  # both the in-flight and the queued one
     assert all(isinstance(c.error, RuntimeError) for c in completions)
     assert ex.has_work is False
+
+
+def test_input_handoff_precedes_forward(monkeypatch) -> None:
+    order = []
+
+    class Handoff:
+        def __init__(self, inputs):
+            order.append("capture")
+
+        def wait(self):
+            order.append("wait")
+
+    class Driver(_StubDriver):
+        def forward(self, task, inputs):
+            order.append("forward")
+            return ({"ok": True},)
+
+    monkeypatch.setattr(single_pass_mod, "InputStreamHandoff", Handoff)
+    request = _req(1, "embed", {})
+    assert order == ["capture"]
+    executor = SinglePassExecutor(Driver(), compute_stream=None)
+    executor.submit(request)
+    executor.advance()
+    assert order == ["capture", "wait", "forward"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_input_waits_for_caller_stream() -> None:
+    producer = torch.cuda.Stream()
+    consumer = torch.cuda.Stream()
+    pixels = torch.zeros(32, device="cuda")
+    torch.cuda.synchronize()
+
+    class Driver(_StubDriver):
+        def __init__(self):
+            super().__init__()
+            self.device = pixels.device
+
+        def forward(self, task, inputs):
+            return ({"pixels": inputs[0]["nested"][0].clone()},)
+
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(50_000_000)
+        pixels.fill_(7)
+        request = _req(1, "embed", {"nested": [pixels]})
+    executor = SinglePassExecutor(Driver(), compute_stream=consumer)
+    executor.submit(request)
+    completed = list(executor.advance().completed)
+    consumer.synchronize()
+    completed.extend(executor.advance().completed)
+    assert len(completed) == 1
+    assert completed[0].error is None
+    torch.testing.assert_close(completed[0].result.output["pixels"],
+                               torch.full_like(pixels, 7))

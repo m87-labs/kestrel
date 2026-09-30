@@ -254,3 +254,75 @@ def test_set_device_mps_is_noop() -> None:
     # MPS doesn't have a per-process device-set concept; we just ensure
     # the call doesn't raise.
     set_device(MPS)
+
+
+def test_tensor_handoff_tracks_each_device_and_handles_nested_aliases(monkeypatch):
+    from kestrel.device import InputStreamHandoff, record_tensor_streams
+
+    events = []
+    phase = ["caller"]
+
+    class Tensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, index):
+            value = torch.Tensor._make_subclass(cls, torch.empty(0))
+            value.index = index
+            return value
+
+        @property
+        def device(self):
+            return torch.device("cuda", self.index)
+
+        def record_stream(self, stream):
+            events.append(("lifetime", stream))
+
+    class Stream:
+        def __init__(self, device):
+            self.identity = (phase[0], device.index)
+
+        def wait_event(self, event):
+            events.append(("wait", self.identity, event.producer))
+
+    class Event:
+        def record(self, stream):
+            self.producer = stream.identity
+            events.append(("record", self.producer))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", Stream)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    a, b = Tensor(0), Tensor(1)
+    values = {"nested": [a, b], "alias": a, "cpu": torch.empty(0)}
+    values["cycle"] = values
+    handoff = InputStreamHandoff(values)
+    assert sorted(events) == [("record", ("caller", 0)), ("record", ("caller", 1))]
+
+    phase[0] = "scheduler"
+    events.clear()
+    handoff.wait()
+    assert sorted(events[:2]) == [
+        ("wait", ("scheduler", 0), ("caller", 0)),
+        ("wait", ("scheduler", 1), ("caller", 1)),
+    ]
+    assert sorted(stream.identity for kind, stream in events[2:]) == [
+        ("scheduler", 0), ("scheduler", 1)
+    ]
+
+    phase[0] = "caller"
+    events.clear()
+    record_tensor_streams({"result": (a, b, a)})
+    assert sorted(stream.identity for kind, stream in events) == [
+        ("caller", 0), ("caller", 1)
+    ]
+
+
+def test_cpu_tensor_handoff_does_not_create_cuda_events(monkeypatch):
+    from kestrel.device import InputStreamHandoff, record_tensor_streams
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("CPU request accessed CUDA")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected)
+    monkeypatch.setattr(torch.cuda, "Event", unexpected)
+    inputs = {"pixels": torch.zeros(2), "metadata": [None, 1, "image"]}
+    InputStreamHandoff(inputs).wait()
+    record_tensor_streams(inputs)

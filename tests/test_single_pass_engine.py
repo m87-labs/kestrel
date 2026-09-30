@@ -625,3 +625,11 @@ def test_single_pass_lane_crash_does_not_kill_the_kernel() -> None:
             sp_mod.SinglePassExecutor.advance = orig_advance
 
     asyncio.run(go())
+
+
+def test_run_transfers_output_lifetime_to_the_caller(monkeypatch) -> None:
+    observed = []
+    monkeypatch.setattr("kestrel.engine.core.record_tensor_streams", observed.append)
+    result = asyncio.run(_run("segment", {"points": [[1, 2]]}))
+    assert len(observed) == 1
+    assert observed[0] is result.output
