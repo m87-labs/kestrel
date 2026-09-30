@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
@@ -15,56 +13,8 @@ from .model import Dinov2Model, Dinov2Output
 from .weights import DEFAULT_DINOV2_MODEL
 
 
-@dataclass(frozen=True)
-class Dinov2ExecutableCapability:
-    """The exact request domain one injected compiled executable claims to serve.
-
-    Capability resolution happens before constructing the runtime. The runtime compares
-    this declaration verbatim and never probes GPU architecture, imports a backend to see
-    whether it happens to exist, or infers support from executable attributes.
-    """
-
-    device: torch.device
-    dtype: torch.dtype
-    image_size: int = 224
-    batch_size: int = 1
-    task: str = "embed"
-
-    def __post_init__(self) -> None:
-        # Canonicalized so an index-less "cuda" and the executable's fully-qualified
-        # "cuda:N" compare equal instead of silently routing to the eager fallback.
-        object.__setattr__(self, "device", resolve_device(self.device))
-        if not isinstance(self.dtype, torch.dtype):
-            raise TypeError("compiled executable dtype must be a torch.dtype")
-        if self.image_size <= 0 or self.batch_size <= 0:
-            raise ValueError(
-                "compiled executable image_size and batch_size must be positive"
-            )
-        if self.task != "embed":
-            raise ValueError("DINOv2 compiled executables must declare task='embed'")
-
-    def matches(
-        self,
-        *,
-        task: str,
-        device: torch.device,
-        dtype: torch.dtype,
-        image_size: int,
-        batch_size: int,
-    ) -> bool:
-        return (
-            self.task == task
-            and self.device == device
-            and self.dtype == dtype
-            and self.image_size == image_size
-            and self.batch_size == batch_size
-        )
-
-
 class Dinov2CompiledExecutable(Protocol):
-    """Declared compiled-backend seam consumed by :class:`Dinov2Runtime`."""
-
-    capability: Dinov2ExecutableCapability
+    """Prepared backend selected once by the model factory."""
 
     def forward(self, pixel_values: torch.Tensor) -> Dinov2Output: ...
 
@@ -108,34 +58,12 @@ class Dinov2Runtime:
         self.primary_stream = compute_stream
         self.compute_stream = compute_stream
         self._compiled_executable = compiled_executable
-        self._use_compiled = bool(
-            compiled_executable is not None
-            and compiled_executable.capability.matches(
-                task="embed",
-                device=self.device,
-                dtype=self.dtype,
-                image_size=self.image_size,
-                batch_size=1,
-            )
-        )
-        if compiled_executable is not None and not self._use_compiled:
-            # The eager fallback on a declared-capability mismatch is deliberate, but an
-            # explicitly injected executable that never serves is a configuration error
-            # the caller should hear about, not discover from a slow checksum.
-            warnings.warn(
-                "Dinov2Runtime: injected compiled executable declares "
-                f"{compiled_executable.capability} but the runtime domain is "
-                f"(task='embed', device={self.device}, dtype={self.dtype}, "
-                f"image_size={self.image_size}, batch_size=1); serving the eager "
-                "fallback instead",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        if (model is None) == (compiled_executable is None):
+            raise ValueError("DINOv2 requires exactly one eager or compiled backend")
+        self._use_compiled = compiled_executable is not None
 
         if not callable(processor):
             raise TypeError("DINOv2 processor must be callable")
-        if not self._use_compiled and model is None:
-            raise RuntimeError("DINOv2 eager fallback has no model")
         if model is not None:
             model.eval()
 
@@ -188,11 +116,13 @@ class Dinov2Runtime:
             )
         if not pixels.is_floating_point():
             raise TypeError("pixel_values must be floating point")
+        if pixels.device.type == "cpu":
+            # Validate after conversion as finite FP32/FP64 can overflow BF16.
+            pixels = pixels.to(dtype=self.dtype).contiguous()
+            if not torch.isfinite(pixels).all():
+                raise ValueError("pixel_values must be finite in the model dtype")
+            return pixels.to(self.device)
         if self._use_compiled:
-            # Cast on the host before transfer, keeping the prepared GPU forward
-            # free of separate conversion or layout-copy kernels.
-            if pixels.device.type == "cpu":
-                return pixels.to(dtype=self.dtype).contiguous().to(self.device)
             if (pixels.device != self.device or pixels.dtype != self.dtype
                     or not pixels.is_contiguous()):
                 raise ValueError(
@@ -233,12 +163,7 @@ class Dinov2Runtime:
                 f"DINOv2 backend returned pooler_output shape "
                 f"{tuple(output.pooler_output.shape)}, expected {expected_pooler}"
             )
-        # One public dtype across eager and compiled execution. The compiled final-norm
-        # seam is FP32 for checkpoint fidelity, while an eager BF16 model naturally
-        # returns BF16; exposing those backend details would make the same runtime request
-        # change type when a compiled capability is injected. Normalize once at the public
-        # boundary and derive the pooler from that tensor so its CLS-view semantics are
-        # identical on every backend.
+        # Keep FP32 output and a CLS view on every backend.
         last_hidden_state = output.last_hidden_state.to(dtype=torch.float32)
         return (
             {
@@ -251,13 +176,16 @@ class Dinov2Runtime:
         if self._shutdown:
             return
         self._shutdown = True
-        if self._compiled_executable is not None:
-            self._compiled_executable.shutdown()
-        empty_cache(self.device)
+        try:
+            if self._compiled_executable is not None:
+                self._compiled_executable.shutdown()
+        finally:
+            self._compiled_executable = None
+            self.model = None
+            empty_cache(self.device)
 
 
 __all__ = [
     "Dinov2CompiledExecutable",
-    "Dinov2ExecutableCapability",
     "Dinov2Runtime",
 ]

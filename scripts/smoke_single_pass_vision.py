@@ -17,7 +17,7 @@ import sys
 
 class NoCompilerImports(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'mkl', 'rfdetr', 'rfdetr_plus', 'kestrel_rfdetr'}:
+        if fullname.split('.')[0] in {'mkl', 'rfdetr', 'rfdetr_plus', 'kestrel_rfdetr', 'kestrel_dinov2'}:
             raise RuntimeError(f'Public serving imported a build/training dependency: {fullname}')
         return None
 
@@ -62,8 +62,8 @@ async def smoke(args):
         kernels = [e.name for e in prof.events()
                    if e.device_type == torch.autograd.DeviceType.CUDA
                    and not e.name.startswith(('Memcpy', 'Memset'))]
+        assert len(kernels) == 1, kernels
         if detection:
-            assert len(kernels) == 1, kernels
             # Repeated-input stability is distinct from independent correctness.
             a, b = first['objects'], repeated['objects']
             assert len(a) == len(b)

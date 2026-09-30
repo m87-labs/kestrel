@@ -18,7 +18,6 @@ from kestrel.runtime import ExecutionShape
 from kestrel.models.dinov2.factory import create_dinov2_runtime
 from kestrel.models.dinov2.model import Dinov2Output
 from kestrel.models.dinov2.runtime import (
-    Dinov2ExecutableCapability,
     Dinov2Runtime,
 )
 from kestrel.models.dinov2.weights import (
@@ -63,8 +62,7 @@ class _FakeModel:
 
 
 class _FakeCompiled:
-    def __init__(self, capability: Dinov2ExecutableCapability) -> None:
-        self.capability = capability
+    def __init__(self) -> None:
         self.calls: list[torch.Tensor] = []
         self.shutdown_calls = 0
 
@@ -110,7 +108,7 @@ def _runtime(
         _cfg(),
         compute_stream=None,
         kv_pool=object(),
-        model=eager,
+        model=eager if compiled is None else None,
         processor=image_processor,
         compiled_executable=compiled,
     )
@@ -228,10 +226,6 @@ def test_registered_factory_builds_the_shipped_sm90_runtime_without_compiler(
                 "state_dict": state_dict,
                 **kwargs,
             }
-            self.capability = Dinov2ExecutableCapability(
-                device=torch.device("cuda:0"),
-                dtype=torch.bfloat16,
-            )
 
         def shutdown(self) -> None:
             calls["shutdowns"] += 1
@@ -374,37 +368,49 @@ def test_input_and_task_validation_is_strict() -> None:
         _forward(runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)})
 
 
-def test_compiled_backend_selection_uses_declared_capability() -> None:
-    matching = _FakeCompiled(
-        Dinov2ExecutableCapability(device=torch.device("cpu"), dtype=torch.float32)
-    )
-    runtime, eager, _ = _runtime(compiled=matching)
-    try:
-        output = _forward(
-            runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)}
-        )
-        assert runtime.execution_backend == "compiled"
-        assert len(matching.calls) == 1
-        assert eager.calls == []
-        assert torch.all(output["pooler_output"] == 2)
-    finally:
-        runtime.shutdown()
-        runtime.shutdown()
-    assert matching.shutdown_calls == 1
+def test_factory_selected_compiled_backend_is_used_and_closed_once() -> None:
+    compiled = _FakeCompiled()
+    runtime, eager, _ = _runtime(compiled=compiled)
+    output = _forward(runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)})
+    assert runtime.execution_backend == "compiled"
+    assert len(compiled.calls) == 1
+    assert eager.calls == []
+    assert torch.all(output["pooler_output"] == 2)
+    runtime.shutdown()
+    runtime.shutdown()
+    assert compiled.shutdown_calls == 1
+    assert runtime._compiled_executable is None
 
-    mismatched = _FakeCompiled(
-        Dinov2ExecutableCapability(device=torch.device("cpu"), dtype=torch.bfloat16)
-    )
-    with pytest.warns(RuntimeWarning, match="serving the eager fallback"):
-        fallback, eager, _ = _runtime(compiled=mismatched)
+
+def test_runtime_requires_exactly_one_backend() -> None:
+    for backends in ({}, {"model": _FakeModel(), "compiled_executable": _FakeCompiled()}):
+        with pytest.raises(ValueError, match="exactly one"):
+            Dinov2Runtime(_cfg(), processor=_FakeProcessor(), **backends)
+
+
+def test_shutdown_releases_eager_model() -> None:
+    import gc
+    import weakref
+
+    runtime = Dinov2Runtime(_cfg(), model=_FakeModel(), processor=_FakeProcessor())
+    model = weakref.ref(runtime.model)
+    runtime.shutdown()
+    gc.collect()
+    assert model() is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 3.4e38, 1e100])
+def test_nonfinite_or_overflowing_pixels_are_rejected_before_execution(value) -> None:
+    compiled = _FakeCompiled()
+    runtime = Dinov2Runtime(_cfg(dtype=torch.bfloat16), processor=_FakeProcessor(),
+                            compiled_executable=compiled)
     try:
-        _forward(fallback, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)})
-        assert fallback.execution_backend == "eager"
-        assert mismatched.calls == []
-        assert len(eager.calls) == 1
+        pixels = torch.full((1, 3, 224, 224), value, dtype=torch.float64)
+        with pytest.raises(ValueError, match="finite"):
+            _forward(runtime, "embed", {"pixel_values": pixels})
+        assert compiled.calls == []
     finally:
-        fallback.shutdown()
-    assert mismatched.shutdown_calls == 1
+        runtime.shutdown()
 
 
 def test_async_preprocessing() -> None:
@@ -419,17 +425,6 @@ def test_async_preprocessing() -> None:
 
 
 def test_generic_handle_run() -> None:
-    try:
-        from kestrel.engine import InferenceEngine
-    except AttributeError as exc:
-        # Kestrel 0.4.1 imports its legacy Moondream scheduler while importing the
-        # generic handle. Current kernels deliberately no longer carry that private
-        # attention symbol; keep the DINOv2 runtime tests runnable in this environment
-        # while leaving the handle integration to a compatible engine lane.
-        if "prefix_lm_mask_730" not in str(exc):
-            raise
-        pytest.skip("installed Kestrel engine predates the current kernels")
-
     engine = object.__new__(InferenceEngine)
     engine._default_model = "ar-default"
     engine._model_ids = ["ar-default", DEFAULT_DINOV2_MODEL]
@@ -465,8 +460,7 @@ def test_generic_handle_run() -> None:
 
 
 def test_compiled_pixels_cast_on_cpu_and_reject_other_device():
-    compiled = _FakeCompiled(Dinov2ExecutableCapability(
-        device=torch.device("cpu"), dtype=torch.bfloat16))
+    compiled = _FakeCompiled()
     runtime = Dinov2Runtime(_cfg(dtype=torch.bfloat16), processor=_FakeProcessor(),
                             compiled_executable=compiled)
     pixels = torch.randn(1, 3, 224, 224).transpose(2, 3)

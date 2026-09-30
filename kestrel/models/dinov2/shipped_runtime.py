@@ -5,7 +5,6 @@ from collections.abc import Mapping
 import torch
 
 from .model import Dinov2Output
-from .runtime import Dinov2ExecutableCapability
 
 
 class Dinov2ShippedExecutable:
@@ -33,13 +32,6 @@ class Dinov2ShippedExecutable:
             config=config,
             device=device,
             dtype=dtype,
-        )
-        self.capability = Dinov2ExecutableCapability(
-            device=device,
-            dtype=dtype,
-            image_size=224,
-            batch_size=1,
-            task="embed",
         )
         self._shutdown = False
 

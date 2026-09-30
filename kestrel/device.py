@@ -13,6 +13,7 @@ on ``runtime._use_cuda_graphs`` which evaluates to False on MPS.
 """
 
 import contextlib
+from collections.abc import Iterator, Mapping
 import threading
 from typing import Any, Callable, Optional
 
@@ -139,6 +140,54 @@ def materialize_blas_runtime(
         raise failures[0]
 
 
+def _cuda_tensors(value: Any) -> Iterator[torch.Tensor]:
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, torch.Tensor) and item.device.type == "cuda":
+            yield item
+        elif isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+
+
+def record_tensor_streams(value: Any) -> None:
+    """Keep tensor storage alive through work on the current consuming streams."""
+    for tensor in _cuda_tensors(value):
+        tensor.record_stream(torch.cuda.current_stream(tensor.device))
+
+
+class InputStreamHandoff:
+    """Carry CUDA tensor readiness across the caller/scheduler thread boundary.
+
+    Capture on the submitting thread. Inputs must be ready on that thread's
+    current stream for each device and must not be mutated until completion.
+    CPU/MPS requests create no events.
+    """
+
+    def __init__(self, inputs: Any) -> None:
+        self._tensors = tuple(_cuda_tensors(inputs))
+        self._events: dict[torch.device, Any] = {}
+        for tensor in self._tensors:
+            if tensor.device not in self._events:
+                stream = torch.cuda.current_stream(tensor.device)
+                event = torch.cuda.Event()
+                event.record(stream)
+                self._events[tensor.device] = event
+
+    def wait(self) -> None:
+        """Order the consuming streams without synchronizing the host."""
+        for device, event in self._events.items():
+            torch.cuda.current_stream(device).wait_event(event)
+        # Also protect allocations if a forward raises after enqueueing work.
+        record_tensor_streams(self._tensors)
+
+
 class NoopEvent:
     """Stand-in for ``torch.cuda.Event`` on devices without async events."""
 
@@ -171,6 +220,7 @@ def make_event(
 
 
 __all__ = [
+    "InputStreamHandoff",
     "NoopEvent",
     "empty_cache",
     "get_device_capability",
@@ -178,6 +228,7 @@ __all__ = [
     "materialize_blas_runtime",
     "make_event",
     "make_stream",
+    "record_tensor_streams",
     "set_device",
     "stream_context",
     "synchronize",

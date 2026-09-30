@@ -40,11 +40,11 @@ def _numpy_rgb(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
-def _to_pil_rgb(image: Image.Image | np.ndarray) -> tuple[Image.Image, bool]:
-    """Return an RGB PIL image and whether float input was internally scaled."""
+def _to_pil_rgb(image: Image.Image | np.ndarray) -> Image.Image:
+    """Convert byte or floating [0, 1] pixels to the PIL resize domain."""
 
     if isinstance(image, Image.Image):
-        return image.convert("RGB"), False
+        return image.convert("RGB")
     if not isinstance(image, np.ndarray):
         raise TypeError("image must be a PIL image or NumPy array")
 
@@ -56,22 +56,19 @@ def _to_pil_rgb(image: Image.Image | np.ndarray) -> tuple[Image.Image, bool]:
     if not np.all(np.isfinite(image)):
         raise ValueError("image values must be finite")
 
-    internally_scaled = False
     if image.dtype == np.uint8:
         converted = image
-    elif np.allclose(image, image.astype(np.int64)):
+    elif np.issubdtype(image.dtype, np.floating):
+        if image.min() < 0 or image.max() > 1:
+            raise ValueError("floating-point image data must lie in [0, 1]")
+        converted = np.rint(image.astype(np.float64) * 255.0).astype(np.uint8)
+    elif np.issubdtype(image.dtype, np.integer):
         if image.min() < 0 or image.max() > 255:
-            raise ValueError("integer-valued image data must lie in [0, 255]")
+            raise ValueError("integer image data must lie in [0, 255]")
         converted = image.astype(np.uint8)
-    elif np.issubdtype(image.dtype, np.floating) and image.min() >= 0 and image.max() <= 1:
-        converted = (image.astype(np.float64) * 255.0).astype(np.uint8)
-        internally_scaled = True
     else:
-        raise ValueError(
-            "fractional image data must lie in [0, 1]; integer-valued data must lie "
-            "in [0, 255]"
-        )
-    return Image.fromarray(converted, mode="RGB"), internally_scaled
+        raise TypeError(f"unsupported NumPy image dtype {image.dtype}")
+    return Image.fromarray(converted, mode="RGB")
 
 
 def _resize_shortest_edge(image: Image.Image, shortest_edge: int, resample: int) -> Image.Image:
@@ -111,7 +108,7 @@ class Dinov2ImageProcessor:
         self.config = config
 
     def __call__(self, image: Any) -> torch.Tensor:
-        pil_image, internally_scaled = _to_pil_rgb(image)
+        pil_image = _to_pil_rgb(image)
         resized = _resize_shortest_edge(
             pil_image,
             self.config.shortest_edge,
@@ -123,8 +120,6 @@ class Dinov2ImageProcessor:
             self.config.crop_width,
         )
 
-        if internally_scaled:
-            pixels = (pixels.astype(np.float64) / 255.0).astype(np.float32)
         pixels = (pixels.astype(np.float64) * self.config.rescale_factor).astype(np.float32)
         mean = np.asarray(self.config.image_mean, dtype=np.float32)
         std = np.asarray(self.config.image_std, dtype=np.float32)

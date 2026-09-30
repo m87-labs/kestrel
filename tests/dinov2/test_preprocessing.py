@@ -16,10 +16,6 @@ def processor() -> Dinov2ImageProcessor:
     return Dinov2ImageProcessor(Dinov2ProcessorConfig.from_dict(PROCESSOR_CONFIG))
 
 
-_MEAN = torch.tensor(PROCESSOR_CONFIG["image_mean"], dtype=torch.float64).view(1, 3, 1, 1)
-_STD = torch.tensor(PROCESSOR_CONFIG["image_std"], dtype=torch.float64).view(1, 3, 1, 1)
-
-
 def test_uint8_numpy_and_pil_inputs_match(processor: Dinov2ImageProcessor) -> None:
     image = synthetic_rgb()
     numpy_output = processor(image)
@@ -61,22 +57,14 @@ def test_chw_and_hwc_inputs_match(processor: Dinov2ImageProcessor) -> None:
     )
 
 
-def test_fractional_float_input_matches_pil_backend_quantization(
-    processor: Dinov2ImageProcessor,
-) -> None:
-    """Float [0,1] input routes through the same uint8 quantization the PIL backend
-    applies (x -> uint8(255x), an exact round trip for every byte value in float32),
-    then the standard rescale on top of the restored [0,1] scale -- the Transformers
-    double-rescale semantics for pre-scaled floats. The float output must therefore be
-    the uint8 output's pixels divided once more by 255 before normalization."""
-    image = synthetic_rgb().astype(np.float32) / 255.0
-    output = processor(image)
-    assert output.shape == (1, 3, 224, 224)
-    from_uint8 = processor(synthetic_rgb()).to(torch.float64)
-    rescaled_once_more = ((from_uint8 * _STD + _MEAN) / 255.0 - _MEAN) / _STD
-    torch.testing.assert_close(
-        output, rescaled_once_more.to(torch.float32), rtol=0.0, atol=1e-6
-    )
+@pytest.mark.parametrize("kind", ["rgb", "black", "white"])
+def test_float_images_preserve_uint8_image_semantics(processor, kind) -> None:
+    image = synthetic_rgb()
+    if kind != "rgb":
+        image.fill(0 if kind == "black" else 255)
+    expected = processor(Image.fromarray(image))
+    actual = processor(image.astype(np.float32) / 255.0)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize(
@@ -86,6 +74,8 @@ def test_fractional_float_input_matches_pil_backend_quantization(
         np.zeros((20, 30, 2), dtype=np.uint8),
         np.full((20, 30, 3), -0.1, dtype=np.float32),
         np.full((20, 30, 3), np.nan, dtype=np.float32),
+        np.full((20, 30, 3), 255, dtype=np.float32),
+        np.full((20, 30, 3), 1j, dtype=np.complex64),
     ],
 )
 def test_invalid_numpy_inputs_are_refused(
@@ -111,8 +101,6 @@ def test_matches_transformers_pil_backend(processor: Dinov2ImageProcessor) -> No
     inputs = (
         Image.fromarray(rgb),
         rgb,
-        rgb.astype(np.float32),
-        rgb.astype(np.float32) / 255.0,
     )
     for image in inputs:
         expected = reference(images=image, return_tensors="pt").pixel_values

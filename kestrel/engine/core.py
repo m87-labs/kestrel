@@ -34,7 +34,7 @@ from dataclasses import replace
 
 from kestrel_kernels import get_runtime
 from kestrel.config import RuntimeConfig
-from kestrel.device import make_stream, set_device, synchronize
+from kestrel.device import make_stream, record_tensor_streams, set_device, synchronize
 from kestrel.runtime import (
     AutoregressiveRuntime,
     CoordToken,
@@ -895,6 +895,10 @@ class InferenceEngine:
         single-pass lane, which runs one ``forward`` and returns the
         structured result. (Autoregressive models keep using ``submit`` /
         the typed verbs.)
+
+        CUDA tensor inputs must be ready on the caller's current stream when
+        this coroutine runs. The engine waits on that stream before reading
+        them. Keep input data unchanged until the request completes.
         """
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
@@ -927,7 +931,11 @@ class InferenceEngine:
             self._fail_all_pending(self._scheduler_failed_error())
         del inputs, req
         try:
-            return await asyncio.shield(future)
+            result = await asyncio.shield(future)
+            # Output is ready, but its allocation belongs to the scheduler's
+            # stream. Protect the caller's use before that storage is recycled.
+            record_tensor_streams(result.output)
+            return result
         except asyncio.CancelledError:
             cancel_event.set()
             self._scheduler_event.set()
