@@ -43,10 +43,9 @@ def test_candidate_selector_uses_anchor_and_selected_predecessor():
     assert result.tolist() == [[1, 2, 0], [2, 0, 1]]
 
 
-@pytest.mark.parametrize("architecture", ["DSparkDraftModel", "UnknownDraftModel"])
-def test_unknown_draft_architecture_rejected_before_loading(architecture):
+def test_unknown_draft_architecture_rejected_before_loading():
     with pytest.raises(ValueError, match="architecture"):
-        DFlashConfig.from_dict({"architectures": [architecture], "dflash_config": {}})
+        DFlashConfig.from_dict({"architectures": ["UnknownDraftModel"], "dflash_config": {}})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

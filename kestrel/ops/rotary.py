@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from torch import nn
 
@@ -62,6 +63,38 @@ def proportional_inv_freq(
     return rotated / float(factor)
 
 
+def yarn_inv_freq(head_dim: int, base: float, parameters: dict, *, device=None):
+    """Construct the checkpoint's static YaRN frequency and amplitude schedule."""
+    factor = float(parameters["factor"])
+    original = int(parameters["original_max_position_embeddings"])
+    fast, slow = float(parameters.get("beta_fast", 32)), float(parameters.get("beta_slow", 1))
+    _validate_schedule(head_dim, base, 1.0, factor)
+    if base <= 1 or original <= 0 or not fast >= slow > 0:
+        raise ValueError("invalid YaRN correction range")
+    def scale(mscale=1.0):
+        return 1.0 if factor <= 1 else 1.0 + 0.1 * mscale * math.log(factor)
+    amplitude = parameters.get("attention_factor")
+    if amplitude is None:
+        mscale, all_dim = parameters.get("mscale"), parameters.get("mscale_all_dim")
+        amplitude = scale(mscale) / scale(all_dim) if mscale and all_dim else scale()
+    amplitude = float(amplitude)
+    if not math.isfinite(amplitude) or amplitude <= 0:
+        raise ValueError("YaRN attention factor must be positive and finite")
+    if torch.empty(0, device=device).is_meta:
+        return torch.empty(head_dim // 2, device=device, dtype=torch.float32), amplitude
+    low = head_dim * math.log(original / (fast * 2 * math.pi)) / (2 * math.log(base))
+    high = head_dim * math.log(original / (slow * 2 * math.pi)) / (2 * math.log(base))
+    if parameters.get("truncate", True):
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, head_dim - 1)
+    if low == high:
+        high += 0.001
+    ramp = ((torch.arange(head_dim // 2, device=device, dtype=torch.float32) - low)
+            / (high - low)).clamp(0, 1)
+    frequencies = base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    return ramp / (factor * frequencies) + (1 - ramp) / frequencies, amplitude
+
+
 def apply_rotary(
     tensor: torch.Tensor,
     cos: torch.Tensor,
@@ -114,6 +147,7 @@ class MultidimensionalRotaryEmbedding(nn.Module):
         if dimensions <= 0 or head_dim % (2 * dimensions):
             raise ValueError("head channels must divide into even rotary blocks")
         self.dimensions = dimensions
+        self.attention_factor = 1.0
         self.register_buffer(
             "inv_freq",
             default_inv_freq(
@@ -137,6 +171,8 @@ class MultidimensionalRotaryEmbedding(nn.Module):
             frequencies = position_ids.float()[..., None] * self.inv_freq.float()
             embedding = torch.cat((frequencies, frequencies), dim=-1).flatten(-2)
             cos, sin = embedding.cos(), embedding.sin()
+            if self.attention_factor != 1.0:
+                cos, sin = cos * self.attention_factor, sin * self.attention_factor
         return cos.to(tensor.dtype), sin.to(tensor.dtype)
 
 
@@ -146,4 +182,5 @@ __all__ = [
     "apply_rotary",
     "default_inv_freq",
     "proportional_inv_freq",
+    "yarn_inv_freq",
 ]
