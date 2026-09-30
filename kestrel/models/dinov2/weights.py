@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 import torch
 
 from .config import Dinov2Config, Dinov2ProcessorConfig
-from .model import Dinov2Model
 from .metadata import DEFAULT_DINOV2_REPO_ID, DEFAULT_DINOV2_REVISION
 
 
@@ -31,7 +29,7 @@ class Dinov2CheckpointFiles:
 
 @dataclass(frozen=True)
 class LoadedDinov2:
-    model: Dinov2Model
+    state_dict: dict[str, torch.Tensor]
     model_config: Dinov2Config
     processor_config: Dinov2ProcessorConfig
     files: Dinov2CheckpointFiles
@@ -98,50 +96,10 @@ def resolve_checkpoint_files(
     return _files_in_directory(root)
 
 
-def _copy_checkpoint_into_model(
-    model: Dinov2Model,
-    checkpoint_state: Mapping[str, torch.Tensor],
-) -> None:
-    destination = model.state_dict()
-    expected = set(destination)
-    provided = set(checkpoint_state)
-    missing = expected - provided
-    unexpected = provided - expected - _IGNORED_CHECKPOINT_KEYS
-    if missing or unexpected:
-        parts = []
-        if missing:
-            parts.append(f"missing={sorted(missing)}")
-        if unexpected:
-            parts.append(f"unexpected={sorted(unexpected)}")
-        raise RuntimeError("invalid DINOv2 checkpoint keys: " + "; ".join(parts))
-
-    shape_errors = [
-        f"{name}: checkpoint {tuple(checkpoint_state[name].shape)} != model {tuple(tensor.shape)}"
-        for name, tensor in destination.items()
-        if tuple(checkpoint_state[name].shape) != tuple(tensor.shape)
-    ]
-    dtype_errors = [
-        f"{name}: checkpoint dtype {checkpoint_state[name].dtype} is not floating point"
-        for name in destination
-        if not checkpoint_state[name].is_floating_point()
-    ]
-    if shape_errors or dtype_errors:
-        raise RuntimeError(
-            "invalid DINOv2 checkpoint tensors: " + "; ".join(shape_errors + dtype_errors)
-        )
-
-    with torch.no_grad():
-        for name, target in destination.items():
-            source = checkpoint_state[name]
-            target.copy_(source.to(device=target.device, dtype=target.dtype))
-
-
 def load_dinov2(
     checkpoint: str | Path = DEFAULT_DINOV2_REPO_ID,
     *,
     revision: str = DEFAULT_DINOV2_REVISION,
-    device: torch.device | str = "cpu",
-    dtype: torch.dtype = torch.float32,
     local_files_only: bool = False,
 ) -> LoadedDinov2:
     """Load the pinned V1 checkpoint without importing ``transformers``."""
@@ -156,18 +114,22 @@ def load_dinov2(
     processor_config = Dinov2ProcessorConfig.from_json_file(files.processor_config)
     processor_config.validate_v1()
 
-    # Checkpoint loading overwrites every inference parameter; avoid allocating
-    # and randomly initializing a second full model before that copy.
-    with torch.device("meta"):
-        model = Dinov2Model(model_config).to(dtype=dtype)
-    model.to_empty(device=device)
     from safetensors.torch import load_file
 
     checkpoint_state = load_file(str(files.weights), device="cpu")
-    _copy_checkpoint_into_model(model, checkpoint_state)
-    model.eval()
+    state_dict = {}
+    for name, value in checkpoint_state.items():
+        if name in _IGNORED_CHECKPOINT_KEYS:
+            continue
+        if not value.is_floating_point():
+            raise ValueError(f"DINOv2 checkpoint tensor {name!r} must be floating point")
+        # Preserve the source dtype used by the original checkpoint binding path.
+        # FP32 checkpoint tensors retain their storage without a model-sized copy.
+        state_dict[name] = value.float()
+    if not state_dict:
+        raise ValueError("DINOv2 checkpoint has no inference tensors")
     return LoadedDinov2(
-        model=model,
+        state_dict=state_dict,
         model_config=model_config,
         processor_config=processor_config,
         files=files,

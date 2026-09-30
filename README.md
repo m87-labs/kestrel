@@ -99,8 +99,9 @@ asyncio.run(main())
 
 `dinov2-small` serves the single-pass `embed` task. Its output contains FP32
 `last_hidden_state` (`[1, 257, 384]`) and `pooler_output` (`[1, 384]`) tensors.
-The H100 BF16 path loads the shipped encoder; other devices use the inference
-model with the same output contract.
+The complete encoder loads from `kestrel-kernels` on supported Hopper devices
+with BF16 inputs. Unsupported devices, precisions, or missing artifacts fail at
+startup.
 
 ```python
 import asyncio
@@ -125,10 +126,8 @@ DINOv2 `image` accepts a PIL image or a NumPy array. Integer pixels use
 `[0, 255]`; floating-point pixels use `[0, 1]`. Preprocessed inputs can instead
 be passed as `pixel_values` with shape `[1, 3, 224, 224]`.
 
-For the DINOv2 Hopper route, supplied GPU `pixel_values` must already be contiguous
-BF16 on the model device. CPU preprocessing casts before transfer. The native
-Torch fallback continues to accept floating-point tensors and converts them to
-its configured device and dtype.
+Supplied GPU `pixel_values` must already be contiguous BF16 on the model device.
+CPU preprocessing casts before transfer.
 
 For either vision model, CUDA tensor inputs must be ready on the caller's current
 stream. Keep them unchanged until the awaited request completes; the engine

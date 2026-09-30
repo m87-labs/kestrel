@@ -1,74 +1,79 @@
-from __future__ import annotations
+"""Checkpoint tensor loading requires no model construction."""
 
-from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
-from kestrel.models.dinov2.config import Dinov2Config
-from kestrel.models.dinov2.model import Dinov2Model
 from kestrel.models.dinov2.weights import (
-    CONFIG_FILENAME,
-    PROCESSOR_CONFIG_FILENAME,
-    WEIGHTS_FILENAME,
-    _copy_checkpoint_into_model,
-    resolve_checkpoint_files,
+    CONFIG_FILENAME, PROCESSOR_CONFIG_FILENAME, WEIGHTS_FILENAME,
+    load_dinov2, resolve_checkpoint_files,
 )
-
-from ._fixtures import MODEL_CONFIG
-
-
-def _small_model() -> Dinov2Model:
-    config = replace(
-        Dinov2Config.from_dict(MODEL_CONFIG),
-        hidden_size=16,
-        image_size=8,
-        mlp_ratio=2,
-        num_attention_heads=4,
-        num_hidden_layers=1,
-        patch_size=2,
-    )
-    return Dinov2Model(config)
+from ._fixtures import MODEL_CONFIG, PROCESSOR_CONFIG
 
 
-def _checkpoint_for(model: Dinov2Model) -> dict[str, torch.Tensor]:
-    state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
-    state["embeddings.mask_token"] = torch.zeros(1, model.config.hidden_size)
-    return state
+def _checkpoint(root, tensors):
+    (root / CONFIG_FILENAME).write_text(json.dumps(MODEL_CONFIG))
+    (root / PROCESSOR_CONFIG_FILENAME).write_text(json.dumps(PROCESSOR_CONFIG))
+    save_file(tensors, str(root / WEIGHTS_FILENAME))
 
 
-def test_checkpoint_copy_is_strict_and_ignores_only_mask_token() -> None:
-    torch.manual_seed(23)
-    source = _small_model()
-    checkpoint = _checkpoint_for(source)
-    destination = _small_model()
-    for parameter in destination.parameters():
-        parameter.data.zero_()
+def test_direct_loader_keeps_fp32_storage_and_does_not_construct_a_model(tmp_path, monkeypatch):
+    state = {"embeddings.cls_token": torch.randn(1, 1, 384),
+             "layernorm.weight": torch.ones(384),
+             "embeddings.mask_token": torch.zeros(1, 384)}
+    _checkpoint(tmp_path, state)
+    monkeypatch.setattr("safetensors.torch.load_file", lambda *args, **kwargs: state)
 
-    _copy_checkpoint_into_model(destination, checkpoint)
-    for name, tensor in source.state_dict().items():
-        torch.testing.assert_close(destination.state_dict()[name], tensor)
+    def no_model(*args, **kwargs):
+        raise AssertionError("checkpoint loading constructed a model")
 
-
-@pytest.mark.parametrize("fault", ["missing", "unexpected", "shape"])
-def test_checkpoint_copy_refuses_invalid_tensors(fault: str) -> None:
-    model = _small_model()
-    checkpoint = _checkpoint_for(model)
-    if fault == "missing":
-        del checkpoint["layernorm.weight"]
-        pattern = "missing"
-    elif fault == "unexpected":
-        checkpoint["classifier.weight"] = torch.zeros(1)
-        pattern = "unexpected"
-    elif fault == "shape":
-        checkpoint["layernorm.weight"] = torch.zeros(17)
-        pattern = "checkpoint.*model"
-    with pytest.raises(RuntimeError, match=pattern):
-        _copy_checkpoint_into_model(model, checkpoint)
+    monkeypatch.setattr(torch.nn.Module, "__init__", no_model)
+    loaded = load_dinov2(tmp_path)
+    assert loaded.state_dict["embeddings.cls_token"] is state["embeddings.cls_token"]
+    assert loaded.state_dict["layernorm.weight"] is state["layernorm.weight"]
+    assert "embeddings.mask_token" not in loaded.state_dict
+    assert loaded.model_config.hidden_size == 384
 
 
-def test_checkpoint_file_path_preserves_hub_symlink_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_checkpoint_tensors_load_on_cpu_as_fp32(tmp_path, dtype):
+    expected = torch.randn(384).to(dtype)
+    _checkpoint(tmp_path, {"layernorm.weight": expected})
+    loaded = load_dinov2(tmp_path)
+    assert loaded.state_dict["layernorm.weight"].dtype is torch.float32
+    assert loaded.state_dict["layernorm.weight"].device.type == "cpu"
+    torch.testing.assert_close(loaded.state_dict["layernorm.weight"], expected.float())
+
+
+def test_nonfloating_checkpoint_tensor_is_rejected(tmp_path):
+    _checkpoint(tmp_path, {"layernorm.weight": torch.ones(384, dtype=torch.int64)})
+    with pytest.raises(ValueError, match="must be floating point"):
+        load_dinov2(tmp_path)
+
+
+def test_pinned_hub_download_requests_only_the_checkpoint_files(tmp_path, monkeypatch):
+    from kestrel.models.dinov2.metadata import DEFAULT_DINOV2_REPO_ID, DEFAULT_DINOV2_REVISION
+
+    _checkpoint(tmp_path, {"layernorm.weight": torch.ones(384)})
+    calls = []
+
+    def download(repo, **kwargs):
+        calls.append((repo, kwargs))
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    load_dinov2()
+    assert calls == [(DEFAULT_DINOV2_REPO_ID, dict(
+        revision=DEFAULT_DINOV2_REVISION,
+        allow_patterns=[CONFIG_FILENAME, PROCESSOR_CONFIG_FILENAME, WEIGHTS_FILENAME],
+        local_files_only=False,
+    ))]
+
+
+def test_checkpoint_file_path_preserves_hub_symlink_name(tmp_path: Path):
     snapshot = tmp_path / "snapshot"
     blobs = tmp_path / "blobs"
     snapshot.mkdir()
@@ -79,27 +84,13 @@ def test_checkpoint_file_path_preserves_hub_symlink_name(tmp_path: Path) -> None
     blob.write_bytes(b"checkpoint")
     weights = snapshot / WEIGHTS_FILENAME
     weights.symlink_to(blob)
-
     files = resolve_checkpoint_files(weights)
     assert files.root == snapshot.resolve()
     assert files.weights.name == WEIGHTS_FILENAME
     assert files.weights.resolve() == blob.resolve()
 
 
-def test_inference_checkpoint_does_not_require_pretraining_mask_token():
-    source = _small_model()
-    destination = _small_model()
-    _copy_checkpoint_into_model(destination, source.state_dict())
-    for name, value in source.state_dict().items():
-        torch.testing.assert_close(destination.state_dict()[name], value)
-
-
-def test_meta_model_materialization_loads_every_inference_parameter():
-    source = _small_model()
-    with torch.device("meta"):
-        destination = Dinov2Model(source.config).to(dtype=torch.float32)
-    assert all(p.is_meta for p in destination.parameters())
-    destination.to_empty(device="cpu")
-    _copy_checkpoint_into_model(destination, source.state_dict())
-    pixels = torch.randn(1, 3, 8, 8)
-    torch.testing.assert_close(destination(pixels).last_hidden_state, source(pixels).last_hidden_state)
+def test_empty_inference_checkpoint_is_rejected(tmp_path):
+    _checkpoint(tmp_path, {"embeddings.mask_token": torch.zeros(1, 384)})
+    with pytest.raises(ValueError, match="no inference tensors"):
+        load_dinov2(tmp_path)

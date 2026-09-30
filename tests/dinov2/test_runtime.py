@@ -1,472 +1,227 @@
-"""Host-only DINOv2 runtime and registry tests with injected backends."""
+"""Serving contracts for the shipped DINOv2 executable."""
 
-from __future__ import annotations
-
-import asyncio
+import gc
+import sys
+import weakref
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-
-import pytest
 
 import numpy as np
+import pytest
 import torch
+
 from kestrel.engine import InferenceEngine
 from kestrel.models import get_spec, known_models
-from kestrel.runtime import ExecutionShape
 from kestrel.models.dinov2.factory import create_dinov2_runtime
-from kestrel.models.dinov2.model import Dinov2Output
-from kestrel.models.dinov2.runtime import (
-    Dinov2Runtime,
-)
-from kestrel.models.dinov2.metadata import (
-    DEFAULT_DINOV2_MODEL,
-    DEFAULT_DINOV2_REPO_ID,
-    DEFAULT_DINOV2_REVISION,
-)
+from kestrel.models.dinov2.metadata import DEFAULT_DINOV2_MODEL, DEFAULT_DINOV2_REPO_ID
+from kestrel.models.dinov2.runtime import Dinov2Runtime
+from kestrel.runtime import ExecutionShape
 
 
-class _FakeProcessor:
-    def __init__(self) -> None:
-        self.calls: list[Any] = []
-
-    def __call__(self, image: Any) -> torch.Tensor:
-        self.calls.append(image)
-        return torch.full((1, 3, 224, 224), 0.25, dtype=torch.float32)
-
-
-class _FakeModel:
-    def __init__(self) -> None:
-        self.calls: list[torch.Tensor] = []
-        self.eval_called = False
-
-    def eval(self):
-        self.eval_called = True
-        return self
-
-    def __call__(self, pixel_values: torch.Tensor) -> Dinov2Output:
-        self.calls.append(pixel_values)
-        hidden = torch.zeros(
-            1,
-            257,
-            384,
-            dtype=pixel_values.dtype,
-            device=pixel_values.device,
-        )
-        hidden = hidden + pixel_values.reshape(-1)[0]
-        return Dinov2Output(hidden, hidden[:, 0, :])
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return {"weight": torch.ones(1)}
-
-
-class _FakeCompiled:
-    def __init__(self) -> None:
-        self.calls: list[torch.Tensor] = []
-        self.shutdown_calls = 0
-
-    def forward(self, pixel_values: torch.Tensor) -> Dinov2Output:
-        self.calls.append(pixel_values)
-        hidden = torch.full(
-            (1, 257, 384),
-            2.0,
-            dtype=pixel_values.dtype,
-            device=pixel_values.device,
-        )
-        return Dinov2Output(hidden, hidden[:, 0, :])
-
-    def shutdown(self) -> None:
-        self.shutdown_calls += 1
-
-
-def _cfg(
-    model: str = DEFAULT_DINOV2_MODEL,
-    *,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.float32,
-) -> SimpleNamespace:
+def _cfg(device="cpu", dtype=torch.bfloat16):
     return SimpleNamespace(
-        model=model,
-        model_path="/unused/model.safetensors",
-        device=device,
-        dtype=dtype,
-        resolved_device=lambda: torch.device(device),
-        resolved_dtype=lambda: dtype,
+        model=DEFAULT_DINOV2_MODEL, model_path=None,
+        resolved_device=lambda: torch.device(device), resolved_dtype=lambda: dtype,
     )
 
 
-def _runtime(
-    *,
-    compiled: _FakeCompiled | None = None,
-    model: _FakeModel | None = None,
-    processor: _FakeProcessor | None = None,
-) -> tuple[Dinov2Runtime, _FakeModel, _FakeProcessor]:
-    eager = model or _FakeModel()
-    image_processor = processor or _FakeProcessor()
-    runtime = Dinov2Runtime(
-        _cfg(),
-        compute_stream=None,
-        kv_pool=object(),
-        model=eager if compiled is None else None,
-        processor=image_processor,
-        compiled_executable=compiled,
-    )
-    return runtime, eager, image_processor
+class _Executable:
+    def __init__(self):
+        self.calls = []
+        self.close_calls = 0
+
+    def forward(self, pixels):
+        self.calls.append(pixels)
+        return torch.full((1, 257, 384), 2.0, dtype=torch.float32)
+
+    def close(self):
+        self.close_calls += 1
 
 
-def _forward(runtime: Dinov2Runtime, task: str, inputs: Any) -> dict[str, torch.Tensor]:
-    return runtime.forward(task, (inputs,))[0]
+def _processor(image):
+    return torch.full((1, 3, 224, 224), .25)
 
 
-def test_model_specs_register_on_import() -> None:
+def _runtime(executable=None, processor=_processor):
+    return Dinov2Runtime(_cfg(), executable=executable or _Executable(), processor=processor)
+
+
+def _factory_stubs(monkeypatch, constructor=None):
+    state = {"weight": torch.ones(1)}
+    calls = []
+
+    def load(source):
+        calls.append(source)
+        return SimpleNamespace(state_dict=state, model_config="model-config", processor_config="processor-config")
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return _Executable()
+
+    monkeypatch.setattr("kestrel.models.dinov2.factory.load_dinov2", load)
+    monkeypatch.setattr("kestrel.models.dinov2.factory.Dinov2ImageProcessor", lambda cfg: _processor)
+    monkeypatch.setattr("kestrel.models.dinov2.factory.get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr("kestrel.models.dinov2.runtime.empty_cache", lambda device: None)
+    monkeypatch.setitem(sys.modules, "kestrel_kernels.megakernel.dinov2",
+                        SimpleNamespace(Dinov2MegakernelEncoder=constructor or create))
+    return state, calls
+
+
+def test_specs_register_the_shipped_factory():
     assert {DEFAULT_DINOV2_MODEL, DEFAULT_DINOV2_REPO_ID} <= set(known_models())
     for name in (DEFAULT_DINOV2_MODEL, DEFAULT_DINOV2_REPO_ID):
         spec = get_spec(name)
         assert spec.runtime is create_dinov2_runtime
-        assert spec.repo_id is None
-        assert spec.filename is None
-        assert spec.checkpoint_format is None
+        assert not spec.needs_kv_pool
         assert spec.tokenizer_id is None
-        assert spec.needs_kv_pool is False
 
 
-def test_registered_factory_owns_the_pinned_snapshot_load(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _FakeModel()
-    processor = _FakeProcessor()
-    calls: list[dict[str, Any]] = []
+@pytest.mark.parametrize("device,dtype,capability", [
+    ("cpu", torch.bfloat16, None),
+    ("mps", torch.float16, None),
+    ("cuda:0", torch.float32, (9, 0)),
+    ("cuda:0", torch.float16, (9, 0)),
+    ("cuda:0", torch.bfloat16, (8, 0)),
+    ("cuda:0", torch.bfloat16, (10, 0)),
+    ("cuda:0", torch.bfloat16, (12, 0)),
+])
+def test_unsupported_targets_fail_before_loading_weights(monkeypatch, device, dtype, capability):
+    def no_load(*args, **kwargs):
+        raise AssertionError("unsupported target loaded a checkpoint")
 
-    def fake_load(source: str | Path, **kwargs: Any):
-        calls.append({"source": source, **kwargs})
-        return SimpleNamespace(
-            model=model,
-            model_config=object(),
-            processor_config=object(),
-        )
-
-    monkeypatch.setattr("kestrel.models.dinov2.factory.load_dinov2", fake_load)
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.Dinov2ImageProcessor",
-        lambda _config: processor,
-    )
-    cfg = _cfg()
-    cfg.model_path = None
-    runtime = get_spec(DEFAULT_DINOV2_MODEL).runtime(cfg, kv_pool=object())
-    try:
-        assert runtime.execution_backend == "eager"
-        assert runtime.model is model
-        assert runtime.processor is processor
-        assert calls == [
-            {
-                "source": DEFAULT_DINOV2_REPO_ID,
-                "revision": DEFAULT_DINOV2_REVISION,
-                "device": torch.device("cpu"),
-                "dtype": torch.float32,
-            }
-        ]
-    finally:
-        runtime.shutdown()
+    monkeypatch.setattr("kestrel.models.dinov2.factory.load_dinov2", no_load)
+    monkeypatch.setattr("kestrel.models.dinov2.factory.get_device_capability", lambda device: capability)
+    with pytest.raises(ValueError, match="requires Hopper CUDA and BF16"):
+        create_dinov2_runtime(_cfg(device, dtype))
 
 
-def test_default_engine_build_does_not_allocate_paged_kv(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _FakeModel()
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.load_dinov2",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            model=model, model_config=object(), processor_config=object()
-        ),
-    )
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.Dinov2ImageProcessor",
-        lambda _config: _FakeProcessor(),
-    )
+@pytest.mark.parametrize("source", [None, "/models/checkpoint"])
+def test_factory_passes_raw_checkpoint_tensors_to_the_encoder(monkeypatch, source):
+    state, calls = _factory_stubs(monkeypatch)
+    cfg = _cfg("cuda:0")
+    cfg.model_path = source
+    runtime = create_dinov2_runtime(cfg, compute_stream=object())
+    assert calls[0] == (source or DEFAULT_DINOV2_REPO_ID)
+    assert calls[1]["state_dict"] is state
+    assert calls[1]["config"] == "model-config"
+    assert calls[1]["device"] == torch.device("cuda:0")
+    assert calls[1]["dtype"] is torch.bfloat16
+    executable = runtime.executable
+    runtime.shutdown()
+    runtime.shutdown()
+    assert executable.close_calls == 1
+    assert runtime.executable is None
+
+
+def test_missing_artifact_is_a_startup_failure(monkeypatch):
+    def missing(**kwargs):
+        raise RuntimeError("no shipped DINOv2 grid")
+
+    _factory_stubs(monkeypatch, missing)
+    with pytest.raises(RuntimeError, match="no shipped DINOv2 grid"):
+        create_dinov2_runtime(_cfg("cuda:0"))
+
+
+def test_engine_build_does_not_allocate_paged_kv(monkeypatch):
+    _factory_stubs(monkeypatch)
     engine = object.__new__(InferenceEngine)
-    engine._runtime_cfg = _cfg()
+    engine._runtime_cfg = _cfg("cuda:0")
     engine._default_model = DEFAULT_DINOV2_MODEL
     engine._compute_stream = None
-
-    def no_pool():
-        raise AssertionError("DINOv2 allocated a KV pool")
-
-    engine._shared_kv_pool = no_pool
+    engine._shared_kv_pool = lambda: pytest.fail("DINOv2 allocated paged KV")
     runtime = engine._build_runtime(DEFAULT_DINOV2_MODEL, None)
-    try:
-        assert runtime.tasks() == ("embed",)
-        engine._runtimes = {DEFAULT_DINOV2_MODEL: runtime}
-        assert engine._tasks_for(DEFAULT_DINOV2_MODEL) == ("embed",)
-    finally:
-        runtime.shutdown()
-
-
-def test_registered_factory_builds_the_shipped_sm90_runtime_without_compiler(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _FakeModel()
-    processor = _FakeProcessor()
-    stream = object()
-    calls: dict[str, Any] = {"loads": 0, "shutdowns": 0}
-
-    def fake_load(source: str | Path, **kwargs: Any):
-        calls["loads"] += 1
-        calls["load"] = {"source": source, **kwargs}
-        return SimpleNamespace(
-            model=model,
-            model_config="model-config",
-            processor_config="processor-config",
-        )
-
-    class FakeExecutable:
-        def __init__(self, config: Any, state_dict: Any, **kwargs: Any) -> None:
-            calls["executable"] = {
-                "config": config,
-                "state_dict": state_dict,
-                **kwargs,
-            }
-
-        def shutdown(self) -> None:
-            calls["shutdowns"] += 1
-
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr("kestrel.models.dinov2.factory.load_dinov2", fake_load)
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.Dinov2ImageProcessor",
-        lambda config: processor if config == "processor-config" else None,
-    )
-    monkeypatch.setattr(
-        "kestrel.models.dinov2.factory.Dinov2ShippedExecutable", FakeExecutable)
-    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
-    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
-    monkeypatch.setattr("kestrel.models.dinov2.runtime.empty_cache", lambda _device: None)
-
-    cfg = _cfg(device="cuda:0", dtype=torch.bfloat16)
-    cfg.model_path = None
-    runtime = get_spec(DEFAULT_DINOV2_MODEL).runtime(
-        cfg,
-        compute_stream=stream,
-        kv_pool=object(),
-    )
-    try:
-        assert runtime.execution_backend == "compiled"
-        assert runtime.model is None
-        assert runtime.processor is processor
-        assert calls["loads"] == 1
-        assert calls["load"] == {
-            "source": DEFAULT_DINOV2_REPO_ID,
-            "revision": DEFAULT_DINOV2_REVISION,
-            "device": torch.device("cpu"),
-            "dtype": torch.float32,
-        }
-        assert calls["executable"]["config"] == "model-config"
-        assert calls["executable"]["device"] == torch.device("cuda:0")
-        assert calls["executable"]["dtype"] is torch.bfloat16
-        assert calls["executable"]["state_dict"].keys() == {"weight"}
-        torch.testing.assert_close(
-            calls["executable"]["state_dict"]["weight"],
-            torch.ones(1),
-        )
-    finally:
-        runtime.shutdown()
-    assert calls["shutdowns"] == 1
-
-
-def test_eager_runtime_accepts_image_and_pixel_values() -> None:
-    runtime, model, processor = _runtime()
-    try:
-        assert runtime.execution_shape is ExecutionShape.SINGLE_PASS
-        assert runtime.model_name == DEFAULT_DINOV2_MODEL
-        assert runtime.tasks() == ("embed",)
-        assert runtime.execution_backend == "eager"
-        assert runtime.primary_stream is None
-        assert model.eval_called
-
-        image = np.zeros((12, 9, 3), dtype=np.uint8)
-        from_image = _forward(runtime, "embed", {"image": image})
-        pixels = torch.full((1, 3, 224, 224), 0.5)
-        from_pixels = _forward(runtime, "embed", {"pixel_values": pixels})
-    finally:
-        runtime.shutdown()
-
-    assert processor.calls == [image]
-    assert len(model.calls) == 2
-    assert model.calls[0].dtype is torch.float32
-    assert set(from_image) == {"last_hidden_state", "pooler_output"}
-    assert from_image["last_hidden_state"].shape == (1, 257, 384)
-    assert from_image["pooler_output"].shape == (1, 384)
-    assert torch.equal(
-        from_pixels["pooler_output"],
-        from_pixels["last_hidden_state"][:, 0, :],
-    )
-
-
-def test_public_outputs_are_fp32_for_bf16_eager_execution() -> None:
-    model = _FakeModel()
-    runtime = Dinov2Runtime(
-        _cfg(dtype=torch.bfloat16),
-        model=model,
-        processor=_FakeProcessor(),
-    )
-    try:
-        output = _forward(
-            runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)}
-        )
-    finally:
-        runtime.shutdown()
-
-    assert model.calls[0].dtype is torch.bfloat16
-    assert output["last_hidden_state"].dtype is torch.float32
-    assert output["pooler_output"].dtype is torch.float32
-    torch.testing.assert_close(
-        output["pooler_output"],
-        output["last_hidden_state"][:, 0, :],
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
-def test_input_and_task_validation_is_strict() -> None:
-    runtime, _, _ = _runtime()
-    try:
-        with pytest.raises(ValueError, match="does not support task"):
-            _forward(runtime, "segment", {"pixel_values": torch.zeros(1, 3, 224, 224)})
-        with pytest.raises(TypeError, match="mapping"):
-            _forward(runtime, "embed", object())
-        with pytest.raises(ValueError, match="exactly one"):
-            _forward(runtime, "embed", {})
-        with pytest.raises(ValueError, match="exactly one"):
-            _forward(
-                runtime,
-                "embed",
-                {
-                    "image": np.zeros((2, 2, 3), dtype=np.uint8),
-                    "pixel_values": torch.zeros(1, 3, 224, 224),
-                },
-            )
-        with pytest.raises(ValueError, match="unsupported embed inputs"):
-            _forward(
-                runtime,
-                "embed",
-                {"pixel_values": torch.zeros(1, 3, 224, 224), "normalize": True},
-            )
-        with pytest.raises(TypeError, match="torch.Tensor"):
-            _forward(runtime, "embed", {"pixel_values": np.zeros((1, 3, 224, 224))})
-        with pytest.raises(ValueError, match="must have shape"):
-            _forward(runtime, "embed", {"pixel_values": torch.zeros(1, 3, 518, 518)})
-        with pytest.raises(TypeError, match="floating point"):
-            _forward(
-                runtime,
-                "embed",
-                {"pixel_values": torch.zeros(1, 3, 224, 224, dtype=torch.uint8)},
-            )
-    finally:
-        runtime.shutdown()
-    with pytest.raises(RuntimeError, match="shut down"):
-        _forward(runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)})
-
-
-def test_factory_selected_compiled_backend_is_used_and_closed_once() -> None:
-    compiled = _FakeCompiled()
-    runtime, eager, _ = _runtime(compiled=compiled)
-    output = _forward(runtime, "embed", {"pixel_values": torch.zeros(1, 3, 224, 224)})
-    assert runtime.execution_backend == "compiled"
-    assert len(compiled.calls) == 1
-    assert eager.calls == []
-    assert torch.all(output["pooler_output"] == 2)
+    assert runtime.tasks() == ("embed",)
     runtime.shutdown()
+
+
+def test_image_and_pixels_return_the_same_owned_output_contract():
+    executable = _Executable()
+    runtime = _runtime(executable)
+    assert runtime.execution_shape is ExecutionShape.SINGLE_PASS
+    for request in ({"image": np.zeros((8, 9, 3), dtype=np.uint8)},
+                    {"pixel_values": torch.zeros(1, 3, 224, 224)}):
+        result = runtime.forward("embed", (request,))[0]
+        assert set(result) == {"last_hidden_state", "pooler_output"}
+        assert result["last_hidden_state"].shape == (1, 257, 384)
+        assert result["pooler_output"].shape == (1, 384)
+        assert result["pooler_output"].dtype is torch.float32
+        assert result["pooler_output"].data_ptr() == result["last_hidden_state"].data_ptr()
+    assert all(pixels.dtype is torch.bfloat16 for pixels in executable.calls)
     runtime.shutdown()
-    assert compiled.shutdown_calls == 1
-    assert runtime._compiled_executable is None
 
 
-def test_runtime_requires_exactly_one_backend() -> None:
-    for backends in ({}, {"model": _FakeModel(), "compiled_executable": _FakeCompiled()}):
-        with pytest.raises(ValueError, match="exactly one"):
-            Dinov2Runtime(_cfg(), processor=_FakeProcessor(), **backends)
-
-
-def test_shutdown_releases_eager_model() -> None:
-    import gc
-    import weakref
-
-    runtime = Dinov2Runtime(_cfg(), model=_FakeModel(), processor=_FakeProcessor())
-    model = weakref.ref(runtime.model)
+@pytest.mark.parametrize("inputs,error", [
+    ({}, "exactly one"),
+    ({"image": None}, "must not be None"),
+    ({"image": object(), "pixel_values": torch.empty(0)}, "exactly one"),
+    ({"pixel_values": torch.zeros(1, 3, 224, 224), "normalize": True}, "unsupported"),
+    ({"pixel_values": torch.zeros(1, 3, 518, 518)}, "shape"),
+    ({"pixel_values": torch.zeros(1, 3, 224, 224, dtype=torch.uint8)}, "floating point"),
+    ({"pixel_values": np.zeros((1, 3, 224, 224))}, "torch.Tensor"),
+    (object(), "mapping"),
+])
+def test_invalid_inputs_do_not_launch(inputs, error):
+    executable = _Executable()
+    runtime = _runtime(executable)
+    with pytest.raises((ValueError, TypeError), match=error):
+        runtime.forward("embed", (inputs,))
+    assert not executable.calls
     runtime.shutdown()
-    gc.collect()
-    assert model() is None
+
+
+def test_cpu_pixels_convert_before_transfer_and_reject_other_device():
+    runtime = _runtime()
+    pixels = torch.randn(1, 3, 224, 224).transpose(2, 3)
+    prepared = runtime._pixel_values({"pixel_values": pixels})
+    assert prepared.dtype is torch.bfloat16 and prepared.is_contiguous()
+    torch.testing.assert_close(prepared, pixels.bfloat16())
+    with pytest.raises(ValueError, match="model device/dtype"):
+        runtime._pixel_values({"pixel_values": torch.empty(1, 3, 224, 224, device="meta")})
+    runtime.shutdown()
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), 3.4e38, 1e100])
-def test_nonfinite_or_overflowing_pixels_are_rejected_before_execution(value) -> None:
-    compiled = _FakeCompiled()
-    runtime = Dinov2Runtime(_cfg(dtype=torch.bfloat16), processor=_FakeProcessor(),
-                            compiled_executable=compiled)
-    try:
-        pixels = torch.full((1, 3, 224, 224), value, dtype=torch.float64)
-        with pytest.raises(ValueError, match="finite"):
-            _forward(runtime, "embed", {"pixel_values": pixels})
-        assert compiled.calls == []
-    finally:
-        runtime.shutdown()
+def test_nonfinite_or_overflowing_pixels_do_not_launch(value):
+    executable = _Executable()
+    runtime = _runtime(executable)
+    with pytest.raises(ValueError, match="finite"):
+        runtime.forward("embed", ({"pixel_values": torch.full((1, 3, 224, 224), value, dtype=torch.float64)},))
+    assert not executable.calls
+    runtime.shutdown()
 
 
-def test_async_preprocessing() -> None:
-    runtime, _, processor = _runtime()
-    image = object()
-    try:
-        future = runtime.preprocess_image_async(image)
-        assert future.result().shape == (1, 3, 224, 224)
-        assert processor.calls == [image]
-    finally:
-        runtime.shutdown()
+@pytest.mark.parametrize("output", ["invalid", torch.zeros(1, 384),
+                                    torch.zeros(1, 257, 384, dtype=torch.bfloat16)])
+def test_malformed_executable_outputs_are_rejected(output):
+    executable = _Executable()
+    executable.forward = lambda pixels: output
+    runtime = _runtime(executable)
+    with pytest.raises((TypeError, RuntimeError)):
+        runtime.forward("embed", ({"pixel_values": torch.zeros(1, 3, 224, 224)},))
+    runtime.shutdown()
 
 
-def test_generic_handle_run() -> None:
-    engine = object.__new__(InferenceEngine)
-    engine._default_model = "ar-default"
-    engine._model_ids = ["ar-default", DEFAULT_DINOV2_MODEL]
-    engine._runtimes = {
-        DEFAULT_DINOV2_MODEL: SimpleNamespace(
-            model_name=DEFAULT_DINOV2_MODEL,
-            execution_shape=ExecutionShape.SINGLE_PASS,
-            tasks=lambda: ("embed",),
-        )
-    }
-    engine._initialized = True
-    engine._scheduler_error = None
-    captured: dict[str, Any] = {}
-
-    async def run(model: str, task: str, inputs: Any) -> str:
-        captured.update(model=model, task=task, inputs=inputs)
-        return "OK"
-
-    engine.run = run  # type: ignore[method-assign]
-    pixels = torch.zeros(1, 3, 224, 224)
-    result = asyncio.run(
-        engine.model(DEFAULT_DINOV2_MODEL).run(
-            "embed",
-            {"pixel_values": pixels},
-        )
-    )
-    assert result == "OK"
-    assert captured == {
-        "model": DEFAULT_DINOV2_MODEL,
-        "task": "embed",
-        "inputs": {"pixel_values": pixels},
-    }
+def test_task_batch_and_shutdown_contracts():
+    runtime = _runtime()
+    with pytest.raises(ValueError, match="does not support task"):
+        runtime.forward("detect", ({},))
+    with pytest.raises(ValueError, match="one embed request"):
+        runtime.forward("embed", ({}, {}))
+    owner = weakref.ref(runtime.executable)
+    runtime.shutdown()
+    gc.collect()
+    assert owner() is None
+    with pytest.raises(RuntimeError, match="shut down"):
+        runtime.forward("embed", ({},))
 
 
-def test_compiled_pixels_cast_on_cpu_and_reject_other_device():
-    compiled = _FakeCompiled()
-    runtime = Dinov2Runtime(_cfg(dtype=torch.bfloat16), processor=_FakeProcessor(),
-                            compiled_executable=compiled)
-    pixels = torch.randn(1, 3, 224, 224).transpose(2, 3)
-    prepared = runtime._pixel_values({"pixel_values": pixels})
-    assert prepared.device.type == "cpu" and prepared.dtype == torch.bfloat16
-    assert prepared.is_contiguous()
-    torch.testing.assert_close(prepared.float(), pixels.to(torch.bfloat16).float())
-    with pytest.raises(ValueError, match="model device/dtype"):
-        runtime._pixel_values({"pixel_values": torch.empty(1, 3, 224, 224, device="meta")})
+def test_preprocessing_future_propagates_errors():
+    def invalid(image):
+        raise ValueError("bad image")
+
+    runtime = _runtime(processor=invalid)
+    with pytest.raises(ValueError, match="bad image"):
+        runtime.preprocess_image_async(object()).result()
+    runtime.shutdown()
