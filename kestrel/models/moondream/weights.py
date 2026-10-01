@@ -316,55 +316,41 @@ def _assign_md2_vision_weights(
         param.data = param.data.contiguous()
 
 
-def _assign_md3_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
-    """Assign vision weights from Moondream 3 checkpoint format (vision_encoder.*)."""
-    vision = model.vision
-    # patch_emb.weight is NOT in this map: its parameter is padded to the tensor-core
-    # alignment, so it needs the zero-extending copy rather than the exact-shape
-    # `copy_` the loop below performs. Keeping it out means the generic loop stays
-    # strict for every other tensor instead of growing a shape-tolerant path that
-    # would mask a real mismatch elsewhere.
-    _copy_patch_emb_weight(
-        vision["patch_emb"].weight,
-        get_tensor("vision_encoder.encoder.model.visual.patch_embed.linear.weight"),
-    )
-    weight_map: Dict[str, torch.Tensor] = {
-        "vision_encoder.encoder.model.visual.patch_embed.linear.bias": vision[
-            "patch_emb"
-        ].bias,
-        "vision_encoder.encoder.model.visual.pos_embed": vision.pos_emb,
-        "vision_encoder.encoder.model.visual.norm.weight": vision["post_ln"].weight,
-        "vision_encoder.encoder.model.visual.norm.bias": vision["post_ln"].bias,
-        "vision_encoder.projection.mlp.fc1.weight": vision["proj_mlp"]["fc1"].weight,
-        "vision_encoder.projection.mlp.fc1.bias": vision["proj_mlp"]["fc1"].bias,
-        "vision_encoder.projection.mlp.fc2.weight": vision["proj_mlp"]["fc2"].weight,
-        "vision_encoder.projection.mlp.fc2.bias": vision["proj_mlp"]["fc2"].bias,
+def md3_vision_parameter_sources(num_layers: int, *, include_projection: bool = True) -> dict[str, str]:
+    """Map canonical inference parameter names to the MD3 vision checkpoint."""
+    prefix = "vision_encoder.encoder.model.visual"
+    sources = {
+        "patch_emb.weight": f"{prefix}.patch_embed.linear.weight",
+        "patch_emb.bias": f"{prefix}.patch_embed.linear.bias",
+        "pos_emb": f"{prefix}.pos_embed",
+        "post_ln.weight": f"{prefix}.norm.weight",
+        "post_ln.bias": f"{prefix}.norm.bias",
     }
+    for layer in range(num_layers):
+        for name, checkpoint_name in (("ln1", "norm1"), ("ln2", "norm2"),
+                                      ("attn.qkv", "attn.qkv"), ("attn.proj", "attn.proj"),
+                                      ("mlp.fc1", "mlp.fc1"), ("mlp.fc2", "mlp.fc2")):
+            for suffix in ("weight", "bias"):
+                sources[f"blocks.{layer}.{name}.{suffix}"] = (
+                    f"{prefix}.blocks.{layer}.{checkpoint_name}.{suffix}")
+    if include_projection:
+        for name in ("fc1", "fc2"):
+            for suffix in ("weight", "bias"):
+                sources[f"proj_mlp.{name}.{suffix}"] = f"vision_encoder.projection.mlp.{name}.{suffix}"
+    return sources
 
-    for i, block in enumerate(vision["blocks"]):
-        prefix = f"vision_encoder.encoder.model.visual.blocks.{i}"
-        weight_map.update(
-            {
-                f"{prefix}.norm1.weight": block["ln1"].weight,
-                f"{prefix}.norm1.bias": block["ln1"].bias,
-                f"{prefix}.norm2.weight": block["ln2"].weight,
-                f"{prefix}.norm2.bias": block["ln2"].bias,
-                f"{prefix}.attn.qkv.weight": block["attn"]["qkv"].weight,
-                f"{prefix}.attn.qkv.bias": block["attn"]["qkv"].bias,
-                f"{prefix}.attn.proj.weight": block["attn"]["proj"].weight,
-                f"{prefix}.attn.proj.bias": block["attn"]["proj"].bias,
-                f"{prefix}.mlp.fc1.weight": block["mlp"]["fc1"].weight,
-                f"{prefix}.mlp.fc1.bias": block["mlp"]["fc1"].bias,
-                f"{prefix}.mlp.fc2.weight": block["mlp"]["fc2"].weight,
-                f"{prefix}.mlp.fc2.bias": block["mlp"]["fc2"].bias,
-            }
-        )
 
-    for key, tensor in weight_map.items():
-        tensor.data.copy_(get_tensor(key))
-
-    for param in vision.parameters():
-        param.data = param.data.contiguous()
+def _assign_md3_vision_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
+    """Assign the complete MD3 vision path using the shared parameter mapping."""
+    vision = model.vision
+    sources = md3_vision_parameter_sources(len(vision.blocks))
+    for name, parameter in vision.named_parameters():
+        value = get_tensor(sources[name])
+        if name == "patch_emb.weight":
+            _copy_patch_emb_weight(parameter, value)
+        else:
+            parameter.data.copy_(value)
+        parameter.data = parameter.data.contiguous()
 
 
 def _assign_md2_region_weights(

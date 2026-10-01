@@ -22,6 +22,7 @@ from . import (  # noqa: F401
     qwen3_asr,
     qwen3_tts,
     rfdetr,
+    siglip,
     whisper,
 )
 
