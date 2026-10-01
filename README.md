@@ -133,6 +133,31 @@ For either vision model, CUDA tensor inputs must be ready on the caller's curren
 stream. Keep them unchanged until the awaited request completes; the engine
 handles the stream handoff internally.
 
+## SigLIP image tokens
+
+`siglip-so400m-378` serves the Moondream-trained SigLIP SO400M/14 encoder on
+H100 (132 SMs). It requires an explicit local Moondream 3 `model_fp8.pt` or
+corresponding safetensors checkpoint. The vision weights are BF16; the filename
+refers to the language model. Arbitrary upstream SigLIP checkpoints are not supported.
+
+```python
+engine = await InferenceEngine.create(RuntimeConfig(
+    model="siglip-so400m-378", model_path="/models/model_fp8.pt"))
+try:
+    result = await engine.model().embed(image=Image.open("photo.jpg"))
+    tokens = result.output["last_hidden_state"]  # BF16 [1, 729, 1152]
+finally:
+    await engine.shutdown()
+```
+
+Each image is converted to RGB and resized to 378 × 378 with bicubic sampling.
+There is no Moondream crop stitching, pooling, or projection. For a batch of
+independent images, pass raw uint8 `pixel_values` with shape `[N, 3, 378, 378]`,
+where N is 1..13; GPU tensors must be contiguous on the model device. Outputs are
+owned `[N, 729, 1152]` tensors and remain valid after later calls. Patch embedding,
+all 27 blocks, and final normalization execute in one persistent GPU launch.
+The existing Moondream image API continues returning its projected tokens.
+
 ## Object detection with RF-DETR
 
 RF-DETR runs through the single-pass detection API on Hopper with BF16:
