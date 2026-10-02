@@ -93,7 +93,7 @@ class DFlashDraftGraphSession:
         self.active = False
         config = model.config
         self.context_rows = config.block_size
-        self.query_rows = config.block_size
+        self.query_rows = config.query_rows
         parameter = next(model.parameters())
         if parameter.device.type != "cuda":
             raise ValueError("draft graph requires CUDA")

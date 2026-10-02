@@ -27,7 +27,7 @@ def _verification_draft(block=16):
     taps = (1, 10, 18, 27, 35, 44, 52, 61) if block == 16 else (5, 19, 33, 47, 61)
     return SimpleNamespace(config=SimpleNamespace(
         block_size=block, target_layer_ids=taps, hidden_size=5120,
-        mask_token_id=1, selector_rank=0))
+        mask_token_id=1, selector_rank=0, markov_rank=0))
 
 
 @pytest.mark.parametrize("capacity,block,page,arch,weight_format,expected", [

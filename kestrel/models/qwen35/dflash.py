@@ -10,7 +10,7 @@ from torch import nn
 
 from kestrel.ops.attention import dense_attention
 from kestrel.ops.rotary import (
-    MultidimensionalRotaryEmbedding, default_inv_freq,
+    MultidimensionalRotaryEmbedding, default_inv_freq, yarn_inv_freq,
 )
 from kestrel_kernels import get_runtime
 from kestrel_kernels.dynamic_conv import causal_dynamic_conv1d
@@ -72,14 +72,24 @@ class DFlashConfig:
     selector_rank: int = 0
     selector_top_k: int = 0
     vocab_size: int = 0
+    markov_rank: int = 0
+    enable_confidence_head: bool = False
+    confidence_head_with_markov: bool = False
+    sample_from_anchor: bool = False
+    rope_parameters: dict | None = None
+
+    @property
+    def query_rows(self):
+        return self.block_size - int(self.sample_from_anchor)
 
     @classmethod
     def from_dict(cls, data):
         draft = data["dflash_config"]
         architecture = data.get("architectures", ["DFlashDraftModel"])
-        if architecture not in (["DFlashDraftModel"], ["DFlash2DraftModel"]):
+        if architecture not in (["DFlashDraftModel"], ["DFlash2DraftModel"], ["DSparkDraftModel"]):
             raise ValueError("unsupported DFlash draft architecture")
         is_v2 = architecture == ["DFlash2DraftModel"]
+        is_dspark = architecture == ["DSparkDraftModel"]
         extra = tuple(int(draft[name]) for name in (
             "conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"
         )) if is_v2 else (0, 0, 0, 0)
@@ -97,9 +107,11 @@ class DFlashConfig:
         window = draft.get("swa_window_size", data.get("sliding_window"))
         if "sliding_attention" in kinds and (window is None or int(window) <= 0):
             raise ValueError("DFlash sliding layers require a positive window")
-        rope = data.get("rope_parameters") or {}
-        if rope.get("rope_type", "default") != "default":
-            raise ValueError("DFlash requires default RoPE")
+        rope = data.get("rope_parameters") or data.get("rope_scaling") or {}
+        if rope.get("rope_type", "default") not in ("default", "yarn"):
+            raise ValueError("unsupported DFlash RoPE schedule")
+        if rope.get("partial_rotary_factor", 1.0) != 1.0:
+            raise ValueError("DFlash requires full-head RoPE")
         if data.get("hidden_act", "silu") != "silu" or data.get("attention_bias", False):
             raise ValueError("DFlash requires bias-free attention and SiLU")
         heads, kv_heads = int(data["num_attention_heads"]), int(data["num_key_value_heads"])
@@ -116,6 +128,19 @@ class DFlashConfig:
         if "num_target_layers" in data and max(taps) >= int(data["num_target_layers"]):
             raise ValueError("DFlash target layer index exceeds target depth")
         block_size = int(draft.get("block_size", data.get("block_size", 16)))
+        markov_rank = int(data.get("markov_rank", draft.get("markov_rank", 0))) if is_dspark else 0
+        confidence = (data.get("enable_confidence_head", draft.get("enable_confidence_head", False))
+                      if is_dspark else False)
+        confidence_markov = (data.get("confidence_head_with_markov", draft.get("confidence_head_with_markov", False))
+                             if is_dspark else False)
+        if is_dspark:
+            if (markov_rank <= 0 or data.get("markov_head_type", draft.get("markov_head_type")) != "vanilla"
+                    or data.get("draft_vocab_size", data["vocab_size"]) != data["vocab_size"]
+                    or not isinstance(confidence, bool) or not isinstance(confidence_markov, bool)):
+                raise ValueError("DSpark requires a vanilla Markov head and the target vocabulary")
+            # DSpark's anchor row predicts a draft; the verifier also consumes
+            # the already-selected target token, so its extent is one larger.
+            block_size += 1
         if block_size <= 1:
             raise ValueError("DFlash block must include a seed and a draft token")
         return cls(
@@ -126,6 +151,8 @@ class DFlashConfig:
             int(draft["mask_token_id"]), taps, kinds,
             None if window is None else int(window), causal, *extra,
             int(data.get("vocab_size", 0)),
+            markov_rank, confidence, confidence_markov, is_dspark,
+            rope if rope.get("rope_type") == "yarn" else None,
         )
 
     def attention(self, layer):
@@ -283,6 +310,35 @@ class _CandidateSelector(nn.Module):
                                       self.successor_codebook.weight, anchors)
 
 
+class _VanillaMarkov(nn.Module):
+    # Tried omitting Markov correction: Qwen3.8 C1 170.5 vs 311.1 tok/s
+    # on the same DSpark checkpoint; retain the trained sequential head.
+    def __init__(self, config):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(config.vocab_size, config.markov_rank)
+        self.markov_w2 = nn.Linear(config.markov_rank, config.vocab_size, bias=False)
+
+    def forward(self, logits, anchors):
+        if anchors is None or anchors.shape != (logits.shape[0],):
+            raise ValueError("DSpark requires one predecessor token per sequence")
+        predecessor = anchors.long()
+        tokens = []
+        for row in range(logits.shape[1]):
+            bias = self.markov_w2(self.markov_w1(predecessor))
+            predecessor = (logits[:, row] + bias).argmax(-1)
+            tokens.append(predecessor)
+        return torch.stack(tokens, dim=1)
+
+
+class _ConfidenceHead(nn.Module):
+    """Retain checkpoint confidence weights; fixed-width drafting does not prune."""
+
+    def __init__(self, config):
+        super().__init__()
+        width = config.hidden_size + (config.markov_rank if config.confidence_head_with_markov else 0)
+        self.proj = nn.Linear(width, 1)
+
+
 class _Layer(nn.Module):
     def __init__(self, config, index):
         super().__init__()
@@ -331,8 +387,13 @@ class DFlashDraftModel(nn.Module):
         self.fc = nn.Linear(len(config.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = _Norm(config.hidden_size, config.rms_norm_eps)
         self.candidate_selector = _CandidateSelector(config) if config.selector_rank else None
+        self.markov_head = _VanillaMarkov(config) if config.markov_rank else None
+        self.confidence_head = _ConfidenceHead(config) if config.enable_confidence_head else None
         self.rotary_emb = MultidimensionalRotaryEmbedding(
             config.head_dim, config.rope_theta, dimensions=1)
+        if config.rope_parameters is not None:
+            self.rotary_emb.inv_freq, self.rotary_emb.attention_factor = yarn_inv_freq(
+                config.head_dim, config.rope_theta, config.rope_parameters)
 
     def forward(self, noise_embedding, target_hidden, position_ids, *, context_cache=None):
         """Append new verified target taps, then evaluate a transient query block.
@@ -418,9 +479,11 @@ class DFlashDraftModel(nn.Module):
         return result
 
     def select_tokens(self, hidden, lm_head, anchors):
-        rows = hidden[:, 1:]
+        rows = hidden if self.config.sample_from_anchor else hidden[:, 1:]
         logits = lm_head(rows.reshape(1, -1, rows.shape[-1])).reshape(
             rows.shape[0], rows.shape[1], -1)
+        if self.markov_head is not None:
+            return self.markov_head(logits, anchors).to(torch.int32)
         if self.candidate_selector is None:
             return logits.argmax(-1).to(torch.int32)
         return self.candidate_selector(rows, logits, anchors).to(torch.int32)
@@ -441,5 +504,9 @@ def load_dflash_drafter(path: str | Path, *, device: torch.device) -> DFlashDraf
     if any(value.dtype != torch.bfloat16 for value in state.values()):
         raise ValueError("DFlash draft checkpoint must contain BF16 weights")
     model.load_state_dict(state, strict=True, assign=True)
-    model.rotary_emb.inv_freq = default_inv_freq(config.head_dim, config.rope_theta, device=device)
+    if config.rope_parameters is None:
+        model.rotary_emb.inv_freq = default_inv_freq(config.head_dim, config.rope_theta, device=device)
+    else:
+        model.rotary_emb.inv_freq, model.rotary_emb.attention_factor = yarn_inv_freq(
+            config.head_dim, config.rope_theta, config.rope_parameters, device=device)
     return model.requires_grad_(False).eval()

@@ -95,7 +95,7 @@ def test_shutdown_releases_replay_graph_after_target_shutdown_error():
 def test_single_draft_device_ids_are_ordered_after_stream_lease():
     from contextlib import contextmanager
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
-    obj.draft = SimpleNamespace(config=SimpleNamespace(block_size=4, mask_token_id=0))
+    obj.draft = SimpleNamespace(config=SimpleNamespace(block_size=4, query_rows=4, mask_token_id=0))
     obj.runtime = SimpleNamespace(device=torch.device("cuda:0"), model=SimpleNamespace(
         lm_head=lambda hidden: torch.cat((hidden, hidden + 1), dim=-1)))
     obj.text = SimpleNamespace(embed_tokens=lambda ids: torch.zeros((*ids.shape, 1), device="cuda"))

@@ -41,7 +41,7 @@ class Qwen35DFlashDecoder:
                 or not config.target_layer_ids
                 or any(i < 0 or i >= target.num_hidden_layers for i in config.target_layer_ids)
                 or not 0 <= config.mask_token_id < target.vocab_size
-                or (config.selector_rank and config.vocab_size != target.vocab_size)
+                or ((config.selector_rank or config.markov_rank) and config.vocab_size != target.vocab_size)
                 or config.block_size < 2):
             raise ValueError("DFlash checkpoint does not match target dimensions, taps, or vocabulary")
         self.num_speculative_tokens = config.block_size - 1
@@ -303,10 +303,10 @@ class Qwen35DFlashDecoder:
     def propose(self, ctx):
         config = self.draft.config
         start = ctx.cache.seq_length
-        noise = torch.full((1, config.block_size), config.mask_token_id,
+        noise = torch.full((1, config.query_rows), config.mask_token_id,
                            device=self.runtime.device, dtype=torch.long)
         noise[0, 0] = ctx.bonus
-        positions = torch.arange(ctx.draft_cache.length, start+config.block_size,
+        positions = torch.arange(ctx.draft_cache.length, start+config.query_rows,
                                  device=self.runtime.device)[None]
         consumer_stream = torch.cuda.current_stream(self.runtime.device)
         with self._draft_tokens([self.text.embed_tokens(noise)], [ctx.features],
@@ -318,12 +318,12 @@ class Qwen35DFlashDecoder:
 
     def _propose_many(self, sessions):
         config = self.draft.config
-        noise = torch.full((len(sessions), config.block_size), config.mask_token_id,
+        noise = torch.full((len(sessions), config.query_rows), config.mask_token_id,
                            device=self.runtime.device, dtype=torch.long)
         noise[:, 0] = torch.tensor([session.bonus for session in sessions],
                                    device=self.runtime.device)
         positions = [torch.arange(session.draft_cache.length,
-                                  session.cache.seq_length + config.block_size,
+                                  session.cache.seq_length + config.query_rows,
                                   device=self.runtime.device)[None]
                      for session in sessions]
         with self._draft_tokens(
