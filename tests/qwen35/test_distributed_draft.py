@@ -33,8 +33,9 @@ def test_rejects_unsupported_placement_before_cuda(devices, changes):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="eight peer GPUs required")
+@pytest.mark.parametrize("deferred_consumer", [False, True])
 @torch.inference_mode()
-def test_explicit_devices_and_cache_rebind():
+def test_explicit_devices_and_cache_rebind(deferred_consumer):
     devices = tuple(reversed(range(8)))
     primary, config = devices[0], _config()
     with torch.cuda.device(primary):
@@ -47,6 +48,31 @@ def test_explicit_devices_and_cache_rebind():
         cache = DFlashContextCache(64)
         model(noise, context, torch.arange(4 + config.block_size, device=primary)[None], context_cache=cache)
         session = DistributedDFlashDraftSession(model, [copy.deepcopy(cache)], lm_head=head, devices=devices)
+        consumer = None
+        if deferred_consumer:
+            from kestrel_kernels.graph_team import CudaGraphTeam
+            from kestrel_kernels.peer_graph import PeerCopies
+
+            proposals = torch.empty((1, config.block_size - 1), device=primary, dtype=torch.int32)
+            streams = tuple(torch.cuda.Stream(device=device) for device in devices)
+            buffers, transfers, graphs = [], [], []
+            for rank, (device, stream) in enumerate(zip(devices, streams, strict=True)):
+                with torch.cuda.device(device), torch.cuda.stream(stream):
+                    destination = torch.empty_like(proposals, device=device)
+                    transfer = PeerCopies(device, (proposals,), (destination,))
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        if rank == len(devices) - 1:
+                            torch.cuda._sleep(500_000)
+                        transfer.launch()
+                        # Verification overwrites its input IDs; proposals must
+                        # remain separate until the final acceptance readback.
+                        destination.add_(rank + 1)
+                    buffers.append(destination)
+                    transfers.append(transfer)
+                    graphs.append(graph)
+            consumer = CudaGraphTeam(devices, graphs, streams, primary=session.stream,
+                                     owners=(proposals, buffers, transfers))
         for rebind in (False, True):
             if rebind:
                 session.rebind([copy.deepcopy(cache)])
@@ -59,13 +85,23 @@ def test_explicit_devices_and_cache_rebind():
                     reference.stream.synchronize()
                     expected = expected.clone()
                 with session.launch([noise], [context], [positions]) as actual:
+                    if consumer is not None:
+                        proposals.copy_(actual)
+                        consumer.replay()
                     session.stream.synchronize()
                     assert (actual == expected).float().mean().item() >= .85
+                    if consumer is not None:
+                        torch.testing.assert_close(proposals, actual, rtol=0, atol=0)
+                        for rank, destination in enumerate(buffers):
+                            torch.testing.assert_close(destination.cpu(), proposals.cpu() + rank + 1,
+                                                       rtol=0, atol=0)
                 for actual_layer, expected_layer in zip(session.caches[0].layers, reference.caches[0].layers):
                     for name in ("keys", "values"):
                         torch.testing.assert_close(getattr(actual_layer, name)[:, :session.lengths[0]],
                                                    getattr(expected_layer, name)[:, :session.lengths[0]],
                                                    rtol=.03, atol=.03)
             reference.shutdown()
+        if consumer is not None:
+            consumer.close()
         session.shutdown()
         session.shutdown()
