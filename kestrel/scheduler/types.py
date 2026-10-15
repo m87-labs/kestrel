@@ -212,6 +212,13 @@ class RequestLifecycle:
         payload = output
         text = payload.get("text", "")
         reasoning = payload.get("reasoning")
+        # Use the same prompt/decode counters as the final result. Buffered
+        # skill output may be published after the final token, with no index.
+        metrics = self.build_metrics(
+            decode_tokens=max(
+                0, self.skill_state.token_count - self.request.generated_prefix_length
+            )
+        )
         callback(
             StreamUpdate(
                 request_id=self.request.request_id,
@@ -222,6 +229,8 @@ class RequestLifecycle:
                 ),
                 reasoning=reasoning if isinstance(reasoning, str) else None,
                 output=payload,
+                input_tokens=metrics.prompt_tokens,
+                output_tokens=metrics.decode_tokens,
             )
         )
         return True
@@ -360,6 +369,8 @@ class StreamUpdate:
     token_index: Optional[int]
     reasoning: Optional[str] = None
     output: Mapping[str, object] = field(default_factory=dict)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 StreamCallback = Callable[[StreamUpdate], None]
