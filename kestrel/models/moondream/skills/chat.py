@@ -53,13 +53,19 @@ class _NativeChatRequest:
     stream: bool
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"{value} is not a JSON value")
+
+
 def _parse_command(text: str):
     match = _COMMAND.match(text)
     if match is None:
         return None
     operation = match[1]
     try:
-        arguments = json.loads(text[match.end() :])
+        arguments = json.loads(
+            text[match.end() :], parse_constant=_reject_json_constant
+        )
     except ValueError as exc:
         raise ValueError(
             f"/{operation} arguments must be a JSON object: {exc}"

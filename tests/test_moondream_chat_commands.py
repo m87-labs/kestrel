@@ -191,7 +191,7 @@ def test_command_requires_exactly_one_image(operation, count):
         ('/point {"object":"person","spatial_refs":[[true,0]]}', "coordinate arrays"),
         ('/point {"object":"person","spatial_refs":[[0,2]]}', "normalised"),
         ('/point {"object":"person","spatial_refs":[[0]]}', "2 .* or 4"),
-        ('/point {"object":"person","spatial_refs":[[NaN,0]]}', "non-finite"),
+        ('/point {"object":"person","spatial_refs":[[1e999,0]]}', "non-finite"),
     ],
 )
 def test_invalid_command_arguments(text, match):
@@ -296,3 +296,16 @@ def test_empty_native_results_remain_json(operation):
     )
     key = "objects" if operation == "detect" else "points"
     assert json.loads(state.finalize(_runtime(), reason="stop").text) == {key: []}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '/caption {"length":NaN}',
+        '/detect {"object":Infinity}',
+        '/caption {"length":NaN,"length":"normal"}',
+    ],
+)
+def test_nonstandard_json_constants_are_rejected(text):
+    with pytest.raises(ValueError, match="JSON object"):
+        _build(text)
