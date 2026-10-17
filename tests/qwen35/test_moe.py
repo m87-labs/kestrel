@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+import kestrel.models.qwen35.qwen_model as model_module
 from kestrel.models.qwen35.qwen_config import Qwen3_5TextConfig
 from kestrel.models.qwen35.qwen_model import Qwen3_5Experts
-import kestrel.models.qwen35.qwen_model as model_module
 
 
 def _moe_config() -> Qwen3_5TextConfig:
@@ -36,7 +37,8 @@ def _moe_config() -> Qwen3_5TextConfig:
     )
 
 
-def test_bf16_experts_use_device_selected_moe_backend(monkeypatch) -> None:
+@pytest.mark.parametrize("tokens", [1, 2, 16])
+def test_bf16_experts_use_device_selected_moe_backend(monkeypatch, tokens) -> None:
     calls: dict[str, object] = {}
 
     class FakeMoeRuntime:
@@ -54,9 +56,9 @@ def test_bf16_experts_use_device_selected_moe_backend(monkeypatch) -> None:
         lambda _device: SimpleNamespace(moe=FakeMoeRuntime()),
     )
     experts = Qwen3_5Experts(_moe_config()).to(dtype=torch.bfloat16)
-    hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
-    indices = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-    weights = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+    hidden = torch.zeros((tokens, 8), dtype=torch.bfloat16)
+    indices = torch.tensor([[0, 1]], dtype=torch.int64).expand(tokens, -1)
+    weights = torch.full((tokens, 2), 0.5, dtype=torch.bfloat16)
 
     output = experts(hidden, indices, weights)
 
@@ -65,4 +67,5 @@ def test_bf16_experts_use_device_selected_moe_backend(monkeypatch) -> None:
     assert spec.weight_format == "bf16"
     assert calls["capacity"].max_tokens == hidden.shape[0]
     assert calls["forward"]["topk_ids"].dtype == torch.int32
+    assert calls["forward"]["weights"].weight_scale_layout == "block128_interleaved8"
     torch.testing.assert_close(output, hidden + 1)

@@ -7,7 +7,7 @@ from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_retired_gemm_graph_releases_workspace():
+def test_retired_gemm_graph_workspace_is_bounded():
     import gc
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -18,7 +18,7 @@ def test_retired_gemm_graph_releases_workspace():
     torch.cuda.synchronize()
     gc.collect()
     baseline = torch.cuda.memory_allocated(device)
-    for _ in range(40):
+    for iteration in range(41):
         session = FixedShapeSinglePassGraph(
             enabled=True, device=device, stream=stream,
             run_forward=lambda x: (torch.nn.functional.linear(x, weight),))
@@ -31,7 +31,10 @@ def test_retired_gemm_graph_releases_workspace():
         del output, session
         gc.collect()
         torch.cuda.synchronize()
-        # Allow small library bookkeeping, but not a retained cuBLAS workspace.
+        if iteration == 0:
+            # One reusable capture stream may retain a library workspace.
+            # Its allocation must not grow with subsequent graph retirements.
+            baseline = torch.cuda.memory_allocated(device)
         assert torch.cuda.memory_allocated(device) <= baseline + 1024 * 1024
 
 
@@ -411,3 +414,65 @@ def test_cuda_session_retains_four_shapes_and_evicts_the_fifth() -> None:
         torch.testing.assert_close(output, first.square() + 1)
     assert calls == 12
     session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_direct_staging_uses_retained_inputs_and_exclusive_lease():
+    value = torch.zeros(8, device='cuda')
+    stream = torch.cuda.Stream()
+    session = FixedShapeSinglePassGraph(enabled=True, device='cuda', stream=stream,
+                                         run_forward=lambda x: (x + 2,), max_entries=1)
+    try:
+        assert not session.has_staged_entry
+        with pytest.raises(RuntimeError, match='one live captured shape'):
+            with session.launch_staged(lambda values: None):
+                pass
+        with session.launch(value) as (result,):
+            address = result.data_ptr()
+        def stage(values):
+            assert torch.cuda.current_stream() == stream
+            values[0].fill_(7)
+        with session.launch_staged(stage) as (result,):
+            assert result.data_ptr() == address
+            assert torch.equal(result, torch.full_like(result, 9))
+            with pytest.raises(RuntimeError, match='nested'):
+                with session.launch(value):
+                    pass
+        with session.launch_staged(lambda values: values[0].fill_(11)) as (result,):
+            assert torch.equal(result, torch.full_like(result, 13))
+    finally:
+        session.shutdown()
+    assert not session.has_staged_entry
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capture_stream_reuse_never_aliases_a_live_owner():
+    from kestrel.runtime.cuda_stream import OwnedCudaStream
+    first = OwnedCudaStream("cuda")
+    second = OwnedCudaStream("cuda")
+    third = fourth = None
+    try:
+        first_handle = first.stream.cuda_stream
+        assert first_handle != second.stream.cuda_stream
+        first.close()
+        third = OwnedCudaStream("cuda")
+        assert third.stream.cuda_stream == first_handle
+        first.close()  # A stale retired owner must not return the lease twice.
+        fourth = OwnedCudaStream("cuda")
+        assert fourth.stream.cuda_stream not in (third.stream.cuda_stream, second.stream.cuda_stream)
+    finally:
+        for owner in (first, second, third, fourth):
+            if owner is not None:
+                owner.close()
+
+
+def test_failed_graph_reset_does_not_recycle_capture_stream():
+    from unittest.mock import Mock
+    from kestrel.runtime.single_pass_graph import _GraphEntry
+
+    graph, capture = Mock(), Mock()
+    graph.reset.side_effect = RuntimeError("reset failed")
+    entry = _GraphEntry((), (), graph, Mock(), capture)
+    with pytest.raises(RuntimeError, match="reset failed"):
+        entry.close()
+    capture.close.assert_called_once_with(reuse=False)

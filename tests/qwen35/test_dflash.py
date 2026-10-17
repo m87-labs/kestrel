@@ -250,3 +250,38 @@ def test_packed_draft_preserves_independent_contexts():
                     torch.testing.assert_close(a.values[:, :left.length], b.values[:, :right.length],
                                                rtol=.02, atol=.02)
             assert packed[0].layers[0].keys.data_ptr() != packed[1].layers[0].keys.data_ptr()
+
+
+def test_checkpoint_projection_packing_preserves_values_and_storage(tmp_path):
+    import json
+    from safetensors.torch import save_file
+    from kestrel.models.qwen35.dflash import DFlashDraftModel, load_dflash_drafter
+
+    metadata = _metadata()
+    source = DFlashDraftModel(DFlashConfig.from_dict(metadata)).to(torch.bfloat16)
+    state = source.state_dict()
+    for index in range(source.config.num_hidden_layers):
+        for module, first, second, packed in (
+            ("self_attn", "k_proj", "v_proj", "kv_proj"),
+            ("mlp", "gate_proj", "up_proj", "gate_up_proj"),
+        ):
+            prefix = f"layers.{index}.{module}."
+            values = state.pop(prefix + packed + ".weight").chunk(2, dim=0)
+            for name, value in zip((first, second), values):
+                state[prefix + name + ".weight"] = value.clone()
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    save_file(state, tmp_path / "model.safetensors")
+    loaded = load_dflash_drafter(tmp_path, device=torch.device("cpu"))
+    hidden = torch.randn(1, 16, metadata["hidden_size"], dtype=torch.bfloat16)
+    for before, after in zip(source.layers, loaded.layers):
+        torch.testing.assert_close(after.mlp.gate_up_proj.weight, before.mlp.gate_up_proj.weight, rtol=0, atol=0)
+        torch.testing.assert_close(after.self_attn.kv_proj.weight, before.self_attn.kv_proj.weight, rtol=0, atol=0)
+        gate_weight, up_weight = after.mlp.gate_up_proj.weight.chunk(2, dim=0)
+        reference = after.mlp.down_proj(torch.nn.functional.silu(
+            torch.nn.functional.linear(hidden, gate_weight)) * torch.nn.functional.linear(hidden, up_weight))
+        torch.testing.assert_close(after.mlp(hidden), reference)
+        key, value = after.self_attn.kv_proj(hidden).chunk(2, dim=-1)
+        torch.testing.assert_close(key, after.self_attn.k_proj(hidden))
+        torch.testing.assert_close(value, after.self_attn.v_proj(hidden))
+        assert not any(name in ("gate_proj.weight", "up_proj.weight") for name, _ in after.mlp.named_parameters())
+        assert not any(name in ("k_proj.weight", "v_proj.weight") for name, _ in after.self_attn.named_parameters())

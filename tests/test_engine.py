@@ -813,3 +813,38 @@ def test_validate_suppress_next_token_ids_rejects_bad_request_scope() -> None:
             SimpleNamespace(suppress_next_token_ids=(0, 1)),
             skill_state(suppressed=[2, 3]),
         )
+
+
+@pytest.mark.parametrize("settled_first", [False, True])
+def test_streamed_failure_observes_duplicate_result_exception(settled_first):
+    import gc
+    from kestrel.engine._types import _StreamCompletion
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        unhandled = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+        async def consume():
+            future = loop.create_future()
+            queue = asyncio.Queue()
+            stream = EngineStream(1, queue, future)
+            error = RuntimeError("admission rejected")
+            queue.put_nowait(_StreamCompletion(error=error))
+            if settled_first:
+                future.set_exception(error)
+            with pytest.raises(RuntimeError, match="admission rejected"):
+                await anext(stream)
+            if not settled_first:
+                future.set_exception(error)
+            await asyncio.sleep(0)
+            with pytest.raises(RuntimeError, match="admission rejected"):
+                await stream.result()
+        try:
+            await consume()
+            gc.collect()
+            await asyncio.sleep(0)
+            assert not unhandled
+        finally:
+            loop.set_exception_handler(previous)
+    asyncio.run(run())

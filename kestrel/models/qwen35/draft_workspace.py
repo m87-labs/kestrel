@@ -79,11 +79,12 @@ class DFlashDraftGraphSession:
     A failed launch/consumer poisons the session rather than attempting rollback.
     """
 
-    def __init__(self, model, caches, *, lm_head=None):
+    def __init__(self, model, caches, *, lm_head=None, confidence=None):
         from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
         self.model = model
         self.lm_head = lm_head
+        self.confidence = confidence
         self.caches = tuple(caches)
         if not self.caches or len({id(cache) for cache in self.caches}) != len(self.caches):
             raise ValueError("draft graph requires distinct cache owners")
@@ -129,13 +130,13 @@ class DFlashDraftGraphSession:
             run_forward=self._forward, max_entries=1)
 
     def rebind(self, caches):
-        """Replace retired owners without changing graph pointers or geometry."""
+        """Replace retired owners whose logical capacities fit retained storage."""
         if self.failed or self.closed or self.active:
             raise RuntimeError("cannot rebind an active, failed, or retired draft graph")
         caches = tuple(caches)
         if (len(caches) != len(self.caches) or len({id(cache) for cache in caches}) != len(caches)
-                or tuple(cache.capacity for cache in caches) != tuple(cache.capacity for cache in self.caches)):
-            raise ValueError("draft graph rebind requires matching slot capacities")
+                or any(cache.capacity > self.workspaces[0].capacity for cache in caches)):
+            raise ValueError("draft graph rebind exceeds retained slot capacity")
         for cache in caches:
             if not 0 <= cache.length <= cache.capacity or len(cache.layers) != len(self.workspaces):
                 raise ValueError("draft graph rebind cache geometry mismatch")
@@ -164,12 +165,30 @@ class DFlashDraftGraphSession:
         cos, sin = self.model.rotary_emb(hidden, positions[..., None])
         query_rotary = (cos[:, -hidden.shape[1]:], sin[:, -hidden.shape[1]:])
         key_rotary = (cos, sin)
-        for layer, workspace in zip(self.model.layers, self.workspaces):
-            hidden = layer.run(hidden, lambda value: layer.self_attn.forward_stable(
-                value, context, query_rotary, key_rotary, workspace, mapping, used))
-        hidden = self.model.norm(hidden)
+        if all(layer.attention_conv is None and layer.mlp_conv is None for layer in self.model.layers):
+            residual = None
+            for layer, workspace in zip(self.model.layers, self.workspaces):
+                norm = layer.input_layernorm
+                normalized = (norm(hidden) if residual is None else
+                              get_runtime().dense.add_rmsnorm(hidden, residual, norm.weight, norm.eps))
+                output = layer.self_attn.forward_stable(
+                    normalized, context, query_rotary, key_rotary, workspace, mapping, used)
+                norm = layer.post_attention_layernorm
+                normalized = get_runtime().dense.add_rmsnorm(output, hidden, norm.weight, norm.eps)
+                residual = output
+                hidden = layer.mlp(normalized)
+            norm = self.model.norm
+            hidden = get_runtime().dense.add_rmsnorm(hidden, residual, norm.weight, norm.eps)
+        else:
+            for layer, workspace in zip(self.model.layers, self.workspaces):
+                hidden = layer.run(hidden, lambda value: layer.self_attn.forward_stable(
+                    value, context, query_rotary, key_rotary, workspace, mapping, used))
+            hidden = self.model.norm(hidden)
         if self.lm_head is None:
             return (hidden,)
+        if self.confidence is not None:
+            return (self.model.select_tokens(hidden, self.lm_head, anchors,
+                                             confidence=self.confidence),)
         return (self.model.select_tokens(hidden, self.lm_head, anchors),)
 
     @contextmanager
@@ -229,25 +248,63 @@ class DFlashDraftGraphSession:
         try:
             with self.graph.launch(*inputs) as (output,):
                 yield output
-                destinations, sources = [], []
-                for index, workspace in enumerate(self.workspaces):
-                    for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
-                        if length:
-                            destinations.extend((cache.layers[index].keys[0, start:start + length],
-                                                 cache.layers[index].values[0, start:start + length]))
-                            sources.extend((workspace.keys[slot, start:start + length],
-                                            workspace.values[slot, start:start + length]))
-                            cache.layers[index].keys.record_stream(self.stream)
-                            cache.layers[index].values.record_stream(self.stream)
-                if destinations:
-                    torch._foreach_copy_(destinations, sources)
-                self.lengths = tuple(start + length for start, length in zip(self.lengths, lengths))
-                for cache, length in zip(self.caches, self.lengths):
-                    cache.length = length
+                self._commit_context(lengths)
             # Cache ownership returns to the caller along with host lengths.
             # A later eager draft must observe these post-consumer KV copies.
             if consumer_stream != self.stream:
                 consumer_stream.wait_stream(self.stream)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.active = False
+
+    def _commit_context(self, lengths):
+        destinations, sources = [], []
+        for index, workspace in enumerate(self.workspaces):
+            for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
+                if length:
+                    destinations.extend((cache.layers[index].keys[0, start:start + length],
+                                         cache.layers[index].values[0, start:start + length]))
+                    sources.extend((workspace.keys[slot, start:start + length],
+                                    workspace.values[slot, start:start + length]))
+                    cache.layers[index].keys.record_stream(self.stream)
+                    cache.layers[index].values.record_stream(self.stream)
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+        self.lengths = tuple(start + length for start, length in zip(self.lengths, lengths))
+        for cache, length in zip(self.caches, self.lengths):
+            cache.length = length
+
+    @contextmanager
+    def launch_tokens(self, features, embedding, *, bonus, target_position):
+        """Fuse C1 staging into the captured inputs under the normal graph lease."""
+        from kestrel_kernels.draft_staging import stage_draft_inputs
+
+        if self.failed or self.closed or self.active:
+            raise RuntimeError("draft graph session is failed or retired")
+        if len(self.caches) != 1 or self.lm_head is None:
+            raise ValueError("direct draft token staging requires one token-producing owner")
+        cache = self.caches[0]
+        length = features.shape[1]
+        if (self.lengths != (cache.length,) or cache.length + length != target_position
+                or cache.length + length + self.query_rows > cache.capacity):
+            raise ValueError("draft staging cache ownership or capacity mismatch")
+        consumer = torch.cuda.current_stream(features.device)
+        def stage(inputs):
+            stage_draft_inputs(features, embedding, inputs, start=cache.length,
+                               bonus=bonus, mask_token=self.model.config.mask_token_id,
+                               capacity=self.workspaces[0].capacity)
+            features.record_stream(self.stream)
+            embedding.record_stream(self.stream)
+        self.active = True
+        try:
+            with self.graph.launch_staged(stage) as (output,):
+                yield output
+                self._commit_context((length,))
+            if consumer != self.stream:
+                consumer.wait_stream(self.stream)
+                output.record_stream(consumer)
         except BaseException:
             self.failed = True
             raise
@@ -259,3 +316,10 @@ class DFlashDraftGraphSession:
             raise RuntimeError("cannot retire an active draft graph lease")
         self.closed = True
         self.graph.shutdown()
+        # A caller can still hold this retired session while constructing its
+        # replacement. Release synchronized storage now to avoid overlapping
+        # two full draft KV workspaces during a batch geometry change.
+        self.workspaces.clear()
+        self.caches = ()
+        self.targets = None
+        self.positions = None
